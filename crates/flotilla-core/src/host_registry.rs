@@ -91,6 +91,19 @@ impl HostRegistry {
         connection_status_for_node(&self.local_node, &node_connectivity, node_id)
     }
 
+    pub(crate) async fn connected_peer_summaries(&self) -> Vec<HostSummary> {
+        let node_connectivity = self.node_connectivity.read().await;
+        let hosts = self.hosts.read().await;
+        hosts
+            .values()
+            .filter(|state| !state.removed && state.node_id != self.local_node.node_id)
+            .filter(|state| {
+                connection_status_for_node(&self.local_node, &node_connectivity, &state.node_id) == PeerConnectionState::Connected
+            })
+            .filter_map(|state| state.summary.clone())
+            .collect()
+    }
+
     pub(crate) async fn list_hosts(&self, counts: &HashMap<EnvironmentId, HostCounts>) -> HostListResponse {
         let configured = self.configured_peers.read().await.clone();
         let node_connectivity = self.node_connectivity.read().await.clone();
@@ -838,6 +851,22 @@ mod tests {
         registry.publish_peer_connection_status(&peer_node(), PeerConnectionState::Connected, &HashMap::new(), &emit).await;
 
         assert!(events.borrow().is_empty(), "peer status without a canonical environment id should not emit host state");
+    }
+
+    #[tokio::test]
+    async fn connected_peer_summaries_only_returns_live_routes() {
+        let registry = HostRegistry::new(local_node(), minimal_summary(&local_node()));
+        let peer = peer_node();
+        let summary = minimal_summary(&peer);
+        registry.publish_peer_summary(summary.clone(), &|_| {}).await;
+
+        assert!(registry.connected_peer_summaries().await.is_empty(), "a disconnected peer must not receive heartbeat refreshes");
+
+        registry.publish_peer_connection_status(&peer, PeerConnectionState::Connected, &HashMap::new(), &|_| {}).await;
+        assert_eq!(registry.connected_peer_summaries().await, vec![summary]);
+
+        registry.publish_peer_connection_status(&peer, PeerConnectionState::Disconnected, &HashMap::new(), &|_| {}).await;
+        assert!(registry.connected_peer_summaries().await.is_empty(), "a disconnected peer must stop receiving heartbeat refreshes");
     }
 
     #[tokio::test]

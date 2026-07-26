@@ -2162,6 +2162,15 @@ impl InProcessDaemon {
             .await;
     }
 
+    /// Keep locally materialized peer hosts ready while their transport route is live.
+    pub async fn refresh_connected_peer_host_heartbeats(&self) {
+        for summary in self.host_registry.connected_peer_summaries().await {
+            if let Err(error) = self.materialize_peer_host_direct_placement(&summary).await {
+                warn!(peer = %summary.node.node_id, %error, "failed to refresh connected peer host heartbeat");
+            }
+        }
+    }
+
     async fn materialize_peer_host_direct_placement(&self, summary: &HostSummary) -> Result<(), String> {
         let Some(host_id) = summary.environment_id.host_id() else {
             return Ok(());

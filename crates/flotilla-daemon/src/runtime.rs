@@ -574,7 +574,9 @@ async fn apply_host_heartbeat(daemon: &Arc<InProcessDaemon>, namespace: &str, pr
     }
     let status =
         HostStatus { capabilities: host_capabilities(&summary, profile), heartbeat_at: Some(Utc::now()), ready: true, resource_store };
-    hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map(|_| ()).map_err(|err| err.to_string())
+    hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|err| err.to_string())?;
+    daemon.refresh_connected_peer_host_heartbeats().await;
+    Ok(())
 }
 
 fn host_capabilities(_summary: &HostSummary, profile: &LocalProvisioningProfile) -> BTreeMap<String, serde_json::Value> {
@@ -2401,6 +2403,71 @@ mod tests {
             status.resource_store.expect("heartbeat should publish resource store diagnostics").event_log_within_retention(),
             "heartbeat should report a bounded resource event log"
         );
+
+        heartbeat.abort();
+        let _ = heartbeat.await;
+    }
+
+    #[tokio::test]
+    async fn heartbeat_task_advances_connected_peer_host_status_after_restart() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let daemon = in_memory_daemon(Vec::new(), config).await;
+        let local_host_id = daemon.local_host_id().expect("local host id").to_string();
+        let peer_node = flotilla_protocol::NodeInfo::new(flotilla_protocol::NodeId::new("feta-node"), "feta");
+        daemon
+            .publish_peer_summary(
+                HostSummary::builder()
+                    .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host")))
+                    .host_name(flotilla_protocol::HostName::new("feta"))
+                    .node(peer_node.clone())
+                    .system(flotilla_protocol::SystemInfo::default())
+                    .providers(Vec::new())
+                    .build(),
+            )
+            .await;
+        daemon.publish_peer_connection_status(&peer_node, flotilla_protocol::PeerConnectionState::Connected).await;
+
+        let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
+        let peer = hosts.get("feta-host").await.expect("peer host should be materialized");
+        let stale_heartbeat = Utc::now() - chrono::Duration::seconds(61);
+        hosts
+            .update_status(&peer.metadata.name, &peer.metadata.resource_version, &HostStatus {
+                capabilities: BTreeMap::new(),
+                heartbeat_at: Some(stale_heartbeat),
+                ready: true,
+                resource_store: None,
+            })
+            .await
+            .expect("seed stale peer heartbeat");
+
+        let heartbeat = spawn_heartbeat_task(
+            Arc::clone(&daemon),
+            NAMESPACE.to_string(),
+            manual_profile(&local_host_id, false),
+            Duration::from_millis(20),
+        );
+        wait_until(|| {
+            let hosts = hosts.clone();
+            async move {
+                hosts
+                    .get("feta-host")
+                    .await
+                    .ok()
+                    .and_then(|host| host.status)
+                    .is_some_and(|status| status.heartbeat_at.is_some_and(|heartbeat| heartbeat > stale_heartbeat))
+            }
+        })
+        .await;
+
+        assert_eq!(
+            daemon.peer_connection_status(&peer_node.node_id).await,
+            flotilla_protocol::PeerConnectionState::Connected,
+            "the peer transport should remain connected"
+        );
+        let mut status = hosts.get("feta-host").await.expect("peer host").status.expect("peer status");
+        status.apply_heartbeat_readiness(Utc::now());
+        assert!(status.ready, "a connected peer should remain ready for placement");
 
         heartbeat.abort();
         let _ = heartbeat.await;
