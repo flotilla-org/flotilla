@@ -244,7 +244,10 @@ async fn query_commands_roundtrip() {
     let (local_node_id, local_environment_id) = match hosts_result {
         CommandValue::HostList(hosts) => {
             let entry = hosts.hosts.iter().find(|entry| entry.is_local).expect("expected local host entry");
-            (entry.node.node_id.clone(), entry.environment_id.clone())
+            (
+                entry.node.as_ref().expect("local host should have node identity").node_id.clone(),
+                entry.environment_id.clone().expect("local host should have environment identity"),
+            )
         }
         other => panic!("expected HostList, got {other:?}"),
     };
@@ -334,9 +337,13 @@ async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
 
     let mut rx = client.subscribe();
     let local_node_id = match run_query(&*client, CommandAction::QueryHostList {}).await {
-        CommandValue::HostList(hosts) => {
-            hosts.hosts.iter().find(|entry| entry.is_local).map(|entry| entry.node.node_id.clone()).expect("expected local host entry")
-        }
+        CommandValue::HostList(hosts) => hosts
+            .hosts
+            .iter()
+            .find(|entry| entry.is_local)
+            .and_then(|entry| entry.node.as_ref())
+            .map(|node| node.node_id.clone())
+            .expect("expected local host entry"),
         other => panic!("expected HostList, got {other:?}"),
     };
     let command_id = client

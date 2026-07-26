@@ -1125,12 +1125,13 @@ mod tests {
             })),
             CommandValue::HostList(Box::new(HostListResponse {
                 hosts: vec![HostListEntry {
-                    environment_id: EnvironmentId::host(HostId::new("desktop-host")),
+                    environment_id: Some(EnvironmentId::host(HostId::new("desktop-host"))),
                     host_name: crate::HostName::new("desktop"),
-                    node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
+                    node: Some(NodeInfo::new(NodeId::new("desktop"), "Desktop")),
                     is_local: true,
                     configured: true,
                     connection_status: PeerConnectionState::Connected,
+                    reconnect: None,
                     has_summary: true,
                     repo_count: 1,
                     work_item_count: 3,

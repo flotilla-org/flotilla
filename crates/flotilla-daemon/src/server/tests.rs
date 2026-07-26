@@ -633,7 +633,7 @@ async fn dispatch_host_query_methods_round_trip() {
     // Host queries now go through execute() via CommandAction::Query* variants.
     // Test the internal methods directly to validate the data path.
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
-    assert!(hosts.hosts.iter().any(|entry| entry.node.node_id == *daemon.node_id()));
+    assert!(hosts.hosts.iter().any(|entry| entry.node.as_ref().is_some_and(|node| node.node_id == *daemon.node_id())));
 
     let status = daemon.get_host_status_internal(&local_environment_id).await.expect("host status");
     assert!(status.is_local);
@@ -855,7 +855,10 @@ async fn sync_peer_query_state_mirrors_host_summaries_and_routes_into_daemon() {
     sync_peer_query_state(&peer_manager, &daemon).await;
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts after sync");
-    assert!(hosts.hosts.iter().any(|entry| entry.node.node_id == node("remote") && entry.has_summary));
+    assert!(hosts
+        .hosts
+        .iter()
+        .any(|entry| entry.node.as_ref().is_some_and(|node_info| node_info.node_id == node("remote")) && entry.has_summary));
 
     let topology = daemon.get_topology().await.expect("topology after sync");
     assert!(topology.routes.iter().any(|route| route.target.node_id == node("remote") && route.next_hop.node_id == node("remote")));
@@ -893,7 +896,8 @@ async fn sync_peer_query_state_preserves_multiple_host_summaries_for_one_node() 
     sync_peer_query_state(&peer_manager, &daemon).await;
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts after sync");
-    let remote_hosts: Vec<_> = hosts.hosts.into_iter().filter(|entry| entry.node.node_id == node("remote")).collect();
+    let remote_hosts: Vec<_> =
+        hosts.hosts.into_iter().filter(|entry| entry.node.as_ref().is_some_and(|node_info| node_info.node_id == node("remote"))).collect();
     assert_eq!(remote_hosts.len(), 2, "both host environments for the same node should remain visible");
 }
 

@@ -268,18 +268,32 @@ pub struct HostListResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostListEntry {
-    pub environment_id: crate::EnvironmentId,
+    /// Canonical host environment identity, when the peer has supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_id: Option<crate::EnvironmentId>,
     pub host_name: HostName,
-    pub node: NodeInfo,
+    /// Canonical node identity, when the configured target has connected at
+    /// least once or pins an expected node id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<NodeInfo>,
     pub is_local: bool,
     /// `true` only for non-local hosts that appear in `hosts.toml`.
     pub configured: bool,
     pub connection_status: PeerConnectionState,
+    /// Live redial details when `connection_status` is `Reconnecting`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect: Option<PeerReconnectStatus>,
     /// Indicates whether `get_host_status` would be able to return a
     /// non-`None` summary for this host.
     pub has_summary: bool,
     pub repo_count: usize,
     pub work_item_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerReconnectStatus {
+    pub attempt: u32,
+    pub next_dial_in_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,12 +423,13 @@ mod tests {
     fn host_list_response_roundtrips_without_summary_data() {
         let response = HostListResponse {
             hosts: vec![HostListEntry {
-                environment_id: EnvironmentId::host(HostId::new("remote-laptop-host")),
+                environment_id: Some(EnvironmentId::host(HostId::new("remote-laptop-host"))),
                 host_name: HostName::new("remote-laptop"),
-                node: NodeInfo::new(NodeId::new("node-remote-1"), "Remote Laptop"),
+                node: Some(NodeInfo::new(NodeId::new("node-remote-1"), "Remote Laptop")),
                 is_local: false,
                 configured: true,
                 connection_status: PeerConnectionState::Disconnected,
+                reconnect: None,
                 has_summary: false,
                 repo_count: 0,
                 work_item_count: 0,

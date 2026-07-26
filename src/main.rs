@@ -1073,10 +1073,22 @@ fn select_host_target(
         0 => Err(color_eyre::eyre::eyre!("unknown host: {subject}")),
         1 => {
             let entry = matches.pop().expect("single host match");
-            Ok((entry.environment_id.clone(), entry.node.node_id.clone()))
+            let environment_id = entry
+                .environment_id
+                .clone()
+                .ok_or_else(|| color_eyre::eyre::eyre!("host {subject} is configured but has no known environment identity"))?;
+            let node_id = entry
+                .node
+                .as_ref()
+                .map(|node| node.node_id.clone())
+                .ok_or_else(|| color_eyre::eyre::eyre!("host {subject} is configured but has no known node identity"))?;
+            Ok((environment_id, node_id))
         }
         _ => {
-            let mut ids: Vec<_> = matches.iter().map(|entry| entry.environment_id.canonical_string()).collect();
+            let mut ids: Vec<_> = matches
+                .iter()
+                .map(|entry| entry.environment_id.as_ref().map(EnvironmentId::canonical_string).unwrap_or_else(|| "configured".into()))
+                .collect();
             ids.sort();
             Err(color_eyre::eyre::eyre!("ambiguous host: {subject} ({})", ids.join(", ")))
         }
@@ -1101,17 +1113,20 @@ async fn resolve_environment_target(
     };
 
     for entry in response.hosts {
-        if entry.environment_id == *target_environment_id {
-            return Ok((provisioning_target_for_environment(&entry.host_name, &entry.environment_id), entry.node.node_id));
+        let (Some(environment_id), Some(node)) = (entry.environment_id, entry.node) else {
+            continue;
+        };
+        if environment_id == *target_environment_id {
+            return Ok((provisioning_target_for_environment(&entry.host_name, &environment_id), node.node_id));
         }
 
         let status = daemon
             .execute_query(
                 Command {
-                    node_id: Some(entry.node.node_id.clone()),
+                    node_id: Some(node.node_id.clone()),
                     provisioning_target: None,
                     context_repo: None,
-                    action: CommandAction::QueryHostStatus { target_environment_id: entry.environment_id.clone() },
+                    action: CommandAction::QueryHostStatus { target_environment_id: environment_id.clone() },
                 },
                 uuid::Uuid::new_v4(),
             )
@@ -1123,8 +1138,8 @@ async fn resolve_environment_target(
             Err(err) => {
                 info!(
                     host = %entry.host_name,
-                    environment_id = %entry.environment_id,
-                    node_id = %entry.node.node_id,
+                    %environment_id,
+                    node_id = %node.node_id,
                     error = %err,
                     "skipping host while resolving environment target"
                 );
@@ -1139,7 +1154,7 @@ async fn resolve_environment_target(
         if response.visible_environments.iter().any(|environment| environment.environment_id() == target_environment_id) {
             return Ok((
                 flotilla_protocol::ProvisioningTarget::ExistingEnvironment { host: entry.host_name, env_id: target_environment_id.clone() },
-                entry.node.node_id,
+                node.node_id,
             ));
         }
     }
@@ -1925,12 +1940,13 @@ mod tests {
     #[test]
     fn host_target_selection_uses_host_facing_name() {
         let hosts = vec![HostListEntry {
-            environment_id: EnvironmentId::host(HostId::new("desktop-a")),
+            environment_id: Some(EnvironmentId::host(HostId::new("desktop-a"))),
             host_name: HostName::new("desktop"),
-            node: NodeInfo::new(NodeId::new("node-a"), "Builder"),
+            node: Some(NodeInfo::new(NodeId::new("node-a"), "Builder")),
             is_local: false,
             configured: true,
             connection_status: PeerConnectionState::Connected,
+            reconnect: None,
             has_summary: true,
             repo_count: 0,
             work_item_count: 0,
@@ -1945,23 +1961,25 @@ mod tests {
     fn host_target_selection_reports_ambiguity_for_duplicate_host_names() {
         let hosts = vec![
             HostListEntry {
-                environment_id: EnvironmentId::host(HostId::new("desktop-a")),
+                environment_id: Some(EnvironmentId::host(HostId::new("desktop-a"))),
                 host_name: HostName::new("desktop"),
-                node: NodeInfo::new(NodeId::new("node-a"), "Desktop"),
+                node: Some(NodeInfo::new(NodeId::new("node-a"), "Desktop")),
                 is_local: false,
                 configured: true,
                 connection_status: PeerConnectionState::Connected,
+                reconnect: None,
                 has_summary: true,
                 repo_count: 0,
                 work_item_count: 0,
             },
             HostListEntry {
-                environment_id: EnvironmentId::host(HostId::new("desktop-b")),
+                environment_id: Some(EnvironmentId::host(HostId::new("desktop-b"))),
                 host_name: HostName::new("desktop"),
-                node: NodeInfo::new(NodeId::new("node-b"), "Desktop"),
+                node: Some(NodeInfo::new(NodeId::new("node-b"), "Desktop")),
                 is_local: false,
                 configured: true,
                 connection_status: PeerConnectionState::Connected,
+                reconnect: None,
                 has_summary: true,
                 repo_count: 0,
                 work_item_count: 0,

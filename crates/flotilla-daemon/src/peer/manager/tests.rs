@@ -672,6 +672,66 @@ async fn configured_targets_are_stored_separately_from_established_peers() {
     assert!(established.is_empty(), "configured targets should not look established before handshake");
 }
 
+#[test]
+fn host_list_projection_includes_configured_target_in_redial_backoff() {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    add_configured_transport(&mut mgr, "feta", "feta", MockTransport::new());
+    mgr.note_reconnect_backoff(&ConfigLabel("feta".into()), 592, Duration::from_secs(60));
+    let mut response = flotilla_protocol::HostListResponse { hosts: vec![] };
+
+    mgr.project_host_list(&mut response);
+
+    let [feta] = response.hosts.as_slice() else {
+        panic!("expected one configured host row, got {:?}", response.hosts);
+    };
+    assert_eq!(feta.host_name, HostName::new("feta"));
+    assert_eq!(feta.environment_id, None);
+    assert_eq!(feta.node, None);
+    assert!(feta.configured);
+    assert_eq!(feta.connection_status, PeerConnectionState::Reconnecting);
+    assert_eq!(feta.reconnect, Some(flotilla_protocol::PeerReconnectStatus { attempt: 592, next_dial_in_seconds: 60 }));
+}
+
+#[test]
+fn host_list_projection_enriches_every_environment_row_for_configured_node() {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    mgr.add_configured_target(
+        ConfigLabel("feta".into()),
+        HostName::new("feta"),
+        Some(NodeId::new("feta-node")),
+        Box::new(MockTransport::new()),
+    );
+    mgr.note_reconnect_backoff(&ConfigLabel("feta".into()), 8, Duration::from_secs(60));
+    let node = NodeInfo::new(NodeId::new("feta-node"), "feta");
+    let mut response = flotilla_protocol::HostListResponse {
+        hosts: ["feta-host", "feta-container"]
+            .into_iter()
+            .map(|environment_id| flotilla_protocol::HostListEntry {
+                environment_id: Some(EnvironmentId::host(HostId::new(environment_id))),
+                host_name: HostName::new("feta"),
+                node: Some(node.clone()),
+                is_local: false,
+                configured: false,
+                connection_status: PeerConnectionState::Disconnected,
+                reconnect: None,
+                has_summary: true,
+                repo_count: 0,
+                work_item_count: 0,
+            })
+            .collect(),
+    };
+
+    mgr.project_host_list(&mut response);
+
+    assert_eq!(response.hosts.len(), 2, "canonical rows should be enriched, not duplicated");
+    assert!(response.hosts.iter().all(|entry| entry.configured));
+    assert!(response.hosts.iter().all(|entry| entry.connection_status == PeerConnectionState::Reconnecting));
+    assert!(response
+        .hosts
+        .iter()
+        .all(|entry| entry.reconnect == Some(flotilla_protocol::PeerReconnectStatus { attempt: 8, next_dial_in_seconds: 60 })));
+}
+
 #[tokio::test]
 async fn reconnect_target_uses_handshake_node_identity() {
     let mut mgr = PeerManager::new(NodeId::new("z"));

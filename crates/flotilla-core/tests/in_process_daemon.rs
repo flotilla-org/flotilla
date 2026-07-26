@@ -2742,8 +2742,11 @@ async fn list_hosts_does_not_materialize_configured_peers_without_host_environme
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
 
-    assert!(hosts.hosts.iter().any(|entry| entry.node.node_id == daemon.node_id().clone() && entry.is_local));
-    assert!(!hosts.hosts.iter().any(|entry| entry.node == test_node("remote")));
+    assert!(hosts
+        .hosts
+        .iter()
+        .any(|entry| { entry.node.as_ref().is_some_and(|node| node.node_id == daemon.node_id().clone()) && entry.is_local }));
+    assert!(!hosts.hosts.iter().any(|entry| entry.node == Some(test_node("remote"))));
 }
 
 #[tokio::test]
@@ -2765,7 +2768,7 @@ async fn get_host_providers_returns_local_summary_and_unmapped_remote_host_is_ab
         .expect("list hosts")
         .hosts
         .into_iter()
-        .any(|entry| entry.node.node_id == test_node("remote").node_id));
+        .any(|entry| entry.node.as_ref().is_some_and(|node| node.node_id == test_node("remote").node_id)));
 }
 
 #[tokio::test]
@@ -2905,7 +2908,7 @@ async fn list_hosts_counts_remote_repo_overlay_and_get_topology_returns_mirrored
     daemon.set_peer_providers(&repo, vec![(HostName::new("remote"), peer_data)], 0).await;
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
-    let remote = hosts.hosts.iter().find(|entry| entry.node == test_node("remote")).expect("remote host entry");
+    let remote = hosts.hosts.iter().find(|entry| entry.node == Some(test_node("remote"))).expect("remote host entry");
     assert_eq!(remote.repo_count, 1);
     assert!(remote.work_item_count >= 1, "remote overlay should contribute work items");
 
@@ -4157,10 +4160,10 @@ async fn set_peer_providers_reuses_existing_peer_host_environment_identity() {
     daemon.set_peer_providers(&repo, vec![(peer_host.clone(), ProviderData::default())], 0).await;
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
-    let peer_entry = hosts.hosts.iter().find(|entry| entry.node == test_node(peer_host.as_str())).expect("peer entry");
+    let peer_entry = hosts.hosts.iter().find(|entry| entry.node == Some(test_node(peer_host.as_str()))).expect("peer entry");
 
-    assert_eq!(peer_entry.environment_id, expected_environment_id);
-    assert!(peer_entry.environment_id.is_host());
+    assert_eq!(peer_entry.environment_id, Some(expected_environment_id));
+    assert!(peer_entry.environment_id.as_ref().is_some_and(EnvironmentId::is_host));
 }
 
 #[tokio::test]
@@ -4238,8 +4241,8 @@ async fn list_hosts_uses_environment_scoped_counts_for_multiple_hosts_on_same_no
     daemon.set_peer_providers(&repo_b, vec![(HostName::new("shared-peer"), providers_b)], 0).await;
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
-    let host_a = hosts.hosts.iter().find(|entry| entry.environment_id == env_a).expect("host a");
-    let host_b = hosts.hosts.iter().find(|entry| entry.environment_id == env_b).expect("host b");
+    let host_a = hosts.hosts.iter().find(|entry| entry.environment_id.as_ref() == Some(&env_a)).expect("host a");
+    let host_b = hosts.hosts.iter().find(|entry| entry.environment_id.as_ref() == Some(&env_b)).expect("host b");
 
     assert_eq!(host_a.repo_count, 1);
     assert_eq!(host_b.repo_count, 2);
@@ -4280,13 +4283,19 @@ async fn set_peer_providers_keeps_multiple_host_environments_visible_for_one_nod
     daemon.set_peer_providers(&repo, vec![(HostName::new("overlay-peer"), peer_data)], 0).await;
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
-    let peer_entries: Vec<_> = hosts.hosts.iter().filter(|entry| entry.node == test_node("overlay-peer")).collect();
+    let peer_entries: Vec<_> = hosts.hosts.iter().filter(|entry| entry.node == Some(test_node("overlay-peer"))).collect();
 
     assert_eq!(peer_entries.len(), 2);
-    assert_eq!(peer_entries.iter().find(|entry| entry.environment_id == env_a).expect("host a").host_name, HostName::new("overlay-peer-a"));
-    assert_eq!(peer_entries.iter().find(|entry| entry.environment_id == env_b).expect("host b").host_name, HostName::new("overlay-peer-b"));
-    assert!(peer_entries.iter().any(|entry| entry.environment_id == env_a));
-    assert!(peer_entries.iter().any(|entry| entry.environment_id == env_b));
+    assert_eq!(
+        peer_entries.iter().find(|entry| entry.environment_id.as_ref() == Some(&env_a)).expect("host a").host_name,
+        HostName::new("overlay-peer-a")
+    );
+    assert_eq!(
+        peer_entries.iter().find(|entry| entry.environment_id.as_ref() == Some(&env_b)).expect("host b").host_name,
+        HostName::new("overlay-peer-b")
+    );
+    assert!(peer_entries.iter().any(|entry| entry.environment_id.as_ref() == Some(&env_a)));
+    assert!(peer_entries.iter().any(|entry| entry.environment_id.as_ref() == Some(&env_b)));
 }
 
 #[tokio::test]
@@ -4312,7 +4321,7 @@ async fn set_peer_providers_without_canonical_host_name_does_not_emit_placeholde
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
     assert!(
-        hosts.hosts.iter().all(|entry| entry.environment_id != env),
+        hosts.hosts.iter().all(|entry| entry.environment_id.as_ref() != Some(&env)),
         "placeholder overlay data without a canonical host-facing name should not materialize a host entry"
     );
 
@@ -4332,7 +4341,7 @@ async fn set_peer_providers_without_environment_mapping_does_not_synthesize_host
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
     assert!(
-        hosts.hosts.iter().all(|entry| entry.node.display_name != peer_host.as_str()),
+        hosts.hosts.iter().all(|entry| entry.node.as_ref().is_none_or(|node| node.display_name != peer_host.as_str())),
         "peer host should not be materialized without a canonical environment id"
     );
 }
@@ -4360,7 +4369,7 @@ async fn set_peer_providers_without_environment_mapping_does_not_emit_host_snaps
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
     assert!(
-        hosts.hosts.iter().all(|entry| entry.node.display_name != overlay_host.as_str()),
+        hosts.hosts.iter().all(|entry| entry.node.as_ref().is_none_or(|node| node.display_name != overlay_host.as_str())),
         "overlay-only peer data should not synthesize host identity"
     );
 
@@ -4428,7 +4437,7 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
     assert!(
-        hosts.hosts.iter().any(|entry| entry.node == test_node(transient_host.as_str())),
+        hosts.hosts.iter().any(|entry| entry.node == Some(test_node(transient_host.as_str()))),
         "transient host should be visible while backed by state"
     );
 
@@ -4453,7 +4462,7 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
     assert!(
-        !hosts.hosts.iter().any(|entry| entry.node == test_node(transient_host.as_str())),
+        !hosts.hosts.iter().any(|entry| entry.node == Some(test_node(transient_host.as_str()))),
         "stale non-configured host should be pruned once summary, connection, and overlay data are gone"
     );
 

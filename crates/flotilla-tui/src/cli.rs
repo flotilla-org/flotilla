@@ -138,10 +138,15 @@ fn format_host_list_human(response: &flotilla_protocol::HostListResponse) -> Str
     for host in &response.hosts {
         table.add_row(vec![
             Cell::new(host.host_name.as_str()),
-            Cell::new(node_label(&host.node)),
+            Cell::new(host.node.as_ref().map(node_label).unwrap_or("-")),
             Cell::new(if host.is_local { "yes" } else { "no" }),
             Cell::new(if host.configured { "yes" } else { "no" }),
-            Cell::new(format_connection_status(&host.connection_status)),
+            Cell::new(match &host.reconnect {
+                Some(reconnect) => {
+                    format!("reconnecting (attempt {}, next dial in {}s)", reconnect.attempt, reconnect.next_dial_in_seconds)
+                }
+                None => format_connection_status(&host.connection_status).to_string(),
+            }),
             Cell::new(if host.has_summary { "yes" } else { "no" }),
             Cell::new(host.repo_count),
             Cell::new(host.work_item_count),
