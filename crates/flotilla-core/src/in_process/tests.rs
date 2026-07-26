@@ -577,7 +577,7 @@ fn convoy_row(namespace: &str, name: &str, phase: WireConvoyPhase, message: Opti
 }
 
 fn convoy_result_set(seq: u64, rows: Vec<ConvoyRow>) -> ResultSet {
-    ResultSet { seq, rows: Rows::Convoys(rows), state: Default::default() }
+    ResultSet { seq, rows: Rows::Convoys { scope: None, rows }, state: Default::default() }
 }
 
 async fn set_local_convoy_rows(daemon: &InProcessDaemon, seq: u64, rows: Vec<ConvoyRow>) {
@@ -4727,13 +4727,13 @@ async fn subscribe_queries_replays_result_set_from_aggregator_state() {
     set_local_convoy_rows(&daemon, 7, vec![convoy_row("flotilla", "convoy-1", WireConvoyPhase::Active, None)]).await;
 
     let events = daemon
-        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys, since: None }])
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys { scope: None }, since: None }])
         .await
         .expect("subscribe_queries should succeed");
     let result_set = events
         .iter()
         .find_map(|e| match e {
-            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys => Some(result_set.clone()),
+            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys { scope: None } => Some(result_set.clone()),
             _ => None,
         })
         .expect("expected ResultSet in subscribe replay");
@@ -4755,7 +4755,7 @@ async fn subscribe_queries_skips_replay_when_cursor_matches_seq() {
     set_local_convoy_rows(&daemon, 7, vec![convoy_row("flotilla", "convoy-1", WireConvoyPhase::Active, None)]).await;
 
     let events = daemon
-        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys, since: Some(7) }])
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys { scope: None }, since: Some(7) }])
         .await
         .expect("subscribe_queries should succeed");
     assert!(!events.iter().any(|event| matches!(event, DaemonEvent::ResultSet(_))));
@@ -4779,13 +4779,13 @@ async fn subscribe_queries_resends_result_set_when_client_seq_is_ahead() {
 
     // Client's cursor is ahead of the daemon's seq — simulates daemon restart.
     let events = daemon
-        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys, since: Some(99) }])
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys { scope: None }, since: Some(99) }])
         .await
         .expect("subscribe_queries should succeed");
     let result_set = events
         .iter()
         .find_map(|e| match e {
-            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys => Some(result_set.clone()),
+            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys { scope: None } => Some(result_set.clone()),
             _ => None,
         })
         .expect("client ahead of daemon must still receive a result set");

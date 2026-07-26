@@ -1192,7 +1192,7 @@ mod result_set_event_formatting {
 
     #[test]
     fn result_set_formatting() {
-        let result_set = ResultSet { seq: 7, rows: Rows::Convoys(vec![]), state: Default::default() };
+        let result_set = ResultSet { seq: 7, rows: Rows::Convoys { scope: None, rows: vec![] }, state: Default::default() };
         let event = DaemonEvent::ResultSet(Box::new(result_set));
         let line = format_event_human(&event);
         assert!(line.contains("[query]"), "should have query tag");
@@ -1206,6 +1206,7 @@ mod result_set_event_formatting {
         let delta = ResultDelta {
             seq: 12,
             changes: QueryChanges::Convoys {
+                scope: None,
                 changed: vec![],
                 removed: vec![ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "old-convoy")],
             },
@@ -1232,13 +1233,13 @@ mod watch_dedupe_query {
     use crate::cli::event_stream_seq;
 
     fn result_set(seq: u64) -> DaemonEvent {
-        DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Convoys(vec![]), state: Default::default() }))
+        DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Convoys { scope: None, rows: vec![] }, state: Default::default() }))
     }
 
     fn result_delta(seq: u64) -> DaemonEvent {
         DaemonEvent::ResultDelta(Box::new(ResultDelta {
             seq,
-            changes: QueryChanges::Convoys { changed: vec![], removed: vec![] },
+            changes: QueryChanges::Convoys { scope: None, changed: vec![], removed: vec![] },
             state: None,
         }))
     }
@@ -1269,14 +1270,14 @@ mod watch_dedupe_query {
     fn event_stream_seq_returns_query_key_for_result_set() {
         let event = result_set(5);
         let result = event_stream_seq(&event);
-        assert_eq!(result, Some((StreamKey::Query { query: QueryId::Convoys }, 5)));
+        assert_eq!(result, Some((StreamKey::Query { query: QueryId::Convoys { scope: None } }, 5)));
     }
 
     #[test]
     fn event_stream_seq_returns_query_key_for_delta() {
         let event = result_delta(9);
         let result = event_stream_seq(&event);
-        assert_eq!(result, Some((StreamKey::Query { query: QueryId::Convoys }, 9)));
+        assert_eq!(result, Some((StreamKey::Query { query: QueryId::Convoys { scope: None } }, 9)));
     }
 
     #[test]

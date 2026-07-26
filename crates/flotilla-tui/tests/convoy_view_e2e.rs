@@ -229,7 +229,7 @@ async fn generated_table_action_completes_work() {
     }
 
     // Switch the TUI into the Convoys tab and drive the keybinding flow.
-    app.open_view(flotilla_protocol::ViewAddress::Convoys { namespace: "flotilla".to_string() });
+    app.open_view(flotilla_protocol::ViewAddress::Convoys { namespace: "flotilla".to_string(), scope: None });
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())

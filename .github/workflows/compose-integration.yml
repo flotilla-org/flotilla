@@ -23,7 +23,32 @@ jobs:
       - name: Install integration test dependencies
         run: python -m pip install ./tests/integration
       - name: Run real-boundary topology and wedge regressions
-        run: python -m pytest -v tests/integration
+        run: >-
+          python -m pytest -v
+          tests/integration/test_minimal_topology.py
+          tests/integration/test_wedge_regressions.py
       - name: Print compose logs
         if: failure()
         run: docker compose -f tests/integration/docker-compose.yml logs --no-color
+
+  hub-spoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests/integration/pyproject.toml
+      - name: Install integration test dependencies
+        run: python -m pip install ./tests/integration
+      - name: Run hub-spoke topology regressions
+        run: python -m pytest -v tests/integration/test_hub_spoke_topology.py
+      - name: Print compose logs
+        if: failure()
+        run: >-
+          docker compose
+          -f tests/integration/docker-compose.hub-spoke.yml
+          logs --no-color

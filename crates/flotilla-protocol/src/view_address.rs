@@ -31,8 +31,8 @@ const QUERY_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').r
 pub enum ViewAddress {
     /// The overview/home view: registered repos, hosts, config.
     Overview,
-    /// All convoys in one namespace.
-    Convoys { namespace: String },
+    /// All convoys in one namespace, fleet-wide or narrowed to one Project.
+    Convoys { namespace: String, scope: Option<QueryScope> },
     /// All terminal sessions that are not associated with a Convoy.
     Independents { scope: Option<QueryScope> },
     /// One convoy: its vessel DAG, phases, and intents.
@@ -85,7 +85,10 @@ impl ViewAddress {
     pub fn human_label(&self) -> String {
         match self {
             Self::Overview => "overview".to_string(),
-            Self::Convoys { namespace } => format!("convoys/{namespace}"),
+            Self::Convoys { namespace, scope: Some(scope) } => {
+                format!("convoys/{namespace}?project={}/{}", scope.namespace, scope.name)
+            }
+            Self::Convoys { namespace, scope: None } => format!("convoys/{namespace}"),
             Self::Independents { scope: Some(scope) } => {
                 format!("independents?project={}/{}", scope.namespace, scope.name)
             }
@@ -120,7 +123,13 @@ impl fmt::Display for ViewAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Overview => f.write_str("overview"),
-            Self::Convoys { namespace } => write!(f, "convoys/{}", encode(namespace)),
+            Self::Convoys { namespace, scope } => {
+                write!(f, "convoys/{}", encode(namespace))?;
+                if let Some(scope) = scope {
+                    write!(f, "?project={}", encode_query_component(&format!("{}/{}", scope.namespace, scope.name)))?;
+                }
+                Ok(())
+            }
             Self::Independents { scope: Some(scope) } => {
                 write!(f, "independents?project={}", encode_query_component(&format!("{}/{}", scope.namespace, scope.name)))
             }
@@ -183,7 +192,10 @@ impl FromStr for ViewAddress {
                 _ => Err(format!("overview takes no parameters: {s}")),
             },
             "convoys" => match segments[1..] {
-                [namespace] => Ok(Self::Convoys { namespace: decode(namespace)? }),
+                [namespace] => {
+                    let scope = parameters.remove("project").map(parse_project_scope).transpose()?;
+                    Ok(Self::Convoys { namespace: decode(namespace)?, scope })
+                }
                 _ => Err(format!("convoys takes exactly one parameter (namespace): {s}")),
             },
             kind if kind.eq_ignore_ascii_case("independents") => match segments.len() {
@@ -298,9 +310,13 @@ mod tests {
 
     #[test]
     fn convoys_round_trips() {
-        let addr = ViewAddress::Convoys { namespace: "flotilla".to_string() };
-        assert_eq!(addr.to_string(), "convoys/flotilla");
-        assert_eq!("convoys/flotilla".parse::<ViewAddress>().expect("parse"), addr);
+        let fleet = ViewAddress::Convoys { namespace: "flotilla".to_string(), scope: None };
+        assert_eq!(fleet.to_string(), "convoys/flotilla");
+        assert_eq!("convoys/flotilla".parse::<ViewAddress>().expect("parse fleet convoys"), fleet);
+
+        let project = ViewAddress::Convoys { namespace: "flotilla".to_string(), scope: Some(QueryScope::new("flotilla", "roadmap")) };
+        assert_eq!("convoys/flotilla?project=flotilla%2froadmap".parse::<ViewAddress>().expect("parse project convoys"), project);
+        assert_eq!(project.to_string(), "convoys/flotilla?project=flotilla%2Froadmap");
     }
 
     #[test]
@@ -430,7 +446,7 @@ mod tests {
 
     #[test]
     fn segments_percent_encode_reserved_characters() {
-        let addr = ViewAddress::Convoys { namespace: "with/slash and space".to_string() };
+        let addr = ViewAddress::Convoys { namespace: "with/slash and space".to_string(), scope: None };
         let rendered = addr.to_string();
         assert_eq!(rendered, "convoys/with%2Fslash%20and%20space");
         assert_eq!(rendered.parse::<ViewAddress>().expect("parse"), addr);

@@ -558,7 +558,7 @@ fn append_crewless_convoy_rows(
 ) {
     let mut convoys_with_crew: HashSet<String> = rows.iter().map(|row| row.convoy.clone()).collect();
     for result_set in result_sets {
-        let Rows::Convoys(convoys) = &result_set.rows else { continue };
+        let Rows::Convoys { rows: convoys, .. } = &result_set.rows else { continue };
         for row in convoys {
             if row.resource.namespace != target_namespace {
                 continue;
@@ -2277,7 +2277,7 @@ impl InProcessDaemon {
         };
 
         let result_set = self.aggregator_projection_state().await.result_set().await;
-        let Rows::Convoys(rows) = result_set.rows else {
+        let Rows::Convoys { rows, .. } = result_set.rows else {
             return Ok(None);
         };
         let mut hosts = rows

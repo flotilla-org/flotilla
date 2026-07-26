@@ -1,0 +1,39 @@
+# 3-node hub-spoke topology: workstation (leader) + 2 followers.
+#
+# Role Dockerfiles layer heterogeneous tools onto the shared flotilla-base
+# image, so the fixture builds flotilla-base before starting the topology.
+services:
+  flotilla-base:
+    profiles: ["build-only"]
+    build:
+      context: ../..
+      dockerfile: tests/integration/docker/base/Dockerfile
+      target: full
+    image: flotilla-base
+
+  workstation:
+    build:
+      context: ../..
+      dockerfile: tests/integration/docker/workstation/Dockerfile
+    hostname: workstation
+    volumes:
+      - shared-keys:/shared-keys
+
+  homelab-1:
+    build:
+      context: ../..
+      dockerfile: tests/integration/docker/follower-codex/Dockerfile
+    hostname: homelab-1
+    volumes:
+      - shared-keys:/shared-keys
+
+  homelab-2:
+    build:
+      context: ../..
+      dockerfile: tests/integration/docker/follower-gemini/Dockerfile
+    hostname: homelab-2
+    volumes:
+      - shared-keys:/shared-keys
+
+volumes:
+  shared-keys:

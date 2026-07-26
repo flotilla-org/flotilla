@@ -289,6 +289,7 @@ pub struct NamespaceModel {
 /// window it subscribed to.
 #[derive(Default)]
 pub struct QueryTableCache {
+    pub convoys: HashMap<flotilla_protocol::QueryId, QueryTableResult<crate::convoy_model::ConvoySummary>>,
     pub independents: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IndependentRow>>,
     pub issues: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IssueRow>>,
     pub checkouts: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::CheckoutRow>>,
@@ -339,6 +340,11 @@ pub fn table_rows<'a>(
 ) -> crate::table_view::TableRows<'a> {
     crate::table_view::TableRows {
         convoys: namespaces.values().flat_map(|namespace| namespace.convoys.values()).collect(),
+        convoy_results: queries
+            .convoys
+            .iter()
+            .map(|(query, result)| crate::table_view::QueryRows { query, rows: &result.rows, state: &result.state })
+            .collect(),
         independent_results: queries
             .independents
             .iter()
@@ -1088,6 +1094,7 @@ impl App {
     /// the model's active-repo scope, the unseen-changes badge, and the
     /// status bar's layout indicator.
     pub fn sync_active_view(&mut self) {
+        self.screen.invalidate_page_layout();
         self.model.active_repo = self.views.active_repo_identity().cloned();
         if let Some(identity) = self.model.active_repo.clone() {
             if let Some(rm) = self.model.repos.get_mut(&identity) {
@@ -1714,16 +1721,21 @@ impl App {
                 self.query_seqs.insert(query.clone(), result_set.seq);
                 self.views.reconcile_authoritative_rows(&query, &crate::table_view::AuthoritativeRowUpdate::Full);
                 match &result_set.rows {
-                    flotilla_protocol::Rows::Convoys(rows) => {
-                        for namespace in self.namespaces.values_mut() {
-                            namespace.convoys.clear();
-                        }
-                        for row in rows {
-                            let convoy = ConvoySummary::from(row);
-                            let namespace = convoy.namespace.clone();
-                            let entry = self.namespaces.entry(namespace).or_default();
-                            entry.convoys.insert(convoy.id.clone(), convoy);
-                            entry.last_seq = result_set.seq;
+                    flotilla_protocol::Rows::Convoys { rows, .. } => {
+                        let convoys = rows.iter().map(ConvoySummary::from).collect::<Vec<_>>();
+                        self.query_tables
+                            .convoys
+                            .insert(query.clone(), QueryTableResult { rows: convoys.clone(), state: result_set.state.clone() });
+                        if matches!(query, flotilla_protocol::QueryId::Convoys { scope: None }) {
+                            for namespace in self.namespaces.values_mut() {
+                                namespace.convoys.clear();
+                            }
+                            for convoy in convoys {
+                                let namespace = convoy.namespace.clone();
+                                let entry = self.namespaces.entry(namespace).or_default();
+                                entry.convoys.insert(convoy.id.clone(), convoy);
+                                entry.last_seq = result_set.seq;
+                            }
                         }
                     }
                     flotilla_protocol::Rows::Independents { rows, .. } => {
@@ -1749,24 +1761,34 @@ impl App {
                 self.pending_fetch_more.remove(&query);
                 self.query_seqs.insert(query.clone(), delta.seq);
                 match &delta.changes {
-                    flotilla_protocol::QueryChanges::Convoys { changed, removed } => {
+                    flotilla_protocol::QueryChanges::Convoys { changed, removed, .. } => {
                         let updated = changed
                             .iter()
                             .map(|row| crate::table_view::RowId::new(ConvoyId::for_resource(&row.resource).as_str()))
                             .chain(removed.iter().map(|resource| crate::table_view::RowId::new(ConvoyId::for_resource(resource).as_str())))
                             .collect();
                         self.views.reconcile_authoritative_rows(&query, &crate::table_view::AuthoritativeRowUpdate::Rows(updated));
-                        for row in changed {
-                            let convoy = ConvoySummary::from(row);
-                            let namespace = convoy.namespace.clone();
-                            let entry = self.namespaces.entry(namespace).or_default();
-                            entry.convoys.insert(convoy.id.clone(), convoy);
-                            entry.last_seq = delta.seq;
-                        }
-                        for removed in removed {
-                            if let Some(entry) = self.namespaces.get_mut(&removed.namespace) {
-                                entry.convoys.shift_remove(&ConvoyId::for_resource(removed));
+                        let changed_convoys = changed.iter().map(ConvoySummary::from).collect::<Vec<_>>();
+                        let removed_ids = removed.iter().map(ConvoyId::for_resource).collect::<Vec<_>>();
+                        self.query_tables.convoys.entry(query.clone()).or_default().apply_delta(
+                            &changed_convoys,
+                            &removed_ids,
+                            delta.state.as_ref(),
+                            |row| row.id.clone(),
+                            |left, right| left.id.as_str().cmp(right.id.as_str()),
+                        );
+                        if matches!(query, flotilla_protocol::QueryId::Convoys { scope: None }) {
+                            for convoy in changed_convoys {
+                                let namespace = convoy.namespace.clone();
+                                let entry = self.namespaces.entry(namespace).or_default();
+                                entry.convoys.insert(convoy.id.clone(), convoy);
                                 entry.last_seq = delta.seq;
+                            }
+                            for removed in removed {
+                                if let Some(entry) = self.namespaces.get_mut(&removed.namespace) {
+                                    entry.convoys.shift_remove(&ConvoyId::for_resource(removed));
+                                    entry.last_seq = delta.seq;
+                                }
                             }
                         }
                     }

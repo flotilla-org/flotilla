@@ -1,0 +1,27 @@
+# A single-repository Project still needs the Repository's fork stance to
+# change admission, brief selection, remotes, review, and settlement (#978).
+display_name: Zellij fork
+default_workflow_ref: implement-review
+
+issue_sources:
+  - role: primary
+    source:
+      service: https://forgejo.lab.flotilla.work
+      scope: fork-issues/zellij
+    repository_ref: github.com/rjwittams/zellij
+
+relevance:
+  default: all
+
+repositories:
+  # The referenced Repository owns:
+  # upstream: { url: https://github.com/zellij-org/zellij, relation: fork }
+  # Provisioning therefore exposes only our fork remote to a crew.
+  - repo: github.com/rjwittams/zellij
+    role: member
+    claim: controller
+    ref:
+      branch: main
+    important_refs:
+      - branch: main
+      - branch: feat/kitty-image-plumbing
