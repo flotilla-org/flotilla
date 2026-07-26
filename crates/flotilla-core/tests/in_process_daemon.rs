@@ -1433,10 +1433,11 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         attach_command: None,
         binding: None
     });
+    let default_convoy = backend.using::<ResourceConvoy>("flotilla").get("default-regard").await.expect("default convoy");
     let regards = backend.using::<Regard>("flotilla").list().await.expect("list default dispatcher regard");
     let regard =
         regards.items.iter().find(|regard| regard.spec.target.name == "default-regard").expect("default implicit dispatcher regard");
-    assert_eq!(regard.spec.principal_ref, persisted.spec.dispatching_principal_ref);
+    assert_eq!(regard.spec.principal_ref, default_convoy.spec.dispatching_principal_ref);
     assert_eq!(regard.spec.source, RegardSource::Implicit { policy: "convoy-dispatch".to_string() });
     assert_eq!(regard.spec.expiry, RegardExpiryPolicy::Decaying { expires_after_seconds: 300 });
 
