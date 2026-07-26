@@ -21,13 +21,14 @@ use flotilla_protocol::{
     commands::RepositoryIdentityChange,
     qualified_path::{HostId, QualifiedPath},
     result_set::{ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
-    AttachBinding, Command, CommandAction, CommandValue, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent,
-    DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse,
-    HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState,
-    PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta,
-    RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand,
-    ResourceJsonResponse, ResourceRef, ResourceWatchResponse, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo,
-    ToolInventory, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, CorrelationKey, CrewCommandContext, CrewListMember,
+    CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus,
+    FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
+    NodeInfo, PeerConnectionState, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo,
+    QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse,
+    ResolvedPaneCommand, ResourceJsonResponse, ResourceRef, ResourceWatchResponse, StatusResponse, StepStatus, StreamKey,
+    SurfaceDeclaration, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY,
+    TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -2339,6 +2340,7 @@ impl InProcessDaemon {
             .maybe_placement_policy_name(placement_policy_name)
             .maybe_placement_policy_spec(placement_policy_spec)
             .auto_attach(self.should_auto_attach(intent.auto_attach))
+            .dispatch_regard(intent.auto_attach.into())
             .build())
     }
 
@@ -3686,15 +3688,23 @@ impl InProcessDaemon {
         dispatching_principal_ref: &PrincipalRef,
     ) -> Result<String, String> {
         let admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
-        self.create_convoy_with_regard(namespace, &admission.name, &admission.spec).await?;
+        self.create_convoy(namespace, &admission.name, &admission.spec, intent.auto_attach.into()).await?;
         Ok(admission.name)
     }
 
-    async fn create_convoy_with_regard(&self, namespace: &str, name: &str, spec: &ConvoySpec) -> Result<(), String> {
+    async fn create_convoy(
+        &self,
+        namespace: &str,
+        name: &str,
+        spec: &ConvoySpec,
+        dispatch_regard: ConvoyDispatchRegard,
+    ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         convoys.create(&InputMeta::builder().name(name.to_string()).build(), spec).await.map_err(|error| error.to_string())?;
-        if let Err(error) = self.emit_implicit_convoy_regard(namespace, name, &spec.dispatching_principal_ref).await {
-            warn!(%error, %namespace, %name, "failed to emit convoy dispatch regard");
+        if dispatch_regard == ConvoyDispatchRegard::Emit {
+            if let Err(error) = self.emit_implicit_convoy_regard(namespace, name, &spec.dispatching_principal_ref).await {
+                warn!(%error, %namespace, %name, "failed to emit convoy dispatch regard");
+            }
         }
         Ok(())
     }
@@ -3843,7 +3853,7 @@ impl InProcessDaemon {
         if let Some((name, spec)) = placement_spec {
             ensure_prepared_placement_snapshot(&self.resource_backend, &namespace, name, &spec).await?;
         }
-        self.create_convoy_with_regard(&namespace, &start.name, &convoy_spec).await
+        self.create_convoy(&namespace, &start.name, &convoy_spec, start.dispatch_regard).await
     }
 
     async fn supervise_convoy_start(&self, task: ConvoyStartTask) {
@@ -6530,7 +6540,7 @@ impl InProcessDaemon {
                 issues: Vec::new(),
                 instruction: None,
             };
-            let result = match self.create_convoy_with_regard(&namespace, name, &spec).await {
+            let result = match self.create_convoy(&namespace, name, &spec, ConvoyDispatchRegard::Emit).await {
                 Ok(()) => flotilla_protocol::CommandValue::ConvoyCreated { name: name.clone() },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };

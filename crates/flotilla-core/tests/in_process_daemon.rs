@@ -1322,6 +1322,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     );
     discovery.factories.ai_utilities.push(Box::new(CountingConvoyAiUtilityFactory { utility: Arc::clone(&utility) }));
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    daemon.connect_surface(uuid::Uuid::new_v4(), flotilla_protocol::SurfaceDeclaration::ambient_for_namespace("flotilla"));
     let backend = daemon.resource_backend();
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     backend
@@ -1394,16 +1395,50 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(persisted.spec.repositories.len(), 1);
     assert_eq!(persisted.spec.instruction.as_deref(), Some("Keep the snapshot durable."));
     let regards = backend.using::<Regard>("flotilla").list().await.expect("list dispatcher regards");
-    let regard = regards.items.iter().find(|regard| regard.spec.target.name == "issue-732").expect("implicit dispatcher regard");
-    assert_eq!(regard.spec.principal_ref, persisted.spec.dispatching_principal_ref);
-    assert_eq!(regard.spec.source, RegardSource::Implicit { policy: "convoy-dispatch".to_string() });
-    assert_eq!(regard.spec.expiry, RegardExpiryPolicy::Decaying { expires_after_seconds: 300 });
+    assert!(
+        regards.items.iter().all(|regard| regard.spec.target.name != "issue-732"),
+        "--no-attach must leave the convoy outside the dispatching principal's searchlight"
+    );
     let persisted_issue = persisted.spec.issues.first().expect("issue snapshot");
     assert_eq!(persisted_issue.reference, reference);
     assert_eq!(persisted_issue.repository_ref, Some(repository.key()));
     assert_eq!(persisted_issue.snapshot.title, issue.title);
     assert_eq!(persisted_issue.snapshot.body, issue.body);
     assert_eq!(utility.calls.load(Ordering::SeqCst), 0, "fully specified admission must not call AI");
+
+    let default_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "flotilla".into(),
+                    issues: Vec::new(),
+                    name: Some("default-regard".into()),
+                    branch: Some("fix/default-regard".into()),
+                    workflow_ref: Some("single-agent-contained".into()),
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: None,
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
+                }),
+            },
+        })
+        .await
+        .expect("default start command accepted");
+    assert_eq!(recv_command_finished(&mut events, default_id).await, CommandValue::ConvoyStarted {
+        name: "default-regard".into(),
+        attach_command: None,
+        binding: None
+    });
+    let regards = backend.using::<Regard>("flotilla").list().await.expect("list default dispatcher regard");
+    let regard =
+        regards.items.iter().find(|regard| regard.spec.target.name == "default-regard").expect("default implicit dispatcher regard");
+    assert_eq!(regard.spec.principal_ref, persisted.spec.dispatching_principal_ref);
+    assert_eq!(regard.spec.source, RegardSource::Implicit { policy: "convoy-dispatch".to_string() });
+    assert_eq!(regard.spec.expiry, RegardExpiryPolicy::Decaying { expires_after_seconds: 300 });
 
     let batch_id = daemon
         .execute(Command {
@@ -1446,6 +1481,11 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     let batch = backend.using::<ResourceConvoy>("flotilla").get("batch-732-733").await.expect("batch convoy");
     assert_eq!(batch.spec.issues.iter().map(|issue| &issue.reference).collect::<Vec<_>>(), vec![&reference, &reference_two]);
     assert_eq!(batch.spec.instruction.as_deref(), Some("Fix both issues in one convoy."));
+    let regards = backend.using::<Regard>("flotilla").list().await.expect("list batch dispatcher regards");
+    assert!(
+        regards.items.iter().all(|regard| regard.spec.target.name != "batch-732-733"),
+        "batch --no-attach must not add a dispatch regard"
+    );
 
     utility.fail.store(true, Ordering::SeqCst);
     let fallback_id = daemon

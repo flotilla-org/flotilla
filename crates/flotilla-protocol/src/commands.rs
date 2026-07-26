@@ -148,6 +148,23 @@ pub enum ConvoyAutoAttach {
     Never,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConvoyDispatchRegard {
+    #[default]
+    Emit,
+    Suppress,
+}
+
+impl From<ConvoyAutoAttach> for ConvoyDispatchRegard {
+    fn from(auto_attach: ConvoyAutoAttach) -> Self {
+        match auto_attach {
+            ConvoyAutoAttach::Never => Self::Suppress,
+            ConvoyAutoAttach::Default | ConvoyAutoAttach::Always => Self::Emit,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoyStartIntent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,6 +211,9 @@ pub struct PreparedConvoyStart {
     #[builder(default)]
     #[serde(default)]
     pub auto_attach: bool,
+    #[builder(default)]
+    #[serde(default)]
+    pub dispatch_regard: ConvoyDispatchRegard,
 }
 
 /// Commands the client can send to the daemon.
@@ -1596,5 +1616,12 @@ mod tests {
     fn issue_page_value_roundtrip() {
         let val = CommandValue::IssuePage(crate::issue_query::IssueResultPage { items: vec![], total: Some(10), has_more: true });
         assert_json_roundtrip(&val);
+    }
+
+    #[test]
+    fn only_no_attach_suppresses_the_dispatch_regard() {
+        assert_eq!(ConvoyDispatchRegard::from(ConvoyAutoAttach::Never), ConvoyDispatchRegard::Suppress);
+        assert_eq!(ConvoyDispatchRegard::from(ConvoyAutoAttach::Default), ConvoyDispatchRegard::Emit);
+        assert_eq!(ConvoyDispatchRegard::from(ConvoyAutoAttach::Always), ConvoyDispatchRegard::Emit);
     }
 }
