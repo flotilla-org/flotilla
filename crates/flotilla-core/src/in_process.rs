@@ -677,14 +677,7 @@ struct ParsedFleetReplicaSnapshot {
 }
 
 fn result_set_records_mut(result_set: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
-    let content = result_set.get_mut("rows")?.get_mut("rows")?;
-    if content.is_array() {
-        // Tuple-style variants such as Rows::Convoys serialize their content
-        // directly as the record array.
-        content.as_array_mut()
-    } else {
-        content.get_mut("rows")?.as_array_mut()
-    }
+    result_set.get_mut("rows")?.get_mut("rows")?.get_mut("rows")?.as_array_mut()
 }
 
 fn retain_parseable_result_set_records(
