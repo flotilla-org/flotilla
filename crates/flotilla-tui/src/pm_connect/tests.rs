@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use flotilla_manifest::{
     entity,
     keys::{KEY_SOURCE, KEY_STATUS_STATE, SOURCE_FLOTILLA},
-    wire::{EntityKind, EntityRef, MetadataTarget, MetadataValue},
+    wire::{EntityRef, MetadataTarget, MetadataValue},
 };
 use flotilla_protocol::{
     result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessState, SessionPhase},
@@ -146,7 +146,7 @@ fn rebuild_prefers_awareness_transport_when_available() {
 
     assert!(patches
         .iter()
-        .any(|patch| { patch.target == MetadataTarget::Entity(EntityRef::new(EntityKind::Issue, "issue/flotilla-org/flotilla/862",)) }));
+        .any(|patch| { patch.target == MetadataTarget::Entity(EntityRef::new("issue", "issue/flotilla-org/flotilla/862",)) }));
     assert!(
         !patches.iter().any(|patch| patch.target == independent_entity("scratch")),
         "raw independent fallback is not projected once awareness is available"

@@ -51,7 +51,7 @@ pub fn pane_stamp(pane: PaneTarget, attach_ref: &str, binding: Option<&AttachBin
             (None, _, None) => None,
         };
         if let Some(entity) = entity {
-            fact(KEY_ENTITY_KIND, entity.kind.as_str().to_owned());
+            fact(KEY_ENTITY_KIND, entity.kind.clone());
             fact(KEY_ENTITY_ID, entity.id);
         }
         if let Some(session) = &binding.session {
@@ -86,7 +86,7 @@ pub struct WorkspaceStamp {
 pub fn tab_stamp(tab_id: u64, stamp: &WorkspaceStamp) -> MetadataPatch {
     let mut set = BTreeMap::new();
     set.insert(KEY_SOURCE.to_owned(), MetadataValueUpdate::new(MetadataValue::text(SOURCE_FLOTILLA), None));
-    set.insert(KEY_ENTITY_KIND.to_owned(), MetadataValueUpdate::new(MetadataValue::text(stamp.entity.kind.as_str()), None));
+    set.insert(KEY_ENTITY_KIND.to_owned(), MetadataValueUpdate::new(MetadataValue::text(stamp.entity.kind.clone()), None));
     set.insert(KEY_ENTITY_ID.to_owned(), MetadataValueUpdate::new(MetadataValue::text(stamp.entity.id.clone()), None));
     MetadataPatch { target: MetadataTarget::Tab(tab_id), source_id: SOURCE_ACTUATOR.to_owned(), set, unset: vec![] }
 }

@@ -5,7 +5,7 @@
 use std::{collections::BTreeMap, env, fs, path::Path};
 
 use andamento_shared::{
-    EntityKind, EntityRef, ExternalMessage, MetadataIdentity, MetadataPatch, MetadataTarget,
+    EntityRef, ExternalMessage, MetadataIdentity, MetadataPatch, MetadataTarget,
     MetadataValue, MetadataValueUpdate, ObservedMetadataIdentity, PaneTarget,
 };
 
@@ -31,9 +31,9 @@ fn patch(target: MetadataTarget, source_id: &str, set: Vec<(&str, MetadataValueU
     })
 }
 
-fn entity_target(kind: EntityKind, id: &str) -> MetadataTarget {
+fn entity_target(kind: &str, id: &str) -> MetadataTarget {
     MetadataTarget::Entity(EntityRef {
-        kind,
+        kind: kind.to_owned(),
         id: id.to_owned(),
     })
 }
@@ -45,7 +45,7 @@ fn main() {
 
     // 1. Catalog patch: a stable entity target with flat facts and one unset.
     let entity_patch = patch(
-        entity_target(EntityKind::Vessel, "dev/manifest-extraction/implement@feta"),
+        entity_target("vessel", "dev/manifest-extraction/implement@feta"),
         "flotilla-connector",
         vec![
             ("entity.kind", update(text("vessel"), Some(30_000))),
@@ -69,7 +69,7 @@ fn main() {
 
     // 2. Independent sessions remain first-class entities.
     let session_patch = patch(
-        entity_target(EntityKind::Session, "feta/dev/terminal-impl-coder"),
+        entity_target("session", "feta/dev/terminal-impl-coder"),
         "flotilla-connector",
         vec![
             ("entity.kind", update(text("session"), Some(30_000))),

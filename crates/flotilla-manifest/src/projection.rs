@@ -15,7 +15,7 @@ use flotilla_protocol::{
 };
 
 use crate::{
-    entity::{self, EntityKind, EntityRef},
+    entity::{self, EntityRef},
     keys::{
         ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY,
         KEY_CONVOY_MESSAGE, KEY_CONVOY_NAME, KEY_CONVOY_PHASE, KEY_CONVOY_WORKFLOW, KEY_COUNT_CHECKOUTS, KEY_COUNT_CONVOYS,
@@ -141,7 +141,7 @@ impl Catalog {
         let target = MetadataTarget::Entity(entity.clone());
         let entry = self.facts.entry(target).or_default();
         let base = [
-            (KEY_ENTITY_KIND, MetadataValue::text(entity.kind.as_str())),
+            (KEY_ENTITY_KIND, MetadataValue::text(entity.kind.clone())),
             (KEY_ENTITY_ID, MetadataValue::text(entity.id)),
             (KEY_SOURCE, MetadataValue::text(SOURCE_FLOTILLA)),
         ];
@@ -324,7 +324,7 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
             (entity, facts)
         }
         AwarenessKind::Issue => {
-            let entity = entry.issue_refs.first().map(entity::issue).unwrap_or_else(|| EntityRef::new(EntityKind::Issue, entry.id.clone()));
+            let entity = entry.issue_refs.first().map(entity::issue).unwrap_or_else(|| EntityRef::new("issue", entry.id.clone()));
             (entity.clone(), vec![(SEGMENT_ISSUE, MetadataValue::text(entity.id.clone()))])
         }
         AwarenessKind::Independent => {
