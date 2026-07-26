@@ -16,10 +16,11 @@ annotation-specific transport, or treat authored facts as view configuration.
 The three layers have different jobs:
 
 1. **Statements are resources.** An annotation is an immutable, attributed
-   statement about a stable subject identity. A semantic retraction or
-   correction is another statement; administrative hard deletion/redaction is
-   a separate policy question. The statement remains present when its subject
-   is renamed, unavailable, or deleted.
+   statement about a source-native canonical subject identity. A semantic
+   retraction or correction is another statement; administrative hard
+   deletion/redaction is a separate policy question. The statement remains
+   present when its subject's locator changes or its target is unavailable,
+   retired, or deleted.
 2. **The resource log is the stream.** Annotation statements use the same
    origin-authored logs, durable replicas, relay, and list/watch API as authored
    definitions in
@@ -95,9 +96,11 @@ that reduces statements into queryable meaning.
 
 An approach is suitable only if it:
 
-1. addresses a subject by stable identity rather than current display name;
+1. addresses a subject by its source-qualified canonical key rather than a
+   locator or display label;
 2. permits an annotation to be authored and read while the subject is offline;
-3. distinguishes deletion/recreation from rename or move;
+3. never silently retargets across an identity change and can relate identities
+   with explicit provenance;
 4. preserves author, origin, causal basis, and history;
 5. converges across roots without a last-writer clock or a master chosen by CLI
    location;
@@ -314,25 +317,28 @@ external joins.
 | Web Annotation / RDF | Global target IRI and target state | Yes; may cache representation | Graph union; application must define conflicts | Open vocabulary; SHACL can constrain | Borrow target/state only |
 | View-only convention | Depends on joined inputs | Only while inputs/replicas exist | Deterministic if inputs converge | Query schema | Correct for derived state, cannot preserve authored judgment |
 | Special annotation stream | Can be designed correctly | Yes | Must duplicate federation semantics | Can be typed | Reject duplicate substrate |
-| **Typed statement resources on existing log** | **Stable UID plus locator hint** | **Yes, first-class unresolved state** | **Slot-causal reduction patterned on ADR 0016** | **Versioned declared schema** | **Recommend** |
+| **Typed statement resources on existing log** | **Source-native key plus locator hint** | **Yes, first-class unresolved state** | **Slot-causal reduction patterned on ADR 0016** | **Versioned declared schema** | **Recommend** |
 
-## Subject identity, rename, move, and absence
+## Subject identity, continuity, and absence
 
-An annotation target is not a URL, resource name, branch, issue number, or
-display label. It is a source-qualified stable entity identity:
+An annotation target is not a locator or display label. It is the entity's
+source-qualified canonical identity:
 
 ```text
 SubjectId {
     authority: "github.com",
     kind: "Issue",
-    uid: "I_kwDORel_088...",
+    key: "I_kwDORel_088...",
 }
 ```
 
-For an internal resource, `uid` is the rename-stable UID to be ruled by
-[#1039](https://github.com/flotilla-org/flotilla/issues/1039). For an external
-entity, the provider adapter maps the source's native stable identifier into
-the same envelope. A human-readable locator is stored separately:
+Per the
+[#1039 resolution](https://github.com/flotilla-org/flotilla/issues/1039#issuecomment-5084923937),
+Flotilla must not mint a parallel surrogate UID. An internal resource's
+canonical name is its key. A Repository uses its canonical remote identity
+(or its provisional `Local{host_ref, git_common_dir}` identity), and an external
+entity uses the provider's own canonical ID. The provider adapter maps that
+native key into the envelope. A human-readable locator is stored separately:
 
 ```text
 locator_hint: "flotilla-org/flotilla#1089"
@@ -343,15 +349,20 @@ used to retarget automatically.
 
 The resolution rules should be:
 
-- **Rename with the same UID:** the statement follows automatically; the
-  current locator is projected from the live entity.
-- **Move represented by the same logical UID:** likewise.
-- **Migration that changes native identity:**
-  [#1039](https://github.com/flotilla-org/flotilla/issues/1039) must emit an explicit
-  continuity/alias fact. A resolver may then present the successor, retaining
-  both old and new identities in provenance.
-- **Delete and recreate under the same name:** the new UID is a different
-  subject. No annotation moves by name.
+- **Provider rename/move with the same native key:** the statement follows
+  automatically; the current locator is projected from the live entity.
+- **Internal rename or canonical-key migration:** create the successor under
+  its new canonical identity and record an explicit provenance edge. The old
+  statement remains addressed to the old identity. A schema may project the
+  relationship, but it must not silently rewrite history or assume equivalence.
+- **Repository extraction or provisional-local → canonical-remote upgrade:**
+  create the canonical Repository, record provenance, and retire the old
+  resource, exactly as that ruling requires. These are new identities, not
+  renames.
+- **Delete and recreate under the same internal name:** name remains the
+  canonical logical identity under that ruling. If occurrence identity matters,
+  the domain must expose an existing immutable occurrence key (for example a
+  commit or attempt); the annotation layer must not invent a surrogate.
 - **Unavailable/offline target:** the statement remains valid and queryable.
   Resolution status is `unavailable`, with the last-known locator and optional
   subject snapshot shown honestly.
@@ -362,6 +373,21 @@ The resolution rules should be:
 
 An annotation target is deliberately not an `ownerReference`: annotations must
 survive target absence and must not participate in target garbage collection.
+
+### Project rename stance
+
+Project-scoped facts should target the constituent Repository, issue, change
+request, Convoy, or other resource whenever that resource is what the statement
+is actually about. Those statements survive Project re-parenting without any
+identity transfer because their canonical subjects do not change.
+
+A genuinely Project-level statement may target `Project` by its canonical
+name. Renaming a Project creates a new Project plus a provenance edge, with
+sub-resources explicitly re-parented. Historical Project annotations stay with
+the old name by default; a schema that genuinely needs continuity may display
+them through the provenance edge or require an explicit restatement against the
+successor. This keeps the common rename nearly free without pretending the old
+and new Project are one opaque-UID entity.
 
 The statement may record a small `subject_basis`—for example target
 resourceVersion, forge `updated_at`, commit ID, or display snapshot—to answer
@@ -375,12 +401,13 @@ operation part of the schema.
 
 ### Replication
 
-Every statement is authored into the writer root's own log. It has an ordinary
-resource UID; its authoring metadata carries an origin and monotonic dot. Roots
-union statements through ADR 0016's durable replicas and relay. No root writes
-a merged result back into an origin log. A semantic retraction references the
-statement or logical slot it retracts and is itself immutable. It is not a
-resource-store delete/tombstone of the asserted statement.
+Every statement is authored into the writer root's own log. Its immutable
+resource name is the statement identity; authoring metadata carries an origin
+and monotonic dot. Roots union statements through ADR 0016's durable replicas
+and relay. No root writes a merged result back into an origin log. A semantic
+retraction references the statement or logical slot it retracts and is itself
+immutable. It is not a resource-store delete/tombstone of the asserted
+statement.
 
 At admission, the annotation layer asks the local merged read path for the
 frontier it has seen for `(subject, schema, slot)`, and the local store stamps
@@ -430,7 +457,7 @@ AnnotationStatement.spec
 ├── subject
 │   ├── authority
 │   ├── kind
-│   ├── uid
+│   ├── key
 │   └── locator_hint?       # display/debug only
 ├── schema
 │   ├── name               # e.g. flotilla.work/TriageDecision
@@ -442,10 +469,10 @@ AnnotationStatement.spec
 └── subject_basis?          # non-authoritative version/snapshot evidence
 ```
 
-The resource metadata supplies statement UID, origin root, and creation time.
-Annotation admission supplies the slot dot/seen-vector described above.
-Clients do not fabricate causal metadata. Semantic history is the immutable
-assert/retract statement set, not resource tombstone history.
+The resource name supplies statement identity; metadata supplies origin root
+and creation time. Annotation admission supplies the slot dot/seen-vector
+described above. Clients do not fabricate causal metadata. Semantic history is
+the immutable assert/retract statement set, not resource tombstone history.
 
 An annotation schema declaration owns:
 
@@ -597,11 +624,13 @@ data migrations. A view must remain rebuildable and application-read-only.
 
 ### Decisions still needed
 
-1. **Stable identity
-   ([#1039](https://github.com/flotilla-org/flotilla/issues/1039)).** Define
-   rename/move continuity for internal
-   Project, Repository, Convoy, and other logical subjects, plus the external
-   provider mapping contract.
+1. **Canonical key encodings.** The
+   [#1039 resolution](https://github.com/flotilla-org/flotilla/issues/1039#issuecomment-5084923937)
+   ruled out surrogate UIDs, and this research resolves its Project dependency:
+   prefer constituent subjects; Project-level annotations use the Project name
+   and explicit provenance on rename. A design issue must specify the typed
+   wire encodings for internal names, Repository identities, and provider-native
+   IDs.
 2. **Authored mastering
    ([#1090](https://github.com/flotilla-org/flotilla/issues/1090)).** The companion
    [issue #1090](https://github.com/flotilla-org/flotilla/issues/1090) may amend
@@ -635,25 +664,27 @@ schemas whose reducers differ:
 
 Use one internal subject and one source-qualified GitHub issue/PR subject. Test:
 
-- target present, renamed, unavailable, deleted/recreated, and explicitly
-  migrated;
+- target present, provider-renamed, unavailable, deleted/recreated, and linked
+  to a new canonical identity by provenance;
 - two roots authoring offline then converging;
 - a causal overwrite versus a concurrent conflict;
 - retraction without erasing audit history;
 - full projection rebuild from resource logs;
 - raw fallback rendering with an unknown schema version.
 
-The experiment should end in an ADR only after
-[#1039](https://github.com/flotilla-org/flotilla/issues/1039) and
-[#1090](https://github.com/flotilla-org/flotilla/issues/1090) rule their shared
-identity and authored-resource substrate. The research recommendation does not
-require another event transport or a general-purpose materialized-view engine.
+The experiment should end in an ADR after incorporating
+[#1039's canonical-key and provenance ruling](https://github.com/flotilla-org/flotilla/issues/1039#issuecomment-5084923937)
+and after
+[#1090](https://github.com/flotilla-org/flotilla/issues/1090) rules the remaining
+authored-resource substrate. The research recommendation does not require
+another event transport or a general-purpose materialized-view engine.
 
 ## Final answer
 
 Build the annotation layer as **typed, immutable statement resources over the
-existing resource log**. Let stable UIDs and explicit continuity facts carry
-statements through rename and move; tolerate unresolved targets and retain
+existing resource log**. Address subjects by source-native canonical keys, not
+surrogate UIDs; use explicit provenance edges rather than automatic retargeting
+when canonical identity changes. Tolerate unresolved targets and retain
 last-known locator/version evidence while they are offline. Merge origin facts
 by union and reduce them under declared schema semantics, applying ADR 0016's
 causal model in a new annotation-slot reducer that exposes rather than erases
