@@ -41,7 +41,7 @@ use flotilla_resources::{
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
-use tracing::warn;
+use tracing::{error, info, warn};
 
 use crate::{
     sleep_inhibitor,
@@ -49,6 +49,10 @@ use crate::{
     Aggregator, AggregatorResolvers,
 };
 
+/// Cadence of the liveness marker (see `spawn_liveness_watchdog_task`). Long
+/// enough to be quiet in a healthy log, short enough to bound how much time a
+/// wedge can hide in.
+const LIVENESS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 
@@ -139,12 +143,20 @@ impl DaemonRuntime {
             ));
         }
 
+        tasks.push(spawn_liveness_watchdog_task(tasks.len(), LIVENESS_WATCHDOG_INTERVAL));
+
         Ok(Self { tasks })
     }
 }
 
 impl Drop for DaemonRuntime {
     fn drop(&mut self) {
+        // Dropping this value silently aborts every supervisory task —
+        // heartbeat, replica refresh, aggregator, controllers. A daemon whose
+        // runtime is dropped while its accept loop keeps running looks alive
+        // (process up, socket accepting) but serves nothing, and until this log
+        // existed it left no trace whatsoever (flotilla#1111).
+        error!(tasks = self.tasks.len(), "daemon runtime dropped; aborting supervisory tasks — the daemon can no longer do background work");
         for task in &self.tasks {
             task.abort();
         }
@@ -534,6 +546,17 @@ fn spawn_adopted_checkout_reconciliation_task(daemon: Arc<InProcessDaemon>, name
 enum PeriodicTaskStart {
     Immediate,
     AfterInterval,
+}
+
+/// Emits one liveness line per interval so a daemon that stops scheduling is
+/// visible in the log by the *absence* of a known-cadence marker, rather than by
+/// the absence of incidental chatter. Added after flotilla#1111, where the only
+/// evidence of a wedged daemon was that unrelated debug lines stopped.
+fn spawn_liveness_watchdog_task(tasks: usize, interval: Duration) -> JoinHandle<()> {
+    let started = tokio::time::Instant::now();
+    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || async move {
+        info!(uptime_secs = started.elapsed().as_secs(), supervisory_tasks = tasks, "daemon alive");
+    })
 }
 
 fn spawn_periodic_task<Operation, OperationFuture>(interval: Duration, start: PeriodicTaskStart, mut operation: Operation) -> JoinHandle<()>
