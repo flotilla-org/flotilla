@@ -21,13 +21,13 @@ use flotilla_protocol::{
     commands::RepositoryIdentityChange,
     qualified_path::{HostId, QualifiedPath},
     result_set::{ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
-    AttachBinding, Command, CommandValue, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry,
-    EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
-    HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PrincipalRef,
-    ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse,
-    RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, ResourceJsonResponse,
-    ResourceRef, ResourceWatchResponse, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo, ToolInventory,
-    TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    AttachBinding, Command, CommandAction, CommandValue, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent,
+    DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse,
+    HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState,
+    PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta,
+    RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand,
+    ResourceJsonResponse, ResourceRef, ResourceWatchResponse, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo,
+    ToolInventory, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -2427,6 +2427,7 @@ impl InProcessDaemon {
             CommandAction::FetchCheckoutStatus { .. }
             | CommandAction::OpenChangeRequest { .. }
             | CommandAction::CloseChangeRequest { .. }
+            | CommandAction::MergeChangeRequest { .. }
             | CommandAction::OpenIssue { .. }
             | CommandAction::LinkIssuesToChangeRequest { .. }
             | CommandAction::ArchiveSession { .. }
@@ -2441,6 +2442,33 @@ impl InProcessDaemon {
             }
             _ => Err("command does not resolve to a single repo".to_string()),
         }
+    }
+
+    async fn repository_action_policy_error(&self, command: &Command, repo: &Path) -> Option<String> {
+        let CommandAction::MergeChangeRequest { id, .. } = &command.action else {
+            return None;
+        };
+        let repository_key = match self.repository_keys_by_path.read().await.get(repo).cloned() {
+            Some(key) => key,
+            None => {
+                return Some(format!(
+                    "cannot determine whether merging change request {id} is permitted: repository policy is unavailable"
+                ));
+            }
+        };
+        let namespace = self.provisioning_namespace().await;
+        let repository = match self.resource_backend.clone().using::<Repository>(&namespace).get(&repository_key.to_string()).await {
+            Ok(repository) => repository,
+            Err(error) => {
+                return Some(format!(
+                    "cannot determine whether merging change request {id} is permitted: repository policy is unavailable: {error}"
+                ));
+            }
+        };
+        repository
+            .spec
+            .is_fork()
+            .then(|| format!("merging change request {id} is forbidden for fork-stance repository; landing is human-only"))
     }
 
     /// Get the local-only provider data for a repo (without peer overlay).
@@ -6597,6 +6625,7 @@ impl InProcessDaemon {
 
         // Gather what the spawned task needs — validate repo before broadcasting
         let repo = self.resolve_repo_for_command(&command).await?;
+        let repository_action_policy_error = self.repository_action_policy_error(&command, &repo).await;
         let runner = Arc::clone(&self.discovery.runner);
         let env = Arc::clone(&self.discovery.env);
         let event_tx = self.event_tx.clone();
@@ -6657,18 +6686,23 @@ impl InProcessDaemon {
             let resolver_repo = executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path.clone() };
             let daemon_socket_dhp = daemon_socket_path.map(DaemonHostPath::new);
 
-            let plan = executor::build_plan(
-                command,
-                executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path },
-                registry,
-                providers_data,
-                config_base,
-                attachable_store,
-                daemon_socket_dhp.clone(),
-                local_node_id.clone(),
-                local_host,
-            )
-            .await;
+            let plan = match repository_action_policy_error {
+                Some(message) => Err(CommandValue::Error { message }),
+                None => {
+                    executor::build_plan(
+                        command,
+                        executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path },
+                        registry,
+                        providers_data,
+                        config_base,
+                        attachable_store,
+                        daemon_socket_dhp.clone(),
+                        local_node_id.clone(),
+                        local_host,
+                    )
+                    .await
+                }
+            };
 
             match plan {
                 Err(result) => {

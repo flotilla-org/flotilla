@@ -22,6 +22,12 @@ pub enum CrVerb {
     Open,
     /// Close a change request
     Close,
+    /// Merge a change request using the repository's squash convention
+    Merge {
+        /// Confirm the merge without prompting
+        #[arg(long)]
+        yes: bool,
+    },
     /// Link issues to a change request
     LinkIssues { issue_ids: Vec<String> },
 }
@@ -49,6 +55,16 @@ impl CrNoun {
                 repo: RepoContext::Inferred,
                 host: HostResolution::ProviderHost,
             }),
+            CrVerb::Merge { yes } => Ok(Resolved::NeedsContext {
+                command: Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::MergeChangeRequest { id: self.subject, confirmed: yes },
+                },
+                repo: RepoContext::Inferred,
+                host: HostResolution::ProviderHost,
+            }),
             CrVerb::LinkIssues { issue_ids } => Ok(Resolved::NeedsContext {
                 command: Command {
                     node_id: None,
@@ -69,6 +85,12 @@ impl std::fmt::Display for CrNoun {
         match &self.verb {
             CrVerb::Open => write!(f, " open")?,
             CrVerb::Close => write!(f, " close")?,
+            CrVerb::Merge { yes } => {
+                write!(f, " merge")?;
+                if *yes {
+                    write!(f, " --yes")?;
+                }
+            }
             CrVerb::LinkIssues { issue_ids } => {
                 write!(f, " link-issues")?;
                 for id in issue_ids {
@@ -127,6 +149,36 @@ mod tests {
     }
 
     #[test]
+    fn cr_merge_requires_surface_confirmation() {
+        let resolved = parse(&["cr", "42", "merge"]).resolve().unwrap();
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::MergeChangeRequest { id: "42".into(), confirmed: false }
+            },
+            repo: RepoContext::Inferred,
+            host: HostResolution::ProviderHost,
+        });
+    }
+
+    #[test]
+    fn cr_merge_yes_records_explicit_confirmation() {
+        let resolved = parse(&["cr", "42", "merge", "--yes"]).resolve().unwrap();
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::MergeChangeRequest { id: "42".into(), confirmed: true }
+            },
+            repo: RepoContext::Inferred,
+            host: HostResolution::ProviderHost,
+        });
+    }
+
+    #[test]
     fn cr_link_issues() {
         let resolved = parse(&["cr", "42", "link-issues", "1", "5", "7"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
@@ -169,6 +221,12 @@ mod tests {
     #[test]
     fn round_trip_close() {
         assert_round_trip::<CrNoun>(&["cr", "42", "close"]);
+    }
+
+    #[test]
+    fn round_trip_merge() {
+        assert_round_trip::<CrNoun>(&["cr", "42", "merge"]);
+        assert_round_trip::<CrNoun>(&["cr", "42", "merge", "--yes"]);
     }
 
     #[test]

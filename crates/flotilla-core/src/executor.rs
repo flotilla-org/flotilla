@@ -325,6 +325,17 @@ pub async fn build_plan(
             action: StepAction::CloseChangeRequest { id },
         }])),
 
+        CommandAction::MergeChangeRequest { id, confirmed } => {
+            if !confirmed {
+                return Err(CommandValue::Error { message: format!("merging change request {id} requires explicit confirmation") });
+            }
+            Ok(StepPlan::new(vec![Step {
+                description: format!("Merge change request {id}"),
+                host: StepExecutionContext::Host(target_node_id.clone()),
+                action: StepAction::MergeChangeRequest { id },
+            }]))
+        }
+
         CommandAction::OpenIssue { id } => Ok(StepPlan::new(vec![Step {
             description: format!("Open issue {id}"),
             host: StepExecutionContext::Host(target_node_id.clone()),
@@ -1088,6 +1099,16 @@ impl StepResolver for ExecutorStepResolver {
                 if let Some(cr) = self.registry.change_requests.preferred() {
                     let _ = cr.close_change_request(self.repo.root.as_path(), &id).await;
                 }
+                Ok(StepOutcome::Completed)
+            }
+            StepAction::MergeChangeRequest { id } => {
+                debug!(%id, "merging change request");
+                let cr = self
+                    .registry
+                    .change_requests
+                    .preferred()
+                    .ok_or_else(|| "no change request provider is active for this repository".to_string())?;
+                cr.merge_change_request(self.repo.root.as_path(), &id).await?;
                 Ok(StepOutcome::Completed)
             }
             StepAction::OpenIssue { id } => {

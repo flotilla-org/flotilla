@@ -1190,6 +1190,47 @@ fn inject_repo_context(cmd: &mut Command, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+fn confirm_command(
+    command: &mut Command,
+    interactive: bool,
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+) -> Result<bool, String> {
+    let CommandAction::MergeChangeRequest { id, confirmed } = &mut command.action else {
+        return Ok(true);
+    };
+    if *confirmed {
+        return Ok(true);
+    }
+    if !interactive {
+        return Err("merging a change request non-interactively requires --yes".to_string());
+    }
+
+    write!(output, "Merge change request {id} using squash? [y/N] ").map_err(|error| error.to_string())?;
+    output.flush().map_err(|error| error.to_string())?;
+    let mut response = String::new();
+    input.read_line(&mut response).map_err(|error| error.to_string())?;
+    if matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        *confirmed = true;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+async fn run_confirmed_control_command(cli: &Cli, mut command: Command, format: OutputFormat) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let stdin = std::io::stdin();
+    let interactive = stdin.is_terminal();
+    let mut input = stdin.lock();
+    let mut output = std::io::stderr().lock();
+    if !confirm_command(&mut command, interactive, &mut input, &mut output).map_err(color_eyre::eyre::Report::msg)? {
+        return Ok(());
+    }
+    run_control_command(cli, command, format).await
+}
+
 async fn dispatch(resolved: flotilla_commands::Resolved, cli: &Cli, format: OutputFormat) -> Result<()> {
     use flotilla_commands::{resolved::HostQueryKind, RepoContext, Resolved};
     reset_sigpipe();
@@ -1200,10 +1241,14 @@ async fn dispatch(resolved: flotilla_commands::Resolved, cli: &Cli, format: Outp
                 HostQueryKind::Status => CommandAction::QueryHostStatus { target_environment_id: environment_id },
                 HostQueryKind::Providers => CommandAction::QueryHostProviders { target_environment_id: environment_id },
             };
-            run_control_command(cli, Command { node_id: Some(node_id), provisioning_target: None, context_repo: None, action }, format)
-                .await
+            run_confirmed_control_command(
+                cli,
+                Command { node_id: Some(node_id), provisioning_target: None, context_repo: None, action },
+                format,
+            )
+            .await
         }
-        Resolved::Ready(cmd) => run_control_command(cli, cmd, format).await,
+        Resolved::Ready(cmd) => run_confirmed_control_command(cli, cmd, format).await,
         Resolved::NeedsContext { mut command, repo, host } => {
             match repo {
                 RepoContext::None => {}
@@ -1225,7 +1270,7 @@ async fn dispatch(resolved: flotilla_commands::Resolved, cli: &Cli, format: Outp
                     _ => {}
                 }
             }
-            run_control_command(cli, command, format).await
+            run_confirmed_control_command(cli, command, format).await
         }
     }
 }
@@ -1519,9 +1564,9 @@ mod tests {
     };
 
     use super::{
-        attach_exit_disposition, default_project_landing, provisioning_target_for_environment, run_replica_snapshot, select_host_target,
-        select_startup_repo_roots, should_reexec_for_incompatible_daemon, show_startup_splash, AttachExitDisposition, Cli,
-        ResourceApplyArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, SubCommand,
+        attach_exit_disposition, confirm_command, default_project_landing, provisioning_target_for_environment, run_replica_snapshot,
+        select_host_target, select_startup_repo_roots, should_reexec_for_incompatible_daemon, show_startup_splash, AttachExitDisposition,
+        Cli, ResourceApplyArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, SubCommand,
     };
 
     fn landing_repo(path: &str, name: &str, key: Option<&str>) -> RepoInfo {
@@ -1920,6 +1965,54 @@ mod tests {
     fn cli_no_subcommand_is_none() {
         let cli = Cli::try_parse_from(["flotilla"]).expect("bare cli should parse");
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn interactive_merge_confirmation_marks_command_confirmed() {
+        let mut command = flotilla_protocol::Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: flotilla_protocol::CommandAction::MergeChangeRequest { id: "42".into(), confirmed: false },
+        };
+        let mut input = std::io::Cursor::new(b"yes\n");
+        let mut output = Vec::new();
+
+        let proceed = confirm_command(&mut command, true, &mut input, &mut output).expect("confirmation prompt");
+
+        assert!(proceed);
+        assert!(matches!(command.action, flotilla_protocol::CommandAction::MergeChangeRequest { confirmed: true, .. }));
+        assert_eq!(String::from_utf8(output).expect("utf8 prompt"), "Merge change request 42 using squash? [y/N] ");
+    }
+
+    #[test]
+    fn interactive_merge_decline_does_not_dispatch() {
+        let mut command = flotilla_protocol::Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: flotilla_protocol::CommandAction::MergeChangeRequest { id: "42".into(), confirmed: false },
+        };
+        let mut input = std::io::Cursor::new(b"n\n");
+        let mut output = Vec::new();
+
+        assert!(!confirm_command(&mut command, true, &mut input, &mut output).expect("confirmation prompt"));
+        assert!(matches!(command.action, flotilla_protocol::CommandAction::MergeChangeRequest { confirmed: false, .. }));
+    }
+
+    #[test]
+    fn non_interactive_merge_requires_yes_flag() {
+        let mut command = flotilla_protocol::Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: flotilla_protocol::CommandAction::MergeChangeRequest { id: "42".into(), confirmed: false },
+        };
+
+        let error = confirm_command(&mut command, false, &mut std::io::empty(), &mut std::io::sink())
+            .expect_err("non-interactive merge must require explicit confirmation");
+
+        assert_eq!(error, "merging a change request non-interactively requires --yes");
     }
 
     #[test]

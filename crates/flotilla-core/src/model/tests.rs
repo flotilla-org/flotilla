@@ -100,6 +100,9 @@ impl ChangeRequestTracker for StubChangeRequestTracker {
     async fn close_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
         Ok(())
     }
+    async fn merge_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+        Ok(())
+    }
     async fn list_merged_branch_names(&self, _: &Path, _: usize) -> Result<Vec<String>, String> {
         Ok(vec![])
     }
