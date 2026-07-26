@@ -331,6 +331,25 @@ fn left_click(x: u16, y: u16) -> MouseEvent {
     MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE }
 }
 
+fn render_screen(app: &mut App) {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let mut ctx = crate::widgets::RenderContext {
+                model: &app.model,
+                views: &mut app.views,
+                ui: &mut app.ui,
+                theme: &app.theme,
+                keymap: &app.keymap,
+                in_flight: &app.in_flight,
+                namespaces: &app.namespaces,
+                query_tables: &app.query_tables,
+            };
+            app.screen.render(frame, frame.area(), &mut ctx);
+        })
+        .expect("draw");
+}
+
 // ── handle_key — top-level dispatch ──────────────────────────────
 
 #[test]
@@ -949,6 +968,7 @@ fn clicking_dismiss_status_target_hides_visible_error() {
 #[test]
 fn clicking_gear_icon_toggles_providers() {
     let mut app = stub_app();
+    render_screen(&mut app);
     // Place the gear hitbox on the active RepoPage's table
     let repo_key = app.model.repo_order[0].clone();
     app.screen.repo_pages.get_mut(&repo_key).expect("repo page").table.gear_area = Some(Rect::new(75, 2, 3, 1));
