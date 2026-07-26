@@ -463,7 +463,9 @@ impl InteractiveWidget for ProjectPageWidget {
             return Outcome::Ignored;
         };
         if line == layout.header_line {
-            ctx.app_actions.push(AppAction::DrillView(layout.panel.target.clone()));
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                ctx.app_actions.push(AppAction::DrillView(layout.panel.target.clone()));
+            }
             return Outcome::Consumed;
         }
         let row_index = line - layout.rows_start;

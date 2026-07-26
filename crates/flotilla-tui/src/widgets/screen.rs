@@ -61,6 +61,7 @@ pub struct Screen {
     pub table: TableWidget,
     pub project_page: ProjectPageWidget,
     view_header_area: Option<Rect>,
+    rendered_view: Option<ViewTarget>,
 }
 
 impl Default for Screen {
@@ -80,6 +81,7 @@ impl Screen {
             table: TableWidget::default(),
             project_page: ProjectPageWidget::default(),
             view_header_area: None,
+            rendered_view: None,
         }
     }
 
@@ -93,6 +95,11 @@ impl Screen {
     /// don't linger across context changes.
     pub fn dismiss_modals(&mut self) {
         self.modal_stack.clear();
+    }
+
+    /// Prevent page mouse dispatch until the active View has rendered again.
+    pub fn invalidate_page_layout(&mut self) {
+        self.rendered_view = None;
     }
 
     /// Apply a widget outcome from event dispatch.
@@ -354,6 +361,14 @@ impl InteractiveWidget for Screen {
             _ => {}
         }
 
+        // Page widgets retain hit-test areas from render. A tab can become
+        // active while several input events are already queued, before the
+        // next frame establishes that page's layout. Do not dispatch content
+        // input against the previously rendered View's coordinates.
+        if self.rendered_view.as_ref() != Some(&ctx.views.active().target) {
+            return Outcome::Consumed;
+        }
+
         // Dispatch to the active View's page for content area mouse events
         let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
             ActivePage::Overview => self.overview_page.handle_mouse(mouse, ctx),
@@ -373,6 +388,8 @@ impl InteractiveWidget for Screen {
     }
 
     fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
+        self.rendered_view = Some(ctx.views.active().target.clone());
+
         // Scoped mode: the pane is one View — no tab bar row.
         let view_header_height = u16::from(ctx.views.active().has_history());
         let constraints = if ctx.views.is_scoped() {

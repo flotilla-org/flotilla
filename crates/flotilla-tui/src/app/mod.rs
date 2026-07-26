@@ -1094,6 +1094,7 @@ impl App {
     /// the model's active-repo scope, the unseen-changes badge, and the
     /// status bar's layout indicator.
     pub fn sync_active_view(&mut self) {
+        self.screen.invalidate_page_layout();
         self.model.active_repo = self.views.active_repo_identity().cloned();
         if let Some(identity) = self.model.active_repo.clone() {
             if let Some(rm) = self.model.repos.get_mut(&identity) {

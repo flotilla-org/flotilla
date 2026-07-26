@@ -2326,6 +2326,86 @@ fn selected_table_name(app: &App) -> Option<String> {
     app.views.active_table_state().selected_row(&view).map(|row| row.cells[name_column].text.clone())
 }
 
+fn render_app(app: &mut App, width: u16, height: u16) {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let mut ctx = crate::widgets::RenderContext {
+                model: &app.model,
+                views: &mut app.views,
+                ui: &mut app.ui,
+                theme: &app.theme,
+                keymap: &app.keymap,
+                in_flight: &app.in_flight,
+                namespaces: &app.namespaces,
+                query_tables: &app.query_tables,
+            };
+            app.screen.render(frame, frame.area(), &mut ctx);
+        })
+        .expect("draw");
+}
+
+#[test]
+fn mouse_does_not_use_a_freshly_activated_pages_stale_layout() {
+    let mut app = stub_app();
+    let project = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
+    app.open_view(project.clone());
+    let project_tab = app.views.active_index();
+    render_app(&mut app, 80, 24);
+
+    app.switch_tab(0);
+    app.switch_tab(project_tab);
+    app.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 3, row: 1, modifiers: KeyModifiers::NONE });
+
+    assert_eq!(app.views.active_address(), Some(&project));
+    assert!(!app.views.active().has_history(), "mouse input must wait for the newly active page to render");
+}
+
+#[test]
+fn right_click_on_a_project_section_header_does_not_drill() {
+    let mut app = stub_app();
+    let project = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
+    app.open_view(project.clone());
+    render_app(&mut app, 80, 24);
+
+    app.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Right), column: 3, row: 1, modifiers: KeyModifiers::NONE });
+
+    assert_eq!(app.views.active_address(), Some(&project));
+    assert!(!app.views.active().has_history(), "right-click is reserved for action menus");
+}
+
+#[test]
+fn tab_bar_click_switches_to_project_without_dispatching_to_its_page() {
+    let mut app = stub_app();
+    let project = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
+    app.open_view(project.clone());
+    let project_tab = app.views.active_index();
+    let project_state = app.views.active_project_table_state().clone();
+    app.switch_tab(0);
+    render_app(&mut app, 80, 24);
+    let tab_area = app.ui.layout.tab_areas[&crate::app::TabId::View(project_tab)];
+    let click =
+        MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: tab_area.x, row: tab_area.y, modifiers: KeyModifiers::NONE };
+
+    let mut screen = std::mem::take(&mut app.screen);
+    let (outcome, actions) = {
+        let mut ctx = app.build_widget_context();
+        let outcome = screen.handle_mouse(click, &mut ctx);
+        (outcome, std::mem::take(&mut ctx.app_actions))
+    };
+    app.screen = screen;
+
+    assert!(matches!(outcome, crate::widgets::Outcome::Consumed));
+    assert!(matches!(actions.as_slice(), [crate::widgets::AppAction::SwitchToTab(index)] if *index == project_tab));
+    assert_eq!(app.views.active_index(), 0, "widgets queue the switch instead of mutating page dispatch state");
+    app.process_app_actions(actions);
+
+    assert_eq!(app.views.active_index(), project_tab);
+    assert_eq!(app.views.active_address(), Some(&project));
+    assert_eq!(app.views.active_project_table_state(), &project_state);
+    assert!(!app.views.active().has_history(), "the switching click must not reach the project header");
+}
+
 #[test]
 fn keyboard_uses_one_cursor_and_drills_with_tab_local_back_history() {
     let mut app = stub_app();
