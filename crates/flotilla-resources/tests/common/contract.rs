@@ -241,7 +241,11 @@ pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
     remote.delete("remote").await.expect("delete remote convoy");
     let deleted = remote.watch(WatchStart::resuming_from(&before_delete)).await.expect("watch remote delete").next().await;
     let deleted = deleted.expect("remote delete event").expect("valid remote delete");
-    backend.replica_writer::<Convoy>(origin, "flotilla").apply(deleted, Utc::now()).await.expect("apply remote delete");
+    backend
+        .replica_writer::<Convoy>(origin, "flotilla")
+        .apply(deleted, updated_sync + chrono::Duration::seconds(1))
+        .await
+        .expect("apply remote delete");
 
     let event = timeout(Duration::from_secs(1), watch.next()).await.expect("replica delete watch timeout");
     assert!(matches!(event, Some(Ok(flotilla_resources::ReadWatchEvent::Deleted(_)))));
@@ -263,6 +267,45 @@ pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
         .expect("read replaced cursor")
         .expect("replaced cursor");
     assert_eq!(cursor.generation.as_deref(), Some("generation-2"));
+}
+
+pub async fn assert_replica_events_ignore_stale_writes_and_deletes_with_backend(backend: ResourceBackend) {
+    let origin = flotilla_protocol::NodeId::new("feta-root");
+    let source_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let source = source_backend.using::<Convoy>("flotilla");
+    let meta = convoy_meta("remote");
+    let first = source.create(&meta, &convoy_spec("first")).await.expect("create source convoy");
+    let first_synced_at = Utc::now();
+    let writer = backend.replica_writer::<Convoy>(origin, "flotilla");
+    writer.apply(WatchEvent::Added(first.clone()), first_synced_at).await.expect("apply initial replica event");
+
+    let second = source.update(&meta, &first.metadata.resource_version, &convoy_spec("second")).await.expect("update source convoy");
+    let stale_delete_synced_at = first_synced_at + chrono::Duration::seconds(1);
+    let second_synced_at = first_synced_at + chrono::Duration::seconds(2);
+    writer.apply(WatchEvent::Modified(second.clone()), second_synced_at).await.expect("apply newer replica update");
+    writer.apply(WatchEvent::Deleted(first), stale_delete_synced_at).await.expect("ignore stale replica delete");
+
+    let after_stale_delete = backend.including_replicas::<Convoy>("flotilla").list().await.expect("list after stale delete");
+    assert_eq!(after_stale_delete.items.len(), 1);
+    assert_eq!(after_stale_delete.items[0].object.spec.workflow_ref, "second");
+
+    let delete_synced_at = first_synced_at + chrono::Duration::seconds(3);
+    writer.apply(WatchEvent::Deleted(second.clone()), delete_synced_at).await.expect("apply current replica delete");
+    writer.apply(WatchEvent::Modified(second.clone()), second_synced_at).await.expect("ignore stale replica update after delete");
+    assert!(
+        backend.including_replicas::<Convoy>("flotilla").list().await.expect("list after stale update").items.is_empty(),
+        "a retained delete tombstone must prevent resurrection by an older write"
+    );
+
+    writer
+        .apply(WatchEvent::Added(second), delete_synced_at + chrono::Duration::seconds(1))
+        .await
+        .expect("apply recreation newer than tombstone");
+    assert_eq!(
+        backend.including_replicas::<Convoy>("flotilla").list().await.expect("list recreated replica").items.len(),
+        1,
+        "a write newer than the delete tombstone should recreate the replica"
+    );
 }
 
 fn project_spec(display_name: &str, workflow: &str) -> ProjectSpec {

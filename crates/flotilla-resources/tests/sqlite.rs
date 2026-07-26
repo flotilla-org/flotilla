@@ -11,7 +11,8 @@ use common::{
         assert_project_definition_causal_merge_with_backend, assert_project_definition_delete_conflicts_with_concurrent_edit_with_backend,
         assert_project_definition_edit_converges_with_backend, assert_project_definition_edit_preserves_unrelated_conflict_with_backend,
         assert_project_definition_optional_field_can_be_cleared_with_backend,
-        assert_repeated_delete_with_pending_finalizers_is_noop_with_backend, assert_replica_read_view_contract,
+        assert_repeated_delete_with_pending_finalizers_is_noop_with_backend,
+        assert_replica_events_ignore_stale_writes_and_deletes_with_backend, assert_replica_read_view_contract,
         assert_stale_resource_version_conflicts_with_backend, assert_store_diagnostics_report_retained_events_with_backend,
         assert_watch_from_version_replays_with_backend, assert_watch_now_semantics_with_backend,
         assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
@@ -165,6 +166,11 @@ async fn replica_read_view_contract() {
 }
 
 #[tokio::test]
+async fn replica_events_ignore_stale_writes_and_deletes() {
+    assert_replica_events_ignore_stale_writes_and_deletes_with_backend(backend()).await;
+}
+
+#[tokio::test]
 async fn project_definition_edit_converges() {
     assert_project_definition_edit_converges_with_backend(backend()).await;
 }
@@ -210,6 +216,36 @@ async fn replica_rows_and_cursor_survive_backend_restart() {
     let cursor =
         reopened.replica_writer::<Convoy>(origin, "flotilla").cursor().await.expect("read persisted cursor").expect("persisted cursor");
     assert_eq!(cursor.resource_version, listed.resource_version);
+}
+
+#[tokio::test]
+async fn replica_delete_tombstone_survives_backend_restart() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("resources.sqlite");
+    let origin = flotilla_protocol::NodeId::new("feta-root");
+    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let object =
+        source.using::<Convoy>("flotilla").create(&convoy_meta("remote"), &convoy_spec("template")).await.expect("create source convoy");
+    let write_synced_at = Utc::now();
+    let delete_synced_at = write_synced_at + chrono::Duration::seconds(1);
+
+    {
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("open sqlite backend"));
+        let writer = backend.replica_writer::<Convoy>(origin.clone(), "flotilla");
+        writer.apply(WatchEvent::Added(object.clone()), write_synced_at).await.expect("apply replica write");
+        writer.apply(WatchEvent::Deleted(object.clone()), delete_synced_at).await.expect("apply replica delete");
+    }
+
+    let reopened = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("reopen sqlite backend"));
+    reopened
+        .replica_writer::<Convoy>(origin, "flotilla")
+        .apply(WatchEvent::Modified(object), write_synced_at)
+        .await
+        .expect("ignore stale write after restart");
+    assert!(
+        reopened.including_replicas::<Convoy>("flotilla").list().await.expect("list replicas after restart").items.is_empty(),
+        "the persisted delete tombstone must prevent stale resurrection after restart"
+    );
 }
 
 #[tokio::test]

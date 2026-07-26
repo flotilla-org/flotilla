@@ -40,6 +40,8 @@ struct ReplicaState {
 #[derive(Debug, Default)]
 struct ReplicaPartition {
     objects: HashMap<String, Value>,
+    // Retained for deleted names as a tombstone so an older relayed write
+    // cannot resurrect an object after a newer delete.
     synced_at_by_name: HashMap<String, chrono::DateTime<Utc>>,
     cursor: Option<ReplicaCursor>,
 }
@@ -299,17 +301,22 @@ impl InMemoryBackend {
         let unchanged = match kind {
             StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
                 match (partition.objects.get(&object.metadata.name), partition.synced_at_by_name.get(&object.metadata.name)) {
-                    (Some(_), Some(existing_synced_at)) if existing_synced_at > &synced_at => true,
+                    (_, Some(existing_synced_at)) if existing_synced_at > &synced_at => true,
                     (Some(existing), Some(existing_synced_at)) if existing_synced_at == &synced_at => {
                         serde_json::to_string(existing)
                             .map_err(|error| ResourceError::decode(format!("encode existing replica: {error}")))?
                             >= serde_json::to_string(&encoded)
                                 .map_err(|error| ResourceError::decode(format!("encode incoming replica: {error}")))?
                     }
+                    (None, Some(existing_synced_at)) if existing_synced_at == &synced_at => true,
                     _ => false,
                 }
             }
-            StoredReplicaEventKind::Deleted => !partition.objects.contains_key(&object.metadata.name),
+            StoredReplicaEventKind::Deleted => match partition.synced_at_by_name.get(&object.metadata.name) {
+                Some(existing_synced_at) if existing_synced_at > &synced_at => true,
+                Some(existing_synced_at) if existing_synced_at == &synced_at => !partition.objects.contains_key(&object.metadata.name),
+                _ => false,
+            },
         };
         if unchanged {
             return Ok(());
@@ -321,7 +328,7 @@ impl InMemoryBackend {
             }
             StoredReplicaEventKind::Deleted => {
                 partition.objects.remove(&object.metadata.name);
-                partition.synced_at_by_name.remove(&object.metadata.name);
+                partition.synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
             }
         }
         partition.cursor = Some(ReplicaCursor {
