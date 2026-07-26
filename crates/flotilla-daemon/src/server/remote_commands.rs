@@ -246,11 +246,7 @@ impl RemoteCommandRouter {
         let target_node_id = command.node_id.clone().unwrap_or_else(|| self.daemon.node_id().clone());
 
         if target_node_id == *self.daemon.node_id() {
-            let mut value = self.daemon.execute_query(command, session_id).await?;
-            if let CommandValue::HostList(response) = &mut value {
-                self.peer_manager.lock().await.project_host_list(response);
-            }
-            return Ok(value);
+            return self.execute_projected_query(command, session_id).await;
         }
 
         let request_id = {
@@ -296,6 +292,14 @@ impl RemoteCommandRouter {
         };
 
         result
+    }
+
+    async fn execute_projected_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
+        let mut value = self.daemon.execute_query(command, session_id).await?;
+        if let CommandValue::HostList(response) = &mut value {
+            self.peer_manager.lock().await.project_host_list(response);
+        }
+        Ok(value)
     }
 
     pub(super) async fn dispatch_cancel(&self, command_id: u64) -> Result<(), String> {
@@ -626,7 +630,7 @@ impl RemoteCommandRouter {
         // result back directly without subscribing to the event stream.
         if command.action.is_query() {
             let query_session = session_id.unwrap_or(uuid::Uuid::nil());
-            let result = match self.daemon.execute_query(command, query_session).await {
+            let result = match self.execute_projected_query(command, query_session).await {
                 Ok(value) => value,
                 Err(message) => CommandValue::Error { message },
             };

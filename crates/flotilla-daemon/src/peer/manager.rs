@@ -420,13 +420,18 @@ impl PeerManager {
                 PeerConnectionState::Disconnected
             };
 
-            let existing = node_id.and_then(|node_id| {
-                response.hosts.iter_mut().find(|entry| entry.node.as_ref().is_some_and(|node| node.node_id == *node_id))
-            });
-            if let Some(entry) = existing {
+            let mut matched_existing = false;
+            for entry in response
+                .hosts
+                .iter_mut()
+                .filter(|entry| node_id.is_some_and(|node_id| entry.node.as_ref().is_some_and(|node| node.node_id == *node_id)))
+            {
+                matched_existing = true;
                 entry.configured = true;
-                entry.connection_status = connection_status;
-                entry.reconnect = reconnect;
+                entry.connection_status = connection_status.clone();
+                entry.reconnect = reconnect.clone();
+            }
+            if matched_existing {
                 continue;
             }
 
