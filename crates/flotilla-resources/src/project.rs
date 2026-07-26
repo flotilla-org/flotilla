@@ -3,15 +3,17 @@ use std::collections::BTreeSet;
 pub use flotilla_protocol::IssueSource;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::NoStatusPatch, Repository, RepositoryKey, TypedResolver};
+use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass, Repository, RepositoryKey, TypedResolver};
 
-define_resource!(Project, "projects", ProjectSpec, (), NoStatusPatch);
+define_resource!(Project, "projects", ProjectSpec, (), NoStatusPatch, replication = ReplicationClass::Definitions);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ProjectSpec {
     pub display_name: String,
     pub default_workflow_ref: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Definitions-class fields must serialize `None` as JSON null so clearing
+    // an optional value participates in the field-level causal merge.
+    #[serde(default)]
     pub issue_source: Option<IssueSource>,
     #[builder(default)]
     #[serde(default)]

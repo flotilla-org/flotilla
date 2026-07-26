@@ -137,6 +137,9 @@ pub struct ProjectListEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_source: Option<IssueSource>,
     pub default_workflow_ref: String,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

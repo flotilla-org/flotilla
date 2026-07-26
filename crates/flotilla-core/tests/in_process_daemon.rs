@@ -787,6 +787,7 @@ async fn resource_watch_emits_initial_resources_as_wire_events() {
                 namespace: "flotilla".to_string(),
                 kind: "convoys".to_string(),
                 include_replicas: false,
+                replica_sources: false,
                 cursor: None,
             },
         })
@@ -835,6 +836,7 @@ async fn resource_watch_resumes_after_a_stored_cursor_without_relisting() {
                 namespace: "flotilla".to_string(),
                 kind: "convoys".to_string(),
                 include_replicas: false,
+                replica_sources: false,
                 cursor: Some(flotilla_protocol::ResourceWatchCursor { resource_version: cursor, generation: None }),
             },
         })

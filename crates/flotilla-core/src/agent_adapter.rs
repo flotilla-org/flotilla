@@ -914,6 +914,7 @@ mod tests {
                 finalizers: Vec::new(),
                 deletion_timestamp: None,
                 creation_timestamp: Utc::now(),
+                merge: None,
             },
             spec: ConvoySpec {
                 workflow_ref: "workflow".to_string(),

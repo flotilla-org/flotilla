@@ -227,10 +227,10 @@ async fn retracking_path_after_remote_appears_migrates_repository_identity() {
         }),
     });
 
-    let projects = backend.using::<Project>("flotilla").list().await.expect("project list");
-    assert_eq!(projects.items.len(), 1, "identity migration must not leave a disambiguated twin");
-    assert_eq!(projects.items[0].metadata.name, "andamento");
-    assert_eq!(projects.items[0].spec.repositories[0].repo, remote_key);
+    let projects = backend.definitions::<Project>("flotilla").list().await.expect("project list");
+    assert_eq!(projects.len(), 1, "identity migration must not leave a disambiguated twin");
+    assert_eq!(projects[0].metadata.name, "andamento");
+    assert_eq!(projects[0].spec.repositories[0].repo, remote_key);
     let repositories = backend.using::<Repository>("flotilla").list().await.expect("repository list");
     assert_eq!(repositories.items.len(), 1, "superseded repository identities should be garbage-collected");
     assert_eq!(repositories.items[0].metadata.name, remote_key.to_string());
@@ -364,11 +364,11 @@ async fn identity_change_preserves_migrated_project_when_local_and_remote_names_
         .expect("repo add after remote appears");
     assert!(matches!(await_command_result(&mut rx, second_id).await, CommandValue::RepoTracked { .. }));
 
-    let projects = backend.using::<Project>("flotilla").list().await.expect("project list");
-    assert_eq!(projects.items.len(), 1, "the pre-existing remote twin should be removed");
-    assert_eq!(projects.items[0].metadata.name, "z-local-name", "the migrated Project should retain its identity");
-    assert_eq!(projects.items[0].spec.display_name, "z-local-name");
-    assert_eq!(projects.items[0].spec.repositories[0].repo, remote_key);
+    let projects = backend.definitions::<Project>("flotilla").list().await.expect("project list");
+    assert_eq!(projects.len(), 1, "the pre-existing remote twin should be removed");
+    assert_eq!(projects[0].metadata.name, "z-local-name", "the migrated Project should retain its identity");
+    assert_eq!(projects[0].spec.display_name, "z-local-name");
+    assert_eq!(projects[0].spec.repositories[0].repo, remote_key);
 }
 
 #[tokio::test]

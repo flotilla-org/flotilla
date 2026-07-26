@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::{
     error::ResourceError,
     replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
-    resource::{InputMeta, K8sResourceObject, ObjectMeta, Resource, ResourceObject},
+    resource::{InputMeta, K8sResourceObject, MergeMetadata, ObjectMeta, Resource, ResourceObject},
     retention::{EventRetention, ResourceStoreDiagnostics},
     watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
 };
@@ -26,6 +26,7 @@ pub struct InMemoryBackend {
     replicas: Arc<Mutex<ReplicaState>>,
     generation: Option<String>,
     event_retention: EventRetention,
+    local_root: Option<NodeId>,
 }
 
 type ReplicaKey = (NodeId, StoreKey);
@@ -39,6 +40,8 @@ struct ReplicaState {
 #[derive(Debug, Default)]
 struct ReplicaPartition {
     objects: HashMap<String, Value>,
+    // Retained for deleted names as a tombstone so an older relayed write
+    // cannot resurrect an object after a newer delete.
     synced_at_by_name: HashMap<String, chrono::DateTime<Utc>>,
     cursor: Option<ReplicaCursor>,
 }
@@ -103,15 +106,31 @@ impl InMemoryBackend {
             replicas: Arc::default(),
             generation: Some(uuid::Uuid::new_v4().to_string()),
             event_retention: EventRetention::default(),
+            local_root: None,
         }
     }
 
     pub fn with_event_retention(event_retention: EventRetention) -> Self {
-        Self { stores: Arc::default(), replicas: Arc::default(), generation: None, event_retention }
+        Self { stores: Arc::default(), replicas: Arc::default(), generation: None, event_retention, local_root: None }
     }
 
     pub fn observed_with_event_retention(event_retention: EventRetention) -> Self {
-        Self { stores: Arc::default(), replicas: Arc::default(), generation: Some(uuid::Uuid::new_v4().to_string()), event_retention }
+        Self {
+            stores: Arc::default(),
+            replicas: Arc::default(),
+            generation: Some(uuid::Uuid::new_v4().to_string()),
+            event_retention,
+            local_root: None,
+        }
+    }
+
+    pub(crate) fn with_local_root(mut self, local_root: NodeId) -> Self {
+        self.local_root = Some(local_root);
+        self
+    }
+
+    pub(crate) fn local_root(&self) -> NodeId {
+        self.local_root.clone().unwrap_or_else(|| NodeId::new("local"))
     }
 
     pub(crate) async fn diagnostics(&self) -> Result<ResourceStoreDiagnostics, ResourceError> {
@@ -279,6 +298,29 @@ impl InMemoryBackend {
         let encoded = Self::encode_object(object)?;
         let mut state = self.replicas.lock().await;
         let partition = state.partitions.entry(replica_key).or_default();
+        let unchanged = match kind {
+            StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
+                match (partition.objects.get(&object.metadata.name), partition.synced_at_by_name.get(&object.metadata.name)) {
+                    (_, Some(existing_synced_at)) if existing_synced_at > &synced_at => true,
+                    (Some(existing), Some(existing_synced_at)) if existing_synced_at == &synced_at => {
+                        serde_json::to_string(existing)
+                            .map_err(|error| ResourceError::decode(format!("encode existing replica: {error}")))?
+                            >= serde_json::to_string(&encoded)
+                                .map_err(|error| ResourceError::decode(format!("encode incoming replica: {error}")))?
+                    }
+                    (None, Some(existing_synced_at)) if existing_synced_at == &synced_at => true,
+                    _ => false,
+                }
+            }
+            StoredReplicaEventKind::Deleted => match partition.synced_at_by_name.get(&object.metadata.name) {
+                Some(existing_synced_at) if existing_synced_at > &synced_at => true,
+                Some(existing_synced_at) if existing_synced_at == &synced_at => !partition.objects.contains_key(&object.metadata.name),
+                _ => false,
+            },
+        };
+        if unchanged {
+            return Ok(());
+        }
         match kind {
             StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
                 partition.objects.insert(object.metadata.name.clone(), encoded.clone());
@@ -286,7 +328,7 @@ impl InMemoryBackend {
             }
             StoredReplicaEventKind::Deleted => {
                 partition.objects.remove(&object.metadata.name);
-                partition.synced_at_by_name.remove(&object.metadata.name);
+                partition.synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
             }
         }
         partition.cursor = Some(ReplicaCursor {
@@ -370,6 +412,26 @@ impl InMemoryBackend {
         meta: &InputMeta,
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
+        self.create_typed_with_merge(namespace, meta, spec, None).await
+    }
+
+    pub(crate) async fn create_definition_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        meta: &InputMeta,
+        spec: &T::Spec,
+        merge: MergeMetadata,
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        self.create_typed_with_merge(namespace, meta, spec, Some(merge)).await
+    }
+
+    async fn create_typed_with_merge<T: Resource>(
+        &self,
+        namespace: &str,
+        meta: &InputMeta,
+        spec: &T::Spec,
+        merge: Option<MergeMetadata>,
+    ) -> Result<ResourceObject<T>, ResourceError> {
         self.with_store_mut::<T, _>(namespace, |store| {
             if store.objects.contains_key(&meta.name) {
                 return Err(ResourceError::conflict(&meta.name, "resource already exists"));
@@ -387,6 +449,7 @@ impl InMemoryBackend {
                     finalizers: meta.finalizers.clone(),
                     deletion_timestamp: meta.deletion_timestamp,
                     creation_timestamp: Utc::now(),
+                    merge,
                 },
                 spec: Self::clone_through_serde(spec)?,
                 status: None,
@@ -407,6 +470,28 @@ impl InMemoryBackend {
         resource_version: &str,
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
+        self.update_typed_with_merge(namespace, meta, resource_version, spec, None).await
+    }
+
+    pub(crate) async fn update_definition_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        meta: &InputMeta,
+        resource_version: &str,
+        spec: &T::Spec,
+        merge: MergeMetadata,
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        self.update_typed_with_merge(namespace, meta, resource_version, spec, Some(merge)).await
+    }
+
+    async fn update_typed_with_merge<T: Resource>(
+        &self,
+        namespace: &str,
+        meta: &InputMeta,
+        resource_version: &str,
+        spec: &T::Spec,
+        admitted_merge: Option<MergeMetadata>,
+    ) -> Result<ResourceObject<T>, ResourceError> {
         self.with_store_mut::<T, _>(namespace, |store| {
             let existing = store.objects.get(&meta.name).cloned().ok_or_else(|| ResourceError::not_found(&meta.name))?;
             let mut object = Self::decode_object::<T>(existing)?;
@@ -414,7 +499,9 @@ impl InMemoryBackend {
                 return Err(ResourceError::conflict(&meta.name, "stale resourceVersion"));
             }
             T::validate_spec_update(&object.spec, spec)?;
-            if object.matches_update(meta, spec)? {
+            if object.matches_update(meta, spec)?
+                && admitted_merge.as_ref().is_none_or(|merge| object.metadata.merge.as_ref() == Some(merge))
+            {
                 return Ok(object);
             }
 
@@ -425,10 +512,16 @@ impl InMemoryBackend {
             object.metadata.owner_references = meta.owner_references.clone();
             object.metadata.finalizers = meta.finalizers.clone();
             object.metadata.deletion_timestamp = meta.deletion_timestamp;
+            if let Some(merge) = admitted_merge {
+                object.metadata.merge = Some(merge);
+            }
             object.spec = Self::clone_through_serde(spec)?;
 
             let encoded = Self::encode_object(&object)?;
-            if object.metadata.deletion_timestamp.is_some() && object.metadata.finalizers.is_empty() {
+            if T::REPLICATION_CLASS != crate::ReplicationClass::Definitions
+                && object.metadata.deletion_timestamp.is_some()
+                && object.metadata.finalizers.is_empty()
+            {
                 store.objects.remove(&meta.name);
                 store.push_event(StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded }, self.event_retention);
             } else {

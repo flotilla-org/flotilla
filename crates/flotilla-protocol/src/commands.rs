@@ -449,6 +449,8 @@ pub enum CommandAction {
         kind: String,
         #[serde(default, skip_serializing_if = "is_false")]
         include_replicas: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        replica_sources: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<ResourceWatchCursor>,
     },
@@ -1021,6 +1023,7 @@ mod tests {
                     namespace: "flotilla".into(),
                     kind: "convoys".into(),
                     include_replicas: false,
+                    replica_sources: false,
                     cursor: None,
                 },
             },

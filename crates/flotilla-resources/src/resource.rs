@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fmt::Debug};
 
 use chrono::{DateTime, Utc};
+use flotilla_protocol::NodeId;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
@@ -114,6 +115,44 @@ pub struct OwnerReference {
     pub controller: bool,
 }
 
+/// One causally unique write in a definitions-class record.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CausalDot {
+    pub author_root: NodeId,
+    pub author_counter: u64,
+}
+
+/// Causal state captured when a field was last authored.
+///
+/// The field-local context keeps a later disjoint-field edit from
+/// accidentally resolving an existing conflict in this field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldMergeMetadata {
+    pub dot: CausalDot,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub seen: BTreeMap<NodeId, u64>,
+    pub written_at: DateTime<Utc>,
+}
+
+/// One causally-maximal value shown when a definitions field conflicts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeConflictSibling {
+    pub value: serde_json::Value,
+    pub dot: CausalDot,
+    pub written_at: DateTime<Utc>,
+}
+
+/// Store-authored causal metadata for a definitions-class object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeMetadata {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<String, FieldMergeMetadata>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub seen: BTreeMap<NodeId, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub conflicts: BTreeMap<String, Vec<MergeConflictSibling>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, bon::Builder)]
 pub struct InputMeta {
     pub name: String,
@@ -178,6 +217,8 @@ pub struct ObjectMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_timestamp: Option<DateTime<Utc>>,
     pub creation_timestamp: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<MergeMetadata>,
 }
 
 impl ObjectMeta {
@@ -282,6 +323,8 @@ pub struct K8sObjectMeta {
     pub deletion_timestamp: Option<DateTime<Utc>>,
     #[serde(rename = "creationTimestamp")]
     pub creation_timestamp: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<MergeMetadata>,
 }
 
 impl From<&ObjectMeta> for K8sObjectMeta {
@@ -296,6 +339,7 @@ impl From<&ObjectMeta> for K8sObjectMeta {
             finalizers: value.finalizers.clone(),
             deletion_timestamp: value.deletion_timestamp,
             creation_timestamp: value.creation_timestamp,
+            merge: value.merge.clone(),
         }
     }
 }
@@ -312,6 +356,7 @@ impl From<K8sObjectMeta> for ObjectMeta {
             finalizers: value.finalizers,
             deletion_timestamp: value.deletion_timestamp,
             creation_timestamp: value.creation_timestamp,
+            merge: value.merge,
         }
     }
 }

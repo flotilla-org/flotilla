@@ -5,6 +5,7 @@ use flotilla_protocol::NodeId;
 use futures::{stream, StreamExt};
 
 use crate::{
+    definition::DefinitionResolver,
     error::ResourceError,
     http::HttpBackend,
     in_memory::InMemoryBackend,
@@ -33,8 +34,28 @@ pub enum ResourceBackend {
 }
 
 impl ResourceBackend {
+    pub fn with_local_root(self, local_root: NodeId) -> Self {
+        match self {
+            Self::InMemory(backend) => Self::InMemory(backend.with_local_root(local_root)),
+            Self::Http(backend) => Self::Http(backend),
+            Self::Sqlite(backend) => Self::Sqlite(backend.with_local_root(local_root)),
+        }
+    }
+
+    pub(crate) fn local_root(&self) -> Result<NodeId, ResourceError> {
+        match self {
+            Self::InMemory(backend) => Ok(backend.local_root()),
+            Self::Sqlite(backend) => Ok(backend.local_root()),
+            Self::Http(_) => Err(ResourceError::invalid("HTTP backends cannot author definitions")),
+        }
+    }
+
     pub fn using<T: Resource>(&self, namespace: &str) -> TypedResolver<T> {
         TypedResolver { backend: self.clone(), namespace: namespace.to_string(), _marker: PhantomData }
+    }
+
+    pub fn definitions<T: Resource>(&self, namespace: &str) -> DefinitionResolver<T> {
+        DefinitionResolver::new(self.clone(), namespace.to_string())
     }
 
     /// A read-only union of locally-authored objects and durable replicas.
@@ -71,6 +92,25 @@ impl<T: Resource> ReplicaReadResolver<T> {
         if let ResourceBackend::Http(backend) = &self.backend {
             return backend.list_including_replicas_typed::<T>(&self.namespace).await;
         }
+        if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
+            let items = self
+                .backend
+                .definitions::<T>(&self.namespace)
+                .list()
+                .await?
+                .into_iter()
+                .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
+                .collect();
+            return Ok(ReadResourceList { items });
+        }
+        self.list_sources().await
+    }
+
+    pub(crate) async fn list_sources(&self) -> Result<ReadResourceList<T>, ResourceError> {
+        ensure_replication_enabled::<T>()?;
+        if matches!(&self.backend, ResourceBackend::Http(_)) {
+            return Err(ResourceError::invalid("HTTP replica-source lists use the resource API"));
+        }
         let local = self.backend.using::<T>(&self.namespace).list().await?;
         let mut items =
             local.items.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect::<Vec<_>>();
@@ -98,6 +138,38 @@ impl<T: Resource> ReplicaReadResolver<T> {
         ensure_replication_enabled::<T>()?;
         if let ResourceBackend::Http(backend) = &self.backend {
             return backend.watch_including_replicas_typed::<T>(&self.namespace).await;
+        }
+        let raw = self.watch_sources().await?;
+        if T::REPLICATION_CLASS != crate::ReplicationClass::Definitions {
+            return Ok(raw);
+        }
+        let backend = self.backend.clone();
+        let namespace = self.namespace.clone();
+        Ok(raw
+            .then(move |event| {
+                let backend = backend.clone();
+                let namespace = namespace.clone();
+                async move {
+                    let event = event?;
+                    let fallback = match event {
+                        ReadWatchEvent::Added(object) | ReadWatchEvent::Modified(object) | ReadWatchEvent::Deleted(object) => object,
+                    };
+                    match backend.definitions::<T>(&namespace).get(&fallback.object.metadata.name).await {
+                        Ok(object) => Ok(ReadWatchEvent::Modified(ReadResourceObject { object, provenance: ResourceProvenance::Local })),
+                        Err(ResourceError::NotFound { .. }) => Ok(ReadWatchEvent::Deleted(fallback)),
+                        Err(error) => Err(error),
+                    }
+                }
+            })
+            .boxed())
+    }
+
+    pub(crate) async fn watch_sources(
+        &self,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
+        ensure_replication_enabled::<T>()?;
+        if matches!(&self.backend, ResourceBackend::Http(_)) {
+            return Err(ResourceError::invalid("HTTP replica-source watches use the resource API"));
         }
         let replicas = match &self.backend {
             ResourceBackend::InMemory(backend) => backend.watch_replicas_typed::<T>(&self.namespace).await?,
@@ -160,7 +232,7 @@ impl<T: Resource> ReplicaWriter<T> {
 }
 
 fn ensure_replication_enabled<T: Resource>() -> Result<(), ResourceError> {
-    if T::REPLICATION_CLASS == crate::ReplicationClass::HomeBoundRuntime {
+    if T::REPLICATION_CLASS != crate::ReplicationClass::None {
         Ok(())
     } else {
         Err(ResourceError::invalid(format!("{} is not enabled for overlay replication", T::API_PATHS.kind)))
@@ -194,10 +266,22 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn create(&self, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
+        if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
+            return self.backend.definitions::<T>(&self.namespace).create(meta, spec).await;
+        }
         dispatch_backend!(self, create_typed, meta, spec)
     }
 
     pub async fn update(&self, meta: &InputMeta, resource_version: &str, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
+        if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
+            let definitions = self.backend.definitions::<T>(&self.namespace);
+            let current = definitions.get(&meta.name).await?;
+            let local_version_matches = self.get(&meta.name).await.is_ok_and(|local| local.metadata.resource_version == resource_version);
+            if current.metadata.resource_version != resource_version && !local_version_matches {
+                return Err(ResourceError::conflict(&meta.name, "stale resourceVersion"));
+            }
+            return definitions.apply(meta, spec).await;
+        }
         dispatch_backend!(self, update_typed, meta, resource_version, spec)
     }
 
@@ -206,6 +290,9 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn delete(&self, name: &str) -> Result<(), ResourceError> {
+        if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
+            return self.backend.definitions::<T>(&self.namespace).delete(name).await;
+        }
         dispatch_backend!(self, delete_typed, name)
     }
 

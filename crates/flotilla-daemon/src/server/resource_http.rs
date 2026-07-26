@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use flotilla_resources::{
-    list_resource_kind, list_resource_kind_including_replicas, watch_resource_kind, watch_resource_kind_from,
-    watch_resource_kind_including_replicas, DynamicResourceWatch, ResourceBackend, ResourceError, WatchStart,
+    list_resource_kind, list_resource_kind_including_replicas, list_resource_kind_replica_sources, watch_resource_kind,
+    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceWatch,
+    ResourceBackend, ResourceError, WatchStart,
 };
 use futures::StreamExt;
 use tokio::{
@@ -41,12 +42,14 @@ pub(super) async fn serve_resource_http(mut stream: UnixStream, first_byte: u8, 
         return write_error(&mut stream, 404, "unknown resource API path").await;
     };
     let query = parse_query(raw_query);
-    let include_replicas =
-        ["includeReplicas", "include-replicas", "include_replicas"].iter().filter_map(|key| query.get(*key)).any(|value| value == "true");
+    let include_replicas = query_flag(&query, &["includeReplicas", "include-replicas", "include_replicas"]);
+    let replica_sources = query_flag(&query, &["replicaSources", "replica-sources", "replica_sources"]);
     let watch = query.get("watch").is_some_and(|value| value == "true");
 
     if !watch {
-        let listed = if include_replicas {
+        let listed = if replica_sources {
+            list_resource_kind_replica_sources(&backend, namespace, kind).await
+        } else if include_replicas {
             list_resource_kind_including_replicas(&backend, namespace, kind).await
         } else {
             list_resource_kind(&backend, namespace, kind).await
@@ -57,7 +60,13 @@ pub(super) async fn serve_resource_http(mut stream: UnixStream, first_byte: u8, 
         };
     }
 
-    let watched = if include_replicas {
+    let watched = if replica_sources {
+        if query.contains_key("resourceVersion") {
+            Err(ResourceError::invalid("replica-source watches do not support resourceVersion resume"))
+        } else {
+            watch_resource_kind_replica_sources(&backend, namespace, kind).await
+        }
+    } else if include_replicas {
         if query.contains_key("resourceVersion") {
             Err(ResourceError::invalid("include-replicas watches do not support resourceVersion resume"))
         } else {
@@ -88,6 +97,10 @@ fn parse_query(raw_query: &str) -> BTreeMap<String, String> {
         .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect()
+}
+
+fn query_flag(query: &BTreeMap<String, String>, names: &[&str]) -> bool {
+    names.iter().filter_map(|name| query.get(*name)).any(|value| value == "true")
 }
 
 async fn stream_watch(stream: &mut UnixStream, mut watch: DynamicResourceWatch) -> Result<(), String> {

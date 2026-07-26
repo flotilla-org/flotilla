@@ -984,6 +984,7 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
                 namespace: "flotilla".into(),
                 kind: "convoys".into(),
                 include_replicas: false,
+                replica_sources: false,
                 cursor: None,
             },
         })
@@ -1007,6 +1008,7 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
                     namespace: "flotilla".into(),
                     kind: "convoys".into(),
                     include_replicas: false,
+                    replica_sources: false,
                     cursor: None,
                 }
             });

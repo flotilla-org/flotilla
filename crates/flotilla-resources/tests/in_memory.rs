@@ -6,9 +6,14 @@ use common::{
     contract::{
         assert_consumer_relists_after_expired_watch_and_converges_with_backend, assert_create_get_list_roundtrip,
         assert_delete_emits_event, assert_identical_status_update_is_noop_with_backend, assert_identical_update_is_noop_with_backend,
-        assert_metadata_roundtrip, assert_namespace_isolation, assert_repeated_delete_with_pending_finalizers_is_noop_with_backend,
-        assert_replica_read_view_contract, assert_stale_resource_version_conflicts,
-        assert_store_diagnostics_report_retained_events_with_backend, assert_watch_from_version_replays, assert_watch_now_semantics,
+        assert_metadata_roundtrip, assert_namespace_isolation, assert_project_definition_causal_merge_with_backend,
+        assert_project_definition_delete_conflicts_with_concurrent_edit_with_backend,
+        assert_project_definition_edit_converges_with_backend, assert_project_definition_edit_preserves_unrelated_conflict_with_backend,
+        assert_project_definition_optional_field_can_be_cleared_with_backend,
+        assert_repeated_delete_with_pending_finalizers_is_noop_with_backend,
+        assert_replica_events_ignore_stale_writes_and_deletes_with_backend, assert_replica_read_view_contract,
+        assert_stale_resource_version_conflicts, assert_store_diagnostics_report_retained_events_with_backend,
+        assert_watch_from_version_replays, assert_watch_now_semantics,
         assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
         assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture, DemandFixture, RegardFixture,
     },
@@ -118,6 +123,37 @@ resource_contract_tests!(demand_contract, DemandFixture);
 #[tokio::test]
 async fn replica_read_view_contract() {
     assert_replica_read_view_contract(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}
+
+#[tokio::test]
+async fn replica_events_ignore_stale_writes_and_deletes() {
+    assert_replica_events_ignore_stale_writes_and_deletes_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}
+
+#[tokio::test]
+async fn project_definition_edit_converges() {
+    assert_project_definition_edit_converges_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}
+
+#[tokio::test]
+async fn project_definition_causal_merge() {
+    assert_project_definition_causal_merge_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}
+
+#[tokio::test]
+async fn project_definition_optional_field_can_be_cleared() {
+    assert_project_definition_optional_field_can_be_cleared_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}
+
+#[tokio::test]
+async fn project_definition_edit_preserves_unrelated_conflict() {
+    assert_project_definition_edit_preserves_unrelated_conflict_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}
+
+#[tokio::test]
+async fn project_definition_delete_conflicts_with_concurrent_edit() {
+    assert_project_definition_delete_conflicts_with_concurrent_edit_with_backend(ResourceBackend::InMemory(InMemoryBackend::default()))
+        .await;
 }
 
 #[tokio::test]

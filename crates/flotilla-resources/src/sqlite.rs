@@ -16,7 +16,7 @@ use tokio_rusqlite::Connection;
 use crate::{
     error::ResourceError,
     replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
-    resource::{InputMeta, K8sResourceObject, ObjectMeta, Resource, ResourceObject},
+    resource::{InputMeta, K8sResourceObject, MergeMetadata, ObjectMeta, Resource, ResourceObject},
     retention::{EventRetention, ResourceStoreDiagnostics},
     watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
 };
@@ -36,6 +36,7 @@ pub struct SqliteBackend {
     watchers: Arc<Mutex<WatchersByStore>>,
     replica_watchers: Arc<Mutex<ReplicaWatchersByStore>>,
     event_retention: EventRetention,
+    local_root: Option<NodeId>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +104,7 @@ impl SqliteBackend {
             watchers: Arc::new(Mutex::new(HashMap::new())),
             replica_watchers: Arc::new(Mutex::new(HashMap::new())),
             event_retention,
+            local_root: None,
         })
     }
 
@@ -116,7 +118,17 @@ impl SqliteBackend {
             watchers: Arc::new(Mutex::new(HashMap::new())),
             replica_watchers: Arc::new(Mutex::new(HashMap::new())),
             event_retention,
+            local_root: None,
         })
+    }
+
+    pub(crate) fn with_local_root(mut self, local_root: NodeId) -> Self {
+        self.local_root = Some(local_root);
+        self
+    }
+
+    pub(crate) fn local_root(&self) -> NodeId {
+        self.local_root.clone().unwrap_or_else(|| NodeId::new("local"))
     }
 
     fn initialize_connection(connection: &mut RusqliteConnection, event_retention: EventRetention) -> Result<(), ResourceError> {
@@ -191,6 +203,17 @@ impl SqliteBackend {
                     generation TEXT,
                     last_synced_at TEXT NOT NULL,
                     PRIMARY KEY (origin_root, group_name, version, kind, namespace)
+                );
+
+                CREATE TABLE IF NOT EXISTS replica_tombstones (
+                    origin_root TEXT NOT NULL,
+                    group_name TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    last_synced_at TEXT NOT NULL,
+                    PRIMARY KEY (origin_root, group_name, version, kind, namespace, name)
                 );
                 "#,
             )
@@ -553,6 +576,14 @@ impl SqliteBackend {
                     params![origin, key.0, key.1, key.2, key.3],
                 )
                 .map_err(|err| Self::map_sqlite(err, "clear sqlite replica partition"))?;
+                tx.execute(
+                    r#"
+                    DELETE FROM replica_tombstones
+                    WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5
+                    "#,
+                    params![origin, key.0, key.1, key.2, key.3],
+                )
+                .map_err(|err| Self::map_sqlite(err, "clear sqlite replica tombstones"))?;
                 for (name, body) in &encoded {
                     tx.execute(
                         r#"
@@ -630,12 +661,53 @@ impl SqliteBackend {
         let body =
             serde_json::to_string(&value).map_err(|err| ResourceError::decode(format!("encode sqlite replica event JSON: {err}")))?;
         let synced = synced_at.to_rfc3339();
-        self.call(move |connection| {
-            let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite replica event"))?;
-            match kind {
-                StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
-                    tx.execute(
+        let changed = self
+            .call(move |connection| {
+                let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite replica event"))?;
+                let existing = tx
+                    .query_row(
                         r#"
+                        SELECT body_json, last_synced_at
+                        FROM replica_objects
+                        WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
+                        "#,
+                        params![origin, key.0, key.1, key.2, key.3, name],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(|err| Self::map_sqlite(err, "read existing sqlite replica event object"))?;
+                let tombstone_synced_at = tx
+                    .query_row(
+                        r#"
+                        SELECT last_synced_at
+                        FROM replica_tombstones
+                        WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
+                        "#,
+                        params![origin, key.0, key.1, key.2, key.3, name],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|err| Self::map_sqlite(err, "read sqlite replica tombstone"))?;
+                let unchanged = match kind {
+                    StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
+                        tombstone_synced_at.as_ref().is_some_and(|existing_synced| existing_synced >= &synced)
+                            || existing.as_ref().is_some_and(|(existing_body, existing_synced)| {
+                                existing_synced > &synced || (existing_synced == &synced && existing_body >= &body)
+                            })
+                    }
+                    StoredReplicaEventKind::Deleted => {
+                        tombstone_synced_at.as_ref().is_some_and(|existing_synced| existing_synced >= &synced)
+                            || existing.as_ref().is_some_and(|(_, existing_synced)| existing_synced > &synced)
+                    }
+                };
+                if unchanged {
+                    return Ok(false);
+                }
+
+                match kind {
+                    StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
+                        tx.execute(
+                            r#"
                         INSERT INTO replica_objects
                             (origin_root, group_name, version, kind, namespace, name, body_json, last_synced_at)
                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -643,33 +715,56 @@ impl SqliteBackend {
                         DO UPDATE SET body_json = excluded.body_json,
                                       last_synced_at = excluded.last_synced_at
                         "#,
-                        params![origin, key.0, key.1, key.2, key.3, name, body, synced],
-                    )
-                    .map_err(|err| Self::map_sqlite(err, "upsert sqlite replica event object"))?;
-                }
-                StoredReplicaEventKind::Deleted => {
-                    tx.execute(
-                        r#"
-                        DELETE FROM replica_objects
+                            params![origin, key.0, key.1, key.2, key.3, name, body, synced],
+                        )
+                        .map_err(|err| Self::map_sqlite(err, "upsert sqlite replica event object"))?;
+                        tx.execute(
+                            r#"
+                        DELETE FROM replica_tombstones
                         WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
                         "#,
-                        params![origin, key.0, key.1, key.2, key.3, name],
-                    )
-                    .map_err(|err| Self::map_sqlite(err, "delete sqlite replica event object"))?;
+                            params![origin, key.0, key.1, key.2, key.3, name],
+                        )
+                        .map_err(|err| Self::map_sqlite(err, "clear sqlite replica tombstone"))?;
+                    }
+                    StoredReplicaEventKind::Deleted => {
+                        tx.execute(
+                            r#"
+                            DELETE FROM replica_objects
+                            WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
+                            "#,
+                            params![origin, key.0, key.1, key.2, key.3, name],
+                        )
+                        .map_err(|err| Self::map_sqlite(err, "delete sqlite replica event object"))?;
+                        tx.execute(
+                            r#"
+                            INSERT INTO replica_tombstones
+                                (origin_root, group_name, version, kind, namespace, name, last_synced_at)
+                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                            ON CONFLICT(origin_root, group_name, version, kind, namespace, name)
+                            DO UPDATE SET last_synced_at = excluded.last_synced_at
+                            "#,
+                            params![origin, key.0, key.1, key.2, key.3, name, synced],
+                        )
+                        .map_err(|err| Self::map_sqlite(err, "write sqlite replica tombstone"))?;
+                    }
                 }
-            }
-            tx.execute(
-                r#"
+                tx.execute(
+                    r#"
                 UPDATE replica_cursors
                 SET resource_version = ?6, last_synced_at = ?7
                 WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5
                 "#,
-                params![origin, key.0, key.1, key.2, key.3, resource_version, synced],
-            )
-            .map_err(|err| Self::map_sqlite(err, "advance sqlite replica cursor"))?;
-            tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite replica event"))
-        })
-        .await?;
+                    params![origin, key.0, key.1, key.2, key.3, resource_version, synced],
+                )
+                .map_err(|err| Self::map_sqlite(err, "advance sqlite replica cursor"))?;
+                tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite replica event"))?;
+                Ok(true)
+            })
+            .await?;
+        if !changed {
+            return Ok(());
+        }
         Self::notify_replica_watchers(&self.replica_watchers, &operation_key, StoredReplicaEvent {
             origin_root: origin_root.clone(),
             synced_at,
@@ -775,6 +870,26 @@ impl SqliteBackend {
         meta: &InputMeta,
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
+        self.create_typed_with_merge(namespace, meta, spec, None).await
+    }
+
+    pub(crate) async fn create_definition_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        meta: &InputMeta,
+        spec: &T::Spec,
+        merge: MergeMetadata,
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        self.create_typed_with_merge(namespace, meta, spec, Some(merge)).await
+    }
+
+    async fn create_typed_with_merge<T: Resource>(
+        &self,
+        namespace: &str,
+        meta: &InputMeta,
+        spec: &T::Spec,
+        merge: Option<MergeMetadata>,
+    ) -> Result<ResourceObject<T>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
         let namespace = namespace.to_string();
         let meta = meta.clone();
@@ -811,6 +926,7 @@ impl SqliteBackend {
                     finalizers: meta.finalizers.clone(),
                     deletion_timestamp: meta.deletion_timestamp,
                     creation_timestamp: Utc::now(),
+                    merge,
                 },
                 spec: Self::clone_through_serde(&spec)?,
                 status: None,
@@ -840,6 +956,28 @@ impl SqliteBackend {
         resource_version: &str,
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
+        self.update_typed_with_merge(namespace, meta, resource_version, spec, None).await
+    }
+
+    pub(crate) async fn update_definition_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        meta: &InputMeta,
+        resource_version: &str,
+        spec: &T::Spec,
+        merge: MergeMetadata,
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        self.update_typed_with_merge(namespace, meta, resource_version, spec, Some(merge)).await
+    }
+
+    async fn update_typed_with_merge<T: Resource>(
+        &self,
+        namespace: &str,
+        meta: &InputMeta,
+        resource_version: &str,
+        spec: &T::Spec,
+        admitted_merge: Option<MergeMetadata>,
+    ) -> Result<ResourceObject<T>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
         let meta = meta.clone();
         let resource_version = resource_version.to_string();
@@ -854,7 +992,9 @@ impl SqliteBackend {
                 return Err(ResourceError::conflict(&meta.name, "stale resourceVersion"));
             }
             T::validate_spec_update(&object.spec, &spec)?;
-            if object.matches_update(&meta, &spec)? {
+            if object.matches_update(&meta, &spec)?
+                && admitted_merge.as_ref().is_none_or(|merge| object.metadata.merge.as_ref() == Some(merge))
+            {
                 return Ok(object);
             }
 
@@ -865,11 +1005,17 @@ impl SqliteBackend {
             object.metadata.owner_references = meta.owner_references.clone();
             object.metadata.finalizers = meta.finalizers.clone();
             object.metadata.deletion_timestamp = meta.deletion_timestamp;
+            if let Some(merge) = admitted_merge {
+                object.metadata.merge = Some(merge);
+            }
             object.spec = Self::clone_through_serde(&spec)?;
 
             let encoded = Self::encode_object(&object)?;
             let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
-            let event_kind = if object.metadata.deletion_timestamp.is_some() && object.metadata.finalizers.is_empty() {
+            let event_kind = if T::REPLICATION_CLASS != crate::ReplicationClass::Definitions
+                && object.metadata.deletion_timestamp.is_some()
+                && object.metadata.finalizers.is_empty()
+            {
                 tx.execute(
                     r#"
                     DELETE FROM resource_objects

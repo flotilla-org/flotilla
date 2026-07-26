@@ -962,6 +962,7 @@ async fn run_resource_watch(cli: &Cli, args: ResourceListArgs, format: OutputFor
                 namespace: args.namespace,
                 kind: args.kind,
                 include_replicas: args.include_replicas,
+                replica_sources: false,
                 cursor: None,
             },
         })
