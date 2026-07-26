@@ -59,12 +59,6 @@ pub const KEY_VESSEL_HOST: &str = "flotilla.vessel.host";
 pub const KEY_INDEPENDENT_HOST: &str = "flotilla.independent.host";
 pub const KEY_VESSEL_ENV: &str = "flotilla.vessel.env";
 pub const KEY_CREW_ROLES: &str = "flotilla.crew.roles";
-/// External change-request number without display decoration such as `PR #`.
-pub const KEY_CHANGE_REQUEST_NUMBER: &str = "change_request.number";
-/// Checkout branch without its path or other display decoration.
-pub const KEY_CHECKOUT_BRANCH: &str = "checkout.branch";
-/// Full checkout path without its branch or other display decoration.
-pub const KEY_CHECKOUT_PATH: &str = "checkout.path";
 
 // Cross-producer vocabulary (proposed for the Leg-1 freeze, design §6/§9).
 
@@ -87,6 +81,12 @@ pub const KEY_STATUS_ATTENTION: &str = "status.attention";
 pub const KEY_STATUS_CONNECTIVITY: &str = "status.connectivity";
 /// Short human summary line, e.g. "2/3 vessels done".
 pub const KEY_SUMMARY_TEXT: &str = "summary.text";
+/// External change-request number without display decoration such as `PR #`.
+pub const KEY_CHANGE_REQUEST_NUMBER: &str = "change_request.number";
+/// Checkout branch without its path or other display decoration.
+pub const KEY_CHECKOUT_BRANCH: &str = "checkout.branch";
+/// Full checkout path without its branch or other display decoration.
+pub const KEY_CHECKOUT_PATH: &str = "checkout.path";
 pub const KEY_COUNT_TOTAL: &str = "count.total";
 pub const KEY_COUNT_ISSUES: &str = "count.issues";
 pub const KEY_COUNT_CONVOYS: &str = "count.convoys";
