@@ -253,6 +253,10 @@ impl PeerRuntime {
                                 daemon_for_cleanup.publish_peer_connection_status(peer, PeerConnectionState::Reconnecting).await;
                             }
                             let delay = SshTransport::backoff_delay(attempt);
+                            {
+                                let mut pm = pm.lock().await;
+                                pm.note_reconnect_backoff(&target_label, attempt, delay);
+                            }
                             info!(target = %target_label.0, %attempt, delay_secs = delay.as_secs(), "reconnecting after backoff");
                             tokio::time::sleep(delay).await;
 

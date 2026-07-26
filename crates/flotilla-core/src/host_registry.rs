@@ -105,7 +105,7 @@ impl HostRegistry {
         host_entries.sort_by(|a, b| {
             b.is_local
                 .cmp(&a.is_local)
-                .then_with(|| a.node.node_id.cmp(&b.node.node_id))
+                .then_with(|| a.node.as_ref().map(|node| &node.node_id).cmp(&b.node.as_ref().map(|node| &node.node_id)))
                 .then_with(|| a.environment_id.cmp(&b.environment_id))
         });
 
@@ -728,12 +728,13 @@ fn build_host_list_entry_from_state(
         state.summary.as_ref().and_then(|summary| summary.host_name.clone()).unwrap_or_else(|| HostName::new(node.display_name.clone()));
 
     HostListEntry {
-        environment_id: state.environment_id.clone(),
+        environment_id: Some(state.environment_id.clone()),
         host_name,
-        node,
+        node: Some(node),
         is_local,
         configured: !is_local && configured.contains_key(&state.node_id),
         connection_status: connection_status_for_node(local_node, node_connectivity, &state.node_id),
+        reconnect: None,
         has_summary: state.summary.is_some(),
         repo_count: counts.repo_count,
         work_item_count: counts.work_item_count,
@@ -866,7 +867,7 @@ mod tests {
         registry.set_configured_peers(vec![NodeInfo::new(NodeId::new("peer-node"), "Build Box")], &HashMap::new(), &|_| {}).await;
 
         let hosts = registry.list_hosts(&HashMap::new()).await;
-        assert!(hosts.hosts.iter().all(|entry| entry.node.node_id != peer_node().node_id));
+        assert!(hosts.hosts.iter().all(|entry| entry.node.as_ref().is_none_or(|node| node.node_id != peer_node().node_id)));
     }
 
     #[tokio::test]
@@ -939,11 +940,11 @@ mod tests {
 
         let hosts = registry.list_hosts(&HashMap::new()).await;
         assert!(
-            hosts.hosts.iter().any(|entry| entry.environment_id == first_environment_id),
+            hosts.hosts.iter().any(|entry| entry.environment_id.as_ref() == Some(&first_environment_id)),
             "the first live environment should remain visible"
         );
         assert!(
-            hosts.hosts.iter().any(|entry| entry.environment_id == second_environment_id),
+            hosts.hosts.iter().any(|entry| entry.environment_id.as_ref() == Some(&second_environment_id)),
             "the second live environment should be visible even with a placeholder summary"
         );
     }
@@ -1010,7 +1011,7 @@ mod tests {
         registry.publish_peer_connection_status(&peer_node(), PeerConnectionState::Connected, &HashMap::new(), &|_| {}).await;
 
         let hosts = registry.list_hosts(&HashMap::new()).await;
-        assert!(hosts.hosts.iter().all(|entry| entry.node.node_id != peer_node().node_id));
+        assert!(hosts.hosts.iter().all(|entry| entry.node.as_ref().is_none_or(|node| node.node_id != peer_node().node_id)));
     }
 
     #[tokio::test]
@@ -1111,11 +1112,12 @@ mod tests {
         registry.publish_peer_summary(second_summary.clone(), &|_| {}).await;
 
         let hosts = registry.list_hosts(&HashMap::new()).await;
-        let peer_entries: Vec<_> = hosts.hosts.iter().filter(|entry| entry.node.node_id == peer.node_id).collect();
+        let peer_entries: Vec<_> =
+            hosts.hosts.iter().filter(|entry| entry.node.as_ref().is_some_and(|node| node.node_id == peer.node_id)).collect();
 
         assert_eq!(peer_entries.len(), 2, "a single node should be able to expose multiple host environments");
-        assert!(peer_entries.iter().any(|entry| entry.environment_id == first_summary.environment_id));
-        assert!(peer_entries.iter().any(|entry| entry.environment_id == second_summary.environment_id));
+        assert!(peer_entries.iter().any(|entry| entry.environment_id.as_ref() == Some(&first_summary.environment_id)));
+        assert!(peer_entries.iter().any(|entry| entry.environment_id.as_ref() == Some(&second_summary.environment_id)));
 
         let status_a =
             registry.get_host_status(&first_summary.environment_id, &HashMap::new()).await.expect("status for first environment");
@@ -1253,8 +1255,10 @@ mod tests {
         ]);
         let hosts = registry.list_hosts(&counts).await;
 
-        let first_entry = hosts.hosts.iter().find(|entry| entry.environment_id == first_environment_id).expect("first entry");
-        let second_entry = hosts.hosts.iter().find(|entry| entry.environment_id == second_environment_id).expect("second entry");
+        let first_entry =
+            hosts.hosts.iter().find(|entry| entry.environment_id.as_ref() == Some(&first_environment_id)).expect("first entry");
+        let second_entry =
+            hosts.hosts.iter().find(|entry| entry.environment_id.as_ref() == Some(&second_environment_id)).expect("second entry");
         assert_eq!((first_entry.repo_count, first_entry.work_item_count), (1, 2));
         assert_eq!((second_entry.repo_count, second_entry.work_item_count), (3, 5));
     }

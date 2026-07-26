@@ -8,9 +8,9 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
-    Command, CommandPeerEvent, CommandValue, ConfigLabel, EnvironmentId, GoodbyeReason, HostName, HostSummary, NodeId, NodeInfo,
-    PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepositoryKey, RoutedPeerMessage, Step, StepOutcome,
-    StepStatus, TopologyRoute, VectorClock,
+    Command, CommandPeerEvent, CommandValue, ConfigLabel, EnvironmentId, GoodbyeReason, HostListEntry, HostListResponse, HostName,
+    HostSummary, NodeId, NodeInfo, PeerConnectionState, PeerDataKind, PeerDataMessage, PeerReconnectStatus, PeerWireMessage, ProviderData,
+    RepoIdentity, RepositoryKey, RoutedPeerMessage, Step, StepOutcome, StepStatus, TopologyRoute, VectorClock,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -177,6 +177,13 @@ struct ConfiguredPeerTarget {
 struct PeerDialStatus {
     last_attempt: Option<DateTime<Utc>>,
     last_error: Option<String>,
+    reconnect_backoff: Option<ReconnectBackoff>,
+}
+
+#[derive(Debug, Clone)]
+struct ReconnectBackoff {
+    attempt: u32,
+    next_dial_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -383,7 +390,67 @@ impl PeerManager {
 
     pub fn note_dial_result(&mut self, label: &ConfigLabel, result: Result<(), &str>) {
         let status = self.peer_dial_status.entry(label.clone()).or_default();
+        let connected = result.is_ok();
         status.last_error = result.err().map(str::to_string);
+        if connected {
+            status.reconnect_backoff = None;
+        }
+    }
+
+    pub fn note_reconnect_backoff(&mut self, label: &ConfigLabel, attempt: u32, delay: Duration) {
+        self.peer_dial_status.entry(label.clone()).or_default().reconnect_backoff =
+            Some(ReconnectBackoff { attempt, next_dial_at: Instant::now() + delay });
+    }
+
+    pub fn project_host_list(&self, response: &mut HostListResponse) {
+        for (label, target) in &self.configured_targets {
+            let node_id =
+                self.transport_peers.get(label).or_else(|| self.learned_transport_peers.get(label)).or(target.expected_node_id.as_ref());
+            let reconnect = self.peer_dial_status.get(label).and_then(|status| status.reconnect_backoff.as_ref()).map(|backoff| {
+                let remaining = backoff.next_dial_at.saturating_duration_since(Instant::now());
+                let next_dial_in_seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+                PeerReconnectStatus { attempt: backoff.attempt, next_dial_in_seconds }
+            });
+            let connected = self.transport_peers.contains_key(label);
+            let connection_status = if connected {
+                PeerConnectionState::Connected
+            } else if reconnect.is_some() {
+                PeerConnectionState::Reconnecting
+            } else {
+                PeerConnectionState::Disconnected
+            };
+
+            let existing = node_id.and_then(|node_id| {
+                response.hosts.iter_mut().find(|entry| entry.node.as_ref().is_some_and(|node| node.node_id == *node_id))
+            });
+            if let Some(entry) = existing {
+                entry.configured = true;
+                entry.connection_status = connection_status;
+                entry.reconnect = reconnect;
+                continue;
+            }
+
+            response.hosts.push(HostListEntry {
+                environment_id: None,
+                host_name: target.expected_host_name.clone(),
+                node: node_id.map(|node_id| self.node_info_for(node_id)),
+                is_local: false,
+                configured: true,
+                connection_status,
+                reconnect,
+                has_summary: false,
+                repo_count: 0,
+                work_item_count: 0,
+            });
+        }
+
+        response.hosts.sort_by(|left, right| {
+            right
+                .is_local
+                .cmp(&left.is_local)
+                .then_with(|| left.host_name.cmp(&right.host_name))
+                .then_with(|| left.node.as_ref().map(|node| &node.node_id).cmp(&right.node.as_ref().map(|node| &node.node_id)))
+        });
     }
 
     /// Register or replace a sender for a connected peer.

@@ -246,7 +246,11 @@ impl RemoteCommandRouter {
         let target_node_id = command.node_id.clone().unwrap_or_else(|| self.daemon.node_id().clone());
 
         if target_node_id == *self.daemon.node_id() {
-            return self.daemon.execute_query(command, session_id).await;
+            let mut value = self.daemon.execute_query(command, session_id).await?;
+            if let CommandValue::HostList(response) = &mut value {
+                self.peer_manager.lock().await.project_host_list(response);
+            }
+            return Ok(value);
         }
 
         let request_id = {

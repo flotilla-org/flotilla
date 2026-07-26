@@ -672,6 +672,26 @@ async fn configured_targets_are_stored_separately_from_established_peers() {
     assert!(established.is_empty(), "configured targets should not look established before handshake");
 }
 
+#[test]
+fn host_list_projection_includes_configured_target_in_redial_backoff() {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    add_configured_transport(&mut mgr, "feta", "feta", MockTransport::new());
+    mgr.note_reconnect_backoff(&ConfigLabel("feta".into()), 592, Duration::from_secs(60));
+    let mut response = flotilla_protocol::HostListResponse { hosts: vec![] };
+
+    mgr.project_host_list(&mut response);
+
+    let [feta] = response.hosts.as_slice() else {
+        panic!("expected one configured host row, got {:?}", response.hosts);
+    };
+    assert_eq!(feta.host_name, HostName::new("feta"));
+    assert_eq!(feta.environment_id, None);
+    assert_eq!(feta.node, None);
+    assert!(feta.configured);
+    assert_eq!(feta.connection_status, PeerConnectionState::Reconnecting);
+    assert_eq!(feta.reconnect, Some(flotilla_protocol::PeerReconnectStatus { attempt: 592, next_dial_in_seconds: 60 }));
+}
+
 #[tokio::test]
 async fn reconnect_target_uses_handshake_node_identity() {
     let mut mgr = PeerManager::new(NodeId::new("z"));

@@ -119,23 +119,25 @@ mod status_human {
         let response = HostListResponse {
             hosts: vec![
                 HostListEntry {
-                    environment_id: EnvironmentId::host(HostId::new("local-env")),
+                    environment_id: Some(EnvironmentId::host(HostId::new("local-env"))),
                     host_name: HostName::new("local"),
-                    node: NodeInfo::new(NodeId::new("local"), "local"),
+                    node: Some(NodeInfo::new(NodeId::new("local"), "local")),
                     is_local: true,
                     configured: false,
                     connection_status: PeerConnectionState::Connected,
+                    reconnect: None,
                     has_summary: true,
                     repo_count: 2,
                     work_item_count: 5,
                 },
                 HostListEntry {
-                    environment_id: EnvironmentId::host(HostId::new("remote-env")),
+                    environment_id: Some(EnvironmentId::host(HostId::new("remote-env"))),
                     host_name: HostName::new("remote"),
-                    node: NodeInfo::new(NodeId::new("remote"), "remote"),
+                    node: Some(NodeInfo::new(NodeId::new("remote"), "remote")),
                     is_local: false,
                     configured: true,
-                    connection_status: PeerConnectionState::Disconnected,
+                    connection_status: PeerConnectionState::Reconnecting,
+                    reconnect: Some(flotilla_protocol::PeerReconnectStatus { attempt: 592, next_dial_in_seconds: 37 }),
                     has_summary: false,
                     repo_count: 0,
                     work_item_count: 0,
@@ -145,7 +147,7 @@ mod status_human {
 
         let output = format_host_list_human(&response);
         assert!(output.contains("remote"));
-        assert!(output.contains("disconnected"));
+        assert!(output.contains("reconnecting (attempt 592, next dial in 37s)"));
         assert!(output.contains("5"));
     }
 
