@@ -24,7 +24,8 @@ The three layers have different jobs:
    origin-authored logs, durable replicas, relay, and list/watch API as authored
    definitions in
    [ADR 0016](../../adr/0016-overlay-replication-for-cross-root-state.md),
-   subject to the authored-resource ruling in #1090. ADR 0016's existing
+   subject to the authored-resource ruling in
+   [#1090](https://github.com/flotilla-org/flotilla/issues/1090). ADR 0016's existing
    per-field merge does not directly merge separate immutable statements; the
    annotation reducer needs slot-level causal context stamped at admission.
    "Separate stream" is useful as a logical description, as with Git notes,
@@ -75,7 +76,9 @@ Several existing rulings constrain the answer:
   ([ADR 0018](../../adr/0018-presentation-attention-demands-regards-projection.md)).
 - [The #1037 ruling](https://github.com/flotilla-org/flotilla/issues/1037)
   makes a convoy's project context an admission-time fact and makes appearance
-  query-governed. The #1089 starting position likewise treats issue provenance
+  query-governed. The
+  [#1089](https://github.com/flotilla-org/flotilla/issues/1089) starting position
+  likewise treats issue provenance
   stamped at admission as constitutive. The annotation layer must not turn
   either fact into detachable commentary.
 - [The #1072 ruling](https://github.com/flotilla-org/flotilla/issues/1072)
@@ -343,7 +346,8 @@ The resolution rules should be:
 - **Rename with the same UID:** the statement follows automatically; the
   current locator is projected from the live entity.
 - **Move represented by the same logical UID:** likewise.
-- **Migration that changes native identity:** #1039 must emit an explicit
+- **Migration that changes native identity:**
+  [#1039](https://github.com/flotilla-org/flotilla/issues/1039) must emit an explicit
   continuity/alias fact. A resolver may then present the successor, retaining
   both old and new identities in provenance.
 - **Delete and recreate under the same name:** the new UID is a different
@@ -477,8 +481,8 @@ the original body; they never disappear from a surface.
 
 | Candidate | Source fact | View |
 |---|---|---|
-| Convoy's project association | Constitutive context stamped on the Convoy at admission, per #1037 | "Appears in project" and project → convoys |
-| Convoy's issue association | Constitutive provenance stamped on the Convoy at admission, per #1089's starting position | Issue → convoys reverse index |
+| Convoy's project association | Constitutive context stamped on the Convoy at admission, per [#1037](https://github.com/flotilla-org/flotilla/issues/1037) | "Appears in project" and project → convoys |
+| Convoy's issue association | Constitutive provenance stamped on the Convoy at admission, per [#1089](https://github.com/flotilla-org/flotilla/issues/1089)'s starting position | Issue → convoys reverse index |
 | Agent-authored note | `Note` annotation statement | Notes-by-subject, unread-note badge, summary |
 | Human triage decision | `TriageDecision` statement, if the foreign issue owner would not accept it as issue state | Effective triage state after policy/conflict reduction |
 | Mechanical triage readiness | Observed forge/resource facts and declared readiness rule | Ready / needs-info / stale queue |
@@ -593,10 +597,13 @@ data migrations. A view must remain rebuildable and application-read-only.
 
 ### Decisions still needed
 
-1. **Stable identity (#1039).** Define rename/move continuity for internal
+1. **Stable identity
+   ([#1039](https://github.com/flotilla-org/flotilla/issues/1039)).** Define
+   rename/move continuity for internal
    Project, Repository, Convoy, and other logical subjects, plus the external
    provider mapping contract.
-2. **Authored mastering (#1090).** The companion
+2. **Authored mastering
+   ([#1090](https://github.com/flotilla-org/flotilla/issues/1090)).** The companion
    [issue #1090](https://github.com/flotilla-org/flotilla/issues/1090) may amend
    which authored kinds use ADR 0016 definitions semantics. Annotations should
    not invent a temporary master while that is open.
@@ -636,7 +643,9 @@ Use one internal subject and one source-qualified GitHub issue/PR subject. Test:
 - full projection rebuild from resource logs;
 - raw fallback rendering with an unknown schema version.
 
-The experiment should end in an ADR only after #1039 and #1090 rule their shared
+The experiment should end in an ADR only after
+[#1039](https://github.com/flotilla-org/flotilla/issues/1039) and
+[#1090](https://github.com/flotilla-org/flotilla/issues/1090) rule their shared
 identity and authored-resource substrate. The research recommendation does not
 require another event transport or a general-purpose materialized-view engine.
 
