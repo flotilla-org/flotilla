@@ -1,14 +1,15 @@
 use flotilla_protocol::{
     result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessState, CrewMemberSummary},
-    HostName, IssueRef, IssueSource, RepoKey, ResourceRef,
+    ChangeRequestStatus, ConvoyChangeRequest, HostName, IssueRef, IssueSource, RepoKey, RepositoryKey, ResourceRef,
 };
 
 use super::*;
 use crate::{
     entity::{self, EntityKind},
     keys::{
-        KEY_CONVOY, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_PRIMARY_ACTION_RECIPE,
-        KEY_PRIMARY_ACTION_TARGET, KEY_SOURCE, KEY_STATUS_STATE, KEY_VESSEL, SEGMENT_PROJECT, SEGMENT_REPO,
+        KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY, KEY_CONVOY_NAME, KEY_COUNT_CHECKOUTS,
+        KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_DISPLAY_LABEL, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_PRIMARY_ACTION_RECIPE,
+        KEY_PRIMARY_ACTION_TARGET, KEY_SOURCE, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL, SEGMENT_PROJECT, SEGMENT_REPO,
     },
     recipe::FlotillaRecipes,
 };
@@ -53,6 +54,11 @@ fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
         .phase(ConvoyPhase::Active)
         .project_ref("project/dev/platform")
         .repo(RepoKey("github.com:flotilla-org/flotilla".to_owned()))
+        .change_request(ConvoyChangeRequest {
+            id: "1044".to_owned(),
+            status: ChangeRequestStatus::Open,
+            repository_key: RepositoryKey("repo-flotilla".to_owned()),
+        })
         .vessels(vec![vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).materialize("terminal-cutover-coder").call()])
         .build();
 
@@ -72,6 +78,7 @@ fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
     assert_eq!(text(convoy_patch, SEGMENT_PROJECT), "dev/platform@kiwi");
     assert_eq!(text(convoy_patch, SEGMENT_REPO), "github.com:flotilla-org/flotilla");
     assert_eq!(text(convoy_patch, KEY_CONVOY), "dev/cutover@kiwi");
+    assert_eq!(text(convoy_patch, KEY_CHANGE_REQUEST_NUMBER), "1044");
     assert_eq!(text(vessel_patch, KEY_VESSEL), "dev/cutover/coder@feta");
     assert_eq!(
         text(convoy_patch, KEY_PRIMARY_ACTION_TARGET),
@@ -119,6 +126,60 @@ fn awareness_issues_are_recipe_less_entities_with_source_plus_id_identity() {
     );
     assert!(!issue_patch.set.contains_key(KEY_COUNT_ISSUES));
     assert!(!issue_patch.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
+}
+
+#[test]
+fn awareness_composed_text_is_unchanged_alongside_granular_facts() {
+    let convoy = AwarenessEntry::builder()
+        .id("convoy/dev/landing".to_owned())
+        .kind(AwarenessKind::Convoy)
+        .label("landing · PR #1044".to_owned())
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .annotations(std::collections::HashMap::from([
+            (KEY_CONVOY_NAME.to_owned(), "landing".to_owned()),
+            (KEY_CHANGE_REQUEST_NUMBER.to_owned(), "1044".to_owned()),
+        ]))
+        .build();
+    let checkout = AwarenessEntry::builder()
+        .id("checkout/kiwi//work/flotilla".to_owned())
+        .kind(AwarenessKind::Checkout)
+        .label("main · /work/flotilla".to_owned())
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .annotations(std::collections::HashMap::from([
+            (KEY_CHECKOUT_BRANCH.to_owned(), "main".to_owned()),
+            (KEY_CHECKOUT_PATH.to_owned(), "/work/flotilla".to_owned()),
+        ]))
+        .build();
+    let node = AwarenessNode::builder()
+        .id("project/dev/platform".to_owned())
+        .kind(AwarenessKind::Project)
+        .label("platform".to_owned())
+        .scope(flotilla_protocol::QueryScope::new("dev", "platform"))
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .counts(AwarenessCounts::builder().total(2).convoys(1).checkouts(1).build())
+        .entries(vec![convoy, checkout])
+        .build();
+
+    let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
+    let convoy = find_entity(&patches, &entity::convoy("dev", "landing", "fleet"));
+    assert_eq!(text(convoy, KEY_DISPLAY_LABEL), "landing · PR #1044");
+    assert_eq!(text(convoy, KEY_SUMMARY_TEXT), "landing · PR #1044");
+    assert_eq!(text(convoy, KEY_CONVOY_NAME), "landing");
+    assert_eq!(text(convoy, KEY_CHANGE_REQUEST_NUMBER), "1044");
+
+    let checkout = find_entity(&patches, &entity::checkout("checkout/kiwi//work/flotilla"));
+    assert_eq!(text(checkout, KEY_DISPLAY_LABEL), "main · /work/flotilla");
+    assert_eq!(text(checkout, KEY_SUMMARY_TEXT), "main · /work/flotilla");
+    assert_eq!(text(checkout, KEY_CHECKOUT_BRANCH), "main");
+    assert_eq!(text(checkout, KEY_CHECKOUT_PATH), "/work/flotilla");
+
+    let project = find_entity(&patches, &entity::project("dev", "platform", "fleet"));
+    assert_eq!(text(project, KEY_SUMMARY_TEXT), "2 entries · 0 issues · 0 vessels · 1 checkouts");
+    assert_eq!(project.set[KEY_COUNT_TOTAL].value, MetadataValue::Integer(2));
+    assert_eq!(project.set[KEY_COUNT_CHECKOUTS].value, MetadataValue::Integer(1));
 }
 
 #[test]

@@ -81,6 +81,12 @@ pub const KEY_STATUS_ATTENTION: &str = "status.attention";
 pub const KEY_STATUS_CONNECTIVITY: &str = "status.connectivity";
 /// Short human summary line, e.g. "2/3 vessels done".
 pub const KEY_SUMMARY_TEXT: &str = "summary.text";
+/// External change-request number without display decoration such as `PR #`.
+pub const KEY_CHANGE_REQUEST_NUMBER: &str = "change_request.number";
+/// Checkout branch without its path or other display decoration.
+pub const KEY_CHECKOUT_BRANCH: &str = "checkout.branch";
+/// Full checkout path without its branch or other display decoration.
+pub const KEY_CHECKOUT_PATH: &str = "checkout.path";
 pub const KEY_COUNT_TOTAL: &str = "count.total";
 pub const KEY_COUNT_ISSUES: &str = "count.issues";
 pub const KEY_COUNT_CONVOYS: &str = "count.convoys";
@@ -97,6 +103,7 @@ pub const KEY_PRIMARY_ACTION_RECIPE: &str = "action.primary.recipe";
 /// Labels for facts used as grouping levels. Identity facts stay canonical;
 /// these are display-only companions selected through `label-key`.
 pub const KEY_REPO_NAME: &str = "vcs.repo.name";
+/// Human-readable convoy name without an associated change-request suffix.
 pub const KEY_CONVOY_NAME: &str = "flotilla.convoy.name";
 pub const KEY_VESSEL_NAME: &str = "flotilla.vessel.name";
 
