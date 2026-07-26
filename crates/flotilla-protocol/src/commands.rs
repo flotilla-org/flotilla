@@ -256,6 +256,11 @@ pub enum CommandAction {
     CloseChangeRequest {
         id: String,
     },
+    MergeChangeRequest {
+        id: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        confirmed: bool,
+    },
     OpenIssue {
         id: String,
     },
@@ -472,6 +477,7 @@ impl Command {
             CommandAction::FetchCheckoutStatus { .. } => "Fetching checkout status...",
             CommandAction::OpenChangeRequest { .. } => "Opening in browser...",
             CommandAction::CloseChangeRequest { .. } => "Closing PR...",
+            CommandAction::MergeChangeRequest { .. } => "Merging change request...",
             CommandAction::OpenIssue { .. } => "Opening in browser...",
             CommandAction::LinkIssuesToChangeRequest { .. } => "Linking issues...",
             CommandAction::ArchiveSession { .. } => "Archiving session...",
@@ -803,6 +809,12 @@ mod tests {
                 provisioning_target: None,
                 context_repo: Some(RepoSelector::Query("owner/repo".into())),
                 action: CommandAction::CloseChangeRequest { id: "99".into() },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: Some(RepoSelector::Query("owner/repo".into())),
+                action: CommandAction::MergeChangeRequest { id: "99".into(), confirmed: true },
             },
             Command {
                 node_id: None,
@@ -1451,6 +1463,12 @@ mod tests {
                 provisioning_target: None,
                 context_repo: Some(RepoSelector::Path(PathBuf::from("/tmp"))),
                 action: CommandAction::CloseChangeRequest { id: "1".into() },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: Some(RepoSelector::Path(PathBuf::from("/tmp"))),
+                action: CommandAction::MergeChangeRequest { id: "1".into(), confirmed: true },
             },
             Command {
                 node_id: None,

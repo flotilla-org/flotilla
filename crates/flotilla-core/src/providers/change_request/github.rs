@@ -167,6 +167,11 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         Ok(())
     }
 
+    async fn merge_change_request(&self, repo_root: &Path, id: &str) -> Result<(), String> {
+        run!(self.runner, "gh", &["pr", "merge", id, "--squash"], repo_root)?;
+        Ok(())
+    }
+
     async fn list_merged_branch_names(&self, repo_root: &Path, limit: usize) -> Result<Vec<String>, String> {
         let per_page = clamp_per_page(limit);
         let endpoint = format!("repos/{}/pulls?state=closed&sort=updated&direction=desc&per_page={}", self.repo_slug, per_page);
@@ -241,6 +246,20 @@ mod tests {
         for name in &branches {
             assert!(!name.is_empty());
         }
+
+        session.finish();
+    }
+
+    #[tokio::test]
+    async fn replay_merge_change_request_uses_squash() {
+        // Merging is destructive on a live forge, so this interaction is
+        // intentionally replay-only rather than recordable in place.
+        let session = replay::Session::replaying(fixture("github_merge.yaml"), Masks::new());
+        let repo_root = PathBuf::from("/test/repo");
+        let (api, runner) = build_api_and_runner(&session);
+        let provider = GitHubChangeRequest::new("github".into(), "rjwittams/flotilla".into(), api, runner);
+
+        provider.merge_change_request(&repo_root, "42").await.expect("merge change request");
 
         session.finish();
     }

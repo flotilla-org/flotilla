@@ -20,5 +20,6 @@ pub trait ChangeRequestTracker: Send + Sync {
     async fn get_change_request(&self, repo_root: &Path, id: &str) -> Result<(String, ChangeRequest), String>;
     async fn open_in_browser(&self, repo_root: &Path, id: &str) -> Result<(), String>;
     async fn close_change_request(&self, repo_root: &Path, id: &str) -> Result<(), String>;
+    async fn merge_change_request(&self, repo_root: &Path, id: &str) -> Result<(), String>;
     async fn list_merged_branch_names(&self, repo_root: &Path, limit: usize) -> Result<Vec<String>, String>;
 }

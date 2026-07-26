@@ -1,0 +1,12 @@
+interactions:
+- channel: command
+  cmd: gh
+  args:
+  - pr
+  - merge
+  - '42'
+  - --squash
+  cwd: /test/repo
+  stdout: ''
+  stderr: null
+  exit_code: 0

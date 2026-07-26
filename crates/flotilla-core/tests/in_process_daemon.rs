@@ -23,9 +23,9 @@ use flotilla_core::{
         discovery::{
             test_support::{
                 fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_providers, fake_vcs_discovery, git_process_discovery,
-                init_git_repo, init_git_repo_with_remote, DiscoveryMockRunner, FakeCheckoutManager, FakeCheckoutManagerFactory,
-                FakeDiscoveryProviders, FakeIssueProvider, FakePresentationManager, FakeTerminalPool, FakeVcsFactory, FakeVcsState,
-                TestEnvVars,
+                init_git_repo, init_git_repo_with_remote, DiscoveryMockRunner, FakeChangeRequest, FakeCheckoutManager,
+                FakeCheckoutManagerFactory, FakeDiscoveryProviders, FakeIssueProvider, FakePresentationManager, FakeTerminalPool,
+                FakeVcsFactory, FakeVcsState, TestEnvVars,
             },
             DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, Factory, HostDetector, HostPlatform, ProviderCategory,
             ProviderDescriptor, RepoDetector, UnmetRequirement,
@@ -640,6 +640,10 @@ impl ChangeRequestTracker for FailingChangeRequestTracker {
         Ok(())
     }
 
+    async fn merge_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn list_merged_branch_names(&self, _: &Path, _: usize) -> Result<Vec<String>, String> {
         Err("merged branch listing failed".into())
     }
@@ -1018,6 +1022,54 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         flotilla_resources::CrewSource::Agent { selector, brief_template: Some(template), .. }
             if selector.capability == "code-review" && template == "diff-review"
     ));
+}
+
+#[tokio::test]
+async fn fork_stance_refuses_change_request_merge_without_calling_provider() {
+    let provider = Arc::new(FakeChangeRequest::new());
+    provider
+        .add_change_requests(vec![("42".to_string(), ChangeRequest {
+            title: "Keep landing human-owned".to_string(),
+            branch: "stack/fork-fix".to_string(),
+            status: flotilla_protocol::ChangeRequestStatus::Open,
+            body: None,
+            correlation_keys: Vec::new(),
+            association_keys: Vec::new(),
+            provider_name: "fake-cr".to_string(),
+            provider_display_name: "Fake PRs".to_string(),
+        })])
+        .await;
+    let discovery = fake_discovery_with_provider_set(
+        FakeDiscoveryProviders::new().with_change_request(provider.clone() as Arc<dyn ChangeRequestTracker>),
+    );
+    let (_temp, repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("reconcile repository identity");
+    let repository_key = daemon.repository_key_for_path(&repo).await.expect("tracked repository key");
+    let repositories = daemon.resource_backend().using::<Repository>("flotilla");
+    let stored = repositories.get(&repository_key.to_string()).await.expect("stored repository");
+    let fork_spec =
+        stored.spec.clone().with_upstream("https://github.com/upstream/repo", RepositoryRelation::Fork).expect("fork provenance");
+    repositories
+        .update(&InputMeta::from(&stored.metadata), &stored.metadata.resource_version, &fork_spec)
+        .await
+        .expect("apply fork stance");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: Some(RepoSelector::Path(repo)),
+            action: CommandAction::MergeChangeRequest { id: "42".to_string(), confirmed: true },
+        })
+        .await
+        .expect("dispatch merge command");
+
+    assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::Error {
+        message: "merging change request 42 is forbidden for fork-stance repository; landing is human-only".to_string(),
+    });
+    let (_, request) = provider.get_change_request(Path::new("/unused"), "42").await.expect("change request should remain available");
+    assert_eq!(request.status, flotilla_protocol::ChangeRequestStatus::Open);
 }
 
 async fn create_test_host_direct_policy(

@@ -110,6 +110,10 @@ impl ChangeRequestTracker for MockChangeRequestTracker {
         Ok(())
     }
 
+    async fn merge_change_request(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn list_merged_branch_names(&self, _repo_root: &Path, _limit: usize) -> Result<Vec<String>, String> {
         self.merged_result.clone()
     }

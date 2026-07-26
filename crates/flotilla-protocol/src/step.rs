@@ -120,6 +120,9 @@ pub enum StepAction {
     CloseChangeRequest {
         id: String,
     },
+    MergeChangeRequest {
+        id: String,
+    },
     OpenIssue {
         id: String,
     },

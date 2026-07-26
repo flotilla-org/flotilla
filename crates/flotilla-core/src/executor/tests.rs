@@ -207,6 +207,37 @@ impl ChangeRequestTracker for MockChangeRequestTracker {
     async fn close_change_request(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
         Ok(())
     }
+    async fn merge_change_request(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn list_merged_branch_names(&self, _repo_root: &Path, _limit: usize) -> Result<Vec<String>, String> {
+        Ok(vec![])
+    }
+}
+
+struct MergeChangeRequestTracker {
+    calls: tokio::sync::Mutex<Vec<String>>,
+    result: Result<(), String>,
+}
+
+#[async_trait]
+impl ChangeRequestTracker for MergeChangeRequestTracker {
+    async fn list_change_requests(&self, _repo_root: &Path, _limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+        Ok(vec![])
+    }
+    async fn get_change_request(&self, _repo_root: &Path, _id: &str) -> Result<(String, ChangeRequest), String> {
+        Err("not implemented".to_string())
+    }
+    async fn open_in_browser(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn close_change_request(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn merge_change_request(&self, _repo_root: &Path, id: &str) -> Result<(), String> {
+        self.calls.lock().await.push(id.to_string());
+        self.result.clone()
+    }
     async fn list_merged_branch_names(&self, _repo_root: &Path, _limit: usize) -> Result<Vec<String>, String> {
         Ok(vec![])
     }
@@ -1526,6 +1557,74 @@ async fn close_change_request_with_provider() {
         run_build_plan_to_completion(CommandAction::CloseChangeRequest { id: "42".to_string() }, registry, empty_data(), runner).await;
 
     assert_ok(result);
+}
+
+// -----------------------------------------------------------------------
+// Tests: MergeChangeRequest
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn merge_change_request_requires_confirmation() {
+    let result = run_build_plan_to_completion(
+        CommandAction::MergeChangeRequest { id: "42".to_string(), confirmed: false },
+        empty_registry(),
+        empty_data(),
+        runner_ok(),
+    )
+    .await;
+
+    assert_error_contains(result, "confirmation");
+}
+
+#[tokio::test]
+async fn merge_change_request_requires_provider() {
+    let result = run_build_plan_to_completion(
+        CommandAction::MergeChangeRequest { id: "42".to_string(), confirmed: true },
+        empty_registry(),
+        empty_data(),
+        runner_ok(),
+    )
+    .await;
+
+    assert_error_contains(result, "change request provider");
+}
+
+#[tokio::test]
+async fn merge_change_request_calls_provider() {
+    let provider = Arc::new(MergeChangeRequestTracker { calls: tokio::sync::Mutex::new(Vec::new()), result: Ok(()) });
+    let mut registry = empty_registry();
+    registry.change_requests.insert("github", desc("github"), provider.clone());
+
+    let result = run_build_plan_to_completion(
+        CommandAction::MergeChangeRequest { id: "42".to_string(), confirmed: true },
+        registry,
+        empty_data(),
+        runner_ok(),
+    )
+    .await;
+
+    assert_ok(result);
+    assert_eq!(provider.calls.lock().await.as_slice(), ["42"]);
+}
+
+#[tokio::test]
+async fn merge_change_request_surfaces_provider_failure() {
+    let provider = Arc::new(MergeChangeRequestTracker {
+        calls: tokio::sync::Mutex::new(Vec::new()),
+        result: Err("merge blocked by required checks".to_string()),
+    });
+    let mut registry = empty_registry();
+    registry.change_requests.insert("github", desc("github"), provider);
+
+    let result = run_build_plan_to_completion(
+        CommandAction::MergeChangeRequest { id: "42".to_string(), confirmed: true },
+        registry,
+        empty_data(),
+        runner_ok(),
+    )
+    .await;
+
+    assert_error_eq(result, "merge blocked by required checks");
 }
 
 // -----------------------------------------------------------------------

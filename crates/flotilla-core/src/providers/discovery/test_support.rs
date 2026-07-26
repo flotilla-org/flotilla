@@ -942,6 +942,16 @@ impl ChangeRequestTracker for FakeChangeRequest {
         }
     }
 
+    async fn merge_change_request(&self, _repo_root: &Path, id: &str) -> Result<(), String> {
+        let mut store = self.change_requests.lock().await;
+        if let Some((_, cr)) = store.iter_mut().find(|(cr_id, _)| cr_id == id) {
+            cr.status = ChangeRequestStatus::Merged;
+            Ok(())
+        } else {
+            Err(format!("change request {id} not found"))
+        }
+    }
+
     async fn list_merged_branch_names(&self, _repo_root: &Path, limit: usize) -> Result<Vec<String>, String> {
         let store = self.merged_branches.lock().await;
         Ok(store.iter().take(limit).cloned().collect())
