@@ -91,6 +91,19 @@ impl HostRegistry {
         connection_status_for_node(&self.local_node, &node_connectivity, node_id)
     }
 
+    pub(crate) async fn connected_peer_summaries(&self) -> Vec<HostSummary> {
+        let node_connectivity = self.node_connectivity.read().await;
+        let hosts = self.hosts.read().await;
+        hosts
+            .values()
+            .filter(|state| !state.removed && state.node_id != self.local_node.node_id)
+            .filter(|state| {
+                connection_status_for_node(&self.local_node, &node_connectivity, &state.node_id) == PeerConnectionState::Connected
+            })
+            .filter_map(|state| state.summary.clone())
+            .collect()
+    }
+
     pub(crate) async fn list_hosts(&self, counts: &HashMap<EnvironmentId, HostCounts>) -> HostListResponse {
         let configured = self.configured_peers.read().await.clone();
         let node_connectivity = self.node_connectivity.read().await.clone();
