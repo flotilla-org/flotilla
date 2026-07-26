@@ -1930,10 +1930,21 @@ async fn replica_refresh_skips_drifted_records_and_reports_the_parse_skew() {
             .authority(LifecycleAuthority::Observed)
             .build()
     };
+    let fleet_row = |convoy: &str| {
+        FleetListRow::builder()
+            .convoy(convoy)
+            .vessel("implement")
+            .crew("implement/coder")
+            .crew_state("running")
+            .host(HostName::new("feta"))
+            .namespace("flotilla")
+            .staleness(FleetStaleness::Local)
+            .build()
+    };
     let snapshot = FleetReplicaSnapshot {
         host: HostName::new("feta"),
         generation: Some("gen-drifted".to_string()),
-        rows: vec![],
+        rows: vec![fleet_row("drifted-flat"), fleet_row("valid-flat")],
         result_sets: vec![ResultSet {
             seq: 4,
             rows: Rows::Checkouts { scope: None, rows: vec![checkout("drifted"), checkout("valid")] },
@@ -1943,8 +1954,10 @@ async fn replica_refresh_skips_drifted_records_and_reports_the_parse_skew() {
     let snapshot = serde_json::to_value(snapshot).expect("serialize replica snapshot");
     let mut drifted_record_snapshot = snapshot.clone();
     drifted_record_snapshot["result_sets"][0]["rows"]["rows"]["rows"][0].as_object_mut().expect("checkout row object").remove("repo_label");
-    let mut drifted_envelope_snapshot = snapshot;
+    let mut drifted_envelope_snapshot = snapshot.clone();
     drifted_envelope_snapshot["result_sets"][0]["rows"]["rows"]["scope"] = serde_json::json!(42);
+    let mut drifted_flat_snapshot = snapshot;
+    drifted_flat_snapshot["rows"][0].as_object_mut().expect("fleet row object").remove("namespace");
     let runner = Arc::new(QueuedOutputRunner::new(vec![
         CommandOutput {
             stdout: serde_json::to_string(&drifted_record_snapshot).expect("serialize record-drifted snapshot"),
@@ -1953,6 +1966,11 @@ async fn replica_refresh_skips_drifted_records_and_reports_the_parse_skew() {
         },
         CommandOutput {
             stdout: serde_json::to_string(&drifted_envelope_snapshot).expect("serialize envelope-drifted snapshot"),
+            stderr: String::new(),
+            success: true,
+        },
+        CommandOutput {
+            stdout: serde_json::to_string(&drifted_flat_snapshot).expect("serialize flat-record-drifted snapshot"),
             stderr: String::new(),
             success: true,
         },
@@ -1994,6 +2012,23 @@ async fn replica_refresh_skips_drifted_records_and_reports_the_parse_skew() {
             .as_deref()
             .is_some_and(|error| error.contains("result_sets[0]") && error.contains("invalid type: integer `42`")),
         "status should count every row dropped with an unparseable envelope: {:?}",
+        response.replicas[0]
+    );
+
+    daemon.refresh_fleet_replicas_once().await.expect("flat-record-drifted refresh should succeed");
+
+    let cached = daemon.cached_fleet_replica_snapshots().await;
+    assert!(matches!(cached[0].rows.as_slice(), [row] if row.convoy == "valid-flat"));
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+    assert!(response.replicas[0].reachable);
+    assert_eq!(response.replicas[0].generation.as_deref(), Some("gen-drifted"));
+    assert_eq!(response.replicas[0].skipped_records, 1);
+    assert!(
+        response.replicas[0]
+            .first_parse_error
+            .as_deref()
+            .is_some_and(|error| error.contains("rows[0]") && error.contains("missing field `namespace`")),
+        "status should report the drifted flat row: {:?}",
         response.replicas[0]
     );
 }
