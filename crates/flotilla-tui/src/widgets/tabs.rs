@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use flotilla_protocol::ViewAddress;
 use ratatui::{layout::Rect, style::Style, Frame};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{ui_state::DragState, OpenView, OpenViews, TabId, TuiModel, UiState, ViewTarget},
@@ -66,39 +67,45 @@ fn repo_label(identity: &flotilla_protocol::RepoIdentity, model: &TuiModel, leve
 /// The default (pre-override) label for an open View's tab at a
 /// qualification `level`: 0 is the short form; each higher level widens the
 /// label with more qualifying parameters (saturating per kind).
-fn default_label(view: &OpenView, model: &TuiModel, level: usize) -> String {
-    match &view.target {
-        ViewTarget::View(ViewAddress::Overview) => " ⚓ flotilla ".to_string(),
-        ViewTarget::View(ViewAddress::Convoys { namespace, .. }) if namespace == "flotilla" && level == 0 => " 🚢 convoys ".to_string(),
-        ViewTarget::View(ViewAddress::Convoys { namespace, .. }) => format!(" 🚢 {namespace} "),
-        ViewTarget::View(ViewAddress::Independents { scope: Some(scope) }) => match level {
+fn default_address_label(address: &ViewAddress, model: &TuiModel, level: usize) -> String {
+    match address {
+        ViewAddress::Overview => " ⚓ flotilla ".to_string(),
+        ViewAddress::Convoys { namespace, .. } if namespace == "flotilla" && level == 0 => " 🚢 convoys ".to_string(),
+        ViewAddress::Convoys { namespace, .. } => format!(" 🚢 {namespace} "),
+        ViewAddress::Independents { scope: Some(scope) } => match level {
             0 => format!("⛵ {} independents", scope.name),
             _ => format!("⛵ {}/{} independents", scope.namespace, scope.name),
         },
-        ViewTarget::View(ViewAddress::Independents { scope: None }) => " ⛵ independents ".to_string(),
-        ViewTarget::View(ViewAddress::Convoy { namespace, name }) => match level {
+        ViewAddress::Independents { scope: None } => " ⛵ independents ".to_string(),
+        ViewAddress::Convoy { namespace, name } => match level {
             0 => format!("🚢 {name}"),
             _ => format!("🚢 {namespace}/{name}"),
         },
-        ViewTarget::View(ViewAddress::Vessel { namespace, convoy, vessel }) => match level {
+        ViewAddress::Vessel { namespace, convoy, vessel } => match level {
             0 => vessel.clone(),
             1 => format!("{convoy}/{vessel}"),
             _ => format!("{namespace}/{convoy}/{vessel}"),
         },
-        ViewTarget::View(ViewAddress::Project { namespace, name }) => match level {
+        ViewAddress::Project { namespace, name } => match level {
             0 => format!("⛰ {name}"),
             _ => format!("⛰ {namespace}/{name}"),
         },
-        ViewTarget::View(ViewAddress::Issues { scope }) => match level {
+        ViewAddress::Issues { scope } => match level {
             0 => format!("◉ {} issues", scope.name),
             _ => format!("◉ {}/{} issues", scope.namespace, scope.name),
         },
-        ViewTarget::View(ViewAddress::Checkouts { scope: Some(scope) }) => match level {
+        ViewAddress::Checkouts { scope: Some(scope) } => match level {
             0 => format!("⌂ {} checkouts", scope.name),
             _ => format!("⌂ {}/{} checkouts", scope.namespace, scope.name),
         },
-        ViewTarget::View(ViewAddress::Checkouts { scope: None }) => "⌂ checkouts".to_string(),
-        ViewTarget::View(ViewAddress::Repo { identity, .. }) => repo_label(identity, model, level),
+        ViewAddress::Checkouts { scope: None } => "⌂ checkouts".to_string(),
+        ViewAddress::Repo { identity, .. } => repo_label(identity, model, level),
+    }
+}
+
+fn default_label(view: &OpenView, model: &TuiModel, level: usize) -> String {
+    match &view.target {
+        ViewTarget::View(address) => default_address_label(address, model, level),
         ViewTarget::Broken { .. } => "⚠ invalid".to_string(),
     }
 }
@@ -114,17 +121,49 @@ fn max_label_level(view: &OpenView) -> usize {
 /// The visible label for an open View's tab: the user override when set,
 /// otherwise the kind default (short form).
 pub fn tab_label(view: &OpenView, model: &TuiModel) -> String {
-    match &view.label_override {
-        Some(label) => label.clone(),
-        None => default_label(view, model, 0),
+    tab_label_at_level(view, model, 0)
+}
+
+fn tab_label_at_level(view: &OpenView, model: &TuiModel, level: usize) -> String {
+    tab_label_parts_at_level(view, model, level).join(" › ")
+}
+
+fn tab_label_parts_at_level(view: &OpenView, model: &TuiModel, level: usize) -> Vec<String> {
+    if !view.has_history() {
+        return vec![match &view.label_override {
+            Some(label) => label.clone(),
+            None => default_label(view, model, level),
+        }];
     }
+
+    let addresses = view.breadcrumb_addresses();
+    let last = addresses.len().saturating_sub(1);
+    addresses
+        .iter()
+        .enumerate()
+        .map(|(index, address)| {
+            if index == 0 {
+                if let Some(label) = &view.label_override {
+                    return label.trim().to_string();
+                }
+            }
+            let address_level = if index == last { level } else { 0 };
+            default_address_label(address, model, address_level).trim().to_string()
+        })
+        .collect::<Vec<_>>()
+}
+
+#[derive(Debug)]
+struct TabLabel {
+    text: String,
+    lineage: Option<Vec<String>>,
 }
 
 /// Labels for the whole tab bar: short defaults, progressively widened with
 /// qualifying parameters only where two tabs would otherwise read the same
 /// (vessel labels widen to convoy/vessel, then namespace/convoy/vessel).
 /// User overrides never widen.
-fn tab_labels(views: &OpenViews, model: &TuiModel) -> Vec<String> {
+fn tab_labels(views: &OpenViews, model: &TuiModel) -> Vec<TabLabel> {
     let mut levels = vec![0usize; views.len()];
     let mut labels: Vec<String> = views.iter().map(|view| tab_label(view, model)).collect();
     // Each pass widens every still-colliding label by one level; two passes
@@ -143,11 +182,76 @@ fn tab_labels(views: &OpenViews, model: &TuiModel) -> Vec<String> {
         }
         for (i, view) in views.iter().enumerate() {
             if view.label_override.is_none() {
-                labels[i] = default_label(view, model, levels[i]);
+                labels[i] = tab_label_at_level(view, model, levels[i]);
             }
         }
     }
-    labels
+    views
+        .iter()
+        .enumerate()
+        .map(|(index, view)| {
+            let parts = tab_label_parts_at_level(view, model, levels[index]);
+            TabLabel { text: parts.join(" › "), lineage: (parts.len() > 1).then_some(parts) }
+        })
+        .collect()
+}
+
+fn truncate_lineage(parts: &[String], max_width: usize) -> String {
+    let full = parts.join(" › ");
+    if full.width() <= max_width {
+        return full;
+    }
+
+    let Some(leaf) = parts.last() else {
+        return String::new();
+    };
+    let leaf_width = leaf.width();
+    const ELLIPSIS_SEPARATOR: &str = "… › ";
+    let fixed_width = ELLIPSIS_SEPARATOR.width() + leaf_width;
+    if max_width < fixed_width {
+        return leaf.clone();
+    }
+
+    let ancestors = parts[..parts.len() - 1].join(" › ");
+    let ancestor_width = max_width - fixed_width;
+    let start = ancestors
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(ancestors.len()))
+        .find(|&index| ancestors[index..].width() <= ancestor_width)
+        .unwrap_or(ancestors.len());
+    format!("…{} › {leaf}", &ancestors[start..])
+}
+
+fn rendered_bar_width(items: &[segment_bar::SegmentItem], style: &dyn BarStyle) -> usize {
+    let items_width: usize = items.iter().map(|item| style.render_item(item).width).sum();
+    items_width + style.separator().width * items.len().saturating_sub(1)
+}
+
+fn truncate_lineages_to_fit(
+    items: &mut [segment_bar::SegmentItem],
+    labels: &[TabLabel],
+    active_idx: usize,
+    style: &dyn BarStyle,
+    max_width: usize,
+) {
+    for (index, label) in labels.iter().enumerate() {
+        let Some(parts) = &label.lineage else {
+            continue;
+        };
+        let total_width = rendered_bar_width(items, style);
+        if total_width <= max_width {
+            break;
+        }
+
+        let overflow = total_width - max_width;
+        let target_width = label.text.width().saturating_sub(overflow);
+        let mut text = truncate_lineage(parts, target_width);
+        if index == active_idx && index != 0 {
+            text = format!("{} {CLOSE_AFFORDANCE} ", text.trim_end_matches(' '));
+        }
+        items[index].label = text;
+    }
 }
 
 impl Tabs {
@@ -169,7 +273,7 @@ impl Tabs {
 
         for (i, view) in views.iter().enumerate() {
             let is_active = i == active_idx;
-            let mut label = labels[i].clone();
+            let mut label = labels[i].text.clone();
             // The active tab carries a mouse close affordance when closable
             // (everything but the pinned overview at index 0).
             if is_active && i != 0 {
@@ -201,6 +305,7 @@ impl Tabs {
             BarKind::Pipe => Box::new(ThemedTabBarStyle { theme, site: &theme.tab_bar }),
             BarKind::Chevron => Box::new(ThemedRibbonStyle { theme, site: &theme.tab_bar }),
         };
+        truncate_lineages_to_fit(&mut items, &labels, active_idx, tab_style.as_ref(), usize::from(area.width));
         let close_offset = (active_idx != 0)
             .then(|| tab_style.render_item(&items[active_idx]).last_cell_offset_of(CLOSE_AFFORDANCE))
             .flatten()
@@ -441,6 +546,36 @@ mod tests {
     }
 
     #[test]
+    fn drilled_tab_label_shows_lineage_and_back_restores_plain_label() {
+        let app = stub_app_with_repos(0);
+        let mut views = OpenViews::scoped("project/flotilla/cleat".parse().expect("valid project"));
+
+        assert!(views.drill("convoys/flotilla?project=flotilla%2Fcleat".parse().expect("valid scoped convoys")));
+        assert_eq!(tab_label(views.active(), &app.model), "⛰ cleat › 🚢 convoys");
+
+        assert!(views.back());
+        assert_eq!(tab_label(views.active(), &app.model), "⛰ cleat");
+    }
+
+    #[test]
+    fn narrow_tab_bar_truncates_drill_lineage_from_the_left_and_keeps_the_leaf() {
+        let mut app = stub_app_with_repos(0);
+        app.views.switch_to(1);
+        assert!(app.views.drill("convoy/flotilla/an-exceptionally-long-convoy-name".parse().expect("valid convoy")));
+        assert!(app.views.drill("vessel/flotilla/an-exceptionally-long-convoy-name/leaf".parse().expect("valid vessel")));
+        let mut tabs = Tabs::new();
+        let theme = Theme::classic();
+        let mut terminal = Terminal::new(TestBackend::new(40, 1)).expect("terminal");
+
+        terminal.draw(|frame| tabs.render(&app.views, &app.model, &mut app.ui, &theme, frame, frame.area())).expect("render tabs");
+
+        let rendered = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(rendered.contains("…"));
+        assert!(rendered.contains("leaf ×"));
+        assert!(!rendered.contains("exceptionally"));
+    }
+
+    #[test]
     fn colliding_short_labels_widen_with_qualifying_parameters() {
         let app = stub_app_with_repos(0);
         let mut views = OpenViews::from_entries(vec![]);
@@ -451,9 +586,9 @@ mod tests {
         views.open_or_focus("vessel/flotilla/bravo/solo".parse().expect("valid"));
 
         let labels = tab_labels(&views, &app.model);
-        assert_eq!(labels[1], "alpha/leg-1", "colliding label widens");
-        assert_eq!(labels[2], "bravo/leg-1", "colliding label widens");
-        assert_eq!(labels[3], "solo", "unique label stays short");
+        assert_eq!(labels[1].text, "alpha/leg-1", "colliding label widens");
+        assert_eq!(labels[2].text, "bravo/leg-1", "colliding label widens");
+        assert_eq!(labels[3].text, "solo", "unique label stays short");
     }
 
     #[test]
@@ -466,8 +601,8 @@ mod tests {
         views.open_or_focus("vessel/ns-two/alpha/leg-1".parse().expect("valid"));
 
         let labels = tab_labels(&views, &app.model);
-        assert_eq!(labels[1], "ns-one/alpha/leg-1");
-        assert_eq!(labels[2], "ns-two/alpha/leg-1");
+        assert_eq!(labels[1].text, "ns-one/alpha/leg-1");
+        assert_eq!(labels[2].text, "ns-two/alpha/leg-1");
     }
 
     #[test]
