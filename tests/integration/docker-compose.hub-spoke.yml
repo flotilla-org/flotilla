@@ -4,6 +4,7 @@
 # image, so the fixture builds flotilla-base before starting the topology.
 services:
   flotilla-base:
+    profiles: ["build-only"]
     build:
       context: ../..
       dockerfile: tests/integration/docker/base/Dockerfile

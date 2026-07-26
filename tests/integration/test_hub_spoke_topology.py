@@ -129,7 +129,7 @@ def hub_spoke_topology():
                 node,
                 "git config --global user.email test@test.com && "
                 "git config --global user.name test && "
-                "git init /home/flotilla/repo && "
+                "git init --initial-branch=master /home/flotilla/repo && "
                 "cd /home/flotilla/repo && "
                 "git commit --allow-empty -m init",
             )
