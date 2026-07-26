@@ -34,7 +34,7 @@ use flotilla_resources::{
     apply_status_patch_checked as apply_resource_status_patch_checked, external_patches as convoy_external_patches, get_resource_kind,
     list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec, repository_display_labels,
     resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from,
-    watch_resource_kind_including_replicas, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
+    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue,
     Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CrewSource,
     Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
@@ -142,6 +142,7 @@ struct ResourceWatchCommandContext {
     namespace: String,
     kind: String,
     include_replicas: bool,
+    replica_sources: bool,
     cursor: Option<flotilla_protocol::ResourceWatchCursor>,
     command_id: u64,
     node_id: NodeId,
@@ -155,11 +156,13 @@ async fn run_resource_watch_command(context: ResourceWatchCommandContext) -> Com
         Some(generation) => WatchStart::FromVersionInGeneration { generation, resource_version: cursor.resource_version },
         None => WatchStart::FromVersion(cursor.resource_version),
     });
-    let result = match (context.include_replicas, start) {
-        (true, Some(_)) => Err(ResourceError::invalid("include-replicas watches cannot resume from an origin resourceVersion")),
-        (true, None) => watch_resource_kind_including_replicas(&context.backend, &context.namespace, &context.kind).await,
-        (false, Some(start)) => watch_resource_kind_from(&context.backend, &context.namespace, &context.kind, start).await,
-        (false, None) => watch_resource_kind(&context.backend, &context.namespace, &context.kind).await,
+    let result = match (context.replica_sources, context.include_replicas, start) {
+        (true, _, Some(_)) => Err(ResourceError::invalid("replica-source watches cannot resume from an origin resourceVersion")),
+        (true, _, None) => watch_resource_kind_replica_sources(&context.backend, &context.namespace, &context.kind).await,
+        (false, true, Some(_)) => Err(ResourceError::invalid("include-replicas watches cannot resume from an origin resourceVersion")),
+        (false, true, None) => watch_resource_kind_including_replicas(&context.backend, &context.namespace, &context.kind).await,
+        (false, false, Some(start)) => watch_resource_kind_from(&context.backend, &context.namespace, &context.kind, start).await,
+        (false, false, None) => watch_resource_kind(&context.backend, &context.namespace, &context.kind).await,
     };
     let watch = match result {
         Ok(watch) => watch,
@@ -1580,6 +1583,7 @@ impl InProcessDaemon {
         let local_node_id = resolve_local_node_id(config.base_path().as_path(), config_machine_id, &*discovery.runner)
             .await
             .expect("failed to resolve local node id");
+        let resource_backend = resource_backend.with_local_root(local_node_id.clone());
         let local_environment_id =
             resolve_or_create_environment_id(&local_environment_state_dir).expect("failed to resolve local direct environment id");
         let local_host_id = resolve_local_host_id(config.state_dir().as_path(), config_machine_id, &*discovery.runner)
@@ -1871,7 +1875,7 @@ impl InProcessDaemon {
         let project = self
             .resource_backend
             .clone()
-            .using::<Project>(&scope.namespace)
+            .definitions::<Project>(&scope.namespace)
             .get(&scope.name)
             .await
             .map_err(|error| format!("project {}/{}: {error}", scope.namespace, scope.name))?;
@@ -3594,7 +3598,7 @@ impl InProcessDaemon {
         let project = self
             .resource_backend
             .clone()
-            .using::<Project>(namespace)
+            .definitions::<Project>(namespace)
             .get(project_ref)
             .await
             .map_err(|error| format!("project {project_ref} is not ready: {error}"))?;
@@ -3908,7 +3912,7 @@ impl InProcessDaemon {
         let project = self
             .resource_backend
             .clone()
-            .using::<Project>(namespace)
+            .definitions::<Project>(namespace)
             .get(project_ref)
             .await
             .map_err(|error| format!("project {project_ref} is not ready: {error}"))?;
@@ -4037,7 +4041,7 @@ impl InProcessDaemon {
         let default_name = normalize_project_name(&repository_spec.leaf_slug())?;
         let project_name = explicit_name.map(str::to_string).unwrap_or(default_name.clone());
         validate_project_name(&project_name)?;
-        let projects = self.resource_backend.clone().using::<Project>(&namespace);
+        let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
         match projects.get(&project_name).await {
             Ok(existing) => {
                 let same_whole_repository = matches!(
@@ -4060,7 +4064,7 @@ impl InProcessDaemon {
         }
 
         let spec = whole_repository_project_spec(key, explicit_display_name.map(str::to_string).unwrap_or(default_name))?;
-        projects.create(&InputMeta::builder().name(project_name.clone()).build(), &spec).await.map_err(|error| error.to_string())?;
+        projects.apply(&InputMeta::builder().name(project_name.clone()).build(), &spec).await.map_err(|error| error.to_string())?;
         Ok(project_name)
     }
 
@@ -4084,7 +4088,7 @@ impl InProcessDaemon {
                 .map_err(|error| error.to_string())?;
         }
 
-        let projects = self.resource_backend.clone().using::<Project>(&namespace);
+        let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
         let repository_objects = repositories.list().await.map_err(|error| error.to_string())?.items;
         let repository_specs = repository_objects
             .iter()
@@ -4132,7 +4136,7 @@ impl InProcessDaemon {
             .collect::<BTreeSet<_>>();
         let migratable_keys = superseded_keys.difference(&other_tracked_keys).cloned().collect::<BTreeSet<_>>();
 
-        let mut project_objects = projects.list().await.map_err(|error| error.to_string())?.items;
+        let mut project_objects = projects.list().await.map_err(|error| error.to_string())?;
         let display_name = normalize_project_name(&repository_spec.leaf_slug())?;
         let mut generated_names = whole_repository_project_names(repository_spec)?.into_iter().collect::<BTreeSet<_>>();
         let mut generated_display_names = BTreeSet::from([display_name.clone()]);
@@ -4154,10 +4158,7 @@ impl InProcessDaemon {
             }
             if changed {
                 updated = normalize_project_spec(updated)?;
-                projects
-                    .update(&InputMeta::from(&project.metadata), &project.metadata.resource_version, &updated)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                projects.apply(&InputMeta::from(&project.metadata), &updated).await.map_err(|error| error.to_string())?;
                 project.spec = updated;
                 migrated_project_names.insert(project.metadata.name.clone());
             }
@@ -4193,7 +4194,7 @@ impl InProcessDaemon {
             }
         }
 
-        let remaining_projects = projects.list().await.map_err(|error| error.to_string())?.items;
+        let remaining_projects = projects.list().await.map_err(|error| error.to_string())?;
         let durable_checkouts =
             self.resource_backend.clone().using::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?.items;
         for old_key in &migratable_keys {
@@ -4745,7 +4746,7 @@ impl InProcessDaemon {
 
     pub async fn list_projects_internal(&self) -> Result<ProjectListResponse, String> {
         let namespace = self.provisioning_namespace().await;
-        let projects = self.resource_backend.clone().using::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let projects = self.resource_backend.clone().definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
         let repositories = self.resource_backend.clone().using::<Repository>(&namespace).list().await.map_err(|error| error.to_string())?;
         let repositories = repositories
             .items
@@ -4755,9 +4756,9 @@ impl InProcessDaemon {
         let repository_slugs = repository_display_labels(repositories.iter().map(|(key, repository)| (key, &repository.spec)));
 
         let mut entries = projects
-            .items
             .into_iter()
             .map(|project| {
+                let conflicts = project.metadata.merge.as_ref().map(|merge| merge.conflicts.keys().cloned().collect()).unwrap_or_default();
                 let mut project_repositories = BTreeMap::<RepositoryKey, BTreeSet<String>>::new();
                 for repository in project.spec.repositories {
                     if let Some(subpath) = repository.subpath {
@@ -4782,6 +4783,7 @@ impl InProcessDaemon {
                     .repositories(repositories)
                     .maybe_issue_source(project.spec.issue_source)
                     .default_workflow_ref(project.spec.default_workflow_ref)
+                    .conflicts(conflicts)
                     .build()
             })
             .collect::<Vec<_>>();
@@ -6053,7 +6055,9 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::ResourceWatch { namespace, kind, include_replicas, cursor } = command.action {
+        if let flotilla_protocol::CommandAction::ResourceWatch { namespace, kind, include_replicas, replica_sources, cursor } =
+            command.action
+        {
             let repo_identity = empty_repo_identity();
             let description = format!("watch resource {namespace}/{kind}");
             let token = CancellationToken::new();
@@ -6079,6 +6083,7 @@ impl InProcessDaemon {
                         .namespace(namespace)
                         .kind(kind)
                         .include_replicas(include_replicas)
+                        .replica_sources(replica_sources)
                         .maybe_cursor(cursor)
                         .command_id(id)
                         .node_id(command_node_id.clone())
@@ -6613,16 +6618,12 @@ impl InProcessDaemon {
                 description: command.description().to_string(),
             });
             let namespace = self.provisioning_namespace().await;
-            let projects = self.resource_backend.clone().using::<Project>(&namespace);
+            let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
             let result = match validate_project_name(name).and_then(|_| parse_project_yaml(spec_yaml)) {
                 Ok(spec) => match normalize_project_spec(spec) {
                     Ok(spec) => {
                         let meta = InputMeta::builder().name(name.clone()).build();
-                        let outcome = match projects.get(name).await {
-                            Ok(existing) => projects.update(&meta, &existing.metadata.resource_version, &spec).await.map(|_| ()),
-                            Err(ResourceError::NotFound { .. }) => projects.create(&meta, &spec).await.map(|_| ()),
-                            Err(err) => Err(err),
-                        };
+                        let outcome = projects.apply(&meta, &spec).await.map(|_| ());
                         match outcome {
                             Ok(()) => flotilla_protocol::CommandValue::ProjectApplied { name: name.clone() },
                             Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },

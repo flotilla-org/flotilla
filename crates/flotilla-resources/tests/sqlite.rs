@@ -8,10 +8,11 @@ use common::{
         assert_consumer_relists_after_expired_watch_and_converges_with_backend, assert_create_get_list_roundtrip_with_backend,
         assert_delete_emits_event_with_backend, assert_identical_status_update_is_noop_with_backend,
         assert_identical_update_is_noop_with_backend, assert_metadata_roundtrip_with_backend, assert_namespace_isolation_with_backend,
-        assert_repeated_delete_with_pending_finalizers_is_noop_with_backend, assert_replica_read_view_contract,
-        assert_stale_resource_version_conflicts_with_backend, assert_store_diagnostics_report_retained_events_with_backend,
-        assert_watch_from_version_replays_with_backend, assert_watch_now_semantics_with_backend,
-        assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
+        assert_project_definition_causal_merge_with_backend, assert_project_definition_delete_conflicts_with_concurrent_edit_with_backend,
+        assert_project_definition_edit_converges_with_backend, assert_repeated_delete_with_pending_finalizers_is_noop_with_backend,
+        assert_replica_read_view_contract, assert_stale_resource_version_conflicts_with_backend,
+        assert_store_diagnostics_report_retained_events_with_backend, assert_watch_from_version_replays_with_backend,
+        assert_watch_now_semantics_with_backend, assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
         assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture, DemandFixture, RegardFixture,
     },
     convoy_meta, convoy_spec, convoy_status, pending_task_state, resource_meta, TestLoopHarness,
@@ -19,9 +20,9 @@ use common::{
 use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
-    ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, EventRetention, InMemoryBackend, NoStatusPatch, Resource, ResourceBackend,
-    ResourceError, SqliteBackend, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart,
-    WorkPhase, WorkflowTemplate, CONVOY_LABEL, VESSEL_REF_LABEL,
+    ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, EventRetention, InMemoryBackend, InputMeta, NoStatusPatch, Project, ProjectSpec,
+    Resource, ResourceBackend, ResourceError, SqliteBackend, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel,
+    VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 use futures::StreamExt;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
@@ -162,6 +163,21 @@ async fn replica_read_view_contract() {
 }
 
 #[tokio::test]
+async fn project_definition_edit_converges() {
+    assert_project_definition_edit_converges_with_backend(backend()).await;
+}
+
+#[tokio::test]
+async fn project_definition_causal_merge() {
+    assert_project_definition_causal_merge_with_backend(backend()).await;
+}
+
+#[tokio::test]
+async fn project_definition_delete_conflicts_with_concurrent_edit() {
+    assert_project_definition_delete_conflicts_with_concurrent_edit_with_backend(backend()).await;
+}
+
+#[tokio::test]
 async fn replica_rows_and_cursor_survive_backend_restart() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("resources.sqlite");
@@ -182,6 +198,47 @@ async fn replica_rows_and_cursor_survive_backend_restart() {
     let cursor =
         reopened.replica_writer::<Convoy>(origin, "flotilla").cursor().await.expect("read persisted cursor").expect("persisted cursor");
     assert_eq!(cursor.resource_version, listed.resource_version);
+}
+
+#[tokio::test]
+async fn replicated_project_definition_survives_backend_restart_without_peer() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("resources.sqlite");
+    let kiwi_root = flotilla_protocol::NodeId::new("kiwi-root");
+    let feta_root = flotilla_protocol::NodeId::new("feta-root");
+    let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    source
+        .definitions::<Project>("flotilla")
+        .apply(
+            &InputMeta::builder().name("widgets".to_string()).build(),
+            &ProjectSpec::builder()
+                .display_name("Widgets".to_string())
+                .default_workflow_ref("default".to_string())
+                .repositories(Vec::new())
+                .build(),
+        )
+        .await
+        .expect("create source Project definition");
+    let source_log = source.using::<Project>("flotilla").list().await.expect("list source Project log");
+
+    {
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("open sqlite backend")).with_local_root(feta_root.clone());
+        backend
+            .replica_writer::<Project>(kiwi_root, "flotilla")
+            .replace(&source_log, Utc::now())
+            .await
+            .expect("persist replicated Project");
+    }
+
+    let reopened = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("reopen sqlite backend")).with_local_root(feta_root);
+    let project = reopened
+        .definitions::<Project>("flotilla")
+        .get("widgets")
+        .await
+        .expect("Project definition should remain available without its peer");
+    assert_eq!(project.spec.display_name, "Widgets");
+    assert_eq!(project.spec.default_workflow_ref, "default");
+    assert!(project.metadata.merge.is_some(), "causal metadata must survive restart");
 }
 
 #[tokio::test]

@@ -4,7 +4,8 @@ use chrono::Utc;
 use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, NodeId, ResourceWatchCursor, ResourceWatchResponse};
 use flotilla_resources::{
-    HttpBackend, K8sWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, WatchStart,
+    HttpBackend, K8sWatchEvent, ReadWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
+    ResourceProvenance, WatchEvent, WatchStart,
 };
 use futures::StreamExt;
 use tokio::sync::watch;
@@ -144,8 +145,64 @@ fn spawn_kind<T: Resource>(
     transport: &ReplicationTransport,
     cancellation: &CancellationToken,
 ) {
-    if T::REPLICATION_CLASS != ReplicationClass::HomeBoundRuntime {
+    if T::REPLICATION_CLASS == ReplicationClass::None {
         return;
+    }
+    match transport.clone() {
+        ReplicationTransport::Http(socket_path_source) => {
+            let relay_daemon = Arc::clone(daemon);
+            let relay_peer = peer.clone();
+            let relay_cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                let run_daemon = Arc::clone(&relay_daemon);
+                let run_peer = relay_peer.clone();
+                supervise_kind(
+                    relay_peer,
+                    generation,
+                    T::API_PATHS.kind,
+                    relay_cancellation,
+                    REPLICATION_RETRY,
+                    move || {
+                        let socket_path_source = socket_path_source.clone();
+                        async move { socket_path_source.resolve().await }
+                    },
+                    move |path| {
+                        let daemon = Arc::clone(&run_daemon);
+                        let peer = run_peer.clone();
+                        async move {
+                            let http = HttpBackend::from_unix_socket(path).map_err(|error| error.to_string())?;
+                            replicate_relay_over_http::<T>(http, &daemon, &peer).await
+                        }
+                    },
+                )
+                .await;
+            });
+        }
+        #[cfg(feature = "test-support")]
+        ReplicationTransport::Routed(router) => {
+            let relay_daemon = Arc::clone(daemon);
+            let relay_peer = peer.clone();
+            let relay_cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                let run_daemon = Arc::clone(&relay_daemon);
+                let run_peer = relay_peer.clone();
+                supervise_kind(
+                    relay_peer,
+                    generation,
+                    T::API_PATHS.kind,
+                    relay_cancellation,
+                    REPLICATION_RETRY,
+                    || async { Ok(()) },
+                    move |()| {
+                        let router = router.clone();
+                        let daemon = Arc::clone(&run_daemon);
+                        let peer = run_peer.clone();
+                        async move { replicate_relay_over_routed_watch::<T>(&router, &daemon, &peer).await }
+                    },
+                )
+                .await;
+            });
+        }
     }
     let daemon = Arc::clone(daemon);
     let peer = peer.clone();
@@ -199,6 +256,45 @@ fn spawn_kind<T: Resource>(
             }
         }
     });
+}
+
+async fn replicate_relay_over_http<T: Resource>(http: HttpBackend, daemon: &Arc<InProcessDaemon>, peer: &NodeId) -> Result<(), String> {
+    let mut watch = http.watch_replica_sources_typed::<T>(REPLICATION_NAMESPACE).await.map_err(|error| error.to_string())?;
+    while let Some(event) = watch.next().await {
+        let event = event.map_err(|error| error.to_string())?;
+        let (kind, mut source) = match event {
+            ReadWatchEvent::Added(source) => (StoredRelayEventKind::Added, source),
+            ReadWatchEvent::Modified(source) => (StoredRelayEventKind::Modified, source),
+            ReadWatchEvent::Deleted(source) => (StoredRelayEventKind::Deleted, source),
+        };
+        let ResourceProvenance::Replica { origin_root, last_synced_at } = source.provenance else {
+            continue;
+        };
+        if &origin_root == daemon.node_id() || &origin_root == peer {
+            continue;
+        }
+        source.object.metadata.annotations.remove("flotilla.work/origin-root");
+        source.object.metadata.annotations.remove("flotilla.work/last-synced-at");
+        let event = match kind {
+            StoredRelayEventKind::Added => WatchEvent::Added(source.object),
+            StoredRelayEventKind::Modified => WatchEvent::Modified(source.object),
+            StoredRelayEventKind::Deleted => WatchEvent::Deleted(source.object),
+        };
+        daemon
+            .resource_backend()
+            .replica_writer::<T>(origin_root, REPLICATION_NAMESPACE)
+            .apply(event, last_synced_at)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum StoredRelayEventKind {
+    Added,
+    Modified,
+    Deleted,
 }
 
 async fn supervise_kind<I, S, SourceFut, F, Fut>(
@@ -322,6 +418,7 @@ async fn run_routed_watch<T: Resource>(
                     namespace: REPLICATION_NAMESPACE.to_string(),
                     kind: T::API_PATHS.plural.to_string(),
                     include_replicas: false,
+                    replica_sources: false,
                     cursor: protocol_cursor,
                 },
             },
@@ -362,6 +459,108 @@ async fn run_routed_watch<T: Resource>(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err("daemon event stream closed".to_string()),
         }
     }
+}
+
+#[cfg(feature = "test-support")]
+async fn replicate_relay_over_routed_watch<T: Resource>(
+    router: &RemoteCommandRouter,
+    daemon: &Arc<InProcessDaemon>,
+    peer: &NodeId,
+) -> Result<(), String> {
+    let mut events = daemon.subscribe();
+    let command_id = router
+        .dispatch_execute_for_principal(
+            Command {
+                node_id: Some(peer.clone()),
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ResourceWatch {
+                    namespace: REPLICATION_NAMESPACE.to_string(),
+                    kind: T::API_PATHS.plural.to_string(),
+                    include_replicas: false,
+                    replica_sources: true,
+                    cursor: None,
+                },
+            },
+            None,
+        )
+        .await?;
+    loop {
+        match events.recv().await {
+            Ok(DaemonEvent::CommandStepUpdate {
+                command_id: event_command_id,
+                status: flotilla_protocol::StepStatus::Produced { value },
+                ..
+            }) if event_command_id == command_id => {
+                let CommandValue::ResourceWatchEvent(response) = *value else {
+                    continue;
+                };
+                if response.kind == T::API_PATHS.kind && response.event["type"] != "BOOKMARK" {
+                    apply_relay_response::<T>(daemon, peer, *response).await?;
+                }
+            }
+            Ok(DaemonEvent::CommandFinished { command_id: event_command_id, result, .. }) if event_command_id == command_id => {
+                return match result {
+                    CommandValue::Cancelled | CommandValue::Ok => Ok(()),
+                    CommandValue::Error { message } => Err(message),
+                    other => Err(format!("resource relay watch ended unexpectedly: {other:?}")),
+                };
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(%peer, kind = T::API_PATHS.kind, skipped, "resource relay lagged; reconnect will relist");
+                return Err("resource relay event subscriber lagged".to_string());
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err("daemon event stream closed".to_string()),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+async fn apply_relay_response<T: Resource>(
+    daemon: &Arc<InProcessDaemon>,
+    peer: &NodeId,
+    response: ResourceWatchResponse,
+) -> Result<(), String> {
+    let event: K8sWatchEvent<T> =
+        serde_json::from_value(response.event).map_err(|error| format!("decode relayed {} event: {error}", T::API_PATHS.kind))?;
+    let event = event.into_watch_event().map_err(|error| error.to_string())?;
+    let object = match &event {
+        WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => object,
+    };
+    let Some(origin) = object.metadata.annotations.get("flotilla.work/origin-root") else {
+        return Ok(());
+    };
+    let origin = NodeId::new(origin.clone());
+    if &origin == daemon.node_id() || &origin == peer {
+        return Ok(());
+    }
+    let synced_at = object
+        .metadata
+        .annotations
+        .get("flotilla.work/last-synced-at")
+        .ok_or_else(|| "relayed resource is missing last-synced-at".to_string())
+        .and_then(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|error| format!("decode relayed sync timestamp: {error}"))
+        })?;
+    let strip = |mut object: ResourceObject<T>| {
+        object.metadata.annotations.remove("flotilla.work/origin-root");
+        object.metadata.annotations.remove("flotilla.work/last-synced-at");
+        object
+    };
+    let event = match event {
+        WatchEvent::Added(object) => WatchEvent::Added(strip(object)),
+        WatchEvent::Modified(object) => WatchEvent::Modified(strip(object)),
+        WatchEvent::Deleted(object) => WatchEvent::Deleted(strip(object)),
+    };
+    daemon
+        .resource_backend()
+        .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
+        .apply(event, synced_at)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "test-support")]

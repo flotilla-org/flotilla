@@ -97,11 +97,19 @@ impl HttpBackend {
     }
 
     pub(crate) async fn list_including_replicas_typed<T: Resource>(&self, namespace: &str) -> Result<ReadResourceList<T>, ResourceError> {
+        self.list_read_view_typed::<T>(namespace, "includeReplicas").await
+    }
+
+    pub async fn list_replica_sources_typed<T: Resource>(&self, namespace: &str) -> Result<ReadResourceList<T>, ResourceError> {
+        self.list_read_view_typed::<T>(namespace, "replicaSources").await
+    }
+
+    async fn list_read_view_typed<T: Resource>(&self, namespace: &str, query_key: &str) -> Result<ReadResourceList<T>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
         let response = self
             .http
             .get(url)
-            .query(&[("includeReplicas", "true")])
+            .query(&[(query_key, "true")])
             .send()
             .await
             .map_err(|err| ResourceError::other(format!("LIST resources including replicas: {err}")))?;
@@ -119,11 +127,26 @@ impl HttpBackend {
         &self,
         namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
+        self.watch_read_view_typed::<T>(namespace, "includeReplicas").await
+    }
+
+    pub async fn watch_replica_sources_typed<T: Resource>(
+        &self,
+        namespace: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
+        self.watch_read_view_typed::<T>(namespace, "replicaSources").await
+    }
+
+    async fn watch_read_view_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        query_key: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
         let response = self
             .http
             .get(url)
-            .query(&[("watch", "true"), ("includeReplicas", "true")])
+            .query(&[("watch", "true"), (query_key, "true")])
             .send()
             .await
             .map_err(|err| ResourceError::other(format!("WATCH resources including replicas: {err}")))?;

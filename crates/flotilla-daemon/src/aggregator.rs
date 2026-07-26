@@ -43,7 +43,7 @@ pub struct AggregatorResolvers {
     durable_environments: TypedResolver<Environment>,
     durable_presentations: TypedResolver<Presentation>,
     durable_sessions: ReplicaReadResolver<TerminalSession>,
-    durable_projects: TypedResolver<Project>,
+    durable_projects: ReplicaReadResolver<Project>,
     durable_repositories: TypedResolver<Repository>,
     durable_regards: TypedResolver<Regard>,
     observed_convoys: TypedResolver<Convoy>,
@@ -59,7 +59,7 @@ struct AggregatorSourceRefs<'a> {
     durable_environments: &'a dyn AggregatorWatchSource<Environment>,
     durable_presentations: &'a dyn AggregatorWatchSource<Presentation>,
     durable_sessions: &'a dyn AggregatorReplicaWatchSource<TerminalSession>,
-    durable_projects: &'a dyn AggregatorWatchSource<Project>,
+    durable_projects: &'a dyn AggregatorReplicaWatchSource<Project>,
     durable_repositories: &'a dyn AggregatorWatchSource<Repository>,
     durable_regards: &'a dyn AggregatorWatchSource<Regard>,
     observed_convoys: &'a dyn AggregatorWatchSource<Convoy>,
@@ -641,14 +641,18 @@ impl Aggregator {
 
     async fn recover_project_watch(
         &mut self,
-        resolver: &dyn AggregatorWatchSource<Project>,
-    ) -> Result<WatchStream<Project>, ResourceError> {
-        loop {
-            match self.list_and_watch_projects(resolver).await {
-                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
-                result => return result,
-            }
-        }
+        resolver: &dyn AggregatorReplicaWatchSource<Project>,
+    ) -> Result<BoxStream<'static, Result<ReadWatchEvent<Project>, ResourceError>>, ResourceError> {
+        let (items, watch) = Self::recover_replica_watch(resolver).await?;
+        self.projects = items
+            .into_iter()
+            .map(|project| {
+                let object = project.object;
+                ((object.metadata.namespace.clone(), object.metadata.name.clone()), object)
+            })
+            .collect();
+        self.rebuild_store_catalog().await;
+        Ok(watch)
     }
 
     async fn recover_repository_watch(
@@ -767,21 +771,6 @@ impl Aggregator {
         let start = WatchStart::resuming_from(&listed);
         let watch = resolver.watch(start).await?;
         self.replace_session_source(source, listed.items).await;
-        Ok(watch)
-    }
-
-    async fn list_and_watch_projects(
-        &mut self,
-        resolver: &dyn AggregatorWatchSource<Project>,
-    ) -> Result<WatchStream<Project>, ResourceError> {
-        let listed = resolver.list().await?;
-        let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
-        self.projects = listed
-            .items
-            .into_iter()
-            .map(|project| ((project.metadata.namespace.clone(), project.metadata.name.clone()), project))
-            .collect();
-        self.rebuild_store_catalog().await;
         Ok(watch)
     }
 
@@ -1249,12 +1238,14 @@ impl Aggregator {
         self.rebuild_local_projection().await;
     }
 
-    async fn apply_project_event(&mut self, event: WatchEvent<Project>) {
+    async fn apply_project_event(&mut self, event: ReadWatchEvent<Project>) {
         match event {
-            WatchEvent::Added(project) | WatchEvent::Modified(project) => {
+            ReadWatchEvent::Added(project) | ReadWatchEvent::Modified(project) => {
+                let project = project.object;
                 self.projects.insert((project.metadata.namespace.clone(), project.metadata.name.clone()), project);
             }
-            WatchEvent::Deleted(project) => {
+            ReadWatchEvent::Deleted(project) => {
+                let project = project.object;
                 self.projects.remove(&(project.metadata.namespace, project.metadata.name));
             }
         }
@@ -2165,7 +2156,7 @@ mod tests {
         };
         state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: query.clone(), since: None }]);
 
-        aggregator.apply_project_event(WatchEvent::Added(project_object("widgets").await)).await;
+        aggregator.apply_project_event(local_read_event(WatchEvent::Added(project_object("widgets").await))).await;
 
         let result_set = timeout(Duration::from_secs(1), async {
             loop {
@@ -2239,7 +2230,7 @@ mod tests {
                         .durable_environments(durable.clone().using::<Environment>("flotilla"))
                         .durable_presentations(durable.clone().using::<Presentation>("flotilla"))
                         .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
-                        .durable_projects(durable.using::<Project>("flotilla"))
+                        .durable_projects(durable.including_replicas::<Project>("flotilla"))
                         .durable_repositories(durable.using::<Repository>("flotilla"))
                         .durable_regards(durable.using::<Regard>("flotilla"))
                         .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
@@ -2380,6 +2371,7 @@ mod tests {
             finalizers: Vec::new(),
             deletion_timestamp: None,
             creation_timestamp,
+            merge: None,
         }
     }
 
@@ -3624,6 +3616,7 @@ mod tests {
                 finalizers: Vec::new(),
                 deletion_timestamp: None,
                 creation_timestamp: Utc::now(),
+                merge: None,
             },
             spec: ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
             status: Some(ConvoyStatus {
@@ -3779,7 +3772,7 @@ mod tests {
                     .durable_environments(durable.clone().using::<Environment>("flotilla"))
                     .durable_presentations(durable.clone().using::<Presentation>("flotilla"))
                     .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
-                    .durable_projects(durable.using::<Project>("flotilla"))
+                    .durable_projects(durable.including_replicas::<Project>("flotilla"))
                     .durable_repositories(durable.using::<Repository>("flotilla"))
                     .durable_regards(durable.using::<Regard>("flotilla"))
                     .observed_convoys(observed.clone().using::<Convoy>("flotilla"))

@@ -873,7 +873,7 @@ fn spawn_aggregator_task(
                             .durable_environments(durable.clone().using::<Environment>(&namespace))
                             .durable_presentations(durable.using::<Presentation>(&namespace))
                             .durable_sessions(durable.including_replicas::<flotilla_resources::TerminalSession>(&namespace))
-                            .durable_projects(durable.using::<Project>(&namespace))
+                            .durable_projects(durable.including_replicas::<Project>(&namespace))
                             .durable_repositories(durable.using::<Repository>(&namespace))
                             .durable_regards(durable.using::<Regard>(&namespace))
                             .observed_convoys(observed.clone().using::<Convoy>(&namespace))

@@ -3,9 +3,9 @@ use std::collections::BTreeSet;
 pub use flotilla_protocol::IssueSource;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::NoStatusPatch, Repository, RepositoryKey, TypedResolver};
+use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass, Repository, RepositoryKey, TypedResolver};
 
-define_resource!(Project, "projects", ProjectSpec, (), NoStatusPatch);
+define_resource!(Project, "projects", ProjectSpec, (), NoStatusPatch, replication = ReplicationClass::Definitions);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ProjectSpec {

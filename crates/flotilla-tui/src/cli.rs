@@ -162,7 +162,7 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Project", "Display Name", "Repositories", "Issue Source", "Workflow", "Address"]);
+    table.set_header(vec!["Project", "Display Name", "Repositories", "Issue Source", "Workflow", "Conflict", "Address"]);
     for project in &response.projects {
         let repository_count = project.repositories.len();
         let repositories = if repository_count <= 3 {
@@ -186,6 +186,7 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
             Cell::new(repositories),
             Cell::new(issue_source),
             Cell::new(&project.default_workflow_ref),
+            Cell::new(if project.conflicts.is_empty() { String::new() } else { format!("! {}", project.conflicts.join(", ")) }),
             Cell::new(project.address.human_label()),
         ]);
     }

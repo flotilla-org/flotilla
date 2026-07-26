@@ -9,8 +9,8 @@ use crate::{
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
     Checkout, Clone as CloneResource, Convoy, Demand, Environment, Host, InputMeta, ObjectMeta, OwnerReference, PlacementPolicy,
-    Presentation, Project, ReadWatchEvent, Regard, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
-    ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
+    Presentation, Project, ReadResourceList, ReadWatchEvent, Regard, Repository, Resource, ResourceBackend, ResourceError, ResourceList,
+    ResourceObject, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +194,22 @@ pub async fn watch_resource_kind_including_replicas(
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed_including_replicas(backend, namespace).await)
 }
 
+pub async fn list_resource_kind_replica_sources(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+) -> Result<DynamicResourceList, ResourceError> {
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, list_typed_replica_sources(backend, namespace).await)
+}
+
+pub async fn watch_resource_kind_replica_sources(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+) -> Result<DynamicResourceWatch, ResourceError> {
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed_replica_sources(backend, namespace).await)
+}
+
 pub async fn apply_resource_document(
     backend: &ResourceBackend,
     default_namespace: &str,
@@ -300,8 +316,32 @@ async fn list_typed_including_replicas<T: Resource>(
     })
 }
 
+async fn list_typed_replica_sources<T: Resource>(backend: &ResourceBackend, namespace: &str) -> Result<DynamicResourceList, ResourceError> {
+    let listed = backend.including_replicas::<T>(namespace).list_sources().await?;
+    dynamic_read_list::<T>(namespace, listed)
+}
+
+fn dynamic_read_list<T: Resource>(namespace: &str, listed: ReadResourceList<T>) -> Result<DynamicResourceList, ResourceError> {
+    let items = listed.items.iter().map(read_object_value).collect::<Result<Vec<_>, _>>()?;
+    Ok(DynamicResourceList {
+        kind: T::API_PATHS.kind.to_string(),
+        plural: T::API_PATHS.plural.to_string(),
+        namespace: namespace.to_string(),
+        value: json!({
+            "apiVersion": api_version(T::API_PATHS),
+            "kind": format!("{}List", T::API_PATHS.kind),
+            "metadata": {"resourceVersion": "overlay"},
+            "items": items,
+        }),
+    })
+}
+
 async fn get_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceObject, ResourceError> {
-    let object = backend.using::<T>(namespace).get(name).await?;
+    let object = if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
+        backend.definitions::<T>(namespace).get(name).await?
+    } else {
+        backend.using::<T>(namespace).get(name).await?
+    };
     Ok(DynamicResourceObject {
         kind: T::API_PATHS.kind.to_string(),
         plural: T::API_PATHS.plural.to_string(),
@@ -373,6 +413,30 @@ async fn watch_typed_including_replicas<T: Resource>(
     })
 }
 
+async fn watch_typed_replica_sources<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+) -> Result<DynamicResourceWatch, ResourceError> {
+    let resolver = backend.including_replicas::<T>(namespace);
+    let stream = resolver.watch_sources().await?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed();
+    let initial = resolver
+        .list_sources()
+        .await?
+        .items
+        .iter()
+        .map(|object| Ok(json!({"type": "ADDED", "object": read_object_value(object)?})))
+        .collect::<Result<Vec<_>, ResourceError>>()?;
+    Ok(DynamicResourceWatch {
+        kind: T::API_PATHS.kind.to_string(),
+        plural: T::API_PATHS.plural.to_string(),
+        namespace: namespace.to_string(),
+        resource_version: "overlay".to_string(),
+        generation: None,
+        initial,
+        stream,
+    })
+}
+
 async fn apply_typed<T: Resource>(
     backend: &ResourceBackend,
     namespace: &str,
@@ -381,6 +445,20 @@ async fn apply_typed<T: Resource>(
 ) -> Result<DynamicResourceObject, ResourceError> {
     let spec = serde_json::from_value::<T::Spec>(spec)
         .map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", T::API_PATHS.kind)))?;
+    if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
+        let meta = match backend.definitions::<T>(namespace).get(&metadata.name).await {
+            Ok(existing) => metadata.input_meta_for_update(&existing.metadata),
+            Err(ResourceError::NotFound { .. }) => metadata.input_meta_for_create(),
+            Err(error) => return Err(error),
+        };
+        let object = backend.definitions::<T>(namespace).apply(&meta, &spec).await?;
+        return Ok(DynamicResourceObject {
+            kind: T::API_PATHS.kind.to_string(),
+            plural: T::API_PATHS.plural.to_string(),
+            namespace: namespace.to_string(),
+            value: object_value(&object)?,
+        });
+    }
     let resolver = backend.using::<T>(namespace);
     let object = match resolver.get(&metadata.name).await {
         Ok(existing) => {

@@ -244,6 +244,7 @@ mod project_list_human {
             .repositories(vec![repository("flotilla-org/cleat"), repository("flotilla-org/flotilla")])
             .maybe_issue_source(Some(IssueSource { service: "https://linear.app".into(), scope: "FLOT".into() }))
             .default_workflow_ref("review-and-fix".to_string())
+            .conflicts(vec!["spec.display_name".to_string()])
             .build();
         let many = ProjectListEntry::builder()
             .namespace("flotilla".to_string())
@@ -262,6 +263,7 @@ mod project_list_human {
         assert!(output.contains("flotilla-org/cleat, flotilla-org/flotilla"));
         assert!(output.contains("https://linear.app / FLOT"));
         assert!(output.contains("review-and-fix"));
+        assert!(output.contains("! spec.display_name"));
         assert!(output.contains("4 repositories"));
         assert!(!output.contains("one, two, three, four"));
     }

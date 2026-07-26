@@ -190,6 +190,7 @@ pub fn object_meta(name: &str, namespace: &str, resource_version: &str) -> Objec
         finalizers: Vec::new(),
         deletion_timestamp: None,
         creation_timestamp: timestamp(1),
+        merge: None,
     }
 }
 

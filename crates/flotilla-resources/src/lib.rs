@@ -3,6 +3,7 @@ mod checkout;
 mod clone;
 pub mod controller;
 mod convoy;
+mod definition;
 mod environment;
 mod error;
 mod host;
@@ -38,6 +39,7 @@ pub use convoy::{
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InputValue, IssueSnapshot,
     PlacementStatus, ReconcileOutcome, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
+pub use definition::DefinitionResolver;
 pub use environment::{
     DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus,
     EnvironmentStatusPatch, HostDirectEnvironmentSpec,
@@ -66,8 +68,9 @@ pub use project::{
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use registry::{
-    apply_resource_document, get_resource_kind, list_resource_kind, list_resource_kind_including_replicas, resource_list_api_version,
-    watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, DynamicResourceList, DynamicResourceObject,
+    apply_resource_document, get_resource_kind, list_resource_kind, list_resource_kind_including_replicas,
+    list_resource_kind_replica_sources, resource_list_api_version, watch_resource_kind, watch_resource_kind_from,
+    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceList, DynamicResourceObject,
     DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
 };
 pub use replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass, ResourceProvenance};
@@ -77,8 +80,8 @@ pub use repository::{
     RepositoryRelation, RepositorySpec, RepositoryStatus, RepositoryStatusPatch, RepositoryUpstream,
 };
 pub use resource::{
-    api_version, ApiPaths, InputMeta, K8sListMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject, K8sWatchEvent, ObjectMeta,
-    OwnerReference, Resource, ResourceObject,
+    api_version, ApiPaths, CausalDot, FieldMergeMetadata, InputMeta, K8sListMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject,
+    K8sWatchEvent, MergeConflictSibling, MergeMetadata, ObjectMeta, OwnerReference, Resource, ResourceObject,
 };
 pub use retention::{EventRetention, ResourceStoreDiagnostics, ResourceStoreWarning};
 pub use sqlite::SqliteBackend;

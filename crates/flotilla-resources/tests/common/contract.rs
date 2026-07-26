@@ -1,11 +1,11 @@
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use chrono::Utc;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
     Convoy, Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, InMemoryBackend, InputMeta, OwnerReference, PrincipalRef,
-    Regard, RegardExpiryPolicy, RegardSource, RegardSpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
-    TypedResolver, WatchEvent, WatchStart, WorkflowTemplate,
+    Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RepositoryKey, Resource,
+    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TypedResolver, WatchEvent, WatchStart, WorkflowTemplate,
 };
 use futures::StreamExt;
 use tokio::time::timeout;
@@ -263,6 +263,151 @@ pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
         .expect("read replaced cursor")
         .expect("replaced cursor");
     assert_eq!(cursor.generation.as_deref(), Some("generation-2"));
+}
+
+fn project_spec(display_name: &str, workflow: &str) -> ProjectSpec {
+    ProjectSpec::builder()
+        .display_name(display_name.to_string())
+        .default_workflow_ref(workflow.to_string())
+        .repositories(vec![ProjectRepositorySpec {
+            repo: RepositoryKey("github.com/acme/widgets".to_string()),
+            subpath: None,
+            default_branch: None,
+        }])
+        .build()
+}
+
+pub async fn assert_project_definition_edit_converges_with_backend(backend: ResourceBackend) {
+    let kiwi_root = flotilla_protocol::NodeId::new("kiwi-root");
+    let feta_root = flotilla_protocol::NodeId::new("feta-root");
+    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let feta = backend.with_local_root(feta_root.clone());
+    let meta = InputMeta::builder().name("widgets".to_string()).build();
+
+    kiwi.definitions::<Project>("flotilla").apply(&meta, &project_spec("Widgets", "default")).await.expect("create Project on kiwi");
+    let kiwi_log = kiwi.using::<Project>("flotilla").list().await.expect("list kiwi Project log");
+    feta.replica_writer::<Project>(kiwi_root.clone(), "flotilla")
+        .replace(&kiwi_log, Utc::now())
+        .await
+        .expect("replicate kiwi Project to feta");
+
+    let visible_on_feta = feta.definitions::<Project>("flotilla").get("widgets").await.expect("Project should be visible on feta");
+    assert_eq!(visible_on_feta.spec.display_name, "Widgets");
+    assert!(feta.using::<Project>("flotilla").list().await.expect("list feta local log").items.is_empty());
+
+    feta.definitions::<Project>("flotilla")
+        .apply(&InputMeta::from(&visible_on_feta.metadata), &project_spec("Feta Widgets", "default"))
+        .await
+        .expect("edit kiwi-authored Project on feta");
+    let feta_log = feta.using::<Project>("flotilla").list().await.expect("list feta Project log");
+    kiwi.replica_writer::<Project>(feta_root, "flotilla").replace(&feta_log, Utc::now()).await.expect("replicate feta Project to kiwi");
+
+    let converged_on_kiwi = kiwi.definitions::<Project>("flotilla").get("widgets").await.expect("merged Project on kiwi");
+    assert_eq!(converged_on_kiwi.spec.display_name, "Feta Widgets");
+    assert!(converged_on_kiwi.metadata.merge.as_ref().expect("definition merge metadata").conflicts.is_empty());
+}
+
+pub async fn assert_project_definition_causal_merge_with_backend(backend: ResourceBackend) {
+    let kiwi_root = flotilla_protocol::NodeId::new("kiwi-root");
+    let feta_root = flotilla_protocol::NodeId::new("feta-root");
+    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let feta = backend.with_local_root(feta_root.clone());
+    let meta = InputMeta::builder().name("widgets".to_string()).build();
+
+    kiwi.definitions::<Project>("flotilla").apply(&meta, &project_spec("Widgets", "default")).await.expect("create Project baseline");
+    let baseline = kiwi.using::<Project>("flotilla").list().await.expect("list Project baseline");
+    feta.replica_writer::<Project>(kiwi_root.clone(), "flotilla").replace(&baseline, Utc::now()).await.expect("replicate baseline to feta");
+
+    kiwi.definitions::<Project>("flotilla")
+        .apply(&meta, &project_spec("Kiwi Widgets", "default"))
+        .await
+        .expect("concurrent kiwi display-name edit");
+    feta.definitions::<Project>("flotilla")
+        .apply(&meta, &project_spec("Feta Widgets", "feta-flow"))
+        .await
+        .expect("concurrent feta display-name and workflow edit");
+
+    let kiwi_log = kiwi.using::<Project>("flotilla").list().await.expect("list updated kiwi log");
+    let feta_log = feta.using::<Project>("flotilla").list().await.expect("list updated feta log");
+    kiwi.replica_writer::<Project>(feta_root.clone(), "flotilla")
+        .replace(&feta_log, Utc::now())
+        .await
+        .expect("replicate concurrent feta edit to kiwi");
+    feta.replica_writer::<Project>(kiwi_root.clone(), "flotilla")
+        .replace(&kiwi_log, Utc::now())
+        .await
+        .expect("replicate concurrent kiwi edit to feta");
+
+    let merged_on_kiwi = kiwi.definitions::<Project>("flotilla").get("widgets").await.expect("merged Project on kiwi");
+    let merged_on_feta = feta.definitions::<Project>("flotilla").get("widgets").await.expect("merged Project on feta");
+    assert_eq!(
+        serde_json::to_value(&merged_on_kiwi).expect("serialize kiwi merge"),
+        serde_json::to_value(&merged_on_feta).expect("serialize feta merge"),
+        "the same source set must produce the same merged view on every root"
+    );
+
+    for merged in [merged_on_kiwi, merged_on_feta] {
+        assert_eq!(merged.spec.default_workflow_ref, "feta-flow", "disjoint-field edit should merge without conflict");
+        let conflicts = &merged.metadata.merge.as_ref().expect("definition merge metadata").conflicts;
+        let display_conflict = conflicts.get("spec.display_name").expect("concurrent same-field edits should conflict");
+        assert_eq!(display_conflict.len(), 2);
+        assert_eq!(
+            display_conflict.iter().map(|sibling| sibling.value.as_str().expect("string sibling")).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["Feta Widgets", "Kiwi Widgets"])
+        );
+        assert!(!conflicts.contains_key("spec.default_workflow_ref"));
+    }
+
+    feta.definitions::<Project>("flotilla")
+        .apply(&meta, &project_spec("Feta Widgets", "feta-flow"))
+        .await
+        .expect("resolve conflict by ordinarily writing an existing sibling");
+    let resolved_log = feta.using::<Project>("flotilla").list().await.expect("list resolution");
+    kiwi.replica_writer::<Project>(feta_root, "flotilla").replace(&resolved_log, Utc::now()).await.expect("replicate resolution to kiwi");
+
+    for merged in [
+        kiwi.definitions::<Project>("flotilla").get("widgets").await.expect("resolved Project on kiwi"),
+        feta.definitions::<Project>("flotilla").get("widgets").await.expect("resolved Project on feta"),
+    ] {
+        assert_eq!(merged.spec.display_name, "Feta Widgets");
+        assert!(merged.metadata.merge.as_ref().expect("definition merge metadata").conflicts.is_empty());
+    }
+}
+
+pub async fn assert_project_definition_delete_conflicts_with_concurrent_edit_with_backend(backend: ResourceBackend) {
+    let kiwi_root = flotilla_protocol::NodeId::new("kiwi-root");
+    let feta_root = flotilla_protocol::NodeId::new("feta-root");
+    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let feta = backend.with_local_root(feta_root.clone());
+    let meta = InputMeta::builder().name("widgets".to_string()).build();
+
+    kiwi.definitions::<Project>("flotilla").apply(&meta, &project_spec("Widgets", "default")).await.expect("create Project baseline");
+    let baseline = kiwi.using::<Project>("flotilla").list().await.expect("list baseline");
+    feta.replica_writer::<Project>(kiwi_root.clone(), "flotilla").replace(&baseline, Utc::now()).await.expect("replicate baseline");
+
+    kiwi.definitions::<Project>("flotilla").delete("widgets").await.expect("delete on kiwi");
+    feta.definitions::<Project>("flotilla")
+        .apply(&meta, &project_spec("Edited on Feta", "default"))
+        .await
+        .expect("concurrent edit on feta");
+    let kiwi_log = kiwi.using::<Project>("flotilla").list().await.expect("list delete");
+    let feta_log = feta.using::<Project>("flotilla").list().await.expect("list edit");
+    kiwi.replica_writer::<Project>(feta_root, "flotilla").replace(&feta_log, Utc::now()).await.expect("sync edit");
+    feta.replica_writer::<Project>(kiwi_root, "flotilla").replace(&kiwi_log, Utc::now()).await.expect("sync delete");
+
+    let conflicted = feta.definitions::<Project>("flotilla").get("widgets").await.expect("delete/edit conflict remains visible");
+    let deletion = conflicted
+        .metadata
+        .merge
+        .as_ref()
+        .expect("definition merge metadata")
+        .conflicts
+        .get("$deleted")
+        .expect("concurrent delete and edit should conflict");
+    assert_eq!(
+        deletion.iter().map(|sibling| sibling.value.as_bool().expect("boolean deletion sibling")).collect::<BTreeSet<_>>(),
+        [false, true,].into_iter().collect()
+    );
 }
 
 pub fn resolver<F: ResourceContractFixture>(backend: ResourceBackend, namespace: &str) -> TypedResolver<F::Resource> {

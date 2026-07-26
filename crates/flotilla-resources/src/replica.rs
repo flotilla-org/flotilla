@@ -14,6 +14,7 @@ pub(crate) const LAST_SYNCED_AT_ANNOTATION: &str = "flotilla.work/last-synced-at
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicationClass {
     None,
+    Definitions,
     HomeBoundRuntime,
 }
 
