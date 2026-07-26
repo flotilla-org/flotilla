@@ -1,0 +1,45 @@
+# Robert's actual cross-project working surface. It intentionally owns no
+# repository: its value is the durable aggregate and its tracker bindings.
+display_name: Robert's daily surface
+default_workflow_ref: implement-review
+
+issue_sources:
+  - role: primary
+    source:
+      service: https://forgejo.lab.flotilla.work
+      scope: fork-issues/zellij
+    repository_ref: github.com/rjwittams/zellij
+  - role: associated
+    source:
+      service: https://github.com
+      scope: flotilla-org/flotilla
+    repository_ref: github.com/flotilla-org/flotilla
+  - role: associated
+    source:
+      service: https://github.com
+      scope: flotilla-org/andamento
+    repository_ref: github.com/flotilla-org/andamento
+
+relevance:
+  default: all
+
+repositories:
+  - repo: github.com/flotilla-org/andamento
+    role: member
+    claim: association
+    ref:
+      branch: main
+
+  - repo: github.com/flotilla-org/flotilla
+    role: member
+    claim: association
+    ref:
+      branch: main
+
+  # Association is still fork stance: dispatch must use implement-review and
+  # must never expose or act against the upstream forge.
+  - repo: github.com/rjwittams/zellij
+    role: member
+    claim: association
+    ref:
+      branch: feat/kitty-image-plumbing

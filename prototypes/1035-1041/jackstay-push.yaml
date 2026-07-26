@@ -1,0 +1,59 @@
+# The post-extraction push described by #1006. The source subtree is retained
+# here to expose the slice-vs-new-Repository decision rather than hiding it.
+display_name: Jackstay push
+default_workflow_ref: implement-review
+
+issue_sources:
+  - role: primary
+    source:
+      service: https://github.com
+      scope: flotilla-org/porthole
+    repository_ref: github.com/flotilla-org/porthole
+  - role: associated
+    source:
+      service: https://github.com
+      scope: flotilla-org/cleat
+    repository_ref: github.com/flotilla-org/cleat
+
+relevance:
+  default: all
+
+repositories:
+  # Porthole is historical/read-only context except for the extracted source
+  # scope. If extraction has completed, this slice should instead be a
+  # standalone jackstay Repository with extraction provenance on Repository.
+  - repo: github.com/flotilla-org/porthole
+    role: reference
+    claim: association
+    ref:
+      branch: main
+    slices:
+      - path: jackstay
+        role: member
+        claim: controller
+
+  - repo: github.com/rjwittams/katzensteg
+    role: member
+    claim: association
+    ref:
+      branch: main
+
+  - repo: github.com/flotilla-org/cleat
+    role: member
+    claim: association
+    ref:
+      branch: main
+
+  # This logical Repository ref remains stable across uishell -> wheelhouse.
+  - repo: uishell
+    role: member
+    claim: association
+    ref:
+      branch: main
+
+  # Fork provenance and upstream guardrails resolve from Repository, not here.
+  - repo: github.com/rjwittams/zellij
+    role: member
+    claim: association
+    ref:
+      branch: feat/kitty-image-plumbing
