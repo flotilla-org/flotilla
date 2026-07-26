@@ -14,7 +14,7 @@ use flotilla_core::{
 use flotilla_protocol::{
     result_set::{
         CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryChanges, QueryId, QueryScope,
-        ResultDelta, Rows, SessionPhase, VesselRow, WorkPhase,
+        ResultDelta, ResultSetState, Rows, SessionPhase, VesselRow, WorkPhase,
     },
     Change, DaemonEvent, EntryOp, FleetReplicaSnapshot, HostName, LifecycleAuthority, ProviderData, RepoDelta, RepoIdentity, RepoSnapshot,
     RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
@@ -169,6 +169,12 @@ pub struct Aggregator {
     observed_checkouts: HashMap<ResourceRef, ResourceObject<Checkout>>,
     bootstrapping: bool,
     emitted_queries: HashSet<QueryId>,
+    /// Last content (rows, state) broadcast per subscribed Awareness query,
+    /// so unrelated-scope rebuilds don't re-send unchanged scoped snapshots.
+    /// `seq` is excluded: it advances on any fleet-wide Convoys/Independents/
+    /// Checkouts change even when a given scope's projected rows are stable.
+    #[builder(skip)]
+    awareness_content_cache: HashMap<QueryId, (Rows, ResultSetState)>,
     #[builder(skip)]
     attach_resolver: Option<Arc<dyn AttachCapabilityResolver>>,
     #[builder(skip)]
@@ -228,6 +234,7 @@ impl Aggregator {
             observed_checkouts: HashMap::new(),
             bootstrapping: false,
             emitted_queries: HashSet::new(),
+            awareness_content_cache: HashMap::new(),
             attach_resolver: None,
             change_request_resolver: None,
             convoy_change_requests: HashMap::new(),
@@ -1290,7 +1297,7 @@ impl Aggregator {
         repository_display_labels(self.repositories.iter().map(|(key, repository)| (key, &repository.spec))).into_iter().collect()
     }
 
-    async fn rebuild_store_catalog(&self) {
+    async fn rebuild_store_catalog(&mut self) {
         let repositories = self.repository_labels();
         let projects = self
             .projects
@@ -1305,7 +1312,7 @@ impl Aggregator {
         self.emit_store_deltas(deltas).await;
     }
 
-    async fn rebuild_checkout_rows(&self) -> Result<(), ResourceError> {
+    async fn rebuild_checkout_rows(&mut self) -> Result<(), ResourceError> {
         let rows = self
             .observed_checkouts
             .values()
@@ -1341,7 +1348,7 @@ impl Aggregator {
         Ok(())
     }
 
-    async fn emit_store_deltas(&self, deltas: Vec<ResultDelta>) {
+    async fn emit_store_deltas(&mut self, deltas: Vec<ResultDelta>) {
         if self.bootstrapping {
             return;
         }
@@ -1436,7 +1443,7 @@ impl Aggregator {
         self.emit_store_deltas(checkout_deltas).await;
     }
 
-    async fn emit_delta(&self, changed: Vec<ConvoyRow>, removed: Vec<ResourceRef>) {
+    async fn emit_delta(&mut self, changed: Vec<ConvoyRow>, removed: Vec<ResourceRef>) {
         let seq = self.state.seq().await;
         let changes = QueryChanges::Convoys { changed, removed };
         let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changes, state: None })));
@@ -1538,14 +1545,20 @@ impl Aggregator {
         self.regards.retain(|_, regard| regard_expiry_at(regard).is_none_or(|expiry| expiry > now));
     }
 
-    async fn emit_awareness_result_sets(&self) {
-        for query in self.state.subscribed_queries() {
+    async fn emit_awareness_result_sets(&mut self) {
+        let subscribed = self.state.subscribed_queries();
+        self.awareness_content_cache.retain(|query, _| subscribed.contains(query));
+        for query in subscribed {
             if !matches!(query, QueryId::Awareness { .. }) {
                 continue;
             }
-            if let Some(result_set) = self.state.result_set_for(&query).await {
-                let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
+            let Some(result_set) = self.state.result_set_for(&query).await else { continue };
+            let content = (result_set.rows.clone(), result_set.state.clone());
+            if self.awareness_content_cache.get(&query) == Some(&content) {
+                continue;
             }
+            self.awareness_content_cache.insert(query, content);
+            let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
         }
     }
 
@@ -2266,6 +2279,76 @@ mod tests {
             .expect_err("closed replica channel should stop run")
             .to_string()
             .contains("replica channel closed"));
+    }
+
+    async fn convoy_object_for_project(name: &str, project_ref: &str) -> ResourceObject<Convoy> {
+        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        backend
+            .using::<Convoy>("flotilla")
+            .create(
+                &InputMeta::builder().name(name.to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("scratch".to_string()).project_ref(project_ref.to_string()).build(),
+            )
+            .await
+            .expect("create project-scoped convoy")
+    }
+
+    #[tokio::test]
+    async fn unrelated_project_scope_does_not_receive_a_resent_awareness_snapshot() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(32);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+
+        // The very first convoy only ever publishes a full Convoys snapshot;
+        // subsequent changes flow through the delta + awareness-refresh path.
+        aggregator
+            .apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_object_for_project("convoy-alpha-1", "alpha").await))
+            .await;
+        let _ = recv_query_event(&mut event_rx, QueryId::Convoys, "initial convoys snapshot").await;
+
+        let alpha_query = QueryId::Awareness {
+            scope: Some(QueryScope::new("flotilla", "alpha")),
+            grouping: flotilla_protocol::AwarenessGrouping::Project,
+            limit: flotilla_protocol::AwarenessLimit::default(),
+        };
+        let beta_query = QueryId::Awareness {
+            scope: Some(QueryScope::new("flotilla", "beta")),
+            grouping: flotilla_protocol::AwarenessGrouping::Project,
+            limit: flotilla_protocol::AwarenessLimit::default(),
+        };
+        state.replace_subscriber(Uuid::new_v4(), &[
+            flotilla_protocol::QueryCursor { query: alpha_query.clone(), since: None },
+            flotilla_protocol::QueryCursor { query: beta_query.clone(), since: None },
+        ]);
+
+        // First rebuild after subscribing primes both scopes' caches.
+        aggregator
+            .apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_object_for_project("convoy-alpha-2", "alpha").await))
+            .await;
+        let _ = recv_query_event(&mut event_rx, alpha_query.clone(), "primed alpha awareness").await;
+        let _ = recv_query_event(&mut event_rx, beta_query.clone(), "primed beta awareness").await;
+
+        // Only alpha's projected rows change from here on.
+        aggregator
+            .apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_object_for_project("convoy-alpha-3", "alpha").await))
+            .await;
+        let alpha_update = recv_query_event(&mut event_rx, alpha_query.clone(), "alpha awareness should update").await;
+        let DaemonEvent::ResultSet(alpha_result) = alpha_update else { panic!("expected result set") };
+        let alpha_rows = alpha_result.rows.as_awareness().expect("awareness rows");
+        assert_eq!(alpha_rows[0].counts.convoys, 3);
+
+        let unrelated_resend = timeout(Duration::from_millis(200), async {
+            loop {
+                let event = event_rx.recv().await.expect("aggregator event");
+                if let DaemonEvent::ResultSet(result_set) = &event {
+                    if result_set.query() == beta_query {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(unrelated_resend.is_err(), "unrelated project scope should not receive a re-sent, unchanged awareness snapshot");
     }
 
     #[tokio::test]
