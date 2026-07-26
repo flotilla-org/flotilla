@@ -661,7 +661,11 @@ struct ReplicaParseDiagnostics {
 
 impl ReplicaParseDiagnostics {
     fn record_skip(&mut self, path: impl std::fmt::Display, error: impl std::fmt::Display) {
-        self.skipped_records += 1;
+        self.record_skips(1, path, error);
+    }
+
+    fn record_skips(&mut self, count: usize, path: impl std::fmt::Display, error: impl std::fmt::Display) {
+        self.skipped_records += count;
         self.first_error.get_or_insert_with(|| format!("{path}: {error}"));
     }
 }
@@ -675,6 +679,8 @@ struct ParsedFleetReplicaSnapshot {
 fn result_set_records_mut(result_set: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
     let content = result_set.get_mut("rows")?.get_mut("rows")?;
     if content.is_array() {
+        // Tuple-style variants such as Rows::Convoys serialize their content
+        // directly as the record array.
         content.as_array_mut()
     } else {
         content.get_mut("rows")?.as_array_mut()
@@ -699,7 +705,7 @@ fn retain_parseable_result_set_records(
 
     let envelope = result_set.clone();
     if let Err(error) = serde_json::from_value::<ResultSet>(envelope.clone()) {
-        diagnostics.record_skip(format_args!("result_sets[{result_set_index}]"), error);
+        diagnostics.record_skips(records.len().max(1), format_args!("result_sets[{result_set_index}]"), error);
         return false;
     }
 

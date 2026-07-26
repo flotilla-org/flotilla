@@ -1912,7 +1912,7 @@ async fn replica_refresh_replaces_rows_when_generation_changes() {
 }
 
 #[tokio::test]
-async fn replica_refresh_skips_a_drifted_record_and_reports_the_parse_skew() {
+async fn replica_refresh_skips_drifted_records_and_reports_the_parse_skew() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -1940,13 +1940,23 @@ async fn replica_refresh_skips_a_drifted_record_and_reports_the_parse_skew() {
             state: Default::default(),
         }],
     };
-    let mut drifted_snapshot = serde_json::to_value(snapshot).expect("serialize replica snapshot");
-    drifted_snapshot["result_sets"][0]["rows"]["rows"]["rows"][0].as_object_mut().expect("checkout row object").remove("repo_label");
-    let runner = Arc::new(QueuedOutputRunner::new(vec![CommandOutput {
-        stdout: serde_json::to_string(&drifted_snapshot).expect("serialize drifted snapshot"),
-        stderr: String::new(),
-        success: true,
-    }]));
+    let snapshot = serde_json::to_value(snapshot).expect("serialize replica snapshot");
+    let mut drifted_record_snapshot = snapshot.clone();
+    drifted_record_snapshot["result_sets"][0]["rows"]["rows"]["rows"][0].as_object_mut().expect("checkout row object").remove("repo_label");
+    let mut drifted_envelope_snapshot = snapshot;
+    drifted_envelope_snapshot["result_sets"][0]["rows"]["rows"]["scope"] = serde_json::json!(42);
+    let runner = Arc::new(QueuedOutputRunner::new(vec![
+        CommandOutput {
+            stdout: serde_json::to_string(&drifted_record_snapshot).expect("serialize record-drifted snapshot"),
+            stderr: String::new(),
+            success: true,
+        },
+        CommandOutput {
+            stdout: serde_json::to_string(&drifted_envelope_snapshot).expect("serialize envelope-drifted snapshot"),
+            stderr: String::new(),
+            success: true,
+        },
+    ]));
     let mut discovery =
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(Arc::new(FakeTerminalPool::new())));
     discovery.runner = runner;
@@ -1968,6 +1978,23 @@ async fn replica_refresh_skips_a_drifted_record_and_reports_the_parse_skew() {
             .as_str()
             .is_some_and(|error| error.contains("result_sets[0].rows[0]") && error.contains("missing field `repo_label`")),
         "status should report the first parse error: {status}"
+    );
+
+    daemon.refresh_fleet_replicas_once().await.expect("envelope-drifted refresh should succeed");
+
+    let cached = daemon.cached_fleet_replica_snapshots().await;
+    assert!(cached[0].result_sets.is_empty(), "an unparseable result-set envelope cannot retain its rows");
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+    assert!(response.replicas[0].reachable);
+    assert_eq!(response.replicas[0].generation.as_deref(), Some("gen-drifted"));
+    assert_eq!(response.replicas[0].skipped_records, 2);
+    assert!(
+        response.replicas[0]
+            .first_parse_error
+            .as_deref()
+            .is_some_and(|error| error.contains("result_sets[0]") && error.contains("invalid type: integer `42`")),
+        "status should count every row dropped with an unparseable envelope: {:?}",
+        response.replicas[0]
     );
 }
 
