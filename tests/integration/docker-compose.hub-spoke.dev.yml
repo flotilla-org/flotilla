@@ -1,0 +1,11 @@
+# Override: use pre-built binaries from the host instead of building with cargo.
+# Usage:
+#   docker compose -f docker-compose.hub-spoke.yml \
+#     -f docker-compose.hub-spoke.dev.yml up -d --build
+#
+# The host binaries must be glibc-compatible with the container's Debian
+# trixie runtime (glibc 2.41).
+services:
+  flotilla-base:
+    build:
+      target: dev
