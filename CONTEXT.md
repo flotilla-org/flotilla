@@ -20,12 +20,13 @@ happens. Realised concretely as the **Project** resource.
 _Avoid_: using "Island" as a code/identifier name — it is the metaphor, not the type.
 
 **Project**:
-The definition resource that structurally groups work (convoys) belonging to
-one codebase, which may span one or more **Repositories** or repository slices.
-Tracking a Repository materialises an ordinary whole-repository Project as the
-human-intent-backed default; that Project remains user-editable and may grow to
-cover more Repositories or select a different Issue Source. The concrete form
-of the **Island** metaphor.
+The definition resource that structurally groups work (convoys and issues)
+belonging to one codebase, which may span one or more **Repositories** or
+repository slices, held as **Membership Claims**. Tracking a Repository
+materialises an ordinary whole-repository Project as the human-intent-backed
+default; that Project remains user-editable. The concrete form of the **Island**
+metaphor. Not a monorepo manifest — closer to a set of source roots modified
+together (see ADR 0020).
 _Avoid_: Repo (a Project may span more than the bare git remote), Workspace.
 
 **Repository**:
@@ -34,6 +35,43 @@ checkout, clone, and Project reference to it. A Repository persists even when
 no checkout currently exists.
 _Avoid_: Project (the stewarded work context), Checkout (one materialisation),
 Repo (too easily conflates all three).
+
+**Membership Claim**:
+How a **Project** includes a **Repository**: a `(Repository, optional subpath)`
+pair carrying a **role** — **member** (the Project changes it: checkouts,
+dispatch, shipped config, issue binding) or **reference** (read-only context,
+never a dispatch target). Exactly one member claim per Repository may be
+**primary**, which governs only ownership of the Repository resource and the
+home for unclaimed ambient entities — never exclusive dispatch.
+_Avoid_: membership list, ownership, vendoring (fork-ness lives on Repository).
+
+**Association**:
+The relationship by which an entity appears under a **Project**, always
+evaluated as a query. An issue's association is *derived* (labels, filters,
+triage); a convoy's is *inherited* — stamped from the context it was dispatched
+from. Reverse indexes over associations are views, never stored.
+_Avoid_: ownership, membership (that is repositories), tagging.
+
+**Workspace Set**:
+The list of **Membership Claims** a convoy's vessels get on disk — mutable
+convoy data, defaulting to the admitted Project's member claims. A single-entry
+set roots the vessel at the repository checkout itself; a multi-entry set
+produces a parent directory of sibling checkouts.
+_Avoid_: workspace (the multiplexer sense), checkout set.
+
+**Hull**:
+A durable workspace directory whose identity outlives the work aboard it.
+Convoys are its **tenants**: filesystem paths are hull-named (never
+convoy-named) so caches, build artifacts, and path-keyed trust survive
+re-tasking. Hulls carry durable memorable ship names.
+_Avoid_: workspace, worktree, vessel (the unit of execution, not of residence).
+
+**Provenance Edge**:
+A recorded link from a resource to the resource it came from — used for
+repository extraction, the provisional→canonical identity upgrade, and
+(prospectively) project rename. The alternative to surrogate identity: names
+stay identity, and history is explicit rather than carried invisibly.
+_Avoid_: UID, alias, redirect.
 
 **Convoy**:
 A named instance of a workflow — the primary unit of *launched* work. What a
@@ -167,9 +205,11 @@ external identity, not a local provider implementation or credential choice.
 _Avoid_: Tracker binding, provider, remote (a Git transport spelling).
 
 **Issue Source**:
-An external service and scope supplying issues. A **Project** may select one
-override (for example, a Linear project); otherwise each constituent
-Repository's Forge is its Issue Source.
+An external service and scope supplying issues, bound to a **Project** as a
+`(source, filter)` pair. Each **Membership Claim** derives one from its
+Repository's Forge; the Project may additionally declare sources deriving from no
+claim, exclude derived ones, or attach filters. Qualified in commands by a
+per-binding **alias** (default: the repository name).
 _Avoid_: Tracker binding, issue cache, provider.
 
 **Demand-backed Query**:
