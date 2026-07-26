@@ -655,7 +655,7 @@ mod tests {
         let view = view();
         let row_id = view.rows[0].id.clone();
         let mut state = TableState::default();
-        state.begin_pending(flotilla_protocol::QueryId::Convoys, row_id, "Delete convoy".into()).expect("pending row");
+        state.begin_pending(flotilla_protocol::QueryId::Convoys { scope: None }, row_id, "Delete convoy".into()).expect("pending row");
         terminal
             .draw(|frame| {
                 TablePanel::render_rows_at(

@@ -69,8 +69,8 @@ fn repo_label(identity: &flotilla_protocol::RepoIdentity, model: &TuiModel, leve
 fn default_label(view: &OpenView, model: &TuiModel, level: usize) -> String {
     match &view.target {
         ViewTarget::View(ViewAddress::Overview) => " ⚓ flotilla ".to_string(),
-        ViewTarget::View(ViewAddress::Convoys { namespace }) if namespace == "flotilla" && level == 0 => " 🚢 convoys ".to_string(),
-        ViewTarget::View(ViewAddress::Convoys { namespace }) => format!(" 🚢 {namespace} "),
+        ViewTarget::View(ViewAddress::Convoys { namespace, .. }) if namespace == "flotilla" && level == 0 => " 🚢 convoys ".to_string(),
+        ViewTarget::View(ViewAddress::Convoys { namespace, .. }) => format!(" 🚢 {namespace} "),
         ViewTarget::View(ViewAddress::Independents { scope: Some(scope) }) => match level {
             0 => format!("⛵ {} independents", scope.name),
             _ => format!("⛵ {}/{} independents", scope.namespace, scope.name),

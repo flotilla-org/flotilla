@@ -532,6 +532,7 @@ struct ScopedIssueProjection {
 #[derive(Default, bon::Builder)]
 pub struct TableRows<'a> {
     pub convoys: Vec<&'a ConvoySummary>,
+    pub convoy_results: Vec<QueryRows<'a, ConvoySummary>>,
     pub independent_results: Vec<QueryRows<'a, IndependentRow>>,
     pub issue_results: Vec<QueryRows<'a, IssueRow>>,
     pub checkout_results: Vec<QueryRows<'a, CheckoutRow>>,
@@ -551,6 +552,7 @@ pub struct QueryRows<'a, R> {
 /// curated table families to prevent subscription/projection drift.
 pub fn query_for(address: &ViewAddress, source_search: Option<&str>) -> Option<QueryId> {
     match address {
+        ViewAddress::Convoys { scope, .. } => Some(QueryId::Convoys { scope: scope.clone() }),
         ViewAddress::Issues { scope } => Some(QueryId::Issues {
             scope: scope.clone(),
             search: source_search.filter(|search| !search.is_empty()).map(str::to_owned),
@@ -564,8 +566,23 @@ pub fn query_for(address: &ViewAddress, source_search: Option<&str>) -> Option<Q
 
 pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView, String> {
     match address {
-        ViewAddress::Convoys { namespace } => {
-            let rows = data.convoys.iter().copied().filter(|convoy| &convoy.namespace == namespace).cloned();
+        ViewAddress::Convoys { namespace, scope } => {
+            let query = query_for(address, data.source_search).expect("convoys address has a query");
+            let query_rows = data.convoy_results.iter().find(|result| *result.query == query).map(|result| result.rows);
+            let rows = query_rows
+                .into_iter()
+                .flatten()
+                .chain(query_rows.is_none().then_some(data.convoys.as_slice()).into_iter().flatten().copied())
+                .filter(|convoy| &convoy.namespace == namespace)
+                .filter(|convoy| {
+                    scope.as_ref().is_none_or(|scope| {
+                        convoy
+                            .project_ref
+                            .as_deref()
+                            .is_some_and(|project| project == scope.name || project == format!("{}/{}", scope.namespace, scope.name))
+                    })
+                })
+                .cloned();
             Ok(convoy_spec().project(format!("Convoys · {namespace}"), rows))
         }
         ViewAddress::Independents { scope } => {
@@ -672,14 +689,8 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
         return Err(format!("view is not project-backed: {}", address.human_label()));
     };
     let scope = QueryScope::new(namespace, name);
-    let convoys = convoy_spec().project(
-        "Convoys".to_string(),
-        data.convoys
-            .iter()
-            .copied()
-            .filter(|convoy| &convoy.namespace == namespace && convoy.project_ref.as_deref() == Some(name))
-            .cloned(),
-    );
+    let convoys_address = ViewAddress::Convoys { namespace: namespace.clone(), scope: Some(scope.clone()) };
+    let convoys = project(&convoys_address, data).unwrap_or_else(|_| pending_project_table(&convoys_address));
     let checkouts_address = ViewAddress::Checkouts { scope: Some(scope.clone()) };
     let issues_address = ViewAddress::Issues { scope: scope.clone() };
     let independents_address = ViewAddress::Independents { scope: Some(scope) };
@@ -712,7 +723,7 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
     }
 
     Ok(vec![
-        ProjectPanel { kind: ProjectPanelKind::Convoys, target: ViewAddress::Convoys { namespace: namespace.clone() }, table: convoys },
+        ProjectPanel { kind: ProjectPanelKind::Convoys, target: convoys_address, table: convoys },
         ProjectPanel { kind: ProjectPanelKind::Checkouts, target: checkouts_address, table: checkouts },
         ProjectPanel { kind: ProjectPanelKind::Issues, target: issues_address, table: issues },
         ProjectPanel { kind: ProjectPanelKind::Independents, target: independents_address, table: independents },
@@ -1609,7 +1620,7 @@ mod tests {
             ProjectPanelKind::Independents,
         ]);
         assert_eq!(panels.iter().map(|panel| panel.target.to_string()).collect::<Vec<_>>(), vec![
-            "convoys/flotilla",
+            "convoys/flotilla?project=flotilla%2Froadmap",
             "checkouts?project=flotilla%2Froadmap",
             "issues?project=flotilla%2Froadmap",
             "independents?project=flotilla%2Froadmap",
@@ -1819,12 +1830,12 @@ mod tests {
         let pending = RowId::new("dev/tables");
         let unrelated = RowId::new("dev/other");
 
-        state.begin_pending(QueryId::Convoys, pending.clone(), "Delete convoy".into()).expect("row should become pending");
-        state.reconcile_authoritative(&QueryId::Convoys, &AuthoritativeRowUpdate::Rows(HashSet::from([unrelated])));
+        state.begin_pending(QueryId::Convoys { scope: None }, pending.clone(), "Delete convoy".into()).expect("row should become pending");
+        state.reconcile_authoritative(&QueryId::Convoys { scope: None }, &AuthoritativeRowUpdate::Rows(HashSet::from([unrelated])));
 
         assert!(matches!(state.row_state(&pending), Some(RowState::Submitting { .. })));
 
-        state.reconcile_authoritative(&QueryId::Convoys, &AuthoritativeRowUpdate::Rows(HashSet::from([pending.clone()])));
+        state.reconcile_authoritative(&QueryId::Convoys { scope: None }, &AuthoritativeRowUpdate::Rows(HashSet::from([pending.clone()])));
 
         assert!(state.row_state(&pending).is_none());
     }
@@ -1835,10 +1846,12 @@ mod tests {
         let convoy = RowId::new("dev/tables");
         let issue = RowId::new("issue:809");
         let issues_query = QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: None, label: None };
-        state.begin_pending(QueryId::Convoys, convoy.clone(), "Delete convoy".into()).expect("convoy should become pending");
+        state
+            .begin_pending(QueryId::Convoys { scope: None }, convoy.clone(), "Delete convoy".into())
+            .expect("convoy should become pending");
         state.begin_pending(issues_query.clone(), issue.clone(), "Start convoy".into()).expect("issue should become pending");
 
-        state.reconcile_authoritative(&QueryId::Convoys, &AuthoritativeRowUpdate::Full);
+        state.reconcile_authoritative(&QueryId::Convoys { scope: None }, &AuthoritativeRowUpdate::Full);
 
         assert!(state.row_state(&convoy).is_none());
         assert!(matches!(state.row_state(&issue), Some(RowState::Submitting { .. })));
@@ -1849,9 +1862,9 @@ mod tests {
         let mut state = TableState::default();
         let pending = RowId::new("dev/pending");
         let failed = RowId::new("dev/failed");
-        state.begin_pending(QueryId::Convoys, pending.clone(), "Delete convoy".into()).expect("row should submit");
+        state.begin_pending(QueryId::Convoys { scope: None }, pending.clone(), "Delete convoy".into()).expect("row should submit");
         state.mark_pending(&pending, 1);
-        state.begin_pending(QueryId::Convoys, failed.clone(), "Delete convoy".into()).expect("row should submit");
+        state.begin_pending(QueryId::Convoys { scope: None }, failed.clone(), "Delete convoy".into()).expect("row should submit");
         state.mark_failed(&failed, "delete failed".into());
 
         state.mark_pending(&pending, 2);

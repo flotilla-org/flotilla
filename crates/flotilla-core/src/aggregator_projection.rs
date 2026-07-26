@@ -39,7 +39,7 @@ impl QueryRow for ConvoyRow {
     }
 
     fn into_rows(rows: Vec<Self>) -> Rows {
-        Rows::Convoys(rows)
+        Rows::Convoys { scope: None, rows }
     }
 }
 
@@ -149,6 +149,13 @@ impl AggregatorProjectionState {
 
     pub async fn result_set(&self) -> ResultSet {
         self.convoys.read().await.result_set()
+    }
+
+    pub async fn convoy_result_set(&self, scope: &Option<QueryScope>) -> ResultSet {
+        let set = self.result_set().await;
+        let Rows::Convoys { rows, .. } = set.rows else { unreachable!("convoy projection must produce convoy rows") };
+        let rows = rows.into_iter().filter(|row| scope.as_ref().is_none_or(|scope| convoy_matches_scope(row, scope))).collect();
+        ResultSet { seq: set.seq, rows: Rows::Convoys { scope: scope.clone(), rows }, state: set.state }
     }
 
     pub async fn seq(&self) -> u64 {
@@ -282,7 +289,7 @@ impl AggregatorProjectionState {
     /// The current fleet-merged result set for one named query.
     pub async fn result_set_for(&self, query: &QueryId) -> Option<ResultSet> {
         match query {
-            QueryId::Convoys => Some(self.result_set().await),
+            QueryId::Convoys { scope } => Some(self.convoy_result_set(scope).await),
             QueryId::Independents { scope } => Some(self.independents_result_set(scope).await),
             QueryId::Issues { .. } => self.demand_backed.result_set(query),
             QueryId::Checkouts { scope } => Some(self.checkouts.write().await.result_set(scope)),
@@ -302,7 +309,7 @@ impl AggregatorProjectionState {
         let convoys = {
             let set = self.result_set().await;
             let rows = match set.rows {
-                Rows::Convoys(rows) => rows,
+                Rows::Convoys { rows, .. } => rows,
                 _ => Vec::new(),
             };
             rows.into_iter().filter(|row| scope.as_ref().is_none_or(|scope| convoy_matches_scope(row, scope))).collect::<Vec<_>>()
@@ -548,6 +555,26 @@ mod tests {
         assert_eq!(empty_node.state, flotilla_protocol::AwarenessState::Idle);
         assert_eq!(empty_node.counts, flotilla_protocol::AwarenessCounts::default());
         assert!(empty_node.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn convoy_result_sets_filter_by_optional_project_scope_without_changing_the_global_set() {
+        let state = AggregatorProjectionState::new();
+        let roadmap = convoy_row("flotilla", "roadmap-work", "roadmap");
+        let other_project = convoy_row("flotilla", "other-work", "other");
+        let other_namespace = convoy_row("platform", "roadmap-work", "roadmap");
+        {
+            let mut convoys = state.write().await;
+            convoys.local_rows =
+                [roadmap.clone(), other_project, other_namespace].into_iter().map(|row| (row.resource.clone(), row)).collect();
+            convoys.seq = 1;
+        }
+
+        let scoped = state.result_set_for(&QueryId::Convoys { scope: Some(scope("roadmap")) }).await.expect("scoped convoy result set");
+        assert_eq!(scoped.rows.as_convoys().expect("scoped convoy rows"), &[roadmap]);
+
+        let global = state.result_set_for(&QueryId::Convoys { scope: None }).await.expect("global convoy result set");
+        assert_eq!(global.rows.as_convoys().expect("global convoy rows").len(), 3);
     }
 
     #[tokio::test]

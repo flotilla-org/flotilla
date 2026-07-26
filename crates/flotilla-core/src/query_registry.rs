@@ -235,7 +235,7 @@ fn issue_demand_query(query: &QueryId) -> Option<QueryId> {
         QueryId::Awareness { scope: Some(scope), .. } => {
             Some(QueryId::Issues { scope: scope.clone(), search: None, label: Some(READY_ISSUE_LABEL.into()) })
         }
-        QueryId::Convoys | QueryId::Independents { .. } | QueryId::Checkouts { .. } | QueryId::Awareness { scope: None, .. } => None,
+        QueryId::Convoys { .. } | QueryId::Independents { .. } | QueryId::Checkouts { .. } | QueryId::Awareness { scope: None, .. } => None,
     }
 }
 

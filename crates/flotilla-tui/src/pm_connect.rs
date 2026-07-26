@@ -136,7 +136,10 @@ impl ConnectorState {
             return Applied::Ignored;
         }
         match &set.rows {
-            Rows::Convoys(rows) => self.convoys = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect(),
+            Rows::Convoys { scope: None, rows } => {
+                self.convoys = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
+            }
+            Rows::Convoys { scope: Some(_), .. } => return Applied::Ignored,
             Rows::Independents { scope: None, rows } => {
                 self.independents = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
             }
@@ -162,7 +165,7 @@ impl ConnectorState {
             return Applied::Gap(query);
         }
         match &delta.changes {
-            QueryChanges::Convoys { changed: rows, removed } => {
+            QueryChanges::Convoys { scope: None, changed: rows, removed } => {
                 for row in rows {
                     self.convoys.insert(row.resource.clone(), row.clone());
                 }
@@ -170,6 +173,7 @@ impl ConnectorState {
                     self.convoys.remove(removed);
                 }
             }
+            QueryChanges::Convoys { scope: Some(_), .. } => return Applied::Ignored,
             QueryChanges::Independents { scope: None, changed: rows, removed } => {
                 for row in rows {
                     self.independents.insert(row.resource.clone(), row.clone());

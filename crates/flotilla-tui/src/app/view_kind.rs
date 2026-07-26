@@ -14,7 +14,8 @@ use crate::binding_table::{BindingModeId, KeyBindingMode};
 /// set. Repo views ride the Plane-A repo streams and return None.
 pub(crate) fn queries(address: &ViewAddress, source_search: Option<&str>) -> Vec<QueryId> {
     match address {
-        ViewAddress::Convoys { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => vec![QueryId::Convoys],
+        ViewAddress::Convoys { scope, .. } => vec![QueryId::Convoys { scope: scope.clone() }],
+        ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => vec![QueryId::Convoys { scope: None }],
         ViewAddress::Project { namespace, name } => {
             vec![
                 QueryId::Awareness {
@@ -22,7 +23,7 @@ pub(crate) fn queries(address: &ViewAddress, source_search: Option<&str>) -> Vec
                     grouping: AwarenessGrouping::Project,
                     limit: AwarenessLimit::default(),
                 },
-                QueryId::Convoys,
+                QueryId::Convoys { scope: Some(QueryScope::new(namespace, name)) },
                 QueryId::Checkouts { scope: Some(QueryScope::new(namespace, name)) },
                 QueryId::Issues {
                     scope: QueryScope::new(namespace, name),
@@ -98,12 +99,21 @@ mod tests {
                 grouping: AwarenessGrouping::Project,
                 limit: AwarenessLimit::default(),
             },
-            QueryId::Convoys,
+            QueryId::Convoys { scope: Some(QueryScope::new("flotilla", "roadmap")) },
             QueryId::Checkouts { scope: Some(QueryScope::new("flotilla", "roadmap")) },
             QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: None, label: None },
             QueryId::Independents { scope: Some(QueryScope::new("flotilla", "roadmap")) },
         ]);
         assert_eq!(kind_modes(Some(&address)), vec![BindingModeId::Convoys, BindingModeId::DemandTable, BindingModeId::Project]);
+    }
+
+    #[test]
+    fn convoy_views_subscribe_to_their_address_scope() {
+        let global: ViewAddress = "convoys/flotilla".parse().expect("global convoys address");
+        assert_eq!(queries(&global, None), vec![QueryId::Convoys { scope: None }]);
+
+        let project: ViewAddress = "convoys/flotilla?project=flotilla%2Froadmap".parse().expect("project-scoped convoys address");
+        assert_eq!(queries(&project, None), vec![QueryId::Convoys { scope: Some(QueryScope::new("flotilla", "roadmap")) }]);
     }
 
     #[test]

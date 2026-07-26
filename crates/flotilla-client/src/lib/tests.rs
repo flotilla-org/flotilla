@@ -73,7 +73,7 @@ fn no_subscriptions() -> Arc<QuerySet> {
 }
 
 fn convoys_subscription() -> Arc<QuerySet> {
-    Arc::new(std::sync::RwLock::new(HashSet::from([QueryId::Convoys])))
+    Arc::new(std::sync::RwLock::new(HashSet::from([QueryId::Convoys { scope: None }])))
 }
 
 fn request_harness() -> RequestHarness {
@@ -1150,11 +1150,11 @@ async fn recover_from_gap_handles_empty_replay() {
 // --- Query result stream gap detection ---
 
 fn make_result_set(seq: u64) -> ResultSet {
-    ResultSet { seq, rows: Rows::Convoys(vec![]), state: Default::default() }
+    ResultSet { seq, rows: Rows::Convoys { scope: None, rows: vec![] }, state: Default::default() }
 }
 
 fn make_result_delta(seq: u64) -> ResultDelta {
-    ResultDelta { seq, changes: QueryChanges::Convoys { changed: vec![], removed: vec![] }, state: None }
+    ResultDelta { seq, changes: QueryChanges::Convoys { scope: None, changed: vec![], removed: vec![] }, state: None }
 }
 
 #[tokio::test]
@@ -1171,13 +1171,16 @@ async fn handle_event_result_set_updates_local_seq_and_forwards() {
 
     let event = event_rx.try_recv().expect("should receive ResultSet");
     assert!(matches!(event, DaemonEvent::ResultSet(_)));
-    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Query { query: QueryId::Convoys }).copied(), Some(5));
+    assert_eq!(
+        local_seqs.read().expect("sequence lock").get(&StreamKey::Query { query: QueryId::Convoys { scope: None } }).copied(),
+        Some(5)
+    );
 }
 
 #[tokio::test]
 async fn handle_event_result_delta_happy_path_applies_and_forwards() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-    local_seqs.write().expect("sequence lock").insert(StreamKey::Query { query: QueryId::Convoys }, 1);
+    local_seqs.write().expect("sequence lock").insert(StreamKey::Query { query: QueryId::Convoys { scope: None } }, 1);
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
     let (session, pending, next_id, _server) = event_harness();
@@ -1190,7 +1193,10 @@ async fn handle_event_result_delta_happy_path_applies_and_forwards() {
 
     let event = event_rx.try_recv().expect("should receive ResultDelta");
     assert!(matches!(event, DaemonEvent::ResultDelta(_)));
-    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Query { query: QueryId::Convoys }).copied(), Some(2));
+    assert_eq!(
+        local_seqs.read().expect("sequence lock").get(&StreamKey::Query { query: QueryId::Convoys { scope: None } }).copied(),
+        Some(2)
+    );
 }
 
 #[tokio::test]
@@ -1198,7 +1204,7 @@ async fn handle_event_result_delta_stale_seq_is_ignored() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     // Local seq is 5 — a delta at seq 5 is already covered by the current
     // result set (e.g. it raced ahead of the subscribe replay).
-    local_seqs.write().expect("sequence lock").insert(StreamKey::Query { query: QueryId::Convoys }, 5);
+    local_seqs.write().expect("sequence lock").insert(StreamKey::Query { query: QueryId::Convoys { scope: None } }, 5);
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
     let (session, pending, next_id, _server) = event_harness();
@@ -1209,14 +1215,17 @@ async fn handle_event_result_delta_stale_seq_is_ignored() {
     );
 
     assert!(event_rx.try_recv().is_err(), "stale delta must not be forwarded");
-    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Query { query: QueryId::Convoys }).copied(), Some(5));
+    assert_eq!(
+        local_seqs.read().expect("sequence lock").get(&StreamKey::Query { query: QueryId::Convoys { scope: None } }).copied(),
+        Some(5)
+    );
 }
 
 #[tokio::test]
 async fn handle_event_result_delta_seq_gap_triggers_resubscribe() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     // Local seq is 1, but incoming delta seq is 3 — seq 2 was dropped.
-    local_seqs.write().expect("sequence lock").insert(StreamKey::Query { query: QueryId::Convoys }, 1);
+    local_seqs.write().expect("sequence lock").insert(StreamKey::Query { query: QueryId::Convoys { scope: None } }, 1);
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (session, pending, next_id, server) = event_harness();
@@ -1235,7 +1244,7 @@ async fn handle_event_result_delta_seq_gap_triggers_resubscribe() {
     let Request::SubscribeQueries { queries } = request else {
         panic!("result seq gap should trigger a SubscribeQueries request, got: {request:?}");
     };
-    assert_eq!(queries, vec![QueryCursor { query: QueryId::Convoys, since: Some(1) }]);
+    assert_eq!(queries, vec![QueryCursor { query: QueryId::Convoys { scope: None }, since: Some(1) }]);
 }
 
 #[tokio::test]

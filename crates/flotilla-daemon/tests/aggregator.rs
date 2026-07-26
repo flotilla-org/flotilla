@@ -482,7 +482,7 @@ async fn aggregator_emits_result_set_events() {
     let found = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == QueryId::Convoys => {
+                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == QueryId::Convoys { scope: None } => {
                     return result_set;
                 }
                 Ok(_) => continue,
@@ -669,13 +669,13 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         "convoy-bound terminal sessions surface on vessel rows, never in independents",
     );
     let convoy_replay = daemon
-        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys, since: None }])
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys { scope: None }, since: None }])
         .await
         .expect("subscribe to convoys query");
     let convoy_rows = convoy_replay
         .iter()
         .find_map(|event| match event {
-            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys => Some(convoy_rows(result_set)),
+            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys { scope: None } => Some(convoy_rows(result_set)),
             _ => None,
         })
         .expect("convoys replay result set");
@@ -866,7 +866,7 @@ async fn subscribe_queries_replays_result_set_after_seq() {
     let result_set_after_a = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == QueryId::Convoys => return result_set,
+                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == QueryId::Convoys { scope: None } => return result_set,
                 Ok(_) => continue,
                 Err(err) => panic!("recv error waiting for result set: {err}"),
             }
@@ -884,7 +884,7 @@ async fn subscribe_queries_replays_result_set_after_seq() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Convoys => return delta,
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Convoys { scope: None } => return delta,
                 Ok(_) => continue,
                 Err(err) => panic!("recv error waiting for delta: {err}"),
             }
@@ -895,7 +895,7 @@ async fn subscribe_queries_replays_result_set_after_seq() {
 
     // Step 3: SubscribeQueries with the cursor from step 1.
     let replay_events = daemon
-        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys, since: Some(cursor_seq) }])
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys { scope: None }, since: Some(cursor_seq) }])
         .await
         .expect("subscribe_queries");
 
@@ -904,7 +904,7 @@ async fn subscribe_queries_replays_result_set_after_seq() {
     let result_set = replay_events
         .iter()
         .find_map(|e| match e {
-            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys => Some(result_set),
+            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys { scope: None } => Some(result_set),
             _ => None,
         })
         .expect("expected a ResultSet for the convoys query in subscribe replay");

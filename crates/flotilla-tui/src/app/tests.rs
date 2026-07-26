@@ -367,11 +367,11 @@ fn persisted_open_views_take_precedence_over_a_fresh_project_landing() {
 #[tokio::test]
 async fn reconnect_daemon_preserves_ui_state_and_clears_daemon_caches() {
     let mut app = stub_app();
-    app.views.open_or_focus(ViewAddress::Convoys { namespace: "flotilla".into() });
+    app.views.open_or_focus(ViewAddress::Convoys { namespace: "flotilla".into(), scope: None });
     app.views.active_table_state_mut().filter = "needle".into();
     app.ui.show_debug = true;
     app.namespaces.insert("stale".into(), NamespaceModel::default());
-    app.query_seqs.insert(flotilla_protocol::QueryId::Convoys, 42);
+    app.query_seqs.insert(flotilla_protocol::QueryId::Convoys { scope: None }, 42);
     let batch_id = app.begin_project_issue_start_batch(1);
     app.command_project_issue_starts.insert(1, ProjectIssueStartContext {
         address: ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() },
@@ -388,7 +388,7 @@ async fn reconnect_daemon_preserves_ui_state_and_clears_daemon_caches() {
 
     app.reconnect_daemon(daemon, repos);
 
-    assert_eq!(app.views.active_address(), Some(&ViewAddress::Convoys { namespace: "flotilla".into() }));
+    assert_eq!(app.views.active_address(), Some(&ViewAddress::Convoys { namespace: "flotilla".into(), scope: None }));
     assert_eq!(app.views.active_table_state().filter, "needle");
     assert!(app.ui.show_debug);
     assert!(app.namespaces.is_empty());
@@ -403,7 +403,7 @@ async fn reconnect_daemon_preserves_ui_state_and_clears_daemon_caches() {
 #[test]
 fn handoff_round_trip_preserves_navigation_table_and_ui_state() {
     let mut source = stub_app();
-    source.views.open_or_focus(ViewAddress::Convoys { namespace: "flotilla".into() });
+    source.views.open_or_focus(ViewAddress::Convoys { namespace: "flotilla".into(), scope: None });
     source.views.active_table_state_mut().filter = "mine".into();
     source.views.drill("convoy/flotilla/demo".parse().expect("valid drill address"));
     source.ui.show_debug = true;
@@ -1781,7 +1781,19 @@ fn result_set_event(snapshot: impl AsRef<crate::convoy_model::ConvoyFixtureSnaps
     let snapshot = snapshot.as_ref().clone();
     flotilla_protocol::DaemonEvent::ResultSet(Box::new(ResultSet {
         seq: snapshot.seq,
-        rows: Rows::Convoys(snapshot.convoys.into_iter().map(wire_convoy_row).collect()),
+        rows: Rows::Convoys { scope: None, rows: snapshot.convoys.into_iter().map(wire_convoy_row).collect() },
+        state: Default::default(),
+    }))
+}
+
+fn scoped_convoy_result_set(
+    seq: u64,
+    scope: flotilla_protocol::QueryScope,
+    convoys: Vec<crate::convoy_model::ConvoySummary>,
+) -> flotilla_protocol::DaemonEvent {
+    flotilla_protocol::DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
+        seq,
+        rows: flotilla_protocol::Rows::Convoys { scope: Some(scope), rows: convoys.into_iter().map(wire_convoy_row).collect() },
         state: Default::default(),
     }))
 }
@@ -1796,6 +1808,7 @@ fn result_delta_event(delta: impl AsRef<crate::convoy_model::ConvoyFixtureDelta>
     flotilla_protocol::DaemonEvent::ResultDelta(Box::new(ResultDelta {
         seq: delta.seq,
         changes: QueryChanges::Convoys {
+            scope: None,
             changed: delta.changed.into_iter().map(wire_convoy_row).collect(),
             removed: delta
                 .removed
@@ -1910,6 +1923,27 @@ fn empty_panel_snapshot_clears_convoys() {
     app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot { seq: 2, namespace: "flotilla".into(), convoys: vec![] })));
 
     assert!(app.convoys("flotilla").is_empty());
+}
+
+#[test]
+fn app_keeps_global_and_project_convoy_results_separate() {
+    use crate::convoy_model::{ConvoyFixtureSnapshot, ConvoyPhase};
+
+    let mut app = stub_app();
+    let global = test_convoy("flotilla", "global", ConvoyPhase::Active, false);
+    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![global],
+    })));
+
+    let scope = flotilla_protocol::QueryScope::new("flotilla", "roadmap");
+    let mut scoped = test_convoy("flotilla", "scoped", ConvoyPhase::Active, false);
+    scoped.project_ref = Some("roadmap".into());
+    app.handle_daemon_event(scoped_convoy_result_set(1, scope.clone(), vec![scoped]));
+
+    assert_eq!(app.convoys("flotilla").iter().map(|convoy| convoy.name.as_str()).collect::<Vec<_>>(), vec!["global"]);
+    assert_eq!(app.query_tables.convoys[&flotilla_protocol::QueryId::Convoys { scope: Some(scope) }].rows[0].name, "scoped");
 }
 
 #[test]
@@ -2653,12 +2687,12 @@ fn escape_clears_a_table_find_before_navigating_back() {
 fn table_refresh_requests_a_fresh_named_query_snapshot() {
     let mut app = stub_app();
     app.switch_tab(1);
-    app.query_seqs.insert(flotilla_protocol::QueryId::Convoys, 42);
+    app.query_seqs.insert(flotilla_protocol::QueryId::Convoys { scope: None }, 42);
     app.subscriptions_dirty = false;
 
     app.handle_key(key(KeyCode::Char('r')));
 
-    assert!(!app.query_seqs.contains_key(&flotilla_protocol::QueryId::Convoys));
+    assert!(!app.query_seqs.contains_key(&flotilla_protocol::QueryId::Convoys { scope: None }));
     assert!(app.subscriptions_dirty);
     assert!(app.proto_commands.take_next().is_none(), "table refresh resubscribes instead of dispatching a repo command");
 }

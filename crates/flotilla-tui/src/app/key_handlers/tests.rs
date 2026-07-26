@@ -196,7 +196,7 @@ fn dispatch_confirmation_warns_for_non_ready_issue_and_cancel_queues_nothing() {
 fn convoy_delete_table_intent_confirms_then_routes_to_origin_host() {
     let mut app = stub_app();
     insert_peer_host(&mut app.model, "remote-host");
-    app.open_view(flotilla_protocol::ViewAddress::Convoys { namespace: "other-team".into() });
+    app.open_view(flotilla_protocol::ViewAddress::Convoys { namespace: "other-team".into(), scope: None });
     let row_id = crate::table_view::RowId::new("other-team/failed-convoy@remote-host");
 
     app.execute_table_intent(TableIntent::DeleteConvoy {

@@ -1185,12 +1185,13 @@ impl Aggregator {
         if self.bootstrapping {
             return;
         }
-        if self.emitted_queries.contains(&QueryId::Convoys) {
+        if self.emitted_queries.contains(&QueryId::Convoys { scope: None }) {
             self.emit_delta(changed, removed).await;
         } else {
-            self.emitted_queries.insert(QueryId::Convoys);
+            self.emitted_queries.insert(QueryId::Convoys { scope: None });
             let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
         }
+        self.emit_scoped_convoy_result_sets().await;
         let represented = self.state.represented_issue_refs().await;
         for delta in self.state.suppress_issues(&represented) {
             let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
@@ -1411,7 +1412,7 @@ impl Aggregator {
             let mut checkout_rows = Vec::new();
             for result_set in snapshot.result_sets {
                 match result_set.rows {
-                    Rows::Convoys(_) | Rows::Independents { .. } => {}
+                    Rows::Convoys { .. } | Rows::Independents { .. } => {}
                     Rows::Issues { .. } => {
                         tracing::warn!(host = %host, "ignoring demand-backed issues in fleet replica snapshot");
                     }
@@ -1438,9 +1439,20 @@ impl Aggregator {
 
     async fn emit_delta(&self, changed: Vec<ConvoyRow>, removed: Vec<ResourceRef>) {
         let seq = self.state.seq().await;
-        let changes = QueryChanges::Convoys { changed, removed };
+        let changes = QueryChanges::Convoys { scope: None, changed, removed };
         let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changes, state: None })));
         self.emit_awareness_result_sets().await;
+    }
+
+    async fn emit_scoped_convoy_result_sets(&self) {
+        for query in self.state.subscribed_queries() {
+            if !matches!(query, QueryId::Convoys { scope: Some(_) }) {
+                continue;
+            }
+            if let Some(result_set) = self.state.result_set_for(&query).await {
+                let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
+            }
+        }
     }
 
     async fn rebuild_salience_projection(&self) -> bool {
@@ -2246,7 +2258,7 @@ mod tests {
             while convoy.is_none() || awareness.is_none() {
                 let event = event_rx.recv().await.expect("aggregator bootstrap event");
                 let DaemonEvent::ResultSet(result) = event else { continue };
-                if result.query() == QueryId::Convoys {
+                if result.query() == (QueryId::Convoys { scope: None }) {
                     convoy = result.rows.as_convoys().expect("convoy rows").first().cloned();
                 } else if result.query() == awareness_query {
                     awareness = Some(result);
@@ -2878,10 +2890,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn convoy_row_insert_and_removal_are_not_blocked_by_change_request_enrichment() {
+    async fn convoy_row_insert_and_removal_update_global_and_scoped_queries_without_waiting_for_change_request_enrichment() {
         let state = AggregatorProjectionState::new();
+        let scoped_query = QueryId::Convoys { scope: Some(QueryScope::new("flotilla", "roadmap")) };
+        state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: scoped_query.clone(), since: None }]);
         let (event_tx, mut event_rx) = broadcast::channel(8);
-        let convoy = convoy_with_branch("convoy-a").await;
+        let mut convoy = convoy_with_branch("convoy-a").await;
+        convoy.spec.project_ref = Some("roadmap".into());
         let mut deleting_convoy = convoy.clone();
         deleting_convoy.metadata.deletion_timestamp = Some(Utc::now());
         let durable_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(watch_events(vec![
@@ -2905,24 +2920,32 @@ mod tests {
         tokio::select! {
             result = &mut run => panic!("aggregator stopped before row lifecycle events: {result:?}"),
             () = async {
-                let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial convoy result set").await;
+                let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial convoy result set").await;
                 let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
                 assert!(initial.rows.is_empty());
 
-                let inserted = recv_query_event(&mut event_rx, QueryId::Convoys, "convoy insert delta").await;
+                let inserted = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "convoy insert delta").await;
                 let DaemonEvent::ResultDelta(inserted) = inserted else { panic!("expected insert delta") };
-                let QueryChanges::Convoys { changed, removed } = &inserted.changes else { panic!("expected convoy changes") };
+                let QueryChanges::Convoys { changed, removed, .. } = &inserted.changes else { panic!("expected convoy changes") };
                 assert_eq!(changed.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(), vec!["convoy-a"]);
                 assert!(removed.is_empty());
 
-                let removed = recv_query_event(&mut event_rx, QueryId::Convoys, "convoy removal delta").await;
+                let scoped = recv_query_event(&mut event_rx, scoped_query.clone(), "scoped convoy insert result set").await;
+                let DaemonEvent::ResultSet(scoped) = scoped else { panic!("expected scoped result set") };
+                assert_eq!(scoped.rows.as_convoys().expect("scoped convoy rows")[0].name, "convoy-a");
+
+                let removed = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "convoy removal delta").await;
                 let DaemonEvent::ResultDelta(removed) = removed else { panic!("expected removal delta") };
-                let QueryChanges::Convoys { changed, removed } = &removed.changes else { panic!("expected convoy changes") };
+                let QueryChanges::Convoys { changed, removed, .. } = &removed.changes else { panic!("expected convoy changes") };
                 assert!(changed.is_empty());
                 assert_eq!(
                     removed.iter().map(|resource| resource.name.as_str()).collect::<Vec<_>>(),
                     vec!["convoy-a"]
                 );
+
+                let scoped = recv_query_event(&mut event_rx, scoped_query, "scoped convoy removal result set").await;
+                let DaemonEvent::ResultSet(scoped) = scoped else { panic!("expected scoped result set") };
+                assert!(scoped.rows.is_empty());
             } => {}
         }
     }
@@ -3054,7 +3077,7 @@ mod tests {
         tokio::select! {
             result = &mut run => panic!("aggregator stopped during route transition test: {result:?}"),
             () = async {
-                let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial convoy set").await;
+                let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial convoy set").await;
                 let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
                 assert_eq!(
                     initial.rows.as_convoys().expect("convoy rows")[0].vessels[0].materialize.as_deref(),
@@ -3066,7 +3089,7 @@ mod tests {
                     node_id: flotilla_protocol::NodeId::new("feta"),
                     status: flotilla_protocol::PeerConnectionState::Disconnected,
                 });
-                let disconnected = recv_query_event(&mut event_rx, QueryId::Convoys, "disconnect should retract recipe").await;
+                let disconnected = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "disconnect should retract recipe").await;
                 let DaemonEvent::ResultDelta(disconnected) = disconnected else { panic!("expected disconnect delta") };
                 assert_eq!(disconnected.changes.as_convoys().expect("convoy changes")[0].vessels[0].materialize, None);
 
@@ -3075,7 +3098,7 @@ mod tests {
                     node_id: flotilla_protocol::NodeId::new("feta"),
                     status: flotilla_protocol::PeerConnectionState::Connected,
                 });
-                let reconnected = recv_query_event(&mut event_rx, QueryId::Convoys, "reconnect should restore recipe").await;
+                let reconnected = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "reconnect should restore recipe").await;
                 let DaemonEvent::ResultDelta(reconnected) = reconnected else { panic!("expected reconnect delta") };
                 assert_eq!(
                     reconnected.changes.as_convoys().expect("convoy changes")[0].vessels[0].materialize.as_deref(),
@@ -3262,9 +3285,9 @@ mod tests {
         tokio::select! {
             result = &mut run => panic!("aggregator stopped before refresh: {result:?}"),
             () = async {
-                let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial convoy result set").await;
+                let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial convoy result set").await;
                 assert!(matches!(initial, DaemonEvent::ResultSet(_)));
-                let initial_change_request = recv_query_event(&mut event_rx, QueryId::Convoys, "initial change request delta").await;
+                let initial_change_request = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial change request delta").await;
                 assert!(matches!(initial_change_request, DaemonEvent::ResultDelta(_)));
                 event_tx
                     .send(DaemonEvent::RepoRefreshCompleted {
@@ -3276,7 +3299,7 @@ mod tests {
                     })
                     .expect("publish provider refresh");
 
-                let refreshed = recv_query_event(&mut event_rx, QueryId::Convoys, "refreshed convoy delta").await;
+                let refreshed = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "refreshed convoy delta").await;
                 let DaemonEvent::ResultDelta(delta) = refreshed else { panic!("expected refreshed result delta") };
                 assert_eq!(
                     delta.changes.as_convoys().expect("convoy changes")[0]
@@ -3332,11 +3355,11 @@ mod tests {
             result = &mut run => panic!("aggregator stopped before refresh: {result:?}"),
             () = async {
                 assert!(matches!(
-                    recv_query_event(&mut event_rx, QueryId::Convoys, "initial convoy result set").await,
+                    recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial convoy result set").await,
                     DaemonEvent::ResultSet(_)
                 ));
                 assert!(matches!(
-                    recv_query_event(&mut event_rx, QueryId::Convoys, "initial change request delta").await,
+                    recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial change request delta").await,
                     DaemonEvent::ResultDelta(_)
                 ));
                 for repo_identity in [
@@ -3351,7 +3374,7 @@ mod tests {
                         .expect("publish provider refresh");
                 }
                 assert!(matches!(
-                    recv_query_event(&mut event_rx, QueryId::Convoys, "related repository refresh delta").await,
+                    recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "related repository refresh delta").await,
                     DaemonEvent::ResultDelta(_)
                 ));
             } => {}
@@ -3477,9 +3500,9 @@ mod tests {
         tokio::select! {
             result = &mut run => panic!("aggregator stopped before repo snapshot: {result:?}"),
             () = async {
-                let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial convoy result set").await;
+                let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial convoy result set").await;
                 assert!(matches!(initial, DaemonEvent::ResultSet(_)));
-                let initial_change_request = recv_query_event(&mut event_rx, QueryId::Convoys, "initial change request delta").await;
+                let initial_change_request = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial change request delta").await;
                 assert!(matches!(initial_change_request, DaemonEvent::ResultDelta(_)));
                 let mut providers = flotilla_protocol::ProviderData::default();
                 providers.change_requests.insert("815".into(), flotilla_protocol::ChangeRequest {
@@ -3508,7 +3531,7 @@ mod tests {
                     })))
                     .expect("publish repo snapshot");
 
-                let refreshed = recv_query_event(&mut event_rx, QueryId::Convoys, "refreshed convoy delta").await;
+                let refreshed = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "refreshed convoy delta").await;
                 let DaemonEvent::ResultDelta(delta) = refreshed else { panic!("expected refreshed result delta") };
                 assert_eq!(
                     delta.changes.as_convoys().expect("convoy changes")[0]
@@ -3807,11 +3830,11 @@ mod tests {
             .await
         });
 
-        let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial result set timeout").await;
+        let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial result set timeout").await;
         let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
         assert_eq!(convoy_names(&initial.rows), vec!["deleted-while-watch-expired"]);
 
-        let removal = recv_query_event(&mut event_rx, QueryId::Convoys, "relist delta timeout").await;
+        let removal = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "relist delta timeout").await;
         let DaemonEvent::ResultDelta(removal) = removal else { panic!("expected relist delta") };
         let removed = removal.changes.removed_resources().expect("convoy removals");
         assert_eq!(removed.len(), 1);
@@ -3918,7 +3941,7 @@ mod tests {
             .await
         });
 
-        let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial result set timeout").await;
+        let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial result set timeout").await;
         let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
         assert!(initial.rows.is_empty(), "failed watch attempt must not publish its stale list");
         assert!(state.result_set().await.rows.is_empty());
@@ -3965,12 +3988,12 @@ mod tests {
             .await
         });
 
-        let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial result set timeout").await;
+        let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial result set timeout").await;
         let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
         let initial_row = initial.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
         assert_eq!(initial_row.vessels.first().expect("vessel row").attach.as_deref(), Some("workspace-1"));
 
-        let update = recv_query_event(&mut event_rx, QueryId::Convoys, "relist delta timeout").await;
+        let update = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "relist delta timeout").await;
         let DaemonEvent::ResultDelta(update) = update else { panic!("expected relist delta") };
         let changed = update.changes.as_convoys().expect("changed convoy rows").first().expect("changed convoy row");
         assert_eq!(changed.vessels.first().expect("changed vessel row").attach, None);
@@ -4036,7 +4059,7 @@ mod tests {
             .await
         });
 
-        let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial result set timeout").await;
+        let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial result set timeout").await;
         let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
         let row = initial.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
         assert_eq!(row.vessels.first().expect("vessel row").attach, None);
