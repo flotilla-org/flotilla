@@ -1,0 +1,20 @@
+apiVersion: flotilla.work/v1
+kind: PlacementPolicy
+metadata:
+  name: docker-crew-image-kiwi
+  namespace: flotilla
+  annotations:
+    flotilla.work/image-recipe: .flotilla/Dockerfile.crew
+spec:
+  pool: passthrough
+  docker_per_vessel:
+    host_ref: d49f4c59-811f-44aa-a4ca-d4cac66cf2a3
+    image: forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-07-26.1
+    agent_adapters:
+      - claude-code
+      - codex
+    default_cwd: /workspace
+    env: {}
+    checkout:
+      worktree_on_host_and_mount:
+        mount_path: /workspace
