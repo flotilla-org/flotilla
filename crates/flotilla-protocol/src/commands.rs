@@ -1203,6 +1203,8 @@ mod tests {
                     reachable: false,
                     last_sync: None,
                     generation: None,
+                    skipped_records: 0,
+                    first_parse_error: None,
                     message: Some("not synced".into()),
                 }],
             })),

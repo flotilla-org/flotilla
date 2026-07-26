@@ -653,6 +653,98 @@ fn replica_staleness(entry: &FleetReplicaCacheEntry, now: DateTime<Utc>) -> Flee
     }
 }
 
+#[derive(Debug, Default)]
+struct ReplicaParseDiagnostics {
+    skipped_records: usize,
+    first_error: Option<String>,
+}
+
+impl ReplicaParseDiagnostics {
+    fn record_skip(&mut self, path: impl std::fmt::Display, error: impl std::fmt::Display) {
+        self.skipped_records += 1;
+        self.first_error.get_or_insert_with(|| format!("{path}: {error}"));
+    }
+}
+
+#[derive(Debug)]
+struct ParsedFleetReplicaSnapshot {
+    snapshot: FleetReplicaSnapshot,
+    diagnostics: ReplicaParseDiagnostics,
+}
+
+fn result_set_records_mut(result_set: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
+    let content = result_set.get_mut("rows")?.get_mut("rows")?;
+    if content.is_array() {
+        content.as_array_mut()
+    } else {
+        content.get_mut("rows")?.as_array_mut()
+    }
+}
+
+fn retain_parseable_result_set_records(
+    result_set: &mut serde_json::Value,
+    result_set_index: usize,
+    diagnostics: &mut ReplicaParseDiagnostics,
+) -> bool {
+    let Some(records) = result_set_records_mut(result_set) else {
+        return match serde_json::from_value::<ResultSet>(result_set.clone()) {
+            Ok(_) => true,
+            Err(error) => {
+                diagnostics.record_skip(format_args!("result_sets[{result_set_index}]"), error);
+                false
+            }
+        };
+    };
+    let records = std::mem::take(records);
+
+    let envelope = result_set.clone();
+    if let Err(error) = serde_json::from_value::<ResultSet>(envelope.clone()) {
+        diagnostics.record_skip(format_args!("result_sets[{result_set_index}]"), error);
+        return false;
+    }
+
+    let mut retained = Vec::with_capacity(records.len());
+    for (record_index, record) in records.into_iter().enumerate() {
+        let mut candidate = envelope.clone();
+        result_set_records_mut(&mut candidate).expect("validated result set has a row array").push(record.clone());
+        match serde_json::from_value::<ResultSet>(candidate) {
+            Ok(_) => retained.push(record),
+            Err(error) => {
+                diagnostics.record_skip(format_args!("result_sets[{result_set_index}].rows[{record_index}]"), error);
+            }
+        }
+    }
+    *result_set_records_mut(result_set).expect("validated result set has a row array") = retained;
+    true
+}
+
+fn parse_fleet_replica_snapshot(input: &str) -> Result<ParsedFleetReplicaSnapshot, String> {
+    let mut value: serde_json::Value = serde_json::from_str(input).map_err(|error| format!("replica snapshot parse failed: {error}"))?;
+    let mut diagnostics = ReplicaParseDiagnostics::default();
+
+    if let Some(rows) = value.get_mut("rows").and_then(serde_json::Value::as_array_mut) {
+        let records = std::mem::take(rows);
+        for (index, record) in records.into_iter().enumerate() {
+            match serde_json::from_value::<FleetListRow>(record.clone()) {
+                Ok(_) => rows.push(record),
+                Err(error) => diagnostics.record_skip(format_args!("rows[{index}]"), error),
+            }
+        }
+    }
+
+    if let Some(result_sets) = value.get_mut("result_sets").and_then(serde_json::Value::as_array_mut) {
+        let records = std::mem::take(result_sets);
+        for (index, mut record) in records.into_iter().enumerate() {
+            if retain_parseable_result_set_records(&mut record, index, &mut diagnostics) {
+                result_sets.push(record);
+            }
+        }
+    }
+
+    let snapshot = serde_json::from_value(value).map_err(|error| format!("replica snapshot parse failed outside a record: {error}"))?;
+    Ok(ParsedFleetReplicaSnapshot { snapshot, diagnostics })
+}
+
 fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTemplateSpec, String> {
     let spec: WorkflowTemplateSpec = serde_yml::from_str(yaml).map_err(|err| format!("invalid workflow template YAML: {err}"))?;
     flotilla_resources::validate(&spec).map_err(|errors| {
@@ -1085,6 +1177,8 @@ struct FleetReplicaCacheEntry {
     result_sets: Vec<ResultSet>,
     last_sync: Option<DateTime<Utc>>,
     generation: Option<String>,
+    skipped_records: usize,
+    first_parse_error: Option<String>,
     last_error: Option<String>,
 }
 
@@ -4719,6 +4813,8 @@ impl InProcessDaemon {
                         reachable: entry.last_error.is_none(),
                         last_sync: entry.last_sync,
                         generation: entry.generation.clone(),
+                        skipped_records: entry.skipped_records,
+                        first_parse_error: entry.first_parse_error.clone(),
                         message: entry.last_error.clone(),
                     });
                 }
@@ -4728,6 +4824,8 @@ impl InProcessDaemon {
                         reachable: false,
                         last_sync: None,
                         generation: None,
+                        skipped_records: 0,
+                        first_parse_error: None,
                         message: Some(format!("replica source '{label}' has not synced yet")),
                     });
                 }
@@ -5293,8 +5391,10 @@ impl InProcessDaemon {
             let multiplex = hosts.resolved_ssh_multiplex(label);
             let result = self.fetch_fleet_replica_snapshot(remote, multiplex, Arc::clone(&runner)).await;
             match result {
-                Ok(snapshot) => {
+                Ok(parsed) => {
                     let now = Utc::now();
+                    let diagnostics = parsed.diagnostics;
+                    let snapshot = parsed.snapshot;
                     let snapshot_host = snapshot.host;
                     let generation = snapshot.generation;
                     let result_sets = snapshot.result_sets.clone();
@@ -5316,6 +5416,8 @@ impl InProcessDaemon {
                         result_sets,
                         last_sync: Some(now),
                         generation,
+                        skipped_records: diagnostics.skipped_records,
+                        first_parse_error: diagnostics.first_error,
                         last_error: None,
                     });
                 }
@@ -5327,6 +5429,8 @@ impl InProcessDaemon {
                             result_sets: Vec::new(),
                             last_sync: None,
                             generation: None,
+                            skipped_records: 0,
+                            first_parse_error: None,
                             last_error: Some(message),
                         }
                     });
@@ -5342,7 +5446,7 @@ impl InProcessDaemon {
         remote: &RemoteHostConfig,
         multiplex: bool,
         runner: Arc<dyn CommandRunner>,
-    ) -> Result<FleetReplicaSnapshot, String> {
+    ) -> Result<ParsedFleetReplicaSnapshot, String> {
         let args = fleet_replica_ssh_args(remote, multiplex);
         let arg_refs: Vec<_> = args.iter().map(String::as_str).collect();
         let output =
@@ -5354,7 +5458,7 @@ impl InProcessDaemon {
             let message = if output.stderr.trim().is_empty() { output.stdout.trim() } else { output.stderr.trim() };
             return Err(format!("replica snapshot command failed: {message}"));
         }
-        serde_json::from_str(output.stdout.trim()).map_err(|err| format!("replica snapshot parse failed: {err}"))
+        parse_fleet_replica_snapshot(output.stdout.trim())
     }
 
     async fn local_fleet_rows(&self, namespace: &str) -> Result<(Vec<FleetListRow>, Option<String>), String> {
