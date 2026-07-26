@@ -40,7 +40,7 @@ fn independents_delta(seq: u64, changed: Vec<IndependentRow>, removed: Vec<Resou
 }
 
 fn convoys_set(seq: u64) -> DaemonEvent {
-    DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Convoys(vec![]), state: Default::default() }))
+    DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Convoys { scope: None, rows: vec![] }, state: Default::default() }))
 }
 
 fn awareness_set(seq: u64, rows: Vec<AwarenessNode>) -> DaemonEvent {
@@ -108,7 +108,7 @@ fn gaps_and_unseeded_deltas_request_resubscription() {
     let cursors = state.cursors();
     let independents = cursors.iter().find(|cursor| cursor.query == (QueryId::Independents { scope: None })).expect("independents cursor");
     assert_eq!(independents.since, Some(1));
-    let convoys = cursors.iter().find(|cursor| cursor.query == QueryId::Convoys).expect("convoys cursor");
+    let convoys = cursors.iter().find(|cursor| cursor.query == QueryId::Convoys { scope: None }).expect("convoys cursor");
     assert_eq!(convoys.since, None, "never-seen queries subscribe from scratch");
     assert!(
         cursors.iter().any(|cursor| matches!(cursor.query, QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, .. })),

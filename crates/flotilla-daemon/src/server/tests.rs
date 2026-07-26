@@ -3134,7 +3134,7 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
     let result_delta = |seq| {
         DaemonEvent::ResultDelta(Box::new(ResultDelta {
             seq,
-            changes: QueryChanges::Convoys { changed: vec![], removed: vec![] },
+            changes: QueryChanges::Convoys { scope: None, changed: vec![], removed: vec![] },
             state: None,
         }))
     };
@@ -3162,14 +3162,14 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
     client_session
         .write(Message::Request {
             id: 2,
-            request: Request::SubscribeQueries { queries: vec![QueryCursor { query: QueryId::Convoys, since: None }] },
+            request: Request::SubscribeQueries { queries: vec![QueryCursor { query: QueryId::Convoys { scope: None }, since: None }] },
         })
         .await
         .expect("write subscribe request");
     match ok_response(read_session_message(&client_session).await, 2) {
         Response::SubscribeQueries(events) => {
             assert!(
-                matches!(events.as_slice(), [DaemonEvent::ResultSet(result_set)] if result_set.query() == QueryId::Convoys),
+                matches!(events.as_slice(), [DaemonEvent::ResultSet(result_set)] if result_set.query() == QueryId::Convoys { scope: None }),
                 "subscribe should replay one convoys result set, got {events:?}"
             );
         }
@@ -3181,7 +3181,7 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
     match read_session_message(&client_session).await {
         Message::Event { event } => match *event {
             DaemonEvent::ResultDelta(delta) => {
-                assert_eq!(delta.query(), QueryId::Convoys);
+                assert_eq!(delta.query(), QueryId::Convoys { scope: None });
                 assert_eq!(delta.seq, 2);
             }
             other => panic!("expected ResultDelta after subscribing, got {other:?}"),

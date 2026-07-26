@@ -19,7 +19,7 @@ fn active_address(app: &App) -> ViewAddress {
 }
 
 fn convoys_address() -> ViewAddress {
-    ViewAddress::Convoys { namespace: "flotilla".to_string() }
+    ViewAddress::Convoys { namespace: "flotilla".to_string(), scope: None }
 }
 
 #[tokio::test]

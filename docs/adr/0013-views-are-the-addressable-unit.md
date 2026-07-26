@@ -111,14 +111,17 @@ concept (see CONTEXT.md: **View**).
 
 ## Amendment: curated query-family Views (2026-07-20)
 
-Issues, checkouts, and independents are addressable as single-table Views.
-Their canonical grammar is `issues?project=<namespace%2Fname>`,
+Issues, convoys, checkouts, and independents are addressable as scoped
+single-table Views. Their canonical grammar is
+`issues?project=<namespace%2Fname>`,
+`convoys/<namespace>?project=<namespace%2Fname>`,
 `checkouts?project=<namespace%2Fname>`, and
 `independents?project=<namespace%2Fname>`. Bare `checkouts` and
-`independents` are their Fleet-wide forms; bare `issues` is invalid. Family
-names and percent escapes render canonically in lowercase/uppercase
-respectively, and parsed addresses deduplicate by their typed identity. The
-earlier experimental `?repo=` form is not part of the contract.
+`independents`, plus `convoys/<namespace>` without the query parameter, are
+their Fleet-wide forms; bare `issues` is invalid. Family names and percent
+escapes render canonically in lowercase/uppercase respectively, and parsed
+addresses deduplicate by their typed identity. The earlier experimental
+`?repo=` form is not part of the contract.
 
 The client-visible query scope is Project-only: Repository membership is an
 Aggregator implementation detail. Source search is transient state of an

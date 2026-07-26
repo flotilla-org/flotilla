@@ -614,13 +614,18 @@ fn result_set_round_trips_a_resource_backed_vessel_dag() {
         })
         .vessels(vec![implement, review])
         .build();
-    let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 7, rows: Rows::Convoys(vec![row]), state: Default::default() }));
+    let scope = QueryScope::new("flotilla", "roadmap");
+    let event = DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 7,
+        rows: Rows::Convoys { scope: Some(scope.clone()), rows: vec![row] },
+        state: Default::default(),
+    }));
 
     let encoded = serde_json::to_string(&event).expect("serialize result set");
     let decoded: DaemonEvent = serde_json::from_str(&encoded).expect("deserialize result set");
     let DaemonEvent::ResultSet(result_set) = decoded else { panic!("expected ResultSet") };
     assert_eq!(result_set.seq, 7);
-    assert_eq!(result_set.query(), QueryId::Convoys);
+    assert_eq!(result_set.query(), QueryId::Convoys { scope: Some(scope.clone()) });
     let rows = result_set.rows.as_convoys().expect("convoy rows");
     assert_eq!(rows[0].vessels[1].depends_on, vec![rows[0].vessels[0].name.clone()]);
     assert!(rows[0].vessels[0].attach.is_some(), "presentation join surfaces as attach capability");
@@ -629,7 +634,7 @@ fn result_set_round_trips_a_resource_backed_vessel_dag() {
     assert!(rows[0].vessels[0].complete_work);
     assert!(!rows[0].vessels[1].complete_work, "capabilities default closed");
     assert_eq!(rows[0].change_request.as_ref().expect("change request").id, "815");
-    assert_eq!(StreamKey::Query { query: QueryId::Convoys }, StreamKey::Query { query: result_set.query() });
+    assert_eq!(StreamKey::Query { query: QueryId::Convoys { scope: Some(scope) } }, StreamKey::Query { query: result_set.query() });
 }
 
 #[test]
@@ -671,7 +676,7 @@ fn subscribe_queries_request_round_trips_cursors() {
     use crate::result_set::QueryId;
 
     let request = Request::SubscribeQueries {
-        queries: vec![QueryCursor { query: QueryId::Convoys, since: Some(41) }, QueryCursor {
+        queries: vec![QueryCursor { query: QueryId::Convoys { scope: None }, since: Some(41) }, QueryCursor {
             query: QueryId::Independents { scope: None },
             since: None,
         }],

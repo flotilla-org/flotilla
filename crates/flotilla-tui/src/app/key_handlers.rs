@@ -443,7 +443,7 @@ impl App {
                 let panel = matches!(&address, flotilla_protocol::ViewAddress::Project { .. })
                     .then(|| self.views.active_project_table_state().active());
                 let pending = PendingActionContext::table_row(
-                    PendingRowContext { address, panel, query: flotilla_protocol::QueryId::Convoys, row_id },
+                    PendingRowContext { address, panel, query: flotilla_protocol::QueryId::Convoys { scope: None }, row_id },
                     "Delete convoy".into(),
                 );
                 self.screen.modal_stack.push(Box::new(ConvoyDeleteConfirmWidget::new(command, pending)));

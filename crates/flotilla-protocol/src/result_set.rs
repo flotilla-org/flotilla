@@ -1,7 +1,7 @@
 //! Named-query result sets — the Aggregator's data plane.
 //!
 //! The Aggregator maintains incrementally-updated result sets for a small set
-//! of named queries (e.g. [`QueryId::Convoys`]: all Convoys, durable ∪
+//! of named queries (e.g. [`QueryId::Convoys`]: Convoys, durable ∪
 //! observed, fleet-merged, joined with Presentation attach state). Clients
 //! subscribe per query and receive a full [`ResultSet`] followed by
 //! [`ResultDelta`]s. Rows are typed per query; presentation concerns
@@ -27,9 +27,10 @@ pub type Timestamp = DateTime<Utc>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryId {
-    /// All Convoys — durable ∪ observed, fleet-merged, joined with
-    /// Presentation attach state. Rows are [`ConvoyRow`].
-    Convoys,
+    /// Convoys — durable ∪ observed, fleet-merged, joined with Presentation
+    /// attach state — fleet-wide (`None`) or in one Project.
+    /// Rows are [`ConvoyRow`].
+    Convoys { scope: Option<QueryScope> },
     /// TerminalSessions with no Convoy association. Rows are
     /// [`IndependentRow`].
     Independents { scope: Option<QueryScope> },
@@ -76,11 +77,11 @@ impl QueryId {
     /// Finite query families that are always materialized. Parameterized
     /// demand-backed queries cannot appear in a static list.
     pub const ALWAYS_MATERIALIZED: &'static [QueryId] =
-        &[QueryId::Convoys, QueryId::Independents { scope: None }, QueryId::Checkouts { scope: None }];
+        &[QueryId::Convoys { scope: None }, QueryId::Independents { scope: None }, QueryId::Checkouts { scope: None }];
 
     pub fn family(&self) -> &'static str {
         match self {
-            Self::Convoys => "convoys",
+            Self::Convoys { .. } => "convoys",
             Self::Independents { .. } => "independents",
             Self::Issues { .. } => "issues",
             Self::Checkouts { .. } => "checkouts",
@@ -140,6 +141,7 @@ impl ResultDelta {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QueryChanges {
     Convoys {
+        scope: Option<QueryScope>,
         changed: Vec<ConvoyRow>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         removed: Vec<ResourceRef>,
@@ -179,7 +181,7 @@ pub enum QueryChanges {
 impl QueryChanges {
     pub fn query(&self) -> QueryId {
         match self {
-            Self::Convoys { .. } => QueryId::Convoys,
+            Self::Convoys { scope, .. } => QueryId::Convoys { scope: scope.clone() },
             Self::Independents { scope, .. } => QueryId::Independents { scope: scope.clone() },
             Self::Issues { scope, search, label, .. } => {
                 QueryId::Issues { scope: scope.clone(), search: search.clone(), label: label.clone() }
@@ -312,7 +314,10 @@ pub enum ResultSetCondition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "rows", rename_all = "snake_case")]
 pub enum Rows {
-    Convoys(Vec<ConvoyRow>),
+    Convoys {
+        scope: Option<QueryScope>,
+        rows: Vec<ConvoyRow>,
+    },
     Independents {
         scope: Option<QueryScope>,
         rows: Vec<IndependentRow>,
@@ -340,7 +345,7 @@ pub enum Rows {
 impl Rows {
     pub fn query(&self) -> QueryId {
         match self {
-            Self::Convoys(_) => QueryId::Convoys,
+            Self::Convoys { scope, .. } => QueryId::Convoys { scope: scope.clone() },
             Self::Independents { scope, .. } => QueryId::Independents { scope: scope.clone() },
             Self::Issues { scope, search, label, .. } => {
                 QueryId::Issues { scope: scope.clone(), search: search.clone(), label: label.clone() }
@@ -354,7 +359,7 @@ impl Rows {
 
     pub fn len(&self) -> usize {
         match self {
-            Self::Convoys(rows) => rows.len(),
+            Self::Convoys { rows, .. } => rows.len(),
             Self::Independents { rows, .. } => rows.len(),
             Self::Issues { rows, .. } => rows.len(),
             Self::Checkouts { rows, .. } => rows.len(),
@@ -368,7 +373,7 @@ impl Rows {
 
     pub fn as_convoys(&self) -> Option<&[ConvoyRow]> {
         match self {
-            Self::Convoys(rows) => Some(rows),
+            Self::Convoys { rows, .. } => Some(rows),
             _ => None,
         }
     }

@@ -262,7 +262,7 @@ impl OpenViews {
         landing: Option<(RepoIdentity, ViewAddress)>,
     ) -> Self {
         let mut entries = vec![OpenViewEntry { address: ViewAddress::Overview.to_string(), label: None }, OpenViewEntry {
-            address: ViewAddress::Convoys { namespace: "flotilla".to_string() }.to_string(),
+            address: ViewAddress::Convoys { namespace: "flotilla".to_string(), scope: None }.to_string(),
             label: None,
         }];
         entries.extend(repos.into_iter().map(|(identity, repository_key)| {
@@ -558,6 +558,8 @@ fn bind_repository_key(target: &mut ViewTarget, keys: &HashMap<RepoIdentity, Rep
 
 #[cfg(test)]
 mod tests {
+    use flotilla_protocol::QueryScope;
+
     use super::*;
 
     fn addr(s: &str) -> ViewAddress {
@@ -602,6 +604,18 @@ mod tests {
         let entries = views.to_entries();
         assert_eq!(entries[1].address, "workflow/ns/w");
         assert_eq!(entries[2].address, "garbage");
+    }
+
+    #[test]
+    fn project_scoped_convoys_round_trip_through_open_view_entries() {
+        let entries = vec![entry("overview"), entry("convoys/flotilla?project=flotilla%2Froadmap")];
+        let views = OpenViews::from_entries(entries.clone());
+
+        assert_eq!(views.to_entries(), entries);
+        assert_eq!(
+            views.get(1).and_then(OpenView::address),
+            Some(&ViewAddress::Convoys { namespace: "flotilla".into(), scope: Some(QueryScope::new("flotilla", "roadmap")) })
+        );
     }
 
     #[test]

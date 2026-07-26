@@ -403,14 +403,14 @@ mod tests {
         let daemon = Arc::new(StubDaemon::builder().execute_gate(Arc::clone(&execute_gate)).build());
         let mut app =
             stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
-        let address = ViewAddress::Convoys { namespace: "flotilla".into() };
+        let address = ViewAddress::Convoys { namespace: "flotilla".into(), scope: None };
         app.open_view(address.clone());
         let row_id = crate::table_view::RowId::new("flotilla/delete-me");
         let pending_ctx = PendingActionContext::table_row(
             crate::table_view::PendingRowContext {
                 address,
                 panel: None,
-                query: flotilla_protocol::QueryId::Convoys,
+                query: flotilla_protocol::QueryId::Convoys { scope: None },
                 row_id: row_id.clone(),
             },
             "Delete convoy".into(),
@@ -449,6 +449,7 @@ mod tests {
         app.handle_daemon_event(flotilla_protocol::DaemonEvent::ResultDelta(Box::new(flotilla_protocol::ResultDelta {
             seq: 1,
             changes: flotilla_protocol::QueryChanges::Convoys {
+                scope: None,
                 changed: vec![],
                 removed: vec![flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "delete-me")],
             },
@@ -463,14 +464,14 @@ mod tests {
         let daemon = Arc::new(StubDaemon::builder().execute_result(Err("delete failed".into())).build());
         let mut app =
             stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
-        let address = ViewAddress::Convoys { namespace: "flotilla".into() };
+        let address = ViewAddress::Convoys { namespace: "flotilla".into(), scope: None };
         app.open_view(address.clone());
         let row_id = crate::table_view::RowId::new("flotilla/delete-me");
         let pending_ctx = PendingActionContext::table_row(
             crate::table_view::PendingRowContext {
                 address,
                 panel: None,
-                query: flotilla_protocol::QueryId::Convoys,
+                query: flotilla_protocol::QueryId::Convoys { scope: None },
                 row_id: row_id.clone(),
             },
             "Delete convoy".into(),
@@ -496,14 +497,14 @@ mod tests {
         let daemon = Arc::new(StubDaemon::new());
         let mut app =
             stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
-        let address = ViewAddress::Convoys { namespace: "flotilla".into() };
+        let address = ViewAddress::Convoys { namespace: "flotilla".into(), scope: None };
         app.open_view(address.clone());
         let row_id = crate::table_view::RowId::new("flotilla/delete-me");
         let pending_ctx = PendingActionContext::table_row(
             crate::table_view::PendingRowContext {
                 address,
                 panel: None,
-                query: flotilla_protocol::QueryId::Convoys,
+                query: flotilla_protocol::QueryId::Convoys { scope: None },
                 row_id: row_id.clone(),
             },
             "Delete convoy".into(),
@@ -684,13 +685,13 @@ mod tests {
     #[test]
     fn table_row_cancellation_before_ack_stops_shimmering() {
         let mut app = stub_app();
-        let address = ViewAddress::Convoys { namespace: "flotilla".into() };
+        let address = ViewAddress::Convoys { namespace: "flotilla".into(), scope: None };
         app.open_view(address.clone());
         let row_id = crate::table_view::RowId::new("flotilla/delete-me");
         let row_ctx = crate::table_view::PendingRowContext {
             address,
             panel: None,
-            query: flotilla_protocol::QueryId::Convoys,
+            query: flotilla_protocol::QueryId::Convoys { scope: None },
             row_id: row_id.clone(),
         };
         let pending_ctx = PendingActionContext::table_row(row_ctx.clone(), "Delete convoy".into());
