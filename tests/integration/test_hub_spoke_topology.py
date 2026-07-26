@@ -371,7 +371,7 @@ def test_terminal_without_shpool_uses_passthrough(hub_spoke_topology):
     assert prepared["attachable_set_id"]
     assert prepared["commands"]
     assert all(
-        arg.get("value") != "shpool"
+        "shpool" not in arg.get("value", "")
         for command in prepared["commands"]
         for arg in command["args"]
     )
