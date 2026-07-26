@@ -9,8 +9,8 @@ use chrono::Utc;
 use flotilla_manifest::keys::{KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY_NAME};
 use flotilla_protocol::{
     AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary, AwarenessGrouping, AwarenessKind, AwarenessLimit,
-    AwarenessNode, AwarenessPhase, AwarenessState, CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryScope, ResourceRef,
-    ResultSetState, Salience, WorkPhase, UNKNOWN_REPOSITORY_LABEL,
+    AwarenessLink, AwarenessNode, AwarenessPhase, AwarenessState, CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow,
+    QueryScope, ResourceRef, ResultSetState, Salience, WorkPhase, AWARENESS_REL_FOR_CONVOY, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{api_version, Project, Resource};
 
@@ -156,6 +156,13 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .state(AwarenessState::Active)
                 .as_of(as_of)
                 .refs(vec![checkout.resource.clone()])
+                .links(
+                    checkout
+                        .for_convoy
+                        .iter()
+                        .map(|convoy| AwarenessLink { rel: AWARENESS_REL_FOR_CONVOY.to_owned(), target: convoy.clone() })
+                        .collect(),
+                )
                 .annotations(checkout_annotations(checkout))
                 .build(),
             &input.salience,
@@ -556,6 +563,7 @@ mod tests {
                 .branch("main")
                 .host(HostName::new("local"))
                 .authority(flotilla_protocol::LifecycleAuthority::Observed)
+                .for_convoy("ship-it")
                 .build()],
             ..AwarenessInput::default()
         });
@@ -569,6 +577,7 @@ mod tests {
         assert_eq!(checkout.label, "main · /work/flotilla");
         assert_eq!(checkout.annotations.get("checkout.branch").map(String::as_str), Some("main"));
         assert_eq!(checkout.annotations.get("checkout.path").map(String::as_str), Some("/work/flotilla"));
+        assert_eq!(checkout.links, vec![flotilla_protocol::AwarenessLink { rel: "for-convoy".to_owned(), target: "ship-it".to_owned() }]);
     }
 
     #[test]

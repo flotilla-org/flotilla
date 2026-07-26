@@ -2681,6 +2681,102 @@ async fn transient_attach_selects_the_displayed_host_for_result_set_only_indepen
 }
 
 #[tokio::test]
+async fn transient_attach_resolves_standing_checkout_paths_locally_and_deterministically() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let checkout_path = temp.path().join("standing-checkout");
+    std::fs::create_dir_all(&checkout_path).expect("create checkout");
+    let (daemon, terminal_pool) = new_attach_test_daemon_with_pool(&config_base).await;
+    let row = CheckoutRow::builder()
+        .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "dev", "standing").on_host(HostName::new(TEST_LOCAL_ATTACH_HOST)))
+        .repo(RepositoryKey("repo-standing".to_owned()))
+        .repo_label("standing")
+        .path(checkout_path.display().to_string())
+        .branch("main")
+        .host(HostName::new(TEST_LOCAL_ATTACH_HOST))
+        .authority(LifecycleAuthority::Observed)
+        .build();
+    daemon.aggregator_projection_state().await.replace_local_checkout_rows(vec![row]).await;
+
+    let mut resolved = Vec::new();
+    for _ in 0..2 {
+        let result = daemon
+            .execute_query(
+                Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::AttachTransient {
+                        reference: checkout_path.display().to_string(),
+                        host: Some(HostName::new(TEST_LOCAL_ATTACH_HOST)),
+                    },
+                },
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("transient attach query should execute");
+        let CommandValue::AttachCommandResolved { command, binding } = result else {
+            panic!("expected attach command, got {result:?}");
+        };
+        assert!(binding.is_none(), "standing checkout terminals are deliberately not stamped as convoy sessions");
+        resolved.push(command);
+    }
+    assert_eq!(resolved[0], resolved[1], "the same checkout must resolve to the same terminal target");
+    let ensured = terminal_pool.ensured.lock().await;
+    assert_eq!(ensured.len(), 1, "re-opening a checkout reuses its terminal-pool session");
+    assert_eq!(ensured[0].cwd.as_path(), checkout_path);
+    assert_eq!(ensured[0].command, "${SHELL:-/bin/sh}");
+}
+
+#[tokio::test]
+async fn transient_attach_routes_standing_checkout_paths_to_the_displayed_remote_host() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let (remote_host, _) = non_local_attach_hosts();
+    let remote_hostname = format!("{remote_host}.local");
+    write_attach_hosts_config(&config_base, &[(remote_host, &remote_hostname, Some("alice"))]);
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let row = CheckoutRow::builder()
+        .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "dev", "standing").on_host(HostName::new(remote_host)))
+        .repo(RepositoryKey("repo-standing".to_owned()))
+        .repo_label("standing")
+        .path("/work/standing")
+        .branch("main")
+        .host(HostName::new(remote_host))
+        .authority(LifecycleAuthority::Observed)
+        .build();
+    daemon
+        .aggregator_projection_state()
+        .await
+        .replace_checkout_replica_rows(HashMap::from([(HostName::new(remote_host), vec![row])]))
+        .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::AttachTransient { reference: "/work/standing".to_owned(), host: Some(HostName::new(remote_host)) },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("transient attach query should execute");
+    let CommandValue::AttachCommandResolved { command, binding } = result else {
+        panic!("expected attach command, got {result:?}");
+    };
+    assert!(binding.is_none());
+    assert!(command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")));
+    assert!(command.contains("--transient"));
+    assert!(command.contains("/work/standing"));
+}
+
+#[tokio::test]
 async fn attach_query_ignores_fleet_replica_hosts_that_are_not_configured() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");

@@ -20,7 +20,7 @@ use flotilla_protocol::{
     arg::{flatten, Arg},
     commands::RepositoryIdentityChange,
     qualified_path::{HostId, QualifiedPath},
-    result_set::{ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
+    result_set::{CheckoutRow, ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
     AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, CorrelationKey, CrewCommandContext, CrewListMember,
     CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus,
     FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
@@ -435,6 +435,7 @@ fn fleet_row_attach_reference_label(row: &FleetListRow) -> String {
 enum AttachTarget {
     Local(Box<flotilla_resources::ResourceObject<ResourceTerminalSession>>),
     Replica { row: Box<FleetListRow> },
+    Checkout(Box<CheckoutRow>),
 }
 
 impl AttachTarget {
@@ -471,6 +472,17 @@ impl AttachTarget {
                     .maybe_role(role)
                     .build();
                 Ok(ResolvedAttach { command, binding: Some(binding) })
+            }
+            Self::Checkout(row) => {
+                if !transient {
+                    return Err(format!("checkout '{}' is only available as a transient attach target", row.path));
+                }
+                let command = if row.host == daemon.host_name {
+                    daemon.local_checkout_terminal_command(row).await?
+                } else {
+                    daemon.recursive_attach_command_for_remote(&row.host, reference, true).await?
+                };
+                Ok(ResolvedAttach { command, binding: None })
             }
         }
     }
@@ -5720,6 +5732,21 @@ impl InProcessDaemon {
             });
         }
 
+        let checkout_set = self
+            .aggregator_projection_state()
+            .await
+            .result_set_for(&flotilla_protocol::QueryId::Checkouts { scope: None })
+            .await
+            .expect("checkout query is always materialized");
+        if let Rows::Checkouts { rows, .. } = checkout_set.rows {
+            candidates.extend(rows.into_iter().filter(|row| row.for_convoy.is_none()).map(|row| AttachCandidate {
+                label: format!("{} ({})", row.path, row.host),
+                references: vec![row.path.clone()],
+                host: row.host.clone(),
+                target: AttachTarget::Checkout(Box::new(row)),
+            }));
+        }
+
         let configured_replica_hosts: HashSet<HostName> = self
             .config
             .load_hosts()
@@ -5785,6 +5812,30 @@ impl InProcessDaemon {
         }
         drop(cache);
         Ok(AttachCandidateIndex::new(candidates))
+    }
+
+    async fn local_checkout_terminal_command(&self, checkout: &CheckoutRow) -> Result<String, String> {
+        let cwd = ExecutionEnvironmentPath::new(&checkout.path);
+        let discovery = discover_repo_for_environment(
+            &self.environment_manager,
+            &self.discovery,
+            &self.config,
+            &self.local_environment_id,
+            &self.local_environment_id,
+            cwd.as_path(),
+        )
+        .await
+        .map_err(|error| format!("checkout {} provider discovery failed: {error}", checkout.path))?;
+        let pool = discovery
+            .registry
+            .terminal_pools
+            .preferred()
+            .cloned()
+            .ok_or_else(|| format!("no terminal pool available for checkout {}", checkout.path))?;
+        let session_name = transient_checkout_session_name(checkout);
+        let command = "${SHELL:-/bin/sh}";
+        pool.ensure_session(&session_name, command, &cwd, &Vec::new(), &[]).await?;
+        pool.attach_command(&session_name, command, &cwd, &Vec::new()).await
     }
 
     /// Resolve the attach command for a locally-known session, returning it
@@ -6884,6 +6935,15 @@ impl InProcessDaemon {
 
         Ok(id)
     }
+}
+
+fn transient_checkout_session_name(checkout: &CheckoutRow) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(checkout.host.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(checkout.path.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!("flotilla-checkout-{}", &digest[..32])
 }
 
 async fn execute_local_remote_step_batch(
