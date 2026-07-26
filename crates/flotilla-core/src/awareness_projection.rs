@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::Utc;
+use flotilla_manifest::keys::{KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY_NAME};
 use flotilla_protocol::{
     AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary, AwarenessGrouping, AwarenessKind, AwarenessLimit,
     AwarenessNode, AwarenessPhase, AwarenessState, CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryScope, ResourceRef,
@@ -82,7 +83,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .as_of(as_of)
                 .refs(vec![convoy.resource.clone()])
                 .issue_refs(convoy.issues.iter().map(|issue| issue.reference.clone()).collect())
-                .annotations(repo_fact_annotations(convoy.repo.as_ref()))
+                .annotations(convoy_annotations(convoy))
                 .build(),
             &input.salience,
             &project_ancestors,
@@ -155,7 +156,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .state(AwarenessState::Active)
                 .as_of(as_of)
                 .refs(vec![checkout.resource.clone()])
-                .annotations(repo_fact_annotations(checkout.repo_fact.as_ref()))
+                .annotations(checkout_annotations(checkout))
                 .build(),
             &input.salience,
             &project_ancestors,
@@ -241,6 +242,22 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
 
 fn repo_fact_annotations(repo: Option<&flotilla_protocol::RepoKey>) -> HashMap<String, String> {
     repo.map(|repo| HashMap::from([(REPO_FACT_ANNOTATION.to_string(), repo.0.clone())])).unwrap_or_default()
+}
+
+fn convoy_annotations(convoy: &ConvoyRow) -> HashMap<String, String> {
+    let mut annotations = repo_fact_annotations(convoy.repo.as_ref());
+    annotations.insert(KEY_CONVOY_NAME.to_owned(), convoy.name.clone());
+    if let Some(change_request) = &convoy.change_request {
+        annotations.insert(KEY_CHANGE_REQUEST_NUMBER.to_owned(), change_request.id.clone());
+    }
+    annotations
+}
+
+fn checkout_annotations(checkout: &CheckoutRow) -> HashMap<String, String> {
+    let mut annotations = repo_fact_annotations(checkout.repo_fact.as_ref());
+    annotations.insert(KEY_CHECKOUT_BRANCH.to_owned(), checkout.branch.clone());
+    annotations.insert(KEY_CHECKOUT_PATH.to_owned(), checkout.path.clone());
+    annotations
 }
 
 fn awareness_family_summaries(entries: &[AwarenessEntry]) -> Vec<AwarenessFamilySummary> {
@@ -435,7 +452,10 @@ fn entry_rank(entry: &AwarenessEntry) -> (u8, u8) {
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
-    use flotilla_protocol::{HostName, Issue, IssueRef, IssueSource, IssueState, RepositoryKey, ResourceRef, SessionPhase};
+    use flotilla_protocol::{
+        ChangeRequestStatus, ConvoyChangeRequest, HostName, Issue, IssueRef, IssueSource, IssueState, RepositoryKey, ResourceRef,
+        SessionPhase,
+    };
     use flotilla_resources::{DemandState, PrincipalRef, TerminalAttentionState};
 
     use super::*;
@@ -515,6 +535,40 @@ mod tests {
                 "repo grouping uses canonical fact value, not display label",
             );
         }
+    }
+
+    #[test]
+    fn composed_labels_retain_granular_convoy_and_checkout_annotations() {
+        let mut convoy = convoy(Some("flotilla/platform"), "ship-it", ConvoyPhase::Active);
+        convoy.change_request = Some(ConvoyChangeRequest {
+            id: "1044".into(),
+            status: ChangeRequestStatus::Open,
+            repository_key: RepositoryKey("repo-a".into()),
+        });
+        let (nodes, _) = project_awareness(AwarenessInput {
+            scope: Some(QueryScope::new("flotilla", "platform")),
+            convoys: vec![convoy],
+            checkouts: vec![CheckoutRow::builder()
+                .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout"))
+                .repo(RepositoryKey("repo-a".into()))
+                .repo_label("github.com/flotilla-org/flotilla")
+                .path("/work/flotilla")
+                .branch("main")
+                .host(HostName::new("local"))
+                .authority(flotilla_protocol::LifecycleAuthority::Observed)
+                .build()],
+            ..AwarenessInput::default()
+        });
+
+        let convoy = nodes[0].entries.iter().find(|entry| entry.kind == AwarenessKind::Convoy).expect("convoy entry");
+        assert_eq!(convoy.label, "ship-it · PR #1044");
+        assert_eq!(convoy.annotations.get("flotilla.convoy.name").map(String::as_str), Some("ship-it"));
+        assert_eq!(convoy.annotations.get("change_request.number").map(String::as_str), Some("1044"));
+
+        let checkout = nodes[0].entries.iter().find(|entry| entry.kind == AwarenessKind::Checkout).expect("checkout entry");
+        assert_eq!(checkout.label, "main · /work/flotilla");
+        assert_eq!(checkout.annotations.get("checkout.branch").map(String::as_str), Some("main"));
+        assert_eq!(checkout.annotations.get("checkout.path").map(String::as_str), Some("/work/flotilla"));
     }
 
     #[test]

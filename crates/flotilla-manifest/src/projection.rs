@@ -17,12 +17,13 @@ use flotilla_protocol::{
 use crate::{
     entity::{self, EntityKind, EntityRef},
     keys::{
-        ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CONVOY, KEY_CONVOY_MESSAGE, KEY_CONVOY_NAME, KEY_CONVOY_PHASE, KEY_CONVOY_WORKFLOW,
-        KEY_COUNT_CHECKOUTS, KEY_COUNT_CONVOYS, KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_COUNT_VESSELS,
-        KEY_CREW_ROLES, KEY_DISPLAY_LABEL, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_INDEPENDENT_HOST, KEY_PRIMARY_ACTION_KEY,
-        KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET, KEY_PRIMARY_ACTION_VEHICLE, KEY_PROJECT_NAME,
-        KEY_REPO_NAME, KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL, KEY_VESSEL_HOST,
-        KEY_VESSEL_NAME, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
+        ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY,
+        KEY_CONVOY_MESSAGE, KEY_CONVOY_NAME, KEY_CONVOY_PHASE, KEY_CONVOY_WORKFLOW, KEY_COUNT_CHECKOUTS, KEY_COUNT_CONVOYS,
+        KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_COUNT_VESSELS, KEY_CREW_ROLES, KEY_DISPLAY_LABEL, KEY_ENTITY_ID,
+        KEY_ENTITY_KIND, KEY_INDEPENDENT_HOST, KEY_PRIMARY_ACTION_KEY, KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE,
+        KEY_PRIMARY_ACTION_TARGET, KEY_PRIMARY_ACTION_VEHICLE, KEY_PROJECT_NAME, KEY_REPO_NAME, KEY_SESSION, KEY_SOURCE,
+        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL, KEY_VESSEL_HOST, KEY_VESSEL_NAME, KEY_WORK_PHASE,
+        SEGMENT_CHECKOUT, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
     recipe::{Recipe, RecipeMint},
     wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
@@ -294,7 +295,13 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
             let row = find_convoy(convoys, namespace, name);
             let origin = row.map(|row| entity::resource_origin(&row.resource)).unwrap_or_else(|| "fleet".to_owned());
             let entity = entity::convoy(namespace, name, &origin);
-            let facts = vec![(KEY_CONVOY, MetadataValue::text(entity.id.clone())), (KEY_CONVOY_NAME, MetadataValue::text(label.clone()))];
+            let mut facts = vec![
+                (KEY_CONVOY, MetadataValue::text(entity.id.clone())),
+                (KEY_CONVOY_NAME, MetadataValue::text(entry.annotations.get(KEY_CONVOY_NAME).cloned().unwrap_or_else(|| name.to_owned()))),
+            ];
+            if let Some(number) = entry.annotations.get(KEY_CHANGE_REQUEST_NUMBER) {
+                facts.push((KEY_CHANGE_REQUEST_NUMBER, MetadataValue::text(number.clone())));
+            }
             (entity, facts)
         }
         AwarenessKind::Vessel => {
@@ -339,7 +346,14 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
         }
         AwarenessKind::Checkout => {
             let entity = entity::checkout(&entry.id);
-            (entity.clone(), vec![(SEGMENT_CHECKOUT, MetadataValue::text(entity.id.clone()))])
+            let mut facts = vec![(SEGMENT_CHECKOUT, MetadataValue::text(entity.id.clone()))];
+            if let Some(branch) = entry.annotations.get(KEY_CHECKOUT_BRANCH) {
+                facts.push((KEY_CHECKOUT_BRANCH, MetadataValue::text(branch.clone())));
+            }
+            if let Some(path) = entry.annotations.get(KEY_CHECKOUT_PATH) {
+                facts.push((KEY_CHECKOUT_PATH, MetadataValue::text(path.clone())));
+            }
+            (entity, facts)
         }
         AwarenessKind::Fleet | AwarenessKind::Project => return None,
     };
@@ -451,6 +465,9 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
         (KEY_CONVOY_WORKFLOW, MetadataValue::text(convoy.workflow_ref.clone())),
         (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
     ]);
+    if let Some(change_request) = &convoy.change_request {
+        facts.push((KEY_CHANGE_REQUEST_NUMBER, MetadataValue::text(change_request.id.clone())));
+    }
     if let Some(message) = &convoy.message {
         facts.push((KEY_CONVOY_MESSAGE, MetadataValue::text(message.clone())));
     }

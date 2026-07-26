@@ -23,6 +23,8 @@
 //! | `flotilla.crew.role` | One bound pane's crew role. |
 //! | `flotilla.attach.ref` | Address accepted by `flotilla attach`. |
 //! | `flotilla.project.name` | Human-readable name of a Project group. |
+//! | `flotilla.convoy.name` | Human-readable convoy name without an associated change-request suffix. |
+//! | `flotilla.vessel.name` | Human-readable vessel name. |
 //! | `flotilla.convoy.phase` | Raw [`flotilla_protocol::ConvoyPhase`] value. |
 //! | `flotilla.convoy.workflow` | WorkflowTemplate resource name used by a convoy. |
 //! | `flotilla.convoy.message` | Convoy lifecycle diagnostic. |
@@ -31,6 +33,10 @@
 //! | `flotilla.independent.host` | Host currently carrying an independent terminal session. |
 //! | `flotilla.vessel.env` | Execution-environment reference for a vessel. |
 //! | `flotilla.crew.roles` | Complete crew-role list aboard a vessel. |
+//! | `vcs.repo.name` | Human-readable Repository name. |
+//! | `change_request.number` | External change-request number without display decoration such as `PR #`. |
+//! | `checkout.branch` | Checkout branch without its path or other display decoration. |
+//! | `checkout.path` | Full checkout path without its branch or other display decoration. |
 //! | `entity.kind` | Canonical presentation entity kind. |
 //! | `entity.id` | Canonical id in that kind's single permitted dialect. |
 //! | `display.label` | Concise human label, never identity. |
@@ -38,6 +44,12 @@
 //! | `status.attention` | Boolean human-attention demand. |
 //! | `status.connectivity` | Connectivity annotation (`connected` or `disconnected`); reserved until emitted. |
 //! | `summary.text` | Short human summary, never an identity. |
+//! | `count.total` | Total awareness entries beneath a project or convoy entity. |
+//! | `count.issues` | Issue-entry count beneath a project or convoy entity. |
+//! | `count.convoys` | Convoy-entry count beneath a project entity. |
+//! | `count.vessels` | Vessel-entry count beneath a project or convoy entity. |
+//! | `count.checkouts` | Checkout-entry count beneath a project entity. |
+//! | `count.independents` | Independent-session count beneath a project entity. |
 //! | `action.primary.key` | Stable verb for the primary action. |
 //! | `action.primary.label` | Human label for the primary action. |
 //! | `action.primary.vehicle` | Execution vehicle for the action. |
