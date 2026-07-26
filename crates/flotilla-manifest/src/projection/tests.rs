@@ -5,7 +5,7 @@ use flotilla_protocol::{
 
 use super::*;
 use crate::{
-    entity::{self, EntityKind},
+    entity,
     keys::{
         KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY, KEY_CONVOY_NAME, KEY_COUNT_CHECKOUTS,
         KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_DISPLAY_LABEL, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_PRIMARY_ACTION_RECIPE,
@@ -118,7 +118,7 @@ fn awareness_issues_are_recipe_less_entities_with_source_plus_id_identity() {
     let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
     let issue_patch = find_entity(&patches, &entity::issue(&issue_ref));
     let project_patch = find_entity(&patches, &entity::project("dev", "platform", "fleet"));
-    assert_eq!(text(issue_patch, KEY_ENTITY_KIND), EntityKind::Issue.as_str());
+    assert_eq!(text(issue_patch, KEY_ENTITY_KIND), "issue");
     assert_eq!(
         project_patch.set[KEY_COUNT_ISSUES].value,
         MetadataValue::Integer(1),
@@ -258,7 +258,7 @@ fn awareness_repository_group_does_not_masquerade_as_project() {
     find_entity(&patches, &entity::repo("flotilla-org/flotilla"));
     find_entity(&patches, &entity::session("independent/dev/governor"));
     assert!(
-        patches.iter().all(|patch| !matches!(&patch.target, MetadataTarget::Entity(entity) if entity.kind == EntityKind::Project)),
+        patches.iter().all(|patch| !matches!(&patch.target, MetadataTarget::Entity(entity) if entity.kind == "project")),
         "repository-only awareness must not mint a project entity"
     );
 }

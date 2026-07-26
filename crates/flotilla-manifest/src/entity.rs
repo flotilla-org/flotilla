@@ -4,52 +4,18 @@
 //! sites. One entity kind has one id dialect, so two observations of the same
 //! thing fold onto the same wire target.
 
-use std::fmt;
-
 use flotilla_protocol::{IssueRef, ResourceRef};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EntityKind {
-    Project,
-    Repo,
-    Convoy,
-    Vessel,
-    Issue,
-    Session,
-    Checkout,
-}
-
-impl EntityKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Project => "project",
-            Self::Repo => "repo",
-            Self::Convoy => "convoy",
-            Self::Vessel => "vessel",
-            Self::Issue => "issue",
-            Self::Session => "session",
-            Self::Checkout => "checkout",
-        }
-    }
-}
-
-impl fmt::Display for EntityKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EntityRef {
-    pub kind: EntityKind,
+    pub kind: String,
     pub id: String,
 }
 
 impl EntityRef {
-    pub fn new(kind: EntityKind, id: impl Into<String>) -> Self {
-        Self { kind, id: id.into() }
+    pub fn new(kind: impl Into<String>, id: impl Into<String>) -> Self {
+        Self { kind: kind.into(), id: id.into() }
     }
 
     /// Stable value used by action facts and live-tab matching.
@@ -67,31 +33,31 @@ pub fn resource_origin(resource: &ResourceRef) -> String {
 }
 
 pub fn project(namespace: &str, name: &str, origin: &str) -> EntityRef {
-    EntityRef::new(EntityKind::Project, format!("{namespace}/{name}@{origin}"))
+    EntityRef::new("project", format!("{namespace}/{name}@{origin}"))
 }
 
 pub fn repo(forge_slug: &str) -> EntityRef {
-    EntityRef::new(EntityKind::Repo, forge_slug)
+    EntityRef::new("repo", forge_slug)
 }
 
 pub fn convoy(namespace: &str, name: &str, origin: &str) -> EntityRef {
-    EntityRef::new(EntityKind::Convoy, format!("{namespace}/{name}@{origin}"))
+    EntityRef::new("convoy", format!("{namespace}/{name}@{origin}"))
 }
 
 pub fn vessel(namespace: &str, convoy_name: &str, vessel_name: &str, origin: &str) -> EntityRef {
-    EntityRef::new(EntityKind::Vessel, format!("{namespace}/{convoy_name}/{vessel_name}@{origin}"))
+    EntityRef::new("vessel", format!("{namespace}/{convoy_name}/{vessel_name}@{origin}"))
 }
 
 pub fn issue(reference: &IssueRef) -> EntityRef {
-    EntityRef::new(EntityKind::Issue, format!("{}/{}#{}", reference.source.service, reference.source.scope, reference.id))
+    EntityRef::new("issue", format!("{}/{}#{}", reference.source.service, reference.source.scope, reference.id))
 }
 
 pub fn session(session_ref: &str) -> EntityRef {
-    EntityRef::new(EntityKind::Session, session_ref)
+    EntityRef::new("session", session_ref)
 }
 
 pub fn checkout(checkout_ref: &str) -> EntityRef {
-    EntityRef::new(EntityKind::Checkout, checkout_ref)
+    EntityRef::new("checkout", checkout_ref)
 }
 
 #[cfg(test)]
@@ -122,5 +88,15 @@ mod tests {
         let remote = local.clone().on_host(HostName::new("kiwi"));
         assert_eq!(resource_origin(&local), "fleet");
         assert_eq!(resource_origin(&remote), "kiwi");
+    }
+
+    #[test]
+    fn entity_kind_is_an_open_wire_string() {
+        let entity = EntityRef::new("deployment", "prod/api");
+        let json = serde_json::to_string(&entity).expect("serialize novel kind");
+        let decoded: EntityRef = serde_json::from_str(&json).expect("deserialize novel kind");
+
+        assert_eq!(json, r#"{"kind":"deployment","id":"prod/api"}"#);
+        assert_eq!(decoded, entity);
     }
 }

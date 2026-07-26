@@ -62,8 +62,8 @@ pub const KEY_CREW_ROLES: &str = "flotilla.crew.roles";
 
 // Cross-producer vocabulary (proposed for the Leg-1 freeze, design §6/§9).
 
-/// Canonical presentation entity kind. Its value is one of the
-/// `EntityKind` wire spellings.
+/// Canonical presentation entity kind. Its value belongs to the
+/// publisher-owned open entity-kind vocabulary.
 pub const KEY_ENTITY_KIND: &str = "entity.kind";
 /// Canonical id within `entity.kind`'s one permitted id dialect.
 pub const KEY_ENTITY_ID: &str = "entity.id";

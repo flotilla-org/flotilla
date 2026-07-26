@@ -27,7 +27,7 @@ fn entity_catalog_patch_round_trips() {
     let MetadataTarget::Entity(entity) = &patch.target else {
         panic!("expected entity target");
     };
-    assert_eq!(entity.kind, EntityKind::Vessel);
+    assert_eq!(entity.kind, "vessel");
     assert_eq!(entity.id, "dev/manifest-extraction/implement@feta");
     assert_eq!(patch.unset, vec!["status.attention"]);
     assert_eq!(patch.set["status.state"].ttl_ms, Some(30_000));
@@ -40,7 +40,7 @@ fn session_entity_patch_round_trips() {
     let MetadataTarget::Entity(entity) = &patch.target else {
         panic!("expected entity target");
     };
-    assert_eq!(entity.kind, EntityKind::Session);
+    assert_eq!(entity.kind, "session");
     assert_eq!(entity.id, "feta/dev/terminal-impl-coder");
     assert!(!patch.set.contains_key("tab.scope"));
 }

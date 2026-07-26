@@ -73,7 +73,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::entity::{EntityKind, EntityRef};
+pub use crate::entity::EntityRef;
 
 /// A metadata fact value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
