@@ -1214,6 +1214,7 @@ fn confirm_command(
         *confirmed = true;
         Ok(true)
     } else {
+        writeln!(output, "Merge cancelled.").map_err(|error| error.to_string())?;
         Ok(false)
     }
 }
@@ -1998,6 +1999,7 @@ mod tests {
 
         assert!(!confirm_command(&mut command, true, &mut input, &mut output).expect("confirmation prompt"));
         assert!(matches!(command.action, flotilla_protocol::CommandAction::MergeChangeRequest { confirmed: false, .. }));
+        assert_eq!(String::from_utf8(output).expect("utf8 prompt"), "Merge change request 42 using squash? [y/N] Merge cancelled.\n");
     }
 
     #[test]
