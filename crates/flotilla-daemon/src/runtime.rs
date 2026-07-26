@@ -575,7 +575,8 @@ async fn apply_host_heartbeat(daemon: &Arc<InProcessDaemon>, namespace: &str, pr
     let status =
         HostStatus { capabilities: host_capabilities(&summary, profile), heartbeat_at: Some(Utc::now()), ready: true, resource_store };
     hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|err| err.to_string())?;
-    daemon.refresh_connected_peer_host_heartbeats().await
+    daemon.refresh_connected_peer_host_heartbeats().await;
+    Ok(())
 }
 
 fn host_capabilities(_summary: &HostSummary, profile: &LocalProvisioningProfile) -> BTreeMap<String, serde_json::Value> {

@@ -854,6 +854,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connected_peer_summaries_only_returns_live_routes() {
+        let registry = HostRegistry::new(local_node(), minimal_summary(&local_node()));
+        let peer = peer_node();
+        let summary = minimal_summary(&peer);
+        registry.publish_peer_summary(summary.clone(), &|_| {}).await;
+
+        assert!(registry.connected_peer_summaries().await.is_empty(), "a disconnected peer must not receive heartbeat refreshes");
+
+        registry.publish_peer_connection_status(&peer, PeerConnectionState::Connected, &HashMap::new(), &|_| {}).await;
+        assert_eq!(registry.connected_peer_summaries().await, vec![summary]);
+
+        registry.publish_peer_connection_status(&peer, PeerConnectionState::Disconnected, &HashMap::new(), &|_| {}).await;
+        assert!(registry.connected_peer_summaries().await.is_empty(), "a disconnected peer must stop receiving heartbeat refreshes");
+    }
+
+    #[tokio::test]
     async fn replay_uses_environment_id_stream_keys() {
         let registry = HostRegistry::new(local_node(), minimal_summary(&local_node()));
         registry.publish_peer_summary(minimal_summary(&peer_node()), &|_| {}).await;
