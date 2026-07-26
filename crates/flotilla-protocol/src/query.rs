@@ -243,8 +243,16 @@ pub struct FleetReplicaStatus {
     pub last_sync: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped_records: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_parse_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

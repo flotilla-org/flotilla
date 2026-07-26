@@ -613,13 +613,26 @@ mod command_result_human {
                 .namespace("dev")
                 .staleness(FleetStaleness::Unreachable { last_sync: None, message: "connection refused".to_string() })
                 .build()],
-            replicas: vec![FleetReplicaStatus {
-                host: HostName::new("feta"),
-                reachable: false,
-                last_sync: None,
-                generation: Some("gen-1".into()),
-                message: Some("connection refused".into()),
-            }],
+            replicas: vec![
+                FleetReplicaStatus {
+                    host: HostName::new("feta"),
+                    reachable: false,
+                    last_sync: None,
+                    generation: Some("gen-1".into()),
+                    skipped_records: 0,
+                    first_parse_error: None,
+                    message: Some("connection refused".into()),
+                },
+                FleetReplicaStatus {
+                    host: HostName::new("udder"),
+                    reachable: true,
+                    last_sync: None,
+                    generation: Some("gen-drifted".into()),
+                    skipped_records: 2,
+                    first_parse_error: Some("result_sets[0].rows[0]: missing field `repo_label`".into()),
+                    message: None,
+                },
+            ],
         }));
 
         let output = format_command_result(&result);
@@ -631,6 +644,10 @@ mod command_result_human {
         assert!(output.contains("unreachable"));
         assert!(output.contains("Replica status"));
         assert!(output.contains("connection refused"));
+        assert!(output.contains("udder"));
+        assert!(output.contains("skipped 2 records"));
+        assert!(output.contains("missing field `repo_label`"));
+        assert!(output.contains("gen-drifted"));
     }
 
     #[test]

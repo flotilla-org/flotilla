@@ -336,17 +336,35 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
         out.push('\n');
     }
 
-    if response.replicas.iter().any(|replica| !replica.reachable) {
+    if response.replicas.iter().any(|replica| !replica.reachable || replica.skipped_records > 0) {
         let mut table = Table::new();
         table.load_preset(UTF8_FULL_CONDENSED);
         table.set_header(vec!["Replica", "Status", "Last Sync", "Generation"]);
         for replica in &response.replicas {
-            if replica.reachable {
+            if replica.reachable && replica.skipped_records == 0 {
                 continue;
             }
+            let parse_skew = || {
+                let noun = if replica.skipped_records == 1 { "record" } else { "records" };
+                format!(
+                    "skipped {} {noun}: {}",
+                    replica.skipped_records,
+                    replica.first_parse_error.as_deref().unwrap_or("unknown parse error")
+                )
+            };
+            let status = if !replica.reachable {
+                let unreachable = replica.message.as_deref().unwrap_or("unreachable");
+                if replica.skipped_records > 0 {
+                    format!("{unreachable}; last sync {}", parse_skew())
+                } else {
+                    unreachable.to_string()
+                }
+            } else {
+                parse_skew()
+            };
             table.add_row(vec![
                 Cell::new(replica.host.as_str()),
-                Cell::new(replica.message.as_deref().unwrap_or("unreachable")),
+                Cell::new(status),
                 Cell::new(replica.last_sync.map(|ts| ts.to_rfc3339()).unwrap_or_else(|| "-".to_string())),
                 Cell::new(replica.generation.as_deref().unwrap_or("-")),
             ]);

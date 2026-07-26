@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     result_set::{
-        AwarenessGrouping, AwarenessKind, AwarenessLimit, ConvoyPhase as WireConvoyPhase, ConvoyRow, DemandBackedMetadata, IndependentRow,
-        IssueRow, QueryId, ResultSet, ResultSetState, Rows, SessionPhase,
+        AwarenessGrouping, AwarenessKind, AwarenessLimit, CheckoutRow, ConvoyPhase as WireConvoyPhase, ConvoyRow, DemandBackedMetadata,
+        IndependentRow, IssueRow, QueryId, ResultSet, ResultSetState, Rows, SessionPhase,
     },
     test_support::TestIssue,
     AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, ConvoyStartIntent,
@@ -1748,6 +1748,8 @@ async fn fleet_list_shows_simultaneous_convoys_on_kiwi_feta_and_udder() {
             result_sets: vec![],
             last_sync: Some(Utc::now()),
             generation: Some(format!("{host}-generation")),
+            skipped_records: 0,
+            first_parse_error: None,
             last_error: None,
         });
     }
@@ -1830,6 +1832,8 @@ async fn fleet_list_preserves_stale_rows_when_replica_is_unreachable() {
         result_sets: vec![],
         last_sync: Some(last_sync),
         generation: Some("gen-1".to_string()),
+        skipped_records: 0,
+        first_parse_error: None,
         last_error: Some("connection refused".to_string()),
     });
 
@@ -1905,6 +1909,128 @@ async fn replica_refresh_replaces_rows_when_generation_changes() {
     assert_eq!(response.replicas.len(), 1);
     assert!(response.replicas[0].reachable);
     assert_eq!(response.replicas[0].generation.as_deref(), Some("gen-2"));
+}
+
+#[tokio::test]
+async fn replica_refresh_skips_drifted_records_and_reports_the_parse_skew() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+
+    let checkout = |name: &str| {
+        CheckoutRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", name))
+            .repo(RepositoryKey("repo-key".to_string()))
+            .repo_label("flotilla-org/flotilla")
+            .path(format!("/work/{name}"))
+            .branch("main")
+            .host(HostName::new("feta"))
+            .authority(LifecycleAuthority::Observed)
+            .build()
+    };
+    let fleet_row = |convoy: &str| {
+        FleetListRow::builder()
+            .convoy(convoy)
+            .vessel("implement")
+            .crew("implement/coder")
+            .crew_state("running")
+            .host(HostName::new("feta"))
+            .namespace("flotilla")
+            .staleness(FleetStaleness::Local)
+            .build()
+    };
+    let snapshot = FleetReplicaSnapshot {
+        host: HostName::new("feta"),
+        generation: Some("gen-drifted".to_string()),
+        rows: vec![fleet_row("drifted-flat"), fleet_row("valid-flat")],
+        result_sets: vec![ResultSet {
+            seq: 4,
+            rows: Rows::Checkouts { scope: None, rows: vec![checkout("drifted"), checkout("valid")] },
+            state: Default::default(),
+        }],
+    };
+    let snapshot = serde_json::to_value(snapshot).expect("serialize replica snapshot");
+    let mut drifted_record_snapshot = snapshot.clone();
+    drifted_record_snapshot["result_sets"][0]["rows"]["rows"]["rows"][0].as_object_mut().expect("checkout row object").remove("repo_label");
+    let mut drifted_envelope_snapshot = snapshot.clone();
+    drifted_envelope_snapshot["result_sets"][0]["rows"]["rows"]["scope"] = serde_json::json!(42);
+    let mut drifted_flat_snapshot = snapshot;
+    drifted_flat_snapshot["rows"][0].as_object_mut().expect("fleet row object").remove("namespace");
+    let runner = Arc::new(QueuedOutputRunner::new(vec![
+        CommandOutput {
+            stdout: serde_json::to_string(&drifted_record_snapshot).expect("serialize record-drifted snapshot"),
+            stderr: String::new(),
+            success: true,
+        },
+        CommandOutput {
+            stdout: serde_json::to_string(&drifted_envelope_snapshot).expect("serialize envelope-drifted snapshot"),
+            stderr: String::new(),
+            success: true,
+        },
+        CommandOutput {
+            stdout: serde_json::to_string(&drifted_flat_snapshot).expect("serialize flat-record-drifted snapshot"),
+            stderr: String::new(),
+            success: true,
+        },
+    ]));
+    let mut discovery =
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(Arc::new(FakeTerminalPool::new())));
+    discovery.runner = runner;
+    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), discovery, HostName::local()).await;
+
+    daemon.refresh_fleet_replicas_once().await.expect("refresh should succeed");
+
+    let cached = daemon.cached_fleet_replica_snapshots().await;
+    let checkouts = cached[0].result_sets[0].rows.as_checkouts().expect("checkout result set");
+    assert!(matches!(checkouts, [row] if row.resource.name == "valid"));
+
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+    assert!(response.replicas[0].reachable);
+    assert_eq!(response.replicas[0].generation.as_deref(), Some("gen-drifted"));
+    let status = serde_json::to_value(&response.replicas[0]).expect("serialize replica status");
+    assert_eq!(status["skipped_records"], 1);
+    assert!(
+        status["first_parse_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("result_sets[0].rows[0]") && error.contains("missing field `repo_label`")),
+        "status should report the first parse error: {status}"
+    );
+
+    daemon.refresh_fleet_replicas_once().await.expect("envelope-drifted refresh should succeed");
+
+    let cached = daemon.cached_fleet_replica_snapshots().await;
+    assert!(cached[0].result_sets.is_empty(), "an unparseable result-set envelope cannot retain its rows");
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+    assert!(response.replicas[0].reachable);
+    assert_eq!(response.replicas[0].generation.as_deref(), Some("gen-drifted"));
+    assert_eq!(response.replicas[0].skipped_records, 2);
+    assert!(
+        response.replicas[0]
+            .first_parse_error
+            .as_deref()
+            .is_some_and(|error| error.contains("result_sets[0]") && error.contains("invalid type: integer `42`")),
+        "status should count every row dropped with an unparseable envelope: {:?}",
+        response.replicas[0]
+    );
+
+    daemon.refresh_fleet_replicas_once().await.expect("flat-record-drifted refresh should succeed");
+
+    let cached = daemon.cached_fleet_replica_snapshots().await;
+    assert!(matches!(cached[0].rows.as_slice(), [row] if row.convoy == "valid-flat"));
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+    assert!(response.replicas[0].reachable);
+    assert_eq!(response.replicas[0].generation.as_deref(), Some("gen-drifted"));
+    assert_eq!(response.replicas[0].skipped_records, 1);
+    assert!(
+        response.replicas[0]
+            .first_parse_error
+            .as_deref()
+            .is_some_and(|error| error.contains("rows[0]") && error.contains("missing field `namespace`")),
+        "status should report the drifted flat row: {:?}",
+        response.replicas[0]
+    );
 }
 
 #[tokio::test]
@@ -2392,6 +2518,8 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
         result_sets: vec![],
         last_sync: Some(Utc::now() - chrono::Duration::seconds(FLEET_REPLICA_FRESH_SECS + 1)),
         generation: Some("gen-1".to_string()),
+        skipped_records: 0,
+        first_parse_error: None,
         last_error: Some("connection refused".to_string()),
     });
 
@@ -2513,6 +2641,8 @@ async fn transient_attach_selects_the_displayed_host_for_result_set_only_indepen
             result_sets: vec![ResultSet { seq: 1, rows: Rows::Independents { scope: None, rows: vec![row] }, state: Default::default() }],
             last_sync: Some(Utc::now()),
             generation: Some(format!("gen-{host}")),
+            skipped_records: 0,
+            first_parse_error: None,
             last_error: None,
         });
     }
@@ -2572,6 +2702,8 @@ async fn attach_query_ignores_fleet_replica_hosts_that_are_not_configured() {
         result_sets: vec![],
         last_sync: Some(Utc::now()),
         generation: Some("gen-1".to_string()),
+        skipped_records: 0,
+        first_parse_error: None,
         last_error: None,
     });
 
