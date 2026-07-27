@@ -376,7 +376,6 @@ fn format_host_provider_status(provider: &flotilla_protocol::HostProviderStatus)
     }
 }
 
-
 fn fleet_age(at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     at.map_or_else(|| "-".to_string(), |at| format!("{}s", now.signed_duration_since(at).num_seconds().max(0)))
 }

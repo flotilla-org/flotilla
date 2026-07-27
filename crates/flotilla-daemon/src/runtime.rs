@@ -633,7 +633,8 @@ fn spawn_heartbeat_task_with_credentials(
         let credential_store = Arc::clone(&credential_store);
         let health = health.clone();
         async move {
-            if let Err(err) = apply_host_heartbeat_with_credentials(&daemon, &namespace, &profile, credential_store.as_deref(), &health).await
+            if let Err(err) =
+                apply_host_heartbeat_with_credentials(&daemon, &namespace, &profile, credential_store.as_deref(), &health).await
             {
                 warn!(%err, "failed to publish host heartbeat");
             }
@@ -737,6 +738,10 @@ async fn apply_host_heartbeat_with_credentials(
         Some(store) => store.held_credentials().await?,
         None => BTreeSet::new(),
     };
+    let repo_default_dir = PathBuf::from(&profile.repo_default_dir);
+    let disk_free_bytes = tokio::task::spawn_blocking(move || measure_available_space(&repo_default_dir))
+        .await
+        .map_err(|error| format!("measure available disk space: {error}"))?;
     let status = HostStatus {
         capabilities: host_capabilities(&summary, profile, &held_credentials),
         heartbeat_at: Some(Utc::now()),
@@ -745,7 +750,7 @@ async fn apply_host_heartbeat_with_credentials(
         daemon_generation: health.generation.clone(),
         daemon_version: Some(health.version.clone()),
         daemon_started_at: Some(health.started_at),
-        disk_free_bytes: measure_available_space(Path::new(&profile.repo_default_dir)),
+        disk_free_bytes,
     };
     hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|err| err.to_string())?;
     daemon.refresh_connected_peer_host_heartbeats().await;

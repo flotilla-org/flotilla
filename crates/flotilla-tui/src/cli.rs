@@ -530,6 +530,9 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::RepoDetail(detail) => format_repo_detail_human(detail),
         CommandValue::RepoProviders(providers) => format_repo_providers_human(providers),
         CommandValue::RepoWork(work) => format_repo_work_human(work),
+        // HostList remains a protocol-level query used by host/environment
+        // target resolution; keep its formatter for direct query diagnostics
+        // even though `host list` now presents the richer fleet-health view.
         CommandValue::HostList(hosts) => format_host_list_human(hosts),
         CommandValue::ProjectList(projects) => format_project_list_human(projects),
         CommandValue::HostStatus(status) => format_host_status_human(status),

@@ -299,9 +299,6 @@ impl RemoteCommandRouter {
         if let CommandValue::HostList(response) = &mut value {
             self.peer_manager.lock().await.project_host_list(response);
         }
-        if let CommandValue::FleetHealth(response) = &mut value {
-            self.peer_manager.lock().await.project_fleet_health(response);
-        }
         Ok(value)
     }
 

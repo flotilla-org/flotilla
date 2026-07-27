@@ -8,10 +8,9 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
-    Command, CommandPeerEvent, CommandValue, ConfigLabel, EnvironmentId, FleetHealthResponse, FleetHostRow, FleetHostStaleness,
-    FleetObservationAgreement, GoodbyeReason, HostListEntry, HostListResponse, HostName, HostSummary, NodeId, NodeInfo,
-    PeerConnectionState, PeerDataKind, PeerDataMessage, PeerReconnectStatus, PeerWireMessage, ProviderData, RepoIdentity, RepositoryKey,
-    RoutedPeerMessage, Step, StepOutcome, StepStatus, TopologyRoute, VectorClock,
+    Command, CommandPeerEvent, CommandValue, ConfigLabel, EnvironmentId, GoodbyeReason, HostListEntry, HostListResponse, HostName,
+    HostSummary, NodeId, NodeInfo, PeerConnectionState, PeerDataKind, PeerDataMessage, PeerReconnectStatus, PeerWireMessage, ProviderData,
+    RepoIdentity, RepositoryKey, RoutedPeerMessage, Step, StepOutcome, StepStatus, TopologyRoute, VectorClock,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -457,37 +456,6 @@ impl PeerManager {
                 .then_with(|| left.host_name.cmp(&right.host_name))
                 .then_with(|| left.node.as_ref().map(|node| &node.node_id).cmp(&right.node.as_ref().map(|node| &node.node_id)))
         });
-    }
-
-    pub fn project_fleet_health(&self, response: &mut FleetHealthResponse) {
-        for (label, target) in &self.configured_targets {
-            let reconnecting = self.peer_dial_status.get(label).and_then(|status| status.reconnect_backoff.as_ref()).is_some();
-            let link = if self.transport_peers.contains_key(label) {
-                PeerConnectionState::Connected
-            } else if reconnecting {
-                PeerConnectionState::Reconnecting
-            } else {
-                PeerConnectionState::Disconnected
-            };
-            if let Some(row) = response.hosts.iter_mut().find(|row| row.host == target.expected_host_name) {
-                row.configured = true;
-                row.link = link;
-                continue;
-            }
-            response.hosts.push(
-                FleetHostRow::builder()
-                    .host(target.expected_host_name.clone())
-                    .is_local(false)
-                    .configured(true)
-                    .link(link)
-                    .crew_count(0)
-                    .convoy_count(0)
-                    .staleness(FleetHostStaleness::Unknown)
-                    .observation_agreement(FleetObservationAgreement::Unknown)
-                    .build(),
-            );
-        }
-        response.hosts.sort_by(|left, right| right.is_local.cmp(&left.is_local).then_with(|| left.host.cmp(&right.host)));
     }
 
     /// Register or replace a sender for a connected peer.

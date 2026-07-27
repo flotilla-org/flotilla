@@ -5500,6 +5500,7 @@ async fn contained_workflow_grants_default_deny_and_admission_names_an_unheld_cr
             heartbeat_at: Some(Utc::now()),
             capabilities: BTreeMap::new(),
             resource_store: None,
+            ..HostStatus::default()
         })
         .await
         .expect("mark host ready");
@@ -5589,6 +5590,7 @@ async fn local_convoy_admission_pins_the_grant_resolved_workflow() {
             heartbeat_at: Some(Utc::now()),
             capabilities: BTreeMap::from([(flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["model-api"]))]),
             resource_store: None,
+            ..HostStatus::default()
         })
         .await
         .expect("mark host ready");
