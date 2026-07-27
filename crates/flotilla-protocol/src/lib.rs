@@ -1,4 +1,5 @@
 pub mod arg;
+pub mod attach_plan;
 pub mod commands;
 pub mod delta;
 pub mod environment;
@@ -26,6 +27,7 @@ pub mod test_support;
 
 use std::fmt;
 
+pub use attach_plan::{ResolvedAttachAction, ResolvedAttachPlan, SendKeyStep};
 pub use environment::{EnvironmentId, EnvironmentInfo, EnvironmentKind, EnvironmentSpec, EnvironmentStatus, ImageId, ImageSource};
 pub use host::{HostName, HostPath, RepoIdentity};
 pub use host_summary::{

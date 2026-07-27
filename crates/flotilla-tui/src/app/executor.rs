@@ -155,8 +155,8 @@ pub fn handle_dispatch_completion(result: Result<u64, String>, pending_ctx: Opti
 
 pub fn handle_attach_dispatch_completion(result: Result<CommandValue, String>, app: &mut App) {
     match result {
-        Ok(CommandValue::AttachCommandResolved { command, .. }) => {
-            app.pending_attach_command = Some(command);
+        Ok(CommandValue::AttachCommandResolved { plan, .. }) => {
+            app.pending_attach_plan = Some(plan);
         }
         Ok(CommandValue::Error { message }) | Err(message) => {
             app.set_status_message(Some(message));
@@ -280,11 +280,11 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
             info!(%name, "convoy created");
             app.set_status_message(Some(format!("Convoy created: {name}")));
         }
-        CommandValue::ConvoyStarted { name, attach_command, .. } => {
+        CommandValue::ConvoyStarted { name, attach_plan, .. } => {
             info!(%name, "convoy started");
             app.set_status_message(Some(format!("Convoy started: {name}")));
-            if let Some(command) = attach_command {
-                app.pending_attach_command = Some(command);
+            if let Some(plan) = attach_plan {
+                app.pending_attach_plan = Some(plan);
             }
         }
         CommandValue::WorkflowTemplateApplied { name } => {
@@ -599,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn pane_attach_query_hands_the_resolved_command_to_the_event_loop() {
         let mut app = stub_app_with_query_result(Ok(CommandValue::AttachCommandResolved {
-            command: "cleat attach terminal-scratch".to_string(),
+            plan: flotilla_protocol::ResolvedAttachPlan::shell_command("cleat attach terminal-scratch"),
             binding: None,
         }));
         let command = app.command(CommandAction::AttachTransient {
@@ -615,7 +615,7 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
 
-        assert_eq!(app.pending_attach_command.as_deref(), Some("cleat attach terminal-scratch"));
+        assert_eq!(app.pending_attach_plan, Some(flotilla_protocol::ResolvedAttachPlan::shell_command("cleat attach terminal-scratch")));
         assert!(app.model.status_message.is_none());
     }
 
@@ -1094,7 +1094,13 @@ mod tests {
     #[test]
     fn attach_command_resolved_is_noop() {
         let mut app = stub_app();
-        handle_result(CommandValue::AttachCommandResolved { command: "bash --login".into(), binding: None }, &mut app);
+        handle_result(
+            CommandValue::AttachCommandResolved {
+                plan: flotilla_protocol::ResolvedAttachPlan::shell_command("bash --login"),
+                binding: None,
+            },
+            &mut app,
+        );
         assert!(app.model.status_message.is_none());
         assert!(app.proto_commands.take_next().is_none());
     }

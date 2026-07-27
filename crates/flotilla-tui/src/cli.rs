@@ -477,8 +477,8 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::IssuePage(page) => format!("issue page: {} items, has_more={}", page.items.len(), page.has_more),
         CommandValue::IssuesByIds { items } => format!("issues by ids: {} items", items.len()),
         CommandValue::ConvoyCreated { name } => format!("convoy created: {name}"),
-        CommandValue::ConvoyStarted { name, attach_command, .. } => {
-            format!("convoy started: {name}{}", if attach_command.is_some() { " (crew ready)" } else { "" })
+        CommandValue::ConvoyStarted { name, attach_plan, .. } => {
+            format!("convoy started: {name}{}", if attach_plan.is_some() { " (crew ready)" } else { "" })
         }
         CommandValue::WorkflowTemplateApplied { name } => format!("workflow template applied: {name}"),
         CommandValue::ProjectAdded { name } => format!("project added: {name}"),

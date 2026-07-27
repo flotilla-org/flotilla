@@ -163,7 +163,7 @@ impl RemoteHopResolver for SshRemoteHopResolver {
     ///
     /// Produces two actions on the stack:
     ///   1. Command: `ssh -t [multiplex] user@host` (bottom — runs first)
-    ///   2. SendKeys: Type(flattened inner command) + WaitForPrompt (top)
+    ///   2. SendKeys: Type(flattened inner command) + WaitForReady (top)
     fn resolve_enter(&self, host: &HostName, context: &mut ResolutionContext) -> Result<(), String> {
         let info = self.ssh_info(host)?;
 
@@ -180,17 +180,20 @@ impl RemoteHopResolver for SshRemoteHopResolver {
             type_parts.push(format!("cd {}", flotilla_protocol::arg::shell_quote(&dir.to_string())));
             if !inner_args.is_empty() {
                 type_parts.push("&&".into());
-                type_parts.push(flotilla_protocol::arg::flatten(&inner_args, 0));
+                type_parts.push(format!("exec {}", flotilla_protocol::arg::flatten(&inner_args, 0)));
             }
         } else if !inner_args.is_empty() {
-            type_parts.push(flotilla_protocol::arg::flatten(&inner_args, 0));
+            type_parts.push(format!("exec {}", flotilla_protocol::arg::flatten(&inner_args, 0)));
         }
 
         let type_text = type_parts.join(" ");
 
         // Push SendKeys for the inner command (if non-empty)
         if !type_text.is_empty() {
-            context.actions.push(ResolvedAction::SendKeys { steps: vec![SendKeyStep::Type(type_text), SendKeyStep::WaitForPrompt] });
+            context.actions.push(ResolvedAction::SendKeys {
+                hop: format!("remote host '{host}'"),
+                steps: vec![SendKeyStep::Type { text: type_text }, SendKeyStep::WaitForReady],
+            });
         }
 
         // Push SSH enter command (no remote command — just open the session)

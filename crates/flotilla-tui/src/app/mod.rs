@@ -530,7 +530,7 @@ pub struct App {
     pub subscriptions_dirty: bool,
     /// A resolved pane attach waiting for the event loop to leave raw mode,
     /// run it as a child process, and then restore the TUI.
-    pub pending_attach_command: Option<String>,
+    pub pending_attach_plan: Option<flotilla_protocol::ResolvedAttachPlan>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -710,7 +710,7 @@ impl App {
             pending_repo_opens: Vec::new(),
             query_seqs: HashMap::new(),
             subscriptions_dirty: true,
-            pending_attach_command: None,
+            pending_attach_plan: None,
         }
     }
 

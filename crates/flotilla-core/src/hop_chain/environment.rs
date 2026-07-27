@@ -48,7 +48,7 @@ impl EnvironmentHopResolver for DockerEnvironmentHopResolver {
             docker_args.push(Arg::Literal("-w".into()));
             docker_args.push(Arg::Quoted(dir.to_string()));
         }
-        docker_args.push(Arg::Literal(container.to_string()));
+        docker_args.push(Arg::Quoted(container.to_string()));
         docker_args.extend(inner_args);
 
         context.actions.push(ResolvedAction::Command(docker_args));
@@ -68,8 +68,11 @@ impl EnvironmentHopResolver for DockerEnvironmentHopResolver {
 
         // Convert inner command to SendKeys (if non-empty)
         if !inner_args.is_empty() {
-            let text = flotilla_protocol::arg::flatten(&inner_args, 0);
-            context.actions.push(ResolvedAction::SendKeys { steps: vec![SendKeyStep::Type(text), SendKeyStep::WaitForPrompt] });
+            let text = format!("exec {}", flotilla_protocol::arg::flatten(&inner_args, 0));
+            context.actions.push(ResolvedAction::SendKeys {
+                hop: format!("docker environment '{env_id}'"),
+                steps: vec![SendKeyStep::Type { text }, SendKeyStep::WaitForReady],
+            });
         }
 
         // Push docker exec enter command
@@ -78,7 +81,7 @@ impl EnvironmentHopResolver for DockerEnvironmentHopResolver {
             docker_args.push(Arg::Literal("-w".into()));
             docker_args.push(Arg::Quoted(dir.to_string()));
         }
-        docker_args.push(Arg::Literal(container.to_string()));
+        docker_args.push(Arg::Quoted(container.to_string()));
         docker_args.push(Arg::Literal("/bin/sh".into()));
         context.actions.push(ResolvedAction::Command(docker_args));
         Ok(())

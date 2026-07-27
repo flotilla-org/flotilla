@@ -490,17 +490,17 @@ impl RemoteCommandRouter {
     }
 
     async fn route_remote_result(&self, result: CommandValue) -> CommandValue {
-        let CommandValue::ConvoyStarted { name, attach_command, binding } = result else {
+        let CommandValue::ConvoyStarted { name, attach_plan, binding } = result else {
             return result;
         };
         let Some(binding) = binding else {
-            return CommandValue::ConvoyStarted { name, attach_command, binding: None };
+            return CommandValue::ConvoyStarted { name, attach_plan, binding: None };
         };
-        if attach_command.is_none() || binding.host == *self.daemon.host_name() {
-            return CommandValue::ConvoyStarted { name, attach_command, binding: Some(binding) };
+        if attach_plan.is_none() || binding.host == *self.daemon.host_name() {
+            return CommandValue::ConvoyStarted { name, attach_plan, binding: Some(binding) };
         }
         match self.daemon.route_remote_attach_binding(&binding).await {
-            Ok(command) => CommandValue::ConvoyStarted { name, attach_command: Some(command), binding: Some(binding) },
+            Ok(plan) => CommandValue::ConvoyStarted { name, attach_plan: Some(plan), binding: Some(binding) },
             Err(message) => CommandValue::Error { message: format!("convoy {name} started, but remote attach routing failed: {message}") },
         }
     }

@@ -1309,7 +1309,7 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
     let mut remote_events = remote_daemon.subscribe();
     let remote_command_id = remote_daemon.execute(routed.clone()).await.expect("prepared command should be accepted by remote daemon");
     let remote_result = wait_for_command_result(&mut remote_events, remote_command_id, StdDuration::from_secs(5)).await;
-    assert_eq!(remote_result, CommandValue::ConvoyStarted { name: "remote-work".to_string(), attach_command: None, binding: None });
+    assert_eq!(remote_result, CommandValue::ConvoyStarted { name: "remote-work".to_string(), attach_plan: None, binding: None });
     let remote_backend = remote_daemon.resource_backend();
     let convoy = remote_backend.clone().using::<Convoy>("flotilla").get("remote-work").await.expect("remote daemon should persist convoy");
     assert_eq!(convoy.spec.workflow_ref, "remote-workflow");
@@ -1344,7 +1344,7 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
         .expect("repeated prepared command should be accepted");
     assert_eq!(wait_for_command_result(&mut repeated_events, repeated_id, StdDuration::from_secs(5)).await, CommandValue::ConvoyStarted {
         name: "remote-work-again".to_string(),
-        attach_command: None,
+        attach_plan: None,
         binding: None
     });
     let prepared_workflows = remote_backend
@@ -1403,7 +1403,7 @@ daemon_socket = "/run/user/1000/flotilla.sock"
             repo: None,
             result: CommandValue::ConvoyStarted {
                 name: "remote-work".to_string(),
-                attach_command: Some("cleat attach remote-session".to_string()),
+                attach_plan: Some(flotilla_protocol::ResolvedAttachPlan::shell_command("cleat attach remote-session")),
                 binding: Some(
                     AttachBinding::builder()
                         .host(HostName::new("feta"))
@@ -1419,12 +1419,13 @@ daemon_socket = "/run/user/1000/flotilla.sock"
         DaemonEvent::CommandFinished { command_id: 42, result, .. } => result,
         event => panic!("expected command finished, got {event:?}"),
     };
-    let CommandValue::ConvoyStarted { attach_command: Some(command), .. } = result else {
+    let CommandValue::ConvoyStarted { attach_plan: Some(plan), .. } = result else {
         panic!("expected routed convoy attach result, got {result:?}");
     };
-    assert!(command.contains("feta.example"), "attach should route through configured peer: {command}");
-    assert!(command.contains("remote-session"), "attach should preserve the remote session reference: {command}");
-    assert!(!command.starts_with("cleat attach"), "origin must not execute the remote host's local attach command");
+    let rendered = format!("{plan:?}");
+    assert!(rendered.contains("feta.example"), "attach should route through configured peer: {rendered}");
+    assert!(rendered.contains("remote-session"), "attach should preserve the remote session reference: {rendered}");
+    assert!(!rendered.starts_with("cleat attach"), "origin must not execute the remote host's local attach command");
 }
 
 #[tokio::test]

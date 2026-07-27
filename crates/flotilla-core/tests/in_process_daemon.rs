@@ -1005,14 +1005,14 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
     let overridden_id = daemon.execute(start("overridden", "single-agent-contained")).await.expect("override dispatch command");
     assert_eq!(recv_command_finished(&mut events, overridden_id).await, CommandValue::ConvoyStarted {
         name: "overridden".into(),
-        attach_command: None,
+        attach_plan: None,
         binding: None
     });
 
     let admitted_id = daemon.execute(start("reviewed", "implement-review")).await.expect("dispatch command");
     assert_eq!(recv_command_finished(&mut events, admitted_id).await, CommandValue::ConvoyStarted {
         name: "reviewed".into(),
-        attach_command: None,
+        attach_plan: None,
         binding: None
     });
     let convoy = backend.using::<ResourceConvoy>("flotilla").get("reviewed").await.expect("reviewed convoy");
@@ -1183,7 +1183,7 @@ async fn bare_convoy_start_uses_the_viable_local_host_direct_policy() {
     })
     .await
     .expect("start command should finish");
-    assert_eq!(result, CommandValue::ConvoyStarted { name: "local-default".into(), attach_command: None, binding: None });
+    assert_eq!(result, CommandValue::ConvoyStarted { name: "local-default".into(), attach_plan: None, binding: None });
     let convoy = backend.using::<ResourceConvoy>("flotilla").get("local-default").await.expect("persisted convoy");
     assert_eq!(convoy.spec.placement_policy.as_deref(), Some("host-direct-z-local"));
 }
@@ -1377,7 +1377,7 @@ async fn convoy_start_accepts_project_list_identifier() {
 
         assert_eq!(recv_command_finished(&mut events, start_id).await, CommandValue::ConvoyStarted {
             name: name.clone(),
-            attach_command: None,
+            attach_plan: None,
             binding: None
         });
         let convoy = backend.using::<ResourceConvoy>("flotilla").get(&name).await.expect("persisted convoy");
@@ -1503,7 +1503,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     .await
     .expect("start command should finish");
 
-    assert_eq!(result, CommandValue::ConvoyStarted { name: "issue-732".into(), attach_command: None, binding: None });
+    assert_eq!(result, CommandValue::ConvoyStarted { name: "issue-732".into(), attach_plan: None, binding: None });
     let persisted = backend.using::<ResourceConvoy>("flotilla").get("issue-732").await.expect("persisted convoy");
     assert_eq!(persisted.spec.project_ref.as_deref(), Some("flotilla"));
     assert_eq!(persisted.spec.workflow_ref, "single-agent-contained");
@@ -1548,7 +1548,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .expect("default start command accepted");
     assert_eq!(recv_command_finished(&mut events, default_id).await, CommandValue::ConvoyStarted {
         name: "default-regard".into(),
-        attach_command: None,
+        attach_plan: None,
         binding: None
     });
     let default_convoy = backend.using::<ResourceConvoy>("flotilla").get("default-regard").await.expect("default convoy");
@@ -1596,7 +1596,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     })
     .await
     .expect("batch start should finish");
-    assert_eq!(batch_result, CommandValue::ConvoyStarted { name: "batch-732-733".into(), attach_command: None, binding: None });
+    assert_eq!(batch_result, CommandValue::ConvoyStarted { name: "batch-732-733".into(), attach_plan: None, binding: None });
     let batch = backend.using::<ResourceConvoy>("flotilla").get("batch-732-733").await.expect("batch convoy");
     assert_eq!(batch.spec.issues.iter().map(|issue| &issue.reference).collect::<Vec<_>>(), vec![&reference, &reference_two]);
     assert_eq!(batch.spec.instruction.as_deref(), Some("Fix both issues in one convoy."));
@@ -1642,7 +1642,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     .expect("offline fallback should finish");
     assert_eq!(fallback_result, CommandValue::ConvoyStarted {
         name: "start-convoy-from-an-issue-732".into(),
-        attach_command: None,
+        attach_plan: None,
         binding: None,
     });
     let fallback = backend.using::<ResourceConvoy>("flotilla").get("start-convoy-from-an-issue-732").await.expect("fallback convoy");
@@ -1693,7 +1693,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     })
     .await
     .expect("explicit workflow should not consult the missing default");
-    assert_eq!(explicit_result, CommandValue::ConvoyStarted { name: "explicit-workflow".into(), attach_command: None, binding: None });
+    assert_eq!(explicit_result, CommandValue::ConvoyStarted { name: "explicit-workflow".into(), attach_plan: None, binding: None });
 
     let wrong_namespace_id = daemon
         .execute(Command {
@@ -1844,7 +1844,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
     .await
     .expect("start command should finish");
 
-    assert_eq!(result, CommandValue::ConvoyStarted { name: "generated-convoy".into(), attach_command: None, binding: None });
+    assert_eq!(result, CommandValue::ConvoyStarted { name: "generated-convoy".into(), attach_plan: None, binding: None });
     let persisted = backend.using::<ResourceConvoy>("flotilla").get("generated-convoy").await.expect("persisted convoy");
     assert_eq!(persisted.spec.r#ref.as_deref(), Some("fix/generated-convoy"));
     assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
@@ -2009,7 +2009,7 @@ async fn convoy_start_worker_panic_finishes_the_command_and_allows_retry() {
 
     let retry_id = daemon.execute(command).await.expect("matching convoy start retry should be accepted");
     let retry_result = recv_command_finished(&mut events, retry_id).await;
-    assert_eq!(retry_result, CommandValue::ConvoyStarted { name: "retried-convoy".into(), attach_command: None, binding: None });
+    assert_eq!(retry_result, CommandValue::ConvoyStarted { name: "retried-convoy".into(), attach_plan: None, binding: None });
 
     drop(temp);
 }

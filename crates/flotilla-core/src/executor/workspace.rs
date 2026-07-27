@@ -12,7 +12,7 @@ use crate::{
         builder::HopPlanBuilder,
         environment::{DockerEnvironmentHopResolver, NoopEnvironmentHopResolver},
         remote::ssh_resolver_from_config,
-        resolver::{AlwaysWrap, HopResolver},
+        resolver::{HopResolver, ResolutionPurpose},
         terminal::NoopTerminalHopResolver,
         Hop, ResolutionContext, ResolvedAction,
     },
@@ -328,7 +328,7 @@ fn workspace_attach_request_from_config(config: crate::providers::types::Workspa
 /// suitable for workspace manager consumption.
 ///
 /// For each `ResolvedPaneCommand`, builds a `HopPlan` via `HopPlanBuilder::build_for_prepared_command`,
-/// resolves it with `SshRemoteHopResolver` + `AlwaysWrap`, and flattens the resulting `Command` to a string.
+/// resolves it for non-interactive command execution and flattens the resulting wrapped `Command` to a string.
 pub(crate) fn resolve_prepared_commands_via_hop_chain(
     target_host: &HostName,
     checkout_path: &Path,
@@ -347,12 +347,8 @@ pub(crate) fn resolve_prepared_commands_via_hop_chain(
         }
         _ => Arc::new(NoopEnvironmentHopResolver),
     };
-    let hop_resolver = HopResolver {
-        remote: Arc::new(ssh_resolver),
-        environment: env_resolver,
-        terminal: Arc::new(NoopTerminalHopResolver),
-        strategy: Arc::new(AlwaysWrap),
-    };
+    let hop_resolver =
+        HopResolver::new(Arc::new(ssh_resolver), env_resolver, Arc::new(NoopTerminalHopResolver), ResolutionPurpose::CommandExecution);
     let plan_builder = HopPlanBuilder::new(local_host);
 
     let mut result = Vec::with_capacity(commands.len());
@@ -371,11 +367,11 @@ pub(crate) fn resolve_prepared_commands_via_hop_chain(
         };
         let resolved = hop_resolver.resolve(&plan, &mut context)?;
 
-        // AlwaysWrap should produce exactly one Command action. Assert this invariant
+        // CommandExecution purpose should produce exactly one wrapped Command action. Assert this invariant
         // so multi-action plans don't silently lose actions.
         if resolved.0.len() != 1 {
             return Err(format!(
-                "hop chain resolution produced {} actions for role '{}', expected exactly 1 (AlwaysWrap)",
+                "hop chain resolution produced {} actions for role '{}', expected exactly 1 (command execution)",
                 resolved.0.len(),
                 cmd.role
             ));

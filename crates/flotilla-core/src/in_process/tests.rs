@@ -53,6 +53,31 @@ use crate::{
 
 const TEST_LOCAL_ATTACH_HOST: &str = "local";
 
+fn attach_plan_text(plan: &flotilla_protocol::ResolvedAttachPlan) -> String {
+    plan.0
+        .iter()
+        .map(|action| match action {
+            flotilla_protocol::ResolvedAttachAction::Command(args) => flotilla_protocol::arg::flatten(args, 0),
+            flotilla_protocol::ResolvedAttachAction::SendKeys { steps, .. } => steps
+                .iter()
+                .filter_map(|step| match step {
+                    flotilla_protocol::SendKeyStep::Type { text } => Some(text.clone()),
+                    flotilla_protocol::SendKeyStep::WaitForReady => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn single_attach_command(plan: &flotilla_protocol::ResolvedAttachPlan) -> String {
+    let [flotilla_protocol::ResolvedAttachAction::Command(args)] = plan.0.as_slice() else {
+        panic!("expected one attach command, got {plan:?}");
+    };
+    flotilla_protocol::arg::flatten(args, 0)
+}
+
 #[test]
 fn project_reference_distinguishes_project_namespace_from_full_address() {
     assert_eq!(resolve_project_ref("flotilla", "project/widgets"), Ok(("project".into(), "widgets".into())));
@@ -2209,9 +2234,10 @@ async fn attach_query_resolves_running_terminal_session_by_convoy_task_role() {
         .await
         .expect("attach query should execute");
 
-    let CommandValue::AttachCommandResolved { command, binding } = result else {
+    let CommandValue::AttachCommandResolved { plan, binding } = result else {
         panic!("expected attach command, got {result:?}");
     };
+    let command = single_attach_command(&plan);
     assert_eq!(command, "attach cleat-session-1");
     let binding = binding.expect("local resolution carries the structured binding");
     assert_eq!(binding.session.as_deref(), Some("terminal-convoy-a-implement-coder"));
@@ -2330,12 +2356,14 @@ async fn attach_query_resolves_remote_session_as_one_recursive_hop() {
         .await
         .expect("attach query should execute");
 
-    let CommandValue::AttachCommandResolved { command, .. } = result else {
+    let CommandValue::AttachCommandResolved { plan, .. } = result else {
         panic!("expected attach command, got {result:?}");
     };
-    assert!(command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")), "command should target the next host over SSH: {command}");
-    assert!(command.contains("${SHELL:-/bin/sh} -l -c"), "command should run through a remote login shell: {command}");
+    let command = attach_plan_text(&plan);
+    assert!(command.contains(&format!("ssh -t 'alice@{remote_hostname}'")), "command should target the next host over SSH: {command}");
+    assert!(!command.contains("${SHELL:-/bin/sh} -l -c"), "interactive attach should enter SSH without wrapping: {command}");
     assert!(command.contains("flotilla attach"), "command should recursively invoke flotilla attach: {command}");
+    assert!(command.contains("--transient"), "every recursive attach hop must avoid Presentation Manager stamping: {command}");
     assert!(command.contains("convoy-a/implement/coder"), "command should preserve the original reference: {command}");
     assert!(!command.contains("remote-provider-session"), "remote hop must not include terminal-provider attach args: {command}");
     assert_eq!(command.matches("flotilla attach").count(), 1, "command should contain exactly one recursive attach invocation: {command}");
@@ -2420,8 +2448,9 @@ async fn replicated_session_recipe_tracks_live_route_and_resolves_through_the_ho
         daemon.resolvable_attach_references_internal(&references).await.expect("connected capability query").contains(session_name),
         "the recipe should appear when the origin route becomes live"
     );
-    assert!(resolved.command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")), "attach should use the live hop");
-    assert!(resolved.command.contains("flotilla attach"), "attach should re-resolve on the remote daemon");
+    let plan_text = attach_plan_text(&resolved.plan);
+    assert!(plan_text.contains(&format!("ssh -t 'alice@{remote_hostname}'")), "attach should use the live hop");
+    assert!(plan_text.contains("flotilla attach"), "attach should re-resolve on the remote daemon");
     assert_eq!(resolved.binding.expect("remote binding").host, HostName::new(remote_host));
 
     daemon.set_topology_routes(Vec::new()).await;
@@ -2516,13 +2545,14 @@ async fn host_qualified_attach_disambiguates_same_named_local_and_replica_sessio
 
     let local =
         daemon.resolve_attach_command_on_host_internal(session_name, Some(&local_host)).await.expect("resolve local same-name session");
-    assert_eq!(local.command, "attach local-provider-session");
+    assert_eq!(single_attach_command(&local.plan), "attach local-provider-session");
     assert_eq!(local.binding.expect("local binding").host, local_host);
 
     let remote =
         daemon.resolve_attach_command_on_host_internal(session_name, Some(&remote_host)).await.expect("resolve remote same-name session");
-    assert!(remote.command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")));
-    assert!(remote.command.contains("--host"));
+    let remote_plan = attach_plan_text(&remote.plan);
+    assert!(remote_plan.contains(&format!("ssh -t 'alice@{remote_hostname}'")));
+    assert!(remote_plan.contains("--host"));
     assert_eq!(remote.binding.expect("remote binding").host, remote_host);
 }
 
@@ -2569,9 +2599,10 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
         .await
         .expect("attach query should execute");
 
-    let CommandValue::AttachCommandResolved { command, binding } = result else {
+    let CommandValue::AttachCommandResolved { plan, binding } = result else {
         panic!("expected attach command, got {result:?}");
     };
+    let command = attach_plan_text(&plan);
     let binding = binding.expect("replica resolution carries the structured binding");
     assert_eq!(binding.host.as_str(), remote_host);
     assert_eq!(binding.namespace, "dev");
@@ -2579,11 +2610,8 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
     assert_eq!(binding.convoy.as_deref(), Some("convoy-a"));
     assert_eq!(binding.vessel.as_deref(), Some("implement"));
     assert_eq!(binding.role.as_deref(), Some("coder"));
-    assert!(
-        command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")),
-        "command should target the replica host over SSH: {command}"
-    );
-    assert!(command.contains("${SHELL:-/bin/sh} -l -c"), "command should run through a remote login shell: {command}");
+    assert!(command.contains(&format!("ssh -t 'alice@{remote_hostname}'")), "command should target the replica host over SSH: {command}");
+    assert!(!command.contains("${SHELL:-/bin/sh} -l -c"), "interactive attach should enter SSH without wrapping: {command}");
     assert!(command.contains("flotilla attach"), "command should recursively invoke flotilla attach: {command}");
     assert!(command.contains("convoy-a/implement/coder"), "command should preserve the original reference: {command}");
 
@@ -2600,13 +2628,11 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
         .await
         .expect("attach query should execute");
 
-    let CommandValue::AttachCommandResolved { command, .. } = result else {
+    let CommandValue::AttachCommandResolved { plan, .. } = result else {
         panic!("expected attach command, got {result:?}");
     };
-    assert!(
-        command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")),
-        "bare role should resolve through the replica host: {command}"
-    );
+    let command = attach_plan_text(&plan);
+    assert!(command.contains(&format!("ssh -t 'alice@{remote_hostname}'")), "bare role should resolve through the replica host: {command}");
     assert!(command.contains("flotilla attach"), "bare role should recursively invoke flotilla attach: {command}");
     assert!(command.contains("coder"), "command should preserve the original bare role reference: {command}");
 
@@ -2623,11 +2649,12 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
         .await
         .expect("attach query should execute");
 
-    let CommandValue::AttachCommandResolved { command, .. } = result else {
+    let CommandValue::AttachCommandResolved { plan, .. } = result else {
         panic!("expected attach command, got {result:?}");
     };
+    let command = attach_plan_text(&plan);
     assert!(
-        command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")),
+        command.contains(&format!("ssh -t 'alice@{remote_hostname}'")),
         "session name should resolve through the replica host: {command}"
     );
     assert!(command.contains("terminal-remote-coder"), "command should preserve the independent row's attach reference: {command}");
@@ -2696,16 +2723,17 @@ async fn transient_attach_selects_the_displayed_host_for_result_set_only_indepen
         .await
         .expect("transient attach query should execute");
 
-    let CommandValue::AttachCommandResolved { command, binding } = result else {
+    let CommandValue::AttachCommandResolved { plan, binding } = result else {
         panic!("expected attach command, got {result:?}");
     };
+    let command = attach_plan_text(&plan);
     let binding = binding.expect("replica resolution carries a structured binding");
     assert_eq!(binding.host, HostName::new(selected_host));
     assert_eq!(binding.session.as_deref(), Some("terminal-scratch"));
     assert_eq!(binding.convoy, None);
     assert_eq!(binding.role, None);
     assert!(
-        command.starts_with(&format!("ssh -t 'alice@{selected_hostname}' ")),
+        command.contains(&format!("ssh -t 'alice@{selected_hostname}'")),
         "selected row should route through {selected_host}: {command}"
     );
     assert!(command.contains("--transient"), "recursive attach must preserve the no-stamp mode: {command}");
@@ -2750,11 +2778,11 @@ async fn transient_attach_resolves_standing_checkout_paths_locally_and_determini
             )
             .await
             .expect("transient attach query should execute");
-        let CommandValue::AttachCommandResolved { command, binding } = result else {
+        let CommandValue::AttachCommandResolved { plan, binding } = result else {
             panic!("expected attach command, got {result:?}");
         };
         assert!(binding.is_none(), "standing checkout terminals are deliberately not stamped as convoy sessions");
-        resolved.push(command);
+        resolved.push(single_attach_command(&plan));
     }
     assert_eq!(resolved[0], resolved[1], "the same checkout must resolve to the same terminal target");
     let ensured = terminal_pool.ensured.lock().await;
@@ -2800,11 +2828,12 @@ async fn transient_attach_routes_standing_checkout_paths_to_the_displayed_remote
         )
         .await
         .expect("transient attach query should execute");
-    let CommandValue::AttachCommandResolved { command, binding } = result else {
+    let CommandValue::AttachCommandResolved { plan, binding } = result else {
         panic!("expected attach command, got {result:?}");
     };
+    let command = attach_plan_text(&plan);
     assert!(binding.is_none());
-    assert!(command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")));
+    assert!(command.contains(&format!("ssh -t 'alice@{remote_hostname}'")));
     assert!(command.contains("--transient"));
     assert!(command.contains("/work/standing"));
 }
@@ -2906,11 +2935,12 @@ async fn attach_query_uses_topology_next_hop_for_multi_hop_route_shape() {
         .await
         .expect("attach query should execute");
 
-    let CommandValue::AttachCommandResolved { command, .. } = result else {
+    let CommandValue::AttachCommandResolved { plan, .. } = result else {
         panic!("expected attach command, got {result:?}");
     };
-    assert!(command.starts_with(&format!("ssh -t 'alice@{next_hop_hostname}' ")), "command should target the routed next hop: {command}");
-    assert!(command.contains("${SHELL:-/bin/sh} -l -c"), "command should run through a remote login shell: {command}");
+    let command = attach_plan_text(&plan);
+    assert!(command.contains(&format!("ssh -t 'alice@{next_hop_hostname}'")), "command should target the routed next hop: {command}");
+    assert!(!command.contains("${SHELL:-/bin/sh} -l -c"), "interactive attach should enter SSH without wrapping: {command}");
     assert!(command.contains("flotilla attach"), "command should recursively invoke flotilla attach on the next hop: {command}");
     assert!(!command.contains(&target_hostname), "command should not try to jump directly to the final host: {command}");
     assert!(!command.contains("gouda-provider-session"), "command should not embed final terminal-provider attach args: {command}");
@@ -2959,9 +2989,10 @@ async fn attach_query_prefers_exact_reference_over_prefix_matches() {
         .await
         .expect("attach query should execute");
 
-    let CommandValue::AttachCommandResolved { command, binding } = result else {
+    let CommandValue::AttachCommandResolved { plan, binding } = result else {
         panic!("expected attach command, got {result:?}");
     };
+    let command = single_attach_command(&plan);
     assert_eq!(command, "attach session-exact");
     assert_eq!(binding.expect("binding present").session.as_deref(), Some("terminal-convoy-a-implement-coder"));
 }

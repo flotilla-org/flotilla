@@ -742,10 +742,10 @@ async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) 
     if let CommandValue::Error { .. } = result {
         std::process::exit(1);
     }
-    if let CommandValue::ConvoyStarted { name, attach_command: Some(command), binding } = result {
+    if let CommandValue::ConvoyStarted { name, attach_plan: Some(plan), binding } = result {
         if matches!(format, OutputFormat::Human) {
             stamp_pane_identity(&name, binding.as_ref()).await;
-            return run_attach_command(&command);
+            return run_attach_plan(&plan);
         }
     }
     Ok(())
@@ -780,16 +780,16 @@ async fn run_attach(cli: &Cli, reference: &str, transient: bool, host: Option<&s
         .map_err(|e| color_eyre::eyre::eyre!(e))?;
 
     match result {
-        CommandValue::AttachCommandResolved { command, binding } => match format {
+        CommandValue::AttachCommandResolved { plan, binding } => match format {
             OutputFormat::Json => {
-                println!("{}", flotilla_protocol::output::json_pretty(&CommandValue::AttachCommandResolved { command, binding }));
+                println!("{}", flotilla_protocol::output::json_pretty(&CommandValue::AttachCommandResolved { plan, binding }));
                 Ok(())
             }
             OutputFormat::Human => {
                 if !transient {
                     stamp_pane_identity(reference, binding.as_ref()).await;
                 }
-                run_attach_command(&command)
+                run_attach_plan(&plan)
             }
         },
         CommandValue::Error { message } => match format {
@@ -1009,8 +1009,8 @@ fn print_resource_watch_event(response: &flotilla_protocol::ResourceWatchRespons
     }
 }
 
-fn run_attach_command(command: &str) -> Result<()> {
-    let status = std::process::Command::new("sh").arg("-lc").arg(command).status()?;
+fn run_attach_plan(plan: &flotilla_protocol::ResolvedAttachPlan) -> Result<()> {
+    let status = flotilla_tui::terminal::run_attach_plan(plan).map_err(|error| color_eyre::eyre::eyre!(error))?;
     terminate_with_attach_status(status)
 }
 

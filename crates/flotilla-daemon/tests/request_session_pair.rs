@@ -515,7 +515,7 @@ async fn convoy_start_uses_live_peer_route_when_presentation_membership_is_stale
 
     assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted {
         name: "remote-work".to_string(),
-        attach_command: None,
+        attach_plan: None,
         binding: None
     });
     topology

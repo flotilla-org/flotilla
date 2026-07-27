@@ -11,7 +11,17 @@ pub trait CombineStrategy: Send + Sync {
     fn should_wrap(&self, hop: &Hop, context: &ResolutionContext) -> bool;
 }
 
-/// Always nests commands as arguments. Matches current SSH wrapping behavior. Default.
+/// Why a hop chain is being resolved.
+///
+/// Interactive attaches enter one boundary at a time and type the next
+/// command. Non-interactive execution keeps a single wrapped command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionPurpose {
+    Attach,
+    CommandExecution,
+}
+
+/// Always nests commands as arguments for non-interactive execution.
 pub struct AlwaysWrap;
 
 impl CombineStrategy for AlwaysWrap {
@@ -20,7 +30,7 @@ impl CombineStrategy for AlwaysWrap {
     }
 }
 
-/// Always creates execution boundaries. For resolution-level testing only in Phase A.
+/// Always creates execution boundaries for interactive attaches.
 pub struct AlwaysSendKeys;
 
 impl CombineStrategy for AlwaysSendKeys {
@@ -45,6 +55,19 @@ pub struct HopResolver {
 }
 
 impl HopResolver {
+    pub fn new(
+        remote: Arc<dyn RemoteHopResolver>,
+        environment: Arc<dyn EnvironmentHopResolver>,
+        terminal: Arc<dyn TerminalHopResolver>,
+        purpose: ResolutionPurpose,
+    ) -> Self {
+        let strategy: Arc<dyn CombineStrategy> = match purpose {
+            ResolutionPurpose::Attach => Arc::new(AlwaysSendKeys),
+            ResolutionPurpose::CommandExecution => Arc::new(AlwaysWrap),
+        };
+        Self { remote, environment, terminal, strategy }
+    }
+
     pub fn resolve(&self, plan: &HopPlan, context: &mut ResolutionContext) -> Result<ResolvedPlan, String> {
         // Walk inside-out (reverse order)
         for hop in plan.0.iter().rev() {
@@ -62,6 +85,9 @@ impl HopResolver {
                     if context.current_environment.as_ref() == Some(env_id) {
                         continue; // collapse — already inside this environment
                     }
+                    // Future depth/total-command-length policy belongs at this
+                    // strategy decision seam; it must not leak into individual
+                    // SSH or environment adapters.
                     if self.strategy.should_wrap(hop, context) {
                         self.environment.resolve_wrap(env_id, context)?;
                     } else {

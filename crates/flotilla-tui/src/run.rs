@@ -154,9 +154,9 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         while let Some((cmd, pending_ctx)) = app.proto_commands.take_next() {
             app::executor::dispatch(cmd, &mut app, pending_ctx, events.sender());
         }
-        if let Some(command) = app.pending_attach_command.take() {
+        if let Some(plan) = app.pending_attach_plan.take() {
             events.pause_terminal_input().await;
-            let (next_terminal, result) = crate::terminal::run_temporary_attach(&command);
+            let (next_terminal, result) = crate::terminal::run_temporary_attach(&plan);
             terminal = next_terminal;
             terminal_title = None;
             events.resume_terminal_input();

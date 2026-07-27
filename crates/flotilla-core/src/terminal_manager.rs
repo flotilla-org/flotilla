@@ -11,7 +11,7 @@ use crate::{
         builder::HopPlanBuilder,
         environment::NoopEnvironmentHopResolver,
         remote::NoopRemoteHopResolver,
-        resolver::{AlwaysWrap, HopResolver},
+        resolver::{HopResolver, ResolutionPurpose},
         terminal::PoolTerminalHopResolver,
         ResolutionContext, ResolvedAction,
     },
@@ -165,7 +165,7 @@ impl TerminalManager {
     /// Returns the command string needed to attach to a terminal session.
     ///
     /// Uses the hop chain internally: builds a `HopPlan` via `HopPlanBuilder::build_for_attachable()`,
-    /// resolves it with `PoolTerminalHopResolver` + `AlwaysWrap`, and flattens to a string.
+    /// resolves it for interactive attach and flattens the sole local command to a string.
     /// For local attach (same-host), the plan is just `[AttachTerminal(id)]` with no remote hop.
     pub async fn attach_command(&self, attachable_id: &AttachableId, daemon_socket_path: Option<&str>) -> Result<String, String> {
         let plan = {
@@ -185,12 +185,12 @@ impl TerminalManager {
 
         let terminal_resolver =
             PoolTerminalHopResolver::new(Arc::clone(&self.pool), self.store.clone(), daemon_socket_path.map(|s| s.to_string()));
-        let hop_resolver = HopResolver {
-            remote: Arc::new(NoopRemoteHopResolver),
-            environment: Arc::new(NoopEnvironmentHopResolver),
-            terminal: Arc::new(terminal_resolver),
-            strategy: Arc::new(AlwaysWrap),
-        };
+        let hop_resolver = HopResolver::new(
+            Arc::new(NoopRemoteHopResolver),
+            Arc::new(NoopEnvironmentHopResolver),
+            Arc::new(terminal_resolver),
+            ResolutionPurpose::Attach,
+        );
 
         let mut context = ResolutionContext {
             current_host: self.local_host.clone(),

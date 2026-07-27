@@ -26,9 +26,9 @@ use flotilla_protocol::{
     FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
     NodeInfo, PeerConnectionState, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo,
     QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse,
-    ResolvedPaneCommand, ResourceJsonResponse, ResourceRef, ResourceWatchResponse, StatusResponse, StepStatus, StreamKey,
-    SurfaceDeclaration, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY,
-    TERMINAL_POOL_PROVIDER_CATEGORY,
+    ResolvedAttachAction, ResolvedAttachPlan, ResourceJsonResponse, ResourceRef, ResourceWatchResponse, StatusResponse, StepStatus,
+    StreamKey, SurfaceDeclaration, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress,
+    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -64,7 +64,13 @@ use crate::{
     environment_manager::EnvironmentManager,
     executor,
     executor::checkout::{checkout_matches_scope, CheckoutResolutionScope},
-    hop_chain::remote::ssh_resolver_from_config,
+    hop_chain::{
+        environment::{DockerEnvironmentHopResolver, NoopEnvironmentHopResolver},
+        remote::ssh_resolver_from_config,
+        resolver::{HopResolver, ResolutionPurpose},
+        terminal::NoopTerminalHopResolver,
+        Hop, HopPlan, ResolutionContext,
+    },
     host_identity::{
         resolve_local_environment_state_dir, resolve_local_host_id, resolve_local_node_id, resolve_or_create_environment_id,
         resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
@@ -358,11 +364,11 @@ fn empty_repo_identity() -> flotilla_protocol::RepoIdentity {
     flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() }
 }
 
-/// An attach resolution: the command the CLI should exec, plus the
+/// An attach resolution: the plan the CLI should execute, plus the
 /// structured binding it stamps onto its enclosing PM pane (#708).
 #[derive(Debug, Clone)]
 pub struct ResolvedAttach {
-    pub command: String,
+    pub plan: ResolvedAttachPlan,
     pub binding: Option<AttachBinding>,
 }
 
@@ -442,7 +448,7 @@ impl AttachTarget {
     async fn resolve(&self, daemon: &InProcessDaemon, reference: &str, transient: bool) -> Result<ResolvedAttach, String> {
         match self {
             Self::Local(session) => {
-                let (command, host) = daemon.attach_command_for_session(reference, session, transient).await?;
+                let (plan, host) = daemon.attach_plan_for_session(reference, session).await?;
                 let labels = &session.metadata.labels;
                 let binding = AttachBinding::builder()
                     .host(host)
@@ -452,10 +458,10 @@ impl AttachTarget {
                     .maybe_vessel(labels.get(VESSEL_LABEL).cloned())
                     .role(labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone()))
                     .build();
-                Ok(ResolvedAttach { command, binding: Some(binding) })
+                Ok(ResolvedAttach { plan, binding: Some(binding) })
             }
             Self::Replica { row } => {
-                let command = daemon.recursive_attach_command_for_remote(&row.host, reference, transient).await?;
+                let plan = daemon.recursive_attach_plan_for_remote(&row.host, reference).await?;
                 // Replica rows carry crew as "vessel/role" (or a bare role)
                 // and the owning host's namespace + session name, so
                 // cross-host panes stamp the full join key.
@@ -471,18 +477,18 @@ impl AttachTarget {
                     .maybe_vessel(vessel)
                     .maybe_role(role)
                     .build();
-                Ok(ResolvedAttach { command, binding: Some(binding) })
+                Ok(ResolvedAttach { plan, binding: Some(binding) })
             }
             Self::Checkout(row) => {
                 if !transient {
                     return Err(format!("checkout '{}' is only available as a transient attach target", row.path));
                 }
-                let command = if row.host == daemon.host_name {
-                    daemon.local_checkout_terminal_command(row).await?
+                let plan = if row.host == daemon.host_name {
+                    daemon.local_checkout_terminal_plan(row).await?
                 } else {
-                    daemon.recursive_attach_command_for_remote(&row.host, reference, true).await?
+                    daemon.recursive_attach_plan_for_remote(&row.host, reference).await?
                 };
-                Ok(ResolvedAttach { command, binding: None })
+                Ok(ResolvedAttach { plan, binding: None })
             }
         }
     }
@@ -3926,14 +3932,12 @@ impl InProcessDaemon {
         let auto_attach = self.should_auto_attach(intent.auto_attach);
         match self.admit_convoy_start(&namespace, &intent, &dispatching_principal_ref).await {
             Ok(name) if auto_attach => match self.wait_for_convoy_attach(&namespace, &name).await {
-                Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
-                    name,
-                    attach_command: Some(resolved.command),
-                    binding: resolved.binding,
-                },
+                Ok(resolved) => {
+                    flotilla_protocol::CommandValue::ConvoyStarted { name, attach_plan: Some(resolved.plan), binding: resolved.binding }
+                }
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             },
-            Ok(name) => flotilla_protocol::CommandValue::ConvoyStarted { name, attach_command: None, binding: None },
+            Ok(name) => flotilla_protocol::CommandValue::ConvoyStarted { name, attach_plan: None, binding: None },
             Err(message) => flotilla_protocol::CommandValue::Error { message },
         }
     }
@@ -3943,12 +3947,12 @@ impl InProcessDaemon {
             Ok(()) if start.auto_attach => match self.wait_for_convoy_attach(&start.namespace, &start.name).await {
                 Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
                     name: start.name,
-                    attach_command: Some(resolved.command),
+                    attach_plan: Some(resolved.plan),
                     binding: resolved.binding,
                 },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             },
-            Ok(()) => flotilla_protocol::CommandValue::ConvoyStarted { name: start.name, attach_command: None, binding: None },
+            Ok(()) => flotilla_protocol::CommandValue::ConvoyStarted { name: start.name, attach_plan: None, binding: None },
             Err(message) => flotilla_protocol::CommandValue::Error { message },
         }
     }
@@ -6011,7 +6015,7 @@ impl InProcessDaemon {
         Ok(AttachCandidateIndex::new(candidates))
     }
 
-    async fn local_checkout_terminal_command(&self, checkout: &CheckoutRow) -> Result<String, String> {
+    async fn local_checkout_terminal_plan(&self, checkout: &CheckoutRow) -> Result<ResolvedAttachPlan, String> {
         let cwd = ExecutionEnvironmentPath::new(&checkout.path);
         let discovery = discover_repo_for_environment(
             &self.environment_manager,
@@ -6032,17 +6036,17 @@ impl InProcessDaemon {
         let session_name = transient_checkout_session_name(checkout);
         let command = "${SHELL:-/bin/sh}";
         pool.ensure_session(&session_name, command, &cwd, &Vec::new(), &[]).await?;
-        pool.attach_command(&session_name, command, &cwd, &Vec::new()).await
+        let args = pool.attach_args(&session_name, command, &cwd, &Vec::new())?;
+        Ok(ResolvedAttachPlan(vec![ResolvedAttachAction::Command(args)]))
     }
 
-    /// Resolve the attach command for a locally-known session, returning it
+    /// Resolve the attach plan for a locally-known session, returning it
     /// with the host that actually owns the session (the binding host).
-    async fn attach_command_for_session(
+    async fn attach_plan_for_session(
         &self,
         reference: &str,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
-        transient: bool,
-    ) -> Result<(String, HostName), String> {
+    ) -> Result<(ResolvedAttachPlan, HostName), String> {
         let namespace = self.provisioning_namespace().await;
         let environments = self.resource_backend.clone().using::<ResourceEnvironment>(&namespace);
         let environment = environments
@@ -6058,20 +6062,15 @@ impl InProcessDaemon {
             .ok_or_else(|| format!("environment {} has no host binding", session.spec.env_ref))?;
         let target_host = self.target_host_for_resource_ref(host_ref);
         if target_host != self.host_name {
-            let command = self.recursive_attach_command_for_remote(&target_host, reference, transient).await?;
-            return Ok((command, target_host));
+            let plan = self.recursive_attach_plan_for_remote(&target_host, reference).await?;
+            return Ok((plan, target_host));
         }
 
-        let command = self.local_attach_command_for_session(session, &environment).await?;
-        Ok((command, self.host_name.clone()))
+        let plan = self.local_attach_plan_for_session(session, &environment).await?;
+        Ok((plan, self.host_name.clone()))
     }
 
-    async fn recursive_attach_command_for_remote(
-        &self,
-        target_host: &HostName,
-        reference: &str,
-        transient: bool,
-    ) -> Result<String, String> {
+    async fn recursive_attach_plan_for_remote(&self, target_host: &HostName, reference: &str) -> Result<ResolvedAttachPlan, String> {
         let next_hop = self.host_registry.next_hop_host_for_target_host(target_host).await?.unwrap_or_else(|| target_host.clone());
         if next_hop == self.host_name {
             return Err(format!("unreachable next hop for host '{target_host}': route points back to local host"));
@@ -6082,30 +6081,44 @@ impl InProcessDaemon {
             vec![flotilla_protocol::arg::Arg::Literal("flotilla".to_string()), flotilla_protocol::arg::Arg::Literal("attach".to_string())];
         command.push(flotilla_protocol::arg::Arg::Literal("--host".to_string()));
         command.push(flotilla_protocol::arg::Arg::Quoted(target_host.to_string()));
-        if transient {
-            command.push(flotilla_protocol::arg::Arg::Literal("--transient".to_string()));
-        }
+        // Recursive attaches only traverse transport boundaries; Presentation
+        // Manager identity belongs to the original foreground attach.
+        command.push(flotilla_protocol::arg::Arg::Literal("--transient".to_string()));
         command.push(flotilla_protocol::arg::Arg::Quoted(reference.to_string()));
-        let args = resolver
-            .one_hop_command_args(&next_hop, command)
-            .map_err(|err| format!("unreachable next hop '{next_hop}' for host '{target_host}': {err}"))?;
-        Ok(flotilla_protocol::arg::flatten(&args, 0))
+        let hop_resolver = HopResolver::new(
+            Arc::new(resolver),
+            Arc::new(NoopEnvironmentHopResolver),
+            Arc::new(NoopTerminalHopResolver),
+            ResolutionPurpose::Attach,
+        );
+        let plan = HopPlan(vec![Hop::RemoteToHost { host: next_hop.clone() }, Hop::RunCommand { command }]);
+        let mut context = ResolutionContext {
+            current_host: self.host_name.clone(),
+            current_environment: None,
+            working_directory: None,
+            actions: Vec::new(),
+            nesting_depth: 0,
+        };
+        hop_resolver
+            .resolve(&plan, &mut context)
+            .map(|resolved| ResolvedAttachPlan(resolved.0))
+            .map_err(|err| format!("unreachable next hop '{next_hop}' for host '{target_host}': {err}"))
     }
 
-    pub async fn route_remote_attach_binding(&self, binding: &AttachBinding) -> Result<String, String> {
+    pub async fn route_remote_attach_binding(&self, binding: &AttachBinding) -> Result<ResolvedAttachPlan, String> {
         let reference = binding
             .session
             .as_deref()
             .or(binding.convoy.as_deref())
             .ok_or_else(|| "remote attach binding has neither a session nor convoy reference".to_string())?;
-        self.recursive_attach_command_for_remote(&binding.host, reference, false).await
+        self.recursive_attach_plan_for_remote(&binding.host, reference).await
     }
 
-    async fn local_attach_command_for_session(
+    async fn local_attach_plan_for_session(
         &self,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
         environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
-    ) -> Result<String, String> {
+    ) -> Result<ResolvedAttachPlan, String> {
         let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
         let registry = self.registry_for_resource_environment(environment, cwd.as_path()).await?;
         let pool = registry
@@ -6116,25 +6129,31 @@ impl InProcessDaemon {
         let attach_target = terminal_session_attach_target(session)?;
         let attach_args = pool.attach_args(attach_target.session_id, attach_target.launch_command, &cwd, &Vec::new())?;
         if environment.spec.docker.is_some() {
-            let command = ResolvedPaneCommand { role: session.spec.role.clone(), args: attach_args };
             let environment_id = EnvironmentId::new(session.spec.env_ref.clone());
             let container_name = environment.status.as_ref().and_then(|status| status.docker_container_id.as_deref());
-            let resolved = executor::workspace::resolve_prepared_commands_via_hop_chain(
-                &self.host_name,
-                cwd.as_path(),
-                &[command],
-                self.config.base_path().as_path(),
-                &self.host_name,
-                Some(&environment_id),
-                container_name,
-            )?;
-            return resolved
-                .into_iter()
-                .next()
-                .map(|(_, command)| command)
-                .ok_or_else(|| "attach command resolution produced no command".to_string());
+            let container_name =
+                container_name.ok_or_else(|| format!("environment {} has no docker container id", session.spec.env_ref))?;
+            let environment_resolver =
+                DockerEnvironmentHopResolver::new(HashMap::from([(environment_id.clone(), container_name.to_string())]));
+            let hop_resolver = HopResolver::new(
+                Arc::new(crate::hop_chain::remote::NoopRemoteHopResolver),
+                Arc::new(environment_resolver),
+                Arc::new(NoopTerminalHopResolver),
+                ResolutionPurpose::Attach,
+            );
+            let plan = HopPlan(vec![Hop::EnterEnvironment { env_id: environment_id, provider: "docker".to_string() }, Hop::RunCommand {
+                command: attach_args,
+            }]);
+            let mut context = ResolutionContext {
+                current_host: self.host_name.clone(),
+                current_environment: None,
+                working_directory: Some(cwd),
+                actions: Vec::new(),
+                nesting_depth: 0,
+            };
+            return hop_resolver.resolve(&plan, &mut context).map(|resolved| ResolvedAttachPlan(resolved.0));
         }
-        Ok(flotilla_protocol::arg::flatten(&attach_args, 0))
+        Ok(ResolvedAttachPlan(vec![ResolvedAttachAction::Command(attach_args)]))
     }
 
     fn target_host_for_resource_ref(&self, host_ref: &str) -> HostName {
@@ -7358,14 +7377,14 @@ impl DaemonHandle for InProcessDaemon {
                             warn!(%error, "failed to emit attach regard");
                         }
                     }
-                    Ok(flotilla_protocol::CommandValue::AttachCommandResolved { command: resolved.command, binding: resolved.binding })
+                    Ok(flotilla_protocol::CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding })
                 }
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
             CommandAction::AttachTransient { reference, host } => {
                 match self.resolve_transient_attach_command_internal(reference, host.as_ref()).await {
                     Ok(resolved) => {
-                        Ok(flotilla_protocol::CommandValue::AttachCommandResolved { command: resolved.command, binding: resolved.binding })
+                        Ok(flotilla_protocol::CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding })
                     }
                     Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
                 }
