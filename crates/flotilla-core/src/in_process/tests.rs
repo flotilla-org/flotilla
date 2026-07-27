@@ -5342,4 +5342,40 @@ async fn local_convoy_admission_pins_the_grant_resolved_workflow() {
     let snapshot =
         daemon.resource_backend().using::<WorkflowTemplate>("flotilla").get(snapshot_ref).await.expect("get resolved workflow snapshot");
     assert_eq!(snapshot.spec.vessels[0].credential_refs, BTreeSet::from(["model-api".to_string()]));
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "credential-create".to_string(),
+                workflow_ref: "credential-workflow".to_string(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: Some("feature/credential-create".to_string()),
+                project_ref: Some("project-a".to_string()),
+                placement_policy: Some("docker-host-a".to_string()),
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("execute standalone create");
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::ConvoyCreated {
+        name: "credential-create".to_string()
+    });
+    let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("credential-create").await.expect("get standalone convoy");
+    let snapshot_ref = convoy
+        .metadata
+        .annotations
+        .get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION)
+        .expect("standalone convoy should pin a resolved workflow");
+    let snapshot = daemon
+        .resource_backend()
+        .using::<WorkflowTemplate>("flotilla")
+        .get(snapshot_ref)
+        .await
+        .expect("get standalone resolved workflow snapshot");
+    assert_eq!(snapshot.spec.vessels[0].credential_refs, BTreeSet::from(["model-api".to_string()]));
 }

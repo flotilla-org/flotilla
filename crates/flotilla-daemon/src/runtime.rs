@@ -1055,37 +1055,51 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .or_else(|| self.state.local_registry.environment_providers.preferred_with_desc())
             .ok_or_else(|| "docker environment provider unavailable".to_string())?;
 
-        match &self.state.credential_store {
-            Some(store) => store.prepare_registry_pull(&credential_refs, &spec.image).await?,
-            None if credential_refs.is_empty() => false,
+        let docker_config_dir = match &self.state.credential_store {
+            Some(store) => store.prepare_registry_pull(name, &credential_refs, &spec.image).await?.map(DaemonHostPath::new),
+            None if credential_refs.is_empty() => None,
             None => return Err("host-local credential store unavailable".to_string()),
         };
         let image = ImageId::new(spec.image.clone());
         let env_id = EnvironmentId::new(name.to_string());
-        let handle = provider
+        let handle = match provider
             .create(env_id.clone(), &image, CreateOpts {
                 tokens: Vec::new(),
                 daemon_socket_path,
                 working_directory: None,
                 image_pull_policy: spec.pull_policy.into(),
                 provisioned_mounts: spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount).collect(),
+                docker_config_dir,
             })
-            .await?;
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(store) = &self.state.credential_store {
+                    if let Err(cleanup_error) = store.forget_environment(name).await {
+                        return Err(format!("{error}; additionally failed to remove credential cache: {cleanup_error}"));
+                    }
+                }
+                return Err(error);
+            }
+        };
 
         let container_id = handle.container_name().map(ToString::to_string).unwrap_or_else(|| format!("flotilla-env-{}", env_id));
         if let Some(store) = &self.state.credential_store {
             if let Err(error) = store.prepare(name, &credential_refs, handle.runner()).await {
-                return Err(discard_failed_environment(&handle, error).await);
+                return Err(discard_failed_environment(&handle, Some(store), name, error).await);
             }
         } else if !credential_refs.is_empty() {
-            return Err(discard_failed_environment(&handle, "host-local credential store unavailable".to_string()).await);
+            return Err(discard_failed_environment(&handle, None, name, "host-local credential store unavailable".to_string()).await);
         }
         let (bag, registry) = match probe_provisioned_environment(&self.state, &env_id, &handle).await {
             Ok(probed) => probed,
-            Err(error) => return Err(discard_failed_environment(&handle, error).await),
+            Err(error) => {
+                return Err(discard_failed_environment(&handle, self.state.credential_store.as_deref(), name, error).await);
+            }
         };
         if let Err(error) = verify_declared_agent_adapters(spec, &registry) {
-            return Err(discard_failed_environment(&handle, error).await);
+            return Err(discard_failed_environment(&handle, self.state.credential_store.as_deref(), name, error).await);
         }
         if let Err(error) = self
             .state
@@ -1093,7 +1107,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .register_provisioned_environment(env_id.clone(), Arc::clone(&handle), bag, Some(registry))
             .map_err(|err| format!("failed to register provisioned environment {env_id}: {err}"))
         {
-            return Err(discard_failed_environment(&handle, error).await);
+            return Err(discard_failed_environment(&handle, self.state.credential_store.as_deref(), name, error).await);
         }
         self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { env_id, handle });
         Ok(container_id)
@@ -1107,7 +1121,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         active.handle.destroy().await?;
         let _ = self.state.daemon.remove_provisioned_environment(&active.env_id);
         if let Some(store) = &self.state.credential_store {
-            store.forget_environment(active.env_id.as_str()).await;
+            store.forget_environment(active.env_id.as_str()).await?;
         }
         Ok(())
     }
@@ -1137,10 +1151,25 @@ fn credential_refs_from_environment(spec: &flotilla_resources::DockerEnvironment
         .map(Option::unwrap_or_default)
 }
 
-async fn discard_failed_environment(handle: &EnvironmentHandle, error: String) -> String {
-    match handle.destroy().await {
-        Ok(()) => error,
-        Err(cleanup_error) => format!("{error}; additionally failed to destroy rejected environment: {cleanup_error}"),
+async fn discard_failed_environment(
+    handle: &EnvironmentHandle,
+    credential_store: Option<&CredentialStore>,
+    environment_ref: &str,
+    error: String,
+) -> String {
+    let mut cleanup_errors = Vec::new();
+    if let Err(cleanup_error) = handle.destroy().await {
+        cleanup_errors.push(format!("destroy rejected environment: {cleanup_error}"));
+    }
+    if let Some(store) = credential_store {
+        if let Err(cleanup_error) = store.forget_environment(environment_ref).await {
+            cleanup_errors.push(format!("remove credential cache: {cleanup_error}"));
+        }
+    }
+    if cleanup_errors.is_empty() {
+        error
+    } else {
+        format!("{error}; additionally failed to {}", cleanup_errors.join("; "))
     }
 }
 
