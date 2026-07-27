@@ -110,6 +110,30 @@ pub trait TerminalPool: Send + Sync {
         env_vars: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String>;
 
+    /// Reports the current controller, when the pool exposes seat state.
+    ///
+    /// `None` means the seat is available. Pools without controller seats use
+    /// the default implementation.
+    async fn controller_holder(&self, _session_name: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// Returns a read-only attachment command for a session.
+    fn watch_args(&self, _session_name: &str) -> Result<Vec<Arg>, String> {
+        Err("terminal pool does not support read-only watch".to_string())
+    }
+
+    /// Returns an attachment command that force-takes the controller seat.
+    async fn take_args(
+        &self,
+        _session_name: &str,
+        _command: &str,
+        _cwd: &ExecutionEnvironmentPath,
+        _env_vars: &TerminalEnvVars,
+    ) -> Result<Vec<Arg>, String> {
+        Err("terminal pool does not support taking the controller seat".to_string())
+    }
+
     /// Returns the attach command as a flat shell string.
     /// Default implementation calls `attach_args()` + `flatten()`.
     async fn attach_command(

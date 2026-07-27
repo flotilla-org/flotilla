@@ -376,6 +376,8 @@ pub async fn build_plan(
         | CommandAction::QueryHostStatus { .. }
         | CommandAction::QueryHostProviders { .. }
         | CommandAction::Attach { .. }
+        | CommandAction::AttachTake { .. }
+        | CommandAction::AttachWatch { .. }
         | CommandAction::AttachTransient { .. }
         | CommandAction::QueryIssues { .. }
         | CommandAction::QueryIssueFetchByIds { .. }

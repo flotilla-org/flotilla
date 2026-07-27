@@ -241,6 +241,20 @@ pub enum CommandAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<crate::HostName>,
     },
+    /// Resolve an attach that force-takes the controller seat.
+    AttachTake {
+        reference: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<crate::HostName>,
+    },
+    /// Resolve a read-only fallback only when the controller seat is held.
+    AttachWatch {
+        reference: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<crate::HostName>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        transient: bool,
+    },
     /// Resolve an attach for a temporary foreground excursion. Unlike the
     /// human-facing CLI attach, recursive hops must not stamp PM metadata.
     AttachTransient {
@@ -474,6 +488,8 @@ impl CommandAction {
                 | CommandAction::QueryResourceList { .. }
                 | CommandAction::QueryResourceGet { .. }
                 | CommandAction::Attach { .. }
+                | CommandAction::AttachTake { .. }
+                | CommandAction::AttachWatch { .. }
                 | CommandAction::AttachTransient { .. }
                 | CommandAction::QueryIssues { .. }
                 | CommandAction::QueryIssueFetchByIds { .. }
@@ -489,6 +505,8 @@ impl Command {
             CommandAction::CreateWorkspaceFromPreparedTerminal { .. } => "Creating workspace...",
             CommandAction::SelectWorkspace { .. } => "Switching workspace...",
             CommandAction::Attach { .. } => "Resolving attach target...",
+            CommandAction::AttachTake { .. } => "Resolving controller takeover...",
+            CommandAction::AttachWatch { .. } => "Resolving read-only fallback...",
             CommandAction::AttachTransient { .. } => "Resolving temporary attach target...",
             CommandAction::PrepareTerminalForCheckout { .. } => "Preparing terminal...",
             CommandAction::Checkout { target, .. } => match target {

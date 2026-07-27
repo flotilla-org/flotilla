@@ -20,6 +20,11 @@ struct SessionInfo {
 }
 
 #[derive(Debug, Deserialize)]
+struct InspectResult {
+    attachments: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 enum SessionStatus {
     Attached,
@@ -51,6 +56,18 @@ impl CleatTerminalPool {
 
     fn parse_list_output(json: &str) -> Result<Vec<SessionInfo>, String> {
         serde_json::from_str(json).map_err(|err| format!("parse session list: {err}"))
+    }
+
+    fn attachment_identity(attachment: &serde_json::Value) -> Option<String> {
+        ["holder", "identity", "principal", "name"].into_iter().find_map(|field| {
+            let value = attachment.get(field)?;
+            value.as_str().map(str::to_string).or_else(|| {
+                value
+                    .as_object()
+                    .and_then(|identity| ["display_name", "name", "id"].into_iter().find_map(|key| identity.get(key)?.as_str()))
+                    .map(str::to_string)
+            })
+        })
     }
 }
 
@@ -134,6 +151,38 @@ impl TerminalPool for CleatTerminalPool {
             Arg::Literal("--cwd".into()),
             Arg::Quoted(cwd.as_path().display().to_string()),
         ])
+    }
+
+    async fn controller_holder(&self, session_name: &str) -> Result<Option<String>, String> {
+        let output = run!(self.runner, &self.binary, &["inspect", "--json", session_name], Path::new("/"))?;
+        let inspect: InspectResult = serde_json::from_str(&output).map_err(|err| format!("parse cleat inspect output: {err}"))?;
+        Ok(inspect.attachments.iter().find_map(|attachment| {
+            (attachment.get("role").and_then(serde_json::Value::as_str) == Some("controller"))
+                .then(|| Self::attachment_identity(attachment).unwrap_or_default())
+        }))
+    }
+
+    fn watch_args(&self, session_name: &str) -> Result<Vec<Arg>, String> {
+        Ok(vec![Arg::Literal(self.binary.clone()), Arg::Literal("watch".into()), Arg::Literal(session_name.into())])
+    }
+
+    async fn take_args(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+    ) -> Result<Vec<Arg>, String> {
+        let help = run!(self.runner, &self.binary, &["attach", "--help"], Path::new("/"))?;
+        if !help.lines().any(|line| line.split_whitespace().any(|word| word == "--take")) {
+            return Err(
+                "`flotilla attach --take` requires cleat force-take support; this cleat does not provide `attach --take` (see flotilla-org/cleat#177)"
+                    .to_string(),
+            );
+        }
+        let mut args = self.attach_args(session_name, command, cwd, env_vars)?;
+        args.insert(2, Arg::Literal("--take".into()));
+        Ok(args)
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
@@ -417,5 +466,45 @@ mod tests {
         let term_pos = cmd_val.find("TERM=").expect("should contain TERM");
         let foo_pos = cmd_val.find("FOO=").expect("should contain FOO");
         assert!(term_pos < foo_pos, "terminal defaults should appear before caller env vars: {cmd_val}");
+    }
+
+    #[tokio::test]
+    async fn controller_holder_reads_identity_when_cleat_reports_it() {
+        let inspect = r#"{"attachments":[{"role":"controller","identity":{"display_name":"alice"}},{"role":"watcher"}]}"#;
+        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![Ok(inspect.into())])), "cleat");
+
+        assert_eq!(pool.controller_holder("sess").await.expect("inspect controller").as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn controller_holder_marks_an_unidentified_controller() {
+        let inspect = r#"{"attachments":[{"role":"controller"}]}"#;
+        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![Ok(inspect.into())])), "cleat");
+
+        assert_eq!(pool.controller_holder("sess").await.expect("inspect controller").as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn take_reports_when_installed_cleat_lacks_the_capability() {
+        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![Ok("Usage: cleat attach [OPTIONS]".into())])), "cleat");
+
+        let error = pool
+            .take_args("sess", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![])
+            .await
+            .expect_err("old cleat should reject take");
+
+        assert!(error.contains("does not provide `attach --take`"));
+        assert!(error.contains("cleat#177"));
+    }
+
+    #[tokio::test]
+    async fn take_uses_the_capability_when_cleat_advertises_it() {
+        let pool =
+            CleatTerminalPool::new(Arc::new(MockRunner::new(vec![Ok("Options:\n      --take  Force take control".into())])), "cleat");
+
+        let args =
+            pool.take_args("sess", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).await.expect("new cleat should support take");
+
+        assert_eq!(flotilla_protocol::arg::flatten(&args, 0), "cleat attach --take sess --cwd '/repo'");
     }
 }

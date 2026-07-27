@@ -174,6 +174,24 @@ impl TerminalPool for SharedTerminalPool {
         self.inner.attach_args(session_name, command, cwd, env_vars)
     }
 
+    async fn controller_holder(&self, session_name: &str) -> Result<Option<String>, String> {
+        self.inner.controller_holder(session_name).await
+    }
+
+    fn watch_args(&self, session_name: &str) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+        self.inner.watch_args(session_name)
+    }
+
+    async fn take_args(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+    ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+        self.inner.take_args(session_name, command, cwd, env_vars).await
+    }
+
     async fn attach_command(
         &self,
         session_name: &str,

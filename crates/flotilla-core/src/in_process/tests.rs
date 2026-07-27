@@ -2195,6 +2195,84 @@ async fn attach_query_resolves_running_terminal_session_by_convoy_task_role() {
 }
 
 #[tokio::test]
+async fn attach_query_falls_back_to_watch_with_controller_banner() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let (daemon, terminal_pool) = new_attach_test_daemon_with_pool(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_running_attach_session(
+        &daemon,
+        &env_ref,
+        "terminal-convoy-a-implement-coder",
+        "cleat-session-1",
+        "convoy-a",
+        "implement",
+        "coder",
+    )
+    .await;
+    terminal_pool.set_controller_holder("cleat-session-1", "crew runner").await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    let CommandValue::AttachCommandResolved { command, .. } = result else {
+        panic!("expected attach command, got {result:?}");
+    };
+    assert!(command.contains("watching — controller held by crew runner; --take to take control"));
+    assert!(command.ends_with("watch cleat-session-1"));
+    assert!(!command.contains("attach cleat-session-1"));
+}
+
+#[tokio::test]
+async fn watch_fallback_refuses_when_the_controller_seat_is_available() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_running_attach_session(
+        &daemon,
+        &env_ref,
+        "terminal-convoy-a-implement-coder",
+        "cleat-session-1",
+        "convoy-a",
+        "implement",
+        "coder",
+    )
+    .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::AttachWatch { reference: "convoy-a/implement/coder".to_string(), host: None, transient: false },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("watch fallback query should execute");
+
+    assert_eq!(result, CommandValue::Error { message: "controller seat is no longer held".to_string() });
+}
+
+#[tokio::test]
 async fn attach_query_rejects_a_running_agent_without_a_recorded_launch_command() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
@@ -2306,6 +2384,24 @@ async fn attach_query_resolves_remote_session_as_one_recursive_hop() {
     assert!(command.contains("convoy-a/implement/coder"), "command should preserve the original reference: {command}");
     assert!(!command.contains("remote-provider-session"), "remote hop must not include terminal-provider attach args: {command}");
     assert_eq!(command.matches("flotilla attach").count(), 1, "command should contain exactly one recursive attach invocation: {command}");
+
+    let take_result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::AttachTake { reference: "convoy-a/implement/coder".to_string(), host: None },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("take attach query should execute");
+    let CommandValue::AttachCommandResolved { command, .. } = take_result else {
+        panic!("expected take attach command, got {take_result:?}");
+    };
+    assert!(command.contains("flotilla attach --host"));
+    assert!(command.contains("--take"));
 }
 
 #[tokio::test]

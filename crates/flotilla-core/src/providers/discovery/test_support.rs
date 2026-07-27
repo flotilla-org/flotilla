@@ -797,6 +797,7 @@ pub struct FakeTerminalPool {
     pub delivered: Arc<TokioMutex<Vec<(String, String, bool)>>>,
     pub ensured: Arc<TokioMutex<Vec<EnsuredTerminalSession>>>,
     pub captured_screens: Arc<TokioMutex<HashMap<String, String>>>,
+    pub controller_holders: Arc<TokioMutex<HashMap<String, String>>>,
 }
 
 pub struct EnsuredTerminalSession {
@@ -820,6 +821,7 @@ impl FakeTerminalPool {
             delivered: Arc::new(TokioMutex::new(Vec::new())),
             ensured: Arc::new(TokioMutex::new(Vec::new())),
             captured_screens: Arc::new(TokioMutex::new(HashMap::new())),
+            controller_holders: Arc::new(TokioMutex::new(HashMap::new())),
         }
     }
 
@@ -833,6 +835,10 @@ impl FakeTerminalPool {
 
     pub async fn set_captured_screen(&self, session_name: &str, screen: &str) {
         self.captured_screens.lock().await.insert(session_name.to_string(), screen.to_string());
+    }
+
+    pub async fn set_controller_holder(&self, session_name: &str, holder: &str) {
+        self.controller_holders.lock().await.insert(session_name.to_string(), holder.to_string());
     }
 }
 
@@ -882,6 +888,14 @@ impl TerminalPool for FakeTerminalPool {
         _env_vars: &super::super::terminal::TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach {session_name}"))])
+    }
+
+    async fn controller_holder(&self, session_name: &str) -> Result<Option<String>, String> {
+        Ok(self.controller_holders.lock().await.get(session_name).cloned())
+    }
+
+    fn watch_args(&self, session_name: &str) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+        Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("watch {session_name}"))])
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
