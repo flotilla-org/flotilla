@@ -264,7 +264,7 @@ async fn generated_table_action_completes_work() {
             }
         }
         if Instant::now() >= deadline {
-            panic!("timed out: work did not transition to Completed in app: {:?}", app.convoys("flotilla"));
+            panic!("timed out: work did not transition to Complete in app: {:?}", app.convoys("flotilla"));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
