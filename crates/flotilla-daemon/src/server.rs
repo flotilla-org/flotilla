@@ -55,6 +55,23 @@ pub(crate) struct PeerConnectedNotice {
     pub resource_socket_path: Option<PathBuf>,
 }
 
+/// Lifecycle event sent from connection sites to the outbound task.
+///
+/// `Connected` drives outbound state sync and starts resource replicators
+/// for the peer's generation. `Disconnected` is sent only from a
+/// connection-owning task that has no retry loop of its own (inbound
+/// `PeerConnection::run`, or the outbound per-target task's terminal
+/// shutdown branch) — never from a transient, still-retrying disconnect —
+/// so the outbound task can cancel and drop that peer's resource
+/// replicators. The generation is checked against the currently tracked
+/// generation before acting, so a stale/displaced connection's belated
+/// teardown can't cancel a newer, already-reconnected generation.
+#[cfg_attr(feature = "test-support", visibility::make(pub))]
+pub(crate) enum PeerConnectionEvent {
+    Connected(PeerConnectedNotice),
+    Disconnected { peer: NodeId, generation: u64 },
+}
+
 fn build_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc<Mutex<PeerManager>>) -> RemoteCommandRouter {
     let pending_remote_commands: PendingRemoteCommandMap = Arc::new(Mutex::new(HashMap::new()));
     let forwarded_commands: ForwardedCommandMap = Arc::new(Mutex::new(HashMap::new()));
@@ -142,12 +159,12 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
 /// Test-only entry point: callers provide a PeerManager with pre-configured
 /// senders (e.g. CapturePeerSender). Passes `None` for `peer_data_rx` to skip
 /// the inbound connection task — tests drive the outbound task via the returned
-/// `PeerConnectedNotice` sender.
+/// `PeerConnectionEvent` sender.
 #[cfg(feature = "test-support")]
 pub fn spawn_test_peer_networking(
     daemon: Arc<InProcessDaemon>,
     peer_manager: Arc<Mutex<PeerManager>>,
-) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectedNotice>) {
+) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) {
     // Receiver dropped intentionally — None is passed for the inbound task,
     // so no messages are forwarded; the sender satisfies the runtime signature.
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(256);
@@ -155,7 +172,7 @@ pub fn spawn_test_peer_networking(
     spawn_peer_networking_runtime(
         daemon,
         peer_manager,
-        None, // No inbound task — test drives outbound via PeerConnectedNotice
+        None, // No inbound task — test drives outbound via PeerConnectionEvent
         peer_data_tx,
         remote_command_router,
         None,
@@ -408,7 +425,7 @@ fn spawn_peer_networking_runtime(
     peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
     remote_command_router: RemoteCommandRouter,
     resource_socket_dir: Option<PathBuf>,
-) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectedNotice>) {
+) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) {
     PeerRuntime::new(daemon, peer_manager, peer_data_rx, peer_data_tx, remote_command_router, resource_socket_dir).spawn()
 }
 
@@ -428,7 +445,7 @@ async fn handle_client(
     remote_command_router: RemoteCommandRouter,
     client_count: Arc<AtomicUsize>,
     client_notify: Arc<Notify>,
-    peer_connected_tx: mpsc::UnboundedSender<PeerConnectedNotice>,
+    peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
     agent_state_store: SharedAgentStateStore,
     environment_context: Option<EnvironmentId>,
 ) {
@@ -472,7 +489,7 @@ async fn handle_client_session(
     remote_command_router: RemoteCommandRouter,
     client_count: Arc<AtomicUsize>,
     client_notify: Arc<Notify>,
-    peer_connected_tx: mpsc::UnboundedSender<PeerConnectedNotice>,
+    peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
     agent_state_store: SharedAgentStateStore,
     environment_context: Option<EnvironmentId>,
 ) {
