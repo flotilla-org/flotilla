@@ -101,6 +101,8 @@ pub struct ProviderInfo {
     pub category: String,
     pub name: String,
     pub healthy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,7 +410,13 @@ mod tests {
                 environment: HostEnvironment::Container,
             },
             inventory: ToolInventory::default(),
-            providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), implementation: "git".into(), healthy: true }],
+            providers: vec![HostProviderStatus {
+                category: "vcs".into(),
+                name: "Git".into(),
+                implementation: "git".into(),
+                healthy: true,
+                disabled_reason: None,
+            }],
             environments: vec![],
         }
     }

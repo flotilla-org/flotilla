@@ -263,7 +263,13 @@ mod tests {
                 environment: HostEnvironment::Container,
             },
             inventory: ToolInventory::default(),
-            providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), implementation: "git".into(), healthy: true }],
+            providers: vec![HostProviderStatus {
+                category: "vcs".into(),
+                name: "Git".into(),
+                implementation: "git".into(),
+                healthy: true,
+                disabled_reason: None,
+            }],
             environments: vec![],
         }
     }

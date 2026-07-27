@@ -914,6 +914,7 @@ mod tests {
                 name: "cmux".into(),
                 implementation: "cmux".into(),
                 healthy: true,
+                disabled_reason: None,
             }],
             environments: vec![],
         };
@@ -946,6 +947,7 @@ mod tests {
                 name: "cmux".into(),
                 implementation: "cmux".into(),
                 healthy: true,
+                disabled_reason: None,
             }],
             environments: vec![],
         };
@@ -1354,6 +1356,7 @@ mod tests {
                 name: "cmux".into(),
                 implementation: "cmux".into(),
                 healthy: true,
+                disabled_reason: None,
             }],
             environments: vec![],
         };
@@ -1464,6 +1467,7 @@ mod tests {
                 name: "cmux".into(),
                 implementation: "cmux".into(),
                 healthy: true,
+                disabled_reason: None,
             }],
             environments: vec![],
         };

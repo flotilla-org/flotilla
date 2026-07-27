@@ -303,6 +303,7 @@ fn factories_with_presentation(factory: CountingPresentationFactory) -> FactoryR
         presentation_managers: vec![Box::new(factory)],
         terminal_pools: vec![],
         environment_providers: vec![],
+        suppressions: vec![],
     }
 }
 

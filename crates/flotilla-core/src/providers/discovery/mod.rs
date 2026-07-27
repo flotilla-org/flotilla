@@ -268,6 +268,8 @@ pub enum ProviderCategory {
 }
 
 impl ProviderCategory {
+    pub const FOLLOWER_SUPPRESSED: [Self; 4] = [Self::ChangeRequest, Self::IssueProvider, Self::CloudAgent, Self::AiUtility];
+
     pub fn slug(&self) -> &'static str {
         match self {
             Self::Vcs => "vcs",
@@ -429,6 +431,8 @@ pub struct FactoryRegistry {
     pub presentation_managers: Vec<Box<PresentationManagerFactory>>,
     pub terminal_pools: Vec<Box<TerminalPoolFactory>>,
     pub environment_providers: Vec<Box<EnvironmentProviderFactory>>,
+    /// Categories intentionally omitted by the selected daemon mode.
+    pub suppressions: Vec<ProviderCategory>,
 }
 
 impl FactoryRegistry {
@@ -645,14 +649,13 @@ impl DiscoveryRuntime {
         Arc::clone(self.attachable_store.get_or_init(|| shared_file_backed_attachable_store(config.base_path())))
     }
 
-    /// A runtime is considered follower-mode when no external-provider factory
-    /// categories are registered. Update this check if new external-provider
-    /// factory categories are added to `FactoryRegistry`.
     pub fn is_follower(&self) -> bool {
-        self.factories.change_requests.is_empty()
-            && self.factories.issue_trackers.is_empty()
-            && self.factories.cloud_agents.is_empty()
-            && self.factories.ai_utilities.is_empty()
+        self.factories.suppressions.len() == ProviderCategory::FOLLOWER_SUPPRESSED.len()
+            && ProviderCategory::FOLLOWER_SUPPRESSED.iter().all(|category| self.factories.suppressions.contains(category))
+    }
+
+    pub fn follower_suppressions(&self) -> impl Iterator<Item = ProviderCategory> + '_ {
+        self.factories.suppressions.iter().copied()
     }
 }
 
@@ -1031,6 +1034,7 @@ mod orchestrator_tests {
             presentation_managers: vec![],
             terminal_pools: vec![],
             environment_providers: vec![],
+            suppressions: vec![],
         };
 
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
@@ -1060,6 +1064,7 @@ mod orchestrator_tests {
             presentation_managers: vec![],
             terminal_pools: vec![],
             environment_providers: vec![],
+            suppressions: vec![],
         };
 
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;

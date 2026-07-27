@@ -510,7 +510,13 @@ fn sample_remote_host_summary(name: &str) -> HostSummary {
             environment: HostEnvironment::Container,
         },
         inventory: ToolInventory::default(),
-        providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), implementation: "git".into(), healthy: true }],
+        providers: vec![HostProviderStatus {
+            category: "vcs".into(),
+            name: "Git".into(),
+            implementation: "git".into(),
+            healthy: true,
+            disabled_reason: None,
+        }],
         environments: vec![],
     }
 }
@@ -5727,6 +5733,10 @@ async fn follower_mode_flag_is_stored() {
     let config = test_config_store(config_tmp.path().to_path_buf());
     let leader = InProcessDaemon::new(vec![], config.clone(), fake_discovery(false), HostName::local()).await;
     assert!(!leader.is_follower(), "default daemon should not be follower");
+    assert!(
+        leader.local_host_summary().await.providers.iter().all(|provider| provider.disabled_reason.is_none()),
+        "leader provider listing should not contain follower suppressions"
+    );
 
     let follower = InProcessDaemon::new(vec![], config, fake_discovery(true), HostName::local()).await;
     assert!(follower.is_follower(), "follower daemon should report follower=true");
@@ -5762,6 +5772,45 @@ async fn follower_mode_skips_external_providers() {
     // In follower mode they should always be absent.
     assert!(!provider_names.contains_key("cloud_agent"), "follower should not have cloud_agent provider");
     assert!(!provider_names.contains_key("ai_utility"), "follower should not have ai_utility provider");
+
+    let expected_suppressions = ["ai_utility", "change_request", "cloud_agent", "issue_tracker"];
+    let host_summary = daemon.local_host_summary().await;
+    let mut host_suppressions = host_summary
+        .providers
+        .iter()
+        .filter(|provider| provider.disabled_reason.as_deref() == Some("follower mode"))
+        .map(|provider| provider.category.as_str())
+        .collect::<Vec<_>>();
+    host_suppressions.sort_unstable();
+    assert_eq!(host_suppressions, expected_suppressions);
+
+    let repo_providers = daemon.get_repo_providers_internal(&RepoSelector::Path(repo)).await.expect("repo providers");
+    let mut repo_suppressions = repo_providers
+        .providers
+        .iter()
+        .filter(|provider| provider.disabled_reason.as_deref() == Some("follower mode"))
+        .map(|provider| provider.category.as_str())
+        .collect::<Vec<_>>();
+    repo_suppressions.sort_unstable();
+    assert_eq!(repo_suppressions, expected_suppressions);
+}
+
+#[tokio::test]
+async fn missing_issue_provider_explains_follower_mode_only_on_followers() {
+    let config_tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(config_tmp.path().to_path_buf());
+    let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+
+    let leader = InProcessDaemon::new(vec![], config.clone(), fake_discovery(false), HostName::local()).await;
+    let leader_error = leader.issue_provider_for_source(&source).await.err().expect("leader should have no provider in test environment");
+    assert_eq!(leader_error, "no issue provider available for https://github.com flotilla-org/flotilla");
+
+    let follower = InProcessDaemon::new(vec![], config, fake_discovery(true), HostName::local()).await;
+    let follower_error = follower.issue_provider_for_source(&source).await.err().expect("follower should have no issue provider");
+    assert_eq!(
+        follower_error,
+        "no issue provider available for https://github.com flotilla-org/flotilla: this host runs in follower mode; dispatch from a leader host"
+    );
 }
 
 #[tokio::test]
