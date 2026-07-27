@@ -2661,7 +2661,8 @@ mod tests {
                 repositories: vec![ConvoyRepositorySpec {
                     url: "https://github.com/flotilla-org/flotilla.git".to_string(),
                     repo_ref: repository_key,
-                    base_ref: "main".to_string(),
+                    source_ref: "main".to_string(),
+                    target_ref: "main".to_string(),
                     workspace_slug: repository_spec.leaf_slug(),
                     subpaths: Vec::new(),
                 }],

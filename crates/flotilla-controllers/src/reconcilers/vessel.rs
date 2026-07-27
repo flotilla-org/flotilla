@@ -473,7 +473,7 @@ impl Reconciler for VesselReconciler {
                                 repo_ref: repository_key.clone(),
                                 env_ref: clone_env_ref.clone(),
                                 r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
-                                base_ref: Some(convoy_repository.base_ref.clone()),
+                                base_ref: Some(convoy_repository.source_ref.clone()),
                                 target_path: checkout_target_path,
                                 clone_ref: clone_name.expect("shared-clone strategy requires clone name"),
                             })
@@ -482,7 +482,7 @@ impl Reconciler for VesselReconciler {
                             repo_ref: repository_key,
                             env_ref: precreated_environment_ref.clone().expect("fresh-clone strategy should precreate environment"),
                             r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
-                            base_ref: Some(convoy_repository.base_ref.clone()),
+                            base_ref: Some(convoy_repository.source_ref.clone()),
                             target_path: checkout_target_path,
                             url: convoy_repository.url.clone(),
                         }),

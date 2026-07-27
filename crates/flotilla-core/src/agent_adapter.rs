@@ -262,7 +262,7 @@ pub fn append_convoy_work_context(
     }
     content.push_str("- Repositories:\n");
     for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
-        content.push_str(&format!("  - `{}` — {}\n", repository.repo_ref, repository.url));
+        content.push_str(&format!("  - `{}` — {} (target `{}`)\n", repository.repo_ref, repository.url, repository.target_ref));
     }
     if !convoy.spec.issues.is_empty() {
         let header = if convoy.spec.issues.len() == 1 { "Issue snapshot" } else { "Issue snapshots" };
@@ -790,7 +790,7 @@ mod tests {
         assert!(brief.contains("sign off on the fork PR"));
         assert!(brief.contains("Never add a git remote"));
         assert!(brief.contains("Never open issues, pull requests, or comments against the upstream repository"));
-        assert!(brief.contains("base set to the stack branch named in the dispatch inputs"));
+        assert!(brief.contains("base set to the repository target named in the work context"));
     }
 
     #[test]
@@ -924,7 +924,8 @@ mod tests {
                 repositories: vec![ConvoyRepositorySpec {
                     url: "https://github.com/flotilla-org/flotilla".to_string(),
                     repo_ref: repo_ref.clone(),
-                    base_ref: "main".to_string(),
+                    source_ref: "main".to_string(),
+                    target_ref: "main".to_string(),
                     workspace_slug: "flotilla".to_string(),
                     subpaths: Vec::new(),
                 }],
@@ -939,6 +940,7 @@ mod tests {
         let mut content = String::new();
         append_convoy_work_context(&mut content, &convoy, &[repo_ref]);
 
+        assert!(content.contains("- `repo_widgets` — https://github.com/flotilla-org/flotilla (target `main`)"));
         assert!(content.contains("First issue body.\n\nSource-qualified reference: `https://github.com` / `flotilla-org/flotilla` / `810`"));
     }
 

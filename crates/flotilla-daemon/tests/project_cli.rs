@@ -873,7 +873,8 @@ async fn convoy_create_carries_project_ref() {
     let convoy = backend.using::<Convoy>("flotilla").get("linked").await.expect("convoy");
     assert_eq!(convoy.spec.project_ref.as_deref(), Some("my-project"));
     assert_eq!(convoy.spec.repositories.len(), 1);
-    assert_eq!(convoy.spec.repositories[0].base_ref, "main");
+    assert_eq!(convoy.spec.repositories[0].source_ref, "main");
+    assert_eq!(convoy.spec.repositories[0].target_ref, "main");
 }
 
 #[tokio::test]

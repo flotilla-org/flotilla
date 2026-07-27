@@ -104,6 +104,7 @@ pub fn convoy_status(phase: flotilla_resources::ConvoyPhase) -> RealConvoyStatus
         finished_at: None,
         observed_workflow_ref: None,
         observed_workflows: None,
+        target_mismatches: Vec::new(),
     }
 }
 
@@ -221,7 +222,8 @@ pub fn task_provisioning_convoy_spec() -> RealConvoySpec {
     spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec {
         url: "git@github.work:flotilla-org/flotilla.git".to_string(),
         repo_ref: repository.key(),
-        base_ref: "main".to_string(),
+        source_ref: "main".to_string(),
+        target_ref: "main".to_string(),
         workspace_slug: repository.leaf_slug(),
         subpaths: Vec::new(),
     }];
@@ -307,6 +309,7 @@ pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some([("review-and-fix".to_string(), "42".to_string())].into_iter().collect()),
+        target_mismatches: Vec::new(),
     }
 }
 
@@ -397,5 +400,6 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some([("review-and-fix".to_string(), "42".to_string())].into_iter().collect()),
+        target_mismatches: Vec::new(),
     }
 }
