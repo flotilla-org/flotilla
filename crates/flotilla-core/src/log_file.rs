@@ -34,7 +34,7 @@ pub fn read_daemon_logs(state_dir: &Path, generations: usize, query: &DaemonLogQ
         .map(|seconds| {
             let duration = Duration::from_std(std::time::Duration::from_secs(seconds))
                 .map_err(|_| format!("log duration is too large: {seconds}s"))?;
-            Ok::<_, String>(Utc::now() - duration)
+            Utc::now().checked_sub_signed(duration).ok_or_else(|| format!("log duration is too large: {seconds}s"))
         })
         .transpose()?;
 
@@ -331,5 +331,14 @@ mod tests {
         let error = read_daemon_logs(state.path(), 4, &DaemonLogQuery { since_seconds: None, level: Some("verbose".into()), target: None })
             .expect_err("unknown level");
         assert!(error.contains("invalid log level"));
+    }
+
+    #[test]
+    fn rejects_since_duration_outside_datetime_range() {
+        let state = tempdir().expect("tempdir");
+        let error =
+            read_daemon_logs(state.path(), 4, &DaemonLogQuery { since_seconds: Some(9_000_000_000_000), level: None, target: None })
+                .expect_err("out-of-range duration");
+        assert!(error.contains("log duration is too large"));
     }
 }

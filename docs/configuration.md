@@ -87,7 +87,9 @@ generations = 4
 ```
 
 The filter uses `RUST_LOG` directive syntax. When it is omitted, the daemon
-uses `RUST_LOG` and then its built-in defaults.
+uses `RUST_LOG` and then its built-in defaults. Restart the daemon after
+changing logging settings; the writer and its rotation bounds are configured
+at startup.
 
 Read local or peer logs on demand without SSH:
 

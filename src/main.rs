@@ -82,7 +82,7 @@ enum SubCommand {
     Watch,
     /// Show the daemon's current multi-host routing view
     Topology,
-    /// Stream structured daemon logs from this host or a peer
+    /// Read structured daemon logs from this host or a peer
     Logs {
         /// Peer host name; omit to read this host
         #[arg(long)]
