@@ -200,7 +200,14 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
                 status.message = Some(message.clone());
             }
             Self::UpdateIntegration { integration } => {
-                let landed_was_latched = status.integration.landed.value == ConditionValue::True;
+                // Only evidence-backed landings latch: a merged change request
+                // does not unmerge, so a later observation may not lower it.
+                // A vacuous True ("nothing to land yet" on an untouched
+                // branch) is not a landing fact and must yield to fresh
+                // evidence — latching it would let a convoy land against an
+                // observation that predates its change request (#1163).
+                let landed_was_latched =
+                    status.integration.landed.value == ConditionValue::True && status.integration.landed_evidence.is_some();
                 let landed_evidence = status.integration.landed_evidence.clone();
                 status.integration = integration.clone();
                 if landed_was_latched {
@@ -211,5 +218,44 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn condition(value: ConditionValue) -> IntegrationCondition {
+        IntegrationCondition::builder().value(value).observed_at("2026-07-27T00:00:00Z".to_string()).build()
+    }
+
+    fn integration(landed: ConditionValue, landed_evidence: Option<LandedEvidence>) -> CheckoutIntegrationStatus {
+        CheckoutIntegrationStatus {
+            clean: condition(ConditionValue::True),
+            pushed: condition(ConditionValue::True),
+            landed: condition(landed),
+            landed_evidence,
+        }
+    }
+
+    #[test]
+    fn vacuous_landed_true_yields_to_fresh_false_observation() {
+        // A True recorded with no landed evidence ("nothing to land yet" on an
+        // untouched branch) is not a landing fact; a later observation that
+        // finds an open change request must lower it (#1163).
+        let mut status = CheckoutStatus { integration: integration(ConditionValue::True, None), ..Default::default() };
+        CheckoutStatusPatch::UpdateIntegration { integration: integration(ConditionValue::False, None) }.apply(&mut status);
+        assert_eq!(status.integration.landed.value, ConditionValue::False);
+    }
+
+    #[test]
+    fn evidence_backed_landed_true_latches_over_later_observations() {
+        // A merged change request does not unmerge: evidence-backed landings
+        // stay landed even if a later probe cannot see the change request.
+        let evidence = LandedEvidence::builder().change_request_id("1162".to_string()).build();
+        let mut status = CheckoutStatus { integration: integration(ConditionValue::True, Some(evidence.clone())), ..Default::default() };
+        CheckoutStatusPatch::UpdateIntegration { integration: integration(ConditionValue::False, None) }.apply(&mut status);
+        assert_eq!(status.integration.landed.value, ConditionValue::True);
+        assert_eq!(status.integration.landed_evidence, Some(evidence));
     }
 }

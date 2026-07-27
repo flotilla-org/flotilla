@@ -1364,6 +1364,9 @@ struct ConvoyAdmission {
 /// recently observed snapshot. Keep this deliberately fixed until an
 /// operational need establishes that it should be configurable.
 const ISSUE_SNAPSHOT_FRESHNESS: ChronoDuration = ChronoDuration::minutes(5);
+/// Maximum age of a checkout's landed observation for the Landing→Landed
+/// decision; older evidence is re-probed at the decision edge (#1163).
+const LANDING_EVIDENCE_TTL: ChronoDuration = ChronoDuration::seconds(30);
 
 fn issue_snapshot_is_fresh(issue: &flotilla_protocol::Issue) -> bool {
     let Some(observed_at) = issue.observed_at else { return false };
@@ -2101,7 +2104,11 @@ impl InProcessDaemon {
             };
             let runner = self.runner_for_resource_checkout(&checkout).await?;
             let mut integration = inspect_checkout_integration(&*runner, Path::new(path), &checkout.spec).await;
-            if let Some(existing) = checkout.status.as_ref().filter(|status| status.integration.landed.value == ConditionValue::True) {
+            if let Some(existing) = checkout
+                .status
+                .as_ref()
+                .filter(|status| status.integration.landed.value == ConditionValue::True && status.integration.landed_evidence.is_some())
+            {
                 integration.landed.value = ConditionValue::True;
                 if integration.landed_evidence.is_none() {
                     integration.landed_evidence = existing.integration.landed_evidence.clone();
@@ -5413,6 +5420,65 @@ impl InProcessDaemon {
         }
     }
 
+    /// Evaluate the Landing→Landed condition on evidence no older than
+    /// [`LANDING_EVIDENCE_TTL`]: every managed convoy checkout's landed
+    /// condition must be `True` on a recent observation. Cached conditions may
+    /// predate a just-opened change request (#1163), so anything older is
+    /// re-probed at the decision edge and the fresh observation persisted;
+    /// anything unknown or unprobeable holds Landing — absence of evidence
+    /// never releases the gate. Recent observations are trusted as-is, which
+    /// bounds forge lookups and keeps the persist from re-triggering the
+    /// reconcile in a loop. Adopted checkouts are exempt, exactly as they are
+    /// from teardown deletion: the convoy does not own their integration
+    /// lifecycle.
+    pub async fn convoy_change_requests_settled(&self, namespace: &str, name: &str) -> Result<bool, String> {
+        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
+        let checkout_list = checkouts
+            .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]))
+            .await
+            .map_err(|err| err.to_string())?
+            .items;
+        for checkout in checkout_list {
+            if checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted) {
+                continue;
+            }
+            if let Some(landed) = checkout.status.as_ref().map(|status| &status.integration.landed) {
+                let recent = landed
+                    .observed_at
+                    .as_deref()
+                    .and_then(|observed_at| chrono::DateTime::parse_from_rfc3339(observed_at).ok())
+                    .is_some_and(|observed_at| Utc::now().signed_duration_since(observed_at) < LANDING_EVIDENCE_TTL);
+                if recent {
+                    if condition_is_true(landed) {
+                        continue;
+                    }
+                    return Ok(false);
+                }
+            }
+            let Some(path) = checkout_path(&checkout).map(|path| Path::new(path).to_path_buf()) else {
+                return Ok(false);
+            };
+            let runner = match self.runner_for_resource_checkout(&checkout).await {
+                Ok(runner) => runner,
+                Err(_) => return Ok(false),
+            };
+            let integration = inspect_checkout_integration(&*runner, &path, &checkout.spec).await;
+            if let Err(error) = apply_resource_status_patch(
+                &checkouts,
+                &checkout.metadata.name,
+                &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: integration.clone() },
+            )
+            .await
+            {
+                warn!(checkout = %checkout.metadata.name, %error, "failed to persist checkout integration conditions during landing evaluation");
+            }
+            if !condition_is_true(&integration.landed) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub async fn verify_convoy_teardown_gate(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         if force {
             return Ok(());
@@ -5469,7 +5535,11 @@ impl InProcessDaemon {
                 }
             };
             let mut integration = inspect_checkout_integration(&*runner, &path, &checkout.spec).await;
-            if let Some(existing) = checkout.status.as_ref().filter(|status| status.integration.landed.value == ConditionValue::True) {
+            if let Some(existing) = checkout
+                .status
+                .as_ref()
+                .filter(|status| status.integration.landed.value == ConditionValue::True && status.integration.landed_evidence.is_some())
+            {
                 integration.landed.value = ConditionValue::True;
                 if integration.landed_evidence.is_none() {
                     integration.landed_evidence = existing.integration.landed_evidence.clone();
