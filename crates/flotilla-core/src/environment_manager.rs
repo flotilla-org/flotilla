@@ -13,7 +13,10 @@ use crate::{
     config::ConfigStore,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
-        discovery::{run_host_detectors, DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, FactoryRegistry},
+        discovery::{
+            detectors::default_host_detectors, run_host_detectors, run_provisioned_host_detectors, DiscoveryRuntime, EnvironmentBag,
+            FactoryRegistry,
+        },
         environment::{CreateOpts, EnvironmentHandle, ProvisionedMount, ProvisionedMountMode},
         registry::ProviderRegistry,
         CommandRunner,
@@ -408,10 +411,7 @@ impl EnvironmentManager {
         let env_runner = handle.runner();
 
         let raw_env_vars = handle.env_vars().await?;
-        let mut bag = EnvironmentBag::new();
-        for (key, value) in &raw_env_vars {
-            bag = bag.with(EnvironmentAssertion::env_var(key, value));
-        }
+        let bag = run_provisioned_host_detectors(&default_host_detectors(), &*env_runner, &raw_env_vars).await;
 
         let config = ConfigStore::with_base(config_base.as_path().join(format!("env-discovery/{env_id}")));
         let env_repo_root = ExecutionEnvironmentPath::new("/workspace");
@@ -958,7 +958,18 @@ mod tests {
         let env_id = EnvironmentId::new("env-discover-1");
         let discovery = fake_discovery(false);
         let manager = EnvironmentManager::new_local(&discovery, test_local_environment_id(), test_local_host_id()).await;
-        let (handle, _) = mock_handle(&env_id, HashMap::from([(String::from("ANTHROPIC_API_KEY"), String::from("test-key"))]), None);
+        let handle: EnvironmentHandle = Arc::new(MockProvisionedEnvironment {
+            id: env_id.clone(),
+            image: ImageId::new("mock:image"),
+            runner: Arc::new(DiscoveryMockRunner::builder().on_run("codex", &["--version"], Ok("codex-cli 1.2.3".to_string())).build()),
+            env_vars: HashMap::from([
+                (String::from("ANTHROPIC_API_KEY"), String::from("test-key")),
+                (String::from("FLOTILLA_ENVIRONMENT_ID"), String::from("env-discover-1")),
+            ]),
+            provisioned_mounts: Vec::new(),
+            destroyed: Arc::new(AtomicBool::new(false)),
+            destroy_error: None,
+        });
         manager
             .register_provisioned_environment(env_id.clone(), handle, EnvironmentBag::new(), None)
             .expect("register provisioned environment");
@@ -969,7 +980,11 @@ mod tests {
             .expect("ensure providers");
 
         assert_eq!(manager.environment_bag(&env_id).expect("environment bag").find_env_var("ANTHROPIC_API_KEY"), Some("test-key"));
-        assert!(manager.environment_registry(&env_id).is_some());
+        assert_eq!(
+            manager.environment_bag(&env_id).expect("environment bag").find_env_var("FLOTILLA_ENVIRONMENT_ID"),
+            Some("env-discover-1")
+        );
+        assert!(manager.environment_registry(&env_id).expect("environment registry").agent_adapters.get("codex").is_some());
     }
 
     #[tokio::test]

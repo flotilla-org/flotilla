@@ -1,6 +1,6 @@
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::Utc;
 use common::{
@@ -717,6 +717,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
     create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-fresh", DockerEnvironmentSpec {
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
+        declared_agent_adapters: Default::default(),
         mounts: Vec::new(),
         env: Default::default(),
     })
@@ -928,6 +929,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
     create_ready_docker_environment(&backend, NAMESPACE, environment_ref, DockerEnvironmentSpec {
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
+        declared_agent_adapters: Default::default(),
         mounts: Vec::new(),
         env: Default::default(),
     })
@@ -1107,7 +1109,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),
-            agent_adapters: Default::default(),
+            agent_adapters: BTreeSet::from(["codex".to_string()]),
             default_cwd: None,
             env: Default::default(),
             checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
@@ -1118,6 +1120,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
     Some(DockerEnvironmentSpec {
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
+        declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
         mounts: vec![flotilla_resources::EnvironmentMount {
             source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
             target_path: "/workspace".to_string(),
@@ -1144,6 +1147,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
     Some(DockerEnvironmentSpec {
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
+        declared_agent_adapters: Default::default(),
         mounts: Vec::new(),
         env: Default::default(),
     }),
