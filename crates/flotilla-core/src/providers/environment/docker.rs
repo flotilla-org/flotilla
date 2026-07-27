@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     runner::DockerEnvironmentRunner, CreateOpts, EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount,
+    ProvisionedMountMode,
 };
 use crate::providers::{ChannelLabel, CommandRunner};
 
@@ -92,8 +93,17 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             &env_id_env,
         ];
 
-        let mount_specs: Vec<String> =
-            opts.provisioned_mounts.iter().map(|mount| format!("{}:{}:ro", mount.host_path, mount.environment_path)).collect();
+        let mount_specs: Vec<String> = opts
+            .provisioned_mounts
+            .iter()
+            .map(|mount| {
+                let mode = match mount.mode {
+                    ProvisionedMountMode::Ro => "ro",
+                    ProvisionedMountMode::Rw => "rw",
+                };
+                format!("{}:{}:{mode}", mount.host_path, mount.environment_path)
+            })
+            .collect();
         for mount_spec in &mount_specs {
             args.push("-v");
             args.push(mount_spec);

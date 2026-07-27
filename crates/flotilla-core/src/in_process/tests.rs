@@ -46,7 +46,7 @@ use crate::{
             },
             EnvironmentAssertion, EnvironmentBag, HostPlatform,
         },
-        environment::{EnvironmentHandle, ProvisionedEnvironment, ProvisionedMount},
+        environment::{EnvironmentHandle, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
         ChannelLabel, CommandOutput, CommandRunner,
     },
 };
@@ -4741,7 +4741,7 @@ async fn normalize_local_provider_hosts_uses_mount_metadata_for_provisioned_chec
         id: environment_id.clone(),
         image: ImageId::new("image:test"),
         runner: Arc::new(DiscoveryMockRunner::builder().build()),
-        mounts: vec![ProvisionedMount::new("/host/reference-repo", "/workspace/repo")],
+        mounts: vec![ProvisionedMount::new("/host/reference-repo", "/workspace/repo", ProvisionedMountMode::Ro)],
     });
     environment_manager
         .register_provisioned_environment(environment_id.clone(), handle, EnvironmentBag::new(), None)

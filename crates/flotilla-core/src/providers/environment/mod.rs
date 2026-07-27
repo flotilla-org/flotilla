@@ -32,11 +32,19 @@ pub struct CreateOpts {
 pub struct ProvisionedMount {
     pub host_path: DaemonHostPath,
     pub environment_path: ExecutionEnvironmentPath,
+    pub mode: ProvisionedMountMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProvisionedMountMode {
+    Ro,
+    Rw,
 }
 
 impl ProvisionedMount {
-    pub fn new(host_path: impl Into<PathBuf>, environment_path: impl Into<PathBuf>) -> Self {
-        Self { host_path: DaemonHostPath::new(host_path), environment_path: ExecutionEnvironmentPath::new(environment_path) }
+    pub fn new(host_path: impl Into<PathBuf>, environment_path: impl Into<PathBuf>, mode: ProvisionedMountMode) -> Self {
+        Self { host_path: DaemonHostPath::new(host_path), environment_path: ExecutionEnvironmentPath::new(environment_path), mode }
     }
 }
 
