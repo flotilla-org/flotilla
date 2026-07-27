@@ -1,5 +1,5 @@
 use flotilla_protocol::{
-    result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessState, CrewMemberSummary},
+    result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessLink, AwarenessNode, AwarenessState, CrewMemberSummary},
     ChangeRequestStatus, ConvoyChangeRequest, HostName, IssueRef, IssueSource, RepoKey, RepositoryKey, ResourceRef,
 };
 
@@ -180,6 +180,47 @@ fn awareness_composed_text_is_unchanged_alongside_granular_facts() {
     assert_eq!(text(project, KEY_SUMMARY_TEXT), "2 entries · 0 issues · 0 vessels · 1 checkouts");
     assert_eq!(project.set[KEY_COUNT_TOTAL].value, MetadataValue::Integer(2));
     assert_eq!(project.set[KEY_COUNT_CHECKOUTS].value, MetadataValue::Integer(1));
+}
+
+#[test]
+fn standing_checkout_mints_a_transient_terminal_action_but_convoy_checkout_does_not() {
+    let checkout = |id: &str, path: &str, links: Vec<AwarenessLink>| {
+        AwarenessEntry::builder()
+            .id(id.to_owned())
+            .kind(AwarenessKind::Checkout)
+            .label(format!("main · {path}"))
+            .state(AwarenessState::Active)
+            .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+            .refs(vec![ResourceRef::new("flotilla.work/v1", "Checkout", "dev", id).on_host(HostName::new("kiwi"))])
+            .links(links)
+            .annotations(std::collections::HashMap::from([
+                (KEY_CHECKOUT_BRANCH.to_owned(), "main".to_owned()),
+                (KEY_CHECKOUT_PATH.to_owned(), path.to_owned()),
+            ]))
+            .build()
+    };
+    let standing = checkout("standing", "/work/standing", vec![]);
+    let convoy_owned =
+        checkout("convoy-owned", "/work/convoy", vec![AwarenessLink { rel: "for-convoy".to_owned(), target: "dev/ship-it".to_owned() }]);
+    let node = AwarenessNode::builder()
+        .id("project/dev/platform".to_owned())
+        .kind(AwarenessKind::Project)
+        .label("platform".to_owned())
+        .scope(flotilla_protocol::QueryScope::new("dev", "platform"))
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .counts(AwarenessCounts::builder().total(2).checkouts(2).build())
+        .entries(vec![standing, convoy_owned])
+        .build();
+
+    let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
+    let standing = find_entity(&patches, &entity::checkout("standing"));
+    assert_eq!(text(standing, KEY_PRIMARY_ACTION_RECIPE), "flotilla attach --transient --host 'kiwi' '/work/standing'");
+    assert_eq!(text(standing, KEY_PRIMARY_ACTION_TARGET), entity::checkout("standing").action_target());
+
+    let convoy_owned = find_entity(&patches, &entity::checkout("convoy-owned"));
+    assert!(!convoy_owned.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
+    assert!(!convoy_owned.set.contains_key(KEY_PRIMARY_ACTION_TARGET));
 }
 
 #[test]
