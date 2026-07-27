@@ -6141,7 +6141,11 @@ impl InProcessDaemon {
                     let holder = if holder.is_empty() { fallback_holder.to_string() } else { holder };
                     (pool.watch_args(attach_target.session_id)?, Some(holder))
                 }
-                Ok(None) | Err(_) => (pool.attach_args(attach_target.session_id, attach_target.launch_command, &cwd, &Vec::new())?, None),
+                Ok(None) => (pool.attach_args(attach_target.session_id, attach_target.launch_command, &cwd, &Vec::new())?, None),
+                Err(error) => {
+                    warn!(session = attach_target.session_id, %error, "could not inspect terminal controller; attempting control attach");
+                    (pool.attach_args(attach_target.session_id, attach_target.launch_command, &cwd, &Vec::new())?, None)
+                }
             },
             AttachSeatRequest::WatchIfControlled => {
                 let holder = pool

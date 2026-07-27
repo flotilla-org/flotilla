@@ -2300,6 +2300,46 @@ async fn watch_fallback_refuses_when_the_controller_seat_is_available() {
 }
 
 #[tokio::test]
+async fn attach_query_fails_open_when_controller_inspection_errors() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let (daemon, terminal_pool) = new_attach_test_daemon_with_pool(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_running_attach_session(
+        &daemon,
+        &env_ref,
+        "terminal-convoy-a-implement-coder",
+        "cleat-session-1",
+        "convoy-a",
+        "implement",
+        "coder",
+    )
+    .await;
+    terminal_pool.set_controller_holder_error("cleat inspect schema changed").await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    let CommandValue::AttachCommandResolved { command, .. } = result else {
+        panic!("expected attach command, got {result:?}");
+    };
+    assert_eq!(command, "attach cleat-session-1");
+}
+
+#[tokio::test]
 async fn attach_query_rejects_a_running_agent_without_a_recorded_launch_command() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");

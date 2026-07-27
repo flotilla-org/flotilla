@@ -798,6 +798,7 @@ pub struct FakeTerminalPool {
     pub ensured: Arc<TokioMutex<Vec<EnsuredTerminalSession>>>,
     pub captured_screens: Arc<TokioMutex<HashMap<String, String>>>,
     pub controller_holders: Arc<TokioMutex<HashMap<String, String>>>,
+    pub controller_holder_error: Arc<TokioMutex<Option<String>>>,
 }
 
 pub struct EnsuredTerminalSession {
@@ -822,6 +823,7 @@ impl FakeTerminalPool {
             ensured: Arc::new(TokioMutex::new(Vec::new())),
             captured_screens: Arc::new(TokioMutex::new(HashMap::new())),
             controller_holders: Arc::new(TokioMutex::new(HashMap::new())),
+            controller_holder_error: Arc::new(TokioMutex::new(None)),
         }
     }
 
@@ -839,6 +841,10 @@ impl FakeTerminalPool {
 
     pub async fn set_controller_holder(&self, session_name: &str, holder: &str) {
         self.controller_holders.lock().await.insert(session_name.to_string(), holder.to_string());
+    }
+
+    pub async fn set_controller_holder_error(&self, error: &str) {
+        *self.controller_holder_error.lock().await = Some(error.to_string());
     }
 }
 
@@ -891,6 +897,9 @@ impl TerminalPool for FakeTerminalPool {
     }
 
     async fn controller_holder(&self, session_name: &str) -> Result<Option<String>, String> {
+        if let Some(error) = self.controller_holder_error.lock().await.clone() {
+            return Err(error);
+        }
         Ok(self.controller_holders.lock().await.get(session_name).cloned())
     }
 
