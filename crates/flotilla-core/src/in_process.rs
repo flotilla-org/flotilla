@@ -2382,12 +2382,14 @@ impl InProcessDaemon {
         dispatching_principal_ref: Option<&PrincipalRef>,
     ) -> Result<flotilla_protocol::PreparedConvoyStart, String> {
         let namespace = self.provisioning_namespace().await;
-        let requested_namespace = intent.namespace.as_deref().unwrap_or(&namespace);
+        let default_namespace = intent.namespace.as_deref().unwrap_or(&namespace);
+        let (requested_namespace, intent) = normalize_convoy_start_intent(default_namespace, intent)?;
         if requested_namespace != namespace {
             return Err(format!("namespace `{requested_namespace}` is not served by this daemon (configured namespace: `{namespace}`)"));
         }
         let fallback_principal = PrincipalRef::implicit_for_namespace(&namespace);
-        let admission = self.prepare_convoy_admission(&namespace, intent, dispatching_principal_ref.unwrap_or(&fallback_principal)).await?;
+        let admission =
+            self.prepare_convoy_admission(&namespace, &intent, dispatching_principal_ref.unwrap_or(&fallback_principal)).await?;
         let workflow_value = serde_json::to_value(&admission.workflow).map_err(|error| error.to_string())?;
         let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
         let (placement_policy_name, placement_policy_spec) = match admission.placement_policy {
@@ -3427,6 +3429,44 @@ fn required_admission_value<'a>(value: &'a str, field: &str) -> Result<&'a str, 
     }
 }
 
+fn resolve_project_ref(default_namespace: &str, value: &str) -> Result<(String, String), String> {
+    let value = required_admission_value(value, "project")?;
+    let address_value = value.strip_prefix(flotilla_protocol::view_address::SCHEME_PREFIX).unwrap_or(value);
+    let has_scheme = address_value != value;
+    if has_scheme || (address_value.starts_with("project/") && address_value.split('/').count() != 2) {
+        return match value.parse::<ViewAddress>() {
+            Ok(ViewAddress::Project { namespace, name }) => Ok((namespace, name)),
+            Ok(address) => Err(format!("invalid project reference {value}: expected a project address, got {}", address.kind_name())),
+            Err(error) => Err(format!("invalid project reference {value}: {error}")),
+        };
+    }
+    match value.split('/').collect::<Vec<_>>().as_slice() {
+        [name] => Ok((default_namespace.to_string(), (*name).to_string())),
+        [namespace, name] if !namespace.is_empty() && !name.is_empty() => Ok(((*namespace).to_string(), (*name).to_string())),
+        _ => Err(format!("invalid project reference {value}: expected <name>, <namespace>/<name>, or project/<namespace>/<name>")),
+    }
+}
+
+fn normalize_convoy_start_intent(
+    default_namespace: &str,
+    intent: &flotilla_protocol::ConvoyStartIntent,
+) -> Result<(String, flotilla_protocol::ConvoyStartIntent), String> {
+    let (namespace, project_ref) = resolve_project_ref(default_namespace, &intent.project_ref)?;
+    let mut intent = intent.clone();
+    intent.namespace = Some(namespace.clone());
+    intent.project_ref = project_ref;
+    Ok((namespace, intent))
+}
+
+fn project_not_ready_error(namespace: &str, project_ref: &str, error: ResourceError) -> String {
+    match error {
+        ResourceError::NotFound { name } => {
+            format!("project {namespace}/{project_ref} is not ready: resource not found: {name} (tried {namespace}/{project_ref})")
+        }
+        error => format!("project {project_ref} is not ready: {error}"),
+    }
+}
+
 fn workflow_has_in_crew_review(workflow: &WorkflowTemplateSpec) -> bool {
     workflow.vessels.iter().any(|vessel| {
         let agent_count = vessel.crew.iter().filter(|crew| matches!(crew.source, CrewSource::Agent { .. })).count();
@@ -3691,7 +3731,7 @@ impl InProcessDaemon {
             .definitions::<Project>(namespace)
             .get(project_ref)
             .await
-            .map_err(|error| format!("project {project_ref} is not ready: {error}"))?;
+            .map_err(|error| project_not_ready_error(namespace, project_ref, error))?;
         let repositories = self.snapshot_project_repositories(namespace, project_ref).await?;
         let mut seen_issue_selectors = HashSet::new();
         let mut issues = Vec::with_capacity(intent.issues.len());
@@ -4080,7 +4120,7 @@ impl InProcessDaemon {
             .definitions::<Project>(namespace)
             .get(project_ref)
             .await
-            .map_err(|error| format!("project {project_ref} is not ready: {error}"))?;
+            .map_err(|error| project_not_ready_error(namespace, project_ref, error))?;
         let repositories = self.resource_backend.clone().using::<Repository>(namespace);
         let mut unresolved = Vec::new();
         let mut snapshots = BTreeMap::<RepositoryKey, (String, RepositorySpec, Option<String>, BTreeSet<String>)>::new();
@@ -6481,10 +6521,17 @@ impl InProcessDaemon {
 
         if let flotilla_protocol::CommandAction::ConvoyStart { intent } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let namespace = intent.namespace.clone().unwrap_or(self.provisioning_namespace().await);
+            let default_namespace = intent.namespace.clone().unwrap_or(self.provisioning_namespace().await);
+            let (namespace, intent) = match normalize_convoy_start_intent(&default_namespace, intent) {
+                Ok(resolved) => resolved,
+                Err(message) => {
+                    self.finish_context_free_command(id, empty_identity, flotilla_protocol::CommandValue::Error { message });
+                    return Ok(id);
+                }
+            };
             let dispatching_principal_ref =
                 dispatching_principal_ref.clone().unwrap_or_else(|| PrincipalRef::implicit_for_namespace(&namespace));
-            let key = ConvoyStartKey::new(namespace, intent);
+            let key = ConvoyStartKey::new(namespace, &intent);
             if !self.pending_convoy_starts.lock().await.insert(key.clone()) {
                 self.finish_context_free_command(id, empty_identity, flotilla_protocol::CommandValue::Error {
                     message: format!("convoy start for project {} is already in progress", intent.project_ref),
@@ -6493,7 +6540,7 @@ impl InProcessDaemon {
             }
             let task = ConvoyStartTask::builder()
                 .command_id(id)
-                .intent(intent.as_ref().clone())
+                .intent(intent)
                 .key(key.clone())
                 .dispatching_principal_ref(dispatching_principal_ref)
                 .build();

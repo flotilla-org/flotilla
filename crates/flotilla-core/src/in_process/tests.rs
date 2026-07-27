@@ -53,6 +53,12 @@ use crate::{
 
 const TEST_LOCAL_ATTACH_HOST: &str = "local";
 
+#[test]
+fn project_reference_distinguishes_project_namespace_from_full_address() {
+    assert_eq!(resolve_project_ref("flotilla", "project/widgets"), Ok(("project".into(), "widgets".into())));
+    assert_eq!(resolve_project_ref("flotilla", "project/project/widgets"), Ok(("project".into(), "widgets".into())));
+}
+
 fn overwrite_single_saved_repo_config(config_base: &Path, repo: &Path, body: String) {
     let store = ConfigStore::with_base(config_base);
     store.save_repo(&ExecutionEnvironmentPath::new(repo));

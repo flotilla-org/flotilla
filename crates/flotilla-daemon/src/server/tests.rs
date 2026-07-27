@@ -1256,7 +1256,7 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
         .action(CommandAction::ConvoyStart {
             intent: Box::new(
                 ConvoyStartIntent::builder()
-                    .project_ref("flotilla".to_string())
+                    .project_ref("flotilla/flotilla".to_string())
                     .name("remote-work".to_string())
                     .branch("feat/remote-work".to_string())
                     .placement_policy(remote_policy_name.clone())
