@@ -1853,6 +1853,35 @@ async fn fleet_list_preserves_stale_rows_when_replica_is_unreachable() {
 }
 
 #[tokio::test]
+async fn fleet_list_reports_a_connected_peer_with_failed_resource_replication() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let peer = NodeId::new("feta-node");
+    daemon.set_configured_peers(vec![NodeInfo::new(peer.clone(), "feta")]).await;
+    publish_attach_host_summary(&daemon, "feta", "feta").await;
+    daemon.report_resource_replication_failure(&peer, "Convoy", "watch resourceVersion 7676 expired").await;
+
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+
+    assert_eq!(response.replicas.len(), 1);
+    assert_eq!(response.replicas[0].host, HostName::new("feta"));
+    assert!(!response.replicas[0].reachable);
+    assert!(
+        response.replicas[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("Convoy") && message.contains("watch resourceVersion 7676 expired")),
+        "the failed peer must have an explicit resource-replication error: {:?}",
+        response.replicas[0]
+    );
+}
+
+#[tokio::test]
 async fn replica_refresh_replaces_rows_when_generation_changes() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
