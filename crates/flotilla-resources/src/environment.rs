@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,9 @@ pub struct HostDirectEnvironmentSpec {
 pub struct DockerEnvironmentSpec {
     pub host_ref: String,
     pub image: String,
+    /// Agent adapters the placement policy expects discovery to find in the image.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub declared_agent_adapters: BTreeSet<String>,
     #[serde(default)]
     pub mounts: Vec<EnvironmentMount>,
     #[serde(default)]

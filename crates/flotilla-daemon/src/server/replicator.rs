@@ -4,7 +4,7 @@ use chrono::Utc;
 use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, NodeId, ResourceWatchCursor, ResourceWatchResponse};
 use flotilla_resources::{
-    HttpBackend, K8sWatchEvent, ReadWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
+    HttpBackend, K8sWatchEvent, ReadWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceList, ResourceObject,
     ResourceProvenance, WatchEvent, WatchStart,
 };
 use futures::StreamExt;
@@ -72,7 +72,7 @@ impl SocketPathSource {
 }
 
 impl PeerReplicatorSupervisors {
-    pub(super) fn peer_connected(
+    pub(super) async fn peer_connected(
         &mut self,
         router: RemoteCommandRouter,
         daemon: Arc<InProcessDaemon>,
@@ -83,6 +83,7 @@ impl PeerReplicatorSupervisors {
         let Some((cancellation, socket_path_source)) = self.begin_generation(&peer, generation, resource_socket_path.clone()) else {
             return;
         };
+        daemon.begin_peer_resource_replication(&peer).await;
         let transport = match resource_socket_path {
             Some(_) => ReplicationTransport::Http(socket_path_source),
             #[cfg(feature = "test-support")]
@@ -94,6 +95,27 @@ impl PeerReplicatorSupervisors {
             }
         };
         flotilla_resources::for_each_registered_resource!(spawn_kind, &daemon, &peer, generation, &transport, &cancellation)
+    }
+
+    /// Cancel and drop a peer's resource replicators, but only if `generation`
+    /// still matches the generation currently tracked for that peer.
+    ///
+    /// Callers must only invoke this from a connection-owning task that has
+    /// no retry loop of its own (a terminal teardown), never from a
+    /// transient, still-retrying disconnect — otherwise replication could
+    /// not heal from a reconnect. The generation check guards against a
+    /// stale/displaced connection's belated teardown cancelling a newer,
+    /// already-reconnected generation's replicators.
+    pub(super) fn peer_disconnected(&mut self, peer: &NodeId, generation: u64) {
+        let is_current = self.generations.get(peer).is_some_and(|active| active.generation == generation);
+        if !is_current {
+            debug!(%peer, generation, "ignoring teardown for stale or already-superseded peer generation");
+            return;
+        }
+        if let Some(active) = self.generations.remove(peer) {
+            active.cancellation.cancel();
+            debug!(%peer, generation, "peer permanently disconnected; cancelled resource replicators");
+        }
     }
 
     fn begin_generation(
@@ -228,7 +250,11 @@ fn spawn_kind<T: Resource>(
                         let peer = run_peer.clone();
                         async move {
                             let http = HttpBackend::from_unix_socket(path).map_err(|error| error.to_string())?;
-                            replicate_kind_over_http::<T>(http, &daemon, &peer).await
+                            let result = replicate_kind_over_http::<T>(http, &daemon, &peer).await;
+                            if let Err(error) = &result {
+                                daemon.report_resource_replication_failure(&peer, T::API_PATHS.kind, error).await;
+                            }
+                            result
                         }
                     },
                 )
@@ -249,7 +275,13 @@ fn spawn_kind<T: Resource>(
                         let router = router.clone();
                         let daemon = Arc::clone(&run_daemon);
                         let peer = run_peer.clone();
-                        async move { replicate_kind_over_routed_watch::<T>(&router, &daemon, &peer).await }
+                        async move {
+                            let result = replicate_kind_over_routed_watch::<T>(&router, &daemon, &peer).await;
+                            if let Err(error) = &result {
+                                daemon.report_resource_replication_failure(&peer, T::API_PATHS.kind, error).await;
+                            }
+                            result
+                        }
                     },
                 )
                 .await;
@@ -345,25 +377,42 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
 ) -> Result<(), String> {
     let remote = ResourceBackend::Http(http).using::<T>(REPLICATION_NAMESPACE);
     let writer = daemon.resource_backend().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
+    let mut listed = remote.list().await.map_err(|error| error.to_string())?;
     let cursor = writer.cursor().await.map_err(|error| error.to_string())?;
-    if let Some(cursor) = cursor {
+    if let Some(cursor) = cursor.clone().filter(|cursor| cursor.generation == listed.generation) {
         let start = match cursor.generation {
             Some(generation) => WatchStart::FromVersionInGeneration { generation, resource_version: cursor.resource_version },
             None => WatchStart::FromVersion(cursor.resource_version),
         };
         match remote.watch(start).await {
-            Ok(watch) => return apply_http_watch(watch, &writer).await,
-            Err(error @ (ResourceError::WatchExpired { .. } | ResourceError::Invalid { .. })) => {
+            Ok(watch) => {
+                daemon.report_resource_replication_healthy(peer, T::API_PATHS.kind).await;
+                match apply_http_watch(watch, &writer).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        debug!(%peer, kind = T::API_PATHS.kind, %error, "replica cursor watch failed; relisting origin");
+                        listed = remote.list().await.map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+            Err(error) => {
                 debug!(%peer, kind = T::API_PATHS.kind, %error, "replica cursor rejected; relisting origin");
             }
-            Err(error) => return Err(error.to_string()),
         }
+    } else if cursor.is_some() {
+        debug!(
+            %peer,
+            kind = T::API_PATHS.kind,
+            stored_generation = ?cursor.as_ref().and_then(|cursor| cursor.generation.as_deref()),
+            origin_generation = ?listed.generation,
+            "replica origin generation changed; replacing local view"
+        );
     }
 
-    let listed = remote.list().await.map_err(|error| error.to_string())?;
     let start = WatchStart::resuming_from(&listed);
     writer.replace(&listed, Utc::now()).await.map_err(|error| error.to_string())?;
     let watch = remote.watch(start).await.map_err(|error| error.to_string())?;
+    daemon.report_resource_replication_healthy(peer, T::API_PATHS.kind).await;
     apply_http_watch(watch, &writer).await
 }
 
@@ -425,6 +474,7 @@ async fn run_routed_watch<T: Resource>(
             None,
         )
         .await?;
+    daemon.report_resource_replication_healthy(peer, T::API_PATHS.kind).await;
     let writer = daemon.resource_backend().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut initial = Vec::<ResourceObject<T>>::new();
     let mut initializing = !resuming;
@@ -832,5 +882,54 @@ mod tests {
             applications += 1;
         }
         assert_eq!(applications, 2, "a newer generation starts exactly one new application stream");
+    }
+
+    #[test]
+    fn permanent_disconnect_cancels_and_removes_the_current_generation() {
+        let peer = NodeId::new("peer");
+        let mut supervisors = PeerReplicatorSupervisors::default();
+        let (cancellation, _) = supervisors.begin_generation(&peer, 3, None).expect("start generation");
+        assert!(!cancellation.is_cancelled());
+
+        supervisors.peer_disconnected(&peer, 3);
+
+        assert!(cancellation.is_cancelled(), "terminal teardown of the current generation must cancel its replicators");
+        assert!(
+            supervisors.begin_generation(&peer, 3, None).is_some(),
+            "removing the entry lets a later reconnect at the same generation number start fresh, \
+             instead of being rejected as stale"
+        );
+    }
+
+    #[test]
+    fn stale_disconnect_notice_does_not_cancel_a_newer_generation() {
+        let peer = NodeId::new("peer");
+        let mut supervisors = PeerReplicatorSupervisors::default();
+        let (_old_cancellation, _) = supervisors.begin_generation(&peer, 1, None).expect("start old generation");
+        let (new_cancellation, _) = supervisors.begin_generation(&peer, 2, None).expect("start newer generation");
+
+        // A belated teardown notice for the superseded generation (e.g. the
+        // old connection's task finally winding down after being displaced)
+        // must not touch the newer, currently-active generation.
+        supervisors.peer_disconnected(&peer, 1);
+
+        assert!(!new_cancellation.is_cancelled(), "a stale-generation disconnect must not cancel the current generation's replicators");
+        assert!(
+            supervisors.begin_generation(&peer, 2, None).is_none(),
+            "the current generation's map entry must still be present after a stale disconnect notice"
+        );
+    }
+
+    #[test]
+    fn unknown_peer_disconnect_is_a_no_op() {
+        let peer = NodeId::new("peer");
+        let mut supervisors = PeerReplicatorSupervisors::default();
+
+        supervisors.peer_disconnected(&peer, 1);
+
+        assert!(
+            supervisors.begin_generation(&peer, 1, None).is_some(),
+            "disconnecting an untracked peer must not leave stray state behind"
+        );
     }
 }

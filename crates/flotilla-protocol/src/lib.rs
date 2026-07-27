@@ -130,7 +130,7 @@ pub use result_set::{
     AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary, AwarenessGrouping, AwarenessKind, AwarenessLimit,
     AwarenessLink, AwarenessNode, AwarenessPhase, AwarenessState, CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow,
     CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow, QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet,
-    ResultSetCondition, ResultSetState, Rows, Salience, SessionPhase, VesselRow, WorkPhase,
+    ResultSetCondition, ResultSetState, Rows, Salience, SessionPhase, VesselRow, WorkPhase, AWARENESS_REL_FOR_CONVOY,
 };
 use serde::{Deserialize, Serialize};
 

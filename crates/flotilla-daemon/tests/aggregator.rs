@@ -141,7 +141,11 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     let checkouts = observed.using::<Checkout>("flotilla");
     let checkout = checkouts
         .create(
-            &InputMeta::builder().name("checkout-widgets".to_string()).build().with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &InputMeta::builder()
+                .name("checkout-widgets".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "ship-it".to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
             &CheckoutSpec::Observed(
                 ObservedCheckoutSpec::builder()
                     .r#ref("feature/query".to_string())
@@ -174,11 +178,16 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
         assert_eq!(rows[0].branch, "feature/query");
         assert_eq!(rows[0].authority, LifecycleAuthority::Adopted);
         assert_eq!(rows[0].host, HostName::new("local"));
+        assert_eq!(rows[0].for_convoy.as_deref(), Some("ship-it"));
     }
 
     let checkout = checkouts
         .update(
-            &InputMeta::builder().name(checkout.metadata.name.clone()).build().with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &InputMeta::builder()
+                .name(checkout.metadata.name.clone())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "ship-it".to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
             &checkout.metadata.resource_version,
             &CheckoutSpec::Observed(
                 ObservedCheckoutSpec::builder()
@@ -208,6 +217,7 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
         let rows = modifications.get(query).expect("scoped modification").changes.as_checkouts().expect("checkout changes");
         assert_eq!(rows[0].path, "/work/widgets-revised");
         assert_eq!(rows[0].branch, "feature/revised");
+        assert_eq!(rows[0].for_convoy.as_deref(), Some("ship-it"));
     }
 
     let stale_replay = daemon

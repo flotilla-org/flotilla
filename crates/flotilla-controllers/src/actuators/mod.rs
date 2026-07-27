@@ -3,12 +3,14 @@ use std::{path::PathBuf, sync::Arc};
 use flotilla_core::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
-        environment::{CreateOpts, EnvironmentProvider, ProvisionedMount},
+        environment::{CreateOpts, EnvironmentProvider, ProvisionedMount, ProvisionedMountMode},
         terminal::TerminalPool,
         vcs::{CloneInspection, CloneProvisioner},
     },
 };
-use flotilla_resources::{DockerEnvironmentSpec, FreshCloneCheckoutSpec, TerminalSessionSource, TerminalSessionSpec};
+use flotilla_resources::{
+    DockerEnvironmentSpec, EnvironmentMount, EnvironmentMountMode, FreshCloneCheckoutSpec, TerminalSessionSource, TerminalSessionSpec,
+};
 
 pub struct CloneActuator {
     provisioner: Arc<dyn CloneProvisioner>,
@@ -45,9 +47,17 @@ impl DockerEnvironmentActuator {
             tokens: self.tokens.clone(),
             daemon_socket_path: self.daemon_socket_path.clone(),
             working_directory: None,
-            provisioned_mounts: spec.mounts.iter().map(|mount| ProvisionedMount::new(&mount.source_path, &mount.target_path)).collect(),
+            provisioned_mounts: spec.mounts.iter().map(provisioned_mount).collect(),
         }
     }
+}
+
+pub fn provisioned_mount(mount: &EnvironmentMount) -> ProvisionedMount {
+    let mode = match mount.mode {
+        EnvironmentMountMode::Ro => ProvisionedMountMode::Ro,
+        EnvironmentMountMode::Rw => ProvisionedMountMode::Rw,
+    };
+    ProvisionedMount::new(&mount.source_path, &mount.target_path, mode)
 }
 
 pub struct TerminalActuator {

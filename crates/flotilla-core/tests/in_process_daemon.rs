@@ -1305,6 +1305,122 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
 }
 
 #[tokio::test]
+async fn convoy_start_accepts_project_list_identifier() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let backend = daemon.resource_backend();
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
+        .await
+        .expect("repository create");
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &single_agent_contained_workflow_spec())
+        .await
+        .expect("workflow create");
+    create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
+    backend
+        .clone()
+        .definitions::<Project>("flotilla")
+        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            display_name: "Flotilla".into(),
+            default_workflow_ref: "single-agent-contained".into(),
+            issue_source: None,
+            repositories: vec![ProjectRepositorySpec { repo: repository.key(), subpath: None, default_branch: Some("main".into()) }],
+        })
+        .await
+        .expect("project create");
+
+    let list_result = daemon
+        .execute_query(
+            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("project list");
+    let CommandValue::ProjectList(projects) = list_result else {
+        panic!("expected project list, got {list_result:?}");
+    };
+    let listed = projects.projects.first().expect("listed project");
+    let project_identifiers = [format!("{}/{}", listed.namespace, listed.name), listed.address.human_label()];
+
+    let mut events = daemon.subscribe();
+    for (index, project_ref) in project_identifiers.into_iter().enumerate() {
+        let name = format!("listed-project-{index}");
+        let start_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref,
+                        issues: Vec::new(),
+                        name: Some(name.clone()),
+                        branch: Some(format!("fix/{name}")),
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                },
+            })
+            .await
+            .expect("convoy start command accepted");
+
+        assert_eq!(recv_command_finished(&mut events, start_id).await, CommandValue::ConvoyStarted {
+            name: name.clone(),
+            attach_command: None,
+            binding: None
+        });
+        let convoy = backend.using::<ResourceConvoy>("flotilla").get(&name).await.expect("persisted convoy");
+        assert_eq!(convoy.spec.project_ref.as_deref(), Some("flotilla"));
+    }
+}
+
+#[tokio::test]
+async fn convoy_start_unknown_project_reports_resolved_reference_tried() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let mut events = daemon.subscribe();
+
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "missing".into(),
+                    issues: Vec::new(),
+                    name: Some("unknown-project".into()),
+                    branch: Some("fix/unknown-project".into()),
+                    workflow_ref: None,
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: None,
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                }),
+            },
+        })
+        .await
+        .expect("convoy start command accepted");
+
+    assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::Error {
+        message: "project flotilla/missing is not ready: resource not found: missing (tried flotilla/missing)".into()
+    });
+}
+
+#[tokio::test]
 async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snapshot() {
     let reference =
         IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/planning".into() }, id: "732".into() };

@@ -16,7 +16,7 @@ use flotilla_core::{
 };
 use flotilla_daemon::{
     peer::{test_support::ensure_test_connection_generation, PeerManager, PeerSender},
-    server::PeerConnectedNotice,
+    server::{PeerConnectedNotice, PeerConnectionEvent},
 };
 use flotilla_protocol::{GoodbyeReason, HostName, NodeId, PeerWireMessage, RepoSelector};
 use tokio::sync::{Mutex, Notify};
@@ -101,7 +101,9 @@ async fn peer_connect_triggers_local_state_send() {
 
     let (_handle, peer_connected_tx) = flotilla_daemon::server::spawn_test_peer_networking(Arc::clone(&daemon), Arc::clone(&peer_manager));
 
-    peer_connected_tx.send(PeerConnectedNotice { peer: node_b.clone(), generation, resource_socket_path: None }).expect("send notice");
+    peer_connected_tx
+        .send(PeerConnectionEvent::Connected(PeerConnectedNotice { peer: node_b.clone(), generation, resource_socket_path: None }))
+        .expect("send notice");
 
     wait_for_local_state(&sent, &notify, &node_a).await;
 
@@ -143,7 +145,7 @@ async fn peer_reconnect_resends_local_state() {
 
     // First connection
     peer_connected_tx
-        .send(PeerConnectedNotice { peer: node_b.clone(), generation: gen1, resource_socket_path: None })
+        .send(PeerConnectionEvent::Connected(PeerConnectedNotice { peer: node_b.clone(), generation: gen1, resource_socket_path: None }))
         .expect("send notice 1");
     wait_for_local_state(&sent, &notify, &node_a).await;
 
@@ -159,7 +161,7 @@ async fn peer_reconnect_resends_local_state() {
     };
 
     peer_connected_tx
-        .send(PeerConnectedNotice { peer: node_b.clone(), generation: gen2, resource_socket_path: None })
+        .send(PeerConnectionEvent::Connected(PeerConnectedNotice { peer: node_b.clone(), generation: gen2, resource_socket_path: None }))
         .expect("send notice 2");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {

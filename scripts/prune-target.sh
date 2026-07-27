@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 
+# Size-cap backstop for one checkout's Cargo target. The daily, per-host
+# cargo-sweep mtime job owns age-based pruning; this script only enforces size
+# ceilings when a target grows unusually large.
+
 set -euo pipefail
 
-readonly default_age_days=30
 readonly default_incremental_max_size=10GiB
 readonly default_max_size=20GiB
 
-age_days=${FLOTILLA_TARGET_GC_DAYS:-$default_age_days}
-incremental_max_size=${FLOTILLA_TARGET_GC_INCREMENTAL_MAX_SIZE:-$default_incremental_max_size}
-max_size=${FLOTILLA_TARGET_GC_MAX_SIZE:-$default_max_size}
+incremental_max_size=${FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE:-$default_incremental_max_size}
+max_size=${FLOTILLA_TARGET_MAX_SIZE:-$default_max_size}
 mode=apply
 preview_target_dir=
 candidate_file=
@@ -16,11 +18,10 @@ candidate_file=
 usage() {
   echo "Usage: scripts/prune-target.sh [--dry-run]"
   echo
-  echo "Prune this checkout's Cargo target by age, then cap its size."
+  echo "Apply the size-cap backstop to this checkout's Cargo target."
   echo "Environment overrides:"
-  echo "  FLOTILLA_TARGET_GC_DAYS                  retention in days (default: $default_age_days)"
-  echo "  FLOTILLA_TARGET_GC_INCREMENTAL_MAX_SIZE  incremental ceiling (default: $default_incremental_max_size)"
-  echo "  FLOTILLA_TARGET_GC_MAX_SIZE              target ceiling (default: $default_max_size)"
+  echo "  FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE  incremental ceiling (default: $default_incremental_max_size)"
+  echo "  FLOTILLA_TARGET_MAX_SIZE              target ceiling (default: $default_max_size)"
 }
 
 case ${1:-} in
@@ -42,11 +43,6 @@ esac
 
 if (( $# != 0 )); then
   usage >&2
-  exit 2
-fi
-
-if [[ ! $age_days =~ ^[0-9]+$ ]]; then
-  echo "FLOTILLA_TARGET_GC_DAYS must be a non-negative integer; got '$age_days'." >&2
   exit 2
 fi
 
@@ -104,11 +100,11 @@ size_to_kib() {
 }
 
 incremental_max_kib=$(size_to_kib "$incremental_max_size") || {
-  echo "FLOTILLA_TARGET_GC_INCREMENTAL_MAX_SIZE must use whole MiB or GiB units; got '$incremental_max_size'." >&2
+  echo "FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE must use whole MiB or GiB units; got '$incremental_max_size'." >&2
   exit 2
 }
 size_to_kib "$max_size" >/dev/null || {
-  echo "FLOTILLA_TARGET_GC_MAX_SIZE must use whole MiB or GiB units; got '$max_size'." >&2
+  echo "FLOTILLA_TARGET_MAX_SIZE must use whole MiB or GiB units; got '$max_size'." >&2
   exit 2
 }
 
@@ -159,36 +155,10 @@ prepare_preview_target() {
 
   target_parent=$(dirname -- "$target_dir")
   target_name=$(basename -- "$target_dir")
-  preview_target_dir=$(mktemp -d "$target_parent/.${target_name}.flotilla-target-gc-preview.XXXXXX")
+  preview_target_dir=$(mktemp -d "$target_parent/.${target_name}.flotilla-target-cap-preview.XXXXXX")
   cp -a -l "$target_dir/." "$preview_target_dir/"
   target_dir=$preview_target_dir
   export CARGO_TARGET_DIR=$target_dir
-}
-
-prune_aged_incrementals() {
-  local count=0
-  local reclaimed_kib=0
-  local generation
-  local generation_kib
-
-  if [[ ! -d $target_dir ]]; then
-    return 0
-  fi
-
-  while IFS= read -r generation; do
-    generation_kib=$(size_kib "$generation")
-    rm -rf -- "$generation"
-    count=$((count + 1))
-    reclaimed_kib=$((reclaimed_kib + generation_kib))
-  done < <(find "$target_dir" -type d -path '*/incremental/*/s-*' -mtime +"$age_days" -prune -print)
-
-  if (( count > 0 )); then
-    if [[ $mode == preview ]]; then
-      echo "Would remove $count incremental generations older than $age_days days ($(format_kib "$reclaimed_kib"))"
-    else
-      echo "Removed $count incremental generations older than $age_days days ($(format_kib "$reclaimed_kib"))"
-    fi
-  fi
 }
 
 cap_incrementals() {
@@ -199,16 +169,12 @@ cap_incrementals() {
   local removed_count=0
   local removed_kib=0
 
-  if [[ ! -d $target_dir ]]; then
-    return 0
-  fi
-
   current_kib=$(incremental_size_kib)
   if (( current_kib <= incremental_max_kib )); then
     return
   fi
 
-  candidate_file=$(mktemp "${TMPDIR:-/tmp}/flotilla-target-gc.XXXXXX")
+  candidate_file=$(mktemp "${TMPDIR:-/tmp}/flotilla-target-cap.XXXXXX")
   while IFS= read -r generation; do
     mtime=$(generation_mtime "$generation")
     generation_kib=$(size_kib "$generation")
@@ -234,47 +200,31 @@ cap_incrementals() {
   fi
 }
 
-run_sweep() {
-  local description=$1
+cap_target() {
   local after_kib
   local before_kib
   local sweep_output
 
-  shift
   if [[ $mode == apply ]]; then
-    cargo sweep "$@"
+    cargo sweep --maxsize "$max_size" "$repo_root"
     return
   fi
 
   before_kib=$(size_kib "$target_dir")
-  if ! sweep_output=$(cargo sweep "$@" 2>&1); then
+  if ! sweep_output=$(cargo sweep --maxsize "$max_size" "$repo_root" 2>&1); then
     printf '%s\n' "$sweep_output" >&2
     return 1
   fi
   after_kib=$(size_kib "$target_dir")
 
   if (( before_kib > after_kib )); then
-    echo "Would remove $description ($(format_kib "$((before_kib - after_kib))"))"
+    echo "Would remove Cargo artifact families to reach $max_size ($(format_kib "$((before_kib - after_kib))"))"
   else
-    echo "Would remove no $description"
+    echo "Would remove no Cargo artifact families to reach $max_size"
   fi
 }
 
-prune_aged_other_artifacts() {
-  run_sweep "Cargo artifact families older than $age_days days" --time "$age_days" "$repo_root"
-}
-
-cap_target() {
-  run_sweep "Cargo artifact families to reach $max_size" --maxsize "$max_size" "$repo_root"
-}
-
 prepare_preview_target
-
-echo "Pruning incremental generations older than $age_days days in $display_target_dir"
-prune_aged_incrementals
-
-echo "Pruning other Cargo artifacts older than $age_days days in $repo_root"
-prune_aged_other_artifacts
 
 echo "Capping incremental generations at $incremental_max_size in $display_target_dir"
 cap_incrementals

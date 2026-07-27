@@ -22,8 +22,8 @@ use flotilla_core::{
     in_process::InProcessDaemon,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
-        discovery::{EnvironmentAssertion, EnvironmentBag},
-        environment::{CreateOpts, EnvironmentHandle, ProvisionedMount},
+        discovery::{run_provisioned_host_detectors, EnvironmentBag},
+        environment::{CreateOpts, EnvironmentHandle},
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool},
         vcs::{CloneProvisioner, GitCloneProvisioner},
@@ -41,7 +41,7 @@ use flotilla_resources::{
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
-use tracing::warn;
+use tracing::{debug, error, info, warn};
 
 use crate::{
     sleep_inhibitor,
@@ -49,6 +49,10 @@ use crate::{
     Aggregator, AggregatorResolvers,
 };
 
+/// Cadence of the liveness marker (see `spawn_liveness_watchdog_task`). Long
+/// enough to be quiet in a healthy log, short enough to bound how much time a
+/// wedge can hide in.
+const LIVENESS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 
@@ -75,6 +79,9 @@ impl Default for RuntimeOptions {
 
 pub struct DaemonRuntime {
     tasks: Vec<JoinHandle<()>>,
+    /// Set by `shutdown` so `Drop` can tell an intended stop from a runtime
+    /// that vanished while the daemon was meant to keep working.
+    stop_expected: bool,
 }
 
 impl DaemonRuntime {
@@ -102,6 +109,10 @@ impl DaemonRuntime {
         let profile = build_local_profile(&daemon, &local_registry)?;
         daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools).await;
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
+        flotilla_resources::PreparedSnapshotGarbageCollector::new(daemon.resource_backend(), &options.namespace)
+            .recover_pending_claims()
+            .await
+            .map_err(|error| format!("recover prepared convoy admissions: {error}"))?;
         apply_host_heartbeat(&daemon, &options.namespace, &profile).await?;
         if let Err(error) = daemon.reconcile_adopted_checkouts(&options.namespace).await {
             warn!(%error, "failed to restore adopted checkout observations during startup; periodic reconciliation will retry");
@@ -139,12 +150,43 @@ impl DaemonRuntime {
             ));
         }
 
-        Ok(Self { tasks })
+        // +1 for the watchdog's own handle, pushed below, so this count matches
+        // `self.tasks.len()` at drop time.
+        let supervisory_tasks = tasks.len() + 1;
+        tasks.push(spawn_liveness_watchdog_task(supervisory_tasks, LIVENESS_WATCHDOG_INTERVAL));
+
+        Ok(Self { tasks, stop_expected: false })
+    }
+}
+
+impl DaemonRuntime {
+    /// Stop the supervisory tasks deliberately. Every routine daemon exit —
+    /// SIGTERM, SIGINT, idle timeout, explicit shutdown — should call this, so
+    /// that `Drop`'s ERROR path stays reserved for a runtime that disappeared
+    /// while the daemon was still meant to be working.
+    pub fn shutdown(mut self) {
+        self.stop_expected = true;
+        info!(tasks = self.tasks.len(), "daemon runtime stopping; aborting supervisory tasks");
     }
 }
 
 impl Drop for DaemonRuntime {
     fn drop(&mut self) {
+        // Dropping this value aborts every supervisory task — heartbeat, replica
+        // refresh, aggregator, controllers. A daemon whose runtime is dropped
+        // while its accept loop keeps running looks alive (process up, socket
+        // accepting) but serves nothing, and until this log existed it left no
+        // trace whatsoever (flotilla#1111). An expected stop goes through
+        // `shutdown` and logs at INFO there; reaching here without that flag is
+        // the case worth shouting about.
+        if self.stop_expected {
+            debug!(tasks = self.tasks.len(), "daemon runtime dropped after expected shutdown");
+        } else {
+            error!(
+                tasks = self.tasks.len(),
+                "daemon runtime dropped unexpectedly; aborting supervisory tasks — the daemon can no longer do background work"
+            );
+        }
         for task in &self.tasks {
             task.abort();
         }
@@ -536,6 +578,17 @@ enum PeriodicTaskStart {
     AfterInterval,
 }
 
+/// Emits one liveness line per interval so a daemon that stops scheduling is
+/// visible in the log by the *absence* of a known-cadence marker, rather than by
+/// the absence of incidental chatter. Added after flotilla#1111, where the only
+/// evidence of a wedged daemon was that unrelated debug lines stopped.
+fn spawn_liveness_watchdog_task(tasks: usize, interval: Duration) -> JoinHandle<()> {
+    let started = tokio::time::Instant::now();
+    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || async move {
+        info!(uptime_secs = started.elapsed().as_secs(), supervisory_tasks = tasks, "daemon alive");
+    })
+}
+
 fn spawn_periodic_task<Operation, OperationFuture>(interval: Duration, start: PeriodicTaskStart, mut operation: Operation) -> JoinHandle<()>
 where
     Operation: FnMut() -> OperationFuture + Send + 'static,
@@ -832,7 +885,11 @@ fn spawn_controller_loops(
                             reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
                                 .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                                 .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
-                                .with_checkouts(backend.clone().using::<Checkout>(&namespace_string)),
+                                .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
+                                .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
+                                    backend.clone(),
+                                    &namespace_string,
+                                )),
                             resync_interval: controller_resync_interval,
                             backend,
                         }
@@ -920,20 +977,26 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 tokens: Vec::new(),
                 daemon_socket_path,
                 working_directory: None,
-                provisioned_mounts: spec
-                    .mounts
-                    .iter()
-                    .map(|mount| ProvisionedMount::new(mount.source_path.clone(), mount.target_path.clone()))
-                    .collect(),
+                provisioned_mounts: spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount).collect(),
             })
             .await?;
 
         let container_id = handle.container_name().map(ToString::to_string).unwrap_or_else(|| format!("flotilla-env-{}", env_id));
-        let (bag, registry) = probe_provisioned_environment(&self.state, &env_id, &handle).await?;
-        self.state
+        let (bag, registry) = match probe_provisioned_environment(&self.state, &env_id, &handle).await {
+            Ok(probed) => probed,
+            Err(error) => return Err(discard_failed_environment(&handle, error).await),
+        };
+        if let Err(error) = verify_declared_agent_adapters(spec, &registry) {
+            return Err(discard_failed_environment(&handle, error).await);
+        }
+        if let Err(error) = self
+            .state
             .daemon
             .register_provisioned_environment(env_id.clone(), Arc::clone(&handle), bag, Some(registry))
-            .map_err(|err| format!("failed to register provisioned environment {env_id}: {err}"))?;
+            .map_err(|err| format!("failed to register provisioned environment {env_id}: {err}"))
+        {
+            return Err(discard_failed_environment(&handle, error).await);
+        }
         self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { env_id, handle });
         Ok(container_id)
     }
@@ -949,18 +1012,40 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
     }
 }
 
+fn verify_declared_agent_adapters(spec: &flotilla_resources::DockerEnvironmentSpec, registry: &ProviderRegistry) -> Result<(), String> {
+    let discovered = registry.agent_adapters.ids().collect::<BTreeSet<_>>();
+    let missing =
+        spec.declared_agent_adapters.iter().map(String::as_str).filter(|adapter| !discovered.contains(adapter)).collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "image `{}` declares agent adapter{} {}, but interior discovery did not find {}",
+        spec.image,
+        if missing.len() == 1 { "" } else { "s" },
+        missing.iter().map(|adapter| format!("`{adapter}`")).collect::<Vec<_>>().join(", "),
+        if missing.len() == 1 { "it" } else { "them" },
+    ))
+}
+
+async fn discard_failed_environment(handle: &EnvironmentHandle, error: String) -> String {
+    match handle.destroy().await {
+        Ok(()) => error,
+        Err(cleanup_error) => format!("{error}; additionally failed to destroy rejected environment: {cleanup_error}"),
+    }
+}
+
 async fn probe_provisioned_environment(
     state: &ControllerRuntimeState,
     env_id: &EnvironmentId,
     handle: &EnvironmentHandle,
 ) -> Result<(EnvironmentBag, Arc<ProviderRegistry>), String> {
-    let mut bag = EnvironmentBag::new();
-    for (key, value) in handle.env_vars().await? {
-        bag = bag.with(EnvironmentAssertion::env_var(key, value));
-    }
+    let env_vars = handle.env_vars().await?;
+    let discovery = state.daemon.discovery_runtime();
+    let bag = run_provisioned_host_detectors(&discovery.host_detectors, &*handle.runner(), &env_vars).await;
     let probe_root = ExecutionEnvironmentPath::new("/workspace");
     let config = ConfigStore::with_base(state.config.base_path().as_path().join(format!("env-discovery/{env_id}")));
-    let registry = state.daemon.discovery_runtime().factories.probe_all(&bag, &config, &probe_root, handle.runner()).await;
+    let registry = discovery.factories.probe_all(&bag, &config, &probe_root, handle.runner()).await;
     Ok((bag, Arc::new(registry)))
 }
 
@@ -1290,7 +1375,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", spec.pool, spec.env_ref))?;
 
         let cwd = ExecutionEnvironmentPath::new(&spec.cwd);
-        let (command, env, crew, initial_message) = match &spec.source {
+        let (command, mut env, crew, initial_message) = match &spec.source {
             TerminalSessionSource::Tool { command } => (command.clone(), Vec::new(), None, None),
             TerminalSessionSource::Agent { selector, brief, context, message } => {
                 let requirement = CapabilityTable::seeded().resolve(&selector.capability)?.clone();
@@ -1329,6 +1414,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 (plan.command, env, Some(crew), message.clone())
             }
         };
+        env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
 
         if matches!(spec.source, TerminalSessionSource::Agent { .. })
             && pool.list_sessions().await?.iter().any(|session| session.session_name == name)
@@ -1514,7 +1600,15 @@ mod test_git_repo;
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, process::Command as ProcessCommand, sync::Arc};
+    use std::{
+        collections::HashMap,
+        fs,
+        process::Command as ProcessCommand,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
 
     use flotilla_core::{
         config::ConfigStore,
@@ -1523,15 +1617,16 @@ mod tests {
         providers::{
             discovery::{
                 test_support::{
-                    fake_discovery_with_provider_set, git_process_discovery, FakeDiscoveryProviders, FakeTerminalPool,
+                    fake_discovery_with_provider_set, git_process_discovery, DiscoveryMockRunner, FakeDiscoveryProviders, FakeTerminalPool,
                     MergedPrProcessRunner,
                 },
                 EnvironmentAssertion, EnvironmentBag,
             },
+            environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount},
             CommandRunner, ProcessCommandRunner,
         },
     };
-    use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent};
+    use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId};
     use flotilla_resources::{
         Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
         CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, LifecycleAuthority,
@@ -1547,6 +1642,72 @@ mod tests {
     enum CompletionAction {
         Retain,
         Delete,
+    }
+
+    struct TestInteriorEnvironment {
+        id: EnvironmentId,
+        image: ImageId,
+        runner: Arc<dyn CommandRunner>,
+        env_vars: HashMap<String, String>,
+        destroyed: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ProvisionedEnvironment for TestInteriorEnvironment {
+        fn id(&self) -> &EnvironmentId {
+            &self.id
+        }
+
+        fn image(&self) -> &ImageId {
+            &self.image
+        }
+
+        fn container_name(&self) -> Option<&str> {
+            Some("test-interior")
+        }
+
+        fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
+            Vec::new()
+        }
+
+        async fn status(&self) -> Result<flotilla_protocol::EnvironmentStatus, String> {
+            Ok(flotilla_protocol::EnvironmentStatus::Running)
+        }
+
+        async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+            Ok(self.env_vars.clone())
+        }
+
+        fn runner(&self) -> Arc<dyn CommandRunner> {
+            Arc::clone(&self.runner)
+        }
+
+        async fn destroy(&self) -> Result<(), String> {
+            self.destroyed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct TestInteriorEnvironmentProvider {
+        handle: Mutex<Option<EnvironmentHandle>>,
+    }
+
+    #[async_trait]
+    impl EnvironmentProvider for TestInteriorEnvironmentProvider {
+        async fn ensure_image(&self, spec: &flotilla_protocol::EnvironmentSpec, _repo_root: &Path) -> Result<ImageId, String> {
+            match &spec.image {
+                ImageSource::Registry(image) => Ok(ImageId::new(image.clone())),
+                ImageSource::Dockerfile { .. } => Err("test provider expects a registry image".to_string()),
+            }
+        }
+
+        async fn create(&self, _id: EnvironmentId, _image: &ImageId, _opts: CreateOpts) -> Result<EnvironmentHandle, String> {
+            self.handle.lock().await.take().ok_or_else(|| "test environment already created".to_string())
+        }
+
+        async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
+            Ok(Vec::new())
+        }
     }
 
     #[tokio::test]
@@ -2022,6 +2183,113 @@ mod tests {
             Arc::new(PassthroughTerminalPool),
         );
         Arc::new(registry)
+    }
+
+    #[tokio::test]
+    async fn provisioned_environment_discovers_and_registers_interior_agent_adapters() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        discovery.host_detectors = flotilla_core::providers::discovery::detectors::default_host_detectors();
+        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let state = ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            passthrough_registry(),
+            None,
+            "host-test".to_string(),
+            None,
+            "host-direct-host-test".to_string(),
+        );
+        let env_id = EnvironmentId::new("contained-work");
+        let runner: Arc<dyn CommandRunner> = Arc::new(
+            DiscoveryMockRunner::builder()
+                .on_run("codex", &["--version"], Ok("codex-cli 1.2.3".to_string()))
+                .on_run("claude", &["--version"], Ok("1.0.0 (Claude Code)".to_string()))
+                .build(),
+        );
+        let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+            id: env_id.clone(),
+            image: ImageId::new("contained-image"),
+            runner,
+            env_vars: HashMap::from([("HOME".to_string(), "/home/crew".to_string())]),
+            destroyed: Arc::new(AtomicBool::new(false)),
+        });
+
+        let (bag, registry) = probe_provisioned_environment(&state, &env_id, &handle).await.expect("interior discovery should succeed");
+
+        assert!(bag.find_binary("codex").is_some());
+        assert!(bag.find_binary("claude").is_some());
+        assert_eq!(bag.find_env_var("HOME"), Some("/home/crew"));
+        assert!(registry.agent_adapters.get("codex").is_some());
+        assert!(registry.agent_adapters.get("claude-code").is_some());
+
+        daemon
+            .register_provisioned_environment(env_id.clone(), Arc::clone(&handle), bag, Some(Arc::clone(&registry)))
+            .expect("provisioned environment should register");
+        let registered = daemon.environment_registry_for_environment(&env_id).expect("interior registry should be available");
+        assert!(registered.agent_adapters.get("codex").is_some());
+        assert!(registered.agent_adapters.get("claude-code").is_some());
+
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host-test".to_string(),
+            image: "contained-image".to_string(),
+            declared_agent_adapters: BTreeSet::from(["codex".to_string(), "missing-adapter".to_string()]),
+            mounts: Vec::new(),
+            env: BTreeMap::new(),
+        };
+        let error = verify_declared_agent_adapters(&spec, &registry).expect_err("missing declared adapter should fail");
+        assert_eq!(error, "image `contained-image` declares agent adapter `missing-adapter`, but interior discovery did not find it");
+    }
+
+    #[tokio::test]
+    async fn provisioned_environment_is_destroyed_when_declared_adapter_is_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        discovery.host_detectors = flotilla_core::providers::discovery::detectors::default_host_detectors();
+        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+            id: EnvironmentId::new("contained-rejected"),
+            image: ImageId::new("contained-image"),
+            runner: Arc::new(DiscoveryMockRunner::builder().build()),
+            env_vars: HashMap::from([("HOME".to_string(), "/home/crew".to_string())]),
+            destroyed: Arc::clone(&destroyed),
+        });
+        let mut local_registry = ProviderRegistry::new();
+        local_registry.environment_providers.insert(
+            "docker",
+            flotilla_core::providers::discovery::ProviderDescriptor::named(
+                flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+                "docker",
+            ),
+            Arc::new(TestInteriorEnvironmentProvider { handle: Mutex::new(Some(handle)) }),
+        );
+        let state = Arc::new(ControllerRuntimeState::new(
+            daemon,
+            config,
+            Arc::new(local_registry),
+            Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+            "host-test".to_string(),
+            None,
+            "host-direct-host-test".to_string(),
+        ));
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host-test".to_string(),
+            image: "contained-image".to_string(),
+            declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
+            mounts: Vec::new(),
+            env: BTreeMap::new(),
+        };
+
+        let error = DockerControllerRuntime { state }
+            .provision("contained-rejected", &spec)
+            .await
+            .expect_err("missing declared adapter should reject the environment");
+
+        assert_eq!(error, "image `contained-image` declares agent adapter `codex`, but interior discovery did not find it");
+        assert!(destroyed.load(Ordering::SeqCst), "rejected environment should be destroyed");
     }
 
     #[tokio::test]
@@ -2979,6 +3247,9 @@ mod tests {
         assert!(coder_launch.command.contains("--dangerously-bypass-approvals-and-sandbox"));
         assert!(!coder_launch.command.contains("without leaking this full brief"));
         assert!(coder_launch.env_vars.iter().any(|(key, value)| key == "FLOTILLA_CREW_ID" && value == &coder_id));
+        assert!(coder_launch.env_vars.iter().any(|(key, value)| key == "CARGO_INCREMENTAL" && value == "0"));
+        let watcher_launch = ensured.iter().find(|launch| launch.session_name.ends_with("-watcher")).expect("watcher launch");
+        assert!(watcher_launch.env_vars.iter().any(|(key, value)| key == "CARGO_INCREMENTAL" && value == "0"));
         drop(ensured);
 
         let crew_context = CrewCommandContext { crew_id: Some(coder_id.clone()), ..Default::default() };

@@ -414,6 +414,7 @@ async fn environment_controller_marks_docker_environment_ready() {
             docker: Some(DockerEnvironmentSpec {
                 host_ref: "01HXYZ".to_string(),
                 image: "ghcr.io/flotilla/dev:latest".to_string(),
+                declared_agent_adapters: Default::default(),
                 mounts: vec![EnvironmentMount {
                     source_path: "/tmp/src".to_string(),
                     target_path: "/workspace".to_string(),

@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, watch, Mutex, Notify};
 use super::{build_remote_command_router, handle_client_session, spawn_peer_networking_runtime};
 use crate::{
     peer::{channel_transport::channel_transport_pair_with_nodes, PeerManager},
-    server::PeerConnectedNotice,
+    server::PeerConnectionEvent,
 };
 
 pub async fn apply_convoy_replica_feed(daemon: &InProcessDaemon, namespace: &str, name: &str, home: HostName) {
@@ -93,7 +93,7 @@ pub async fn spawn_in_memory_request_topology(
     let leader_remote_router = build_remote_command_router(&leader, &leader_peer_manager);
     let follower_remote_router = build_remote_command_router(&follower, &follower_peer_manager);
 
-    let (leader_runtime_handle, _leader_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectedNotice>) =
+    let (leader_runtime_handle, _leader_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =
         spawn_peer_networking_runtime(
             Arc::clone(&leader),
             Arc::clone(&leader_peer_manager),
@@ -102,7 +102,7 @@ pub async fn spawn_in_memory_request_topology(
             leader_remote_router.clone(),
             None,
         );
-    let (follower_runtime_handle, _follower_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectedNotice>) =
+    let (follower_runtime_handle, _follower_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =
         spawn_peer_networking_runtime(
             Arc::clone(&follower),
             Arc::clone(&follower_peer_manager),
@@ -183,7 +183,7 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
     let leader_remote_router = build_remote_command_router(&leader, &leader_peer_manager);
     let follower_remote_router = build_remote_command_router(&follower, &follower_peer_manager);
 
-    let (leader_runtime_handle, _leader_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectedNotice>) =
+    let (leader_runtime_handle, _leader_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =
         spawn_peer_networking_runtime(
             Arc::clone(&leader),
             Arc::clone(&leader_peer_manager),
@@ -192,7 +192,7 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
             leader_remote_router.clone(),
             None,
         );
-    let (follower_runtime_handle, _follower_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectedNotice>) =
+    let (follower_runtime_handle, _follower_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =
         spawn_peer_networking_runtime(
             Arc::clone(&follower),
             Arc::clone(&follower_peer_manager),
@@ -208,7 +208,7 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let client_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
-    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
     let leader_for_client = Arc::clone(&leader);
     let leader_peer_manager_for_client = Arc::clone(&leader_peer_manager);
     let leader_peer_data_tx_for_client = leader_peer_data_tx;
@@ -285,7 +285,7 @@ async fn spawn_topology_with_client(
     let client_notify = Arc::new(Notify::new());
     // The in-memory request topology only needs the sender side because readiness is polled from
     // each daemon's topology view below; peer-connected notices are intentionally ignored here.
-    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
     let leader_for_client = Arc::clone(&leader);
     let leader_peer_manager_for_client = Arc::clone(&leader_peer_manager);
     let leader_peer_data_tx_for_client = leader_peer_data_tx;

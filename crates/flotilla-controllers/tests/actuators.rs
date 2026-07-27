@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use flotilla_core::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
-        environment::{CreateOpts, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount},
+        environment::{CreateOpts, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
         terminal::{TerminalEnvVars, TerminalPool, TerminalSession as PoolSession},
         vcs::CloneProvisioner,
     },
@@ -104,6 +104,7 @@ async fn environment_actuator_translates_mounts_into_provider_create_opts() {
     let spec = DockerEnvironmentSpec {
         host_ref: "01HXYZ".to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
+        declared_agent_adapters: Default::default(),
         mounts: vec![EnvironmentMount {
             source_path: "/Users/alice/dev/flotilla".to_string(),
             target_path: "/workspace".to_string(),
@@ -114,7 +115,7 @@ async fn environment_actuator_translates_mounts_into_provider_create_opts() {
 
     let opts = actuator.build_create_opts(&spec);
 
-    assert_eq!(opts.provisioned_mounts, vec![ProvisionedMount::new("/Users/alice/dev/flotilla", "/workspace")]);
+    assert_eq!(opts.provisioned_mounts, vec![ProvisionedMount::new("/Users/alice/dev/flotilla", "/workspace", ProvisionedMountMode::Rw)]);
     assert_eq!(opts.tokens, vec![("GITHUB_TOKEN".to_string(), "secret".to_string())]);
 }
 
