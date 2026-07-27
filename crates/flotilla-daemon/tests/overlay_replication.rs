@@ -2,10 +2,10 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
 use flotilla_daemon::server::test_support::spawn_in_memory_request_topology;
-use flotilla_protocol::HostName;
+use flotilla_protocol::{HostName, PeerConnectionState};
 use flotilla_resources::{
-    watch_resource_kind_replica_sources, Convoy, ConvoySpec, InMemoryBackend, InputMeta, Project, ProjectSpec, ResourceBackend,
-    ResourceProvenance, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec,
+    watch_resource_kind_replica_sources, Convoy, ConvoySpec, Host, HostSpec, HostStatus, InMemoryBackend, InputMeta, Project, ProjectSpec,
+    ResourceBackend, ResourceProvenance, SqliteBackend, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec,
 };
 use futures::StreamExt;
 
@@ -16,14 +16,76 @@ fn config(path: std::path::PathBuf, machine_id: &str) -> Arc<ConfigStore> {
 }
 
 async fn daemon(path: std::path::PathBuf, machine_id: &str, host: &str) -> Arc<InProcessDaemon> {
-    InProcessDaemon::new_with_resource_backend(
-        vec![],
-        config(path, machine_id),
-        fake_discovery(false),
-        HostName::new(host),
-        ResourceBackend::InMemory(InMemoryBackend::default()),
-    )
+    daemon_with_backend(path, machine_id, host, ResourceBackend::InMemory(InMemoryBackend::default())).await
+}
+
+async fn sqlite_daemon(path: std::path::PathBuf, machine_id: &str, host: &str) -> Arc<InProcessDaemon> {
+    std::fs::create_dir_all(&path).expect("create sqlite daemon directory");
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(path.join("resources.sqlite")).expect("open sqlite backend"));
+    daemon_with_backend(path, machine_id, host, backend).await
+}
+
+async fn daemon_with_backend(path: std::path::PathBuf, machine_id: &str, host: &str, backend: ResourceBackend) -> Arc<InProcessDaemon> {
+    InProcessDaemon::new_with_resource_backend(vec![], config(path, machine_id), fake_discovery(false), HostName::new(host), backend).await
+}
+
+#[tokio::test]
+async fn sqlite_daemons_expose_remote_host_self_report_in_fleet_health() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let kiwi = sqlite_daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
+    let feta = sqlite_daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    let feta_host_id = feta.local_host_summary().await.environment_id.host_id().expect("feta host id").to_string();
+    let started_at = chrono::Utc::now() - chrono::Duration::hours(2);
+    let heartbeat_at = chrono::Utc::now();
+    let feta_hosts = feta.resource_backend().using::<Host>("flotilla");
+    let feta_host = feta_hosts
+        .create(&InputMeta::builder().name(feta_host_id.clone()).build(), &HostSpec {})
+        .await
+        .expect("create feta host self-report");
+    feta_hosts
+        .update_status(&feta_host_id, &feta_host.metadata.resource_version, &HostStatus {
+            heartbeat_at: Some(heartbeat_at),
+            ready: true,
+            daemon_generation: Some("feta-generation".to_string()),
+            daemon_version: Some("0.1.0".to_string()),
+            daemon_started_at: Some(started_at),
+            disk_free_bytes: Some(459_371_896_832),
+            ..HostStatus::default()
+        })
+        .await
+        .expect("publish feta host self-report");
+
+    let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect sqlite daemons");
+
+    let replicated = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let hosts = kiwi.resource_backend().including_replicas::<Host>("flotilla").list().await.expect("list kiwi host sources");
+            if let Some(host) = hosts.items.into_iter().find(|host| {
+                matches!(host.provenance, ResourceProvenance::Replica { .. })
+                    && host.object.status.as_ref().and_then(|status| status.daemon_version.as_deref()) == Some("0.1.0")
+            }) {
+                break host;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
     .await
+    .expect("feta host self-report did not replicate to kiwi");
+    assert!(matches!(
+        replicated.provenance,
+        ResourceProvenance::Replica { ref origin_root, .. } if origin_root == feta.node_id()
+    ));
+
+    let health = kiwi.fleet_health_internal().await.expect("query kiwi fleet health");
+    let row = health.hosts.into_iter().find(|row| row.host == HostName::new("feta")).expect("feta fleet health row");
+
+    assert_eq!(row.daemon_version.as_deref(), Some("0.1.0"));
+    assert_eq!(row.daemon_generation.as_deref(), Some("feta-generation"));
+    assert_eq!(row.heartbeat_at, Some(heartbeat_at));
+    assert_eq!(row.link, PeerConnectionState::Connected);
+    assert_eq!(row.disk_free_bytes, Some(459_371_896_832));
+    assert!(row.daemon_uptime_seconds.is_some_and(|uptime| uptime >= 2 * 60 * 60));
+    drop(topology);
 }
 
 #[tokio::test]

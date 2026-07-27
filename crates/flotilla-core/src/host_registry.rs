@@ -125,7 +125,6 @@ impl HostRegistry {
         HostListResponse { hosts: host_entries }
     }
 
-    #[cfg(test)]
     pub(crate) async fn environment_id_for_node(&self, node_id: &NodeId) -> Option<EnvironmentId> {
         self.node_environments.read().await.get(node_id).cloned()
     }

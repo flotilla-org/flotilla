@@ -1857,8 +1857,10 @@ async fn fleet_health_keeps_link_heartbeat_and_generation_disagreements_visible(
 
     let source = ResourceBackend::InMemory(InMemoryBackend::default());
     let source_hosts = source.using::<ResourceHost>("flotilla");
-    let remote =
-        source_hosts.create(&InputMeta::builder().name("feta-host".to_string()).build(), &HostSpec {}).await.expect("create source host");
+    let remote = source_hosts
+        .create(&InputMeta::builder().name("feta-feta-host".to_string()).build(), &HostSpec {})
+        .await
+        .expect("create source host");
     let frozen_heartbeat = Utc::now() - ChronoDuration::seconds(HEARTBEAT_READY_TTL_SECS + 1);
     source_hosts
         .update_status(&remote.metadata.name, &remote.metadata.resource_version, &HostStatus {
