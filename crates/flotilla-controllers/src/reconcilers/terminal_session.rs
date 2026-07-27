@@ -6,7 +6,7 @@ use flotilla_resources::{
     controller::{ReconcileOutcome, Reconciler},
     Environment, EnvironmentPhase, ResourceBackend, ResourceError, ResourceObject, TerminalAttention, TerminalAttentionSource,
     TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver,
-    CONVOY_LABEL, VESSEL_REF_LABEL,
+    CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -123,13 +123,18 @@ where
             return Ok(TerminalDeps::Waiting);
         }
 
-        let tags = [
+        let mut tags = [
             obj.metadata.labels.get(CONVOY_LABEL).map(|value| TerminalSessionTag::new("convoy", value)),
             obj.metadata.labels.get(VESSEL_REF_LABEL).map(|value| TerminalSessionTag::new("vessel", value)),
         ]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
+        if let Some(encoded) = obj.metadata.annotations.get(CREDENTIAL_REFS_ANNOTATION) {
+            let credentials = serde_json::from_str::<std::collections::BTreeSet<String>>(encoded)
+                .map_err(|error| ResourceError::invalid(format!("invalid credential references: {error}")))?;
+            tags.extend(credentials.into_iter().map(|credential| TerminalSessionTag::new(CREDENTIAL_REF_SESSION_TAG, credential)));
+        }
         Ok(match self.runtime.ensure_session(&obj.metadata.name, &obj.spec, &tags).await {
             Ok(state) => TerminalDeps::Running(state),
             Err(err) => TerminalDeps::Failed(err),

@@ -485,7 +485,7 @@ async fn tracking_repo_fails_when_its_project_cannot_be_materialized() {
 }
 
 #[tokio::test]
-async fn daemon_start_backfills_project_idempotently_and_preserves_edits() {
+async fn daemon_start_backfills_project_idempotently_and_preserves_edits_to_generated_name_occupant() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("backfilled");
@@ -534,7 +534,14 @@ async fn daemon_start_backfills_project_idempotently_and_preserves_edits() {
     let _restarted = DaemonRuntime::start_with_options(daemon, config, None, options).await.expect("runtime restart");
 
     assert_eq!(projects.get("backfilled").await.expect("evolved project").spec, evolved);
-    assert_eq!(projects.list().await.expect("project list").items.len(), 1);
+    let materialized = projects.list().await.expect("project list");
+    assert_eq!(materialized.items.len(), 2);
+    assert!(materialized.items.iter().any(|project| {
+        matches!(
+            project.spec.repositories.as_slice(),
+            [entry] if entry.repo == repository_key && entry.subpath.is_none()
+        )
+    }));
 }
 
 #[tokio::test]
@@ -873,7 +880,8 @@ async fn convoy_create_carries_project_ref() {
     let convoy = backend.using::<Convoy>("flotilla").get("linked").await.expect("convoy");
     assert_eq!(convoy.spec.project_ref.as_deref(), Some("my-project"));
     assert_eq!(convoy.spec.repositories.len(), 1);
-    assert_eq!(convoy.spec.repositories[0].base_ref, "main");
+    assert_eq!(convoy.spec.repositories[0].source_ref, "main");
+    assert_eq!(convoy.spec.repositories[0].target_ref, "main");
 }
 
 #[tokio::test]

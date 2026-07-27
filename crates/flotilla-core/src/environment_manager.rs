@@ -276,6 +276,7 @@ impl EnvironmentManager {
             working_directory: None,
             provisioned_mounts,
             image_pull_policy: Default::default(),
+            docker_config_dir: None,
         };
         let handle = env_provider.create(env_id.clone(), &image, opts).await?;
         let (env_bag, provider_registry) = self.probe_provisioned_environment(&env_id, &handle, config_base).await?;

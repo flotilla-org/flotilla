@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use bon::builder;
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     result_set::{
@@ -19,16 +20,18 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
-    CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus, Selector, Stance,
-    TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
-    Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
-    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL,
-    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer,
+    CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
+    CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment,
+    EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, LifecycleAuthority,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
+    ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus, Selector, Stance, TerminalBrief, TerminalCrewContext,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase,
+    VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
+    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL,
+    VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -891,6 +894,46 @@ async fn create_ready_observed_checkout_for_convoy(
         .expect("checkout should be ready");
 }
 
+#[builder]
+async fn create_ready_worktree_checkout_for_repository(
+    daemon: &InProcessDaemon,
+    namespace: &str,
+    convoy: &str,
+    checkout_name: &str,
+    path: &str,
+    branch: &str,
+    base_ref: &str,
+    repository: &str,
+    environment: &str,
+) {
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>(namespace);
+    let created = checkouts
+        .create(
+            &input_meta_with_labels(checkout_name, BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.to_string())])),
+            &ResourceCheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+                repo_ref: flotilla_resources::RepositoryKey(repository.to_string()),
+                env_ref: environment.to_string(),
+                r#ref: branch.to_string(),
+                base_ref: Some(base_ref.to_string()),
+                target_path: path.to_string(),
+                clone_ref: format!("clone-{repository}"),
+            }),
+        )
+        .await
+        .expect("checkout should be created");
+    checkouts
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &ResourceCheckoutStatus {
+            phase: ResourceCheckoutPhase::Ready,
+            path: Some(path.to_string()),
+            commit: None,
+            branch_provenance: Default::default(),
+            integration: Default::default(),
+            message: None,
+        })
+        .await
+        .expect("checkout should be ready");
+}
+
 async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
     let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
     let convoy = convoys
@@ -936,6 +979,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
                         stance: Default::default(),
                         depends_on: Vec::new(),
                         repository_refs: None,
+                        credential_refs: BTreeSet::new(),
                         crew: Vec::new(),
                     },
                     VesselRequirement {
@@ -943,6 +987,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
                         stance: Default::default(),
                         depends_on: Vec::new(),
                         repository_refs: None,
+                        credential_refs: BTreeSet::new(),
                         crew: processes,
                     },
                 ],
@@ -1058,14 +1103,16 @@ async fn handoff_brief_for_demo_repository_scope(repository_refs: Option<Vec<Rep
         ConvoyRepositorySpec::builder()
             .url("https://github.com/flotilla-org/flotilla".to_string())
             .repo_ref(flotilla_repo.clone())
-            .base_ref("main".to_string())
+            .source_ref("main".to_string())
+            .target_ref("main".to_string())
             .workspace_slug("flotilla".to_string())
             .subpaths(Vec::new())
             .build(),
         ConvoyRepositorySpec::builder()
             .url("https://github.com/flotilla-org/cleat".to_string())
             .repo_ref(cleat_repo)
-            .base_ref("main".to_string())
+            .source_ref("main".to_string())
+            .target_ref("main".to_string())
             .workspace_slug("cleat".to_string())
             .subpaths(Vec::new())
             .build(),
@@ -1127,7 +1174,8 @@ async fn fork_review_handoff_launches_reviewer_with_diff_review_and_fork_brief()
     spec.repositories = vec![ConvoyRepositorySpec::builder()
         .url("https://forgejo.lab/fork-issues/zellij".to_string())
         .repo_ref(repository.key())
-        .base_ref("stack/base".to_string())
+        .source_ref("main".to_string())
+        .target_ref("stack/base".to_string())
         .workspace_slug("zellij".to_string())
         .subpaths(Vec::new())
         .build()];
@@ -1464,16 +1512,16 @@ async fn handoff_rejects_self_and_unknown_targets_without_delivery() {
 async fn handoff_brief_uses_vessel_repository_scope() {
     let brief = handoff_brief_for_demo_repository_scope(Some(vec![RepositoryKey("repo-flotilla".into())])).await;
 
-    assert!(brief.contains("  - `repo-flotilla` — https://github.com/flotilla-org/flotilla\n"));
-    assert!(!brief.contains("  - `repo-cleat` — https://github.com/flotilla-org/cleat\n"));
+    assert!(brief.contains("  - `repo-flotilla` — https://github.com/flotilla-org/flotilla (target `main`)\n"));
+    assert!(!brief.contains("  - `repo-cleat` — https://github.com/flotilla-org/cleat (target `main`)\n"));
 }
 
 #[tokio::test]
 async fn handoff_brief_for_unscoped_vessel_lists_all_repositories() {
     let brief = handoff_brief_for_demo_repository_scope(None).await;
 
-    assert!(brief.contains("  - `repo-flotilla` — https://github.com/flotilla-org/flotilla\n"));
-    assert!(brief.contains("  - `repo-cleat` — https://github.com/flotilla-org/cleat\n"));
+    assert!(brief.contains("  - `repo-flotilla` — https://github.com/flotilla-org/flotilla (target `main`)\n"));
+    assert!(brief.contains("  - `repo-cleat` — https://github.com/flotilla-org/cleat (target `main`)\n"));
 }
 
 #[tokio::test]
@@ -3865,6 +3913,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             finished_at: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
+            target_mismatches: Vec::new(),
         })
         .await
         .expect("convoy status update should succeed");
@@ -3962,11 +4011,13 @@ async fn convoy_admission_snapshots_every_project_repository() {
     let convoy = backend.using::<Convoy>("flotilla").get("multi-repo").await.expect("convoy should exist");
     assert_eq!(convoy.spec.repositories.len(), 2);
     assert_eq!(convoy.spec.repositories[0].repo_ref, cleat.key());
-    assert_eq!(convoy.spec.repositories[0].base_ref, "stable");
+    assert_eq!(convoy.spec.repositories[0].source_ref, "stable");
+    assert_eq!(convoy.spec.repositories[0].target_ref, "stable");
     assert_eq!(convoy.spec.repositories[0].workspace_slug, "cleat");
     assert!(convoy.spec.repositories[0].subpaths.is_empty());
     assert_eq!(convoy.spec.repositories[1].repo_ref, flotilla.key());
-    assert_eq!(convoy.spec.repositories[1].base_ref, "main");
+    assert_eq!(convoy.spec.repositories[1].source_ref, "main");
+    assert_eq!(convoy.spec.repositories[1].target_ref, "main");
     assert_eq!(convoy.spec.repositories[1].workspace_slug, "flotilla");
     assert_eq!(convoy.spec.repositories[1].subpaths, ["crates/flotilla-core", "crates/flotilla-tui"]);
 }
@@ -4125,7 +4176,8 @@ async fn direct_repository_admission_snapshots_its_resolved_default_branch() {
         name: "direct-repository".to_string()
     });
     let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("direct-repository").await.expect("convoy");
-    assert_eq!(convoy.spec.repositories[0].base_ref, "main");
+    assert_eq!(convoy.spec.repositories[0].source_ref, "main");
+    assert_eq!(convoy.spec.repositories[0].target_ref, "main");
 }
 
 #[tokio::test]
@@ -4426,6 +4478,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             finished_at: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
+            target_mismatches: Vec::new(),
         })
         .await
         .expect("convoy status update should succeed");
@@ -4531,8 +4584,19 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
         .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("1\n".into()))
         .on_run(
             "gh",
-            &["pr", "list", "--head", "feature/missing-push", "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
-            Ok(r#"[{"number":812,"state":"MERGED","mergedAt":"2026-07-22T00:00:00Z"}]"#.into()),
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/missing-push",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName",
+                "--limit",
+                "1",
+            ],
+            Ok(r#"[{"number":812,"state":"MERGED","mergedAt":"2026-07-22T00:00:00Z","baseRefName":"main"}]"#.into()),
         )
         .build();
     let mut discovery = fake_discovery(false);
@@ -4562,6 +4626,7 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
             finished_at: Some(chrono::Utc::now()),
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
+            target_mismatches: Vec::new(),
         })
         .await
         .expect("convoy status should update");
@@ -4607,6 +4672,126 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
 
     assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
     assert!(matches!(convoys.get("completed-convoy").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+}
+
+#[tokio::test]
+async fn convoy_delete_refuses_diverged_checkout_without_a_change_request() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/diverged\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/diverged..HEAD"], Ok("0\n".into()))
+        .on_run(
+            "gh",
+            &["pr", "list", "--head", "feature/diverged", "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
+            Ok("[]".into()),
+        )
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("1\n".into()))
+        .build();
+    let mut discovery = fake_discovery(false);
+    discovery.runner = Arc::new(runner);
+    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), discovery, HostName::local()).await;
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    convoys
+        .create(&empty_input_meta("diverged-convoy"), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
+        .await
+        .expect("convoy create should succeed");
+    create_ready_observed_checkout_for_convoy(&daemon, "flotilla", "diverged-convoy", "checkout-diverged", "/repo", "feature/diverged")
+        .await;
+
+    let result = daemon.verify_convoy_teardown_gate("flotilla", "diverged-convoy", false).await;
+
+    let error = result.expect_err("diverged checkout without a change request must block teardown");
+    assert!(error.contains("Landed=False"), "refusal should identify the landed condition: {error}");
+}
+
+#[tokio::test]
+async fn convoy_delete_allows_multi_repo_convoy_with_work_on_only_one_side() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/one-sided-work\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/one-sided-work\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/one-sided-work..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/one-sided-work..HEAD"], Ok("0\n".into()))
+        .on_run(
+            "gh",
+            &["pr", "list", "--head", "feature/one-sided-work", "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
+            Ok(r#"[{"number":44,"state":"MERGED","mergedAt":"2026-07-27T12:00:00Z"}]"#.into()),
+        )
+        .on_run(
+            "gh",
+            &["pr", "list", "--head", "feature/one-sided-work", "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
+            Ok("[]".into()),
+        )
+        .on_run("git", &["rev-list", "--count", "main..HEAD"], Ok("0\n".into()))
+        .build();
+    let mut discovery = fake_discovery(false);
+    discovery.runner = Arc::new(runner);
+    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), discovery, HostName::local()).await;
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    convoys
+        .create(&empty_input_meta("one-sided-convoy"), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
+        .await
+        .expect("convoy create should succeed");
+    let environments = daemon.resource_backend().using::<ResourceEnvironment>("flotilla");
+    let environment = environments
+        .create(&empty_input_meta("host-env"), &ResourceEnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-01".to_string(), repo_default_dir: "/work".to_string() }),
+            docker: None,
+        })
+        .await
+        .expect("environment create should succeed");
+    environments
+        .update_status(&environment.metadata.name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
+            phase: flotilla_resources::EnvironmentPhase::Ready,
+            ready: true,
+            docker_container_id: None,
+            message: None,
+        })
+        .await
+        .expect("environment status should update");
+    create_ready_worktree_checkout_for_repository()
+        .daemon(&daemon)
+        .namespace("flotilla")
+        .convoy("one-sided-convoy")
+        .checkout_name("checkout-a-andamento")
+        .path("/work/andamento")
+        .branch("feature/one-sided-work")
+        .base_ref("main")
+        .repository("andamento")
+        .environment("host-env")
+        .call()
+        .await;
+    create_ready_worktree_checkout_for_repository()
+        .daemon(&daemon)
+        .namespace("flotilla")
+        .convoy("one-sided-convoy")
+        .checkout_name("checkout-b-flotilla")
+        .path("/work/flotilla")
+        .branch("feature/one-sided-work")
+        .base_ref("main")
+        .repository("flotilla")
+        .environment("host-env")
+        .call()
+        .await;
+
+    let result = daemon.verify_convoy_teardown_gate("flotilla", "one-sided-convoy", false).await;
+
+    result.expect("untouched checkout alongside landed work must not block teardown");
 }
 
 #[tokio::test]
@@ -4790,6 +4975,7 @@ async fn convoy_abandon_command_archives_and_retains_terminal_record() {
             finished_at: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
+            target_mismatches: Vec::new(),
         })
         .await
         .expect("convoy status should update");
@@ -5160,4 +5346,218 @@ async fn recreated_issue_materialization_replays_even_when_cursor_matches_initia
 
     let events = daemon.subscribe_queries(subscriber, &[QueryCursor { query, since: Some(1) }]).await.expect("recreated subscription");
     assert!(matches!(events.as_slice(), [DaemonEvent::ResultSet(_)]));
+}
+
+#[tokio::test]
+async fn contained_workflow_grants_default_deny_and_admission_names_an_unheld_credential() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    backend
+        .clone()
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&InputMeta::builder().name("model-api".to_string()).build(), &CredentialSpecSpec {
+            consumer: CredentialConsumer::Codex,
+            source: CredentialSource::File { path: "/host/credential".to_string() },
+            lifecycle: CredentialLifecycle::Static,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("create credential declaration");
+    backend
+        .clone()
+        .definitions::<CredentialGrant>("flotilla")
+        .create(
+            &InputMeta::builder().name("contained-model-api".to_string()).build(),
+            &CredentialGrantSpec::builder()
+                .selector(CredentialGrantSelector::builder().stance(Stance::Contained).build())
+                .credentials(BTreeSet::from(["model-api".to_string()]))
+                .build(),
+        )
+        .await
+        .expect("create credential grant");
+    let mut workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![
+            VesselRequirement::builder().name("contained".to_string()).stance(Stance::Contained).crew(Vec::new()).build(),
+            VesselRequirement::builder().name("trusted".to_string()).stance(Stance::Trusted).crew(Vec::new()).build(),
+        ])
+        .build();
+
+    resolve_workflow_credentials(&backend, "flotilla", Some("project-a"), &[], &mut workflow).await.expect("resolve grants");
+    assert_eq!(workflow.vessels[0].credential_refs, BTreeSet::from(["model-api".to_string()]));
+    assert!(workflow.vessels[1].credential_refs.is_empty(), "uncontained workflow behavior remains unchanged");
+
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.create(&InputMeta::builder().name("host-a".to_string()).build(), &HostSpec {}).await.expect("create host");
+    hosts
+        .update_status("host-a", &host.metadata.resource_version, &HostStatus {
+            ready: true,
+            heartbeat_at: Some(Utc::now()),
+            capabilities: BTreeMap::new(),
+            resource_store: None,
+        })
+        .await
+        .expect("mark host ready");
+    let placement = backend
+        .clone()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &InputMeta::builder().name("docker-host-a".to_string()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
+                    host_ref: "host-a".to_string(),
+                    image: "crew:latest".to_string(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::new(),
+                    default_cwd: None,
+                    env: BTreeMap::new(),
+                    checkout: flotilla_resources::DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                })
+                .build(),
+        )
+        .await
+        .expect("create placement");
+
+    let error = validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect_err("host without granted credential must be refused");
+    assert!(error.contains("model-api"));
+    assert!(error.contains("host-a"));
+}
+
+#[tokio::test]
+async fn local_convoy_admission_pins_the_grant_resolved_workflow() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::new("kiwi")).await;
+    let backend = daemon.resource_backend();
+    let workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder().name("contained".to_string()).stance(Stance::Contained).crew(Vec::new()).build()])
+        .build();
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&empty_input_meta("credential-workflow"), &workflow)
+        .await
+        .expect("create workflow");
+    backend
+        .clone()
+        .definitions::<Project>("flotilla")
+        .create(
+            &empty_input_meta("project-a"),
+            &ProjectSpec::builder().display_name("Project A".to_string()).default_workflow_ref("credential-workflow".to_string()).build(),
+        )
+        .await
+        .expect("create project");
+    backend
+        .clone()
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&empty_input_meta("model-api"), &CredentialSpecSpec {
+            consumer: CredentialConsumer::Codex,
+            source: CredentialSource::Env { name: "HOST_ONLY_KEY".to_string() },
+            lifecycle: CredentialLifecycle::Static,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("create credential declaration");
+    backend
+        .clone()
+        .definitions::<CredentialGrant>("flotilla")
+        .create(
+            &empty_input_meta("contained-model-api"),
+            &CredentialGrantSpec::builder()
+                .selector(CredentialGrantSelector::builder().stance(Stance::Contained).build())
+                .credentials(BTreeSet::from(["model-api".to_string()]))
+                .build(),
+        )
+        .await
+        .expect("create credential grant");
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.create(&empty_input_meta("host-a"), &HostSpec {}).await.expect("create host");
+    hosts
+        .update_status("host-a", &host.metadata.resource_version, &HostStatus {
+            ready: true,
+            heartbeat_at: Some(Utc::now()),
+            capabilities: BTreeMap::from([(flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["model-api"]))]),
+            resource_store: None,
+        })
+        .await
+        .expect("mark host ready");
+    backend
+        .clone()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &empty_input_meta("docker-host-a"),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
+                    host_ref: "host-a".to_string(),
+                    image: "crew:latest".to_string(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::new(),
+                    default_cwd: None,
+                    env: BTreeMap::new(),
+                    checkout: flotilla_resources::DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                })
+                .build(),
+        )
+        .await
+        .expect("create placement");
+    let intent = ConvoyStartIntent::builder()
+        .project_ref("project-a".to_string())
+        .name("credential-convoy".to_string())
+        .branch("feature/credential-convoy".to_string())
+        .placement_policy("docker-host-a".to_string())
+        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+        .build();
+
+    daemon.admit_convoy_start("flotilla", &intent, &PrincipalRef::implicit_for_namespace("flotilla")).await.expect("admit local convoy");
+
+    let convoy = backend.using::<Convoy>("flotilla").get("credential-convoy").await.expect("get convoy");
+    let snapshot_ref = convoy
+        .metadata
+        .annotations
+        .get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION)
+        .expect("local convoy should pin a resolved workflow");
+    let snapshot =
+        daemon.resource_backend().using::<WorkflowTemplate>("flotilla").get(snapshot_ref).await.expect("get resolved workflow snapshot");
+    assert_eq!(snapshot.spec.vessels[0].credential_refs, BTreeSet::from(["model-api".to_string()]));
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "credential-create".to_string(),
+                workflow_ref: "credential-workflow".to_string(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: Some("feature/credential-create".to_string()),
+                project_ref: Some("project-a".to_string()),
+                placement_policy: Some("docker-host-a".to_string()),
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("execute standalone create");
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::ConvoyCreated {
+        name: "credential-create".to_string()
+    });
+    let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("credential-create").await.expect("get standalone convoy");
+    let snapshot_ref = convoy
+        .metadata
+        .annotations
+        .get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION)
+        .expect("standalone convoy should pin a resolved workflow");
+    let snapshot = daemon
+        .resource_backend()
+        .using::<WorkflowTemplate>("flotilla")
+        .get(snapshot_ref)
+        .await
+        .expect("get standalone resolved workflow snapshot");
+    assert_eq!(snapshot.spec.vessels[0].credential_refs, BTreeSet::from(["model-api".to_string()]));
 }

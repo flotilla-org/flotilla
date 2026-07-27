@@ -345,7 +345,7 @@ fn reconcile_internal(
         });
     }
 
-    if let Some(outcome) = roll_up_phase_outcome(&status, conditions.no_change_request_outstanding, now) {
+    if let Some(outcome) = roll_up_phase_outcome(convoy, &status, checkouts, conditions.no_change_request_outstanding, now) {
         return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, InternalReconcileOutcome {
             patch: outcome.patch,
             actuations: provisioning.actuations,
@@ -405,6 +405,7 @@ fn bootstrap_outcome(
                 stance: vessel.stance,
                 depends_on: vessel.depends_on.clone(),
                 repository_refs: vessel.repository_refs.clone(),
+                credential_refs: vessel.credential_refs.clone(),
                 crew: vessel.crew.iter().map(|member| instantiate_process(convoy, member)).collect(),
             })
             .collect(),
@@ -647,14 +648,37 @@ fn roll_up_crew_work_outcome(status: &super::ConvoyStatus, now: DateTime<Utc>) -
 }
 
 fn roll_up_phase_outcome(
+    convoy: &ResourceObject<Convoy>,
     status: &super::ConvoyStatus,
+    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     no_change_request_outstanding: bool,
     now: DateTime<Utc>,
 ) -> Option<ReconcileOutcome> {
     let all_complete = !status.work.is_empty() && status.work.values().all(|state| state.phase == WorkPhase::Complete);
     if status.phase == ConvoyPhase::Landing && all_complete && no_change_request_outstanding {
+        let target_mismatches = convoy
+            .spec
+            .repositories
+            .iter()
+            .filter_map(|repository| {
+                checkouts
+                    .values()
+                    .find(|checkout| checkout.spec.repo_ref() == &repository.repo_ref)
+                    .and_then(|checkout| checkout.status.as_ref())
+                    .and_then(|status| status.integration.landed_evidence.as_ref())
+                    .and_then(|evidence| {
+                        let observed_target_ref = evidence.target_ref.as_ref()?;
+                        (observed_target_ref != &repository.target_ref).then(|| super::TargetMismatch {
+                            repo_ref: repository.repo_ref.clone(),
+                            change_request_id: evidence.change_request_id.clone(),
+                            declared_target_ref: repository.target_ref.clone(),
+                            observed_target_ref: observed_target_ref.clone(),
+                        })
+                    })
+            })
+            .collect();
         return Some(ReconcileOutcome {
-            patch: Some(controller_patches::roll_up_phase(ConvoyPhase::Landed, None, Some(now))),
+            patch: Some(controller_patches::settle(target_mismatches, now)),
             events: vec![ConvoyEvent::PhaseChanged { from: ConvoyPhase::Landing, to: ConvoyPhase::Landed }],
         });
     }

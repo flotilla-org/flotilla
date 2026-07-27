@@ -72,6 +72,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
                     stance: Stance::Trusted,
                     depends_on: Vec::new(),
                     repository_refs: None,
+                    credential_refs: Default::default(),
                     crew: vec![CrewSpec::builder()
                         .role("shell".to_string())
                         .source(CrewSource::Tool { command: "bash".to_string() })
@@ -194,6 +195,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
         stance: Stance::Trusted,
         depends_on: vec!["implement".to_string()],
         repository_refs: None,
+        credential_refs: Default::default(),
         crew: Vec::new(),
     });
     backend
@@ -318,14 +320,16 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                 ConvoyRepositorySpec {
                     url: "https://github.com/flotilla-org/cleat".to_string(),
                     repo_ref: repository_specs[1].key(),
-                    base_ref: "main".to_string(),
+                    source_ref: "main".to_string(),
+                    target_ref: "main".to_string(),
                     workspace_slug: "cleat".to_string(),
                     subpaths: Vec::new(),
                 },
                 ConvoyRepositorySpec {
                     url: "https://github.com/flotilla-org/flotilla".to_string(),
                     repo_ref: repository_specs[0].key(),
-                    base_ref: "main".to_string(),
+                    source_ref: "main".to_string(),
+                    target_ref: "main".to_string(),
                     workspace_slug: "flotilla".to_string(),
                     subpaths: Vec::new(),
                 },
@@ -377,6 +381,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                     stance: Stance::Trusted,
                     depends_on: Vec::new(),
                     repository_refs: None,
+                    credential_refs: Default::default(),
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
                         .source(CrewSource::Agent {
@@ -521,14 +526,16 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
                 ConvoyRepositorySpec {
                     url: "https://github.com/flotilla-org/flotilla".to_string(),
                     repo_ref: repositories[0].key(),
-                    base_ref: "main".to_string(),
+                    source_ref: "main".to_string(),
+                    target_ref: "main".to_string(),
                     workspace_slug: "flotilla".to_string(),
                     subpaths: Vec::new(),
                 },
                 ConvoyRepositorySpec {
                     url: "https://github.com/flotilla-org/cleat".to_string(),
                     repo_ref: repositories[1].key(),
-                    base_ref: "main".to_string(),
+                    source_ref: "main".to_string(),
+                    target_ref: "main".to_string(),
                     workspace_slug: "cleat".to_string(),
                     subpaths: Vec::new(),
                 },
@@ -551,6 +558,7 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
                     stance: Stance::Contained,
                     depends_on: Vec::new(),
                     repository_refs: None,
+                    credential_refs: Default::default(),
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
                         .source(CrewSource::Tool { command: "cargo test".to_string() })
@@ -673,14 +681,16 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
                 ConvoyRepositorySpec {
                     url: "https://github.com/flotilla-org/flotilla".to_string(),
                     repo_ref: repositories[0].key(),
-                    base_ref: "main".to_string(),
+                    source_ref: "main".to_string(),
+                    target_ref: "main".to_string(),
                     workspace_slug: "flotilla".to_string(),
                     subpaths: Vec::new(),
                 },
                 ConvoyRepositorySpec {
                     url: "https://github.com/flotilla-org/cleat".to_string(),
                     repo_ref: repositories[1].key(),
-                    base_ref: "main".to_string(),
+                    source_ref: "main".to_string(),
+                    target_ref: "main".to_string(),
                     workspace_slug: "cleat".to_string(),
                     subpaths: Vec::new(),
                 },
@@ -703,6 +713,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
                     stance: Stance::Contained,
                     depends_on: Vec::new(),
                     repository_refs: None,
+                    credential_refs: Default::default(),
                     crew: Vec::new(),
                 }],
             }),
@@ -785,14 +796,16 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
                 ConvoyRepositorySpec {
                     url: "https://github.com/flotilla-org/cleat".to_string(),
                     repo_ref: cleat.key(),
-                    base_ref: "main".to_string(),
+                    source_ref: "main".to_string(),
+                    target_ref: "main".to_string(),
                     workspace_slug: "cleat".to_string(),
                     subpaths: Vec::new(),
                 },
                 ConvoyRepositorySpec {
                     url: "https://github.com/flotilla-org/flotilla".to_string(),
                     repo_ref: flotilla.key(),
-                    base_ref: "main".to_string(),
+                    source_ref: "main".to_string(),
+                    target_ref: "main".to_string(),
                     workspace_slug: "flotilla".to_string(),
                     subpaths: Vec::new(),
                 },
@@ -815,6 +828,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
                     stance: Stance::Trusted,
                     depends_on: Vec::new(),
                     repository_refs: Some(vec![cleat.key()]),
+                    credential_refs: Default::default(),
                     crew: Vec::new(),
                 }],
             }),
@@ -1081,7 +1095,11 @@ async fn reuses_existing_clone_by_deterministic_name() {
         matches!(
             actuation,
             Actuation::CreateCheckout { spec, .. }
-                if matches!(spec, CheckoutSpec::Worktree(worktree) if worktree.clone_ref == clone_name)
+                if matches!(
+                    spec,
+                    CheckoutSpec::Worktree(worktree)
+                        if worktree.clone_ref == clone_name && worktree.base_ref.as_deref() == Some(GIT_REF)
+                )
         )
     }));
 }
@@ -1476,7 +1494,8 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
             repositories: vec![ConvoyRepositorySpec {
                 url: "https://github.com/flotilla-org/flotilla".to_string(),
                 repo_ref: repository_key.clone(),
-                base_ref: "main".to_string(),
+                source_ref: "main".to_string(),
+                target_ref: "main".to_string(),
                 workspace_slug: "flotilla".to_string(),
                 subpaths: Vec::new(),
             }],
@@ -1886,7 +1905,8 @@ async fn create_convoy_with_labeled_processes(
             repositories: vec![ConvoyRepositorySpec {
                 url: repo_url.to_string(),
                 repo_ref: repository_key,
-                base_ref: git_ref.to_string(),
+                source_ref: git_ref.to_string(),
+                target_ref: "landing-target".to_string(),
                 workspace_slug: repository_spec.leaf_slug(),
                 subpaths: Vec::new(),
             }],
@@ -1907,6 +1927,7 @@ async fn create_convoy_with_labeled_processes(
                         stance: Default::default(),
                         depends_on: Vec::new(),
                         repository_refs: None,
+                        credential_refs: Default::default(),
                         crew: vec![CrewSpec::builder()
                             .role("coder".to_string())
                             .source(CrewSource::Tool { command: "cargo fmt --check".to_string() })
@@ -1917,6 +1938,7 @@ async fn create_convoy_with_labeled_processes(
                         stance: Default::default(),
                         depends_on: vec!["implement".to_string()],
                         repository_refs: None,
+                        credential_refs: Default::default(),
                         crew: vec![
                             CrewSpec::builder()
                                 .role("build".to_string())

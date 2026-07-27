@@ -256,6 +256,7 @@ async fn create_returns_handle() {
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
     };
 
     let id = EnvironmentId::new("test-env-1");
@@ -304,6 +305,7 @@ async fn create_translates_image_pull_policy_to_docker_run() {
             working_directory: None,
             provisioned_mounts: Vec::new(),
             image_pull_policy: policy,
+            docker_config_dir: None,
         };
 
         provider.create(EnvironmentId::new(docker_value), &image, opts).await.expect("image policy should create an environment");
@@ -314,6 +316,31 @@ async fn create_translates_image_pull_policy_to_docker_run() {
         assert!(args.windows(2).any(|pair| pair == ["--pull", docker_value]));
         assert!(!calls.iter().any(|(_, args, _)| args.first().is_some_and(|arg| arg == "pull")));
     }
+}
+
+#[tokio::test]
+async fn create_uses_the_credential_scoped_docker_config_for_pull_on_run() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let image = ImageId::new("registry.example/crew:latest");
+    let opts = CreateOpts {
+        tokens: Vec::new(),
+        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        working_directory: None,
+        provisioned_mounts: Vec::new(),
+        image_pull_policy: ImagePullPolicy::Always,
+        docker_config_dir: Some(DaemonHostPath::new("/run/flotilla/registry-auth")),
+    };
+
+    provider.create(EnvironmentId::new("private-registry"), &image, opts).await.expect("create authenticated environment");
+
+    let calls = runner.calls();
+    let (command, args, _) = &calls[0];
+    assert_eq!(command, "docker");
+    assert_eq!(&args[..3], &["--config", "/run/flotilla/registry-auth", "run"]);
+    assert!(args.windows(2).any(|pair| pair == ["--pull", "always"]));
 }
 
 #[tokio::test]
@@ -330,6 +357,7 @@ async fn create_preserves_reference_repo_mount_metadata() {
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new(reference_repo.as_path().to_path_buf(), "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
     };
 
     let id = EnvironmentId::new("test-env-metadata");
@@ -358,6 +386,7 @@ async fn create_uses_requested_mount_modes_in_docker_arguments() {
             ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro),
         ],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
     };
 
     provider.create(EnvironmentId::new("test-env-mount-modes"), &image, opts).await.expect("create");
@@ -394,6 +423,7 @@ async fn list_preserves_reference_repo_mount_metadata() {
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
     };
 
     provider.create(EnvironmentId::new("test-env-list"), &image, opts).await.expect("create");
@@ -421,6 +451,7 @@ async fn list_fails_on_malformed_reference_repo_mount_metadata() {
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
     };
 
     provider.create(EnvironmentId::new("test-env-list-malformed"), &image, opts).await.expect("create");
@@ -442,6 +473,7 @@ async fn list_rejects_missing_reference_repo_mount_metadata() {
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
     };
 
     provider.create(EnvironmentId::new("test-env-list-missing"), &image, opts).await.expect("create");
@@ -463,6 +495,7 @@ async fn provisioned_handle_returns_its_initialized_runner() {
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
     };
 
     let handle = provider.create(EnvironmentId::new("test-env-runner"), &image, opts).await.expect("create");
@@ -487,6 +520,7 @@ async fn status_returns_running() {
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
     };
 
     let id = EnvironmentId::new("test-env-status");
@@ -517,6 +551,7 @@ async fn env_vars_parses_output() {
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
     };
 
     let id = EnvironmentId::new("test-env-vars");
@@ -549,6 +584,7 @@ async fn destroy_calls_docker_rm() {
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
     };
 
     let id = EnvironmentId::new("test-env-destroy");

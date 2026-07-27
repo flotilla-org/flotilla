@@ -84,7 +84,8 @@ pub async fn create_convoy_with_single_task(
             repositories: vec![ConvoyRepositorySpec {
                 url: repo_url.to_string(),
                 repo_ref: repository_key,
-                base_ref: git_ref.to_string(),
+                source_ref: git_ref.to_string(),
+                target_ref: git_ref.to_string(),
                 workspace_slug: repository_spec.leaf_slug(),
                 subpaths: Vec::new(),
             }],
@@ -104,6 +105,7 @@ pub async fn create_convoy_with_single_task(
                     stance: Default::default(),
                     depends_on: Vec::new(),
                     repository_refs: None,
+                    credential_refs: Default::default(),
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
                         .source(CrewSource::Tool { command: "cargo test".to_string() })

@@ -14,7 +14,8 @@ use flotilla_resources::{
     EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta,
     LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey,
     RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, CONVOY_LABEL, VESSEL_REF_LABEL,
+    TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, CONVOY_LABEL,
+    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -280,7 +281,7 @@ impl Reconciler for VesselReconciler {
                                     declared_agent_adapters: declared_agent_adapters.clone(),
                                     pull_policy: *pull_policy,
                                     mounts: Vec::new(),
-                                    env: env.clone(),
+                                    env: environment_with_credentials(env.clone(), &requirement.credential_refs),
                                 }),
                             },
                         });
@@ -472,7 +473,7 @@ impl Reconciler for VesselReconciler {
                                 repo_ref: repository_key.clone(),
                                 env_ref: clone_env_ref.clone(),
                                 r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
-                                base_ref: Some(convoy_repository.base_ref.clone()),
+                                base_ref: Some(convoy_repository.source_ref.clone()),
                                 target_path: checkout_target_path,
                                 clone_ref: clone_name.expect("shared-clone strategy requires clone name"),
                             })
@@ -481,7 +482,7 @@ impl Reconciler for VesselReconciler {
                             repo_ref: repository_key,
                             env_ref: precreated_environment_ref.clone().expect("fresh-clone strategy should precreate environment"),
                             r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
-                            base_ref: Some(convoy_repository.base_ref.clone()),
+                            base_ref: Some(convoy_repository.source_ref.clone()),
                             target_path: checkout_target_path,
                             url: convoy_repository.url.clone(),
                         }),
@@ -564,7 +565,7 @@ impl Reconciler for VesselReconciler {
                                         })
                                         .into_iter()
                                         .collect(),
-                                    env: env.clone(),
+                                    env: environment_with_credentials(env.clone(), &requirement.credential_refs),
                                 }),
                             },
                         });
@@ -683,8 +684,15 @@ impl Reconciler for VesselReconciler {
                             flotilla_resources::TerminalSessionSource::Agent { selector: selector.clone(), brief, context, message: None }
                         }
                     };
+                    let mut terminal_meta = identity.input_meta();
+                    if !requirement.credential_refs.is_empty() {
+                        terminal_meta.annotations.insert(
+                            CREDENTIAL_REFS_ANNOTATION.to_string(),
+                            serde_json::to_string(&requirement.credential_refs).expect("credential names serialize"),
+                        );
+                    }
                     actuations.push(Actuation::CreateTerminalSession {
-                        meta: identity.input_meta(),
+                        meta: terminal_meta,
                         spec: TerminalSessionSpec {
                             env_ref: resolved_environment_ref.clone(),
                             role: process.role.clone(),
@@ -744,6 +752,16 @@ impl Reconciler for VesselReconciler {
     fn finalizer_name(&self) -> Option<&'static str> {
         Some("flotilla.work/vessel-workspace-teardown")
     }
+}
+
+fn environment_with_credentials(
+    mut env: BTreeMap<String, String>,
+    credentials: &std::collections::BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    if !credentials.is_empty() {
+        env.insert(CREDENTIAL_REFS_ENV.to_string(), serde_json::to_string(credentials).expect("credential names serialize"));
+    }
+    env
 }
 
 fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, String> {

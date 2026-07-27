@@ -17,7 +17,7 @@ use flotilla_controllers::reconcilers::{
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
     aggregator_projection::AggregatorProjectionState,
-    checkout_integration::{checkout_branch_from_spec, checkout_path_from_status_and_spec, inspect_checkout_integration},
+    checkout_integration::{checkout_path_from_status_and_spec, inspect_checkout_integration},
     config::ConfigStore,
     in_process::InProcessDaemon,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
@@ -38,12 +38,14 @@ use flotilla_resources::{
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy,
     PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend, ResourceError, ResourceObject, Stance,
     TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    credential::CredentialStore,
     sleep_inhibitor,
     supervisor::{supervise, ControllerSupervision},
     Aggregator, AggregatorResolvers,
@@ -127,19 +129,33 @@ impl DaemonRuntime {
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
+        let credential_store = Arc::new(CredentialStore::new(
+            daemon.resource_backend(),
+            &options.namespace,
+            Arc::clone(&daemon.discovery_runtime().env),
+            daemon.local_environment_bag().ok_or_else(|| "local environment bag unavailable".to_string())?,
+            daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?,
+            config.state_dir().as_path().to_path_buf(),
+        ));
         daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools).await;
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
         flotilla_resources::PreparedSnapshotGarbageCollector::new(daemon.resource_backend(), &options.namespace)
             .recover_pending_claims()
             .await
             .map_err(|error| format!("recover prepared convoy admissions: {error}"))?;
-        apply_host_heartbeat(&daemon, &options.namespace, &profile).await?;
+        apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store)).await?;
         if let Err(error) = daemon.reconcile_adopted_checkouts(&options.namespace).await {
             warn!(%error, "failed to restore adopted checkout observations during startup; periodic reconciliation will retry");
         }
 
         let mut tasks = vec![
-            spawn_heartbeat_task(Arc::clone(&daemon), options.namespace.clone(), profile.clone(), options.heartbeat_interval),
+            spawn_heartbeat_task_with_credentials(
+                Arc::clone(&daemon),
+                options.namespace.clone(),
+                profile.clone(),
+                Arc::new(Some(Arc::clone(&credential_store))),
+                options.heartbeat_interval,
+            ),
             spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
             spawn_adopted_checkout_reconciliation_task(Arc::clone(&daemon), options.namespace.clone(), options.controller_resync_interval),
             spawn_sleep_inhibitor_task(daemon.resource_backend(), options.namespace.clone(), options.controller_supervision.clone()),
@@ -153,15 +169,18 @@ impl DaemonRuntime {
 
         if options.start_controllers {
             let local_repo_root = daemon.tracked_repo_paths().await.into_iter().next().map(ExecutionEnvironmentPath::new);
-            let state = Arc::new(ControllerRuntimeState::new(
-                daemon,
-                config,
-                local_registry,
-                daemon_socket_path.map(DaemonHostPath::new),
-                profile.host_id.clone(),
-                local_repo_root,
-                profile.host_direct_environment_name(),
-            ));
+            let state = Arc::new(
+                ControllerRuntimeState::new(
+                    daemon,
+                    config,
+                    local_registry,
+                    daemon_socket_path.map(DaemonHostPath::new),
+                    profile.host_id.clone(),
+                    local_repo_root,
+                    profile.host_direct_environment_name(),
+                )
+                .with_credential_store(credential_store),
+            );
             tasks.extend(spawn_controller_loops(
                 state,
                 &options.namespace,
@@ -246,6 +265,7 @@ struct ControllerRuntimeState {
     local_host_ref: String,
     local_repo_root: Option<ExecutionEnvironmentPath>,
     host_direct_environment_name: String,
+    credential_store: Option<Arc<CredentialStore>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
 }
 
@@ -284,8 +304,14 @@ impl ControllerRuntimeState {
             local_host_ref,
             local_repo_root,
             host_direct_environment_name,
+            credential_store: None,
             provisioned_environments: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn with_credential_store(mut self, credential_store: Arc<CredentialStore>) -> Self {
+        self.credential_store = Some(credential_store);
+        self
     }
 }
 
@@ -552,22 +578,39 @@ fn spawn_sleep_inhibitor_task(backend: ResourceBackend, namespace: String, super
     })
 }
 
+#[cfg(test)]
 fn spawn_heartbeat_task(
     daemon: Arc<InProcessDaemon>,
     namespace: String,
     profile: LocalProvisioningProfile,
     interval: Duration,
 ) -> JoinHandle<()> {
+    spawn_heartbeat_task_with_credentials(daemon, namespace, profile, Arc::new(None), interval)
+}
+
+fn spawn_heartbeat_task_with_credentials(
+    daemon: Arc<InProcessDaemon>,
+    namespace: String,
+    profile: LocalProvisioningProfile,
+    credential_store: Arc<Option<Arc<CredentialStore>>>,
+    interval: Duration,
+) -> JoinHandle<()> {
     spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
         let namespace = namespace.clone();
         let profile = profile.clone();
+        let credential_store = Arc::clone(&credential_store);
         async move {
-            if let Err(err) = apply_host_heartbeat(&daemon, &namespace, &profile).await {
+            if let Err(err) = apply_host_heartbeat_with_credentials(&daemon, &namespace, &profile, credential_store.as_deref()).await {
                 warn!(%err, "failed to publish host heartbeat");
             }
         }
     })
+}
+
+#[cfg(test)]
+async fn apply_host_heartbeat(daemon: &Arc<InProcessDaemon>, namespace: &str, profile: &LocalProvisioningProfile) -> Result<(), String> {
+    apply_host_heartbeat_with_credentials(daemon, namespace, profile, None).await
 }
 
 fn spawn_replica_refresh_task(daemon: Arc<InProcessDaemon>, interval: Duration) -> JoinHandle<()> {
@@ -629,7 +672,12 @@ where
     })
 }
 
-async fn apply_host_heartbeat(daemon: &Arc<InProcessDaemon>, namespace: &str, profile: &LocalProvisioningProfile) -> Result<(), String> {
+async fn apply_host_heartbeat_with_credentials(
+    daemon: &Arc<InProcessDaemon>,
+    namespace: &str,
+    profile: &LocalProvisioningProfile,
+    credential_store: Option<&CredentialStore>,
+) -> Result<(), String> {
     ensure_host_exists(&daemon.resource_backend(), namespace, &profile.host_id).await?;
     let backend = daemon.resource_backend();
     let hosts = backend.using::<Host>(namespace);
@@ -646,16 +694,29 @@ async fn apply_host_heartbeat(daemon: &Arc<InProcessDaemon>, namespace: &str, pr
             "resource event log tripwire triggered",
         );
     }
-    let status =
-        HostStatus { capabilities: host_capabilities(&summary, profile), heartbeat_at: Some(Utc::now()), ready: true, resource_store };
+    let held_credentials = match credential_store {
+        Some(store) => store.held_credentials().await?,
+        None => BTreeSet::new(),
+    };
+    let status = HostStatus {
+        capabilities: host_capabilities(&summary, profile, &held_credentials),
+        heartbeat_at: Some(Utc::now()),
+        ready: true,
+        resource_store,
+    };
     hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|err| err.to_string())?;
     daemon.refresh_connected_peer_host_heartbeats().await;
     Ok(())
 }
 
-fn host_capabilities(_summary: &HostSummary, profile: &LocalProvisioningProfile) -> BTreeMap<String, serde_json::Value> {
+fn host_capabilities(
+    _summary: &HostSummary,
+    profile: &LocalProvisioningProfile,
+    held_credentials: &BTreeSet<String>,
+) -> BTreeMap<String, serde_json::Value> {
     BTreeMap::from([
         (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
+        (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(held_credentials)),
         ("docker".to_string(), json!(profile.docker_available)),
         ("terminal_pools".to_string(), json!(profile.available_pools)),
     ])
@@ -980,6 +1041,7 @@ struct DockerControllerRuntime {
 #[async_trait]
 impl DockerEnvironmentRuntime for DockerControllerRuntime {
     async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<String, String> {
+        let credential_refs = credential_refs_from_environment(spec)?;
         let daemon_socket_path = self
             .state
             .daemon_socket_path
@@ -993,25 +1055,51 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .or_else(|| self.state.local_registry.environment_providers.preferred_with_desc())
             .ok_or_else(|| "docker environment provider unavailable".to_string())?;
 
+        let docker_config_dir = match &self.state.credential_store {
+            Some(store) => store.prepare_registry_pull(name, &credential_refs, &spec.image).await?.map(DaemonHostPath::new),
+            None if credential_refs.is_empty() => None,
+            None => return Err("host-local credential store unavailable".to_string()),
+        };
         let image = ImageId::new(spec.image.clone());
         let env_id = EnvironmentId::new(name.to_string());
-        let handle = provider
+        let handle = match provider
             .create(env_id.clone(), &image, CreateOpts {
                 tokens: Vec::new(),
                 daemon_socket_path,
                 working_directory: None,
                 image_pull_policy: spec.pull_policy.into(),
                 provisioned_mounts: spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount).collect(),
+                docker_config_dir,
             })
-            .await?;
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(store) = &self.state.credential_store {
+                    if let Err(cleanup_error) = store.forget_environment(name).await {
+                        return Err(format!("{error}; additionally failed to remove credential cache: {cleanup_error}"));
+                    }
+                }
+                return Err(error);
+            }
+        };
 
         let container_id = handle.container_name().map(ToString::to_string).unwrap_or_else(|| format!("flotilla-env-{}", env_id));
+        if let Some(store) = &self.state.credential_store {
+            if let Err(error) = store.prepare(name, &credential_refs, handle.runner()).await {
+                return Err(discard_failed_environment(&handle, Some(store), name, error).await);
+            }
+        } else if !credential_refs.is_empty() {
+            return Err(discard_failed_environment(&handle, None, name, "host-local credential store unavailable".to_string()).await);
+        }
         let (bag, registry) = match probe_provisioned_environment(&self.state, &env_id, &handle).await {
             Ok(probed) => probed,
-            Err(error) => return Err(discard_failed_environment(&handle, error).await),
+            Err(error) => {
+                return Err(discard_failed_environment(&handle, self.state.credential_store.as_deref(), name, error).await);
+            }
         };
         if let Err(error) = verify_declared_agent_adapters(spec, &registry) {
-            return Err(discard_failed_environment(&handle, error).await);
+            return Err(discard_failed_environment(&handle, self.state.credential_store.as_deref(), name, error).await);
         }
         if let Err(error) = self
             .state
@@ -1019,7 +1107,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .register_provisioned_environment(env_id.clone(), Arc::clone(&handle), bag, Some(registry))
             .map_err(|err| format!("failed to register provisioned environment {env_id}: {err}"))
         {
-            return Err(discard_failed_environment(&handle, error).await);
+            return Err(discard_failed_environment(&handle, self.state.credential_store.as_deref(), name, error).await);
         }
         self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { env_id, handle });
         Ok(container_id)
@@ -1032,6 +1120,9 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         };
         active.handle.destroy().await?;
         let _ = self.state.daemon.remove_provisioned_environment(&active.env_id);
+        if let Some(store) = &self.state.credential_store {
+            store.forget_environment(active.env_id.as_str()).await?;
+        }
         Ok(())
     }
 }
@@ -1052,10 +1143,33 @@ fn verify_declared_agent_adapters(spec: &flotilla_resources::DockerEnvironmentSp
     ))
 }
 
-async fn discard_failed_environment(handle: &EnvironmentHandle, error: String) -> String {
-    match handle.destroy().await {
-        Ok(()) => error,
-        Err(cleanup_error) => format!("{error}; additionally failed to destroy rejected environment: {cleanup_error}"),
+fn credential_refs_from_environment(spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<BTreeSet<String>, String> {
+    spec.env
+        .get(CREDENTIAL_REFS_ENV)
+        .map(|encoded| serde_json::from_str(encoded).map_err(|error| format!("invalid credential references: {error}")))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+async fn discard_failed_environment(
+    handle: &EnvironmentHandle,
+    credential_store: Option<&CredentialStore>,
+    environment_ref: &str,
+    error: String,
+) -> String {
+    let mut cleanup_errors = Vec::new();
+    if let Err(cleanup_error) = handle.destroy().await {
+        cleanup_errors.push(format!("destroy rejected environment: {cleanup_error}"));
+    }
+    if let Some(store) = credential_store {
+        if let Err(cleanup_error) = store.forget_environment(environment_ref).await {
+            cleanup_errors.push(format!("remove credential cache: {cleanup_error}"));
+        }
+    }
+    if cleanup_errors.is_empty() {
+        error
+    } else {
+        format!("{error}; additionally failed to {}", cleanup_errors.join("; "))
     }
 }
 
@@ -1106,10 +1220,6 @@ impl CheckoutControllerRuntime {
     fn checkout_path<'a>(&self, checkout: &'a ResourceObject<Checkout>) -> Result<&'a str, String> {
         checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
             .ok_or_else(|| format!("checkout {} has no resolved path", checkout.metadata.name))
-    }
-
-    fn checkout_branch<'a>(&self, checkout: &'a ResourceObject<Checkout>) -> &'a str {
-        checkout_branch_from_spec(&checkout.spec)
     }
 }
 
@@ -1258,8 +1368,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
     }
 
     async fn inspect_integration(&self, checkout: &ResourceObject<Checkout>) -> Result<CheckoutIntegrationStatus, String> {
-        Ok(inspect_checkout_integration(&*self.local_runner()?, Path::new(self.checkout_path(checkout)?), self.checkout_branch(checkout))
-            .await)
+        Ok(inspect_checkout_integration(&*self.local_runner()?, Path::new(self.checkout_path(checkout)?), &checkout.spec).await)
     }
 
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
@@ -1399,6 +1508,17 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", spec.pool, spec.env_ref))?;
 
         let cwd = ExecutionEnvironmentPath::new(&spec.cwd);
+        let credential_refs =
+            tags.iter().filter(|tag| tag.key == CREDENTIAL_REF_SESSION_TAG).map(|tag| tag.value.clone()).collect::<BTreeSet<_>>();
+        let pool_tags = tags.iter().filter(|tag| tag.key != CREDENTIAL_REF_SESSION_TAG).cloned().collect::<Vec<_>>();
+        let credential_env = match &self.state.credential_store {
+            Some(store) => {
+                let runner = self.runner_for_env(&spec.env_ref)?;
+                store.prepare(&spec.env_ref, &credential_refs, runner).await?
+            }
+            None if credential_refs.is_empty() => Vec::new(),
+            None => return Err("host-local credential store unavailable".to_string()),
+        };
         let (command, mut env, crew, initial_message) = match &spec.source {
             TerminalSessionSource::Tool { command } => (command.clone(), Vec::new(), None, None),
             TerminalSessionSource::Agent { selector, brief, context, message } => {
@@ -1438,6 +1558,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 (plan.command, env, Some(crew), message.clone())
             }
         };
+        env.extend(credential_env);
         env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
 
         if matches!(spec.source, TerminalSessionSource::Agent { .. })
@@ -1445,7 +1566,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         {
             pool.kill_session(name).await?;
         }
-        pool.ensure_session(name, &command, &cwd, &env, tags).await?;
+        pool.ensure_session(name, &command, &cwd, &env, &pool_tags).await?;
         let delivered_message_id = initial_message.as_ref().map(|message| message.id.clone());
         if let Some(message) = initial_message {
             if let Err(err) = pool.deliver(name, &message.text, true).await {
@@ -1563,6 +1684,16 @@ impl TerminalRuntime for TerminalControllerRuntime {
 }
 
 impl TerminalControllerRuntime {
+    fn runner_for_env(&self, env_ref: &str) -> Result<Arc<dyn CommandRunner>, String> {
+        if env_ref == self.state.host_direct_environment_name {
+            return self.state.daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string());
+        }
+        self.state
+            .daemon
+            .command_runner_for_environment(&EnvironmentId::new(env_ref.to_string()))
+            .ok_or_else(|| format!("command runner unavailable for environment {env_ref}"))
+    }
+
     fn registry_for_env(&self, env_ref: &str) -> Result<Arc<ProviderRegistry>, String> {
         if env_ref == self.state.host_direct_environment_name {
             return Ok(Arc::clone(&self.state.local_registry));
@@ -2525,7 +2656,8 @@ mod tests {
                 repositories: vec![ConvoyRepositorySpec {
                     url: "https://github.com/flotilla-org/flotilla.git".to_string(),
                     repo_ref: repository_key,
-                    base_ref: "main".to_string(),
+                    source_ref: "main".to_string(),
+                    target_ref: "main".to_string(),
                     workspace_slug: repository_spec.leaf_slug(),
                     subpaths: Vec::new(),
                 }],

@@ -26,6 +26,7 @@ pub struct CreateOpts {
     pub working_directory: Option<ExecutionEnvironmentPath>,
     pub provisioned_mounts: Vec<ProvisionedMount>,
     pub image_pull_policy: ImagePullPolicy,
+    pub docker_config_dir: Option<DaemonHostPath>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

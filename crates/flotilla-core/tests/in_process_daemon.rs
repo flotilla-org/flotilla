@@ -3604,6 +3604,50 @@ async fn repository_identity_change_removes_old_repo_key_observed_checkouts() {
 }
 
 #[tokio::test]
+async fn whole_repository_materialization_skips_generated_name_occupied_by_multi_repository_project() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let state = FakeVcsState::builder(repo.clone()).branch("main", true).checkout("main").is_main(true).path(&repo).build().build();
+    let mut discovery = fake_vcs_discovery(state);
+    discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
+
+    let daemon = InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
+
+    let tracked = RepositorySpec::remote("https://github.com/owner/repo").expect("tracked repository spec");
+    let other = RepositorySpec::remote("https://github.com/owner/other").expect("other repository spec");
+    let projects = daemon.resource_backend().using::<Project>("flotilla");
+    projects
+        .create(&InputMeta::builder().name("repo".to_string()).build(), &ProjectSpec {
+            display_name: "repo suite".to_string(),
+            default_workflow_ref: "single-agent-contained".to_string(),
+            issue_source: None,
+            repositories: vec![ProjectRepositorySpec { repo: tracked.key(), subpath: None, default_branch: None }, ProjectRepositorySpec {
+                repo: other.key(),
+                subpath: None,
+                default_branch: None,
+            }],
+        })
+        .await
+        .expect("generated-name occupant should be creatable");
+
+    daemon.add_repo(&repo).await.expect("tracked repository should be added");
+
+    let materialized = projects.list().await.expect("project list should succeed");
+    assert_eq!(materialized.items.len(), 2);
+    assert!(materialized.items.iter().any(|project| {
+        matches!(
+            project.spec.repositories.as_slice(),
+            [entry] if entry.repo == tracked.key() && entry.subpath.is_none()
+        )
+    }));
+    let occupant = materialized.items.iter().find(|project| project.metadata.name == "repo").expect("collision occupant should remain");
+    assert_eq!(occupant.spec.repositories.len(), 2);
+}
+
+#[tokio::test]
 async fn repository_identity_change_tolerates_missing_superseded_repository_retained_by_durable_checkout() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");

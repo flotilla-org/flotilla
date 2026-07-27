@@ -3,6 +3,7 @@ mod checkout;
 mod clone;
 pub mod controller;
 mod convoy;
+mod credential;
 mod definition;
 mod environment;
 mod error;
@@ -39,8 +40,13 @@ pub use convoy::{
     controller_patches, external_patches, pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending, provisioning_patches,
     reconcile, Convoy, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
     ConvoyStatusPatch, ConvoyTeardownRuntime, CrewWorkPhase, CrewWorkState, InputValue, IssueSnapshot, PlacementStatus, ReconcileOutcome,
-    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_PENDING_ANNOTATION,
-    WORKFLOW_SNAPSHOT_ANNOTATION,
+    TargetMismatch, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION,
+    PREPARED_SNAPSHOT_PENDING_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
+};
+pub use credential::{
+    CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
+    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
+    CREDENTIAL_REF_SESSION_TAG,
 };
 pub use definition::DefinitionResolver;
 pub use environment::{
@@ -49,7 +55,9 @@ pub use environment::{
 };
 pub use error::ResourceError;
 pub use flotilla_protocol::PrincipalRef;
-pub use host::{Host, HostSpec, HostStatus, HostStatusPatch, AGENT_ADAPTERS_CAPABILITY, TERMINAL_POOLS_CAPABILITY};
+pub use host::{
+    Host, HostSpec, HostStatus, HostStatusPatch, AGENT_ADAPTERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, TERMINAL_POOLS_CAPABILITY,
+};
 pub use http::{ensure_crd, ensure_namespace, HttpBackend};
 pub use in_memory::InMemoryBackend;
 pub use labels::{
@@ -109,6 +117,8 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Checkout>($($argument),*);
         $callback::<$crate::Clone>($($argument),*);
         $callback::<$crate::Convoy>($($argument),*);
+        $callback::<$crate::CredentialGrant>($($argument),*);
+        $callback::<$crate::CredentialSpec>($($argument),*);
         $callback::<$crate::Demand>($($argument),*);
         $callback::<$crate::Environment>($($argument),*);
         $callback::<$crate::Host>($($argument),*);

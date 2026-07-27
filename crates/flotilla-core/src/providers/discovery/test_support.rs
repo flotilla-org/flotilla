@@ -63,7 +63,7 @@ impl MergedPrProcessRunner {
     }
 
     fn response(&self) -> String {
-        format!(r#"[{{"number":{},"state":"MERGED","mergedAt":"2026-07-22T00:00:00Z"}}]"#, self.pr_number)
+        format!(r#"[{{"number":{},"state":"MERGED","mergedAt":"2026-07-22T00:00:00Z","baseRefName":"main"}}]"#, self.pr_number)
     }
 }
 
