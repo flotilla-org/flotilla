@@ -7,8 +7,10 @@ use common::{
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
     apply_status_patch, controller::ControllerLoop, external_patches, reconcile, Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler,
-    InMemoryBackend, InputMeta, IssueSnapshot, LifecycleAuthority, Presentation, PresentationSpec, RepositorySpec, ResourceBackend,
-    ResourceError, Vessel, VesselPhase, VesselStatus, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
+    InMemoryBackend, InputMeta, IssueSnapshot, LifecycleAuthority, PlacementPolicy, PlacementPolicySpec, PreparedSnapshotGarbageCollector,
+    Presentation, PresentationSpec, RepositorySpec, ResourceBackend, ResourceError, Vessel, VesselPhase, VesselStatus, WorkflowTemplate,
+    WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, VESSEL_LABEL,
+    WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
 };
 use tokio::time::{timeout, Duration};
 
@@ -287,9 +289,32 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let workspaces = backend.clone().using::<Vessel>("flotilla");
     let presentations = backend.clone().using::<Presentation>("flotilla");
+    let workflow_snapshot_name = "workflow-snapshot-012345abcdef";
+    let placement_snapshot_name = "placement-snapshot-012345abcdef";
+    let snapshot_labels = |kind: &str| [(PREPARED_SNAPSHOT_LABEL.to_string(), kind.to_string())].into_iter().collect();
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &InputMeta::builder().name(workflow_snapshot_name.to_string()).labels(snapshot_labels(WORKFLOW_SNAPSHOT_KIND)).build(),
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
+        .await
+        .expect("workflow snapshot create should succeed");
+    backend
+        .clone()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &InputMeta::builder().name(placement_snapshot_name.to_string()).labels(snapshot_labels(PLACEMENT_SNAPSHOT_KIND)).build(),
+            &PlacementPolicySpec::builder().pool("remote".to_string()).build(),
+        )
+        .await
+        .expect("placement snapshot create should succeed");
 
-    let created =
-        convoys.create(&convoy_meta("convoy-delete"), &task_provisioning_convoy_spec()).await.expect("convoy create should succeed");
+    let mut convoy_meta = convoy_meta("convoy-delete");
+    convoy_meta.annotations.insert(WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_snapshot_name.to_string());
+    convoy_meta.annotations.insert(PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), placement_snapshot_name.to_string());
+    let created = convoys.create(&convoy_meta, &task_provisioning_convoy_spec()).await.expect("convoy create should succeed");
     let mut status = bootstrapped_tool_only_convoy_status();
     status.phase = ConvoyPhase::Active;
     status.started_at = Some(timestamp(18));
@@ -437,7 +462,8 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
             secondaries: ConvoyReconciler::secondary_watches(),
             reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
                 .with_vessels(workspaces.clone())
-                .with_presentations(presentations.clone()),
+                .with_presentations(presentations.clone())
+                .with_prepared_snapshot_gc(PreparedSnapshotGarbageCollector::new(backend.clone(), "flotilla")),
             resync_interval: Duration::from_millis(50),
             backend: backend.clone(),
         }
@@ -463,6 +489,14 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
             if matches!(convoys.get("convoy-delete").await, Err(ResourceError::NotFound { .. }))
                 && matches!(workspaces.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. }))
                 && matches!(presentations.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. }))
+                && matches!(
+                    backend.clone().using::<WorkflowTemplate>("flotilla").get(workflow_snapshot_name).await,
+                    Err(ResourceError::NotFound { .. })
+                )
+                && matches!(
+                    backend.clone().using::<PlacementPolicy>("flotilla").get(placement_snapshot_name).await,
+                    Err(ResourceError::NotFound { .. })
+                )
             {
                 break;
             }

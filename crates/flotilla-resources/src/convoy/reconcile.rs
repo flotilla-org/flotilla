@@ -17,12 +17,13 @@ use crate::{
         SecondaryWatch,
     },
     labels::{CONVOY_LABEL, VESSEL_LABEL},
+    pinned_placement_ref, pinned_workflow_ref,
     presentation::{Presentation, PresentationSpec},
     resource::ResourceObject,
     status_patch::StatusPatch,
     vessel::{Vessel, VesselPhase},
     workflow_template::{validate, visit_template_tokens, CrewSource, CrewSpec, ValidationError, WorkflowTemplate},
-    InputMeta, InputValue, OwnerReference, PlacementStatus, Resource, ResourceError, TypedResolver,
+    InputMeta, InputValue, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, Resource, ResourceError, TypedResolver,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,7 @@ pub struct ConvoyReconciler {
     vessels: Option<TypedResolver<Vessel>>,
     presentations: Option<TypedResolver<Presentation>>,
     checkouts: Option<TypedResolver<Checkout>>,
+    prepared_snapshot_gc: Option<PreparedSnapshotGarbageCollector>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,7 +67,7 @@ pub struct ConvoyDependencies {
 
 impl ConvoyReconciler {
     pub fn new(templates: TypedResolver<WorkflowTemplate>) -> Self {
-        Self { templates, vessels: None, presentations: None, checkouts: None }
+        Self { templates, vessels: None, presentations: None, checkouts: None, prepared_snapshot_gc: None }
     }
 
     pub fn with_vessels(mut self, vessels: TypedResolver<Vessel>) -> Self {
@@ -80,6 +82,11 @@ impl ConvoyReconciler {
 
     pub fn with_checkouts(mut self, checkouts: TypedResolver<Checkout>) -> Self {
         self.checkouts = Some(checkouts);
+        self
+    }
+
+    pub fn with_prepared_snapshot_gc(mut self, collector: PreparedSnapshotGarbageCollector) -> Self {
+        self.prepared_snapshot_gc = Some(collector);
         self
     }
 
@@ -100,7 +107,7 @@ impl Reconciler for ConvoyReconciler {
         let template = if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() {
             None
         } else {
-            match self.templates.get(&obj.spec.workflow_ref).await {
+            match self.templates.get(pinned_workflow_ref(obj)).await {
                 Ok(template) => Some(template),
                 Err(ResourceError::NotFound { .. }) => None,
                 Err(err) => return Err(err),
@@ -154,6 +161,9 @@ impl Reconciler for ConvoyReconciler {
         }
         if let Some(checkouts) = &self.checkouts {
             delete_lifecycle_owned_matching(checkouts, &selector).await?;
+        }
+        if let Some(collector) = &self.prepared_snapshot_gc {
+            collector.collect(Some(&obj.metadata.name)).await?;
         }
         Ok(())
     }
@@ -694,7 +704,7 @@ fn cleanup_actuations(
 }
 
 fn create_vessel_outcome(convoy: &ResourceObject<Convoy>, vessel: &str, _now: DateTime<Utc>) -> Option<InternalReconcileOutcome> {
-    let placement_policy_ref = convoy.spec.placement_policy.clone()?;
+    let placement_policy_ref = pinned_placement_ref(convoy)?.to_string();
     let requirement = convoy.status.as_ref()?.workflow_snapshot.as_ref()?.vessels.iter().find(|requirement| requirement.name == vessel)?;
     let repository_refs = requirement
         .repository_refs

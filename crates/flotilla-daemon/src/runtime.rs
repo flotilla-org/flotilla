@@ -832,7 +832,11 @@ fn spawn_controller_loops(
                             reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
                                 .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                                 .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
-                                .with_checkouts(backend.clone().using::<Checkout>(&namespace_string)),
+                                .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
+                                .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
+                                    backend.clone(),
+                                    &namespace_string,
+                                )),
                             resync_interval: controller_resync_interval,
                             backend,
                         }

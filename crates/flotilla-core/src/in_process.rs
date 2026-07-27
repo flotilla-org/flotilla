@@ -2330,16 +2330,13 @@ impl InProcessDaemon {
             return Err(format!("namespace `{requested_namespace}` is not served by this daemon (configured namespace: `{namespace}`)"));
         }
         let fallback_principal = PrincipalRef::implicit_for_namespace(&namespace);
-        let mut admission =
-            self.prepare_convoy_admission(&namespace, intent, dispatching_principal_ref.unwrap_or(&fallback_principal)).await?;
+        let admission = self.prepare_convoy_admission(&namespace, intent, dispatching_principal_ref.unwrap_or(&fallback_principal)).await?;
         let workflow_value = serde_json::to_value(&admission.workflow).map_err(|error| error.to_string())?;
-        let workflow_name = prepared_snapshot_name(&admission.name, "workflow", &workflow_value)?;
-        admission.spec.workflow_ref.clone_from(&workflow_name);
+        let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
         let (placement_policy_name, placement_policy_spec) = match admission.placement_policy {
             Some(spec) => {
                 let value = serde_json::to_value(spec).map_err(|error| error.to_string())?;
-                let name = prepared_snapshot_name(&admission.name, "placement", &value)?;
-                admission.spec.placement_policy = Some(name.clone());
+                let name = prepared_snapshot_name("placement", &value)?;
                 (Some(name), Some(value))
             }
             None => (None, None),
@@ -3195,11 +3192,11 @@ async fn ensure_default_workflows(backend: &ResourceBackend, namespace: &str) ->
     Ok(())
 }
 
-fn prepared_snapshot_name(convoy_name: &str, kind: &str, spec: &serde_json::Value) -> Result<String, String> {
+fn prepared_snapshot_name(kind: &str, spec: &serde_json::Value) -> Result<String, String> {
     let encoded = serde_json::to_vec(spec).map_err(|error| error.to_string())?;
     let digest = Sha256::digest(encoded);
     let suffix = digest[..6].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-    Ok(format!("{convoy_name}-remote-{kind}-{suffix}"))
+    Ok(format!("{kind}-snapshot-{suffix}"))
 }
 
 async fn ensure_prepared_workflow_snapshot(
@@ -3213,7 +3210,16 @@ async fn ensure_prepared_workflow_snapshot(
         Ok(existing) if existing.spec == *spec => Ok(()),
         Ok(_) => Err(format!("prepared workflow snapshot {name} already exists with different contents")),
         Err(ResourceError::NotFound { .. }) => templates
-            .create(&InputMeta::builder().name(name.to_string()).build(), spec)
+            .create(
+                &InputMeta::builder()
+                    .name(name.to_string())
+                    .labels(BTreeMap::from([(
+                        flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(),
+                        flotilla_resources::WORKFLOW_SNAPSHOT_KIND.to_string(),
+                    )]))
+                    .build(),
+                spec,
+            )
             .await
             .map(|_| ())
             .map_err(|error| error.to_string()),
@@ -3231,9 +3237,20 @@ async fn ensure_prepared_placement_snapshot(
     match policies.get(name).await {
         Ok(existing) if existing.spec == *spec => Ok(()),
         Ok(_) => Err(format!("prepared placement snapshot {name} already exists with different contents")),
-        Err(ResourceError::NotFound { .. }) => {
-            policies.create(&InputMeta::builder().name(name.to_string()).build(), spec).await.map(|_| ()).map_err(|error| error.to_string())
-        }
+        Err(ResourceError::NotFound { .. }) => policies
+            .create(
+                &InputMeta::builder()
+                    .name(name.to_string())
+                    .labels(BTreeMap::from([(
+                        flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(),
+                        flotilla_resources::PLACEMENT_SNAPSHOT_KIND.to_string(),
+                    )]))
+                    .build(),
+                spec,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
         Err(error) => Err(error.to_string()),
     }
 }
@@ -3271,7 +3288,12 @@ async fn ensure_repository_and_default_project_workflow(
     flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(namespace), repository_key, repository_spec)
         .await
         .map_err(|error| error.to_string())?;
-    ensure_default_workflows(backend, namespace).await
+    ensure_default_workflows(backend, namespace).await?;
+    flotilla_resources::PreparedSnapshotGarbageCollector::new(backend.clone(), namespace)
+        .collect(None)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: String) -> Result<ProjectSpec, String> {
@@ -3712,8 +3734,22 @@ impl InProcessDaemon {
         spec: &ConvoySpec,
         dispatch_regard: ConvoyDispatchRegard,
     ) -> Result<(), String> {
+        self.create_convoy_with_annotations(namespace, name, spec, dispatch_regard, BTreeMap::new()).await
+    }
+
+    async fn create_convoy_with_annotations(
+        &self,
+        namespace: &str,
+        name: &str,
+        spec: &ConvoySpec,
+        dispatch_regard: ConvoyDispatchRegard,
+        annotations: BTreeMap<String, String>,
+    ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        convoys.create(&InputMeta::builder().name(name.to_string()).build(), spec).await.map_err(|error| error.to_string())?;
+        convoys
+            .create(&InputMeta::builder().name(name.to_string()).annotations(annotations).build(), spec)
+            .await
+            .map_err(|error| error.to_string())?;
         if dispatch_regard == ConvoyDispatchRegard::Emit {
             if let Err(error) = self.emit_implicit_convoy_regard(namespace, name, &spec.dispatching_principal_ref).await {
                 warn!(%error, %namespace, %name, "failed to emit convoy dispatch regard");
@@ -3829,13 +3865,17 @@ impl InProcessDaemon {
             serde_json::from_value(start.convoy_spec.clone()).map_err(|error| format!("invalid prepared convoy spec: {error}"))?;
         let workflow_spec: WorkflowTemplateSpec =
             serde_json::from_value(start.workflow_spec.clone()).map_err(|error| format!("invalid prepared workflow snapshot: {error}"))?;
-        if convoy_spec.workflow_ref != start.workflow_name {
-            return Err("prepared convoy workflow reference does not match its snapshot name".to_string());
+        let expected_workflow_name = prepared_snapshot_name("workflow", &start.workflow_spec)
+            .map_err(|error| format!("invalid prepared workflow snapshot: {error}"))?;
+        if expected_workflow_name != start.workflow_name {
+            return Err("prepared workflow snapshot name does not match its contents".to_string());
         }
         let placement_spec = match (&start.placement_policy_name, &start.placement_policy_spec) {
             (Some(name), Some(value)) => {
-                if convoy_spec.placement_policy.as_deref() != Some(name) {
-                    return Err("prepared convoy placement reference does not match its snapshot name".to_string());
+                let expected_name =
+                    prepared_snapshot_name("placement", value).map_err(|error| format!("invalid prepared placement snapshot: {error}"))?;
+                if expected_name != *name {
+                    return Err("prepared placement snapshot name does not match its contents".to_string());
                 }
                 let spec: PlacementPolicySpec =
                     serde_json::from_value(value.clone()).map_err(|error| format!("invalid prepared placement snapshot: {error}"))?;
@@ -3866,7 +3906,11 @@ impl InProcessDaemon {
         if let Some((name, spec)) = placement_spec {
             ensure_prepared_placement_snapshot(&self.resource_backend, &namespace, name, &spec).await?;
         }
-        self.create_convoy(&namespace, &start.name, &convoy_spec, start.dispatch_regard).await
+        let mut annotations = BTreeMap::from([(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), start.workflow_name.clone())]);
+        if let Some(name) = &start.placement_policy_name {
+            annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), name.clone());
+        }
+        self.create_convoy_with_annotations(&namespace, &start.name, &convoy_spec, start.dispatch_regard, annotations).await
     }
 
     async fn supervise_convoy_start(&self, task: ConvoyStartTask) {

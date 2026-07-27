@@ -12,6 +12,9 @@ pub use reconcile::{reconcile, ConvoyEvent, ConvoyReconciler, ReconcileOutcome};
 
 define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
 
+pub const WORKFLOW_SNAPSHOT_ANNOTATION: &str = "flotilla.work/workflow-snapshot";
+pub const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapshot";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoySpec {
     pub workflow_ref: String,
@@ -52,6 +55,14 @@ impl ConvoySpec {
         };
         Some(repository)
     }
+}
+
+pub fn pinned_workflow_ref(convoy: &crate::ResourceObject<Convoy>) -> &str {
+    convoy.metadata.annotations.get(WORKFLOW_SNAPSHOT_ANNOTATION).map(String::as_str).unwrap_or(&convoy.spec.workflow_ref)
+}
+
+pub fn pinned_placement_ref(convoy: &crate::ResourceObject<Convoy>) -> Option<&str> {
+    convoy.metadata.annotations.get(PLACEMENT_SNAPSHOT_ANNOTATION).map(String::as_str).or(convoy.spec.placement_policy.as_deref())
 }
 
 /// Durable source-qualified issue context captured when a convoy is admitted.
