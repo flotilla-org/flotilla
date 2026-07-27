@@ -74,3 +74,11 @@ flotilla resource get \
 The host reference is an identity assigned by Flotilla. If kiwi is
 re-registered as a new host, update `host_ref`, reapply the manifest, and
 commit that change.
+
+`docker_per_vessel.image` remains a literal Docker image tag. Its
+`pull_policy` accepts `always` (the default), `if_not_present`, or `never`.
+Use `if_not_present` to prefer a locally-built image while retaining registry
+fallback, or `never` when the image must already exist on the placement host.
+This policy does not resolve or build the image recipe in
+`.flotilla/environment.yaml`; connecting placement tags to image recipes is a
+separate design concern.

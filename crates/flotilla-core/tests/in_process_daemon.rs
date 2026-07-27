@@ -889,6 +889,7 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                     host_ref: "host-test".into(),
                     image: image.into(),
+                    pull_policy: Default::default(),
                     agent_adapters,
                     default_cwd: Some("/workspace".into()),
                     env: Default::default(),

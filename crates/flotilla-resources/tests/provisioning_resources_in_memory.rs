@@ -3,8 +3,8 @@ mod common;
 use chrono::Utc;
 use common::{owner_reference, resource_meta};
 use flotilla_resources::{
-    Checkout, CheckoutSpec, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerPerVesselPlacementPolicySpec, Environment,
-    EnvironmentMount, EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, Host, HostDirectEnvironmentSpec,
+    Checkout, CheckoutSpec, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec,
+    Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, Host, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend, PlacementPolicy, PlacementPolicySpec,
     ResourceBackend, Selector, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel,
     VesselPhase, VesselSpec, VesselStatus,
@@ -105,6 +105,7 @@ async fn environment_and_checkout_specs_serialize_through_in_memory_backend() {
             host_ref: "01HXYZ".to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),
             declared_agent_adapters: Default::default(),
+            pull_policy: Default::default(),
             mounts: vec![EnvironmentMount {
                 source_path: "/Users/alice/dev/flotilla.fix-bug-123".to_string(),
                 target_path: "/workspace".to_string(),
@@ -169,6 +170,7 @@ fn docker_per_vessel_policy_uses_vessel_spelling_in_serialized_resources() {
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: "01HXYZ".to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),
+            pull_policy: DockerImagePullPolicy::Never,
             agent_adapters: Default::default(),
             default_cwd: Some("/workspace".to_string()),
             env: [("FOO".to_string(), "bar".to_string())].into_iter().collect(),
@@ -183,6 +185,7 @@ fn docker_per_vessel_policy_uses_vessel_spelling_in_serialized_resources() {
             "docker_per_vessel": {
                 "host_ref": "01HXYZ",
                 "image": "ghcr.io/flotilla/dev:latest",
+                "pull_policy": "never",
                 "default_cwd": "/workspace",
                 "env": {"FOO": "bar"},
                 "checkout": {"fresh_clone_in_container": {"clone_path": "/workspace"}}

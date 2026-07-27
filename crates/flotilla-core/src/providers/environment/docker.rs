@@ -79,6 +79,8 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         let mut args = vec![
             "run",
             "-d",
+            "--pull",
+            opts.image_pull_policy.docker_value(),
             "--name",
             &container_name,
             "--label",

@@ -10,8 +10,8 @@ use flotilla_resources::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
     repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
-    CrewSource, DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
-    EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta,
+    CrewSource, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentMount, EnvironmentMountMode,
+    EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta,
     LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey,
     RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionIdentity,
     TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, CONVOY_LABEL, VESSEL_REF_LABEL,
@@ -73,6 +73,7 @@ enum PlacementStrategy {
         host_ref: String,
         pool: String,
         image: String,
+        pull_policy: DockerImagePullPolicy,
         env: BTreeMap<String, String>,
         mount_path: String,
         default_cwd: Option<String>,
@@ -81,6 +82,7 @@ enum PlacementStrategy {
         host_ref: String,
         pool: String,
         image: String,
+        pull_policy: DockerImagePullPolicy,
         env: BTreeMap<String, String>,
         clone_path: String,
         default_cwd: Option<String>,
@@ -251,7 +253,7 @@ impl Reconciler for VesselReconciler {
         };
 
         let precreated_environment_ref = match &strategy {
-            PlacementStrategy::DockerFreshCloneInContainer { host_ref, image, env, .. } => {
+            PlacementStrategy::DockerFreshCloneInContainer { host_ref, image, pull_policy, env, .. } => {
                 let env_name = environment_name(&obj.metadata.name);
                 match self.environments.get(&env_name).await {
                     Ok(existing) => {
@@ -276,6 +278,7 @@ impl Reconciler for VesselReconciler {
                                     host_ref: host_ref.clone(),
                                     image: image.clone(),
                                     declared_agent_adapters: declared_agent_adapters.clone(),
+                                    pull_policy: *pull_policy,
                                     mounts: Vec::new(),
                                     env: env.clone(),
                                 }),
@@ -527,7 +530,7 @@ impl Reconciler for VesselReconciler {
                 }
                 env_name
             }
-            PlacementStrategy::DockerWorktreeOnHostAndMount { host_ref, image, env, mount_path, .. } => {
+            PlacementStrategy::DockerWorktreeOnHostAndMount { host_ref, image, pull_policy, env, mount_path, .. } => {
                 let env_name = environment_name(&obj.metadata.name);
                 match self.environments.get(&env_name).await {
                     Ok(existing) => {
@@ -552,6 +555,7 @@ impl Reconciler for VesselReconciler {
                                     host_ref: host_ref.clone(),
                                     image: image.clone(),
                                     declared_agent_adapters: declared_agent_adapters.clone(),
+                                    pull_policy: *pull_policy,
                                     mounts: has_repositories
                                         .then(|| EnvironmentMount {
                                             source_path: workspace_root.clone(),
@@ -753,6 +757,7 @@ fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, S
                 host_ref: docker.host_ref.clone(),
                 pool: spec.pool.clone(),
                 image: docker.image.clone(),
+                pull_policy: docker.pull_policy,
                 env: docker.env.clone(),
                 mount_path: mount_path.clone(),
                 default_cwd: docker.default_cwd.clone(),
@@ -761,6 +766,7 @@ fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, S
                 host_ref: docker.host_ref.clone(),
                 pool: spec.pool.clone(),
                 image: docker.image.clone(),
+                pull_policy: docker.pull_policy,
                 env: docker.env.clone(),
                 clone_path: clone_path.clone(),
                 default_cwd: docker.default_cwd.clone(),

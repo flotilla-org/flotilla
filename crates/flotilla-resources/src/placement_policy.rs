@@ -31,6 +31,10 @@ pub enum HostDirectPlacementPolicyCheckout {
 pub struct DockerPerVesselPlacementPolicySpec {
     pub host_ref: String,
     pub image: String,
+    /// Controls registry access for the literal image tag. Image build recipes
+    /// are intentionally outside placement policy and are tracked separately.
+    #[serde(default)]
+    pub pull_policy: DockerImagePullPolicy,
     /// Agent adapters the image recipe promises will be available after provisioning.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub agent_adapters: BTreeSet<String>,
@@ -39,6 +43,15 @@ pub struct DockerPerVesselPlacementPolicySpec {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub checkout: DockerCheckoutStrategy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerImagePullPolicy {
+    #[default]
+    Always,
+    IfNotPresent,
+    Never,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use flotilla_core::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
-        environment::{CreateOpts, EnvironmentProvider, ProvisionedMount, ProvisionedMountMode},
+        environment::{CreateOpts, EnvironmentProvider, ImagePullPolicy, ProvisionedMount, ProvisionedMountMode},
         terminal::TerminalPool,
         vcs::{CloneInspection, CloneProvisioner},
     },
@@ -47,6 +47,11 @@ impl DockerEnvironmentActuator {
             tokens: self.tokens.clone(),
             daemon_socket_path: self.daemon_socket_path.clone(),
             working_directory: None,
+            image_pull_policy: match spec.pull_policy {
+                flotilla_resources::DockerImagePullPolicy::Always => ImagePullPolicy::Always,
+                flotilla_resources::DockerImagePullPolicy::IfNotPresent => ImagePullPolicy::IfNotPresent,
+                flotilla_resources::DockerImagePullPolicy::Never => ImagePullPolicy::Never,
+            },
             provisioned_mounts: spec.mounts.iter().map(provisioned_mount).collect(),
         }
     }

@@ -63,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokens: vec![],
         daemon_socket_path: socket_path,
         working_directory: None,
+        image_pull_policy: Default::default(),
         provisioned_mounts: vec![flotilla_core::providers::environment::ProvisionedMount::new(
             reference_repo.as_path().to_path_buf(),
             "/ref/repo",

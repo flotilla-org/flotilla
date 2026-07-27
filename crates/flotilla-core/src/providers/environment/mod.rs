@@ -25,6 +25,25 @@ pub struct CreateOpts {
     pub daemon_socket_path: DaemonHostPath,
     pub working_directory: Option<ExecutionEnvironmentPath>,
     pub provisioned_mounts: Vec<ProvisionedMount>,
+    pub image_pull_policy: ImagePullPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ImagePullPolicy {
+    Always,
+    #[default]
+    IfNotPresent,
+    Never,
+}
+
+impl ImagePullPolicy {
+    fn docker_value(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::IfNotPresent => "missing",
+            Self::Never => "never",
+        }
+    }
 }
 
 /// Structured metadata for a flotilla-managed bind mount inside a provisioned environment.

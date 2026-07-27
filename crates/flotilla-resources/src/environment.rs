@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch};
+use crate::{placement_policy::DockerImagePullPolicy, resource::define_resource, status_patch::StatusPatch};
 
 define_resource!(Environment, "environments", EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch);
 
@@ -27,6 +27,8 @@ pub struct DockerEnvironmentSpec {
     /// Agent adapters the placement policy expects discovery to find in the image.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub declared_agent_adapters: BTreeSet<String>,
+    #[serde(default)]
+    pub pull_policy: DockerImagePullPolicy,
     #[serde(default)]
     pub mounts: Vec<EnvironmentMount>,
     #[serde(default)]

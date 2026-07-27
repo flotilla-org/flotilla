@@ -270,7 +270,13 @@ impl EnvironmentManager {
             .as_ref()
             .map(|repo| vec![ProvisionedMount::new(repo.as_path().to_path_buf(), PathBuf::from("/ref/repo"), ProvisionedMountMode::Ro)])
             .unwrap_or_default();
-        let opts = CreateOpts { tokens, daemon_socket_path: daemon_socket_path.clone(), working_directory: None, provisioned_mounts };
+        let opts = CreateOpts {
+            tokens,
+            daemon_socket_path: daemon_socket_path.clone(),
+            working_directory: None,
+            provisioned_mounts,
+            image_pull_policy: Default::default(),
+        };
         let handle = env_provider.create(env_id.clone(), &image, opts).await?;
         let (env_bag, provider_registry) = self.probe_provisioned_environment(&env_id, &handle, config_base).await?;
         self.register_provisioned_environment(env_id, handle, env_bag, Some(Arc::new(provider_registry)))

@@ -23,21 +23,21 @@ use flotilla_core::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{run_provisioned_host_detectors, EnvironmentBag},
-        environment::{CreateOpts, EnvironmentHandle},
+        environment::{CreateOpts, EnvironmentHandle, ImagePullPolicy},
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool},
         vcs::{CloneProvisioner, GitCloneProvisioner},
         ChannelLabel, CommandRunner,
     },
 };
-use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec, HostSummary, ImageId, ImageSource, TerminalStatus};
+use flotilla_protocol::{EnvironmentId, HostSummary, ImageId, TerminalStatus};
 use flotilla_resources::{
     clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone,
-    CloneSpec, Convoy, ConvoyReconciler, CrewSource, CrewSpec, Demand, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec,
-    Environment, EnvironmentSpec, ForgeIdentity, Host, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation,
-    Project, Regard, Repository, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement,
-    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    CloneSpec, Convoy, ConvoyReconciler, CrewSource, CrewSpec, Demand, DockerCheckoutStrategy, DockerImagePullPolicy,
+    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host, HostDirectEnvironmentSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy,
+    PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend, ResourceError, ResourceObject, Stance,
+    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -506,6 +506,7 @@ async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, pro
                         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                             host_ref: profile.host_id.clone(),
                             image: DEFAULT_DOCKER_IMAGE.to_string(),
+                            pull_policy: Default::default(),
                             agent_adapters: BTreeSet::new(),
                             default_cwd: Some("/workspace".to_string()),
                             env: BTreeMap::new(),
@@ -969,14 +970,18 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .or_else(|| self.state.local_registry.environment_providers.preferred_with_desc())
             .ok_or_else(|| "docker environment provider unavailable".to_string())?;
 
-        let runtime_spec = RuntimeEnvironmentSpec { image: ImageSource::Registry(spec.image.clone()), token_env_vars: Vec::new() };
-        let image = provider.ensure_image(&runtime_spec, Path::new("/")).await?;
+        let image = ImageId::new(spec.image.clone());
         let env_id = EnvironmentId::new(name.to_string());
         let handle = provider
-            .create(env_id.clone(), &ImageId::new(image.as_str().to_string()), CreateOpts {
+            .create(env_id.clone(), &image, CreateOpts {
                 tokens: Vec::new(),
                 daemon_socket_path,
                 working_directory: None,
+                image_pull_policy: match spec.pull_policy {
+                    DockerImagePullPolicy::Always => ImagePullPolicy::Always,
+                    DockerImagePullPolicy::IfNotPresent => ImagePullPolicy::IfNotPresent,
+                    DockerImagePullPolicy::Never => ImagePullPolicy::Never,
+                },
                 provisioned_mounts: spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount).collect(),
             })
             .await?;
