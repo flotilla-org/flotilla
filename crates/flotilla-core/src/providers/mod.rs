@@ -231,6 +231,15 @@ pub trait CommandRunner: Send + Sync {
     /// Check if a command is available by running it.
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool;
 
+    /// Check whether a path exists in the runner's execution environment.
+    ///
+    /// Unlike checking from the daemon process, this preserves container and
+    /// remote-host path semantics.
+    async fn path_exists(&self, path: &Path) -> Result<bool, String> {
+        let path = path.to_string_lossy();
+        self.run_output("test", &["-e", &path], Path::new("/"), &ChannelLabel::Noop).await.map(|output| output.success)
+    }
+
     /// Ensure `path` exists with `content` if absent, returning the resulting
     /// file contents. Existing files are preserved.
     async fn ensure_file(&self, _path: &Path, content: &str) -> Result<String, String> {

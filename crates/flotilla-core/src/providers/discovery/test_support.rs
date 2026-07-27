@@ -267,6 +267,10 @@ impl CommandRunner for DiscoveryMockRunner {
         self.tool_exists.get(cmd).copied().unwrap_or(false)
     }
 
+    async fn path_exists(&self, _path: &Path) -> Result<bool, String> {
+        Ok(true)
+    }
+
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
         let mut files = self.files.lock().expect("lock poisoned");
         Ok(files.entry(path.to_path_buf()).or_insert_with(|| content.to_owned()).clone())

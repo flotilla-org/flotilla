@@ -192,6 +192,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
         observed_policy_ref: "docker-on-01HXYZ".to_string(),
         observed_policy_version: "12".to_string(),
         started_at,
+        message: None,
     }
     .apply(&mut status);
     assert_eq!(status.phase, VesselPhase::Provisioning);
@@ -201,9 +202,11 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
         observed_policy_ref: "docker-on-01HXYZ".to_string(),
         observed_policy_version: "13".to_string(),
         started_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
+        message: Some("still waiting".to_string()),
     }
     .apply(&mut status);
     assert_eq!(status.started_at, Some(started_at), "reconcile must not restamp an in-progress transition");
+    assert_eq!(status.message.as_deref(), Some("still waiting"));
 
     VesselStatusPatch::MarkReady {
         environment_ref: Some("env-a".to_string()),

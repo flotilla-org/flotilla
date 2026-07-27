@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, marker::PhantomData, path::PathBuf};
+use std::{collections::BTreeMap, marker::PhantomData, path::PathBuf, time::Duration};
 
 use chrono::{DateTime, Utc};
 use flotilla_core::agent_adapter::{
@@ -21,6 +21,8 @@ use flotilla_resources::{
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
 const REPO_LABEL: &str = "flotilla.work/repo";
 const ENV_LABEL: &str = "flotilla.work/env";
+const VESSEL_PROVISIONING_REQUEUE_AFTER: Duration = Duration::from_secs(5);
+const VESSEL_PROVISIONING_STUCK_SECONDS: i64 = 2 * 60;
 
 #[derive(bon::Builder)]
 pub struct VesselReconciler {
@@ -96,6 +98,7 @@ enum PlannedPatch {
     Provisioning {
         observed_policy_ref: String,
         observed_policy_version: String,
+        waiting_for: String,
     },
     Ready {
         environment_ref: String,
@@ -127,8 +130,13 @@ impl VesselDeps {
         Self { patch: PlannedPatch::None, actuations: Vec::new() }
     }
 
-    fn provisioning(obj: &ResourceObject<Vessel>, placement_policy: &ResourceObject<PlacementPolicy>, actuations: Vec<Actuation>) -> Self {
-        Self { patch: provisioning_patch(obj, placement_policy), actuations }
+    fn provisioning(
+        obj: &ResourceObject<Vessel>,
+        placement_policy: &ResourceObject<PlacementPolicy>,
+        waiting_for: impl Into<String>,
+        actuations: Vec<Actuation>,
+    ) -> Self {
+        Self { patch: provisioning_patch(obj, placement_policy, waiting_for.into()), actuations }
     }
 
     fn ready(
@@ -254,7 +262,12 @@ impl Reconciler for VesselReconciler {
                 None => return Ok(VesselDeps::failed(format!("environment {clone_env_ref} is not a host_direct environment"))),
             };
             if clone_env.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
+                return Ok(VesselDeps::provisioning(
+                    obj,
+                    &placement_policy,
+                    format!("environment {clone_env_ref} to become ready"),
+                    actuations,
+                ));
             }
             Some(clone_env_spec.repo_default_dir.clone())
         } else {
@@ -275,7 +288,12 @@ impl Reconciler for VesselReconciler {
                             return Ok(VesselDeps::failed(message));
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                            return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
+                            return Ok(VesselDeps::provisioning(
+                                obj,
+                                &placement_policy,
+                                format!("environment {env_name} to become ready"),
+                                actuations,
+                            ));
                         }
                         match image_stamp(&existing) {
                             Ok(image) => image,
@@ -297,7 +315,12 @@ impl Reconciler for VesselReconciler {
                                 }),
                             },
                         });
-                        return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
+                        return Ok(VesselDeps::provisioning(
+                            obj,
+                            &placement_policy,
+                            format!("environment {env_name} to become ready"),
+                            actuations,
+                        ));
                     }
                     Err(err) => return Err(err),
                 };
@@ -323,7 +346,7 @@ impl Reconciler for VesselReconciler {
         };
         let mut checkout_refs = BTreeMap::new();
         let mut checkout_paths = BTreeMap::new();
-        let mut waiting_for_checkouts = false;
+        let mut waiting_for_checkouts = Vec::new();
         let mut fork_stance = false;
         for convoy_repository in convoy_repositories {
             let repository_spec = match self.repositories.get(&convoy_repository.repo_ref.to_string()).await {
@@ -472,7 +495,7 @@ impl Reconciler for VesselReconciler {
                         checkout_refs.insert(repository_key.clone(), checkout_name);
                         checkout_paths.insert(repository_key, path);
                     } else {
-                        waiting_for_checkouts = true;
+                        waiting_for_checkouts.push(checkout_name);
                     }
                 }
                 Err(ResourceError::NotFound { .. }) => {
@@ -511,13 +534,18 @@ impl Reconciler for VesselReconciler {
                         PlacementStrategy::DockerFreshCloneInContainer { .. } => owned_child_meta(&checkout_name, obj, labels),
                     };
                     actuations.push(Actuation::CreateCheckout { meta, spec });
-                    waiting_for_checkouts = true;
+                    waiting_for_checkouts.push(checkout_name);
                 }
                 Err(err) => return Err(err),
             }
         }
-        if waiting_for_checkouts {
-            return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
+        if !waiting_for_checkouts.is_empty() {
+            return Ok(VesselDeps::provisioning(
+                obj,
+                &placement_policy,
+                format!("checkout {} to become ready", waiting_for_checkouts.join(", ")),
+                actuations,
+            ));
         }
         let has_repositories = !repository_refs.is_empty();
         let workspace_root = if multi_repository {
@@ -542,7 +570,12 @@ impl Reconciler for VesselReconciler {
                     return Ok(VesselDeps::failed(format!("environment {env_name} failed")));
                 }
                 if environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                    return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
+                    return Ok(VesselDeps::provisioning(
+                        obj,
+                        &placement_policy,
+                        format!("environment {env_name} to become ready"),
+                        actuations,
+                    ));
                 }
                 (env_name, None)
             }
@@ -559,7 +592,12 @@ impl Reconciler for VesselReconciler {
                             return Ok(VesselDeps::failed(message));
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                            return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
+                            return Ok(VesselDeps::provisioning(
+                                obj,
+                                &placement_policy,
+                                format!("environment {env_name} to become ready"),
+                                actuations,
+                            ));
                         }
                         match image_stamp(&existing) {
                             Ok(image) => image,
@@ -588,7 +626,12 @@ impl Reconciler for VesselReconciler {
                                 }),
                             },
                         });
-                        return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
+                        return Ok(VesselDeps::provisioning(
+                            obj,
+                            &placement_policy,
+                            format!("environment {env_name} to become ready"),
+                            actuations,
+                        ));
                     }
                     Err(err) => return Err(err),
                 };
@@ -652,7 +695,12 @@ impl Reconciler for VesselReconciler {
                         continue;
                     }
                     if should_start && phase != Some(TerminalSessionPhase::Running) {
-                        return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
+                        return Ok(VesselDeps::provisioning(
+                            obj,
+                            &placement_policy,
+                            format!("terminal session {terminal_name} to become running"),
+                            actuations,
+                        ));
                     }
                 }
                 Err(ResourceError::NotFound { .. }) => {
@@ -721,7 +769,12 @@ impl Reconciler for VesselReconciler {
                             pool: strategy.pool().to_string(),
                         },
                     });
-                    return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
+                    return Ok(VesselDeps::provisioning(
+                        obj,
+                        &placement_policy,
+                        format!("terminal session {terminal_name} to become running"),
+                        actuations,
+                    ));
                 }
                 Err(err) => return Err(err),
             }
@@ -740,17 +793,20 @@ impl Reconciler for VesselReconciler {
 
     fn reconcile(
         &self,
-        _obj: &ResourceObject<Self::Resource>,
+        obj: &ResourceObject<Self::Resource>,
         deps: &Self::Dependencies,
         now: DateTime<Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         let patch = match &deps.patch {
             PlannedPatch::None => None,
-            PlannedPatch::Provisioning { observed_policy_ref, observed_policy_version } => Some(VesselStatusPatch::MarkProvisioning {
-                observed_policy_ref: observed_policy_ref.clone(),
-                observed_policy_version: observed_policy_version.clone(),
-                started_at: now,
-            }),
+            PlannedPatch::Provisioning { observed_policy_ref, observed_policy_version, waiting_for } => {
+                Some(VesselStatusPatch::MarkProvisioning {
+                    observed_policy_ref: observed_policy_ref.clone(),
+                    observed_policy_version: observed_policy_version.clone(),
+                    started_at: now,
+                    message: provisioning_stuck_message(obj, waiting_for, now),
+                })
+            }
             PlannedPatch::Ready { environment_ref, image, checkout_refs, terminal_session_refs, requested_stance, effective_stance } => {
                 Some(VesselStatusPatch::MarkReady {
                     environment_ref: Some(environment_ref.clone()),
@@ -766,7 +822,11 @@ impl Reconciler for VesselReconciler {
             PlannedPatch::Failed { message } => Some(VesselStatusPatch::MarkFailed { message: message.clone() }),
         };
 
-        ReconcileOutcome::with_actuations(patch, deps.actuations.clone())
+        let mut outcome = ReconcileOutcome::with_actuations(patch, deps.actuations.clone());
+        if matches!(&deps.patch, PlannedPatch::Provisioning { .. }) {
+            outcome.requeue_after = Some(VESSEL_PROVISIONING_REQUEUE_AFTER);
+        }
+        outcome
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
@@ -834,15 +894,22 @@ fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, S
     Err("placement policy must define exactly one supported strategy".to_string())
 }
 
-fn provisioning_patch(obj: &ResourceObject<Vessel>, placement_policy: &ResourceObject<PlacementPolicy>) -> PlannedPatch {
-    if obj.status.as_ref().map(|status| status.phase) == Some(VesselPhase::Provisioning) {
-        PlannedPatch::None
-    } else {
-        PlannedPatch::Provisioning {
-            observed_policy_ref: placement_policy.metadata.name.clone(),
-            observed_policy_version: placement_policy.metadata.resource_version.clone(),
-        }
+fn provisioning_patch(
+    _obj: &ResourceObject<Vessel>,
+    placement_policy: &ResourceObject<PlacementPolicy>,
+    waiting_for: String,
+) -> PlannedPatch {
+    PlannedPatch::Provisioning {
+        observed_policy_ref: placement_policy.metadata.name.clone(),
+        observed_policy_version: placement_policy.metadata.resource_version.clone(),
+        waiting_for,
     }
+}
+
+fn provisioning_stuck_message(obj: &ResourceObject<Vessel>, waiting_for: &str, now: DateTime<Utc>) -> Option<String> {
+    let started_at = obj.status.as_ref().filter(|status| status.phase == VesselPhase::Provisioning).and_then(|status| status.started_at)?;
+    (now.signed_duration_since(started_at) >= chrono::Duration::seconds(VESSEL_PROVISIONING_STUCK_SECONDS))
+        .then(|| format!("provisioning is stalled while waiting for {waiting_for}; reconciliation will continue retrying"))
 }
 
 fn host_direct_environment_name(host_ref: &str) -> String {

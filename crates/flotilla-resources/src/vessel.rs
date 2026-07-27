@@ -62,6 +62,7 @@ pub enum VesselStatusPatch {
         observed_policy_ref: String,
         observed_policy_version: String,
         started_at: DateTime<Utc>,
+        message: Option<String>,
     },
     MarkReady {
         environment_ref: Option<String>,
@@ -82,12 +83,12 @@ pub enum VesselStatusPatch {
 impl StatusPatch<VesselStatus> for VesselStatusPatch {
     fn apply(&self, status: &mut VesselStatus) {
         match self {
-            Self::MarkProvisioning { observed_policy_ref, observed_policy_version, started_at } => {
+            Self::MarkProvisioning { observed_policy_ref, observed_policy_version, started_at, message } => {
                 status.phase = VesselPhase::Provisioning;
                 status.observed_policy_ref = Some(observed_policy_ref.clone());
                 status.observed_policy_version = Some(observed_policy_version.clone());
                 status.started_at.get_or_insert(*started_at);
-                status.message = None;
+                status.message = message.clone();
             }
             Self::MarkReady {
                 environment_ref,

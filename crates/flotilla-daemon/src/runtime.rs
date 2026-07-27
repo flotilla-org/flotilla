@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -61,6 +61,18 @@ const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 
 struct DaemonConvoyTeardownRuntime {
     daemon: Arc<InProcessDaemon>,
+    reclaim_refusals: StdMutex<HashMap<String, ReclaimRefusal>>,
+}
+
+struct ReclaimRefusal {
+    error: String,
+    attempts: u64,
+}
+
+impl DaemonConvoyTeardownRuntime {
+    fn new(daemon: Arc<InProcessDaemon>) -> Self {
+        Self { daemon, reclaim_refusals: StdMutex::new(HashMap::new()) }
+    }
 }
 
 #[async_trait]
@@ -75,13 +87,44 @@ impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
 
     async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
         let result = self.daemon.verify_convoy_teardown_gate(&convoy.metadata.namespace, &convoy.metadata.name, false).await;
-        if let Err(error) = &result {
-            warn!(
-                namespace = %convoy.metadata.namespace,
-                convoy = %convoy.metadata.name,
-                %error,
-                "automatic convoy reclaim refused"
-            );
+        let key = format!("{}/{}", convoy.metadata.namespace, convoy.metadata.name);
+        match &result {
+            Err(error) => {
+                let attempts = {
+                    let mut refusals = self.reclaim_refusals.lock().expect("reclaim refusal lock poisoned");
+                    match refusals.get_mut(&key) {
+                        Some(refusal) if refusal.error == *error => {
+                            refusal.attempts += 1;
+                            refusal.attempts
+                        }
+                        _ => {
+                            refusals.insert(key, ReclaimRefusal { error: error.clone(), attempts: 1 });
+                            1
+                        }
+                    }
+                };
+                if attempts == 1 {
+                    warn!(
+                        namespace = %convoy.metadata.namespace,
+                        convoy = %convoy.metadata.name,
+                        attempts,
+                        %error,
+                        "automatic convoy reclaim refused"
+                    );
+                }
+            }
+            Ok(()) => {
+                if let Some(refusal) = self.reclaim_refusals.lock().expect("reclaim refusal lock poisoned").remove(&key) {
+                    if refusal.attempts > 1 {
+                        info!(
+                            namespace = %convoy.metadata.namespace,
+                            convoy = %convoy.metadata.name,
+                            refused_attempts = refusal.attempts,
+                            "automatic convoy reclaim recovered after repeated refusal"
+                        );
+                    }
+                }
+            }
         }
         result
     }
@@ -1026,7 +1069,7 @@ fn spawn_controller_loops(
                                 .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                                 .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
                                 .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
-                                .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime { daemon }))
+                                .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
                                 .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
                                     backend.clone(),
                                     &namespace_string,

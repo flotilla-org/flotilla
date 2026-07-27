@@ -23,8 +23,8 @@ use flotilla_resources::{
     EnvironmentSpec, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus,
     InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend,
     ResourceError, Selector, Stance, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
-    CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkflowSnapshot, WorkflowTemplate,
+    CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use rstest::rstest;
 
@@ -258,6 +258,60 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
         .await
         .expect("convoy finalization");
     assert!(matches!(checkouts.get(&checkout_meta.name).await, Err(ResourceError::NotFound { .. })));
+}
+
+#[tokio::test]
+async fn stuck_provisioning_vessel_surfaces_the_statusless_checkout_it_is_retrying() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-stuck", "implement", REPO_URL, GIT_REF).await;
+    create_host_direct_policy(&backend, NAMESPACE, "policy-stuck", HOST_REF, "cleat").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    let clone_name =
+        format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
+    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
+    let vessels = backend.clone().using::<Vessel>(NAMESPACE);
+    let vessel = create_workspace(&backend, NAMESPACE, "workspace-stuck", "convoy-stuck", "implement", "policy-stuck", REPO_URL).await;
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&vessel).await.expect("initial dependencies");
+    let initial = reconciler.reconcile(&vessel, &deps, Utc::now());
+    let (checkout_meta, checkout_spec) = initial
+        .actuations
+        .into_iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateCheckout { meta, spec } => Some((meta, spec)),
+            _ => None,
+        })
+        .expect("initial pass should request the checkout");
+    backend
+        .clone()
+        .using::<Checkout>(NAMESPACE)
+        .create(&checkout_meta, &checkout_spec)
+        .await
+        .expect("checkout resource should be created without a completion status");
+    let now = Utc::now();
+    vessels
+        .update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &VesselStatus {
+            phase: VesselPhase::Provisioning,
+            started_at: Some(now - chrono::Duration::minutes(3)),
+            ..VesselStatus::default()
+        })
+        .await
+        .expect("vessel should be marked provisioning");
+    let vessel = vessels.get("workspace-stuck").await.expect("vessel should exist");
+
+    let deps = reconciler.fetch_dependencies(&vessel).await.expect("stuck dependencies");
+    let outcome = reconciler.reconcile(&vessel, &deps, now);
+
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::VesselStatusPatch::MarkProvisioning {
+            message: Some(ref message),
+            ..
+        }) if message.contains("provisioning is stalled")
+            && message.contains("checkout checkout-convoy-stuck")
+            && message.contains("continue retrying")
+    ));
+    assert!(outcome.requeue_after.is_some(), "stuck provisioning must schedule another convergence pass");
 }
 
 #[tokio::test]
