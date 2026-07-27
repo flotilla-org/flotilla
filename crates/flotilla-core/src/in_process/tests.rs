@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use bon::builder;
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     result_set::{
@@ -876,6 +877,46 @@ async fn create_ready_observed_checkout_for_convoy(
                 repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
                 host_ref: "host-01".to_string(),
                 is_main: false,
+            }),
+        )
+        .await
+        .expect("checkout should be created");
+    checkouts
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &ResourceCheckoutStatus {
+            phase: ResourceCheckoutPhase::Ready,
+            path: Some(path.to_string()),
+            commit: None,
+            branch_provenance: Default::default(),
+            integration: Default::default(),
+            message: None,
+        })
+        .await
+        .expect("checkout should be ready");
+}
+
+#[builder]
+async fn create_ready_worktree_checkout_for_repository(
+    daemon: &InProcessDaemon,
+    namespace: &str,
+    convoy: &str,
+    checkout_name: &str,
+    path: &str,
+    branch: &str,
+    base_ref: &str,
+    repository: &str,
+    environment: &str,
+) {
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>(namespace);
+    let created = checkouts
+        .create(
+            &input_meta_with_labels(checkout_name, BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.to_string())])),
+            &ResourceCheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+                repo_ref: flotilla_resources::RepositoryKey(repository.to_string()),
+                env_ref: environment.to_string(),
+                r#ref: branch.to_string(),
+                base_ref: Some(base_ref.to_string()),
+                target_path: path.to_string(),
+                clone_ref: format!("clone-{repository}"),
             }),
         )
         .await
@@ -4631,6 +4672,126 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
 
     assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
     assert!(matches!(convoys.get("completed-convoy").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+}
+
+#[tokio::test]
+async fn convoy_delete_refuses_diverged_checkout_without_a_change_request() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/diverged\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/diverged..HEAD"], Ok("0\n".into()))
+        .on_run(
+            "gh",
+            &["pr", "list", "--head", "feature/diverged", "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
+            Ok("[]".into()),
+        )
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("1\n".into()))
+        .build();
+    let mut discovery = fake_discovery(false);
+    discovery.runner = Arc::new(runner);
+    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), discovery, HostName::local()).await;
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    convoys
+        .create(&empty_input_meta("diverged-convoy"), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
+        .await
+        .expect("convoy create should succeed");
+    create_ready_observed_checkout_for_convoy(&daemon, "flotilla", "diverged-convoy", "checkout-diverged", "/repo", "feature/diverged")
+        .await;
+
+    let result = daemon.verify_convoy_teardown_gate("flotilla", "diverged-convoy", false).await;
+
+    let error = result.expect_err("diverged checkout without a change request must block teardown");
+    assert!(error.contains("Landed=False"), "refusal should identify the landed condition: {error}");
+}
+
+#[tokio::test]
+async fn convoy_delete_allows_multi_repo_convoy_with_work_on_only_one_side() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/one-sided-work\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/one-sided-work\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/one-sided-work..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/one-sided-work..HEAD"], Ok("0\n".into()))
+        .on_run(
+            "gh",
+            &["pr", "list", "--head", "feature/one-sided-work", "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
+            Ok(r#"[{"number":44,"state":"MERGED","mergedAt":"2026-07-27T12:00:00Z"}]"#.into()),
+        )
+        .on_run(
+            "gh",
+            &["pr", "list", "--head", "feature/one-sided-work", "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
+            Ok("[]".into()),
+        )
+        .on_run("git", &["rev-list", "--count", "main..HEAD"], Ok("0\n".into()))
+        .build();
+    let mut discovery = fake_discovery(false);
+    discovery.runner = Arc::new(runner);
+    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), discovery, HostName::local()).await;
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    convoys
+        .create(&empty_input_meta("one-sided-convoy"), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
+        .await
+        .expect("convoy create should succeed");
+    let environments = daemon.resource_backend().using::<ResourceEnvironment>("flotilla");
+    let environment = environments
+        .create(&empty_input_meta("host-env"), &ResourceEnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-01".to_string(), repo_default_dir: "/work".to_string() }),
+            docker: None,
+        })
+        .await
+        .expect("environment create should succeed");
+    environments
+        .update_status(&environment.metadata.name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
+            phase: flotilla_resources::EnvironmentPhase::Ready,
+            ready: true,
+            docker_container_id: None,
+            message: None,
+        })
+        .await
+        .expect("environment status should update");
+    create_ready_worktree_checkout_for_repository()
+        .daemon(&daemon)
+        .namespace("flotilla")
+        .convoy("one-sided-convoy")
+        .checkout_name("checkout-a-andamento")
+        .path("/work/andamento")
+        .branch("feature/one-sided-work")
+        .base_ref("main")
+        .repository("andamento")
+        .environment("host-env")
+        .call()
+        .await;
+    create_ready_worktree_checkout_for_repository()
+        .daemon(&daemon)
+        .namespace("flotilla")
+        .convoy("one-sided-convoy")
+        .checkout_name("checkout-b-flotilla")
+        .path("/work/flotilla")
+        .branch("feature/one-sided-work")
+        .base_ref("main")
+        .repository("flotilla")
+        .environment("host-env")
+        .call()
+        .await;
+
+    let result = daemon.verify_convoy_teardown_gate("flotilla", "one-sided-convoy", false).await;
+
+    result.expect("untouched checkout alongside landed work must not block teardown");
 }
 
 #[tokio::test]

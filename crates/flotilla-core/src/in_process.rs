@@ -57,7 +57,7 @@ use tracing::{debug, info, warn};
 use crate::{
     agent_adapter::CapabilityTable,
     aggregator_projection::AggregatorProjectionState,
-    checkout_integration::{checkout_branch_from_spec, checkout_path_from_status_and_spec, inspect_checkout_integration},
+    checkout_integration::{checkout_path_from_status_and_spec, inspect_checkout_integration},
     config::{ConfigStore, RemoteHostConfig, StaticEnvironmentConfig},
     convert::snapshot_to_proto,
     daemon::{DaemonHandle, QuerySubscription},
@@ -1432,10 +1432,6 @@ fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<Strin
     }
 }
 
-fn checkout_branch(checkout: &ResourceObject<ResourceCheckout>) -> &str {
-    checkout_branch_from_spec(&checkout.spec)
-}
-
 fn checkout_path(checkout: &ResourceObject<ResourceCheckout>) -> Option<&str> {
     checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
 }
@@ -2104,7 +2100,7 @@ impl InProcessDaemon {
                 continue;
             };
             let runner = self.runner_for_resource_checkout(&checkout).await?;
-            let mut integration = inspect_checkout_integration(&*runner, Path::new(path), checkout_branch(&checkout)).await;
+            let mut integration = inspect_checkout_integration(&*runner, Path::new(path), &checkout.spec).await;
             if let Some(existing) = checkout.status.as_ref().filter(|status| status.integration.landed.value == ConditionValue::True) {
                 integration.landed.value = ConditionValue::True;
                 if integration.landed_evidence.is_none() {
@@ -5466,7 +5462,7 @@ impl InProcessDaemon {
                     continue;
                 }
             };
-            let mut integration = inspect_checkout_integration(&*runner, &path, checkout_branch(&checkout)).await;
+            let mut integration = inspect_checkout_integration(&*runner, &path, &checkout.spec).await;
             if let Some(existing) = checkout.status.as_ref().filter(|status| status.integration.landed.value == ConditionValue::True) {
                 integration.landed.value = ConditionValue::True;
                 if integration.landed_evidence.is_none() {
