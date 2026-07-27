@@ -669,6 +669,24 @@ fn replica_staleness(entry: &FleetReplicaCacheEntry, now: DateTime<Utc>) -> Flee
     }
 }
 
+fn format_resource_replication_failures(failures: &[ResourceReplicationFailure]) -> Option<String> {
+    if failures.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "resource replication failed: {}",
+        failures.iter().map(|failure| format!("{}: {}", failure.kind, failure.message)).collect::<Vec<_>>().join("; ")
+    ))
+}
+
+fn join_replica_errors(first: Option<&str>, second: Option<&str>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(message), None) | (None, Some(message)) => Some(message.to_string()),
+        (None, None) => None,
+    }
+}
+
 #[derive(Debug, Default)]
 struct ReplicaParseDiagnostics {
     skipped_records: usize,
@@ -1197,6 +1215,12 @@ struct FleetReplicaCacheEntry {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ResourceReplicationFailure {
+    kind: String,
+    message: String,
+}
+
 const SUPERSEDED_BY_ANNOTATION: &str = "flotilla.work/superseded-by";
 
 #[derive(bon::Builder)]
@@ -1516,6 +1540,7 @@ pub struct InProcessDaemon {
     provisioning_namespace: std::sync::RwLock<String>,
     fleet_replica_cache: RwLock<HashMap<HostName, FleetReplicaCacheEntry>>,
     fleet_replica_tx: broadcast::Sender<Vec<FleetReplicaSnapshot>>,
+    resource_replication_failures: RwLock<HashMap<NodeId, BTreeMap<String, String>>>,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
     local_placement_provider_statuses: RwLock<Vec<HostProviderStatus>>,
 }
@@ -1705,6 +1730,7 @@ impl InProcessDaemon {
             provisioning_namespace: std::sync::RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
             fleet_replica_cache: RwLock::new(HashMap::new()),
             fleet_replica_tx,
+            resource_replication_failures: RwLock::new(HashMap::new()),
             repository_inspector: RwLock::new(None),
             local_placement_provider_statuses: RwLock::new(Vec::new()),
         });
@@ -2161,6 +2187,25 @@ impl InProcessDaemon {
                 let _ = self.event_tx.send(e);
             })
             .await;
+    }
+
+    pub async fn begin_peer_resource_replication(&self, peer: &NodeId) {
+        self.resource_replication_failures.write().await.remove(peer);
+    }
+
+    pub async fn report_resource_replication_failure(&self, peer: &NodeId, kind: &str, message: &str) {
+        self.resource_replication_failures.write().await.entry(peer.clone()).or_default().insert(kind.to_string(), message.to_string());
+    }
+
+    pub async fn report_resource_replication_healthy(&self, peer: &NodeId, kind: &str) {
+        let mut failures = self.resource_replication_failures.write().await;
+        let Some(peer_failures) = failures.get_mut(peer) else {
+            return;
+        };
+        peer_failures.remove(kind);
+        if peer_failures.is_empty() {
+            failures.remove(peer);
+        }
     }
 
     pub async fn publish_peer_summary(&self, summary: HostSummary) {
@@ -4857,10 +4902,21 @@ impl InProcessDaemon {
         let mut replicas = Vec::new();
         let now = Utc::now();
         let configured_hosts = self.config.load_hosts().map(|hosts| hosts.hosts).unwrap_or_default();
+        let failures = self.resource_replication_failures.read().await.clone();
+        let mut replication_failures_by_host = HashMap::<HostName, Vec<ResourceReplicationFailure>>::new();
+        for (peer, peer_failures) in failures {
+            let host = self.host_registry.host_name_for_node(&peer).await.unwrap_or_else(|| HostName::new(peer.as_str()));
+            replication_failures_by_host
+                .entry(host)
+                .or_default()
+                .extend(peer_failures.into_iter().map(|(kind, message)| ResourceReplicationFailure { kind, message }));
+        }
         let cache = self.fleet_replica_cache.read().await;
 
         for (label, remote) in configured_hosts {
             let host = HostName::new(remote.expected_host_name);
+            let replication_failures = replication_failures_by_host.remove(&host).unwrap_or_default();
+            let replication_error = format_resource_replication_failures(&replication_failures);
             match cache.get(&host) {
                 Some(entry) => {
                     let staleness = replica_staleness(entry, now);
@@ -4870,15 +4926,16 @@ impl InProcessDaemon {
                     }));
                     replicas.push(FleetReplicaStatus {
                         host,
-                        reachable: entry.last_error.is_none(),
+                        reachable: entry.last_error.is_none() && replication_error.is_none(),
                         last_sync: entry.last_sync,
                         generation: entry.generation.clone(),
                         skipped_records: entry.skipped_records,
                         first_parse_error: entry.first_parse_error.clone(),
-                        message: entry.last_error.clone(),
+                        message: join_replica_errors(entry.last_error.as_deref(), replication_error.as_deref()),
                     });
                 }
                 None => {
+                    let unsynced = format!("replica source '{label}' has not synced yet");
                     replicas.push(FleetReplicaStatus {
                         host,
                         reachable: false,
@@ -4886,10 +4943,21 @@ impl InProcessDaemon {
                         generation: None,
                         skipped_records: 0,
                         first_parse_error: None,
-                        message: Some(format!("replica source '{label}' has not synced yet")),
+                        message: join_replica_errors(Some(&unsynced), replication_error.as_deref()),
                     });
                 }
             }
+        }
+        for (host, failures) in replication_failures_by_host {
+            replicas.push(FleetReplicaStatus {
+                host,
+                reachable: false,
+                last_sync: None,
+                generation: None,
+                skipped_records: 0,
+                first_parse_error: None,
+                message: format_resource_replication_failures(&failures),
+            });
         }
 
         rows.sort_by(|left, right| {
