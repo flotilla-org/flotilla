@@ -63,7 +63,16 @@ struct DaemonConvoyTeardownRuntime {
 #[async_trait]
 impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
     async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
-        self.daemon.verify_convoy_teardown_gate(&convoy.metadata.namespace, &convoy.metadata.name, false).await
+        let result = self.daemon.verify_convoy_teardown_gate(&convoy.metadata.namespace, &convoy.metadata.name, false).await;
+        if let Err(error) = &result {
+            warn!(
+                namespace = %convoy.metadata.namespace,
+                convoy = %convoy.metadata.name,
+                %error,
+                "automatic convoy reclaim refused"
+            );
+        }
+        result
     }
 }
 
