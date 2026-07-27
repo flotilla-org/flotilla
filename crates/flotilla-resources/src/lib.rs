@@ -11,6 +11,7 @@ mod http;
 mod in_memory;
 mod labels;
 mod placement_policy;
+mod prepared_snapshot;
 mod presentation;
 mod principal_attention;
 mod project;
@@ -35,9 +36,11 @@ pub use checkout::{
 };
 pub use clone::{Clone, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use convoy::{
-    controller_patches, external_patches, provisioning_patches, reconcile, Convoy, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyReconciler,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InputValue, IssueSnapshot,
-    PlacementStatus, ReconcileOutcome, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    controller_patches, external_patches, pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending, provisioning_patches,
+    reconcile, Convoy, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
+    ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InputValue, IssueSnapshot, PlacementStatus, ReconcileOutcome, WorkCompletionAuthority,
+    WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_PENDING_ANNOTATION,
+    WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use definition::DefinitionResolver;
 pub use environment::{
@@ -56,6 +59,10 @@ pub use labels::{
 pub use placement_policy::{
     DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
     PlacementPolicy, PlacementPolicySpec,
+};
+pub use prepared_snapshot::{
+    PreparedSnapshotGarbageCollector, PreparedSnapshotGcResult, PreparedSnapshotRecoveryResult, PLACEMENT_SNAPSHOT_KIND,
+    PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
 };
 pub use presentation::{Presentation, PresentationPhase, PresentationSpec, PresentationStatus, PresentationStatusPatch};
 pub use principal_attention::{

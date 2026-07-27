@@ -244,13 +244,11 @@ async fn convoy_admission_uses_only_fresh_cached_issue_snapshots() {
 
 #[test]
 fn prepared_snapshot_names_are_content_addressed_for_safe_convoy_name_reuse() {
-    let first =
-        prepared_snapshot_name("remote-work", "workflow", &serde_json::json!({ "vessels": ["implement"] })).expect("first snapshot name");
-    let second =
-        prepared_snapshot_name("remote-work", "workflow", &serde_json::json!({ "vessels": ["review"] })).expect("second snapshot name");
+    let first = prepared_snapshot_name("workflow", &serde_json::json!({ "vessels": ["implement"] })).expect("first snapshot name");
+    let second = prepared_snapshot_name("workflow", &serde_json::json!({ "vessels": ["review"] })).expect("second snapshot name");
 
     assert_ne!(first, second);
-    assert!(first.starts_with("remote-work-remote-workflow-"));
+    assert!(first.starts_with("workflow-snapshot-"));
 }
 
 #[tokio::test]

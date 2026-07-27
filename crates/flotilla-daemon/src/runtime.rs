@@ -109,6 +109,10 @@ impl DaemonRuntime {
         let profile = build_local_profile(&daemon, &local_registry)?;
         daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools).await;
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
+        flotilla_resources::PreparedSnapshotGarbageCollector::new(daemon.resource_backend(), &options.namespace)
+            .recover_pending_claims()
+            .await
+            .map_err(|error| format!("recover prepared convoy admissions: {error}"))?;
         apply_host_heartbeat(&daemon, &options.namespace, &profile).await?;
         if let Err(error) = daemon.reconcile_adopted_checkouts(&options.namespace).await {
             warn!(%error, "failed to restore adopted checkout observations during startup; periodic reconciliation will retry");
@@ -881,7 +885,11 @@ fn spawn_controller_loops(
                             reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
                                 .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                                 .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
-                                .with_checkouts(backend.clone().using::<Checkout>(&namespace_string)),
+                                .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
+                                .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
+                                    backend.clone(),
+                                    &namespace_string,
+                                )),
                             resync_interval: controller_resync_interval,
                             backend,
                         }

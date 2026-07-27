@@ -1293,9 +1293,9 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
         let CommandAction::ConvoyStartPrepared { start } = &routed.action else {
             panic!("remote launch must carry an admitted convoy snapshot");
         };
-        assert!(start.workflow_name.starts_with("remote-work-remote-workflow-"));
+        assert!(start.workflow_name.starts_with("workflow-snapshot-"));
         let placement_snapshot_name = start.placement_policy_name.clone().expect("prepared placement snapshot name");
-        assert!(placement_snapshot_name.starts_with("remote-work-remote-placement-"));
+        assert!(placement_snapshot_name.starts_with("placement-snapshot-"));
         let mut delivered = routed.as_ref().clone();
         delivered.node_id = None;
         (delivered, start.workflow_name.clone(), placement_snapshot_name)
@@ -1307,13 +1307,13 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
     );
 
     let mut remote_events = remote_daemon.subscribe();
-    let remote_command_id = remote_daemon.execute(routed).await.expect("prepared command should be accepted by remote daemon");
+    let remote_command_id = remote_daemon.execute(routed.clone()).await.expect("prepared command should be accepted by remote daemon");
     let remote_result = wait_for_command_result(&mut remote_events, remote_command_id, StdDuration::from_secs(5)).await;
     assert_eq!(remote_result, CommandValue::ConvoyStarted { name: "remote-work".to_string(), attach_command: None, binding: None });
     let remote_backend = remote_daemon.resource_backend();
     let convoy = remote_backend.clone().using::<Convoy>("flotilla").get("remote-work").await.expect("remote daemon should persist convoy");
-    assert_eq!(convoy.spec.workflow_ref, workflow_snapshot_name);
-    assert_eq!(convoy.spec.placement_policy.as_deref(), Some(placement_snapshot_name.as_str()));
+    assert_eq!(convoy.spec.workflow_ref, "remote-workflow");
+    assert_eq!(convoy.spec.placement_policy.as_deref(), Some(remote_policy_name.as_str()));
     let remote_workflow = remote_backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
@@ -1322,11 +1322,52 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
         .expect("remote daemon should persist workflow snapshot");
     assert_eq!(remote_workflow.spec.vessels[0].stance, Stance::Trusted);
     let remote_policy = remote_backend
+        .clone()
         .using::<PlacementPolicy>("flotilla")
         .get(&placement_snapshot_name)
         .await
         .expect("remote daemon should persist placement snapshot");
     assert_eq!(remote_policy.spec.host_direct.expect("host-direct snapshot").host_ref, remote_host_id);
+
+    let mut repeated = match &routed.action {
+        CommandAction::ConvoyStartPrepared { start } => start.as_ref().clone(),
+        _ => panic!("routed command must remain a prepared convoy start"),
+    };
+    repeated.name = "remote-work-again".to_string();
+    let mut repeated_spec: serde_json::Value = repeated.convoy_spec.clone();
+    repeated_spec["ref"] = serde_json::Value::String("feat/remote-work-again".to_string());
+    repeated.convoy_spec = repeated_spec;
+    let mut repeated_events = remote_daemon.subscribe();
+    let repeated_id = remote_daemon
+        .execute(Command::builder().action(CommandAction::ConvoyStartPrepared { start: Box::new(repeated) }).build())
+        .await
+        .expect("repeated prepared command should be accepted");
+    assert_eq!(wait_for_command_result(&mut repeated_events, repeated_id, StdDuration::from_secs(5)).await, CommandValue::ConvoyStarted {
+        name: "remote-work-again".to_string(),
+        attach_command: None,
+        binding: None
+    });
+    let prepared_workflows = remote_backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .list()
+        .await
+        .expect("list workflow snapshots")
+        .items
+        .into_iter()
+        .filter(|workflow| workflow.metadata.name == workflow_snapshot_name)
+        .count();
+    let prepared_placements = remote_backend
+        .using::<PlacementPolicy>("flotilla")
+        .list()
+        .await
+        .expect("list placement snapshots")
+        .items
+        .into_iter()
+        .filter(|policy| policy.metadata.name == placement_snapshot_name)
+        .count();
+    assert_eq!(prepared_workflows, 1);
+    assert_eq!(prepared_placements, 1);
 }
 
 #[tokio::test]
