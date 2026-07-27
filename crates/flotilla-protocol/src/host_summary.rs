@@ -95,12 +95,25 @@ pub struct HostProviderStatus {
     #[serde(default)]
     pub implementation: String,
     pub healthy: bool,
+    /// Why this provider category is intentionally unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
 }
 
 impl HostProviderStatus {
     pub fn available(category: impl Into<String>, implementation: impl Into<String>) -> Self {
         let implementation = implementation.into();
         Self::builder().category(category.into()).name(implementation.clone()).implementation(implementation).healthy(true).build()
+    }
+
+    pub fn disabled(category: impl Into<String>, name: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::builder()
+            .category(category.into())
+            .name(name.into())
+            .implementation(String::new())
+            .healthy(true)
+            .disabled_reason(reason.into())
+            .build()
     }
 }
 
@@ -135,7 +148,13 @@ mod tests {
                 environment: HostEnvironment::Container,
             },
             inventory: ToolInventory::default(),
-            providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), implementation: "git".into(), healthy: true }],
+            providers: vec![HostProviderStatus {
+                category: "vcs".into(),
+                name: "Git".into(),
+                implementation: "git".into(),
+                healthy: true,
+                disabled_reason: None,
+            }],
             environments: vec![
                 EnvironmentInfo::Direct {
                     id: EnvironmentId::new("env-direct"),

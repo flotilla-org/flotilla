@@ -66,6 +66,7 @@ impl FactoryRegistry {
             presentation_managers: presentation_factories(),
             terminal_pools: terminal_pool_factories(),
             environment_providers: vec![Box::new(docker::DockerEnvironmentFactory)],
+            suppressions: vec![],
         }
     }
 
@@ -80,6 +81,7 @@ impl FactoryRegistry {
             presentation_managers: presentation_factories(),
             terminal_pools: terminal_pool_factories(),
             environment_providers: vec![Box::new(docker::DockerEnvironmentFactory)],
+            suppressions: super::ProviderCategory::FOLLOWER_SUPPRESSED.to_vec(),
         }
     }
 }
@@ -99,6 +101,7 @@ mod tests {
         assert!(!reg.ai_utilities.is_empty());
         assert!(!reg.presentation_managers.is_empty());
         assert!(!reg.terminal_pools.is_empty());
+        assert!(reg.suppressions.is_empty());
     }
 
     #[test]
@@ -112,5 +115,6 @@ mod tests {
         assert!(reg.ai_utilities.is_empty());
         assert!(!reg.presentation_managers.is_empty());
         assert!(!reg.terminal_pools.is_empty());
+        assert_eq!(reg.suppressions, super::super::ProviderCategory::FOLLOWER_SUPPRESSED);
     }
 }

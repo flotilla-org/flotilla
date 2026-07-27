@@ -1059,6 +1059,7 @@ mod tests {
             name: "Docker".to_string(),
             implementation: "docker".to_string(),
             healthy: true,
+            disabled_reason: None,
         });
         feta_summary.environments.push(EnvironmentInfo::Provisioned {
             id: EnvironmentId::new("env-abc123"),

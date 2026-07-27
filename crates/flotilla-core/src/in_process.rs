@@ -1906,9 +1906,9 @@ impl InProcessDaemon {
             .host_scoped_providers
             .discover_for_environment(&self.local_environment_id, &host_bag, &self.discovery.factories, &self.config, &probe_root, runner)
             .await;
-        let provider = host_scoped
-            .issue_provider_for(source)
-            .ok_or_else(|| format!("no issue provider available for {} {}", source.service, source.scope))?;
+        let provider = host_scoped.issue_provider_for(source).ok_or_else(|| {
+            self.missing_external_provider_error(&format!("no issue provider available for {} {}", source.service, source.scope))
+        })?;
         Ok(provider)
     }
 
@@ -4950,8 +4950,14 @@ impl InProcessDaemon {
             .into_iter()
             .map(|(category, name)| {
                 let healthy = snapshot.provider_health.get(&category).and_then(|providers| providers.get(&name)).copied().unwrap_or(true);
-                ProviderInfo { category, name, healthy }
+                ProviderInfo { category, name, healthy, disabled_reason: None }
             })
+            .chain(self.discovery.follower_suppressions().map(|category| ProviderInfo {
+                category: category.slug().to_string(),
+                name: category.display_name().to_string(),
+                healthy: true,
+                disabled_reason: Some("follower mode".to_string()),
+            }))
             .collect();
 
         let unmet_requirements =
@@ -6251,6 +6257,11 @@ impl InProcessDaemon {
                 providers.push(advertised.clone());
             }
         }
+        providers.extend(
+            self.discovery
+                .follower_suppressions()
+                .map(|category| HostProviderStatus::disabled(category.slug(), category.display_name(), "follower mode")),
+        );
         providers.sort_by(|left, right| (&left.category, &left.name).cmp(&(&right.category, &right.name)));
         let summary = crate::host_summary::build_local_host_summary(
             &self.node_id,
@@ -6270,11 +6281,18 @@ impl InProcessDaemon {
         let repos = self.repos.read().await;
         let state = repos.get(&identity).ok_or_else(|| "repo not found".to_string())?;
         let source = forge_issue_source(state.identity());
-        let provider = state
-            .registry()
-            .issue_provider_for(&source)
-            .ok_or_else(|| format!("no issue provider available for {} {}", source.service, source.scope))?;
+        let provider = state.registry().issue_provider_for(&source).ok_or_else(|| {
+            self.missing_external_provider_error(&format!("no issue provider available for {} {}", source.service, source.scope))
+        })?;
         Ok((provider, source))
+    }
+
+    fn missing_external_provider_error(&self, error: &str) -> String {
+        if self.follower {
+            format!("{error}: this host runs in follower mode; dispatch from a leader host")
+        } else {
+            error.to_string()
+        }
     }
 
     pub async fn execute_with_remote_executor(

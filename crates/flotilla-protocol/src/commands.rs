@@ -1198,6 +1198,7 @@ mod tests {
                         name: "Git".into(),
                         implementation: "git".into(),
                         healthy: true,
+                        disabled_reason: None,
                     }],
                     environments: vec![],
                 }),

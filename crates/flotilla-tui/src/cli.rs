@@ -256,7 +256,10 @@ fn format_host_providers_human(response: &HostProvidersResponse) -> String {
         table.add_row(vec![
             Cell::new(&provider.category),
             Cell::new(&provider.name),
-            Cell::new(if provider.healthy { "ok" } else { "error" }),
+            Cell::new(provider.disabled_reason.as_ref().map_or_else(
+                || if provider.healthy { "ok".to_string() } else { "error".to_string() },
+                |reason| format!("disabled: {reason}"),
+            )),
         ]);
     }
     out.push_str(&table.to_string());
@@ -669,7 +672,14 @@ fn format_repo_providers_human(resp: &RepoProvidersResponse) -> String {
         table.load_preset(UTF8_FULL_CONDENSED);
         table.set_header(vec!["Category", "Name", "Health"]);
         for p in &resp.providers {
-            table.add_row(vec![Cell::new(&p.category), Cell::new(&p.name), Cell::new(if p.healthy { "ok" } else { "error" })]);
+            table.add_row(vec![
+                Cell::new(&p.category),
+                Cell::new(&p.name),
+                Cell::new(p.disabled_reason.as_ref().map_or_else(
+                    || if p.healthy { "ok".to_string() } else { "error".to_string() },
+                    |reason| format!("disabled: {reason}"),
+                )),
+            ]);
         }
         out.push_str(&table.to_string());
         out.push('\n');

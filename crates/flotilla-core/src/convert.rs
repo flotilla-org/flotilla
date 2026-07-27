@@ -265,6 +265,7 @@ pub fn provider_health_to_host_statuses(health: &HashMap<(&'static str, String),
             // keys, but will break if a display name diverges from its key.
             implementation: name.to_lowercase(),
             healthy: *healthy,
+            disabled_reason: None,
         })
         .collect();
     statuses.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.name.cmp(&b.name)));
@@ -392,13 +393,15 @@ mod tests {
             category: "vcs".into(),
             name: "Git".into(),
             implementation: "git".into(),
-            healthy: true
+            healthy: true,
+            disabled_reason: None,
         }));
         assert!(statuses.contains(&HostProviderStatus {
             category: "cloud_agent".into(),
             name: "Claude".into(),
             implementation: "claude".into(),
-            healthy: false
+            healthy: false,
+            disabled_reason: None,
         }));
     }
 

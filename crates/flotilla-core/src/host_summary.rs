@@ -45,6 +45,7 @@ pub fn provider_statuses_from_registries<'a>(registries: impl IntoIterator<Item 
                         name: entry.display_name,
                         implementation: entry.implementation,
                         healthy: true,
+                        disabled_reason: None,
                     });
                 }
             }

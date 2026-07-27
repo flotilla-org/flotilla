@@ -92,7 +92,13 @@ mod status_human {
                 environment: HostEnvironment::Container,
             },
             inventory: ToolInventory::default(),
-            providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), implementation: "git".into(), healthy: true }],
+            providers: vec![HostProviderStatus {
+                category: "vcs".into(),
+                name: "Git".into(),
+                implementation: "git".into(),
+                healthy: true,
+                disabled_reason: None,
+            }],
             environments: vec![],
         }
     }
@@ -177,7 +183,7 @@ mod status_human {
 
     #[test]
     fn host_providers_shows_inventory_and_provider_rows() {
-        let response = HostProvidersResponse {
+        let mut response = HostProvidersResponse {
             environment_id: EnvironmentId::host(HostId::new("local-env")),
             host_name: HostName::new("local"),
             node: NodeInfo::new(NodeId::new("local"), "local"),
@@ -187,10 +193,12 @@ mod status_human {
             summary: sample_host_summary("local"),
             visible_environments: sample_visible_environments(),
         };
+        response.summary.providers.push(HostProviderStatus::disabled("issue_tracker", "Issue Provider", "follower mode"));
 
         let output = format_host_providers_human(&response);
         assert!(output.contains("Providers:"));
         assert!(output.contains("Git"));
+        assert!(output.contains("disabled: follower mode"));
         assert!(output.contains("Visible Environments:"));
         assert!(output.contains("direct-env"));
         assert!(output.contains("provisioned-env"));
@@ -934,17 +942,32 @@ mod repo_providers_human {
     #[test]
     fn with_providers_table() {
         let mut resp = empty_response();
-        resp.providers = vec![ProviderInfo { category: "vcs".into(), name: "Git".into(), healthy: true }, ProviderInfo {
-            category: "change_request".into(),
-            name: "GitHub".into(),
-            healthy: false,
-        }];
+        resp.providers =
+            vec![ProviderInfo { category: "vcs".into(), name: "Git".into(), healthy: true, disabled_reason: None }, ProviderInfo {
+                category: "change_request".into(),
+                name: "GitHub".into(),
+                healthy: false,
+                disabled_reason: None,
+            }];
         let output = format_repo_providers_human(&resp);
         assert!(output.contains("Providers:"), "should show providers header");
         assert!(output.contains("vcs"), "should show category");
         assert!(output.contains("Git"), "should show name");
         assert!(output.contains("ok"), "should show healthy as ok");
         assert!(output.contains("error"), "should show unhealthy as error");
+    }
+
+    #[test]
+    fn with_follower_suppression() {
+        let mut resp = empty_response();
+        resp.providers = vec![ProviderInfo {
+            category: "issue_tracker".into(),
+            name: "Issue Provider".into(),
+            healthy: true,
+            disabled_reason: Some("follower mode".into()),
+        }];
+        let output = format_repo_providers_human(&resp);
+        assert!(output.contains("disabled: follower mode"));
     }
 
     #[test]
