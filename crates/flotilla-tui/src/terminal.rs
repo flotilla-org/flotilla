@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::sync::Once;
 use std::{
     collections::HashSet,
     io::stdout,
@@ -33,6 +35,8 @@ trait AttachCommandRunner {
 struct SystemAttachCommandRunner;
 
 static ACTIVE_ATTACH_BRIDGES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+#[cfg(unix)]
+static ATTACH_SIGNAL_HANDLER: Once = Once::new();
 
 impl AttachCommandRunner for SystemAttachCommandRunner {
     fn status(&mut self, program: &str, args: &[String]) -> Result<std::process::ExitStatus, String> {
@@ -128,6 +132,11 @@ fn run_send_keys_attach(
 
 /// Execute an interactive attach plan and return the attached process status.
 pub fn run_attach_plan(plan: &ResolvedAttachPlan) -> Result<std::process::ExitStatus, String> {
+    // Standalone CLI and convoy auto-attach paths do not pass through TUI
+    // startup, so install the idempotent bridge cleanup handler here too.
+    #[cfg(unix)]
+    install_sigterm_handler();
+
     let mut runner = SystemAttachCommandRunner;
     match plan.0.as_slice() {
         [ResolvedAttachAction::Command(args)] => run_direct_attach(args, &mut runner),
@@ -178,18 +187,20 @@ pub fn install_panic_hook() {
 /// before the event loop begins.
 #[cfg(unix)]
 pub fn install_sigterm_handler() {
-    use tokio::signal::unix::{signal, SignalKind};
+    ATTACH_SIGNAL_HANDLER.call_once(|| {
+        use tokio::signal::unix::{signal, SignalKind};
 
-    let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
-    let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-    tokio::spawn(async move {
-        let exit_code = tokio::select! {
-            _ = sigint.recv() => 130,
-            _ = sigterm.recv() => 0,
-        };
-        restore_terminal();
-        kill_all_attach_bridges();
-        std::process::exit(exit_code);
+        let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+        let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        tokio::spawn(async move {
+            let exit_code = tokio::select! {
+                _ = sigint.recv() => 130,
+                _ = sigterm.recv() => 0,
+            };
+            restore_terminal();
+            kill_all_attach_bridges();
+            std::process::exit(exit_code);
+        });
     });
 }
 
