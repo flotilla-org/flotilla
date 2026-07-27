@@ -94,6 +94,10 @@ pub trait EnvironmentProvider: Send + Sync {
 pub trait ProvisionedEnvironment: Send + Sync {
     fn id(&self) -> &EnvironmentId;
     fn image(&self) -> &ImageId;
+    /// Immutable content digest of the image actually backing this environment.
+    fn image_digest(&self) -> Option<&str> {
+        None
+    }
     /// Provider-specific transport identifier (e.g. Docker container name).
     /// Used by hop chain to construct exec/enter commands.
     fn container_name(&self) -> Option<&str>;

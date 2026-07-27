@@ -857,6 +857,12 @@ pub struct VesselRow {
     pub requested_stance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_stance: Option<String>,
+    /// Placement image reference as named when this vessel was provisioned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
+    /// Immutable Docker image content digest actually run by this vessel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
     /// Names of sibling vessels this vessel depends on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]

@@ -37,6 +37,9 @@ impl RecordingRunner {
 impl CommandRunner for RecordingRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
         self.calls.lock().expect("calls mutex").push((cmd.to_string(), args.iter().map(|a| a.to_string()).collect(), cwd.to_path_buf()));
+        if cmd == "docker" && args.starts_with(&["inspect", "--format", "{{.Image}}"]) {
+            return Ok("sha256:test-image-digest\n".to_string());
+        }
         self.result.clone()
     }
 
@@ -247,7 +250,7 @@ async fn ensure_image_pulls_registry() {
 #[tokio::test]
 async fn create_returns_handle() {
     use flotilla_protocol::ImageId;
-    let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
+    let runner = Arc::new(QueuedRunner::new([Ok("container-id-123".into()), Ok("sha256:8c7f4e5d6a1b\n".into())]));
     let provider = DockerEnvironmentProvider::new(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
@@ -266,7 +269,7 @@ async fn create_returns_handle() {
     let handle = result.unwrap();
 
     let calls = runner.calls();
-    assert_eq!(calls.len(), 1);
+    assert_eq!(calls.len(), 2);
     let (cmd, args, _) = &calls[0];
     assert_eq!(cmd, "docker");
     assert_eq!(args[0], "run");
@@ -284,6 +287,12 @@ async fn create_returns_handle() {
     // Environment ID in handle should match label value
     let expected_id = label_val.strip_prefix("flotilla.environment=").unwrap();
     assert_eq!(handle.id().as_str(), expected_id);
+    assert_eq!(handle.image().as_str(), "ubuntu:22.04");
+    assert_eq!(handle.image_digest(), Some("sha256:8c7f4e5d6a1b"));
+
+    let (inspect_cmd, inspect_args, _) = &calls[1];
+    assert_eq!(inspect_cmd, "docker");
+    assert_eq!(inspect_args, &["inspect", "--format", "{{.Image}}", "flotilla-env-test-env-1"]);
 
     // Token env var should be present
     assert!(args.iter().any(|a| a.starts_with("GITHUB_TOKEN=")), "token env var should be passed");
@@ -311,7 +320,7 @@ async fn create_translates_image_pull_policy_to_docker_run() {
         provider.create(EnvironmentId::new(docker_value), &image, opts).await.expect("image policy should create an environment");
 
         let calls = runner.calls();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 2);
         let (_, args, _) = &calls[0];
         assert!(args.windows(2).any(|pair| pair == ["--pull", docker_value]));
         assert!(!calls.iter().any(|(_, args, _)| args.first().is_some_and(|arg| arg == "pull")));
@@ -409,11 +418,13 @@ async fn list_preserves_reference_repo_mount_metadata() {
 
     let runner = Arc::new(QueuedRunner::new([
         Ok("container-id-123".into()),
+        Ok("sha256:test-image".into()),
         Ok(format!(
             "container-1\ttest-env-list\tubuntu:22.04\t{}\n",
             serde_json::to_string(&vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro,)])
                 .expect("serialize mount metadata")
         )),
+        Ok("sha256:test-image".into()),
     ]));
     let provider = DockerEnvironmentProvider::new(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
@@ -441,8 +452,11 @@ async fn list_preserves_reference_repo_mount_metadata() {
 async fn list_fails_on_malformed_reference_repo_mount_metadata() {
     use flotilla_protocol::ImageId;
 
-    let runner =
-        Arc::new(QueuedRunner::new([Ok("container-id-123".into()), Ok("container-1\ttest-env-list\tubuntu:22.04\tnot-json\n".into())]));
+    let runner = Arc::new(QueuedRunner::new([
+        Ok("container-id-123".into()),
+        Ok("sha256:test-image".into()),
+        Ok("container-1\ttest-env-list\tubuntu:22.04\tnot-json\n".into()),
+    ]));
     let provider = DockerEnvironmentProvider::new(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
@@ -464,7 +478,11 @@ async fn list_fails_on_malformed_reference_repo_mount_metadata() {
 async fn list_rejects_missing_reference_repo_mount_metadata() {
     use flotilla_protocol::ImageId;
 
-    let runner = Arc::new(QueuedRunner::new([Ok("container-id-123".into()), Ok("container-1\ttest-env-list\tubuntu:22.04\t\n".into())]));
+    let runner = Arc::new(QueuedRunner::new([
+        Ok("container-id-123".into()),
+        Ok("sha256:test-image".into()),
+        Ok("container-1\ttest-env-list\tubuntu:22.04\t\n".into()),
+    ]));
     let provider = DockerEnvironmentProvider::new(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
@@ -510,7 +528,8 @@ async fn status_returns_running() {
     use flotilla_protocol::ImageId;
     let runner = Arc::new(QueuedRunner::new([
         Ok("container-id".into()), // docker run
-        Ok("running".into()),      // docker inspect
+        Ok("sha256:test-image".into()),
+        Ok("running".into()), // docker inspect status
     ]));
     let provider = DockerEnvironmentProvider::new(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
@@ -529,8 +548,8 @@ async fn status_returns_running() {
 
     assert_eq!(status, EnvironmentStatus::Running);
     let calls = runner.calls();
-    // Second call should be docker inspect
-    let (cmd, args, _) = &calls[1];
+    // Third call should inspect container status after image digest resolution.
+    let (cmd, args, _) = &calls[2];
     assert_eq!(cmd, "docker");
     assert_eq!(args[0], "inspect");
     assert!(args.contains(&"--format".to_string()));
@@ -540,7 +559,8 @@ async fn status_returns_running() {
 async fn env_vars_parses_output() {
     use flotilla_protocol::ImageId;
     let runner = Arc::new(QueuedRunner::new([
-        Ok("container-id".into()),       // docker run
+        Ok("container-id".into()), // docker run
+        Ok("sha256:test-image".into()),
         Ok("FOO=bar\nBAZ=qux\n".into()), // docker exec sh -lc env
     ]));
     let provider = DockerEnvironmentProvider::new(runner.clone());
@@ -562,7 +582,7 @@ async fn env_vars_parses_output() {
     assert_eq!(vars.get("BAZ"), Some(&"qux".to_string()));
 
     let calls = runner.calls();
-    let (cmd, args, _) = &calls[1];
+    let (cmd, args, _) = &calls[2];
     assert_eq!(cmd, "docker");
     assert_eq!(args[0], "exec");
     assert!(args.contains(&"sh".to_string()));
@@ -574,7 +594,8 @@ async fn destroy_calls_docker_rm() {
     use flotilla_protocol::ImageId;
     let runner = Arc::new(QueuedRunner::new([
         Ok("container-id".into()), // docker run
-        Ok("".into()),             // docker rm -f
+        Ok("sha256:test-image".into()),
+        Ok("".into()), // docker rm -f
     ]));
     let provider = DockerEnvironmentProvider::new(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
@@ -593,7 +614,7 @@ async fn destroy_calls_docker_rm() {
     handle.destroy().await.expect("destroy");
 
     let calls = runner.calls();
-    let (cmd, args, _) = &calls[1];
+    let (cmd, args, _) = &calls[2];
     assert_eq!(cmd, "docker");
     assert_eq!(args[0], "rm");
     assert!(args.contains(&"-f".to_string()), "should pass -f flag");

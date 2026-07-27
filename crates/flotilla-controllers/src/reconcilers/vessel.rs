@@ -99,6 +99,7 @@ enum PlannedPatch {
     },
     Ready {
         environment_ref: String,
+        image: Option<ImageStamp>,
         checkout_refs: BTreeMap<RepositoryKey, String>,
         terminal_session_refs: Vec<String>,
         requested_stance: Stance,
@@ -107,6 +108,12 @@ enum PlannedPatch {
     Failed {
         message: String,
     },
+}
+
+#[derive(Debug, Clone)]
+struct ImageStamp {
+    image_ref: String,
+    image_digest: String,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +133,7 @@ impl VesselDeps {
 
     fn ready(
         environment_ref: String,
+        image: Option<ImageStamp>,
         checkout_refs: BTreeMap<RepositoryKey, String>,
         terminal_session_refs: Vec<String>,
         requested_stance: Stance,
@@ -133,7 +141,7 @@ impl VesselDeps {
         actuations: Vec<Actuation>,
     ) -> Self {
         Self {
-            patch: PlannedPatch::Ready { environment_ref, checkout_refs, terminal_session_refs, requested_stance, effective_stance },
+            patch: PlannedPatch::Ready { environment_ref, image, checkout_refs, terminal_session_refs, requested_stance, effective_stance },
             actuations,
         }
     }
@@ -707,7 +715,29 @@ impl Reconciler for VesselReconciler {
             }
         }
 
-        Ok(VesselDeps::ready(resolved_environment_ref, checkout_refs, terminal_refs, requirement.stance, effective_stance, actuations))
+        let image = match strategy {
+            PlacementStrategy::HostDirect { .. } => None,
+            PlacementStrategy::DockerWorktreeOnHostAndMount { .. } | PlacementStrategy::DockerFreshCloneInContainer { .. } => {
+                let environment = self.environments.get(&resolved_environment_ref).await?;
+                let status = environment.status.as_ref().expect("ready environment has status");
+                let Some(image_ref) = status.image_ref.clone() else {
+                    return Ok(VesselDeps::failed(format!("environment {resolved_environment_ref} is missing its image ref")));
+                };
+                let Some(image_digest) = status.image_digest.clone() else {
+                    return Ok(VesselDeps::failed(format!("environment {resolved_environment_ref} is missing its image digest")));
+                };
+                Some(ImageStamp { image_ref, image_digest })
+            }
+        };
+        Ok(VesselDeps::ready(
+            resolved_environment_ref,
+            image,
+            checkout_refs,
+            terminal_refs,
+            requirement.stance,
+            effective_stance,
+            actuations,
+        ))
     }
 
     fn reconcile(
@@ -723,9 +753,11 @@ impl Reconciler for VesselReconciler {
                 observed_policy_version: observed_policy_version.clone(),
                 started_at: now,
             }),
-            PlannedPatch::Ready { environment_ref, checkout_refs, terminal_session_refs, requested_stance, effective_stance } => {
+            PlannedPatch::Ready { environment_ref, image, checkout_refs, terminal_session_refs, requested_stance, effective_stance } => {
                 Some(VesselStatusPatch::MarkReady {
                     environment_ref: Some(environment_ref.clone()),
+                    image_ref: image.as_ref().map(|image| image.image_ref.clone()),
+                    image_digest: image.as_ref().map(|image| image.image_digest.clone()),
                     checkout_refs: checkout_refs.clone(),
                     terminal_session_refs: terminal_session_refs.clone(),
                     requested_stance: *requested_stance,

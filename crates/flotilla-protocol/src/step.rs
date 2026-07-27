@@ -135,17 +135,10 @@ pub enum StepAction {
     Noop,
 
     // Environment lifecycle
-    EnsureEnvironmentImage {
-        /// The environment provider to use (e.g. "docker").
-        provider: String,
-    },
     CreateEnvironment {
         env_id: crate::EnvironmentId,
         /// The environment provider to use (e.g. "docker").
         provider: String,
-        /// `None` means resolve from prior `EnsureEnvironmentImage` outcome.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        image: Option<crate::ImageId>,
     },
     DestroyEnvironment {
         env_id: crate::EnvironmentId,

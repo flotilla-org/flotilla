@@ -24,10 +24,17 @@ fn host_status_patch_updates_heartbeat_snapshot() {
 #[test]
 fn environment_status_patch_marks_ready_and_failed() {
     let mut status = EnvironmentStatus::default();
-    EnvironmentStatusPatch::MarkReady { docker_container_id: Some("container-123".to_string()) }.apply(&mut status);
+    EnvironmentStatusPatch::MarkReady {
+        docker_container_id: Some("container-123".to_string()),
+        image_ref: Some("registry.example/crew:latest".to_string()),
+        image_digest: Some("sha256:first".to_string()),
+    }
+    .apply(&mut status);
     assert_eq!(status.phase, EnvironmentPhase::Ready);
     assert!(status.ready);
     assert_eq!(status.docker_container_id.as_deref(), Some("container-123"));
+    assert_eq!(status.image_ref.as_deref(), Some("registry.example/crew:latest"));
+    assert_eq!(status.image_digest.as_deref(), Some("sha256:first"));
 
     EnvironmentStatusPatch::MarkFailed { message: "docker run failed".to_string() }.apply(&mut status);
     assert_eq!(status.phase, EnvironmentPhase::Failed);
@@ -196,6 +203,8 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
 
     VesselStatusPatch::MarkReady {
         environment_ref: Some("env-a".to_string()),
+        image_ref: Some("registry.example/crew:latest".to_string()),
+        image_digest: Some("sha256:test-image".to_string()),
         checkout_refs: Default::default(),
         terminal_session_refs: vec!["term-a".to_string(), "term-b".to_string()],
         requested_stance: Stance::WorkspaceWrite,
@@ -205,9 +214,13 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     .apply(&mut status);
     assert_eq!(status.phase, VesselPhase::Ready);
     assert_eq!(status.terminal_session_refs.len(), 2);
+    assert_eq!(status.image_ref.as_deref(), Some("registry.example/crew:latest"));
+    assert_eq!(status.image_digest.as_deref(), Some("sha256:test-image"));
 
     VesselStatusPatch::MarkReady {
         environment_ref: Some("env-a".to_string()),
+        image_ref: Some("registry.example/crew:latest".to_string()),
+        image_digest: Some("sha256:test-image".to_string()),
         checkout_refs: Default::default(),
         terminal_session_refs: vec!["term-a".to_string(), "term-b".to_string()],
         requested_stance: Stance::WorkspaceWrite,

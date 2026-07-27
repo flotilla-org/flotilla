@@ -254,6 +254,8 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
             observed_policy_ref: Some("laptop-docker".to_string()),
             observed_policy_version: Some("17".to_string()),
             environment_ref: Some("env-implement".to_string()),
+            image_ref: Some("registry.example/crew:latest".to_string()),
+            image_digest: Some("sha256:test-image".to_string()),
             checkout_refs: Default::default(),
             terminal_session_refs: vec!["terminal-implement-coder".to_string()],
             started_at: Some(timestamp(18)),

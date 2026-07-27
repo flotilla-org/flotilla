@@ -1760,6 +1760,10 @@ impl Aggregator {
             .and_then(|placement| placement.fields.get("effective_stance"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        let image_ref =
+            placement.and_then(|placement| placement.fields.get("image_ref")).and_then(serde_json::Value::as_str).map(str::to_string);
+        let image_digest =
+            placement.and_then(|placement| placement.fields.get("image_digest")).and_then(serde_json::Value::as_str).map(str::to_string);
         let crew = definition
             .crew
             .iter()
@@ -1803,6 +1807,8 @@ impl Aggregator {
             .maybe_message(state.and_then(|state| state.message.clone()))
             .requested_stance(requested_stance)
             .maybe_effective_stance(effective_stance)
+            .maybe_image_ref(image_ref)
+            .maybe_image_digest(image_digest)
             .depends_on(definition.depends_on.clone())
             .host(vessel_host.clone())
             .maybe_attach(self.vessel_attach(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
@@ -3676,6 +3682,8 @@ mod tests {
             fields: BTreeMap::from([
                 ("requested_stance".to_string(), serde_json::json!("workspace-write")),
                 ("effective_stance".to_string(), serde_json::json!("contained")),
+                ("image_ref".to_string(), serde_json::json!("registry.example/crew:latest")),
+                ("image_digest".to_string(), serde_json::json!("sha256:test-image")),
             ]),
         });
 
@@ -3683,6 +3691,8 @@ mod tests {
 
         assert_eq!(vessel.requested_stance.as_deref(), Some("workspace-write"));
         assert_eq!(vessel.effective_stance.as_deref(), Some("contained"));
+        assert_eq!(vessel.image_ref.as_deref(), Some("registry.example/crew:latest"));
+        assert_eq!(vessel.image_digest.as_deref(), Some("sha256:test-image"));
         assert_eq!(vessel.crew[0].requested_stance.as_deref(), Some("workspace-write"));
         assert_eq!(vessel.crew[0].effective_stance.as_deref(), Some("contained"));
     }
