@@ -28,6 +28,7 @@ use flotilla_resources::{
 };
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::sync::{broadcast, mpsc};
+use tracing::debug;
 
 use crate::issue_materializer::{IssueMaterializationResolver, IssueMaterializer};
 
@@ -1437,13 +1438,20 @@ impl Aggregator {
     }
 
     async fn emit_scoped_convoy_result_sets(&self) {
-        for query in self.state.subscribed_queries() {
-            if !matches!(query, QueryId::Convoys { scope: Some(_) }) {
-                continue;
-            }
-            if let Some(result_set) = self.state.result_set_for(&query).await {
-                let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
-            }
+        let fleet_rows = self.state.result_set().await.rows.len();
+        let subscribed_scopes =
+            self.state.subscribed_queries().into_iter().filter(|query| matches!(query, QueryId::Convoys { scope: Some(_) })).count();
+        let result_sets = self.state.changed_scoped_convoy_result_sets().await;
+        let scoped_row_counts = result_sets.iter().map(|result_set| (result_set.query(), result_set.rows.len())).collect::<Vec<_>>();
+        debug!(
+            fleet_rows,
+            subscribed_scopes,
+            changed_scopes = result_sets.len(),
+            scoped_row_counts = ?scoped_row_counts,
+            "projected scoped convoy snapshots"
+        );
+        for result_set in result_sets {
+            let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
         }
     }
 
@@ -2899,10 +2907,13 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let mut convoy = convoy_with_branch("convoy-a").await;
         convoy.spec.project_ref = Some("roadmap".into());
+        let mut unrelated_convoy = convoy_with_branch("convoy-b").await;
+        unrelated_convoy.spec.project_ref = Some("other".into());
         let mut deleting_convoy = convoy.clone();
         deleting_convoy.metadata.deletion_timestamp = Some(Utc::now());
         let durable_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(watch_events(vec![
             WatchEvent::Added(convoy),
+            WatchEvent::Added(unrelated_convoy),
             WatchEvent::Modified(deleting_convoy),
         ]))]);
         let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -2935,6 +2946,13 @@ mod tests {
                 let scoped = recv_query_event(&mut event_rx, scoped_query.clone(), "scoped convoy insert result set").await;
                 let DaemonEvent::ResultSet(scoped) = scoped else { panic!("expected scoped result set") };
                 assert_eq!(scoped.rows.as_convoys().expect("scoped convoy rows")[0].name, "convoy-a");
+
+                let unrelated =
+                    recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "unrelated convoy insert delta").await;
+                let DaemonEvent::ResultDelta(unrelated) = unrelated else { panic!("expected unrelated insert delta") };
+                let QueryChanges::Convoys { changed, removed, .. } = &unrelated.changes else { panic!("expected convoy changes") };
+                assert_eq!(changed.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(), vec!["convoy-b"]);
+                assert!(removed.is_empty());
 
                 let removed = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "convoy removal delta").await;
                 let DaemonEvent::ResultDelta(removed) = removed else { panic!("expected removal delta") };
