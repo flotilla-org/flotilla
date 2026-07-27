@@ -693,7 +693,7 @@ pub async fn run_provisioned_host_detectors(
         .iter()
         .fold(EnvironmentBag::new(), |bag, (key, value)| bag.with(EnvironmentAssertion::env_var(key.clone(), value.clone())));
     let detected = run_host_detectors(detectors, runner, &ProvisionedEnvVars { values: env_vars }).await;
-    bag.extend(detected.assertions().iter().cloned())
+    bag.extend(detected.assertions().iter().filter(|assertion| !matches!(assertion, EnvironmentAssertion::EnvVarSet { .. })).cloned())
 }
 
 pub async fn discover_providers(
@@ -1100,5 +1100,13 @@ mod orchestrator_tests {
         assert_eq!(bag.find_env_var("FLOTILLA_ENVIRONMENT_ID"), Some("contained-work"));
         assert_eq!(bag.find_env_var("HOME"), Some("/home/crew"));
         assert!(bag.find_binary("codex").is_some());
+        assert_eq!(
+            bag.assertions()
+                .iter()
+                .filter(|assertion| matches!(assertion, EnvironmentAssertion::EnvVarSet { key, .. } if key == "HOME"))
+                .count(),
+            1,
+            "raw env vars should not be duplicated by env-var detectors"
+        );
     }
 }
