@@ -30,7 +30,7 @@ use flotilla_core::{
         ChannelLabel, CommandRunner,
     },
 };
-use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec, HostSummary, ImageId, ImageSource, TerminalStatus};
+use flotilla_protocol::{EnvironmentId, HostSummary, ImageId, TerminalStatus};
 use flotilla_resources::{
     clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone,
     CloneSpec, Convoy, ConvoyReconciler, CrewSource, CrewSpec, Demand, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec,
@@ -506,6 +506,7 @@ async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, pro
                         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                             host_ref: profile.host_id.clone(),
                             image: DEFAULT_DOCKER_IMAGE.to_string(),
+                            pull_policy: Default::default(),
                             agent_adapters: BTreeSet::new(),
                             default_cwd: Some("/workspace".to_string()),
                             env: BTreeMap::new(),
@@ -969,14 +970,14 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .or_else(|| self.state.local_registry.environment_providers.preferred_with_desc())
             .ok_or_else(|| "docker environment provider unavailable".to_string())?;
 
-        let runtime_spec = RuntimeEnvironmentSpec { image: ImageSource::Registry(spec.image.clone()), token_env_vars: Vec::new() };
-        let image = provider.ensure_image(&runtime_spec, Path::new("/")).await?;
+        let image = ImageId::new(spec.image.clone());
         let env_id = EnvironmentId::new(name.to_string());
         let handle = provider
-            .create(env_id.clone(), &ImageId::new(image.as_str().to_string()), CreateOpts {
+            .create(env_id.clone(), &image, CreateOpts {
                 tokens: Vec::new(),
                 daemon_socket_path,
                 working_directory: None,
+                image_pull_policy: spec.pull_policy.into(),
                 provisioned_mounts: spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount).collect(),
             })
             .await?;
@@ -1626,7 +1627,7 @@ mod tests {
             CommandRunner, ProcessCommandRunner,
         },
     };
-    use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId};
+    use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource};
     use flotilla_resources::{
         Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
         CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, LifecycleAuthority,
@@ -2235,6 +2236,7 @@ mod tests {
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::from(["codex".to_string(), "missing-adapter".to_string()]),
+            pull_policy: Default::default(),
             mounts: Vec::new(),
             env: BTreeMap::new(),
         };
@@ -2279,6 +2281,7 @@ mod tests {
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
+            pull_policy: Default::default(),
             mounts: Vec::new(),
             env: BTreeMap::new(),
         };

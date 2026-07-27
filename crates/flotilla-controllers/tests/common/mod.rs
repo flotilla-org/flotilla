@@ -180,6 +180,7 @@ pub async fn create_docker_worktree_policy(backend: &ResourceBackend, namespace:
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                 host_ref: fixture.host_ref,
                 image: fixture.image,
+                pull_policy: Default::default(),
                 agent_adapters: Default::default(),
                 default_cwd: fixture.default_cwd,
                 env: Default::default(),

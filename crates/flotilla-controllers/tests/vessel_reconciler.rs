@@ -15,7 +15,7 @@ use flotilla_resources::{
     controller::{Actuation, Reconciler},
     ensure_repository, interactive_single_workflow_spec, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec,
     Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
-    DockerCheckoutStrategy, DockerEnvironmentSpec, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec,
+    DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta,
     IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend,
     ResourceError, Selector, Stance, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
@@ -706,6 +706,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                 host_ref: HOST_REF.to_string(),
                 image: "ghcr.io/flotilla/dev:latest".to_string(),
+                pull_policy: Default::default(),
                 agent_adapters: Default::default(),
                 default_cwd: None,
                 env: Default::default(),
@@ -718,6 +719,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
         declared_agent_adapters: Default::default(),
+        pull_policy: Default::default(),
         mounts: Vec::new(),
         env: Default::default(),
     })
@@ -917,6 +919,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                 host_ref: HOST_REF.to_string(),
                 image: "ghcr.io/flotilla/dev:latest".to_string(),
+                pull_policy: Default::default(),
                 agent_adapters: Default::default(),
                 default_cwd: None,
                 env: Default::default(),
@@ -930,6 +933,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
         declared_agent_adapters: Default::default(),
+        pull_policy: Default::default(),
         mounts: Vec::new(),
         env: Default::default(),
     })
@@ -980,6 +984,50 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn contained_docker_placement_propagates_never_pull_policy_to_environment() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-local-image", "implement", REPO_URL, GIT_REF).await;
+    create_policy(
+        &backend,
+        NAMESPACE,
+        "policy-local-image",
+        PlacementPolicySpec::builder()
+            .pool("cleat".to_string())
+            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                host_ref: HOST_REF.to_string(),
+                image: "flotilla-dev-env:latest".to_string(),
+                pull_policy: DockerImagePullPolicy::Never,
+                agent_adapters: Default::default(),
+                default_cwd: None,
+                env: Default::default(),
+                checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+            })
+            .build(),
+    )
+    .await;
+    let vessel =
+        create_workspace(&backend, NAMESPACE, "workspace-local-image", "convoy-local-image", "implement", "policy-local-image", REPO_URL)
+            .await;
+
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&vessel).await.expect("deps should load");
+    let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
+
+    assert!(outcome.actuations.iter().any(|actuation| {
+        matches!(
+            actuation,
+            Actuation::CreateEnvironment { spec, .. }
+                if matches!(
+                    spec.docker.as_ref(),
+                    Some(docker)
+                        if docker.image == "flotilla-dev-env:latest"
+                            && docker.pull_policy == DockerImagePullPolicy::Never
+                )
+        )
+    }));
 }
 
 #[tokio::test]
@@ -1109,6 +1157,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),
+            pull_policy: Default::default(),
             agent_adapters: BTreeSet::from(["codex".to_string()]),
             default_cwd: None,
             env: Default::default(),
@@ -1121,6 +1170,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
         declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
+        pull_policy: Default::default(),
         mounts: vec![flotilla_resources::EnvironmentMount {
             source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
             target_path: "/workspace".to_string(),
@@ -1136,6 +1186,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),
+            pull_policy: Default::default(),
             agent_adapters: Default::default(),
             default_cwd: Some("/app".to_string()),
             env: Default::default(),
@@ -1148,6 +1199,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
         declared_agent_adapters: Default::default(),
+        pull_policy: Default::default(),
         mounts: Vec::new(),
         env: Default::default(),
     }),

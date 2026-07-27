@@ -712,6 +712,7 @@ async fn create_ready_docker_env(backend: &ResourceBackend, name: &str) {
                 host_ref: HOST_REF.to_string(),
                 image: "ubuntu:24.04".to_string(),
                 declared_agent_adapters: Default::default(),
+                pull_policy: Default::default(),
                 mounts: Vec::new(),
                 env: BTreeMap::new(),
             }),

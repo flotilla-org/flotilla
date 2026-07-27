@@ -10,6 +10,7 @@ spec:
   docker_per_vessel:
     host_ref: d49f4c59-811f-44aa-a4ca-d4cac66cf2a3
     image: forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-07-26.1
+    pull_policy: always
     agent_adapters:
       - claude-code
       - codex
