@@ -1647,7 +1647,7 @@ mod tests {
                 EnvironmentAssertion, EnvironmentBag,
             },
             environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount},
-            CommandRunner, ProcessCommandRunner,
+            ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
         },
     };
     use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource};
@@ -1666,6 +1666,31 @@ mod tests {
     enum CompletionAction {
         Retain,
         Delete,
+    }
+
+    struct NoPrProcessRunner;
+
+    #[async_trait]
+    impl CommandRunner for NoPrProcessRunner {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            if cmd == "gh" {
+                Ok("[]".to_string())
+            } else {
+                ProcessCommandRunner.run(cmd, args, cwd, label).await
+            }
+        }
+
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            if cmd == "gh" {
+                Ok(CommandOutput { stdout: "[]".to_string(), stderr: String::new(), success: true })
+            } else {
+                ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+            }
+        }
+
+        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+            ProcessCommandRunner.exists(cmd, args).await
+        }
     }
 
     struct TestInteriorEnvironment {
@@ -2358,7 +2383,7 @@ mod tests {
     }
 
     async fn daemon_with_backend(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>, backend: ResourceBackend) -> Arc<InProcessDaemon> {
-        daemon_with_backend_and_runner(tracked_repos, config, backend, Arc::new(ProcessCommandRunner)).await
+        daemon_with_backend_and_runner(tracked_repos, config, backend, Arc::new(NoPrProcessRunner)).await
     }
 
     async fn daemon_with_backend_and_runner(
