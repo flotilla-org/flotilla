@@ -6,7 +6,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use flotilla_protocol::{
@@ -133,6 +133,11 @@ pub struct AggregatorProjectionState {
     salience: Arc<RwLock<SalienceProjection>>,
     #[builder(skip)]
     project_catalog: Arc<RwLock<ProjectCatalogProjection>>,
+    /// Last projected snapshot observed by subscription replay or live
+    /// delivery. Scoped Convoys use full snapshots, so retaining their last
+    /// rows lets rebuilds suppress notifications for unrelated projects.
+    #[builder(skip)]
+    scoped_convoy_snapshots: Arc<Mutex<HashMap<QueryId, ResultSet>>>,
     /// Subscriber ownership and demand-backed materializations belong to the
     /// Aggregator state, shared with the daemon's subscription transport.
     demand_backed: QueryRegistry,
@@ -229,11 +234,19 @@ impl AggregatorProjectionState {
     /// Replace one subscriber's complete demand and return queries whose
     /// materialization lifetime was newly created.
     pub fn replace_subscriber(&self, subscriber: Uuid, cursors: &[QueryCursor]) -> HashSet<QueryId> {
-        self.demand_backed.replace(subscriber, cursors)
+        let newly_materialized = self.demand_backed.replace(subscriber, cursors);
+        self.retain_subscribed_scoped_convoy_snapshots();
+        newly_materialized
     }
 
     pub fn remove_subscriber(&self, subscriber: Uuid) {
         self.demand_backed.remove(subscriber);
+        self.retain_subscribed_scoped_convoy_snapshots();
+    }
+
+    fn retain_subscribed_scoped_convoy_snapshots(&self) {
+        let subscribed = self.demand_backed.subscribed_queries();
+        self.scoped_convoy_snapshots.lock().expect("scoped convoy snapshot lock poisoned").retain(|query, _| subscribed.contains(query));
     }
 
     pub fn subscribed_queries(&self) -> HashSet<QueryId> {
@@ -288,12 +301,55 @@ impl AggregatorProjectionState {
 
     /// The current fleet-merged result set for one named query.
     pub async fn result_set_for(&self, query: &QueryId) -> Option<ResultSet> {
-        match query {
+        let result_set = match query {
             QueryId::Convoys { scope } => Some(self.convoy_result_set(scope).await),
             QueryId::Independents { scope } => Some(self.independents_result_set(scope).await),
             QueryId::Issues { .. } => self.demand_backed.result_set(query),
             QueryId::Checkouts { scope } => Some(self.checkouts.write().await.result_set(scope)),
             QueryId::Awareness { scope, grouping, limit } => Some(self.awareness_result_set(scope, *grouping, *limit).await),
+        };
+        if let Some(result_set) = result_set.as_ref().filter(|result_set| matches!(result_set.query(), QueryId::Convoys { scope: Some(_) }))
+        {
+            self.remember_scoped_convoy_snapshot(result_set);
+        }
+        result_set
+    }
+
+    /// Return only live scoped Convoys snapshots whose projected rows changed
+    /// since subscription replay or the previous live delivery.
+    pub async fn changed_scoped_convoy_result_sets(&self) -> Vec<ResultSet> {
+        let queries =
+            self.subscribed_queries().into_iter().filter(|query| matches!(query, QueryId::Convoys { scope: Some(_) })).collect::<Vec<_>>();
+        let mut changed = Vec::new();
+        for query in queries {
+            let QueryId::Convoys { scope } = &query else { unreachable!("queries were filtered to scoped Convoys") };
+            let result_set = self.convoy_result_set(scope).await;
+            let mut snapshots = self.scoped_convoy_snapshots.lock().expect("scoped convoy snapshot lock poisoned");
+            let projected_changed =
+                snapshots.get(&query).is_none_or(|previous| previous.rows != result_set.rows || previous.state != result_set.state);
+            let is_stale = snapshots.get(&query).is_some_and(|previous| previous.seq > result_set.seq);
+            tracing::debug!(
+                query = %query,
+                rows = result_set.rows.len(),
+                projected_changed,
+                "evaluated scoped convoy snapshot"
+            );
+            if !is_stale {
+                snapshots.insert(query, result_set.clone());
+            }
+            drop(snapshots);
+            if projected_changed && !is_stale {
+                changed.push(result_set);
+            }
+        }
+        changed
+    }
+
+    fn remember_scoped_convoy_snapshot(&self, result_set: &ResultSet) {
+        let query = result_set.query();
+        let mut snapshots = self.scoped_convoy_snapshots.lock().expect("scoped convoy snapshot lock poisoned");
+        if snapshots.get(&query).is_none_or(|previous| previous.seq <= result_set.seq) {
+            snapshots.insert(query, result_set.clone());
         }
     }
 
@@ -584,6 +640,50 @@ mod tests {
 
         let global = state.result_set_for(&QueryId::Convoys { scope: None }).await.expect("global convoy result set");
         assert_eq!(global.rows.as_convoys().expect("global convoy rows").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn scoped_convoy_snapshots_advance_only_when_projected_rows_change() {
+        let state = AggregatorProjectionState::new();
+        let query = QueryId::Convoys { scope: Some(scope("roadmap")) };
+        let roadmap = convoy_row("flotilla", "roadmap-work", "roadmap");
+        let mut unrelated = convoy_row("flotilla", "other-work", "other");
+        {
+            let mut convoys = state.write().await;
+            convoys.local_rows = [roadmap.clone(), unrelated.clone()].into_iter().map(|row| (row.resource.clone(), row)).collect();
+            convoys.seq = 1;
+        }
+        state.replace_subscriber(Uuid::new_v4(), &[QueryCursor { query: query.clone(), since: None }]);
+        let initial = state.result_set_for(&query).await.expect("initial scoped result set");
+        assert_eq!(initial.rows.as_convoys().expect("initial scoped rows"), std::slice::from_ref(&roadmap));
+
+        unrelated.workflow_ref = "review".into();
+        {
+            let mut convoys = state.write().await;
+            convoys.local_rows.insert(unrelated.resource.clone(), unrelated);
+            convoys.seq = 2;
+        }
+        assert!(state.changed_scoped_convoy_result_sets().await.is_empty());
+
+        let mut changed_roadmap = roadmap.clone();
+        changed_roadmap.workflow_ref = "review".into();
+        {
+            let mut convoys = state.write().await;
+            convoys.local_rows.insert(changed_roadmap.resource.clone(), changed_roadmap.clone());
+            convoys.seq = 3;
+        }
+        let changed = state.changed_scoped_convoy_result_sets().await;
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].rows.as_convoys().expect("changed scoped rows"), std::slice::from_ref(&changed_roadmap));
+
+        {
+            let mut convoys = state.write().await;
+            convoys.local_rows.remove(&changed_roadmap.resource);
+            convoys.seq = 4;
+        }
+        let removed = state.changed_scoped_convoy_result_sets().await;
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].rows.is_empty());
     }
 
     #[tokio::test]
