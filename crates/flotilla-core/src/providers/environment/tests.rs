@@ -299,6 +299,34 @@ async fn create_returns_handle() {
 }
 
 #[tokio::test]
+async fn create_removes_container_when_image_digest_cannot_be_resolved() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(QueuedRunner::new([Ok("container-id-123".into()), Ok("not-a-digest".into()), Err("docker rm failed".into())]));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let image = ImageId::new("registry.example/crew:latest");
+    let opts = CreateOpts {
+        tokens: Vec::new(),
+        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        working_directory: None,
+        provisioned_mounts: Vec::new(),
+        image_pull_policy: ImagePullPolicy::Always,
+        docker_config_dir: None,
+    };
+
+    let error = match provider.create(EnvironmentId::new("invalid-digest"), &image, opts).await {
+        Ok(_) => panic!("invalid digest should reject the environment"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("invalid image digest"), "{error}");
+    assert!(error.contains("additionally failed to remove container flotilla-env-invalid-digest: docker rm failed"), "{error}");
+    let calls = runner.calls();
+    assert_eq!(calls[2].0, "docker");
+    assert_eq!(calls[2].1, ["rm", "-f", "flotilla-env-invalid-digest"]);
+}
+
+#[tokio::test]
 async fn create_translates_image_pull_policy_to_docker_run() {
     use flotilla_protocol::ImageId;
 
@@ -424,7 +452,6 @@ async fn list_preserves_reference_repo_mount_metadata() {
             serde_json::to_string(&vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro,)])
                 .expect("serialize mount metadata")
         )),
-        Ok("sha256:test-image".into()),
     ]));
     let provider = DockerEnvironmentProvider::new(runner.clone());
     let image = ImageId::new("ubuntu:22.04");

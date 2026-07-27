@@ -261,10 +261,10 @@ impl Reconciler for VesselReconciler {
             None
         };
 
-        let precreated_environment_ref = match &strategy {
+        let precreated_environment = match &strategy {
             PlacementStrategy::DockerFreshCloneInContainer { host_ref, image, pull_policy, env, .. } => {
                 let env_name = environment_name(&obj.metadata.name);
-                match self.environments.get(&env_name).await {
+                let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
                         if existing.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Failed) {
                             let message = existing
@@ -276,6 +276,10 @@ impl Reconciler for VesselReconciler {
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
                             return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
+                        }
+                        match image_stamp(&existing) {
+                            Ok(image) => image,
+                            Err(message) => return Ok(VesselDeps::failed(message)),
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {
@@ -296,8 +300,8 @@ impl Reconciler for VesselReconciler {
                         return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                     }
                     Err(err) => return Err(err),
-                }
-                Some(env_name)
+                };
+                Some((env_name, image))
             }
             _ => None,
         };
@@ -488,7 +492,10 @@ impl Reconciler for VesselReconciler {
                         }
                         PlacementStrategy::DockerFreshCloneInContainer { .. } => CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
                             repo_ref: repository_key,
-                            env_ref: precreated_environment_ref.clone().expect("fresh-clone strategy should precreate environment"),
+                            env_ref: precreated_environment
+                                .as_ref()
+                                .map(|(environment_ref, _)| environment_ref.clone())
+                                .expect("fresh-clone strategy should precreate environment"),
                             r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
                             base_ref: Some(convoy_repository.source_ref.clone()),
                             target_path: checkout_target_path,
@@ -521,7 +528,7 @@ impl Reconciler for VesselReconciler {
             shared_clone_root.clone().unwrap_or_default()
         };
 
-        let resolved_environment_ref = match &strategy {
+        let (resolved_environment_ref, image) = match &strategy {
             PlacementStrategy::HostDirect { host_ref, .. } => {
                 let env_name = host_direct_environment_name(host_ref);
                 let environment = match self.environments.get(&env_name).await {
@@ -537,11 +544,11 @@ impl Reconciler for VesselReconciler {
                 if environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
                     return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                 }
-                env_name
+                (env_name, None)
             }
             PlacementStrategy::DockerWorktreeOnHostAndMount { host_ref, image, pull_policy, env, mount_path, .. } => {
                 let env_name = environment_name(&obj.metadata.name);
-                match self.environments.get(&env_name).await {
+                let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
                         if existing.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Failed) {
                             let message = existing
@@ -553,6 +560,10 @@ impl Reconciler for VesselReconciler {
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
                             return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
+                        }
+                        match image_stamp(&existing) {
+                            Ok(image) => image,
+                            Err(message) => return Ok(VesselDeps::failed(message)),
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {
@@ -580,11 +591,12 @@ impl Reconciler for VesselReconciler {
                         return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                     }
                     Err(err) => return Err(err),
-                }
-                env_name
+                };
+                (env_name, Some(image))
             }
             PlacementStrategy::DockerFreshCloneInContainer { .. } => {
-                precreated_environment_ref.expect("fresh-clone strategy should resolve environment first")
+                let (environment_ref, image) = precreated_environment.expect("fresh-clone strategy should resolve environment first");
+                (environment_ref, Some(image))
             }
         };
         let terminal_cwd = strategy.terminal_cwd(&workspace_root, multi_repository, has_repositories);
@@ -715,20 +727,6 @@ impl Reconciler for VesselReconciler {
             }
         }
 
-        let image = match strategy {
-            PlacementStrategy::HostDirect { .. } => None,
-            PlacementStrategy::DockerWorktreeOnHostAndMount { .. } | PlacementStrategy::DockerFreshCloneInContainer { .. } => {
-                let environment = self.environments.get(&resolved_environment_ref).await?;
-                let status = environment.status.as_ref().expect("ready environment has status");
-                let Some(image_ref) = status.image_ref.clone() else {
-                    return Ok(VesselDeps::failed(format!("environment {resolved_environment_ref} is missing its image ref")));
-                };
-                let Some(image_digest) = status.image_digest.clone() else {
-                    return Ok(VesselDeps::failed(format!("environment {resolved_environment_ref} is missing its image digest")));
-                };
-                Some(ImageStamp { image_ref, image_digest })
-            }
-        };
         Ok(VesselDeps::ready(
             resolved_environment_ref,
             image,
@@ -784,6 +782,15 @@ impl Reconciler for VesselReconciler {
     fn finalizer_name(&self) -> Option<&'static str> {
         Some("flotilla.work/vessel-workspace-teardown")
     }
+}
+
+fn image_stamp(environment: &ResourceObject<Environment>) -> Result<ImageStamp, String> {
+    let status = environment.status.as_ref().expect("ready environment has status");
+    let image_ref =
+        status.image_ref.clone().ok_or_else(|| format!("environment {} is missing its image ref", environment.metadata.name))?;
+    let image_digest =
+        status.image_digest.clone().ok_or_else(|| format!("environment {} is missing its image digest", environment.metadata.name))?;
+    Ok(ImageStamp { image_ref, image_digest })
 }
 
 fn environment_with_credentials(

@@ -139,7 +139,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             }
         };
 
-        Ok(self.inner.provisioned_environment(id, image.clone(), image_digest, container_name, opts.provisioned_mounts))
+        Ok(self.inner.provisioned_environment(id, image.clone(), Some(image_digest), container_name, opts.provisioned_mounts))
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
@@ -176,11 +176,10 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
                     return Err(format!("failed to parse provisioned mount metadata for container {container_name}: {err}"));
                 }
             };
-            let image_digest = self.inner.image_digest(&container_name).await?;
             handles.push(self.inner.provisioned_environment(
                 EnvironmentId::new(env_id),
                 ImageId::new(image),
-                image_digest,
+                None,
                 container_name,
                 provisioned_mounts,
             ));
@@ -222,7 +221,7 @@ impl DockerEnvironmentProviderInner {
         self: &Arc<Self>,
         id: EnvironmentId,
         image: ImageId,
-        image_digest: String,
+        image_digest: Option<String>,
         container_name: String,
         provisioned_mounts: Vec<ProvisionedMount>,
     ) -> EnvironmentHandle {
@@ -292,7 +291,7 @@ pub struct DockerProvisionedEnvironment {
     id: EnvironmentId,
     container_name: String,
     image: ImageId,
-    image_digest: String,
+    image_digest: Option<String>,
     inner: Arc<DockerEnvironmentProviderInner>,
     runner: Arc<dyn CommandRunner>,
     provisioned_mounts: Vec<ProvisionedMount>,
@@ -309,7 +308,7 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
     }
 
     fn image_digest(&self) -> Option<&str> {
-        Some(&self.image_digest)
+        self.image_digest.as_deref()
     }
 
     fn container_name(&self) -> Option<&str> {
