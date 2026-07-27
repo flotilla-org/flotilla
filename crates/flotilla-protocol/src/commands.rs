@@ -625,7 +625,7 @@ pub enum CommandValue {
     },
     Cancelled,
     AttachCommandResolved {
-        command: String,
+        plan: crate::ResolvedAttachPlan,
         /// Structured binding for pane→identity stamping; `None` when the
         /// resolving path cannot describe the target session.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -666,7 +666,7 @@ pub enum CommandValue {
     ConvoyStarted {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        attach_command: Option<String>,
+        attach_plan: Option<crate::ResolvedAttachPlan>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binding: Option<AttachBinding>,
     },
@@ -1135,7 +1135,7 @@ mod tests {
             }),
             CommandValue::Error { message: "something failed".into() },
             CommandValue::Cancelled,
-            CommandValue::AttachCommandResolved { command: "bash --login".into(), binding: None },
+            CommandValue::AttachCommandResolved { plan: crate::ResolvedAttachPlan::shell_command("bash --login"), binding: None },
             CommandValue::CheckoutPathResolved { path: PathBuf::from("/repos/project/wt-1") },
             CommandValue::RepoDetail(Box::new(RepoDetailResponse {
                 path: PathBuf::from("/repo"),

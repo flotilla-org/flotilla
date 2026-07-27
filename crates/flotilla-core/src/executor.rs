@@ -16,7 +16,8 @@ use std::{
 use flotilla_protocol::{
     arg::Arg,
     qualified_path::{PathQualifier, QualifiedPath},
-    CheckoutTarget, Command, CommandAction, CommandValue, HostName, NodeId, PreparedWorkspace, ResolvedPaneCommand,
+    CheckoutTarget, Command, CommandAction, CommandValue, HostName, NodeId, PreparedWorkspace, ResolvedAttachAction, ResolvedAttachPlan,
+    ResolvedPaneCommand,
 };
 use tracing::{debug, error, info};
 
@@ -759,7 +760,8 @@ impl StepResolver for ExecutorStepResolver {
                 let cmd = resolve_attach_command(&session_id, self.registry.as_ref(), self.providers_data.as_ref()).await?;
                 // Step-planned attach paths resolve provider sessions directly
                 // and have no resource-level binding to stamp.
-                Ok(StepOutcome::Produced(CommandValue::AttachCommandResolved { command: cmd, binding: None }))
+                let plan = ResolvedAttachPlan(vec![ResolvedAttachAction::Command(vec![Arg::Literal(cmd)])]);
+                Ok(StepOutcome::Produced(CommandValue::AttachCommandResolved { plan, binding: None }))
             }
             StepAction::EnsureCheckoutForTeleport { branch, checkout_key, initial_path } => {
                 if let Some(path) = initial_path {
@@ -783,13 +785,17 @@ impl StepResolver for ExecutorStepResolver {
                 }
             }
             StepAction::CreateTeleportWorkspace { session_id: _, branch } => {
-                let cmd = prior
+                let plan = prior
                     .iter()
                     .find_map(|o| match o {
-                        StepOutcome::Produced(CommandValue::AttachCommandResolved { command, .. }) => Some(command.clone()),
+                        StepOutcome::Produced(CommandValue::AttachCommandResolved { plan, .. }) => Some(plan),
                         _ => None,
                     })
                     .ok_or_else(|| "attach command not resolved by prior step".to_string())?;
+                let [ResolvedAttachAction::Command(args)] = plan.0.as_slice() else {
+                    return Err("teleport workspace requires a single resolved attach command".to_string());
+                };
+                let cmd = flotilla_protocol::arg::flatten(args, 0);
 
                 let path = prior
                     .iter()

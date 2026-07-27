@@ -9,7 +9,7 @@ use flotilla_protocol::{arg::flatten, EnvironmentId, HostName, TerminalStatus};
 use super::{
     environment::{DockerEnvironmentHopResolver, EnvironmentHopResolver, NoopEnvironmentHopResolver},
     remote::{RemoteHopResolver, SshRemoteHopResolver},
-    resolver::{AlwaysSendKeys, AlwaysWrap, CombineStrategy, HopResolver},
+    resolver::{AlwaysSendKeys, AlwaysWrap, CombineStrategy, HopResolver, ResolutionPurpose},
     terminal::TerminalHopResolver,
     Arg, Hop, HopPlan, ResolutionContext, ResolvedAction, ResolvedPlan, SendKeyStep,
 };
@@ -46,7 +46,7 @@ fn expect_command(action: &ResolvedAction) -> &[Arg] {
 #[track_caller]
 fn expect_send_keys(action: &ResolvedAction) -> &[SendKeyStep] {
     match action {
-        ResolvedAction::SendKeys { steps } => steps,
+        ResolvedAction::SendKeys { steps, .. } => steps,
         other => panic!("expected SendKeys, got {other:?}"),
     }
 }
@@ -54,7 +54,7 @@ fn expect_send_keys(action: &ResolvedAction) -> &[SendKeyStep] {
 #[track_caller]
 fn expect_type_step(step: &SendKeyStep) -> &str {
     match step {
-        SendKeyStep::Type(text) => text,
+        SendKeyStep::Type { text } => text,
         other => panic!("expected Type step, got {other:?}"),
     }
 }
@@ -72,7 +72,7 @@ fn flatten_actions(actions: &[ResolvedAction]) -> Vec<String> {
         .iter()
         .map(|action| match action {
             ResolvedAction::Command(args) => format!("Command: {}", flatten(args, 0)),
-            ResolvedAction::SendKeys { steps } => format!("SendKeys: {steps:?}"),
+            ResolvedAction::SendKeys { hop, steps } => format!("SendKeys({hop}): {steps:?}"),
         })
         .collect()
 }
@@ -359,7 +359,7 @@ fn wrap_empty_stack_returns_error() {
 fn wrap_non_command_on_stack_returns_error() {
     let resolver = test_resolver_no_multiplex();
     let mut context = minimal_context();
-    context.actions.push(ResolvedAction::SendKeys { steps: vec![SendKeyStep::Type("hello".into())] });
+    context.actions.push(ResolvedAction::SendKeys { hop: "test hop".into(), steps: vec![SendKeyStep::Type { text: "hello".into() }] });
 
     let err = resolver.resolve_wrap(&HostName::new("feta"), &mut context).expect_err("should fail with non-Command");
     assert!(err.contains("expected Command"), "error should mention expected Command: {err}");
@@ -407,7 +407,7 @@ fn enter_produces_ssh_command_and_sendkeys() {
     assert!(text.contains("cd"), "should include cd: {text}");
     assert!(text.contains("/home/alice/dev/my-repo"), "should include dir: {text}");
     assert!(text.contains("cleat attach sess-1"), "should include inner cmd: {text}");
-    assert_eq!(steps[1], SendKeyStep::WaitForPrompt);
+    assert_eq!(steps[1], SendKeyStep::WaitForReady);
 
     // Top: SSH enter command (no inner command arg)
     let args = expect_command(&context.actions[1]);
@@ -430,7 +430,7 @@ fn enter_without_working_directory() {
     // SendKeys should just have the inner command, no cd
     let text = expect_type_step(&expect_send_keys(&context.actions[0])[0]);
     assert!(!text.contains("cd"), "should not include cd: {text}");
-    assert_eq!(text, "echo 'hello'");
+    assert_eq!(text, "exec echo 'hello'");
 }
 
 #[test]
@@ -709,7 +709,10 @@ impl RemoteHopResolver for MockRemoteHopResolver {
         // Convert inner to SendKeys
         if !inner_args.is_empty() {
             let text = flotilla_protocol::arg::flatten(&inner_args, 0);
-            context.actions.push(ResolvedAction::SendKeys { steps: vec![SendKeyStep::Type(text), SendKeyStep::WaitForPrompt] });
+            context.actions.push(ResolvedAction::SendKeys {
+                hop: format!("remote host '{host}'"),
+                steps: vec![SendKeyStep::Type { text }, SendKeyStep::WaitForReady],
+            });
         }
 
         // Push SSH enter command
@@ -765,6 +768,15 @@ fn resolve_with_mocks(strategy: Arc<dyn CombineStrategy>, hops: Vec<Hop>) -> Moc
     MockResolution { resolved, remote_calls: remote.recorded_calls(), terminal_calls: terminal.recorded_calls(), context }
 }
 
+fn resolve_with_mocks_for_purpose(purpose: ResolutionPurpose, hops: Vec<Hop>) -> MockResolution {
+    let remote = Arc::new(MockRemoteHopResolver::new());
+    let terminal = Arc::new(MockTerminalHopResolver::new());
+    let resolver = HopResolver::new(remote.clone(), Arc::new(NoopEnvironmentHopResolver), terminal.clone(), purpose);
+    let mut context = minimal_context();
+    let resolved = resolver.resolve(&HopPlan(hops), &mut context).expect("resolution should succeed");
+    MockResolution { resolved, remote_calls: remote.recorded_calls(), terminal_calls: terminal.recorded_calls(), context }
+}
+
 // ── HopResolver tests ────────────────────────────────────────────────
 
 #[test]
@@ -799,7 +811,7 @@ fn hop_resolver_remote_run_command_with_always_send_keys() {
     let text = expect_type_step(&steps[0]);
     assert!(text.contains("echo"), "SendKeys should contain inner command: {text}");
     assert!(text.contains("hello"), "SendKeys should contain inner command args: {text}");
-    assert_eq!(steps[1], SendKeyStep::WaitForPrompt);
+    assert_eq!(steps[1], SendKeyStep::WaitForReady);
 
     let args = expect_command(&r.resolved.0[1]);
     assert_eq!(args[0], Arg::Literal("ssh".into()));
@@ -809,6 +821,19 @@ fn hop_resolver_remote_run_command_with_always_send_keys() {
     assert_eq!(r.remote_calls.len(), 1);
     assert!(matches!(&r.remote_calls[0], MockRemoteCall::Enter(h) if h.as_str() == "feta"));
     assert!(r.terminal_calls.is_empty());
+}
+
+#[test]
+fn resolution_purpose_selects_attach_send_keys_and_command_wrapping() {
+    let hops = vec![Hop::RemoteToHost { host: HostName::new("feta") }, Hop::RunCommand {
+        command: vec![Arg::Literal("echo".into()), Arg::Quoted("hello world".into())],
+    }];
+
+    let attach = resolve_with_mocks_for_purpose(ResolutionPurpose::Attach, hops.clone());
+    assert!(matches!(attach.resolved.0.as_slice(), [ResolvedAction::SendKeys { .. }, ResolvedAction::Command(_)]));
+
+    let command = resolve_with_mocks_for_purpose(ResolutionPurpose::CommandExecution, hops);
+    assert!(matches!(command.resolved.0.as_slice(), [ResolvedAction::Command(_)]));
 }
 
 #[test]
@@ -1210,7 +1235,7 @@ fn enter_environment_wrap_produces_docker_exec() {
     assert_eq!(args[0], Arg::Literal("docker".into()));
     assert_eq!(args[1], Arg::Literal("exec".into()));
     assert_eq!(args[2], Arg::Literal("-it".into()));
-    assert_eq!(args[3], Arg::Literal("my-container".into()));
+    assert_eq!(args[3], Arg::Quoted("my-container".into()));
     assert_eq!(args[4], Arg::Literal("mock-attach".into()));
     assert_eq!(args[5], Arg::Quoted("sess-1".into()));
 
@@ -1267,7 +1292,7 @@ fn remote_then_environment_then_terminal() {
     assert_eq!(nested[0], Arg::Literal("docker".into()));
     assert_eq!(nested[1], Arg::Literal("exec".into()));
     assert_eq!(nested[2], Arg::Literal("-it".into()));
-    assert_eq!(nested[3], Arg::Literal("container-abc".into()));
+    assert_eq!(nested[3], Arg::Quoted("container-abc".into()));
     assert_eq!(nested[4], Arg::Literal("mock-attach".into()));
     assert_eq!(nested[5], Arg::Quoted("sess-1".into()));
 
@@ -1305,15 +1330,39 @@ fn enter_environment_enter_produces_docker_exec_shell_and_sendkeys() {
     assert_eq!(steps.len(), 2);
     let text = expect_type_step(&steps[0]);
     assert!(text.contains("mock-attach"), "SendKeys should contain terminal command: {text}");
-    assert_eq!(steps[1], SendKeyStep::WaitForPrompt);
+    assert_eq!(steps[1], SendKeyStep::WaitForReady);
 
     // Second action: docker exec enter command
     let args = expect_command(&resolved.0[1]);
     assert_eq!(args[0], Arg::Literal("docker".into()));
     assert_eq!(args[1], Arg::Literal("exec".into()));
     assert_eq!(args[2], Arg::Literal("-it".into()));
-    assert_eq!(args[3], Arg::Literal("my-container".into()));
+    assert_eq!(args[3], Arg::Quoted("my-container".into()));
     assert_eq!(args[4], Arg::Literal("/bin/sh".into()));
+}
+
+#[test]
+fn send_keys_quotes_hostile_attach_names_exactly_once() {
+    let env_id = EnvironmentId::new("my env '雪'");
+    let container = "container with 'quote' 雪";
+    let resolver = DockerEnvironmentHopResolver::new(HashMap::from([(env_id.clone(), container.to_string())]));
+    let mut context = minimal_context();
+    context.actions.push(ResolvedAction::Command(vec![
+        Arg::Literal("flotilla".into()),
+        Arg::Literal("attach".into()),
+        Arg::Quoted("crew with 'quote' 雪".into()),
+    ]));
+
+    resolver.resolve_enter(&env_id, &mut context).expect("hostile names should resolve");
+
+    let steps = expect_send_keys(&context.actions[0]);
+    assert_eq!(expect_type_step(&steps[0]), "exec flotilla attach 'crew with '\\''quote'\\'' 雪'");
+    let command = expect_command(&context.actions[1]);
+    assert_eq!(
+        flatten(command, 0),
+        "docker exec -it 'container with '\\''quote'\\'' 雪' /bin/sh",
+        "the container name and typed payload should each be quoted only at their own shell boundary"
+    );
 }
 
 #[test]

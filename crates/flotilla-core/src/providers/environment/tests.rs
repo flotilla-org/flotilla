@@ -737,7 +737,7 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
     assert_eq!(docker_nested[0], Arg::Literal("docker".into()), "middle command should be docker");
     assert_eq!(docker_nested[1], Arg::Literal("exec".into()), "docker subcommand should be exec");
     assert_eq!(docker_nested[2], Arg::Literal("-it".into()), "docker exec should have -it flag");
-    assert_eq!(docker_nested[3], Arg::Literal("container-abc".into()), "docker exec target should be container-abc");
+    assert_eq!(docker_nested[3], Arg::Quoted("container-abc".into()), "docker exec target should be container-abc");
 
     // Innermost args are flattened directly into the docker exec invocation
     assert_eq!(docker_nested[4], Arg::Literal("cleat".into()), "innermost command should be cleat");
@@ -748,7 +748,8 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
     // Verify flatten produces the expected structure
     let flat = flatten(outer_args, 0);
     assert!(flat.starts_with("ssh "), "flattened output should start with ssh: {flat}");
-    assert!(flat.contains("docker exec -it container-abc"), "should contain docker exec: {flat}");
+    assert!(flat.contains("docker exec -it"), "should contain docker exec: {flat}");
+    assert!(flat.contains("container-abc"), "should contain the quoted container target: {flat}");
     assert!(flat.contains("cleat attach"), "should contain cleat attach: {flat}");
     assert!(flat.contains(att_id.as_str()), "should contain session id: {flat}");
 

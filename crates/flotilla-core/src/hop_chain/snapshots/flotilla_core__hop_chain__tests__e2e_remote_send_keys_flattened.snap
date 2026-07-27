@@ -3,6 +3,6 @@ source: crates/flotilla-core/src/hop_chain/tests.rs
 expression: "&flattened"
 ---
 [
-    "SendKeys: [Type(\"cd '/home/alice/dev/my-repo/wt-feat' && cleat attach feat__shell__0 --cwd '/home/alice/dev/my-repo/wt-feat'\"), WaitForPrompt]",
+    "SendKeys(remote host 'feta'): [Type { text: \"cd '/home/alice/dev/my-repo/wt-feat' && exec cleat attach feat__shell__0 --cwd '/home/alice/dev/my-repo/wt-feat'\" }, WaitForReady]",
     "Command: ssh -t 'alice@feta.local'",
 ]

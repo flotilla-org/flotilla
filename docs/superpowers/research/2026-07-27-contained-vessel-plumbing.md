@@ -36,7 +36,7 @@ attach path, so the final classification is **probably works**, not **works**.
 
 | Link | Verdict | Short reason |
 |---|---|---|
-| Docker hop in the hop-chain abstraction | **works** | `EnterEnvironment` wraps an inner structured command with `docker exec -it`, including `-w` for the interior cwd. |
+| Docker hop in the hop-chain abstraction | **works** | `EnterEnvironment` supports both architecture-level forms: interactive attach enters `docker exec -it ... /bin/sh` and sends the inner attach one boundary at a time; non-interactive execution wraps the structured command with `docker exec -it`, including `-w` for the interior cwd. |
 | Current crew attach with `pool: passthrough` | **probably works** | The control-plane attach path supplies the container id and resolves the passthrough launch command through the Docker hop; only synthetic/unit coverage proves it. |
 | Hop-chain quoting | **probably works** | Quoting is centralized in the structured `Arg` tree and handles nested commands and apostrophes; the already-built agent command remains trusted raw shell. |
 | `worktree_on_host_and_mount` writable workspace | **broken** | The reconciler asks for `Rw`, the runtime erases the mode, and Docker emits `:ro`. |

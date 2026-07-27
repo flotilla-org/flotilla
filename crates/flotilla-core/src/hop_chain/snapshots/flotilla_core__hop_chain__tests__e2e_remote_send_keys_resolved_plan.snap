@@ -5,11 +5,12 @@ expression: "&resolved"
 ResolvedPlan(
     [
         SendKeys {
+            hop: "remote host 'feta'",
             steps: [
-                Type(
-                    "cd '/home/alice/dev/my-repo/wt-feat' && cleat attach feat__shell__0 --cwd '/home/alice/dev/my-repo/wt-feat'",
-                ),
-                WaitForPrompt,
+                Type {
+                    text: "cd '/home/alice/dev/my-repo/wt-feat' && exec cleat attach feat__shell__0 --cwd '/home/alice/dev/my-repo/wt-feat'",
+                },
+                WaitForReady,
             ],
         },
         Command(
