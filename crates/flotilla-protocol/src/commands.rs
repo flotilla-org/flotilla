@@ -7,8 +7,8 @@ use crate::{
     issue_query::{IssueQuery, IssueResultPage},
     qualified_path::QualifiedPath,
     query::{
-        CrewCommandContext, CrewListResponse, FleetListResponse, FleetReplicaSnapshot, HostListResponse, HostProvidersResponse,
-        HostStatusResponse, ProjectListResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse,
+        CrewCommandContext, CrewListResponse, FleetHealthResponse, FleetListResponse, FleetReplicaSnapshot, HostListResponse,
+        HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse,
     },
     AttachableSetId, IssueRef, RepoIdentity,
 };
@@ -438,6 +438,7 @@ pub enum CommandAction {
     QueryHostProviders {
         target_environment_id: crate::EnvironmentId,
     },
+    QueryFleetHealth {},
     QueryFleetList {},
     QueryCrewList {
         context: CrewCommandContext,
@@ -485,6 +486,7 @@ impl CommandAction {
                 | CommandAction::QueryProjectList {}
                 | CommandAction::QueryHostStatus { .. }
                 | CommandAction::QueryHostProviders { .. }
+                | CommandAction::QueryFleetHealth {}
                 | CommandAction::QueryFleetList {}
                 | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryFleetReplicaSnapshot {}
@@ -549,6 +551,7 @@ impl Command {
             CommandAction::QueryProjectList {} => "query project list",
             CommandAction::QueryHostStatus { .. } => "query host status",
             CommandAction::QueryHostProviders { .. } => "query host providers",
+            CommandAction::QueryFleetHealth {} => "query fleet health",
             CommandAction::QueryFleetList {} => "query fleet list",
             CommandAction::QueryCrewList { .. } => "query crew list",
             CommandAction::QueryFleetReplicaSnapshot {} => "query fleet replica snapshot",
@@ -660,6 +663,7 @@ pub enum CommandValue {
     ProjectList(Box<ProjectListResponse>),
     HostStatus(Box<HostStatusResponse>),
     HostProviders(Box<HostProvidersResponse>),
+    FleetHealth(Box<FleetHealthResponse>),
     FleetList(Box<FleetListResponse>),
     CrewList(Box<CrewListResponse>),
     FleetReplicaSnapshot(Box<FleetReplicaSnapshot>),

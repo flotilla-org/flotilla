@@ -900,6 +900,7 @@ async fn create_ready_host(backend: &ResourceBackend, name: &str) {
             heartbeat_at: Some(Utc::now()),
             ready: true,
             resource_store: None,
+            ..HostStatus::default()
         })
         .await
         .expect("host status update should succeed");

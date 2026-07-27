@@ -11,12 +11,12 @@ pub(crate) fn check_free_space_floor(host: &str, path: &Path, floor_gib: u64) ->
 
     let floor_bytes =
         floor_gib.checked_mul(BYTES_PER_GIB).ok_or_else(|| format!("free-space floor for host `{host}` is too large: {floor_gib} GiB"))?;
-    let free_bytes = available_space(path)
+    let free_bytes = measure_available_space(path)
         .ok_or_else(|| format!("placement refused on host `{host}`: free space could not be measured for {}", path.display()))?;
     check_measured_free_space(host, free_bytes, floor_bytes)
 }
 
-fn available_space(path: &Path) -> Option<u64> {
+pub fn measure_available_space(path: &Path) -> Option<u64> {
     let disks = Disks::new_with_refreshed_list();
     disks
         .list()

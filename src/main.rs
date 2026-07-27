@@ -97,6 +97,8 @@ enum SubCommand {
         #[arg(long)]
         target: Option<String>,
     },
+    /// Show fleet-wide host health without collapsing independent observations
+    Fleet,
     /// List convoy vessels and crew sessions
     Ls,
     /// Attach to a running convoy crew session
@@ -330,6 +332,7 @@ async fn main() -> Result<()> {
         Some(SubCommand::Watch) => run_watch(&cli, format).await,
         Some(SubCommand::Topology) => run_topology_command(&cli, format).await,
         Some(SubCommand::Logs { host, since, level, target }) => run_logs(&cli, host.as_deref(), since, level, target).await,
+        Some(SubCommand::Fleet) => run_fleet_health(&cli, format).await,
         Some(SubCommand::Ls) => run_fleet_list(&cli, format).await,
         Some(SubCommand::Attach { reference, transient, host }) => run_attach(&cli, &reference, transient, host.as_deref(), format).await,
         Some(SubCommand::ReplicaSnapshot) => run_replica_snapshot(&cli).await,
@@ -845,6 +848,15 @@ async fn run_fleet_list(cli: &Cli, format: OutputFormat) -> Result<()> {
     run_control_command(
         cli,
         Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetList {} },
+        format,
+    )
+    .await
+}
+
+async fn run_fleet_health(cli: &Cli, format: OutputFormat) -> Result<()> {
+    run_control_command(
+        cli,
+        Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetHealth {} },
         format,
     )
     .await
@@ -2028,6 +2040,12 @@ mod tests {
     fn cli_parses_host_noun() {
         let cli = Cli::try_parse_from(["flotilla", "host", "list"]).expect("host list should parse");
         assert!(matches!(cli.command, Some(SubCommand::Host(_))));
+    }
+
+    #[test]
+    fn cli_parses_fleet_health_dashboard() {
+        let cli = Cli::try_parse_from(["flotilla", "fleet"]).expect("fleet should parse");
+        assert!(matches!(cli.command, Some(SubCommand::Fleet)));
     }
 
     #[test]

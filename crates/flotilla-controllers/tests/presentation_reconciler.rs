@@ -683,7 +683,16 @@ async fn create_ready_host(backend: &ResourceBackend, name: &str) {
     let hosts = backend.clone().using::<Host>(NAMESPACE);
     let created = hosts.create(&meta(name), &HostSpec {}).await.expect("host create should succeed");
     let mut status = HostStatus::default();
-    HostStatusPatch::Heartbeat { capabilities: BTreeMap::new(), heartbeat_at: Utc::now(), ready: true }.apply(&mut status);
+    HostStatusPatch::Heartbeat {
+        capabilities: BTreeMap::new(),
+        heartbeat_at: Utc::now(),
+        ready: true,
+        daemon_generation: None,
+        daemon_version: None,
+        daemon_started_at: None,
+        disk_free_bytes: None,
+    }
+    .apply(&mut status);
     hosts.update_status(name, &created.metadata.resource_version, &status).await.expect("host status update should succeed");
 }
 

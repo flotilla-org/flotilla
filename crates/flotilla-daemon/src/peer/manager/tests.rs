@@ -693,6 +693,24 @@ fn host_list_projection_includes_configured_target_in_redial_backoff() {
 }
 
 #[test]
+fn fleet_health_projection_includes_unreachable_configured_target() {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    add_configured_transport(&mut mgr, "feta", "feta", MockTransport::new());
+    mgr.note_reconnect_backoff(&ConfigLabel("feta".into()), 3, Duration::from_secs(60));
+    let mut response = flotilla_protocol::FleetHealthResponse::default();
+
+    mgr.project_fleet_health(&mut response);
+
+    let [feta] = response.hosts.as_slice() else {
+        panic!("expected one configured fleet row, got {:?}", response.hosts);
+    };
+    assert_eq!(feta.host, HostName::new("feta"));
+    assert!(feta.configured);
+    assert_eq!(feta.link, PeerConnectionState::Reconnecting);
+    assert_eq!(feta.staleness, flotilla_protocol::FleetHostStaleness::Unknown);
+}
+
+#[test]
 fn host_list_projection_enriches_every_environment_row_for_configured_node() {
     let mut mgr = PeerManager::new(NodeId::new("local"));
     mgr.add_configured_target(

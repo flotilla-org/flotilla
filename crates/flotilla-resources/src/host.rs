@@ -25,6 +25,14 @@ pub struct HostStatus {
     pub ready: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_store: Option<ResourceStoreDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_bytes: Option<u64>,
 }
 
 impl HostStatus {
@@ -46,16 +54,36 @@ impl HostStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostStatusPatch {
-    Heartbeat { capabilities: BTreeMap<String, serde_json::Value>, heartbeat_at: DateTime<Utc>, ready: bool },
+    Heartbeat {
+        capabilities: BTreeMap<String, serde_json::Value>,
+        heartbeat_at: DateTime<Utc>,
+        ready: bool,
+        daemon_generation: Option<String>,
+        daemon_version: Option<String>,
+        daemon_started_at: Option<DateTime<Utc>>,
+        disk_free_bytes: Option<u64>,
+    },
 }
 
 impl StatusPatch<HostStatus> for HostStatusPatch {
     fn apply(&self, status: &mut HostStatus) {
         match self {
-            Self::Heartbeat { capabilities, heartbeat_at, ready } => {
+            Self::Heartbeat {
+                capabilities,
+                heartbeat_at,
+                ready,
+                daemon_generation,
+                daemon_version,
+                daemon_started_at,
+                disk_free_bytes,
+            } => {
                 status.capabilities = capabilities.clone();
                 status.heartbeat_at = Some(*heartbeat_at);
                 status.ready = *ready;
+                status.daemon_generation.clone_from(daemon_generation);
+                status.daemon_version.clone_from(daemon_version);
+                status.daemon_started_at = *daemon_started_at;
+                status.disk_free_bytes = *disk_free_bytes;
             }
         }
     }

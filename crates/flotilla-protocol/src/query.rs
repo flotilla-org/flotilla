@@ -197,6 +197,54 @@ mod project_list_tests {
 
 // --- fleet listing / replicas ---
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetHealthResponse {
+    pub hosts: Vec<FleetHostRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct FleetHostRow {
+    pub host: HostName,
+    pub is_local: bool,
+    pub configured: bool,
+    pub link: PeerConnectionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_uptime_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_last_sync: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_generation: Option<String>,
+    pub crew_count: usize,
+    pub convoy_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_bytes: Option<u64>,
+    pub staleness: FleetHostStaleness,
+    pub observation_agreement: FleetObservationAgreement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetHostStaleness {
+    Current,
+    Stale,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetObservationAgreement {
+    Agree,
+    Disagree,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetListResponse {
     pub rows: Vec<FleetListRow>,

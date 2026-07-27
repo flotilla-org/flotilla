@@ -13,6 +13,10 @@ fn host_status_patch_updates_heartbeat_snapshot() {
         capabilities: [("docker".to_string(), serde_json::Value::Bool(true))].into_iter().collect(),
         heartbeat_at: Utc::now(),
         ready: true,
+        daemon_generation: None,
+        daemon_version: None,
+        daemon_started_at: None,
+        disk_free_bytes: None,
     }
     .apply(&mut status);
 

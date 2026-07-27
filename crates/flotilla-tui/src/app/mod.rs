@@ -146,6 +146,8 @@ pub struct TuiModel {
     pub status_message: Option<String>,
     /// All known host environments indexed by canonical environment identity.
     pub hosts: HashMap<EnvironmentId, TuiHostState>,
+    /// Shared fleet-health view-model used by the CLI and overview dashboard.
+    pub fleet_health: flotilla_protocol::FleetHealthResponse,
 }
 
 impl TuiModel {
@@ -172,7 +174,15 @@ impl TuiModel {
                 has_unseen_changes: false,
             });
         }
-        Self { repos, repo_order: order, active_repo: None, provider_statuses: HashMap::new(), status_message: None, hosts: HashMap::new() }
+        Self {
+            repos,
+            repo_order: order,
+            active_repo: None,
+            provider_statuses: HashMap::new(),
+            status_message: None,
+            hosts: HashMap::new(),
+            fleet_health: flotilla_protocol::FleetHealthResponse::default(),
+        }
     }
 
     pub fn active(&self) -> &TuiRepoModel {
@@ -776,6 +786,7 @@ impl App {
 
         self.model.provider_statuses.clear();
         self.model.hosts.clear();
+        self.model.fleet_health = flotilla_protocol::FleetHealthResponse::default();
         self.query_tables = QueryTableCache::default();
         self.namespaces.clear();
         self.query_seqs.clear();
