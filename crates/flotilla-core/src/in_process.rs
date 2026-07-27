@@ -22,13 +22,13 @@ use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     result_set::{CheckoutRow, ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
     AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, CorrelationKey, CrewCommandContext, CrewListMember,
-    CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus,
-    FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
-    NodeInfo, PeerConnectionState, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo,
-    QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse,
-    ResolvedAttachAction, ResolvedAttachPlan, ResourceJsonResponse, ResourceRef, ResourceWatchResponse, StatusResponse, StepStatus,
-    StreamKey, SurfaceDeclaration, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress,
-    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse,
+    FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
+    HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PrincipalRef,
+    ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse,
+    RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedAttachAction, ResolvedAttachPlan,
+    ResourceJsonResponse, ResourceRef, ResourceWatchResponse, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo,
+    ToolInventory, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -39,14 +39,14 @@ use flotilla_resources::{
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue,
     Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec,
     CrewSource, Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
-    IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
-    Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
-    ResourceObject, ResourceProvenance, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
+    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
+    PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource,
+    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL,
-    VESSEL_LABEL, VESSEL_REF_LABEL,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, REPO_KEY_LABEL,
+    REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -672,6 +672,48 @@ fn replica_staleness(entry: &FleetReplicaCacheEntry, now: DateTime<Utc>) -> Flee
         FleetStaleness::Stale { last_sync }
     } else {
         FleetStaleness::Fresh { last_sync }
+    }
+}
+
+fn accumulate_fleet_health_counts(counts: &mut HashMap<HostName, (usize, HashSet<String>)>, rows: &[FleetListRow]) {
+    for row in rows {
+        let (crew_count, convoys) = counts.entry(row.host.clone()).or_default();
+        if row.crew != "-" {
+            *crew_count += 1;
+        }
+        if row.convoy != "-" {
+            convoys.insert(row.convoy.clone());
+        }
+    }
+}
+
+fn fleet_observation_agreement(
+    link: &PeerConnectionState,
+    heartbeat_at: Option<DateTime<Utc>>,
+    heartbeat_fresh: bool,
+    daemon_generation: Option<&str>,
+    replica_generation: Option<&str>,
+    is_local: bool,
+) -> FleetObservationAgreement {
+    if is_local {
+        return FleetObservationAgreement::Agree;
+    }
+    let generation_disagrees = matches!((daemon_generation, replica_generation), (Some(daemon), Some(replica)) if daemon != replica);
+    let link_disagrees = match link {
+        PeerConnectionState::Connected => !heartbeat_fresh,
+        PeerConnectionState::Disconnected | PeerConnectionState::Rejected { .. } => heartbeat_fresh,
+        PeerConnectionState::Connecting | PeerConnectionState::Reconnecting => false,
+    };
+    if generation_disagrees || link_disagrees {
+        FleetObservationAgreement::Disagree
+    } else if heartbeat_at.is_none()
+        || matches!(link, PeerConnectionState::Connecting | PeerConnectionState::Reconnecting)
+        || daemon_generation.is_none()
+        || replica_generation.is_none()
+    {
+        FleetObservationAgreement::Unknown
+    } else {
+        FleetObservationAgreement::Agree
     }
 }
 
@@ -5124,6 +5166,125 @@ impl InProcessDaemon {
         Ok(self.host_registry.list_hosts(&counts).await)
     }
 
+    pub async fn fleet_health_internal(&self) -> Result<FleetHealthResponse, String> {
+        let now = Utc::now();
+        let namespace = self.provisioning_namespace().await;
+        let host_list = self.list_hosts_internal().await?;
+        let configured_hosts = self.config.load_hosts().map(|hosts| hosts.hosts).unwrap_or_default();
+        let configured_names =
+            configured_hosts.values().map(|remote| HostName::new(remote.expected_host_name.clone())).collect::<HashSet<_>>();
+        let configured_by_node = configured_hosts
+            .values()
+            .filter_map(|remote| remote.expected_node_id.clone().map(|node_id| (node_id, HostName::new(remote.expected_host_name.clone()))))
+            .collect::<HashMap<_, _>>();
+
+        let mut host_rows = BTreeMap::<HostName, (bool, bool, PeerConnectionState)>::new();
+        for entry in host_list.hosts {
+            let configured = entry.configured || configured_names.contains(&entry.host_name);
+            host_rows
+                .entry(entry.host_name)
+                .and_modify(|row| {
+                    row.0 |= entry.is_local;
+                    row.1 |= configured;
+                    if entry.connection_status == PeerConnectionState::Connected {
+                        row.2 = PeerConnectionState::Connected;
+                    }
+                })
+                .or_insert((entry.is_local, configured, entry.connection_status));
+        }
+        for host in configured_names {
+            host_rows.entry(host).or_insert((false, true, PeerConnectionState::Disconnected));
+        }
+        host_rows.entry(self.host_name.clone()).or_insert((true, false, PeerConnectionState::Connected));
+
+        let local_host_id = self.local_host_id().map(|host_id| host_id.to_string());
+        let mut statuses = HashMap::<HostName, ResourceHostStatus>::new();
+        let resource_hosts =
+            self.resource_backend.clone().including_replicas::<ResourceHost>(&namespace).list().await.map_err(|error| error.to_string())?;
+        for resource_host in resource_hosts.items {
+            let host = match &resource_host.provenance {
+                ResourceProvenance::Local if local_host_id.as_deref() == Some(resource_host.object.metadata.name.as_str()) => {
+                    Some(self.host_name.clone())
+                }
+                ResourceProvenance::Local => None,
+                ResourceProvenance::Replica { origin_root, .. } => {
+                    self.host_registry.host_name_for_node(origin_root).await.or_else(|| configured_by_node.get(origin_root).cloned())
+                }
+            };
+            let (Some(host), Some(status)) = (host, resource_host.object.status) else {
+                continue;
+            };
+            let replace = statuses.get(&host).is_none_or(|current| current.heartbeat_at < status.heartbeat_at);
+            if replace {
+                statuses.insert(host, status);
+            }
+        }
+
+        let (local_rows, _) = self.local_fleet_rows(&namespace).await?;
+        let mut counts = HashMap::<HostName, (usize, HashSet<String>)>::new();
+        accumulate_fleet_health_counts(&mut counts, &local_rows);
+        let replicas = self.fleet_replica_cache.read().await;
+        for entry in replicas.values() {
+            accumulate_fleet_health_counts(&mut counts, &entry.rows);
+        }
+
+        let mut rows = Vec::with_capacity(host_rows.len());
+        for (host, (is_local, configured, link)) in host_rows {
+            let status = statuses.get(&host);
+            let replica = replicas.get(&host);
+            let heartbeat_at = status.and_then(|status| status.heartbeat_at);
+            let heartbeat_fresh = heartbeat_at.is_some_and(|at| now.signed_duration_since(at).num_seconds() <= HEARTBEAT_READY_TTL_SECS);
+            let replica_fresh = is_local
+                || replica.is_some_and(|replica| {
+                    replica.last_error.is_none()
+                        && replica.last_sync.is_some_and(|at| now.signed_duration_since(at).num_seconds() <= FLEET_REPLICA_FRESH_SECS)
+                });
+            let daemon_generation = status.and_then(|status| status.daemon_generation.clone());
+            let replica_generation =
+                if is_local { daemon_generation.clone() } else { replica.and_then(|replica| replica.generation.clone()) };
+            let staleness = if heartbeat_fresh && replica_fresh {
+                FleetHostStaleness::Current
+            } else if heartbeat_at.is_some() || replica.and_then(|replica| replica.last_sync).is_some() {
+                FleetHostStaleness::Stale
+            } else {
+                FleetHostStaleness::Unknown
+            };
+            let observation_agreement = fleet_observation_agreement(
+                &link,
+                heartbeat_at,
+                heartbeat_fresh,
+                daemon_generation.as_deref(),
+                replica_generation.as_deref(),
+                is_local,
+            );
+            let (crew_count, convoys) = counts.remove(&host).unwrap_or_default();
+
+            rows.push(
+                FleetHostRow::builder()
+                    .host(host)
+                    .is_local(is_local)
+                    .configured(configured)
+                    .link(link)
+                    .maybe_daemon_generation(daemon_generation)
+                    .maybe_daemon_version(status.and_then(|status| status.daemon_version.clone()))
+                    .maybe_daemon_uptime_seconds(status.and_then(|status| {
+                        status.daemon_started_at.map(|started_at| now.signed_duration_since(started_at).num_seconds().max(0) as u64)
+                    }))
+                    .maybe_heartbeat_at(heartbeat_at)
+                    .maybe_replica_last_sync(if is_local { Some(now) } else { replica.and_then(|replica| replica.last_sync) })
+                    .maybe_replica_generation(replica_generation)
+                    .crew_count(crew_count)
+                    .convoy_count(convoys.len())
+                    .maybe_disk_free_bytes(status.and_then(|status| status.disk_free_bytes))
+                    .staleness(staleness)
+                    .observation_agreement(observation_agreement)
+                    .build(),
+            );
+        }
+        rows.sort_by(|left, right| right.is_local.cmp(&left.is_local).then_with(|| left.host.cmp(&right.host)));
+        Ok(FleetHealthResponse { hosts: rows })
+    }
+
     pub async fn list_projects_internal(&self) -> Result<ProjectListResponse, String> {
         let namespace = self.provisioning_namespace().await;
         let projects = self.resource_backend.clone().definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
@@ -7621,6 +7782,10 @@ impl DaemonHandle for InProcessDaemon {
                     Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
                 }
             }
+            CommandAction::QueryFleetHealth {} => match self.fleet_health_internal().await {
+                Ok(v) => Ok(flotilla_protocol::CommandValue::FleetHealth(Box::new(v))),
+                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+            },
             CommandAction::QueryFleetList {} => match self.fleet_list_internal().await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::FleetList(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),

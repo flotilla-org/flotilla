@@ -264,6 +264,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::ProjectList(_)
         | CommandValue::HostStatus(_)
         | CommandValue::HostProviders(_)
+        | CommandValue::FleetHealth(_)
         | CommandValue::FleetList(_)
         | CommandValue::CrewList(_)
         | CommandValue::FleetReplicaSnapshot(_)

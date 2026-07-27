@@ -1225,6 +1225,7 @@ dependencies = [
  "async-trait",
  "bon",
  "catppuccin",
+ "chrono",
  "clap",
  "color-eyre",
  "comfy-table",

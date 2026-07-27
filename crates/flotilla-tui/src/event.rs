@@ -19,6 +19,7 @@ pub enum Event {
     DaemonDisconnected,
     CommandDispatchCompleted { result: Result<u64, String>, pending_ctx: Option<PendingActionContext> },
     AttachDispatchCompleted(Result<CommandValue, String>),
+    FleetHealthRefreshed(Result<CommandValue, String>),
 }
 
 pub struct EventHandler {

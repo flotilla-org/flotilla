@@ -99,7 +99,7 @@ impl HostNoun {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::QueryHostList {},
+                action: CommandAction::QueryFleetHealth {},
             })),
             HostVerb::Status => {
                 let host = self.subject.ok_or("status requires a host name")?;
@@ -191,7 +191,7 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::QueryHostList {}
+                action: CommandAction::QueryFleetHealth {}
             })
         );
     }

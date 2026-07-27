@@ -621,6 +621,7 @@ mod tests {
                 heartbeat_at: Some(Utc::now() - Duration::seconds(61)),
                 ready: true,
                 resource_store: None,
+                ..HostStatus::default()
             })
             .await
             .expect("write stale heartbeat");
@@ -643,6 +644,7 @@ mod tests {
                 heartbeat_at: Some(Utc::now() - Duration::seconds(61)),
                 ready: true,
                 resource_store: None,
+                ..HostStatus::default()
             })
             .await
             .expect("write source stale heartbeat");

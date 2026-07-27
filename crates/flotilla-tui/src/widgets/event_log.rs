@@ -1,6 +1,8 @@
 use std::{any::Any, collections::HashMap};
 
+use chrono::{DateTime, Utc};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use flotilla_protocol::{FleetHostRow, FleetHostStaleness, FleetObservationAgreement, PeerConnectionState};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
@@ -173,8 +175,11 @@ impl InteractiveWidget for EventLogWidget {
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
             .split(area);
 
-        let host_count = ctx.model.hosts.len();
-        let host_height = (host_count as u16 + 2).min(8);
+        let host_height = if ctx.model.fleet_health.hosts.is_empty() {
+            (ctx.model.hosts.len() as u16 + 2).min(8)
+        } else {
+            (ctx.model.fleet_health.hosts.len() as u16 + 3).min(10)
+        };
         let left_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(host_height)])
@@ -294,6 +299,11 @@ fn render_global_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area
 }
 
 fn render_hosts_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area: Rect) {
+    if !model.fleet_health.hosts.is_empty() {
+        render_fleet_health(&model.fleet_health.hosts, theme, frame, area);
+        return;
+    }
+
     let mut hosts: Vec<&TuiHostState> = model.hosts.values().collect();
     hosts.sort_by(|a, b| match (a.is_local, b.is_local) {
         (true, false) => std::cmp::Ordering::Less,
@@ -364,6 +374,83 @@ fn format_host_provider_status(provider: &flotilla_protocol::HostProviderStatus)
             format!("{} {check}", provider.name)
         }
     }
+}
+
+fn fleet_age(at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    at.map_or_else(|| "-".to_string(), |at| format!("{}s", now.signed_duration_since(at).num_seconds().max(0)))
+}
+
+fn short_generation(generation: Option<&str>) -> String {
+    generation.map_or_else(|| "-".to_string(), |generation| generation.chars().take(8).collect())
+}
+
+fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame, area: Rect) {
+    let now = Utc::now();
+    let rows = hosts.iter().map(|host| {
+        let disagreement = host.observation_agreement == FleetObservationAgreement::Disagree;
+        let icon = if disagreement {
+            "⚠"
+        } else if host.staleness == FleetHostStaleness::Current {
+            "●"
+        } else {
+            "○"
+        };
+        let style = if disagreement {
+            Style::default().fg(theme.warning)
+        } else if host.staleness == FleetHostStaleness::Current {
+            Style::default().fg(theme.status_ok)
+        } else {
+            Style::default().fg(theme.error)
+        };
+        let name = if host.is_local { format!("{} (local)", host.host) } else { host.host.to_string() };
+        let daemon = format!(
+            "{} {} {}",
+            host.daemon_version.as_deref().unwrap_or("-"),
+            short_generation(host.daemon_generation.as_deref()),
+            host.daemon_uptime_seconds.map_or_else(|| "-".to_string(), |seconds| format!("{seconds}s"))
+        );
+        let link = match &host.link {
+            PeerConnectionState::Connected => "connected",
+            PeerConnectionState::Disconnected => "disconnected",
+            PeerConnectionState::Connecting => "connecting",
+            PeerConnectionState::Reconnecting => "reconnecting",
+            PeerConnectionState::Rejected { .. } => "rejected",
+        };
+        let replica = format!("{} {}", fleet_age(host.replica_last_sync, now), short_generation(host.replica_generation.as_deref()));
+        let disk =
+            host.disk_free_bytes.map_or_else(|| "-".to_string(), |bytes| format!("{:.1}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0)));
+        let stale = match host.staleness {
+            FleetHostStaleness::Current => "current",
+            FleetHostStaleness::Stale => "STALE",
+            FleetHostStaleness::Unknown => "unknown",
+        };
+        Row::new(vec![
+            Cell::from(Span::styled(icon, style)),
+            Cell::from(name),
+            Cell::from(daemon),
+            Cell::from(link),
+            Cell::from(fleet_age(host.heartbeat_at, now)),
+            Cell::from(replica),
+            Cell::from(format!("{}/{}", host.crew_count, host.convoy_count)),
+            Cell::from(disk),
+            Cell::from(stale),
+        ])
+    });
+    let widths = [
+        Constraint::Length(2),
+        Constraint::Min(12),
+        Constraint::Length(22),
+        Constraint::Length(12),
+        Constraint::Length(10),
+        Constraint::Length(19),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(8),
+    ];
+    let header = Row::new(["", "Host", "Daemon v/gen/up", "Link", "Heartbeat", "Replica sync/gen", "Crew/Conv", "Disk", "Staleness"])
+        .style(theme.header_style());
+    let table = Table::new(rows, widths).header(header).block(Block::bordered().style(theme.block_style()).title(" Fleet Health "));
+    frame.render_widget(table, area);
 }
 
 #[cfg(test)]

@@ -38,5 +38,6 @@ pub mod template;
 pub mod terminal_manager;
 
 // Re-export shared infrastructure and host types for convenience.
+pub use admission::measure_available_space;
 pub use flotilla_protocol::HostName;
 pub use flotilla_resources::tls;

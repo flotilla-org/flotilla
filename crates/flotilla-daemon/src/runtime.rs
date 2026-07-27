@@ -20,6 +20,7 @@ use flotilla_core::{
     checkout_integration::{checkout_path_from_status_and_spec, inspect_checkout_integration},
     config::ConfigStore,
     in_process::InProcessDaemon,
+    measure_available_space,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{run_provisioned_host_detectors, EnvironmentBag},
@@ -114,6 +115,22 @@ pub struct DaemonRuntime {
     stop_expected: bool,
 }
 
+#[derive(Debug, Clone)]
+struct DaemonHealthIdentity {
+    generation: Option<String>,
+    version: String,
+    started_at: chrono::DateTime<Utc>,
+}
+
+#[cfg(test)]
+fn test_health_identity() -> DaemonHealthIdentity {
+    DaemonHealthIdentity {
+        generation: Some("test-generation".to_string()),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        started_at: Utc::now(),
+    }
+}
+
 impl DaemonRuntime {
     pub async fn start(
         daemon: Arc<InProcessDaemon>,
@@ -145,13 +162,24 @@ impl DaemonRuntime {
             daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?,
             config.state_dir().as_path().to_path_buf(),
         ));
+        let health = DaemonHealthIdentity {
+            generation: daemon
+                .observed_resource_backend()
+                .using::<Checkout>(&options.namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .generation,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            started_at: Utc::now(),
+        };
         daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools).await;
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
         flotilla_resources::PreparedSnapshotGarbageCollector::new(daemon.resource_backend(), &options.namespace)
             .recover_pending_claims()
             .await
             .map_err(|error| format!("recover prepared convoy admissions: {error}"))?;
-        apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store)).await?;
+        apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health).await?;
         if let Err(error) = daemon.reconcile_adopted_checkouts(&options.namespace).await {
             warn!(%error, "failed to restore adopted checkout observations during startup; periodic reconciliation will retry");
         }
@@ -162,6 +190,7 @@ impl DaemonRuntime {
                 options.namespace.clone(),
                 profile.clone(),
                 Arc::new(Some(Arc::clone(&credential_store))),
+                health,
                 options.heartbeat_interval,
             ),
             spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
@@ -591,9 +620,10 @@ fn spawn_heartbeat_task(
     daemon: Arc<InProcessDaemon>,
     namespace: String,
     profile: LocalProvisioningProfile,
+    health: DaemonHealthIdentity,
     interval: Duration,
 ) -> JoinHandle<()> {
-    spawn_heartbeat_task_with_credentials(daemon, namespace, profile, Arc::new(None), interval)
+    spawn_heartbeat_task_with_credentials(daemon, namespace, profile, Arc::new(None), health, interval)
 }
 
 fn spawn_heartbeat_task_with_credentials(
@@ -601,6 +631,7 @@ fn spawn_heartbeat_task_with_credentials(
     namespace: String,
     profile: LocalProvisioningProfile,
     credential_store: Arc<Option<Arc<CredentialStore>>>,
+    health: DaemonHealthIdentity,
     interval: Duration,
 ) -> JoinHandle<()> {
     spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
@@ -608,8 +639,11 @@ fn spawn_heartbeat_task_with_credentials(
         let namespace = namespace.clone();
         let profile = profile.clone();
         let credential_store = Arc::clone(&credential_store);
+        let health = health.clone();
         async move {
-            if let Err(err) = apply_host_heartbeat_with_credentials(&daemon, &namespace, &profile, credential_store.as_deref()).await {
+            if let Err(err) =
+                apply_host_heartbeat_with_credentials(&daemon, &namespace, &profile, credential_store.as_deref(), &health).await
+            {
                 warn!(%err, "failed to publish host heartbeat");
             }
         }
@@ -617,8 +651,13 @@ fn spawn_heartbeat_task_with_credentials(
 }
 
 #[cfg(test)]
-async fn apply_host_heartbeat(daemon: &Arc<InProcessDaemon>, namespace: &str, profile: &LocalProvisioningProfile) -> Result<(), String> {
-    apply_host_heartbeat_with_credentials(daemon, namespace, profile, None).await
+async fn apply_host_heartbeat(
+    daemon: &Arc<InProcessDaemon>,
+    namespace: &str,
+    profile: &LocalProvisioningProfile,
+    health: &DaemonHealthIdentity,
+) -> Result<(), String> {
+    apply_host_heartbeat_with_credentials(daemon, namespace, profile, None, health).await
 }
 
 fn spawn_replica_refresh_task(daemon: Arc<InProcessDaemon>, interval: Duration) -> JoinHandle<()> {
@@ -685,6 +724,7 @@ async fn apply_host_heartbeat_with_credentials(
     namespace: &str,
     profile: &LocalProvisioningProfile,
     credential_store: Option<&CredentialStore>,
+    health: &DaemonHealthIdentity,
 ) -> Result<(), String> {
     ensure_host_exists(&daemon.resource_backend(), namespace, &profile.host_id).await?;
     let backend = daemon.resource_backend();
@@ -706,11 +746,19 @@ async fn apply_host_heartbeat_with_credentials(
         Some(store) => store.held_credentials().await?,
         None => BTreeSet::new(),
     };
+    let repo_default_dir = PathBuf::from(&profile.repo_default_dir);
+    let disk_free_bytes = tokio::task::spawn_blocking(move || measure_available_space(&repo_default_dir))
+        .await
+        .map_err(|error| format!("measure available disk space: {error}"))?;
     let status = HostStatus {
         capabilities: host_capabilities(&summary, profile, &held_credentials),
         heartbeat_at: Some(Utc::now()),
         ready: true,
         resource_store,
+        daemon_generation: health.generation.clone(),
+        daemon_version: Some(health.version.clone()),
+        daemon_started_at: Some(health.started_at),
+        disk_free_bytes,
     };
     hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|err| err.to_string())?;
     daemon.refresh_connected_peer_host_heartbeats().await;
@@ -2633,7 +2681,7 @@ mod tests {
         let backend = daemon.resource_backend();
 
         register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("startup registration should succeed");
-        apply_host_heartbeat(&daemon, NAMESPACE, &profile).await.expect("host heartbeat should succeed");
+        apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("host heartbeat should succeed");
 
         let state = Arc::new(ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -2868,7 +2916,8 @@ mod tests {
         let profile = manual_profile(&host_id, false);
 
         ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id).await.expect("host registration should succeed");
-        let heartbeat = spawn_heartbeat_task(Arc::clone(&daemon), NAMESPACE.to_string(), profile, Duration::from_millis(20));
+        let heartbeat =
+            spawn_heartbeat_task(Arc::clone(&daemon), NAMESPACE.to_string(), profile, test_health_identity(), Duration::from_millis(20));
         let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
 
         let status = wait_for_host_status(&hosts, &host_id).await;
@@ -2876,6 +2925,10 @@ mod tests {
         assert_eq!(status.agent_adapters().expect("valid agent adapter capability"), BTreeSet::new());
         assert_eq!(status.capabilities.get("docker"), Some(&json!(false)));
         assert_eq!(status.capabilities.get("terminal_pools"), Some(&json!(["passthrough"])));
+        assert_eq!(status.daemon_generation.as_deref(), Some("test-generation"));
+        assert_eq!(status.daemon_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert!(status.daemon_started_at.is_some());
+        assert!(status.disk_free_bytes.is_some());
         assert!(
             status.resource_store.expect("heartbeat should publish resource store diagnostics").event_log_within_retention(),
             "heartbeat should report a bounded resource event log"
@@ -2914,6 +2967,7 @@ mod tests {
                 heartbeat_at: Some(stale_heartbeat),
                 ready: true,
                 resource_store: None,
+                ..HostStatus::default()
             })
             .await
             .expect("seed stale peer heartbeat");
@@ -2922,6 +2976,7 @@ mod tests {
             Arc::clone(&daemon),
             NAMESPACE.to_string(),
             manual_profile(&local_host_id, false),
+            test_health_identity(),
             Duration::from_millis(20),
         );
         wait_until(|| {
@@ -3351,7 +3406,7 @@ mod tests {
         let backend = daemon.resource_backend();
 
         register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("startup resources");
-        apply_host_heartbeat(&daemon, NAMESPACE, &profile).await.expect("host heartbeat");
+        apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("host heartbeat");
         let state = Arc::new(ControllerRuntimeState::new(
             Arc::clone(&daemon),
             Arc::clone(&config),
@@ -3796,7 +3851,7 @@ mod tests {
         let backend = daemon.resource_backend();
 
         register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("startup registration should succeed");
-        apply_host_heartbeat(&daemon, NAMESPACE, &profile).await.expect("host heartbeat should succeed");
+        apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("host heartbeat should succeed");
 
         let state = Arc::new(ControllerRuntimeState::new(
             Arc::clone(&daemon),

@@ -463,11 +463,12 @@ mod watch_human {
 mod command_result_human {
     use std::path::PathBuf;
 
+    use chrono::{Duration, Utc};
     use flotilla_protocol::{
         commands::{CheckoutStatus, CommandValue, RepositoryIdentityChange},
         qualified_path::{HostId, QualifiedPath},
-        CrewListMember, CrewListResponse, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness, HostName, NodeId,
-        PreparedWorkspace,
+        CrewListMember, CrewListResponse, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow,
+        FleetObservationAgreement, FleetReplicaStatus, FleetStaleness, HostName, NodeId, PeerConnectionState, PreparedWorkspace,
     };
 
     use crate::cli::format_command_result;
@@ -658,6 +659,36 @@ mod command_result_human {
         assert!(output.contains("skipped 2 records"));
         assert!(output.contains("missing field `repo_label`"));
         assert!(output.contains("gen-drifted"));
+    }
+
+    #[test]
+    fn fleet_health_shows_independent_observations_and_disagreement() {
+        let now = Utc::now();
+        let result = CommandValue::FleetHealth(Box::new(FleetHealthResponse {
+            hosts: vec![FleetHostRow::builder()
+                .host(HostName::new("feta"))
+                .is_local(false)
+                .configured(true)
+                .link(PeerConnectionState::Connected)
+                .daemon_generation("old-generation")
+                .daemon_version("0.9.0")
+                .daemon_uptime_seconds(7200)
+                .heartbeat_at(now - Duration::seconds(61))
+                .replica_last_sync(now)
+                .replica_generation("new-generation")
+                .crew_count(3)
+                .convoy_count(2)
+                .disk_free_bytes(42 * 1024 * 1024 * 1024)
+                .staleness(FleetHostStaleness::Stale)
+                .observation_agreement(FleetObservationAgreement::Disagree)
+                .build()],
+        }));
+
+        let output = format_command_result(&result);
+
+        for expected in ["feta", "connected", "old-generation", "new-generation", "0.9.0", "7200s", "42.0 GiB", "STALE", "⚠ DISAGREE"] {
+            assert!(output.contains(expected), "expected fleet health output to contain {expected:?}:\n{output}");
+        }
     }
 
     #[test]

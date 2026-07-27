@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 bon = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 flotilla-client = { path = "../flotilla-client" }
 flotilla-commands = { path = "../flotilla-commands" }
 flotilla-core = { path = "../flotilla-core" }

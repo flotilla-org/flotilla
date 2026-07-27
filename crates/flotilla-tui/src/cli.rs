@@ -1,11 +1,13 @@
 use std::{collections::HashMap, path::Path};
 
+use chrono::{DateTime, Utc};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    output::OutputFormat, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus, FleetListResponse,
-    FleetStaleness, HostProvidersResponse, HostStatusResponse, NodeInfo, PeerConnectionState, ProjectListResponse, RepoDetailResponse,
-    RepoProvidersResponse, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse,
+    output::OutputFormat, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus, FleetHealthResponse,
+    FleetHostStaleness, FleetListResponse, FleetObservationAgreement, FleetStaleness, HostProvidersResponse, HostStatusResponse, NodeInfo,
+    PeerConnectionState, ProjectListResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse, StreamKey,
+    TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -150,6 +152,71 @@ fn format_host_list_human(response: &flotilla_protocol::HostListResponse) -> Str
             Cell::new(if host.has_summary { "yes" } else { "no" }),
             Cell::new(host.repo_count),
             Cell::new(host.work_item_count),
+        ]);
+    }
+    format!("{table}\n")
+}
+
+fn format_observation_time(at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    let Some(at) = at else {
+        return "-".to_string();
+    };
+    let age = now.signed_duration_since(at).num_seconds().max(0);
+    format!("{} ({age}s ago)", at.format("%Y-%m-%d %H:%M:%SZ"))
+}
+
+fn format_disk_free(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| "-".to_string(), |bytes| format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0)))
+}
+
+pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> String {
+    if response.hosts.is_empty() {
+        return "No hosts known.\n".to_string();
+    }
+    let now = Utc::now();
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec![
+        "Host",
+        "Version",
+        "Daemon Gen",
+        "Uptime",
+        "Link",
+        "Last Heartbeat",
+        "Replica Sync",
+        "Replica Gen",
+        "Crew",
+        "Convoys",
+        "Disk Free",
+        "Staleness",
+        "Diagnosis",
+    ]);
+    for host in &response.hosts {
+        let name = if host.is_local { format!("{} (local)", host.host) } else { host.host.to_string() };
+        let row = match host.staleness {
+            FleetHostStaleness::Current => "current",
+            FleetHostStaleness::Stale => "STALE",
+            FleetHostStaleness::Unknown => "unknown",
+        };
+        let diagnosis = match host.observation_agreement {
+            FleetObservationAgreement::Agree => "agree",
+            FleetObservationAgreement::Disagree => "⚠ DISAGREE",
+            FleetObservationAgreement::Unknown => "unknown",
+        };
+        table.add_row(vec![
+            Cell::new(name),
+            Cell::new(host.daemon_version.as_deref().unwrap_or("-")),
+            Cell::new(host.daemon_generation.as_deref().unwrap_or("-")),
+            Cell::new(host.daemon_uptime_seconds.map_or_else(|| "-".to_string(), |seconds| format!("{seconds}s"))),
+            Cell::new(format_connection_status(&host.link)),
+            Cell::new(format_observation_time(host.heartbeat_at, now)),
+            Cell::new(format_observation_time(host.replica_last_sync, now)),
+            Cell::new(host.replica_generation.as_deref().unwrap_or("-")),
+            Cell::new(host.crew_count),
+            Cell::new(host.convoy_count),
+            Cell::new(format_disk_free(host.disk_free_bytes)),
+            Cell::new(row),
+            Cell::new(diagnosis),
         ]);
     }
     format!("{table}\n")
@@ -463,10 +530,14 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::RepoDetail(detail) => format_repo_detail_human(detail),
         CommandValue::RepoProviders(providers) => format_repo_providers_human(providers),
         CommandValue::RepoWork(work) => format_repo_work_human(work),
+        // HostList remains a protocol-level query used by host/environment
+        // target resolution; keep its formatter for direct query diagnostics
+        // even though `host list` now presents the richer fleet-health view.
         CommandValue::HostList(hosts) => format_host_list_human(hosts),
         CommandValue::ProjectList(projects) => format_project_list_human(projects),
         CommandValue::HostStatus(status) => format_host_status_human(status),
         CommandValue::HostProviders(providers) => format_host_providers_human(providers),
+        CommandValue::FleetHealth(fleet) => format_fleet_health_human(fleet),
         CommandValue::FleetList(fleet) => format_fleet_list_human(fleet),
         CommandValue::CrewList(crew) => format_crew_list_human(crew),
         CommandValue::FleetReplicaSnapshot(_) => "fleet replica snapshot".to_string(),

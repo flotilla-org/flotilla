@@ -56,7 +56,8 @@ pub use environment::{
 pub use error::ResourceError;
 pub use flotilla_protocol::PrincipalRef;
 pub use host::{
-    Host, HostSpec, HostStatus, HostStatusPatch, AGENT_ADAPTERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, TERMINAL_POOLS_CAPABILITY,
+    Host, HostSpec, HostStatus, HostStatusPatch, AGENT_ADAPTERS_CAPABILITY, HEARTBEAT_READY_TTL_SECS, HELD_CREDENTIALS_CAPABILITY,
+    TERMINAL_POOLS_CAPABILITY,
 };
 pub use http::{ensure_crd, ensure_namespace, HttpBackend};
 pub use in_memory::InMemoryBackend;

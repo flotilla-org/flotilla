@@ -1,4 +1,7 @@
-use std::{io::stdout, time::Duration};
+use std::{
+    io::stdout,
+    time::{Duration, Instant},
+};
 
 use color_eyre::Result;
 use crossterm::{
@@ -32,6 +35,8 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     // Subscribe before replay so events emitted between replay and the event
     // loop are buffered rather than silently dropped.
     let daemon_rx = app.daemon.subscribe();
+    let mut events = event::EventHandler::new(Duration::from_millis(50));
+    events.attach_daemon(daemon_rx);
 
     // Get initial state via replay_since (works for both in-process and socket).
     let replay_events =
@@ -39,6 +44,8 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     for event in replay_events {
         app.handle_daemon_event(event);
     }
+    spawn_fleet_health_refresh(&app, events.sender());
+    let mut fleet_health_refresh_in_flight = true;
 
     // Subscribe the named queries the open Views consume — the tab set is
     // the subscription set (ADR 0013). The subscribe replay returns the
@@ -48,8 +55,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     execute!(stdout(), EnableMouseCapture)?;
     let mut terminal_title = None;
     sync_terminal_title(&app, &mut terminal_title)?;
-    let mut events = event::EventHandler::new(Duration::from_millis(50));
-    events.attach_daemon(daemon_rx);
+    let mut next_fleet_health_refresh = Instant::now() + Duration::from_secs(5);
 
     // Initial draw before entering the event loop
     render_frame(&mut terminal, &mut app)?;
@@ -89,8 +95,10 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                     _ => other_events.push(evt),
                 },
                 Event::Tick => {
-                    // Keep one tick to trigger a redraw when shimmer animation is active.
-                    if app.needs_animation() && !other_events.iter().any(|e| matches!(e, Event::Tick)) {
+                    // Keep one tick for animation and periodic fleet-health refresh.
+                    if (app.needs_animation() || (!fleet_health_refresh_in_flight && Instant::now() >= next_fleet_health_refresh))
+                        && !other_events.iter().any(|e| matches!(e, Event::Tick))
+                    {
                         other_events.push(evt);
                     }
                 }
@@ -114,6 +122,17 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                 Event::AttachDispatchCompleted(result) => {
                     app::executor::handle_attach_dispatch_completion(result, &mut app);
                 }
+                Event::FleetHealthRefreshed(result) => {
+                    fleet_health_refresh_in_flight = false;
+                    match result {
+                        Ok(flotilla_protocol::CommandValue::FleetHealth(health)) => app.model.fleet_health = *health,
+                        Ok(flotilla_protocol::CommandValue::Error { message }) => {
+                            tracing::debug!(%message, "fleet health refresh unavailable");
+                        }
+                        Ok(other) => tracing::debug!(?other, "fleet health refresh returned unexpected value"),
+                        Err(error) => tracing::debug!(%error, "fleet health refresh failed"),
+                    }
+                }
                 Event::Key(k) => {
                     // Ctrl-Z: suspend/resume (unix only)
                     #[cfg(unix)]
@@ -127,7 +146,13 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                 Event::Mouse(m) => {
                     app.handle_mouse(m);
                 }
-                Event::Tick => {} // already filtered out
+                Event::Tick => {
+                    if !fleet_health_refresh_in_flight && Instant::now() >= next_fleet_health_refresh {
+                        spawn_fleet_health_refresh(&app, events.sender());
+                        fleet_health_refresh_in_flight = true;
+                        next_fleet_health_refresh = Instant::now() + Duration::from_secs(5);
+                    }
+                }
             }
         }
 
@@ -184,6 +209,21 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     app.daemon.unsubscribe_queries(app.session_id).await;
     crate::terminal::restore_terminal();
     Ok(EventLoopExit::Quit)
+}
+
+fn spawn_fleet_health_refresh(app: &App, event_tx: tokio::sync::mpsc::UnboundedSender<Event>) {
+    let daemon = app.daemon.clone();
+    let session_id = app.session_id;
+    let command = flotilla_protocol::Command {
+        node_id: None,
+        provisioning_target: None,
+        context_repo: None,
+        action: flotilla_protocol::CommandAction::QueryFleetHealth {},
+    };
+    tokio::spawn(async move {
+        let result = daemon.execute_query(command, session_id).await;
+        let _ = event_tx.send(Event::FleetHealthRefreshed(result));
+    });
 }
 
 fn sync_terminal_title(app: &App, current: &mut Option<String>) -> Result<()> {

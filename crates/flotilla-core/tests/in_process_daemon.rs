@@ -1094,6 +1094,7 @@ async fn create_test_host_direct_policy(
             heartbeat_at: Some(chrono::Utc::now()),
             ready: true,
             resource_store: None,
+            ..HostStatus::default()
         })
         .await
         .expect("host status update");

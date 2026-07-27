@@ -296,6 +296,7 @@ async fn agent_adapter_admission_rejects_a_host_that_does_not_advertise_the_requ
             heartbeat_at: Some(Utc::now()),
             ready: true,
             resource_store: None,
+            ..HostStatus::default()
         })
         .await
         .expect("host status update");
@@ -335,6 +336,7 @@ async fn agent_adapter_admission_rejects_a_host_with_stale_heartbeat() {
             heartbeat_at: Some(Utc::now() - ChronoDuration::seconds(61)),
             ready: true,
             resource_store: None,
+            ..HostStatus::default()
         })
         .await
         .expect("host status update");
@@ -372,6 +374,7 @@ async fn create_host_direct_placement(backend: &ResourceBackend, policy_name: &s
             heartbeat_at: Some(Utc::now()),
             ready: true,
             resource_store: None,
+            ..HostStatus::default()
         })
         .await
         .expect("host status update");
@@ -1836,6 +1839,86 @@ async fn fleet_list_shows_simultaneous_convoys_on_kiwi_feta_and_udder() {
     assert_eq!(placements.get("kiwi-work"), Some(&daemon.host_name));
     assert_eq!(placements.get("feta-work"), Some(&HostName::new("feta")));
     assert_eq!(placements.get("udder-work"), Some(&HostName::new("udder")));
+}
+
+#[tokio::test]
+async fn fleet_health_keeps_link_heartbeat_and_generation_disagreements_visible() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"kiwi-host\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", None), ("udder", "udder.local", None)]);
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let peer = node("feta").node_id;
+    daemon.set_configured_peers(vec![NodeInfo::new(peer.clone(), "feta")]).await;
+    publish_attach_host_summary(&daemon, "feta", "feta").await;
+    daemon.publish_peer_connection_status(&node("feta"), PeerConnectionState::Connected).await;
+
+    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let source_hosts = source.using::<ResourceHost>("flotilla");
+    let remote =
+        source_hosts.create(&InputMeta::builder().name("feta-host".to_string()).build(), &HostSpec {}).await.expect("create source host");
+    let frozen_heartbeat = Utc::now() - ChronoDuration::seconds(HEARTBEAT_READY_TTL_SECS + 1);
+    source_hosts
+        .update_status(&remote.metadata.name, &remote.metadata.resource_version, &HostStatus {
+            heartbeat_at: Some(frozen_heartbeat),
+            ready: true,
+            daemon_generation: Some("old-generation".to_string()),
+            daemon_version: Some("0.9.0".to_string()),
+            daemon_started_at: Some(Utc::now() - ChronoDuration::hours(2)),
+            disk_free_bytes: Some(42 * 1024 * 1024 * 1024),
+            ..HostStatus::default()
+        })
+        .await
+        .expect("update source host");
+    daemon
+        .resource_backend()
+        .replica_writer::<ResourceHost>(peer.clone(), "flotilla")
+        .replace(&source_hosts.list().await.expect("list source hosts"), Utc::now())
+        .await
+        .expect("replicate host status");
+    assert_eq!(daemon.host_registry.host_name_for_node(&peer).await, Some(HostName::new("feta")));
+    let replicated_hosts =
+        daemon.resource_backend().including_replicas::<ResourceHost>("flotilla").list().await.expect("list replicated hosts");
+    assert!(replicated_hosts.items.iter().any(|host| {
+        matches!(&host.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root == &peer)
+            && host.object.status.as_ref().and_then(|status| status.heartbeat_at) == Some(frozen_heartbeat)
+    }));
+    daemon.fleet_replica_cache.write().await.insert(HostName::new("feta"), FleetReplicaCacheEntry {
+        rows: vec![FleetListRow::builder()
+            .convoy("remote-convoy")
+            .vessel("implement")
+            .crew("implement/coder")
+            .crew_state("running")
+            .host(HostName::new("feta"))
+            .namespace("flotilla")
+            .staleness(FleetStaleness::Local)
+            .build()],
+        result_sets: vec![],
+        last_sync: Some(Utc::now()),
+        generation: Some("new-generation".to_string()),
+        skipped_records: 0,
+        first_parse_error: None,
+        last_error: None,
+    });
+
+    let response = daemon.fleet_health_internal().await.expect("fleet health");
+
+    let feta = response.hosts.iter().find(|row| row.host == HostName::new("feta")).expect("configured feta row");
+    assert_eq!(feta.link, PeerConnectionState::Connected);
+    assert_eq!(feta.heartbeat_at, Some(frozen_heartbeat));
+    assert_eq!(feta.daemon_generation.as_deref(), Some("old-generation"));
+    assert_eq!(feta.replica_generation.as_deref(), Some("new-generation"));
+    assert_eq!(feta.disk_free_bytes, Some(42 * 1024 * 1024 * 1024));
+    assert_eq!(feta.crew_count, 1);
+    assert_eq!(feta.convoy_count, 1);
+    assert_eq!(feta.staleness, FleetHostStaleness::Stale);
+    assert_eq!(feta.observation_agreement, FleetObservationAgreement::Disagree);
+
+    let udder = response.hosts.iter().find(|row| row.host == HostName::new("udder")).expect("unreachable configured host row");
+    assert_eq!(udder.link, PeerConnectionState::Disconnected);
+    assert_eq!(udder.staleness, FleetHostStaleness::Unknown);
 }
 
 #[tokio::test]
@@ -5402,6 +5485,7 @@ async fn contained_workflow_grants_default_deny_and_admission_names_an_unheld_cr
             heartbeat_at: Some(Utc::now()),
             capabilities: BTreeMap::new(),
             resource_store: None,
+            ..HostStatus::default()
         })
         .await
         .expect("mark host ready");
@@ -5491,6 +5575,7 @@ async fn local_convoy_admission_pins_the_grant_resolved_workflow() {
             heartbeat_at: Some(Utc::now()),
             capabilities: BTreeMap::from([(flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["model-api"]))]),
             resource_store: None,
+            ..HostStatus::default()
         })
         .await
         .expect("mark host ready");
