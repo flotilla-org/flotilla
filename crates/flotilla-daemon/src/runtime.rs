@@ -1375,7 +1375,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", spec.pool, spec.env_ref))?;
 
         let cwd = ExecutionEnvironmentPath::new(&spec.cwd);
-        let (command, env, crew, initial_message) = match &spec.source {
+        let (command, mut env, crew, initial_message) = match &spec.source {
             TerminalSessionSource::Tool { command } => (command.clone(), Vec::new(), None, None),
             TerminalSessionSource::Agent { selector, brief, context, message } => {
                 let requirement = CapabilityTable::seeded().resolve(&selector.capability)?.clone();
@@ -1414,6 +1414,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 (plan.command, env, Some(crew), message.clone())
             }
         };
+        env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
 
         if matches!(spec.source, TerminalSessionSource::Agent { .. })
             && pool.list_sessions().await?.iter().any(|session| session.session_name == name)
@@ -3246,6 +3247,9 @@ mod tests {
         assert!(coder_launch.command.contains("--dangerously-bypass-approvals-and-sandbox"));
         assert!(!coder_launch.command.contains("without leaking this full brief"));
         assert!(coder_launch.env_vars.iter().any(|(key, value)| key == "FLOTILLA_CREW_ID" && value == &coder_id));
+        assert!(coder_launch.env_vars.iter().any(|(key, value)| key == "CARGO_INCREMENTAL" && value == "0"));
+        let watcher_launch = ensured.iter().find(|launch| launch.session_name.ends_with("-watcher")).expect("watcher launch");
+        assert!(watcher_launch.env_vars.iter().any(|(key, value)| key == "CARGO_INCREMENTAL" && value == "0"));
         drop(ensured);
 
         let crew_context = CrewCommandContext { crew_id: Some(coder_id.clone()), ..Default::default() };

@@ -1,0 +1,6 @@
+[Unit]
+Description=Flotilla mtime-based Cargo artifact sweep
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/flotilla/cargo-sweep-mtime.sh

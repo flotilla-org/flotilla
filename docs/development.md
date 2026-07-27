@@ -2,47 +2,81 @@
 
 ## Cargo target cache policy
 
-A checkout's `target/` is managed cache state. Developer builds keep Cargo's incremental compilation enabled because it materially shortens the edit-build loop, but old generations and dependency artifacts must not accumulate indefinitely.
+A checkout's `target/` is managed cache state. The fleet uses two complementary controls: a daily, per-host mtime-based sweep for old Cargo artifact families and a per-checkout size-cap backstop for unusually large targets.
 
-Install the pruning tool once:
+### Daily mtime-based sweep
+
+Install and immediately verify the schedule on each fleet host from a Flotilla checkout:
 
 ```bash
-cargo install cargo-sweep --version 0.8.0 --locked
+scripts/install-cargo-sweep-schedule.sh
 ```
 
-Preview the per-checkout policy, then apply it when no build or test is running:
+The installer pins `cargo-sweep` 0.8.0 when the command is absent, copies the runner to `~/.local/libexec/flotilla/`, installs a systemd user timer on Linux or the checked-in launchd agent on macOS, enables the daily schedule, and starts one observed run. The installed policy runs `cargo-sweep --time 3` once a day. This is an mtime-based three-day retention policy.
+
+Each run sweeps:
+
+- every immediate directory under `~/dev/` that has its own `target/`; and
+- every checkout with a `target/` beneath `~/dev/flotilla-repos`, covering that convoy root until lifecycle teardown owns checkout removal under #1113.
+
+The runner records reclaimed bytes for every root and the whole run in:
+
+```text
+~/.local/state/flotilla/cargo-sweep-mtime.log
+```
+
+Inspect the scheduler and the most recent result with:
+
+```bash
+# Linux
+systemctl --user status flotilla-cargo-sweep-mtime.timer
+systemctl --user status flotilla-cargo-sweep-mtime.service
+tail -n 50 ~/.local/state/flotilla/cargo-sweep-mtime.log
+
+# macOS
+launchctl print "gui/$UID/org.flotilla.cargo-sweep-mtime"
+tail -n 50 ~/.local/state/flotilla/cargo-sweep-mtime.log
+```
+
+An identity-based artifact policy remains a candidate for future evaluation; it is not part of the installed policy.
+
+### Incremental compilation split
+
+Interactive desk builds keep Cargo's incremental compilation enabled because it materially shortens the edit-build loop. Crew vessel provisioning exports `CARGO_INCREMENTAL=0`, so short-lived crew builds do not mint incremental generations. GitHub Actions also sets `CARGO_INCREMENTAL=0` for the same short-lived-build reason.
+
+To confirm the setting in a dispatched crew vessel, build once and check both the environment and target:
+
+```bash
+test "$CARGO_INCREMENTAL" = 0
+cargo check --locked
+test -z "$(find target -path '*/incremental/*' -print -quit)"
+```
+
+Current Cargo may create the empty `target/debug/incremental/` container even when incremental compilation is disabled; the verification checks that it contains no generated state.
+
+### Size-cap backstop
+
+The daily host sweep owns age-based removal. `scripts/prune-target.sh` only caps a single checkout when its target grows unusually large: it removes the oldest incremental generations until their total is at most 10 GiB, then asks `cargo-sweep` to reduce the complete target to at most 20 GiB.
+
+Preview the size decisions, then apply them when no build or test is running:
 
 ```bash
 scripts/prune-target.sh --dry-run
 scripts/prune-target.sh
 ```
 
-Preview mode runs the complete policy against a temporary hard-linked copy beside the target directory. This lets later size decisions observe the earlier simulated removals without changing the real target; the temporary copy is removed before the command exits.
+Preview mode runs the complete size-cap policy against a temporary hard-linked copy beside the target directory. This lets the complete-target decision observe the simulated incremental removals without changing the real target; the temporary copy is removed before the command exits.
 
-The command removes incremental generations and other Cargo artifact families unused for 30 days. It then removes the oldest remaining generations until incremental state is at most 10 GiB, and asks `cargo-sweep` to reduce the complete target to at most 20 GiB by discarding stale dependency/fingerprint companions. Recent compiler products are retained whenever they fit within the ceilings, so ordinary developer builds remain warm.
-
-Both thresholds can be overridden for an exceptional checkout:
+Both ceilings can be overridden for an exceptional checkout:
 
 ```bash
-FLOTILLA_TARGET_GC_DAYS=14 \
-  FLOTILLA_TARGET_GC_INCREMENTAL_MAX_SIZE=15GiB \
-  FLOTILLA_TARGET_GC_MAX_SIZE=30GiB \
+FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE=15GiB \
+  FLOTILLA_TARGET_MAX_SIZE=30GiB \
   scripts/prune-target.sh
 ```
 
-Run the command in each long-lived checkout. With Cargo's default configuration it acts only on that checkout's `target/` and does not traverse sibling worktrees or shared development roots. When `CARGO_TARGET_DIR` is set, the command intentionally honors it; unset or redirect a shared target before pruning if other checkouts still use that cache. Relative values are anchored to this checkout's root, so use an absolute value if Cargo is normally invoked elsewhere.
+With Cargo's default configuration the script acts only on that checkout's `target/`. When `CARGO_TARGET_DIR` is set, the command intentionally honors it. Relative values are anchored to this checkout's root, so use an absolute value if Cargo is normally invoked elsewhere.
 
-### CI decision
+### CI cache decision
 
-GitHub Actions keeps target caches because compiled dependencies are expensive and reusable across runs with the same lockfile. Compiler incremental state is disabled in CI with `CARGO_INCREMENTAL=0`: clippy, tests, coverage, and Dylint run in short-lived checkouts, so uploading their incremental generations costs cache time and storage without a dependable later edit-build loop to amortize it. Cache keys were rotated when this policy was introduced, and every target-caching job removes restored incremental directories before the cache post-action saves a new entry; old generations are therefore neither restored through the new key prefixes nor re-uploaded.
-
-### Validation measurement
-
-The policy was validated on 2026-07-23 against a clone-on-write copy of a real, long-lived Flotilla target in a scratch checkout. The copy isolated the measurement from active developer work and exercised the same inode-heavy copy shape as a warm hull. Its source target occupied 50 GiB; splitting hard-linked artifact identities into cloned files made the scratch copy's initial `du` total 68 GiB.
-
-| State | Total target | `debug/incremental` | `debug/deps` | Files |
-|---|---:|---:|---:|---:|
-| Before | 68 GiB | 28 GiB | 38 GiB | 180,542 |
-| After `scripts/prune-target.sh` | 20 GiB | 9.9 GiB | 9.2 GiB | 52,150 |
-
-The run took 131.59 seconds and removed 362 of 539 incremental generation directories before pruning stale dependency families. It reclaimed 48 GiB and reduced file count by 71%, while retaining the newest 177 incremental generations.
+GitHub Actions keeps target caches because compiled dependencies are expensive and reusable across runs with the same lockfile. Compiler incremental state is disabled with `CARGO_INCREMENTAL=0`; every target-caching job removes restored incremental directories before the cache post-action saves a new entry, so incremental generations are neither restored nor re-uploaded.
