@@ -131,12 +131,11 @@ impl VesselDeps {
     }
 
     fn provisioning(
-        obj: &ResourceObject<Vessel>,
         placement_policy: &ResourceObject<PlacementPolicy>,
         waiting_for: impl Into<String>,
         actuations: Vec<Actuation>,
     ) -> Self {
-        Self { patch: provisioning_patch(obj, placement_policy, waiting_for.into()), actuations }
+        Self { patch: provisioning_patch(placement_policy, waiting_for.into()), actuations }
     }
 
     fn ready(
@@ -262,12 +261,7 @@ impl Reconciler for VesselReconciler {
                 None => return Ok(VesselDeps::failed(format!("environment {clone_env_ref} is not a host_direct environment"))),
             };
             if clone_env.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                return Ok(VesselDeps::provisioning(
-                    obj,
-                    &placement_policy,
-                    format!("environment {clone_env_ref} to become ready"),
-                    actuations,
-                ));
+                return Ok(VesselDeps::provisioning(&placement_policy, format!("environment {clone_env_ref} to become ready"), actuations));
             }
             Some(clone_env_spec.repo_default_dir.clone())
         } else {
@@ -289,7 +283,6 @@ impl Reconciler for VesselReconciler {
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
                             return Ok(VesselDeps::provisioning(
-                                obj,
                                 &placement_policy,
                                 format!("environment {env_name} to become ready"),
                                 actuations,
@@ -316,7 +309,6 @@ impl Reconciler for VesselReconciler {
                             },
                         });
                         return Ok(VesselDeps::provisioning(
-                            obj,
                             &placement_policy,
                             format!("environment {env_name} to become ready"),
                             actuations,
@@ -540,10 +532,10 @@ impl Reconciler for VesselReconciler {
             }
         }
         if !waiting_for_checkouts.is_empty() {
+            let checkout_label = if waiting_for_checkouts.len() == 1 { "checkout" } else { "checkouts" };
             return Ok(VesselDeps::provisioning(
-                obj,
                 &placement_policy,
-                format!("checkout {} to become ready", waiting_for_checkouts.join(", ")),
+                format!("{checkout_label} {} to become ready", waiting_for_checkouts.join(", ")),
                 actuations,
             ));
         }
@@ -570,12 +562,7 @@ impl Reconciler for VesselReconciler {
                     return Ok(VesselDeps::failed(format!("environment {env_name} failed")));
                 }
                 if environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                    return Ok(VesselDeps::provisioning(
-                        obj,
-                        &placement_policy,
-                        format!("environment {env_name} to become ready"),
-                        actuations,
-                    ));
+                    return Ok(VesselDeps::provisioning(&placement_policy, format!("environment {env_name} to become ready"), actuations));
                 }
                 (env_name, None)
             }
@@ -593,7 +580,6 @@ impl Reconciler for VesselReconciler {
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
                             return Ok(VesselDeps::provisioning(
-                                obj,
                                 &placement_policy,
                                 format!("environment {env_name} to become ready"),
                                 actuations,
@@ -627,7 +613,6 @@ impl Reconciler for VesselReconciler {
                             },
                         });
                         return Ok(VesselDeps::provisioning(
-                            obj,
                             &placement_policy,
                             format!("environment {env_name} to become ready"),
                             actuations,
@@ -696,7 +681,6 @@ impl Reconciler for VesselReconciler {
                     }
                     if should_start && phase != Some(TerminalSessionPhase::Running) {
                         return Ok(VesselDeps::provisioning(
-                            obj,
                             &placement_policy,
                             format!("terminal session {terminal_name} to become running"),
                             actuations,
@@ -770,7 +754,6 @@ impl Reconciler for VesselReconciler {
                         },
                     });
                     return Ok(VesselDeps::provisioning(
-                        obj,
                         &placement_policy,
                         format!("terminal session {terminal_name} to become running"),
                         actuations,
@@ -894,11 +877,7 @@ fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, S
     Err("placement policy must define exactly one supported strategy".to_string())
 }
 
-fn provisioning_patch(
-    _obj: &ResourceObject<Vessel>,
-    placement_policy: &ResourceObject<PlacementPolicy>,
-    waiting_for: String,
-) -> PlannedPatch {
+fn provisioning_patch(placement_policy: &ResourceObject<PlacementPolicy>, waiting_for: String) -> PlannedPatch {
     PlannedPatch::Provisioning {
         observed_policy_ref: placement_policy.metadata.name.clone(),
         observed_policy_version: placement_policy.metadata.resource_version.clone(),

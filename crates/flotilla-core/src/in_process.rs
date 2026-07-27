@@ -5763,6 +5763,7 @@ impl InProcessDaemon {
         if refusals.is_empty() {
             Ok(())
         } else {
+            refusals.sort();
             Err(format!("convoy {namespace}/{name} is not safe to delete:\n{}", refusals.join("\n")))
         }
     }
