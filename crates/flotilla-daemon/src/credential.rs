@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -137,7 +138,8 @@ impl CredentialStore {
         let CredentialConsumer::DockerRegistry { registry, username } = &spec.consumer else {
             unreachable!("matching credentials are docker-registry consumers");
         };
-        if let Some(previous) = self.registry_configs.lock().await.remove(environment_ref) {
+        let previous = self.registry_configs.lock().await.remove(environment_ref);
+        if let Some(previous) = previous {
             remove_registry_config(&previous)
                 .await
                 .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("remove stale writable cache: {error}")))?;
@@ -149,6 +151,9 @@ impl CredentialStore {
         tokio::fs::create_dir_all(&config_dir)
             .await
             .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("create cache directory: {error}")))?;
+        tokio::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("protect cache directory: {error}")))?;
         let config = config_dir.to_string_lossy();
         let operation = async {
             self.host_runner
@@ -182,7 +187,8 @@ impl CredentialStore {
     pub(crate) async fn forget_environment(&self, environment_ref: &str) -> Result<(), String> {
         self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
-        if let Some(config_dir) = self.registry_configs.lock().await.remove(environment_ref) {
+        let config_dir = self.registry_configs.lock().await.remove(environment_ref);
+        if let Some(config_dir) = config_dir {
             remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
         }
         Ok(())
@@ -625,6 +631,11 @@ mod tests {
             .expect("matching registry credential");
 
         assert!(config_dir.is_dir(), "credential config must remain available to docker run");
+        assert_eq!(
+            std::fs::metadata(&config_dir).expect("credential config metadata").permissions().mode() & 0o777,
+            0o700,
+            "credential config directory must not be readable by other host users"
+        );
         let config = config_dir.to_string_lossy();
         {
             let calls = runner.calls.lock().expect("calls lock");
