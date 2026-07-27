@@ -8,9 +8,8 @@ use async_trait::async_trait;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, EnvironmentStatus, HostName, ImageSource};
 
 use super::{
-    docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner, CreateOpts, EnvironmentProvider, ProvisionedMount,
+    docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner, CreateOpts, EnvironmentProvider, ImagePullPolicy, ProvisionedMount,
     ProvisionedMountMode,
-    ImagePullPolicy,
 };
 use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
 

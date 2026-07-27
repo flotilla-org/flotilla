@@ -1186,7 +1186,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),
-                pull_policy: Default::default(),
+            pull_policy: Default::default(),
             agent_adapters: Default::default(),
             default_cwd: Some("/app".to_string()),
             env: Default::default(),

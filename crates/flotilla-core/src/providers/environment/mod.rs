@@ -46,6 +46,16 @@ impl ImagePullPolicy {
     }
 }
 
+impl From<flotilla_resources::DockerImagePullPolicy> for ImagePullPolicy {
+    fn from(value: flotilla_resources::DockerImagePullPolicy) -> Self {
+        match value {
+            flotilla_resources::DockerImagePullPolicy::Always => Self::Always,
+            flotilla_resources::DockerImagePullPolicy::IfNotPresent => Self::IfNotPresent,
+            flotilla_resources::DockerImagePullPolicy::Never => Self::Never,
+        }
+    }
+}
+
 /// Structured metadata for a flotilla-managed bind mount inside a provisioned environment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvisionedMount {

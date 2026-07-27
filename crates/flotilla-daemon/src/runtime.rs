@@ -23,7 +23,7 @@ use flotilla_core::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{run_provisioned_host_detectors, EnvironmentBag},
-        environment::{CreateOpts, EnvironmentHandle, ImagePullPolicy},
+        environment::{CreateOpts, EnvironmentHandle},
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool},
         vcs::{CloneProvisioner, GitCloneProvisioner},
@@ -33,11 +33,11 @@ use flotilla_core::{
 use flotilla_protocol::{EnvironmentId, HostSummary, ImageId, TerminalStatus};
 use flotilla_resources::{
     clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone,
-    CloneSpec, Convoy, ConvoyReconciler, CrewSource, CrewSpec, Demand, DockerCheckoutStrategy, DockerImagePullPolicy,
-    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy,
-    PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend, ResourceError, ResourceObject, Stance,
-    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    CloneSpec, Convoy, ConvoyReconciler, CrewSource, CrewSpec, Demand, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec,
+    Environment, EnvironmentSpec, ForgeIdentity, Host, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation,
+    Project, Regard, Repository, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement,
+    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -977,11 +977,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 tokens: Vec::new(),
                 daemon_socket_path,
                 working_directory: None,
-                image_pull_policy: match spec.pull_policy {
-                    DockerImagePullPolicy::Always => ImagePullPolicy::Always,
-                    DockerImagePullPolicy::IfNotPresent => ImagePullPolicy::IfNotPresent,
-                    DockerImagePullPolicy::Never => ImagePullPolicy::Never,
-                },
+                image_pull_policy: spec.pull_policy.into(),
                 provisioned_mounts: spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount).collect(),
             })
             .await?;
@@ -1631,7 +1627,7 @@ mod tests {
             CommandRunner, ProcessCommandRunner,
         },
     };
-    use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId};
+    use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource};
     use flotilla_resources::{
         Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
         CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, LifecycleAuthority,
@@ -2240,6 +2236,7 @@ mod tests {
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::from(["codex".to_string(), "missing-adapter".to_string()]),
+            pull_policy: Default::default(),
             mounts: Vec::new(),
             env: BTreeMap::new(),
         };
@@ -2284,6 +2281,7 @@ mod tests {
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
+            pull_policy: Default::default(),
             mounts: Vec::new(),
             env: BTreeMap::new(),
         };
