@@ -61,7 +61,8 @@ pub use placement_policy::{
     PlacementPolicy, PlacementPolicySpec,
 };
 pub use prepared_snapshot::{
-    PreparedSnapshotGarbageCollector, PreparedSnapshotGcResult, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
+    PreparedSnapshotGarbageCollector, PreparedSnapshotGcResult, PreparedSnapshotRecoveryResult, PLACEMENT_SNAPSHOT_KIND,
+    PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
 };
 pub use presentation::{Presentation, PresentationPhase, PresentationSpec, PresentationStatus, PresentationStatusPatch};
 pub use principal_attention::{

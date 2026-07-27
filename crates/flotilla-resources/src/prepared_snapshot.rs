@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    Convoy, PlacementPolicy, ResourceBackend, ResourceError, WorkflowTemplate, PLACEMENT_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
+    Convoy, InputMeta, PlacementPolicy, ResourceBackend, ResourceError, WorkflowTemplate, PLACEMENT_SNAPSHOT_ANNOTATION,
+    PREPARED_SNAPSHOT_PENDING_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 
 pub const PREPARED_SNAPSHOT_LABEL: &str = "flotilla.work/prepared-snapshot";
@@ -20,9 +21,60 @@ pub struct PreparedSnapshotGcResult {
     pub placements_deleted: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PreparedSnapshotRecoveryResult {
+    pub completed: usize,
+    pub discarded: usize,
+}
+
 impl PreparedSnapshotGarbageCollector {
     pub fn new(backend: ResourceBackend, namespace: impl Into<String>) -> Self {
         Self { backend, namespace: namespace.into() }
+    }
+
+    /// Recover claims left pending by a daemon crash during prepared admission.
+    ///
+    /// Complete claims whose snapshots were fully materialized; discard claims
+    /// that cannot be completed because their shipped specs died with the
+    /// interrupted command.
+    pub async fn recover_pending_claims(&self) -> Result<PreparedSnapshotRecoveryResult, ResourceError> {
+        let convoys = self.backend.clone().using::<Convoy>(&self.namespace);
+        let workflows = self.backend.clone().using::<WorkflowTemplate>(&self.namespace);
+        let placements = self.backend.clone().using::<PlacementPolicy>(&self.namespace);
+        let mut result = PreparedSnapshotRecoveryResult::default();
+        for convoy in convoys.list().await?.items {
+            if !convoy.metadata.annotations.contains_key(PREPARED_SNAPSHOT_PENDING_ANNOTATION) {
+                continue;
+            }
+            let workflow_ready = match convoy.metadata.annotations.get(WORKFLOW_SNAPSHOT_ANNOTATION) {
+                Some(name) => resource_exists(&workflows, name).await?,
+                None => false,
+            };
+            let placement_ready = match convoy.metadata.annotations.get(PLACEMENT_SNAPSHOT_ANNOTATION) {
+                Some(name) => resource_exists(&placements, name).await?,
+                None => convoy.spec.placement_policy.is_none(),
+            };
+            if workflow_ready && placement_ready {
+                loop {
+                    let current = convoys.get(&convoy.metadata.name).await?;
+                    let mut meta = InputMeta::from(&current.metadata);
+                    meta.annotations.remove(PREPARED_SNAPSHOT_PENDING_ANNOTATION);
+                    match convoys.update(&meta, &current.metadata.resource_version, &current.spec).await {
+                        Ok(_) => {
+                            result.completed += 1;
+                            break;
+                        }
+                        Err(ResourceError::Conflict { .. }) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+            } else {
+                convoys.delete(&convoy.metadata.name).await?;
+                result.discarded += 1;
+            }
+        }
+        self.collect(None).await?;
+        Ok(result)
     }
 
     /// Delete prepared snapshots not referenced by any remaining convoy.
@@ -76,6 +128,14 @@ impl PreparedSnapshotGarbageCollector {
             }
         }
         Ok(result)
+    }
+}
+
+async fn resource_exists<T: crate::Resource>(resolver: &crate::TypedResolver<T>, name: &str) -> Result<bool, ResourceError> {
+    match resolver.get(name).await {
+        Ok(_) => Ok(true),
+        Err(ResourceError::NotFound { .. }) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 

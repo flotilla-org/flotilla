@@ -3926,19 +3926,19 @@ impl InProcessDaemon {
         .await;
         if let Err(error) = prepared {
             if let Err(cleanup_error) = convoys.delete(&start.name).await {
-                warn!(%cleanup_error, namespace, convoy = %start.name, "failed to remove incomplete prepared convoy claim");
+                warn!(%cleanup_error, %namespace, convoy = %start.name, "failed to remove incomplete prepared convoy claim");
             }
             if let Err(cleanup_error) = flotilla_resources::PreparedSnapshotGarbageCollector::new(self.resource_backend.clone(), &namespace)
                 .collect(Some(&start.name))
                 .await
             {
-                warn!(%cleanup_error, namespace, convoy = %start.name, "failed to collect snapshots after prepared convoy admission error");
+                warn!(%cleanup_error, %namespace, convoy = %start.name, "failed to collect snapshots after prepared convoy admission error");
             }
             return Err(error);
         }
         if start.dispatch_regard == flotilla_protocol::ConvoyDispatchRegard::Emit {
             if let Err(error) = self.emit_implicit_convoy_regard(&namespace, &start.name, &convoy_spec.dispatching_principal_ref).await {
-                warn!(%error, namespace, convoy = %start.name, "failed to emit convoy dispatch regard");
+                warn!(%error, %namespace, convoy = %start.name, "failed to emit convoy dispatch regard");
             }
         }
         Ok(())
