@@ -41,7 +41,7 @@ use flotilla_resources::{
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     sleep_inhibitor,
@@ -79,6 +79,9 @@ impl Default for RuntimeOptions {
 
 pub struct DaemonRuntime {
     tasks: Vec<JoinHandle<()>>,
+    /// Set by `shutdown` so `Drop` can tell an intended stop from a runtime
+    /// that vanished while the daemon was meant to keep working.
+    stop_expected: bool,
 }
 
 impl DaemonRuntime {
@@ -143,20 +146,43 @@ impl DaemonRuntime {
             ));
         }
 
-        tasks.push(spawn_liveness_watchdog_task(tasks.len(), LIVENESS_WATCHDOG_INTERVAL));
+        // +1 for the watchdog's own handle, pushed below, so this count matches
+        // `self.tasks.len()` at drop time.
+        let supervisory_tasks = tasks.len() + 1;
+        tasks.push(spawn_liveness_watchdog_task(supervisory_tasks, LIVENESS_WATCHDOG_INTERVAL));
 
-        Ok(Self { tasks })
+        Ok(Self { tasks, stop_expected: false })
+    }
+}
+
+impl DaemonRuntime {
+    /// Stop the supervisory tasks deliberately. Every routine daemon exit —
+    /// SIGTERM, SIGINT, idle timeout, explicit shutdown — should call this, so
+    /// that `Drop`'s ERROR path stays reserved for a runtime that disappeared
+    /// while the daemon was still meant to be working.
+    pub fn shutdown(mut self) {
+        self.stop_expected = true;
+        info!(tasks = self.tasks.len(), "daemon runtime stopping; aborting supervisory tasks");
     }
 }
 
 impl Drop for DaemonRuntime {
     fn drop(&mut self) {
-        // Dropping this value silently aborts every supervisory task —
-        // heartbeat, replica refresh, aggregator, controllers. A daemon whose
-        // runtime is dropped while its accept loop keeps running looks alive
-        // (process up, socket accepting) but serves nothing, and until this log
-        // existed it left no trace whatsoever (flotilla#1111).
-        error!(tasks = self.tasks.len(), "daemon runtime dropped; aborting supervisory tasks — the daemon can no longer do background work");
+        // Dropping this value aborts every supervisory task — heartbeat, replica
+        // refresh, aggregator, controllers. A daemon whose runtime is dropped
+        // while its accept loop keeps running looks alive (process up, socket
+        // accepting) but serves nothing, and until this log existed it left no
+        // trace whatsoever (flotilla#1111). An expected stop goes through
+        // `shutdown` and logs at INFO there; reaching here without that flag is
+        // the case worth shouting about.
+        if self.stop_expected {
+            debug!(tasks = self.tasks.len(), "daemon runtime dropped after expected shutdown");
+        } else {
+            error!(
+                tasks = self.tasks.len(),
+                "daemon runtime dropped unexpectedly; aborting supervisory tasks — the daemon can no longer do background work"
+            );
+        }
         for task in &self.tasks {
             task.abort();
         }

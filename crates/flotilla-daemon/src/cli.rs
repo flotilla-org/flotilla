@@ -31,7 +31,12 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
     let repo_root_paths = repo_roots.into_iter().map(|p| p.into_path_buf()).collect();
     let server = DaemonServer::new(repo_root_paths, Arc::clone(&config), discovery, socket_path.to_path_buf(), timeout).await?;
     let daemon = server.daemon();
-    let _runtime = DaemonRuntime::start(daemon, Arc::clone(&config), Some(socket_path.to_path_buf())).await?;
+    let runtime = DaemonRuntime::start(daemon, Arc::clone(&config), Some(socket_path.to_path_buf())).await?;
 
-    server.run().await
+    let result = server.run().await;
+    // Every path out of `run` here is an intended stop (SIGTERM, SIGINT, idle
+    // timeout, explicit shutdown); say so, so the runtime's Drop ERROR keeps
+    // meaning "this went away when it should not have".
+    runtime.shutdown();
+    result
 }
