@@ -194,6 +194,16 @@ fn vessel_meta(name: &str, convoy_name: &str, task: &str) -> InputMeta {
 }
 
 fn vessel_object(convoy_name: &str, task: &str, phase: VesselPhase, message: Option<&str>) -> flotilla_resources::ResourceObject<Vessel> {
+    vessel_object_with_image_digest(convoy_name, task, phase, message, "sha256:first")
+}
+
+fn vessel_object_with_image_digest(
+    convoy_name: &str,
+    task: &str,
+    phase: VesselPhase,
+    message: Option<&str>,
+    image_digest: &str,
+) -> flotilla_resources::ResourceObject<Vessel> {
     let repository_key =
         flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository identity").key();
     flotilla_resources::ResourceObject {
@@ -210,6 +220,8 @@ fn vessel_object(convoy_name: &str, task: &str, phase: VesselPhase, message: Opt
             observed_policy_ref: Some("laptop-docker".to_string()),
             observed_policy_version: Some("19".to_string()),
             environment_ref: Some(format!("env-{task}")),
+            image_ref: Some("registry.example/crew:latest".to_string()),
+            image_digest: Some(image_digest.to_string()),
             checkout_refs: BTreeMap::from([(repository_key, format!("checkout-{task}"))]),
             terminal_session_refs: vec![format!("terminal-{task}-coder")],
             started_at: Some(timestamp(16)),
@@ -992,8 +1004,41 @@ async fn ready_task_with_ready_workspace_moves_to_launching() {
             if work == "implement"
                 && started_at == timestamp(20)
                 && placement.fields.get("environment_ref") == Some(&serde_json::Value::String("env-implement".to_string()))
+                && placement.fields.get("image_ref")
+                    == Some(&serde_json::Value::String("registry.example/crew:latest".to_string()))
+                && placement.fields.get("image_digest") == Some(&serde_json::Value::String("sha256:first".to_string()))
                 && placement.fields.get("checkout_refs") == Some(&expected_checkout_refs)
     ));
+}
+
+#[tokio::test]
+async fn same_image_tag_moving_between_convoys_produces_distinct_settlement_testimony() {
+    async fn testimony(convoy_name: &str, digest: &str) -> flotilla_resources::PlacementStatus {
+        let mut status = bootstrapped_tool_only_convoy_status();
+        status.work.get_mut("implement").expect("implement work").phase = WorkPhase::Ready;
+        status.work.get_mut("implement").expect("implement work").ready_at = Some(timestamp(12));
+        let convoy = convoy_object(convoy_name, task_provisioning_convoy_spec(), Some(status));
+        let outcome = reconcile_once_with_resources(
+            &convoy,
+            None,
+            vec![vessel_object_with_image_digest(convoy_name, "implement", VesselPhase::Ready, None, digest)],
+            Vec::new(),
+            timestamp(20),
+        )
+        .await;
+        match outcome.patch {
+            Some(ConvoyStatusPatch::WorkLaunching { placement, .. }) => placement,
+            other => panic!("expected placement testimony, got {other:?}"),
+        }
+    }
+
+    let first = testimony("convoy-first", "sha256:first").await;
+    let second = testimony("convoy-second", "sha256:second").await;
+
+    assert_eq!(first.fields.get("image_ref"), second.fields.get("image_ref"));
+    assert_eq!(first.fields.get("image_digest"), Some(&serde_json::json!("sha256:first")));
+    assert_eq!(second.fields.get("image_digest"), Some(&serde_json::json!("sha256:second")));
+    assert_ne!(first.fields.get("image_digest"), second.fields.get("image_digest"));
 }
 
 #[tokio::test]

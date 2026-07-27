@@ -33,7 +33,7 @@ async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
     environments
         .update_status("env-a", &env.metadata.resource_version, &{
             let mut status = EnvironmentStatus::default();
-            EnvironmentStatusPatch::MarkReady { docker_container_id: None }.apply(&mut status);
+            EnvironmentStatusPatch::MarkReady { docker_container_id: None, image_ref: None, image_digest: None }.apply(&mut status);
             status
         })
         .await
@@ -148,7 +148,7 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
         .await
         .expect("environment");
     let mut env_status = EnvironmentStatus::default();
-    EnvironmentStatusPatch::MarkReady { docker_container_id: None }.apply(&mut env_status);
+    EnvironmentStatusPatch::MarkReady { docker_container_id: None, image_ref: None, image_digest: None }.apply(&mut env_status);
     environments.update_status("env-a", &env.metadata.resource_version, &env_status).await.expect("ready environment");
     let input = InputMeta::builder()
         .name("term-a".to_string())

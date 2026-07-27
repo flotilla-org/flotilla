@@ -2304,6 +2304,8 @@ fn convoy_with_vessels(name: &str, vessel_names: &[&str]) -> crate::convoy_model
             started_at: None,
             finished_at: None,
             message: None,
+            image_ref: None,
+            image_digest: None,
         })
         .collect();
     convoy

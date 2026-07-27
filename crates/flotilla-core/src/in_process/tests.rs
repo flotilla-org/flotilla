@@ -4688,7 +4688,7 @@ async fn convoy_delete_refuses_diverged_checkout_without_a_change_request() {
         .on_run("git", &["rev-list", "--count", "origin/feature/diverged..HEAD"], Ok("0\n".into()))
         .on_run(
             "gh",
-            &["pr", "list", "--head", "feature/diverged", "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
+            &["pr", "list", "--head", "feature/diverged", "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
             Ok("[]".into()),
         )
         .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
@@ -4729,12 +4729,34 @@ async fn convoy_delete_allows_multi_repo_convoy_with_work_on_only_one_side() {
         .on_run("git", &["rev-list", "--count", "origin/feature/one-sided-work..HEAD"], Ok("0\n".into()))
         .on_run(
             "gh",
-            &["pr", "list", "--head", "feature/one-sided-work", "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
-            Ok(r#"[{"number":44,"state":"MERGED","mergedAt":"2026-07-27T12:00:00Z"}]"#.into()),
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/one-sided-work",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName",
+                "--limit",
+                "1",
+            ],
+            Ok(r#"[{"number":44,"state":"MERGED","mergedAt":"2026-07-27T12:00:00Z","baseRefName":"main"}]"#.into()),
         )
         .on_run(
             "gh",
-            &["pr", "list", "--head", "feature/one-sided-work", "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/one-sided-work",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName",
+                "--limit",
+                "1",
+            ],
             Ok("[]".into()),
         )
         .on_run("git", &["rev-list", "--count", "main..HEAD"], Ok("0\n".into()))
@@ -4760,6 +4782,8 @@ async fn convoy_delete_allows_multi_repo_convoy_with_work_on_only_one_side() {
             phase: flotilla_resources::EnvironmentPhase::Ready,
             ready: true,
             docker_container_id: None,
+            image_ref: None,
+            image_digest: None,
             message: None,
         })
         .await

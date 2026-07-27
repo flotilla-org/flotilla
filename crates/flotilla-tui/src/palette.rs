@@ -834,6 +834,8 @@ mod tests {
                     started_at: None,
                     finished_at: None,
                     message: None,
+                    image_ref: None,
+                    image_digest: None,
                 })
                 .collect(),
             started_at: None,

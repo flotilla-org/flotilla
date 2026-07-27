@@ -8,8 +8,15 @@ use flotilla_resources::{
 
 #[async_trait]
 pub trait DockerEnvironmentRuntime: Send + Sync {
-    async fn provision(&self, name: &str, spec: &DockerEnvironmentSpec) -> Result<String, String>;
+    async fn provision(&self, name: &str, spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String>;
     async fn destroy(&self, container_id: &str) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerProvisioning {
+    pub container_id: String,
+    pub image_ref: String,
+    pub image_digest: String,
 }
 
 pub struct EnvironmentReconciler<R> {
@@ -24,7 +31,7 @@ impl<R> EnvironmentReconciler<R> {
 
 pub enum EnvironmentDeps {
     None,
-    Ready { docker_container_id: Option<String> },
+    Ready(DockerProvisioning),
     Failed(String),
 }
 
@@ -40,7 +47,7 @@ where
             EnvironmentPhase::Pending => {
                 if let Some(spec) = &obj.spec.docker {
                     match self.docker.provision(&obj.metadata.name, spec).await {
-                        Ok(container_id) => Ok(EnvironmentDeps::Ready { docker_container_id: Some(container_id) }),
+                        Ok(provisioning) => Ok(EnvironmentDeps::Ready(provisioning)),
                         Err(err) => Ok(EnvironmentDeps::Failed(err)),
                     }
                 } else {
@@ -59,12 +66,14 @@ where
     ) -> ReconcileOutcome<Self::Resource> {
         let patch = match obj.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending) {
             EnvironmentPhase::Pending if obj.spec.host_direct.is_some() => {
-                Some(EnvironmentStatusPatch::MarkReady { docker_container_id: None })
+                Some(EnvironmentStatusPatch::MarkReady { docker_container_id: None, image_ref: None, image_digest: None })
             }
             EnvironmentPhase::Pending => match deps {
-                EnvironmentDeps::Ready { docker_container_id } => {
-                    Some(EnvironmentStatusPatch::MarkReady { docker_container_id: docker_container_id.clone() })
-                }
+                EnvironmentDeps::Ready(provisioning) => Some(EnvironmentStatusPatch::MarkReady {
+                    docker_container_id: Some(provisioning.container_id.clone()),
+                    image_ref: Some(provisioning.image_ref.clone()),
+                    image_digest: Some(provisioning.image_digest.clone()),
+                }),
                 EnvironmentDeps::Failed(message) => Some(EnvironmentStatusPatch::MarkFailed { message: message.clone() }),
                 EnvironmentDeps::None => None,
             },

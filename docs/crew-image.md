@@ -9,6 +9,47 @@ forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-07-26.1
 The explicit release tag is the deployment contract. Do not point placement
 policies at `latest`.
 
+This document is curation advice for the Flotilla project. It is not a schema
+or a contract that Flotilla validates. Flotilla's contract stays deliberately
+narrow: a placement names an image and declares the adapters it promises,
+admission checks those declarations, and provisioning records the named image
+reference together with the immutable digest actually run.
+
+## Why these layers pay here
+
+The boundary between image contents and startup installation is a caching
+decision, and it should follow the placement's host class.
+
+Fungible cloud runners commonly begin with a popular base image and install
+project tools at startup. A fresh runner can rely on the base being cached
+fleet-wide, but a project-specific layer is unlikely to survive for the next
+job, so the startup cost is a rational trade.
+
+Flotilla's hosts are persistent. Image layers are pulled once and remain in
+the host's Docker cache, while hull filesystem state such as dependency caches
+and build outputs also survives re-tasking. Persistent hosts therefore retain
+both halves of the cache. Putting stable toolchains and utilities in reusable
+layers pays on these hosts where it often does not on fungible runners.
+
+The placement already names the image, so it is also the right place for an
+operator to choose this boundary. A persistent Docker host can use a layered
+project image and do little at startup; a fungible cloud placement can use a
+generic image and install per job. This advice does not introduce a Flotilla
+image-content schema.
+
+## Keep image material project-side
+
+Image recipes, build automation, and registry entries belong to the project,
+never to an upstream repository merely because the project consumes its code.
+This keeps upstream policy from constraining what the project's convoys can
+run.
+
+- A fork-based project keeps image material in a project-owned repository.
+- A project that owns its code repository may use that same repository as its
+  operations home.
+- A multi-repository project records which member repositories an image serves
+  and uses distinct entries where their stacks require distinct images.
+
 ## Build and publish
 
 The Dockerfile is deliberately ordered from slowest-changing to

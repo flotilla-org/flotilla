@@ -2898,38 +2898,35 @@ async fn build_plan_with_environment_prepends_lifecycle_steps() {
     .await
     .expect("build_plan should succeed");
 
-    // Verify 6 steps (create now initializes the environment for later env-scoped steps)
-    assert_eq!(plan.steps.len(), 6);
+    // Verify 5 steps (create resolves the image and initializes the environment).
+    assert_eq!(plan.steps.len(), 5);
 
     // Verify step actions in order
     assert!(matches!(plan.steps[0].action, StepAction::ReadEnvironmentSpec));
-    assert!(matches!(plan.steps[1].action, StepAction::EnsureEnvironmentImage { .. }));
-    assert!(matches!(plan.steps[2].action, StepAction::CreateEnvironment { .. }));
-    assert!(matches!(plan.steps[3].action, StepAction::CreateCheckout { .. }));
-    assert!(matches!(plan.steps[4].action, StepAction::PrepareWorkspace { .. }));
-    assert!(matches!(plan.steps[5].action, StepAction::AttachWorkspace));
+    assert!(matches!(plan.steps[1].action, StepAction::CreateEnvironment { .. }));
+    assert!(matches!(plan.steps[2].action, StepAction::CreateCheckout { .. }));
+    assert!(matches!(plan.steps[3].action, StepAction::PrepareWorkspace { .. }));
+    assert!(matches!(plan.steps[4].action, StepAction::AttachWorkspace));
 
-    // Verify host assignments — steps 0-2: Host(feta)
+    // Verify host assignments — steps 0-1: Host(feta)
     assert_eq!(plan.steps[0].host.node_id(), &node_id("feta-node"));
     assert_eq!(plan.steps[1].host.node_id(), &node_id("feta-node"));
-    assert_eq!(plan.steps[2].host.node_id(), &node_id("feta-node"));
     assert!(matches!(&plan.steps[0].host, StepExecutionContext::Host(_)));
     assert!(matches!(&plan.steps[1].host, StepExecutionContext::Host(_)));
-    assert!(matches!(&plan.steps[2].host, StepExecutionContext::Host(_)));
 
-    // Steps 3-4: Environment(feta, env_id)
+    // Steps 2-3: Environment(feta, env_id)
+    assert!(matches!(&plan.steps[2].host, StepExecutionContext::Environment(h, _) if *h == node_id("feta-node")));
     assert!(matches!(&plan.steps[3].host, StepExecutionContext::Environment(h, _) if *h == node_id("feta-node")));
-    assert!(matches!(&plan.steps[4].host, StepExecutionContext::Environment(h, _) if *h == node_id("feta-node")));
 
-    // Step 5: Host(laptop) — attach on local
-    assert_eq!(plan.steps[5].host.node_id(), &local_node_id());
-    assert!(matches!(&plan.steps[5].host, StepExecutionContext::Host(_)));
+    // Step 4: Host(laptop) — attach on local
+    assert_eq!(plan.steps[4].host.node_id(), &local_node_id());
+    assert!(matches!(&plan.steps[4].host, StepExecutionContext::Host(_)));
 
     // Verify workspace label includes remote host suffix
-    if let StepAction::PrepareWorkspace { ref label, .. } = plan.steps[4].action {
+    if let StepAction::PrepareWorkspace { ref label, .. } = plan.steps[3].action {
         assert_eq!(label, "feature-x@feta");
     } else {
-        panic!("step 4 should be PrepareWorkspace");
+        panic!("step 3 should be PrepareWorkspace");
     }
 }
 
@@ -2962,22 +2959,22 @@ async fn build_plan_with_environment_local_host_omits_suffix() {
     .await
     .expect("build_plan should succeed");
 
-    assert_eq!(plan.steps.len(), 6);
+    assert_eq!(plan.steps.len(), 5);
 
     // When target_host == local_host, workspace label should be just the branch
-    if let StepAction::PrepareWorkspace { ref label, .. } = plan.steps[4].action {
+    if let StepAction::PrepareWorkspace { ref label, .. } = plan.steps[3].action {
         assert_eq!(label, "main");
     } else {
-        panic!("step 4 should be PrepareWorkspace");
+        panic!("step 3 should be PrepareWorkspace");
     }
 
     // Checkout step should use ExistingBranch intent
-    if let StepAction::CreateCheckout { ref branch, create_branch, intent, .. } = plan.steps[3].action {
+    if let StepAction::CreateCheckout { ref branch, create_branch, intent, .. } = plan.steps[2].action {
         assert_eq!(branch, "main");
         assert!(!create_branch);
         assert_eq!(intent, CheckoutIntent::ExistingBranch);
     } else {
-        panic!("step 3 should be CreateCheckout");
+        panic!("step 2 should be CreateCheckout");
     }
 }
 
@@ -3563,70 +3560,6 @@ async fn manager_with_provisioned_environment(
 }
 
 #[tokio::test]
-async fn executor_step_resolver_ensure_environment_image() {
-    let config_base = config_base();
-    let provider = Arc::new(MockEnvironmentProvider {
-        ensure_image_results: tokio::sync::Mutex::new(vec![Ok(ImageId::new("flotilla:test-abc123"))]),
-        create_results: tokio::sync::Mutex::new(vec![]),
-        seen_create_opts: tokio::sync::Mutex::new(vec![]),
-    });
-    let registry = registry_with_env_provider(provider.clone());
-    let resolver = ExecutorStepResolver {
-        repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        registry: Arc::new(registry),
-        providers_data: Arc::new(empty_data()),
-        runner: Arc::new(runner_ok()),
-        env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
-        config_base: config_base.clone(),
-        attachable_store: test_attachable_store(&config_base),
-        daemon_socket_path: None,
-        local_node_id: local_node_id(),
-        local_host: local_host(),
-        environment_manager: empty_environment_manager().await,
-    };
-
-    // Spec is now read from the prior ReadEnvironmentSpec step outcome
-    let spec = EnvironmentSpec { image: flotilla_protocol::ImageSource::Registry("test:latest".into()), token_env_vars: vec![] };
-    let prior = vec![StepOutcome::Produced(CommandValue::EnvironmentSpecRead { spec })];
-    let action = StepAction::EnsureEnvironmentImage { provider: "docker".into() };
-    let context = StepExecutionContext::Host(local_node_id());
-    let outcome = resolver.resolve("ensure image", &context, action, &prior).await;
-    match outcome {
-        Ok(StepOutcome::Produced(CommandValue::ImageEnsured { image })) => {
-            assert_eq!(image, ImageId::new("flotilla:test-abc123"));
-        }
-        other => panic!("expected ImageEnsured outcome, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn executor_step_resolver_ensure_environment_image_error_when_no_provider() {
-    let config_base = config_base();
-    let resolver = ExecutorStepResolver {
-        repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        registry: Arc::new(empty_registry()),
-        providers_data: Arc::new(empty_data()),
-        runner: Arc::new(runner_ok()),
-        env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
-        config_base: config_base.clone(),
-        attachable_store: test_attachable_store(&config_base),
-        daemon_socket_path: None,
-        local_node_id: local_node_id(),
-        local_host: local_host(),
-        environment_manager: empty_environment_manager().await,
-    };
-
-    // Spec is now read from the prior ReadEnvironmentSpec step outcome
-    let spec = EnvironmentSpec { image: flotilla_protocol::ImageSource::Registry("test:latest".into()), token_env_vars: vec![] };
-    let prior = vec![StepOutcome::Produced(CommandValue::EnvironmentSpecRead { spec })];
-    let action = StepAction::EnsureEnvironmentImage { provider: "docker".into() };
-    let context = StepExecutionContext::Host(local_node_id());
-    let outcome = resolver.resolve("ensure image", &context, action, &prior).await;
-    assert!(outcome.is_err(), "should fail when no environment provider available");
-    assert!(outcome.unwrap_err().contains("environment provider not available"));
-}
-
-#[tokio::test]
 async fn executor_step_resolver_create_environment() {
     let config_base = config_base();
     let env_id = EnvironmentId::new("env-test-1");
@@ -3639,7 +3572,7 @@ async fn executor_step_resolver_create_environment() {
     });
 
     let provider = Arc::new(MockEnvironmentProvider {
-        ensure_image_results: tokio::sync::Mutex::new(vec![]),
+        ensure_image_results: tokio::sync::Mutex::new(vec![Ok(image_id.clone())]),
         create_results: tokio::sync::Mutex::new(vec![Ok(mock_env)]),
         seen_create_opts: tokio::sync::Mutex::new(vec![]),
     });
@@ -3664,19 +3597,11 @@ async fn executor_step_resolver_create_environment() {
         image: flotilla_protocol::ImageSource::Registry("test:latest".into()),
         token_env_vars: vec!["GITHUB_TOKEN".into()],
     };
-    let prior = vec![
-        StepOutcome::Produced(CommandValue::EnvironmentSpecRead { spec }),
-        StepOutcome::Produced(CommandValue::ImageEnsured { image: image_id.clone() }),
-    ];
-    let action = StepAction::CreateEnvironment { env_id: env_id.clone(), provider: "docker".into(), image: None };
+    let prior = vec![StepOutcome::Produced(CommandValue::EnvironmentSpecRead { spec })];
+    let action = StepAction::CreateEnvironment { env_id: env_id.clone(), provider: "docker".into() };
     let context = StepExecutionContext::Host(local_node_id());
     let outcome = resolver.resolve("create env", &context, action, &prior).await;
-    match outcome {
-        Ok(StepOutcome::Produced(CommandValue::EnvironmentCreated { env_id: created_id })) => {
-            assert_eq!(created_id, env_id);
-        }
-        other => panic!("expected EnvironmentCreated outcome, got {other:?}"),
-    }
+    assert!(matches!(outcome, Ok(StepOutcome::Completed)));
 
     assert!(
         resolver.environment_manager.environment_runner(&env_id).is_some(),
@@ -3688,7 +3613,7 @@ async fn executor_step_resolver_create_environment() {
 }
 
 #[tokio::test]
-async fn executor_step_resolver_create_environment_errors_without_image_outcome() {
+async fn executor_step_resolver_create_environment_errors_without_spec_outcome() {
     let config_base = config_base();
     let env_id = EnvironmentId::new("env-test-missing-image");
     let resolver = ExecutorStepResolver {
@@ -3705,12 +3630,12 @@ async fn executor_step_resolver_create_environment_errors_without_image_outcome(
         environment_manager: empty_environment_manager().await,
     };
 
-    let action = StepAction::CreateEnvironment { env_id, provider: "docker".into(), image: None };
+    let action = StepAction::CreateEnvironment { env_id, provider: "docker".into() };
     let context = StepExecutionContext::Host(local_node_id());
     let outcome = resolver.resolve("create env", &context, action, &[]).await;
 
-    assert!(outcome.is_err(), "create environment should fail without an ensured image");
-    assert!(outcome.unwrap_err().contains("image not produced by prior EnsureEnvironmentImage step"));
+    assert!(outcome.is_err(), "create environment should fail without an environment spec");
+    assert!(outcome.unwrap_err().contains("spec not produced by prior ReadEnvironmentSpec step"));
 }
 
 #[tokio::test]

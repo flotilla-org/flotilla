@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
-    DockerEnvironmentRuntime, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout,
+    DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout,
     PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalRuntime,
     TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
 };
@@ -1040,7 +1040,7 @@ struct DockerControllerRuntime {
 
 #[async_trait]
 impl DockerEnvironmentRuntime for DockerControllerRuntime {
-    async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<String, String> {
+    async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
         let credential_refs = credential_refs_from_environment(spec)?;
         let daemon_socket_path = self
             .state
@@ -1083,6 +1083,19 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 return Err(error);
             }
         };
+        let image_ref = handle.image().as_str().to_string();
+        let image_digest = match handle.image_digest() {
+            Some(digest) => digest.to_string(),
+            None => {
+                return Err(discard_failed_environment(
+                    &handle,
+                    self.state.credential_store.as_deref(),
+                    name,
+                    format!("docker environment provider did not report an image digest for {name}"),
+                )
+                .await)
+            }
+        };
 
         let container_id = handle.container_name().map(ToString::to_string).unwrap_or_else(|| format!("flotilla-env-{}", env_id));
         if let Some(store) = &self.state.credential_store {
@@ -1110,7 +1123,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             return Err(discard_failed_environment(&handle, self.state.credential_store.as_deref(), name, error).await);
         }
         self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { env_id, handle });
-        Ok(container_id)
+        Ok(DockerProvisioning { container_id, image_ref, image_digest })
     }
 
     async fn destroy(&self, container_id: &str) -> Result<(), String> {
@@ -1840,6 +1853,10 @@ mod tests {
 
         fn image(&self) -> &ImageId {
             &self.image
+        }
+
+        fn image_digest(&self) -> Option<&str> {
+            Some("sha256:test-interior")
         }
 
         fn container_name(&self) -> Option<&str> {

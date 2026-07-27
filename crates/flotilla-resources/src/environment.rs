@@ -66,12 +66,16 @@ pub struct EnvironmentStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker_container_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentStatusPatch {
-    MarkReady { docker_container_id: Option<String> },
+    MarkReady { docker_container_id: Option<String>, image_ref: Option<String>, image_digest: Option<String> },
     MarkFailed { message: String },
     MarkTerminating,
 }
@@ -79,10 +83,12 @@ pub enum EnvironmentStatusPatch {
 impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
     fn apply(&self, status: &mut EnvironmentStatus) {
         match self {
-            Self::MarkReady { docker_container_id } => {
+            Self::MarkReady { docker_container_id, image_ref, image_digest } => {
                 status.phase = EnvironmentPhase::Ready;
                 status.ready = true;
                 status.docker_container_id = docker_container_id.clone();
+                status.image_ref = image_ref.clone();
+                status.image_digest = image_digest.clone();
                 status.message = None;
             }
             Self::MarkFailed { message } => {

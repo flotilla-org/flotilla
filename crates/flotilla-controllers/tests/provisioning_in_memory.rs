@@ -14,7 +14,7 @@ use common::{
 };
 use flotilla_controllers::reconcilers::{
     CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime,
-    EnvironmentReconciler, HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler,
+    DockerProvisioning, EnvironmentReconciler, HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler,
     ProviderPresentationRuntime, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
@@ -46,8 +46,12 @@ struct FakeDockerRuntime {
 
 #[async_trait]
 impl DockerEnvironmentRuntime for FakeDockerRuntime {
-    async fn provision(&self, name: &str, _spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<String, String> {
-        Ok(format!("container-{name}"))
+    async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+        Ok(DockerProvisioning {
+            container_id: format!("container-{name}"),
+            image_ref: spec.image.clone(),
+            image_digest: "sha256:test-image".to_string(),
+        })
     }
 
     async fn destroy(&self, container_id: &str) -> Result<(), String> {
@@ -440,6 +444,8 @@ async fn environment_controller_marks_docker_environment_ready() {
                     Some(status)
                         if status.phase == EnvironmentPhase::Ready
                             && status.docker_container_id.as_deref() == Some("container-docker-env")
+                            && status.image_ref.as_deref() == Some("ghcr.io/flotilla/dev:latest")
+                            && status.image_digest.as_deref() == Some("sha256:test-image")
                 )
             }
         })

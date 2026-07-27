@@ -128,8 +128,18 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         args.push("infinity");
 
         self.inner.runner.run("docker", &args, Path::new("/"), &ChannelLabel::Noop).await?;
+        let image_digest = match self.inner.image_digest(&container_name).await {
+            Ok(digest) => digest,
+            Err(error) => {
+                let cleanup = self.inner.destroy(&container_name).await;
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup_error) => format!("{error}; additionally failed to remove container {container_name}: {cleanup_error}"),
+                });
+            }
+        };
 
-        Ok(self.inner.provisioned_environment(id, image.clone(), container_name, opts.provisioned_mounts))
+        Ok(self.inner.provisioned_environment(id, image.clone(), Some(image_digest), container_name, opts.provisioned_mounts))
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
@@ -169,6 +179,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             handles.push(self.inner.provisioned_environment(
                 EnvironmentId::new(env_id),
                 ImageId::new(image),
+                None,
                 container_name,
                 provisioned_mounts,
             ));
@@ -210,11 +221,30 @@ impl DockerEnvironmentProviderInner {
         self: &Arc<Self>,
         id: EnvironmentId,
         image: ImageId,
+        image_digest: Option<String>,
         container_name: String,
         provisioned_mounts: Vec<ProvisionedMount>,
     ) -> EnvironmentHandle {
         let runner = Arc::new(DockerEnvironmentRunner::new(container_name.clone(), Arc::clone(&self.runner))) as Arc<dyn CommandRunner>;
-        Arc::new(DockerProvisionedEnvironment { id, container_name, image, inner: Arc::clone(self), runner, provisioned_mounts })
+        Arc::new(DockerProvisionedEnvironment {
+            id,
+            container_name,
+            image,
+            image_digest,
+            inner: Arc::clone(self),
+            runner,
+            provisioned_mounts,
+        })
+    }
+
+    async fn image_digest(&self, container_name: &str) -> Result<String, String> {
+        let output =
+            self.runner.run("docker", &["inspect", "--format", "{{.Image}}", container_name], Path::new("/"), &ChannelLabel::Noop).await?;
+        let digest = output.trim();
+        if !digest.starts_with("sha256:") || digest.len() == "sha256:".len() {
+            return Err(format!("docker returned invalid image digest for container {container_name}: {digest:?}"));
+        }
+        Ok(digest.to_string())
     }
 
     async fn status(&self, container_name: &str) -> Result<EnvironmentStatus, String> {
@@ -261,6 +291,7 @@ pub struct DockerProvisionedEnvironment {
     id: EnvironmentId,
     container_name: String,
     image: ImageId,
+    image_digest: Option<String>,
     inner: Arc<DockerEnvironmentProviderInner>,
     runner: Arc<dyn CommandRunner>,
     provisioned_mounts: Vec<ProvisionedMount>,
@@ -274,6 +305,10 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
 
     fn image(&self) -> &ImageId {
         &self.image
+    }
+
+    fn image_digest(&self) -> Option<&str> {
+        self.image_digest.as_deref()
     }
 
     fn container_name(&self) -> Option<&str> {

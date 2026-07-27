@@ -1008,8 +1008,10 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
         Some(flotilla_resources::VesselStatusPatch::MarkReady {
             requested_stance: Stance::Contained,
             effective_stance: Stance::Contained,
+            image_ref: Some(ref image_ref),
+            image_digest: Some(ref image_digest),
             ..
-        })
+        }) if image_ref == "ghcr.io/flotilla/dev:latest" && image_digest == "sha256:test-image"
     ));
 }
 

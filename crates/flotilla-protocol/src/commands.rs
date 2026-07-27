@@ -647,12 +647,6 @@ pub enum CommandValue {
     ResourceList(Box<ResourceJsonResponse>),
     ResourceObject(Box<ResourceJsonResponse>),
     ResourceWatchEvent(Box<ResourceWatchResponse>),
-    ImageEnsured {
-        image: crate::ImageId,
-    },
-    EnvironmentCreated {
-        env_id: crate::EnvironmentId,
-    },
     EnvironmentSpecRead {
         spec: crate::EnvironmentSpec,
     },
@@ -1302,8 +1296,6 @@ mod tests {
                     "object": { "apiVersion": "flotilla.work/v1", "kind": "Convoy", "metadata": { "name": "demo" }, "spec": {} }
                 }),
             })),
-            CommandValue::ImageEnsured { image: crate::ImageId::new("sha256:abc123") },
-            CommandValue::EnvironmentCreated { env_id: crate::EnvironmentId::new("env-1") },
             CommandValue::EnvironmentSpecRead {
                 spec: crate::EnvironmentSpec {
                     image: crate::ImageSource::Registry("ubuntu:24.04".into()),

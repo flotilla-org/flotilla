@@ -1260,6 +1260,8 @@ fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
         DetailField { label: "Phase", value: vessel_phase(row).text },
         DetailField { label: "Crew", value: vessel_crew(row).text },
         DetailField { label: "Host", value: row.vessel.host.as_ref().map(ToString::to_string).unwrap_or_default() },
+        DetailField { label: "Image ref", value: row.vessel.image_ref.clone().unwrap_or_default() },
+        DetailField { label: "Image digest", value: row.vessel.image_digest.clone().unwrap_or_default() },
         DetailField { label: "Message", value: row.vessel.message.clone().unwrap_or_default() },
     ]
 }
@@ -1349,6 +1351,8 @@ mod tests {
             started_at: None,
             finished_at: None,
             message: None,
+            image_ref: None,
+            image_digest: None,
         }
     }
 
@@ -1498,7 +1502,10 @@ mod tests {
 
     #[test]
     fn vessel_address_scopes_rows_without_changing_the_widget_contract() {
-        let in_project = convoy(vec![vessel("implement", &[], WorkPhase::Running), vessel("review", &["implement"], WorkPhase::Pending)]);
+        let mut implement = vessel("implement", &[], WorkPhase::Running);
+        implement.image_ref = Some("registry.example/crew:latest".to_string());
+        implement.image_digest = Some("sha256:test-image".to_string());
+        let in_project = convoy(vec![implement, vessel("review", &["implement"], WorkPhase::Pending)]);
         let mut elsewhere = convoy(vec![]);
         elsewhere.id = ConvoyId::new("dev", "elsewhere");
         elsewhere.name = "elsewhere".into();
@@ -1507,6 +1514,12 @@ mod tests {
         let vessel = project_convoys("vessel/dev/tables/review", &[&in_project, &elsewhere]).expect("vessel table");
         assert_eq!(vessel.rows.len(), 1);
         assert_eq!(vessel.rows[0].cells[1].text, "review");
+
+        let implement = project_convoys("vessel/dev/tables/implement", &[&in_project]).expect("implement vessel table");
+        assert!(implement.rows[0]
+            .describe
+            .contains(&DetailField { label: "Image ref", value: "registry.example/crew:latest".to_string() }));
+        assert!(implement.rows[0].describe.contains(&DetailField { label: "Image digest", value: "sha256:test-image".to_string() }));
     }
 
     #[test]

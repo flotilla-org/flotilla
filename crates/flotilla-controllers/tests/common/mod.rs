@@ -213,6 +213,8 @@ pub async fn create_ready_host_direct_environment(
             phase: EnvironmentPhase::Ready,
             ready: true,
             docker_container_id: None,
+            image_ref: None,
+            image_digest: None,
             message: None,
         })
         .await
@@ -227,6 +229,7 @@ pub async fn create_ready_docker_environment(
     docker: DockerEnvironmentSpec,
 ) -> flotilla_resources::ResourceObject<Environment> {
     let environments = backend.clone().using::<Environment>(namespace);
+    let image_ref = docker.image.clone();
     let created = environments
         .create(&meta(name), &EnvironmentSpec { host_direct: None, docker: Some(docker) })
         .await
@@ -236,6 +239,8 @@ pub async fn create_ready_docker_environment(
             phase: EnvironmentPhase::Ready,
             ready: true,
             docker_container_id: Some(format!("container-{name}")),
+            image_ref: Some(image_ref),
+            image_digest: Some("sha256:test-image".to_string()),
             message: None,
         })
         .await

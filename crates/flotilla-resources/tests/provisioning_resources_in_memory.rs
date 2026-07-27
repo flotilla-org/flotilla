@@ -77,6 +77,8 @@ async fn vessel_metadata_and_status_roundtrip() {
             observed_policy_ref: Some("docker-on-01HXYZ".to_string()),
             observed_policy_version: Some("12".to_string()),
             environment_ref: Some("env-a".to_string()),
+            image_ref: Some("registry.example/crew:latest".to_string()),
+            image_digest: Some("sha256:test-image".to_string()),
             checkout_refs: Default::default(),
             terminal_session_refs: vec!["term-a".to_string()],
             started_at: Some(Utc::now()),
