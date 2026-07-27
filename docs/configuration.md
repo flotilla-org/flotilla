@@ -49,6 +49,20 @@ To override the default for every convoy start that omits those flags, set
 auto_attach = false
 ```
 
+## Convoy placement admission
+
+Each host refuses new convoy placement when the volume containing its Flotilla
+state directory is below a free-space floor. The default is 20 GiB. Override it
+per host in that host's `~/.config/flotilla/daemon.toml`:
+
+```toml
+[admission]
+free_space_floor_gib = 50
+```
+
+Set the floor to `0` only when an external system provides an equivalent
+capacity guard.
+
 ## Dependencies
 
 Flotilla auto-detects available tools. Nothing is strictly required beyond git, but more tools unlock more features.

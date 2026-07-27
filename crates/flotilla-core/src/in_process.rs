@@ -3701,8 +3701,18 @@ impl InProcessDaemon {
         dispatching_principal_ref: &PrincipalRef,
     ) -> Result<String, String> {
         let admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
+        self.check_local_free_space_floor()?;
         self.create_convoy(namespace, &admission.name, &admission.spec, intent.auto_attach.into()).await?;
         Ok(admission.name)
+    }
+
+    fn check_local_free_space_floor(&self) -> Result<(), String> {
+        let config = self.config.load_daemon_config()?;
+        crate::admission::check_free_space_floor(
+            self.host_name.as_str(),
+            self.config.state_dir().as_path(),
+            config.admission.free_space_floor_gib,
+        )
     }
 
     async fn create_convoy(
@@ -3862,6 +3872,10 @@ impl InProcessDaemon {
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
+        // The target daemon is authoritative for its own capacity. Keep this
+        // ahead of snapshot persistence so a refusal cannot leave prepared
+        // workflow or placement resources behind.
+        self.check_local_free_space_floor()?;
         ensure_prepared_workflow_snapshot(&self.resource_backend, &namespace, &start.workflow_name, &workflow_spec).await?;
         if let Some((name, spec)) = placement_spec {
             ensure_prepared_placement_snapshot(&self.resource_backend, &namespace, name, &spec).await?;
