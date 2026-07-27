@@ -17,7 +17,7 @@ use flotilla_controllers::reconcilers::{
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
     aggregator_projection::AggregatorProjectionState,
-    checkout_integration::{checkout_branch_from_spec, checkout_path_from_status_and_spec, inspect_checkout_integration},
+    checkout_integration::{checkout_path_from_status_and_spec, inspect_checkout_integration},
     config::ConfigStore,
     in_process::InProcessDaemon,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
@@ -1221,10 +1221,6 @@ impl CheckoutControllerRuntime {
         checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
             .ok_or_else(|| format!("checkout {} has no resolved path", checkout.metadata.name))
     }
-
-    fn checkout_branch<'a>(&self, checkout: &'a ResourceObject<Checkout>) -> &'a str {
-        checkout_branch_from_spec(&checkout.spec)
-    }
 }
 
 #[async_trait]
@@ -1372,8 +1368,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
     }
 
     async fn inspect_integration(&self, checkout: &ResourceObject<Checkout>) -> Result<CheckoutIntegrationStatus, String> {
-        Ok(inspect_checkout_integration(&*self.local_runner()?, Path::new(self.checkout_path(checkout)?), self.checkout_branch(checkout))
-            .await)
+        Ok(inspect_checkout_integration(&*self.local_runner()?, Path::new(self.checkout_path(checkout)?), &checkout.spec).await)
     }
 
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {

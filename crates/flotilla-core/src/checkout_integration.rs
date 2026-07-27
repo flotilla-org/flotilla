@@ -30,11 +30,20 @@ impl fmt::Display for EmbeddedRepository {
     }
 }
 
-pub fn checkout_branch_from_spec(spec: &CheckoutSpec) -> &str {
+fn checkout_branch_from_spec(spec: &CheckoutSpec) -> &str {
     match spec {
         CheckoutSpec::Worktree(spec) => &spec.r#ref,
         CheckoutSpec::FreshClone(spec) => &spec.r#ref,
         CheckoutSpec::Observed(spec) => &spec.r#ref,
+    }
+}
+
+fn checkout_base_ref_from_spec(spec: &CheckoutSpec) -> Option<&str> {
+    match spec {
+        CheckoutSpec::Worktree(spec) => spec.base_ref.as_deref(),
+        CheckoutSpec::FreshClone(spec) => spec.base_ref.as_deref(),
+        CheckoutSpec::Observed(spec) if spec.is_main => Some(&spec.r#ref),
+        CheckoutSpec::Observed(_) => None,
     }
 }
 
@@ -45,11 +54,16 @@ pub fn checkout_path_from_status_and_spec<'a>(status: Option<&'a CheckoutStatus>
     })
 }
 
-pub async fn inspect_checkout_integration(runner: &dyn CommandRunner, checkout_path: &Path, branch: &str) -> CheckoutIntegrationStatus {
+pub async fn inspect_checkout_integration(
+    runner: &dyn CommandRunner,
+    checkout_path: &Path,
+    spec: &CheckoutSpec,
+) -> CheckoutIntegrationStatus {
     let observed_at = Utc::now().to_rfc3339();
     let clean = inspect_clean(runner, checkout_path, &observed_at).await;
     let pushed = inspect_pushed(runner, checkout_path, &observed_at).await;
-    let (landed, landed_evidence) = inspect_landed(runner, checkout_path, branch, &observed_at).await;
+    let (landed, landed_evidence) =
+        inspect_landed(runner, checkout_path, checkout_branch_from_spec(spec), checkout_base_ref_from_spec(spec), &observed_at).await;
     CheckoutIntegrationStatus { clean, pushed, landed, landed_evidence }
 }
 
@@ -217,6 +231,7 @@ async fn inspect_landed(
     runner: &dyn CommandRunner,
     checkout_path: &Path,
     branch: &str,
+    base_ref: Option<&str>,
     observed_at: &str,
 ) -> (IntegrationCondition, Option<LandedEvidence>) {
     match runner
@@ -258,14 +273,7 @@ async fn inspect_landed(
                         )
                     }
                 }
-                None => (
-                    IntegrationCondition::builder()
-                        .value(ConditionValue::True)
-                        .details(vec!["no change request exists for branch".to_string()])
-                        .observed_at(observed_at.to_string())
-                        .build(),
-                    None,
-                ),
+                None => (inspect_no_change_request(runner, checkout_path, base_ref, observed_at).await, None),
             },
             Ok(_) | Err(_) => (
                 IntegrationCondition::builder()
@@ -292,6 +300,64 @@ async fn inspect_landed(
                 .build(),
             None,
         ),
+    }
+}
+
+async fn inspect_no_change_request(
+    runner: &dyn CommandRunner,
+    checkout_path: &Path,
+    base_ref: Option<&str>,
+    observed_at: &str,
+) -> IntegrationCondition {
+    let base_ref = match base_ref {
+        Some(base_ref) => base_ref.to_string(),
+        None => match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Noop).await {
+            Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+            Ok(output) => {
+                return IntegrationCondition::builder()
+                    .value(ConditionValue::Unknown)
+                    .details(vec![non_empty_output_or("no change request exists and the base ref could not be determined", &output.stderr)])
+                    .observed_at(observed_at.to_string())
+                    .build();
+            }
+            Err(error) => {
+                return IntegrationCondition::builder()
+                    .value(ConditionValue::Unknown)
+                    .details(vec![format!("no change request exists and the base ref could not be determined: {error}")])
+                    .observed_at(observed_at.to_string())
+                    .build();
+            }
+        },
+    };
+    let range = format!("{base_ref}..HEAD");
+    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Noop).await {
+        Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
+            Ok(0) => IntegrationCondition::builder()
+                .value(ConditionValue::True)
+                .details(vec![format!("no change request exists; branch has no commits beyond {base_ref}")])
+                .observed_at(observed_at.to_string())
+                .build(),
+            Ok(count) => IntegrationCondition::builder()
+                .value(ConditionValue::False)
+                .details(vec![format!("no change request exists; {count} commit{} beyond {base_ref}", if count == 1 { "" } else { "s" })])
+                .observed_at(observed_at.to_string())
+                .build(),
+            Err(_) => IntegrationCondition::builder()
+                .value(ConditionValue::Unknown)
+                .details(vec![format!("could not parse commit count beyond {base_ref}: {}", output.stdout.trim())])
+                .observed_at(observed_at.to_string())
+                .build(),
+        },
+        Ok(output) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![non_empty_output_or(&format!("could not compare branch with base ref {base_ref}"), &output.stderr)])
+            .observed_at(observed_at.to_string())
+            .build(),
+        Err(error) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![format!("could not compare branch with base ref {base_ref}: {error}")])
+            .observed_at(observed_at.to_string())
+            .build(),
     }
 }
 
