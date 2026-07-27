@@ -34,6 +34,9 @@ contains_root() {
   local candidate=$1
   local root
 
+  if (( ${#sweep_roots[@]} == 0 )); then
+    return 1
+  fi
   for root in "${sweep_roots[@]}"; do
     [[ $root == "$candidate" ]] && return 0
   done
@@ -64,18 +67,30 @@ fi
   failed_roots=0
   echo "$started_at mtime-based cargo sweep started: retention_days=$retention_days roots=${#sweep_roots[@]}"
 
-  for root in "${sweep_roots[@]}"; do
-    before_kib=$(size_kib "$root")
-    if ! "$cargo_sweep" sweep --time "$retention_days" "$root"; then
-      failed_roots=$((failed_roots + 1))
-      echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root failed"
-    fi
-    after_kib=$(size_kib "$root")
-    reclaimed_kib=$((before_kib > after_kib ? before_kib - after_kib : 0))
-    reclaimed_bytes=$((reclaimed_kib * 1024))
-    total_reclaimed_bytes=$((total_reclaimed_bytes + reclaimed_bytes))
-    echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root reclaimed_bytes=$reclaimed_bytes"
-  done
+  if (( ${#sweep_roots[@]} > 0 )); then
+    for root in "${sweep_roots[@]}"; do
+      if ! before_kib=$(size_kib "$root"); then
+        failed_roots=$((failed_roots + 1))
+        echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root failed: could not measure before sweep"
+        continue
+      fi
+      root_failed=0
+      if ! "$cargo_sweep" sweep --time "$retention_days" "$root"; then
+        root_failed=1
+        echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root failed"
+      fi
+      if ! after_kib=$(size_kib "$root"); then
+        root_failed=1
+        echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root failed: could not measure after sweep"
+      else
+        reclaimed_kib=$((before_kib > after_kib ? before_kib - after_kib : 0))
+        reclaimed_bytes=$((reclaimed_kib * 1024))
+        total_reclaimed_bytes=$((total_reclaimed_bytes + reclaimed_bytes))
+        echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root reclaimed_bytes=$reclaimed_bytes"
+      fi
+      failed_roots=$((failed_roots + root_failed))
+    done
+  fi
 
   echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep completed: reclaimed_bytes=$total_reclaimed_bytes failed_roots=$failed_roots"
   (( failed_roots == 0 ))

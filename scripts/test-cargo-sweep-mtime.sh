@@ -8,6 +8,8 @@ test_root=$(mktemp -d "${TMPDIR:-/tmp}/flotilla-mtime-sweep-test.XXXXXX")
 test_home=$test_root/home
 stub_log=$test_root/invocations.log
 sweep_log=$test_root/sweep.log
+empty_home=$test_root/empty-home
+empty_log=$test_root/empty-sweep.log
 
 cleanup() {
   rm -rf -- "$test_root"
@@ -37,5 +39,16 @@ grep -Fxq "sweep --time 3 $test_home/dev/flotilla-repos/convoy" "$stub_log"
 [[ $(wc -l < "$stub_log") == 2 ]]
 ! grep -Fq "$test_home/dev/no-target" "$stub_log"
 grep -Fq "mtime-based cargo sweep completed: reclaimed_bytes=2097152 failed_roots=0" "$sweep_log"
+
+mkdir -p "$empty_home/.cargo/bin"
+cp "$test_home/.cargo/bin/cargo-sweep" "$empty_home/.cargo/bin/"
+HOME="$empty_home" \
+  FLOTILLA_SWEEP_LOG="$empty_log" \
+  FLOTILLA_SWEEP_TEST_INVOCATIONS="$stub_log" \
+  "$repo_root/scripts/cargo-sweep-mtime.sh"
+
+[[ $(wc -l < "$stub_log") == 2 ]]
+grep -Fq "mtime-based cargo sweep started: retention_days=3 roots=0" "$empty_log"
+grep -Fq "mtime-based cargo sweep completed: reclaimed_bytes=0 failed_roots=0" "$empty_log"
 
 echo "mtime-based cargo sweep behavior tests passed"
