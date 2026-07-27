@@ -498,7 +498,7 @@ impl AttachTarget {
                 let command = if row.host == daemon.host_name {
                     daemon.local_checkout_terminal_command(row).await?
                 } else {
-                    daemon.recursive_attach_command_for_remote(&row.host, reference, true).await?
+                    daemon.recursive_attach_command_for_remote(&row.host, reference, true, AttachSeatRequest::Control).await?
                 };
                 Ok(ResolvedAttach { command, binding: None })
             }
