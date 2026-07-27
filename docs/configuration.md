@@ -72,6 +72,33 @@ measurement from silently disabling admission.
 Set the floor to `0` only when an external system provides an equivalent
 capacity guard.
 
+## Daemon logging
+
+Each daemon writes structured JSON-lines to
+`~/.local/state/flotilla/log/flotillad.jsonl`. The file rotates by size and
+remains host-local. Configure the filter and rotation bounds in that host's
+`~/.config/flotilla/daemon.toml`:
+
+```toml
+[logging]
+filter = "info,flotilla_daemon::peer=debug"
+max_bytes = 10485760
+generations = 4
+```
+
+The filter uses `RUST_LOG` directive syntax. When it is omitted, the daemon
+uses `RUST_LOG` and then its built-in defaults. Restart the daemon after
+changing logging settings; the writer and its rotation bounds are configured
+at startup.
+
+Read local or peer logs on demand without SSH:
+
+```bash
+flotilla logs --host feta --since 2h --level warn --target flotilla_daemon::peer
+```
+
+Output remains JSONL so it can be piped directly to `jq`.
+
 ## Dependencies
 
 Flotilla auto-detects available tools. Nothing is strictly required beyond git, but more tools unlock more features.

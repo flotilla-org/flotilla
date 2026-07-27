@@ -72,6 +72,20 @@ pub struct ResourceWatchCursor {
     pub generation: Option<String>,
 }
 
+/// Filters for reading a daemon's host-local structured log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct DaemonLogQuery {
+    /// Only include events this many seconds old or newer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_seconds: Option<u64>,
+    /// Minimum tracing level (`trace`, `debug`, `info`, `warn`, or `error`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// Exact tracing target or one of its child module paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
 /// Structured resolved attach command for a workspace pane.
 /// Produced on the target host, consumed on the presentation host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,6 +443,9 @@ pub enum CommandAction {
         context: CrewCommandContext,
     },
     QueryFleetReplicaSnapshot {},
+    QueryDaemonLogs {
+        query: DaemonLogQuery,
+    },
     QueryResourceList {
         namespace: String,
         kind: String,
@@ -471,6 +488,7 @@ impl CommandAction {
                 | CommandAction::QueryFleetList {}
                 | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryFleetReplicaSnapshot {}
+                | CommandAction::QueryDaemonLogs { .. }
                 | CommandAction::QueryResourceList { .. }
                 | CommandAction::QueryResourceGet { .. }
                 | CommandAction::Attach { .. }
@@ -534,6 +552,7 @@ impl Command {
             CommandAction::QueryFleetList {} => "query fleet list",
             CommandAction::QueryCrewList { .. } => "query crew list",
             CommandAction::QueryFleetReplicaSnapshot {} => "query fleet replica snapshot",
+            CommandAction::QueryDaemonLogs { .. } => "query daemon logs",
             CommandAction::QueryResourceList { .. } => "query resource list",
             CommandAction::QueryResourceGet { .. } => "query resource get",
             CommandAction::ResourceApply { .. } => "apply resource",
@@ -644,6 +663,10 @@ pub enum CommandValue {
     FleetList(Box<FleetListResponse>),
     CrewList(Box<CrewListResponse>),
     FleetReplicaSnapshot(Box<FleetReplicaSnapshot>),
+    DaemonLogs {
+        /// Complete JSON-lines records, oldest first.
+        lines: Vec<String>,
+    },
     ResourceList(Box<ResourceJsonResponse>),
     ResourceObject(Box<ResourceJsonResponse>),
     ResourceWatchEvent(Box<ResourceWatchResponse>),
@@ -993,6 +1016,18 @@ mod tests {
                 },
             },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetReplicaSnapshot {} },
+            Command {
+                node_id: Some(NodeId::new("feta")),
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryDaemonLogs {
+                    query: DaemonLogQuery {
+                        since_seconds: Some(7200),
+                        level: Some("warn".into()),
+                        target: Some("flotilla_daemon::peer".into()),
+                    },
+                },
+            },
             Command {
                 node_id: Some(NodeId::new("feta")),
                 provisioning_target: None,

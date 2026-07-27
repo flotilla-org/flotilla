@@ -46,7 +46,7 @@ ssh -f <USER>@<HOST> '
 ssh <USER>@<HOST> 'pgrep -af "flotilla daemon" | grep -v grep'
 
 # logs (daemon writes to $XDG_STATE_HOME/flotilla/ i.e. ~/.local/state/flotilla/)
-ssh <USER>@<HOST> 'tail -50 ~/.local/state/flotilla/daemon.log'
+ssh <USER>@<HOST> 'tail -50 ~/.local/state/flotilla/log/flotillad.jsonl'
 ```
 
 If the daemon is managed some other way, restart it using that mechanism

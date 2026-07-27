@@ -267,6 +267,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::FleetList(_)
         | CommandValue::CrewList(_)
         | CommandValue::FleetReplicaSnapshot(_)
+        | CommandValue::DaemonLogs { .. }
         | CommandValue::ResourceList(_)
         | CommandValue::ResourceObject(_)
         | CommandValue::ResourceWatchEvent(_) => {

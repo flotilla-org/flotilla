@@ -7545,6 +7545,18 @@ impl DaemonHandle for InProcessDaemon {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::FleetReplicaSnapshot(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
+            CommandAction::QueryDaemonLogs { query } => {
+                let generations = self.config.load_daemon_config()?.logging.generations;
+                let state_dir = self.config.state_dir().as_path().to_path_buf();
+                let query = query.clone();
+                let read_result = tokio::task::spawn_blocking(move || crate::log_file::read_daemon_logs(&state_dir, generations, &query))
+                    .await
+                    .map_err(|error| format!("daemon log reader task failed: {error}"))?;
+                match read_result {
+                    Ok(lines) => Ok(flotilla_protocol::CommandValue::DaemonLogs { lines }),
+                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                }
+            }
             CommandAction::QueryResourceList { namespace, kind, include_replicas } => match if *include_replicas {
                 list_resource_kind_including_replicas(&self.resource_backend, namespace, kind).await
             } else {

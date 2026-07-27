@@ -652,6 +652,22 @@ fn load_daemon_config_invalid_file_returns_error() {
 }
 
 #[test]
+fn load_daemon_logging_config_with_target_directives_and_rotation_bounds() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("daemon.toml"),
+        "[logging]\nfilter = \"info,flotilla_daemon::peer=debug\"\nmax_bytes = 4096\ngenerations = 7\n",
+    )
+    .unwrap();
+
+    let config = ConfigStore::with_base(dir.path()).load_daemon_config().expect("daemon config");
+
+    assert_eq!(config.logging.filter.as_deref(), Some("info,flotilla_daemon::peer=debug"));
+    assert_eq!(config.logging.max_bytes, 4096);
+    assert_eq!(config.logging.generations, 7);
+}
+
+#[test]
 fn load_hosts_with_ssh_config() {
     let dir = tempdir().unwrap();
     let base = dir.path();

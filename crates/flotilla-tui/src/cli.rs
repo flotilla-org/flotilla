@@ -467,6 +467,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::FleetList(fleet) => format_fleet_list_human(fleet),
         CommandValue::CrewList(crew) => format_crew_list_human(crew),
         CommandValue::FleetReplicaSnapshot(_) => "fleet replica snapshot".to_string(),
+        CommandValue::DaemonLogs { lines } => lines.join("\n"),
         CommandValue::ResourceList(response) | CommandValue::ResourceObject(response) => {
             flotilla_protocol::output::json_pretty(&response.value)
         }
