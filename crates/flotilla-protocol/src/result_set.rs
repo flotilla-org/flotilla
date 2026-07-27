@@ -535,6 +535,8 @@ pub struct AwarenessLink {
     pub target: String,
 }
 
+pub const AWARENESS_REL_FOR_CONVOY: &str = "for-convoy";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct AwarenessEntry {
     pub id: String,
@@ -636,6 +638,10 @@ pub struct CheckoutRow {
     pub branch: String,
     pub host: HostName,
     pub authority: LifecycleAuthority,
+    /// Convoy this checkout serves, when it is part of convoy work rather
+    /// than a standing checkout available for independent use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_convoy: Option<String>,
 }
 
 /// Lifecycle phase of an independent terminal session.
@@ -893,7 +899,7 @@ mod tests {
     use crate::{provider_data::Issue, HostName, IssueRef, IssueSource, IssueState, LifecycleAuthority, RepositoryKey, ResourceRef};
 
     #[test]
-    fn fleet_checkout_result_set_round_trip_preserves_host_and_authority() {
+    fn fleet_checkout_result_set_round_trip_preserves_host_authority_and_convoy_relationship() {
         let set = ResultSet {
             seq: 7,
             rows: Rows::Checkouts {
@@ -906,6 +912,7 @@ mod tests {
                     .branch("feature/query")
                     .host(HostName::new("kiwi"))
                     .authority(LifecycleAuthority::Adopted)
+                    .for_convoy("ship-it")
                     .build()],
             },
             state: ResultSetState::default(),
