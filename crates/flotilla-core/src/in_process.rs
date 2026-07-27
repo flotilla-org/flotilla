@@ -3397,6 +3397,13 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
     })
 }
 
+fn is_whole_repository_project(spec: &ProjectSpec, repository_key: &RepositoryKey) -> bool {
+    matches!(
+        spec.repositories.as_slice(),
+        [entry] if &entry.repo == repository_key && entry.subpath.is_none()
+    )
+}
+
 fn whole_repository_project_names(repository_spec: &RepositorySpec) -> Result<Vec<String>, String> {
     let repository_key = repository_spec.key();
     let display_name = normalize_project_name(&repository_spec.leaf_slug())?;
@@ -4417,11 +4424,7 @@ impl InProcessDaemon {
         let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
         match projects.get(&project_name).await {
             Ok(existing) => {
-                let same_whole_repository = matches!(
-                    existing.spec.repositories.as_slice(),
-                    [entry] if entry.repo == key && entry.subpath.is_none()
-                );
-                if !same_whole_repository {
+                if !is_whole_repository_project(&existing.spec, &key) {
                     return Err(format!("project {project_name} already exists with a different repository definition"));
                 }
                 if explicit_display_name.is_some_and(|display_name| display_name != existing.spec.display_name) {
@@ -4540,12 +4543,7 @@ impl InProcessDaemon {
         let spec = whole_repository_project_spec(repository_key.clone(), display_name)?;
         let primary_name = project_objects
             .iter()
-            .filter(|project| {
-                matches!(
-                    project.spec.repositories.as_slice(),
-                    [entry] if entry.repo == repository_key && entry.subpath.is_none()
-                )
-            })
+            .filter(|project| is_whole_repository_project(&project.spec, &repository_key))
             .min_by_key(|project| {
                 (
                     !migrated_project_names.contains(&project.metadata.name),
@@ -4611,7 +4609,7 @@ impl InProcessDaemon {
                 Ok(_) => return Ok(identity_change),
                 Err(ResourceError::Conflict { .. }) => {
                     let existing = projects.get(&project_name).await.map_err(|error| error.to_string())?;
-                    if existing.spec.repositories.iter().any(|entry| entry.repo == repository_key && entry.subpath.is_none()) {
+                    if is_whole_repository_project(&existing.spec, &repository_key) {
                         return Ok(identity_change);
                     }
                 }
