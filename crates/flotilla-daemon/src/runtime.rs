@@ -23,7 +23,7 @@ use flotilla_core::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{EnvironmentAssertion, EnvironmentBag},
-        environment::{CreateOpts, EnvironmentHandle, ProvisionedMount},
+        environment::{CreateOpts, EnvironmentHandle},
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool},
         vcs::{CloneProvisioner, GitCloneProvisioner},
@@ -920,11 +920,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 tokens: Vec::new(),
                 daemon_socket_path,
                 working_directory: None,
-                provisioned_mounts: spec
-                    .mounts
-                    .iter()
-                    .map(|mount| ProvisionedMount::new(mount.source_path.clone(), mount.target_path.clone()))
-                    .collect(),
+                provisioned_mounts: spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount).collect(),
             })
             .await?;
 
