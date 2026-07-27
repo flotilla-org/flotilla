@@ -38,8 +38,8 @@ pub use clone::{Clone, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use convoy::{
     controller_patches, external_patches, pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending, provisioning_patches,
     reconcile, Convoy, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
-    ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InputValue, IssueSnapshot, PlacementStatus, ReconcileOutcome, WorkCompletionAuthority,
-    WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_PENDING_ANNOTATION,
+    ConvoyStatusPatch, ConvoyTeardownRuntime, CrewWorkPhase, CrewWorkState, InputValue, IssueSnapshot, PlacementStatus, ReconcileOutcome,
+    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_PENDING_ANNOTATION,
     WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use definition::DefinitionResolver;

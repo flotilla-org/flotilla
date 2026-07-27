@@ -332,10 +332,13 @@ async fn hostless_convoy_abandon_routes_to_remote_home() {
         .expect("dispatch hostless convoy abandon");
 
     assert_eq!(await_command_result(&mut rx, command_id).await, CommandValue::Ok);
-    assert!(
-        matches!(follower_convoys.get(convoy_name).await, Err(ResourceError::NotFound { .. })),
-        "remote-homed convoy should be abandoned and deleted from follower store"
-    );
+    let status = follower_convoys
+        .get(convoy_name)
+        .await
+        .expect("remote-homed convoy should be retained")
+        .status
+        .expect("remote-homed convoy status");
+    assert_eq!(status.phase, ResourceConvoyPhase::Abandoned);
 }
 
 #[tokio::test]

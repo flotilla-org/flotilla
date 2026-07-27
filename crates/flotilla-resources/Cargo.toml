@@ -14,6 +14,7 @@ flotilla-protocol = { path = "../flotilla-protocol" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+async-trait = { workspace = true }
 bon = { workspace = true }
 futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

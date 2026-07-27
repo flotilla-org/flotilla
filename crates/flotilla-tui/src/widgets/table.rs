@@ -601,7 +601,7 @@ mod tests {
             ),
             convoy(
                 "docs",
-                ConvoyPhase::Completed,
+                ConvoyPhase::Landed,
                 false,
                 vec![vessel("write", WorkPhase::Complete), vessel("review", WorkPhase::Complete)],
                 None,

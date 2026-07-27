@@ -198,7 +198,7 @@ fn active_convoy_status() -> ConvoyStatus {
 
 fn settled_convoy_status() -> ConvoyStatus {
     let mut status = active_convoy_status();
-    status.phase = ConvoyPhase::Completed;
+    status.phase = ConvoyPhase::Landed;
     status.finished_at = Some(ts(20));
     status.work.insert("implement".to_string(), work_state(WorkPhase::Complete, Some(ts(10)), Some(ts(20))));
     status.crew_work.insert(
@@ -374,7 +374,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             exercise: || {
                 let mut status = settled_convoy_status();
                 let before = convoy_timestamps(&status);
-                let patch = ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Completed, started_at: None, finished_at: Some(ts(30)) };
+                let patch = ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Landed, started_at: None, finished_at: Some(ts(30)) };
                 apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
             },
@@ -778,7 +778,7 @@ fn settling_again_after_a_continuation_records_the_new_outcome_time() {
                 let mut status = settled_convoy_status();
                 status.phase = ConvoyPhase::Failed;
                 let before = convoy_timestamps(&status);
-                let patch = ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Completed, started_at: None, finished_at: Some(ts(30)) };
+                let patch = ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Landed, started_at: None, finished_at: Some(ts(30)) };
                 apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
             },

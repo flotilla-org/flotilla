@@ -139,6 +139,37 @@ fn crew_completion_updates_only_the_calling_agent() {
     assert_eq!(status.crew_work["implement"]["coder"].message.as_deref(), Some("still ready"));
     assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Working);
     assert_eq!(status.work["implement"].phase, WorkPhase::Running);
+    assert_eq!(status.phase, ConvoyPhase::Active);
+}
+
+#[test]
+fn final_crew_completion_claim_enters_landing_idempotently() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(sample_snapshot()),
+        work: BTreeMap::from([("implement".to_string(), WorkState {
+            phase: WorkPhase::Running,
+            completion_authority: WorkCompletionAuthority::CrewRollup,
+            ready_at: Some(ts(8)),
+            started_at: Some(ts(9)),
+            finished_at: None,
+            message: None,
+            placement: None,
+        })]),
+        crew_work: BTreeMap::from([("implement".to_string(), BTreeMap::from([("coder".to_string(), crew_work(CrewWorkPhase::Working))]))]),
+        message: None,
+        started_at: Some(ts(1)),
+        finished_at: None,
+        observed_workflow_ref: Some("review-and-fix".to_string()),
+        observed_workflows: Some(BTreeMap::new()),
+    };
+
+    let patch = external_patches::mark_crew_completed("implement".to_string(), "coder".to_string(), ts(20), Some("ready".to_string()));
+    patch.apply(&mut status);
+    patch.apply(&mut status);
+
+    assert_eq!(status.phase, ConvoyPhase::Landing);
+    assert_eq!(status.finished_at, None);
 }
 
 #[test]
@@ -172,7 +203,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
     let mut coder = crew_work(CrewWorkPhase::Done);
     coder.finished_at = Some(ts(15));
     let mut status = ConvoyStatus {
-        phase: ConvoyPhase::Completed,
+        phase: ConvoyPhase::Landed,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
             phase: WorkPhase::Complete,
@@ -217,7 +248,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
     coder.finished_at = Some(ts(15));
     coder.message = Some("ready".to_string());
     let mut status = ConvoyStatus {
-        phase: ConvoyPhase::Completed,
+        phase: ConvoyPhase::Landed,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
             phase: WorkPhase::Complete,
@@ -450,17 +481,17 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
         observed_workflows: Some(BTreeMap::from([("review-and-fix".to_string(), "42".to_string())])),
     };
 
-    let patch = controller_patches::roll_up_phase(ConvoyPhase::Completed, None, Some(ts(40)));
+    let patch = controller_patches::roll_up_phase(ConvoyPhase::Landed, None, Some(ts(40)));
     patch.apply(&mut status);
 
-    assert_eq!(status.phase, ConvoyPhase::Completed);
+    assert_eq!(status.phase, ConvoyPhase::Landed);
     assert_eq!(status.finished_at, Some(ts(40)));
     assert_eq!(status.message.as_deref(), Some("keep"));
     assert_eq!(status.work["review"], review);
 }
 
 #[test]
-fn external_completion_marks_work_complete_without_touching_convoy_phase() {
+fn forced_work_completion_claim_enters_landing() {
     let mut status = ConvoyStatus {
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
@@ -485,7 +516,7 @@ fn external_completion_marks_work_complete_without_touching_convoy_phase() {
         ConvoyStatusPatch::ForceWorkCompleted { work: "review".to_string(), finished_at: ts(50), message: Some("done".to_string()) };
     patch.apply(&mut status);
 
-    assert_eq!(status.phase, ConvoyPhase::Active);
+    assert_eq!(status.phase, ConvoyPhase::Landing);
     assert_eq!(status.work["review"].phase, WorkPhase::Complete);
     assert_eq!(status.work["review"].completion_authority, WorkCompletionAuthority::HumanOverride);
     assert_eq!(status.work["review"].finished_at, Some(ts(50)));
@@ -572,7 +603,7 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
     ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Active, started_at: Some(ts(41)), finished_at: None }.apply(&mut status);
     assert_eq!(status.started_at, Some(ts(40)));
 
-    ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Completed, started_at: None, finished_at: Some(ts(50)) }.apply(&mut status);
-    ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Completed, started_at: None, finished_at: Some(ts(51)) }.apply(&mut status);
+    ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Landed, started_at: None, finished_at: Some(ts(50)) }.apply(&mut status);
+    ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Landed, started_at: None, finished_at: Some(ts(51)) }.apply(&mut status);
     assert_eq!(status.finished_at, Some(ts(50)));
 }

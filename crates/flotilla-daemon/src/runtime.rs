@@ -33,11 +33,11 @@ use flotilla_core::{
 use flotilla_protocol::{EnvironmentId, HostSummary, ImageId, TerminalStatus};
 use flotilla_resources::{
     clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone,
-    CloneSpec, Convoy, ConvoyReconciler, CrewSource, CrewSpec, Demand, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec,
-    Environment, EnvironmentSpec, ForgeIdentity, Host, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation,
-    Project, Regard, Repository, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement,
-    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    CloneSpec, Convoy, ConvoyReconciler, ConvoyTeardownRuntime, CrewSource, CrewSpec, Demand, DockerCheckoutStrategy,
+    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host, HostDirectEnvironmentSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy,
+    PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend, ResourceError, ResourceObject, Stance,
+    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -55,6 +55,17 @@ use crate::{
 const LIVENESS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
+
+struct DaemonConvoyTeardownRuntime {
+    daemon: Arc<InProcessDaemon>,
+}
+
+#[async_trait]
+impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
+    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
+        self.daemon.verify_convoy_teardown_gate(&convoy.metadata.namespace, &convoy.metadata.name, false).await
+    }
+}
 
 #[derive(Debug, Clone, bon::Builder)]
 pub struct RuntimeOptions {
@@ -874,11 +885,13 @@ fn spawn_controller_loops(
         tokio::spawn({
             let backend = backend.clone();
             let namespace_string = namespace_string.clone();
+            let daemon = Arc::clone(&state.daemon);
             let supervision = supervision.clone();
             async move {
                 supervise("convoy", supervision, move || {
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
+                    let daemon = Arc::clone(&daemon);
                     async move {
                         ControllerLoop {
                             primary: backend.clone().using::<Convoy>(&namespace_string),
@@ -887,6 +900,7 @@ fn spawn_controller_loops(
                                 .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                                 .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
                                 .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
+                                .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime { daemon }))
                                 .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
                                     backend.clone(),
                                     &namespace_string,
@@ -2531,6 +2545,29 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
+        let teardown_checkout_path = if matches!(completion_action, CompletionAction::Delete) {
+            let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
+            let checkout = checkouts
+                .list()
+                .await
+                .expect("checkout list should succeed")
+                .items
+                .into_iter()
+                .find(|checkout| checkout.metadata.labels.get(flotilla_resources::CONVOY_LABEL).is_some_and(|value| value == "convoy-a"))
+                .expect("convoy checkout should exist");
+            let checkout_path = checkout.status.expect("checkout should be ready").path.expect("checkout should have a path");
+            for args in [
+                ["update-ref", "refs/remotes/origin/main", "HEAD"].as_slice(),
+                ["branch", "--set-upstream-to", "origin/main", "main"].as_slice(),
+            ] {
+                let status = ProcessCommand::new("git").arg("-C").arg(&checkout_path).args(args).status().expect("prepare pushed state");
+                assert!(status.success());
+            }
+            Some(checkout_path)
+        } else {
+            None
+        };
+
         daemon
             .execute(Command {
                 node_id: None,
@@ -2551,49 +2588,27 @@ mod tests {
                 matches!(
                     convoys.get("convoy-a").await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
-                        if status.phase == ConvoyPhase::Completed
+                        if status.phase == ConvoyPhase::Landed
                             && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
                 )
             }
         })
         .await;
 
-        if matches!(completion_action, CompletionAction::Delete) {
-            let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
-            let checkout = checkouts
-                .list()
-                .await
-                .expect("checkout list should succeed")
-                .items
-                .into_iter()
-                .find(|checkout| checkout.metadata.labels.get(flotilla_resources::CONVOY_LABEL).is_some_and(|value| value == "convoy-a"))
-                .expect("convoy checkout should exist");
-            let checkout_path = checkout.status.expect("checkout should be ready").path.expect("checkout should have a path");
-            for args in [
-                ["update-ref", "refs/remotes/origin/main", "HEAD"].as_slice(),
-                ["branch", "--set-upstream-to", "origin/main", "main"].as_slice(),
-            ] {
-                let status = ProcessCommand::new("git").arg("-C").arg(&checkout_path).args(args).status().expect("prepare pushed state");
-                assert!(status.success());
-            }
-
-            let mut events = daemon.subscribe();
-            let command_id = daemon
-                .execute(Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::ConvoyDelete { namespace: None, name: "convoy-a".to_string(), force: false },
-                })
-                .await
-                .expect("convoy delete should start");
-            assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
-
+        if let Some(checkout_path) = teardown_checkout_path {
             wait_until(|| {
                 let convoys = convoys.clone();
+                let workspaces = workspaces.clone();
                 let checkout_path = checkout_path.clone();
                 async move {
-                    matches!(convoys.get("convoy-a").await, Err(ResourceError::NotFound { .. })) && !Path::new(&checkout_path).exists()
+                    convoys
+                        .get("convoy-a")
+                        .await
+                        .ok()
+                        .and_then(|convoy| convoy.status)
+                        .is_some_and(|status| status.phase == ConvoyPhase::Landed)
+                        && workspaces.list().await.is_ok_and(|list| list.items.is_empty())
+                        && !Path::new(&checkout_path).exists()
                 }
             })
             .await;
@@ -3340,33 +3355,6 @@ mod tests {
         drop(delivered);
 
         let mut rx = daemon.subscribe();
-        let reviewer_complete_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
-                    message: Some("initial review complete".to_string()),
-                },
-            })
-            .await
-            .expect("reviewer complete");
-        assert_eq!(wait_for_command_result(&mut rx, reviewer_complete_id).await, CommandValue::Ok);
-        wait_until(|| {
-            let convoys = convoys.clone();
-            async move {
-                convoys
-                    .get("crew-convoy")
-                    .await
-                    .ok()
-                    .and_then(|convoy| convoy.status)
-                    .is_some_and(|status| status.phase == ConvoyPhase::Completed)
-            }
-        })
-        .await;
-
-        let mut rx = daemon.subscribe();
         let hand_back_id = daemon
             .execute(Command {
                 node_id: None,
@@ -3501,6 +3489,21 @@ mod tests {
         assert_eq!(wait_for_command_result(&mut rx, return_to_reviewer_id).await, CommandValue::Ok);
 
         let mut rx = daemon.subscribe();
+        let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
+        let checkout = checkouts.get("adopted-checkout-crew-convoy").await.expect("adopted checkout");
+        let mut integration = checkout.status.expect("checkout status").integration;
+        integration.landed = flotilla_resources::IntegrationCondition::builder()
+            .value(flotilla_resources::ConditionValue::True)
+            .details(vec!["no change request exists for branch".to_string()])
+            .observed_at(Utc::now().to_rfc3339())
+            .build();
+        flotilla_resources::apply_status_patch(
+            &checkouts,
+            &checkout.metadata.name,
+            &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration },
+        )
+        .await
+        .expect("record observed absence of a change request");
         let final_review_id = daemon
             .execute(Command {
                 node_id: None,
@@ -3522,7 +3525,7 @@ mod tests {
                     .await
                     .ok()
                     .and_then(|convoy| convoy.status)
-                    .is_some_and(|status| status.phase == ConvoyPhase::Completed)
+                    .is_some_and(|status| status.phase == ConvoyPhase::Landed)
             }
         })
         .await;
@@ -3667,6 +3670,7 @@ mod tests {
         })
         .await;
 
+        daemon.reconcile_adopted_checkouts(NAMESPACE).await.expect("adopted checkout integration observation should succeed");
         let complete_id = daemon
             .execute(Command {
                 node_id: None,
@@ -3688,7 +3692,7 @@ mod tests {
                 matches!(
                     convoys.get("convoy-adopted").await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
-                        if status.phase == ConvoyPhase::Completed
+                        if status.phase == ConvoyPhase::Landed
                             && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
                 )
             }

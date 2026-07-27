@@ -1175,6 +1175,7 @@ dependencies = [
 name = "flotilla-resources"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "bon",
  "bytes",

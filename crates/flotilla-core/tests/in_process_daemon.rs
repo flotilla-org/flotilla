@@ -48,12 +48,11 @@ use flotilla_protocol::{
 use flotilla_resources::{
     apply_status_patch, controller_patches as convoy_controller_patches, implement_review_workflow_spec,
     single_agent_contained_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
-    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyPhase,
-    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy,
-    PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository,
-    RepositoryRelation, RepositorySpec, Stance, TypedResolver, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-    AGENT_ADAPTERS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL,
+    CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase, DockerCheckoutStrategy,
+    DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
+    HostStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
+    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryRelation, RepositorySpec, Stance, TypedResolver,
+    WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL,
 };
 use tokio::sync::Notify;
 
@@ -3384,10 +3383,9 @@ async fn adopted_checkout_reconciliation_repairs_partial_durable_creation() {
     daemon.reconcile_adopted_checkouts("flotilla").await.expect("adopted checkout reconciliation should succeed");
 
     let durable_checkout = durable.get("adopted-checkout-reconcile").await.expect("durable checkout should remain");
-    assert_eq!(
-        durable_checkout.status,
-        Some(ResourceCheckoutStatus::builder().phase(ResourceCheckoutPhase::Ready).path("/work/reconcile".to_string()).build())
-    );
+    let durable_status = durable_checkout.status.as_ref().expect("repaired durable status");
+    assert_eq!(durable_status.phase, ResourceCheckoutPhase::Ready);
+    assert_eq!(durable_status.path.as_deref(), Some("/work/reconcile"));
     let observed_checkout = observed.get("adopted-checkout-reconcile").await.expect("observed checkout should be projected");
     assert_eq!(observed_checkout.spec, durable_checkout.spec);
     assert_eq!(observed_checkout.status, durable_checkout.status);

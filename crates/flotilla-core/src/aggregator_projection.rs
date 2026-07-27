@@ -148,7 +148,7 @@ impl AggregatorProjectionState {
     }
 
     pub async fn result_set(&self) -> ResultSet {
-        self.convoys.read().await.result_set()
+        hide_terminal_convoys(self.convoys.read().await.result_set())
     }
 
     pub async fn convoy_result_set(&self, scope: &Option<QueryScope>) -> ResultSet {
@@ -163,7 +163,7 @@ impl AggregatorProjectionState {
     }
 
     pub async fn local_result_set(&self) -> ResultSet {
-        self.convoys.read().await.local_result_set()
+        hide_terminal_convoys(self.convoys.read().await.local_result_set())
     }
 
     pub async fn independents_result_set(&self, scope: &Option<QueryScope>) -> ResultSet {
@@ -374,7 +374,16 @@ fn sorted_project_scopes(projects: &HashMap<QueryScope, Vec<RepositoryKey>>) -> 
 }
 
 fn convoy_phase_represents_issues(phase: ConvoyPhase) -> bool {
-    matches!(phase, ConvoyPhase::Pending | ConvoyPhase::Active)
+    matches!(phase, ConvoyPhase::Pending | ConvoyPhase::Active | ConvoyPhase::Anchored | ConvoyPhase::Landing)
+}
+
+fn hide_terminal_convoys(mut set: ResultSet) -> ResultSet {
+    if let Rows::Convoys { rows, .. } = &mut set.rows {
+        rows.retain(|row| {
+            !matches!(row.phase, ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned)
+        });
+    }
+    set
 }
 
 fn convoy_matches_scope(row: &ConvoyRow, scope: &QueryScope) -> bool {
@@ -575,6 +584,24 @@ mod tests {
 
         let global = state.result_set_for(&QueryId::Convoys { scope: None }).await.expect("global convoy result set");
         assert_eq!(global.rows.as_convoys().expect("global convoy rows").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn default_convoy_result_set_hides_terminal_records() {
+        let state = AggregatorProjectionState::new();
+        let active = convoy_row("flotilla", "active", "roadmap");
+        let mut landing = convoy_row("flotilla", "landing", "roadmap");
+        landing.phase = ConvoyPhase::Landing;
+        let mut landed = convoy_row("flotilla", "landed", "roadmap");
+        landed.phase = ConvoyPhase::Landed;
+        {
+            let mut convoys = state.write().await;
+            convoys.local_rows = [active.clone(), landing.clone(), landed].into_iter().map(|row| (row.resource.clone(), row)).collect();
+        }
+
+        let result = state.result_set_for(&QueryId::Convoys { scope: None }).await.expect("convoy result set");
+
+        assert_eq!(result.rows.as_convoys().expect("convoy rows"), &[active, landing]);
     }
 
     #[tokio::test]

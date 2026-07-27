@@ -24,11 +24,11 @@ use flotilla_protocol::{
     DaemonEvent, HostName, LifecycleAuthority, QueryCursor, QueryScope,
 };
 use flotilla_resources::{
-    Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus,
-    Environment, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObservedCheckoutSpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, ResourceBackend, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState,
-    WorkflowSnapshot, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
+    Checkout, CheckoutPhase, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment,
+    EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec,
+    ProjectSpec, Repository, RepositorySpec, ResourceBackend, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot,
+    CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -341,7 +341,9 @@ async fn runtime_start_republishes_durable_adopted_checkouts_before_query_bootst
     assert!(matches!(rows, [row] if row.authority == LifecycleAuthority::Adopted && row.branch == "feature/restart"));
     let durable =
         backend.using::<Checkout>("flotilla").get("adopted-checkout-restart").await.expect("durable adopted checkout should remain");
-    assert_eq!(durable.status, Some(CheckoutStatus::builder().phase(CheckoutPhase::Ready).path("/work/widgets".to_string()).build()));
+    let durable_status = durable.status.expect("durable adopted checkout status");
+    assert_eq!(durable_status.phase, CheckoutPhase::Ready);
+    assert_eq!(durable_status.path.as_deref(), Some("/work/widgets"));
 }
 
 #[tokio::test]
@@ -863,7 +865,10 @@ async fn subscribe_queries_replays_result_set_after_seq() {
         namespace: "flotilla".to_string(),
         heartbeat_interval: Duration::from_secs(300),
         controller_resync_interval: Duration::from_secs(300),
-        start_controllers: true,
+        // This test exercises query replay, not convoy reconciliation. Keeping
+        // controllers stopped prevents the intentionally incomplete fixtures
+        // from being failed and hidden from the default active-convoy query.
+        start_controllers: false,
         ..RuntimeOptions::default()
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");

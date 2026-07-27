@@ -1,7 +1,11 @@
 mod common;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
+use async_trait::async_trait;
 use chrono::Utc;
 use common::{
     create_convoy_with_single_task, create_docker_worktree_policy, create_host_direct_policy, create_policy, create_ready_checkout,
@@ -14,10 +18,10 @@ use flotilla_resources::{
     canonicalize_repo_url, clone_key,
     controller::{Actuation, Reconciler},
     ensure_repository, interactive_single_workflow_spec, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec,
-    Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
-    DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta,
-    IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend,
+    Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CrewSource,
+    CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment,
+    EnvironmentSpec, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus,
+    InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend,
     ResourceError, Selector, Stance, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
     TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
     CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
@@ -28,6 +32,15 @@ const NAMESPACE: &str = "flotilla";
 const REPO_URL: &str = "https://github.com/flotilla-org/flotilla.git";
 const GIT_REF: &str = "feat/task-provisioning";
 const HOST_REF: &str = "01HXYZ";
+
+struct AlwaysEligible;
+
+#[async_trait]
+impl ConvoyTeardownRuntime for AlwaysEligible {
+    async fn verify_reclaim(&self, _convoy: &flotilla_resources::ResourceObject<Convoy>) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 #[tokio::test]
 async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
@@ -1593,7 +1606,7 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-finalizer", "implement", REPO_URL, GIT_REF).await;
 
     let mut status = convoy.status.expect("convoy status");
-    status.phase = ConvoyPhase::Completed;
+    status.phase = ConvoyPhase::Landed;
     status.observed_workflow_ref = Some("wf".to_string());
     status.work.insert(
         "implement".to_string(),
@@ -1616,7 +1629,9 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
         .expect("vessel finalizer and convoy label should be recorded");
     create_labeled_terminal(&backend, NAMESPACE, "terminal-convoy-finalizer-implement-coder", "convoy-finalizer-implement").await;
 
-    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(NAMESPACE)).with_vessels(vessels.clone());
+    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(NAMESPACE))
+        .with_vessels(vessels.clone())
+        .with_teardown_runtime(Arc::new(AlwaysEligible));
     let completed = convoys.get("convoy-finalizer").await.expect("completed convoy should exist");
     let first_dependencies = convoy_reconciler.fetch_dependencies(&completed).await.expect("first dependencies should load");
     let first_outcome = convoy_reconciler.reconcile(&completed, &first_dependencies, Utc::now());

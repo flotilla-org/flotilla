@@ -405,7 +405,8 @@ fn convoy_state(phase: ConvoyPhase, initializing: bool) -> AwarenessState {
     match phase {
         ConvoyPhase::Pending => AwarenessState::Pending,
         ConvoyPhase::Active => AwarenessState::Active,
-        ConvoyPhase::Completed => AwarenessState::Done,
+        ConvoyPhase::Landed => AwarenessState::Done,
+        ConvoyPhase::Anchored | ConvoyPhase::Landing => AwarenessState::Active,
         ConvoyPhase::Failed => AwarenessState::Failed,
         ConvoyPhase::Cancelled | ConvoyPhase::Abandoned => AwarenessState::Cancelled,
     }
