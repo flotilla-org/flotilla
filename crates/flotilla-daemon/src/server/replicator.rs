@@ -356,7 +356,7 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
 ) -> Result<(), String> {
     let remote = ResourceBackend::Http(http).using::<T>(REPLICATION_NAMESPACE);
     let writer = daemon.resource_backend().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
-    let listed = remote.list().await.map_err(|error| error.to_string())?;
+    let mut listed = remote.list().await.map_err(|error| error.to_string())?;
     let cursor = writer.cursor().await.map_err(|error| error.to_string())?;
     if let Some(cursor) = cursor.clone().filter(|cursor| cursor.generation == listed.generation) {
         let start = match cursor.generation {
@@ -370,6 +370,7 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
                     Ok(()) => return Ok(()),
                     Err(error) => {
                         debug!(%peer, kind = T::API_PATHS.kind, %error, "replica cursor watch failed; relisting origin");
+                        listed = remote.list().await.map_err(|error| error.to_string())?;
                     }
                 }
             }

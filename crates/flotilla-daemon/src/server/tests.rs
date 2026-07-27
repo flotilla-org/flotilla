@@ -269,6 +269,129 @@ async fn http_replicator_relists_after_an_origin_generation_change() {
     let _ = server.await;
     std::fs::remove_file(&socket_path).expect("remove replicator HTTP socket");
 }
+
+#[tokio::test]
+async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
+    let origin = ResourceBackend::InMemory(InMemoryBackend::observed());
+    origin
+        .using::<Convoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("before-watch".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("create initial convoy");
+    let initial = origin.using::<Convoy>("flotilla").list().await.expect("list initial origin");
+    let initial_body = serde_json::to_vec(&list_resource_kind(&origin, "flotilla", "convoys").await.expect("encode initial list").value)
+        .expect("encode initial response");
+
+    let holder_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let origin_root = NodeId::new("remote-root");
+    holder_backend
+        .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
+        .replace(&initial, chrono::Utc::now())
+        .await
+        .expect("seed resumable cursor");
+    origin
+        .using::<Convoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("after-watch".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("create convoy after initial list");
+    let fresh_body = serde_json::to_vec(&list_resource_kind(&origin, "flotilla", "convoys").await.expect("encode fresh list").value)
+        .expect("encode fresh response");
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let holder = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        test_config_store(temp.path().join("holder")),
+        fake_discovery(false),
+        HostName::new("holder"),
+        holder_backend.clone(),
+    )
+    .await;
+    let socket_path = PathBuf::from(format!("/tmp/flotilla-replicator-relist-{}.sock", uuid::Uuid::new_v4()));
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind replicator HTTP socket");
+    let requested_targets = Arc::new(StdMutex::new(Vec::new()));
+    let server_targets = Arc::clone(&requested_targets);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("accept replicator HTTP request");
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut buffer = [0_u8; 1024];
+                let read = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await.expect("read replicator HTTP request");
+                assert_ne!(read, 0, "replicator HTTP request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request = std::str::from_utf8(&request).expect("replicator HTTP request is UTF-8");
+            let target =
+                request.lines().next().and_then(|line| line.split_whitespace().nth(1)).expect("replicator HTTP request target").to_string();
+            let request_number = {
+                let mut targets = server_targets.lock().expect("requested targets lock");
+                targets.push(target.clone());
+                targets.len()
+            };
+            if target.contains("watch=true") {
+                let body = if request_number == 2 { b"not-json\n".as_slice() } else { b"".as_slice() };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.expect("write watch response headers");
+                tokio::io::AsyncWriteExt::write_all(&mut stream, body).await.expect("write watch response body");
+                if request_number > 2 {
+                    std::future::pending::<()>().await;
+                }
+                continue;
+            }
+            let body = if request_number == 1 { &initial_body } else { &fresh_body };
+            let response =
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.expect("write list response headers");
+            tokio::io::AsyncWriteExt::write_all(&mut stream, body).await.expect("write list response body");
+        }
+    });
+
+    let http = HttpBackend::from_unix_socket(&socket_path).expect("build replicator HTTP client");
+    let holder_for_replication = Arc::clone(&holder);
+    let origin_for_replication = origin_root.clone();
+    let replicator =
+        tokio::spawn(async move { replicate_kind_over_http::<Convoy>(http, &holder_for_replication, &origin_for_replication).await });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let listed = holder_backend.including_replicas::<Convoy>("flotilla").list().await.expect("list relisted replicas");
+            if listed.items.iter().any(|item| item.object.metadata.name == "after-watch") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fresh relist timeout");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while requested_targets.lock().expect("requested targets lock").len() < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replacement watch request timeout");
+    let requested_targets = requested_targets.lock().expect("requested targets lock").clone();
+    assert!(!requested_targets[0].contains("watch=true"));
+    assert!(requested_targets[1].contains("watch=true"));
+    assert!(!requested_targets[2].contains("watch=true"), "a failed resumed watch must trigger a fresh list");
+    assert!(requested_targets[3].contains("watch=true"));
+
+    replicator.abort();
+    server.abort();
+    let _ = replicator.await;
+    let _ = server.await;
+    std::fs::remove_file(&socket_path).expect("remove replicator HTTP socket");
+}
+
 use crate::peer::{
     test_support::{ensure_test_connection_generation, handle_test_peer_data, wait_for_command_result, BlockingPeerSender, MockPeerSender},
     InboundPeerEnvelope, PeerConnectionStatus, PeerManager, PeerSender, PeerTransport,
