@@ -24,13 +24,14 @@ cargo test --workspace --locked                # CI test gate
 cargo +nightly-2026-03-12 fmt                  # apply pinned formatting
 cargo dylint --all -- --all-targets             # custom lints (requires cargo-dylint + dylint-link)
 cargo run                                      # run, auto-detect repo from cwd
-scripts/prune-target.sh --dry-run              # preview per-checkout target cache pruning
-scripts/prune-target.sh                        # prune aged/oversized target artifacts
+scripts/prune-target.sh --dry-run              # preview the per-checkout target size-cap backstop
+scripts/prune-target.sh                        # apply the per-checkout target size-cap backstop
+scripts/install-cargo-sweep-schedule.sh        # install/verify the daily per-host mtime sweep
 ```
 
 Before pushing, run the exact CI commands: `cargo +nightly-2026-03-12 fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked`.
 
-Developer incrementals stay enabled, with aged generations pruned under the target cache policy. See [docs/development.md](docs/development.md) for setup, thresholds, measurement, and the CI decision.
+Desk builds keep Cargo incrementals enabled. Crew vessel and CI builds set `CARGO_INCREMENTAL=0`. Each fleet host runs an mtime-based `cargo-sweep --time 3` daily, while `scripts/prune-target.sh` remains a size-cap backstop. See [docs/development.md](docs/development.md) for installation, scope, logs, and thresholds.
 
 **Nightly toolchain:** All nightly-dependent tools (rustfmt, llvm-cov, Dylint) are pinned to `nightly-2026-03-12`. Install with `rustup toolchain install nightly-2026-03-12 --component rustfmt llvm-tools-preview`.
 

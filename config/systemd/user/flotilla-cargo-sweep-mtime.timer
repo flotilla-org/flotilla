@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Flotilla mtime-based Cargo artifact sweep daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+Unit=flotilla-cargo-sweep-mtime.service
+
+[Install]
+WantedBy=timers.target

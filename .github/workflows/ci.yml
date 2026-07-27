@@ -25,8 +25,10 @@ jobs:
         with:
           toolchain: nightly-2026-03-12
           components: rustfmt
-      - name: Test target pruning policy
-        run: scripts/test-prune-target.sh
+      - name: Test target cache policies
+        run: |
+          scripts/test-prune-target.sh
+          scripts/test-cargo-sweep-mtime.sh
       - name: Check Rust formatting
         run: cargo +nightly-2026-03-12 fmt --check
 
