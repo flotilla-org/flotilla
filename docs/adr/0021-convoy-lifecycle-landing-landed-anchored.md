@@ -63,9 +63,10 @@ preserving ADR 0017's claims/conditions split:
 - **`Landing → Landed` is condition-written.** The sole writer is the
   lifecycle reconciler, continuously evaluating the standing integration
   condition: *no change request remains outstanding* — which uniformly
-  covers merged, closed, and never-existed (a no-CR convoy satisfies the
-  condition on first evaluation and lands immediately). Testimony can
-  never write `Landed`.
+  covers merged and closed change requests. A checkout for which no change
+  request ever existed satisfies `Landed` only when its branch has no commits
+  beyond its base ref; a divergent no-CR branch remains unsettled. Testimony
+  can never write `Landed`.
 
 ### Refinement of ADR 0017's "No `Integrated` phase, ever"
 
