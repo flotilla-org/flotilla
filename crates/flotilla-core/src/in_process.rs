@@ -1419,7 +1419,9 @@ fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<Strin
         flotilla_resources::ConvoyPhase::Cancelled => Some(format!("convoy {} was cancelled while starting", convoy.metadata.name)),
         flotilla_resources::ConvoyPhase::Pending
         | flotilla_resources::ConvoyPhase::Active
-        | flotilla_resources::ConvoyPhase::Completed
+        | flotilla_resources::ConvoyPhase::Anchored
+        | flotilla_resources::ConvoyPhase::Landing
+        | flotilla_resources::ConvoyPhase::Landed
         | flotilla_resources::ConvoyPhase::Abandoned => None,
     }
 }
@@ -2080,10 +2082,35 @@ impl InProcessDaemon {
         self.observed_resource_backend.clone()
     }
 
-    /// Restore the ephemeral adopted Checkout projection from durable
-    /// controller-facing Checkout resources.
+    /// Refresh durable integration observations for adopted checkouts, then
+    /// restore their ephemeral query-facing projection.
     pub async fn reconcile_adopted_checkouts(&self, namespace: &str) -> Result<(), String> {
         let _reconciliation = self.observed_checkout_reconciliation.lock().await;
+        crate::observed_resources::reconcile_adopted_checkouts(&self.resource_backend, &self.observed_resource_backend, namespace)
+            .await
+            .map_err(|error| error.to_string())?;
+        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
+        for checkout in checkouts.list().await.map_err(|error| error.to_string())?.items {
+            if checkout.metadata.lifecycle_authority().map_err(|error| error.to_string())? != Some(LifecycleAuthority::Adopted) {
+                continue;
+            }
+            let Some(path) = checkout_path(&checkout) else {
+                continue;
+            };
+            let runner = self.runner_for_resource_checkout(&checkout).await?;
+            let mut integration = inspect_checkout_integration(&*runner, Path::new(path), checkout_branch(&checkout)).await;
+            if let Some(existing) = checkout.status.as_ref().filter(|status| status.integration.landed.value == ConditionValue::True) {
+                integration.landed.value = ConditionValue::True;
+                if integration.landed_evidence.is_none() {
+                    integration.landed_evidence = existing.integration.landed_evidence.clone();
+                }
+            }
+            apply_resource_status_patch(&checkouts, &checkout.metadata.name, &flotilla_resources::CheckoutStatusPatch::UpdateIntegration {
+                integration,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        }
         crate::observed_resources::reconcile_adopted_checkouts(&self.resource_backend, &self.observed_resource_backend, namespace)
             .await
             .map_err(|error| error.to_string())
@@ -5261,7 +5288,7 @@ impl InProcessDaemon {
         }
     }
 
-    async fn verify_convoy_teardown_gate(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
+    pub async fn verify_convoy_teardown_gate(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         if force {
             return Ok(());
         }
@@ -5390,8 +5417,9 @@ impl InProcessDaemon {
         .await
         .map_err(|err| err.to_string())?;
         // Abandonment is an explicit terminal override: the phase stamp above is
-        // the teardown gate, after the best-effort archive push has run.
-        convoys.delete(name).await.map_err(|err| err.to_string())
+        // the teardown gate, after the best-effort archive push has run. The
+        // lifecycle reconciler reclaims children while retaining the convoy.
+        Ok(())
     }
 
     async fn apply_crew_work_patch(
@@ -6514,7 +6542,14 @@ impl InProcessDaemon {
                 None => Err(ResourceError::other(format!("convoy {convoy} has no status"))),
                 Some(status) => match status.work.get(work) {
                     None => Err(ResourceError::other(format!("convoy {convoy} does not contain work {work}"))),
-                    Some(state) if state.phase.is_terminal() => {
+                    Some(state)
+                        if matches!(
+                            state.phase,
+                            flotilla_resources::WorkPhase::Failed
+                                | flotilla_resources::WorkPhase::Cancelled
+                                | flotilla_resources::WorkPhase::Abandoned
+                        ) =>
+                    {
                         Err(ResourceError::other(format!("convoy {convoy} work {work} is already terminal")))
                     }
                     Some(_) => Ok(()),

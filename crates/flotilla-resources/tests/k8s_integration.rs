@@ -141,9 +141,9 @@ async fn convoy_controller_roundtrip_and_cel_validation() -> Result<(), Box<dyn 
     )
     .await?;
     let completed = reconcile_once(&convoys, &templates, &created.metadata.name, chrono::Utc::now()).await?;
-    assert!(matches!(completed, Some(flotilla_resources::ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Completed, .. })));
+    assert!(matches!(completed, Some(flotilla_resources::ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Landing, .. })));
 
     let final_convoy = convoys.get(&created.metadata.name).await?;
-    assert_eq!(final_convoy.status.expect("status").phase, ConvoyPhase::Completed);
+    assert_eq!(final_convoy.status.expect("status").phase, ConvoyPhase::Landing);
     Ok(())
 }

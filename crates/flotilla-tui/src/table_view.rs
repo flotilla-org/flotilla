@@ -1080,7 +1080,8 @@ fn convoy_phase(row: &ConvoySummary) -> CellValue {
     let tone = match row.phase {
         ConvoyPhase::Pending => CellTone::Muted,
         ConvoyPhase::Active => CellTone::Plain,
-        ConvoyPhase::Completed => CellTone::Success,
+        ConvoyPhase::Landed => CellTone::Success,
+        ConvoyPhase::Anchored | ConvoyPhase::Landing => CellTone::Plain,
         ConvoyPhase::Failed => CellTone::Error,
         ConvoyPhase::Cancelled => CellTone::Muted,
         ConvoyPhase::Abandoned => CellTone::Muted,
@@ -1403,7 +1404,7 @@ mod tests {
     #[test]
     fn terminal_convoy_phases_have_distinct_row_tones() {
         let mut completed = convoy(vec![]);
-        completed.phase = ConvoyPhase::Completed;
+        completed.phase = ConvoyPhase::Landed;
         let mut failed = convoy(vec![]);
         failed.id = ConvoyId::new("dev", "failed");
         failed.name = "failed".into();
@@ -1411,7 +1412,7 @@ mod tests {
 
         let view = project_convoys("convoys/dev", &[&completed, &failed]).expect("convoy table");
 
-        assert_eq!(view.rows[0].cells[2], CellValue::toned("completed", CellTone::Success));
+        assert_eq!(view.rows[0].cells[2], CellValue::toned("landed", CellTone::Success));
         assert_eq!(view.rows[1].cells[2], CellValue::toned("failed", CellTone::Error));
     }
 

@@ -1,7 +1,12 @@
 mod common;
 
-use std::{sync::mpsc as std_mpsc, thread, time::Instant};
+use std::{
+    sync::{mpsc as std_mpsc, Arc},
+    thread,
+    time::Instant,
+};
 
+use async_trait::async_trait;
 use chrono::Utc;
 use common::{
     contract::{
@@ -23,9 +28,9 @@ use common::{
 use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
-    ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, EventRetention, InMemoryBackend, InputMeta, NoStatusPatch, Project, ProjectSpec,
-    Resource, ResourceBackend, ResourceError, SqliteBackend, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel,
-    VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate, CONVOY_LABEL, VESSEL_REF_LABEL,
+    ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, ConvoyTeardownRuntime, EventRetention, InMemoryBackend, InputMeta, NoStatusPatch,
+    Project, ProjectSpec, Resource, ResourceBackend, ResourceError, SqliteBackend, TerminalSession, TerminalSessionSource,
+    TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 use futures::StreamExt;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
@@ -34,6 +39,15 @@ use tokio::time::{timeout, Duration};
 
 fn backend() -> ResourceBackend {
     ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend should open"))
+}
+
+struct AlwaysEligible;
+
+#[async_trait]
+impl ConvoyTeardownRuntime for AlwaysEligible {
+    async fn verify_reclaim(&self, _convoy: &flotilla_resources::ResourceObject<Convoy>) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -407,7 +421,7 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
 
     let convoy =
         convoys.create(&convoy_meta("convoy-restart"), &convoy_spec("workflow-restart")).await.expect("convoy create should succeed");
-    let mut completed_status = convoy_status(ConvoyPhase::Completed);
+    let mut completed_status = convoy_status(ConvoyPhase::Landed);
     completed_status.observed_workflow_ref = Some("workflow-restart".to_string());
     let mut completed_work = pending_task_state();
     completed_work.phase = WorkPhase::Complete;
@@ -441,7 +455,9 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
         .await
         .expect("terminal child should be created");
 
-    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
+    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+        .with_vessels(vessels.clone())
+        .with_teardown_runtime(Arc::new(AlwaysEligible));
     let completed_convoy = convoys.get("convoy-restart").await.expect("completed convoy should exist");
     let initial_dependencies =
         convoy_reconciler.fetch_dependencies(&completed_convoy).await.expect("initial cleanup dependencies should load");
@@ -464,7 +480,9 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
     let terminals = backend.clone().using::<TerminalSession>("flotilla");
-    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
+    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+        .with_vessels(vessels.clone())
+        .with_teardown_runtime(Arc::new(AlwaysEligible));
     let restarted_convoy = convoys.get("convoy-restart").await.expect("completed convoy should survive restart");
     let restart_dependencies =
         convoy_reconciler.fetch_dependencies(&restarted_convoy).await.expect("restart cleanup dependencies should load");

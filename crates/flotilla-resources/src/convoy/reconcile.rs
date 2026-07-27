@@ -1,8 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
+    sync::Arc,
 };
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
@@ -16,7 +18,7 @@ use crate::{
         delete_lifecycle_owned_matching, Actuation, LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler,
         SecondaryWatch,
     },
-    labels::{CONVOY_LABEL, VESSEL_LABEL},
+    labels::{LifecycleAuthority, CONVOY_LABEL, VESSEL_LABEL},
     pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending,
     presentation::{Presentation, PresentationSpec},
     resource::ResourceObject,
@@ -25,6 +27,25 @@ use crate::{
     workflow_template::{validate, visit_template_tokens, CrewSource, CrewSpec, ValidationError, WorkflowTemplate},
     InputMeta, InputValue, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, Resource, ResourceError, TypedResolver,
 };
+
+#[async_trait]
+pub trait ConvoyTeardownRuntime: Send + Sync {
+    /// Evaluate the standing Landing condition against current checkout
+    /// integration state. Runtimes may re-probe external change-request state
+    /// before answering; the default keeps in-memory reconcilers deterministic.
+    async fn no_change_request_outstanding(
+        &self,
+        _convoy: &ResourceObject<Convoy>,
+        checkouts: &[ResourceObject<Checkout>],
+    ) -> Result<bool, String> {
+        Ok(checkouts
+            .iter()
+            .all(|checkout| checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)))
+    }
+
+    /// Re-verify ADR 0017 teardown eligibility at the execution edge.
+    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String>;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileOutcome {
@@ -39,6 +60,12 @@ struct InternalReconcileOutcome {
     events: Vec<ConvoyEvent>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LifecycleConditions {
+    no_change_request_outstanding: bool,
+    reclaim_eligible: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyEvent {
     PhaseChanged { from: ConvoyPhase, to: ConvoyPhase },
@@ -49,13 +76,14 @@ pub enum ConvoyEvent {
     MissingInput { name: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConvoyReconciler {
     templates: TypedResolver<WorkflowTemplate>,
     vessels: Option<TypedResolver<Vessel>>,
     presentations: Option<TypedResolver<Presentation>>,
     checkouts: Option<TypedResolver<Checkout>>,
     prepared_snapshot_gc: Option<PreparedSnapshotGarbageCollector>,
+    teardown_runtime: Option<Arc<dyn ConvoyTeardownRuntime>>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,11 +91,14 @@ pub struct ConvoyDependencies {
     template: Option<ResourceObject<WorkflowTemplate>>,
     vessels: BTreeMap<String, ResourceObject<Vessel>>,
     presentations: BTreeMap<String, ResourceObject<Presentation>>,
+    checkouts: BTreeMap<String, ResourceObject<Checkout>>,
+    no_change_request_outstanding: bool,
+    reclaim_eligible: bool,
 }
 
 impl ConvoyReconciler {
     pub fn new(templates: TypedResolver<WorkflowTemplate>) -> Self {
-        Self { templates, vessels: None, presentations: None, checkouts: None, prepared_snapshot_gc: None }
+        Self { templates, vessels: None, presentations: None, checkouts: None, prepared_snapshot_gc: None, teardown_runtime: None }
     }
 
     pub fn with_vessels(mut self, vessels: TypedResolver<Vessel>) -> Self {
@@ -87,6 +118,11 @@ impl ConvoyReconciler {
 
     pub fn with_prepared_snapshot_gc(mut self, collector: PreparedSnapshotGarbageCollector) -> Self {
         self.prepared_snapshot_gc = Some(collector);
+        self
+    }
+
+    pub fn with_teardown_runtime(mut self, runtime: Arc<dyn ConvoyTeardownRuntime>) -> Self {
+        self.teardown_runtime = Some(runtime);
         self
     }
 
@@ -133,7 +169,38 @@ impl Reconciler for ConvoyReconciler {
                 .collect(),
             _ => BTreeMap::new(),
         };
-        Ok(ConvoyDependencies { template, vessels, presentations })
+        let checkouts = match &self.checkouts {
+            Some(checkouts) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => checkouts
+                .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]))
+                .await?
+                .items
+                .into_iter()
+                .map(|checkout| (checkout.metadata.name.clone(), checkout))
+                .collect(),
+            _ => BTreeMap::new(),
+        };
+        let no_change_request_outstanding = if obj.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing) {
+            match &self.teardown_runtime {
+                Some(runtime) => {
+                    let checkout_list = checkouts.values().cloned().collect::<Vec<_>>();
+                    runtime.no_change_request_outstanding(obj, &checkout_list).await.unwrap_or(false)
+                }
+                None => checkouts.values().all(|checkout| {
+                    checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)
+                }),
+            }
+        } else {
+            false
+        };
+        let reclaim_eligible = if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            match &self.teardown_runtime {
+                Some(runtime) => runtime.verify_reclaim(obj).await.is_ok(),
+                None => false,
+            }
+        } else {
+            false
+        };
+        Ok(ConvoyDependencies { template, vessels, presentations, checkouts, no_change_request_outstanding, reclaim_eligible })
     }
 
     fn reconcile(
@@ -142,7 +209,18 @@ impl Reconciler for ConvoyReconciler {
         deps: &Self::Dependencies,
         now: DateTime<Utc>,
     ) -> ControllerReconcileOutcome<Self::Resource> {
-        let outcome = reconcile_internal(obj, deps.template.as_ref(), &deps.vessels, &deps.presentations, now);
+        let outcome = reconcile_internal(
+            obj,
+            deps.template.as_ref(),
+            &deps.vessels,
+            &deps.presentations,
+            &deps.checkouts,
+            LifecycleConditions {
+                no_change_request_outstanding: deps.no_change_request_outstanding,
+                reclaim_eligible: deps.reclaim_eligible,
+            },
+            now,
+        );
         ControllerReconcileOutcome {
             patch: outcome.patch,
             actuations: outcome.actuations,
@@ -178,7 +256,15 @@ pub fn reconcile(
     template: Option<&ResourceObject<WorkflowTemplate>>,
     now: DateTime<Utc>,
 ) -> ReconcileOutcome {
-    let outcome = reconcile_internal(convoy, template, &BTreeMap::new(), &BTreeMap::new(), now);
+    let outcome = reconcile_internal(
+        convoy,
+        template,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        LifecycleConditions { no_change_request_outstanding: true, reclaim_eligible: false },
+        now,
+    );
     ReconcileOutcome { patch: outcome.patch, events: outcome.events }
 }
 
@@ -187,6 +273,8 @@ fn reconcile_internal(
     template: Option<&ResourceObject<WorkflowTemplate>>,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     presentations: &BTreeMap<String, ResourceObject<Presentation>>,
+    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    conditions: LifecycleConditions,
     now: DateTime<Utc>,
 ) -> InternalReconcileOutcome {
     if prepared_snapshot_pending(convoy) {
@@ -194,8 +282,8 @@ fn reconcile_internal(
     }
     let status = convoy.status.clone().unwrap_or_default();
 
-    if matches!(status.phase, ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned) {
-        return with_cleanup(convoy, &status, vessels, presentations, InternalReconcileOutcome {
+    if status.phase.is_terminal() {
+        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, InternalReconcileOutcome {
             patch: None,
             actuations: Vec::new(),
             events: Vec::new(),
@@ -204,15 +292,23 @@ fn reconcile_internal(
 
     if let Some(observed) = status.observed_workflow_ref.as_ref() {
         if observed != &convoy.spec.workflow_ref {
-            return with_cleanup(convoy, &status, vessels, presentations, InternalReconcileOutcome {
-                patch: Some(controller_patches::fail_init(
-                    ConvoyPhase::Failed,
-                    "workflow_ref changed after init; not supported".to_string(),
-                    now,
-                )),
-                actuations: Vec::new(),
-                events: vec![ConvoyEvent::WorkflowRefChanged { from: observed.clone(), to: convoy.spec.workflow_ref.clone() }],
-            });
+            return with_cleanup(
+                convoy,
+                &status,
+                vessels,
+                presentations,
+                checkouts,
+                conditions.reclaim_eligible,
+                InternalReconcileOutcome {
+                    patch: Some(controller_patches::fail_init(
+                        ConvoyPhase::Failed,
+                        "workflow_ref changed after init; not supported".to_string(),
+                        now,
+                    )),
+                    actuations: Vec::new(),
+                    events: vec![ConvoyEvent::WorkflowRefChanged { from: observed.clone(), to: convoy.spec.workflow_ref.clone() }],
+                },
+            );
         }
     }
 
@@ -221,20 +317,20 @@ fn reconcile_internal(
     }
 
     if let Some(outcome) = backfill_crew_work_outcome(&status) {
-        return with_cleanup(convoy, &status, vessels, presentations, outcome);
+        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, outcome);
     }
 
     if let Some(outcome) = fail_fast_outcome(&status, now) {
-        return with_cleanup(convoy, &status, vessels, presentations, outcome);
+        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, outcome);
     }
 
     let provisioning = vessel_outcome(convoy, &status, vessels, now);
     if provisioning.patch.is_some() {
-        return with_cleanup(convoy, &status, vessels, presentations, provisioning);
+        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, provisioning);
     }
 
     if let Some(outcome) = roll_up_crew_work_outcome(&status, now) {
-        return with_cleanup(convoy, &status, vessels, presentations, InternalReconcileOutcome {
+        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, InternalReconcileOutcome {
             patch: outcome.patch,
             actuations: provisioning.actuations,
             events: outcome.events,
@@ -242,22 +338,22 @@ fn reconcile_internal(
     }
 
     if let Some(outcome) = advance_ready_outcome(&status, now) {
-        return with_cleanup(convoy, &status, vessels, presentations, InternalReconcileOutcome {
+        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, InternalReconcileOutcome {
             patch: outcome.patch,
             actuations: provisioning.actuations,
             events: outcome.events,
         });
     }
 
-    if let Some(outcome) = roll_up_phase_outcome(&status, now) {
-        return with_cleanup(convoy, &status, vessels, presentations, InternalReconcileOutcome {
+    if let Some(outcome) = roll_up_phase_outcome(&status, conditions.no_change_request_outstanding, now) {
+        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, InternalReconcileOutcome {
             patch: outcome.patch,
             actuations: provisioning.actuations,
             events: outcome.events,
         });
     }
 
-    with_cleanup(convoy, &status, vessels, presentations, provisioning)
+    with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, provisioning)
 }
 
 fn bootstrap_outcome(
@@ -550,19 +646,16 @@ fn roll_up_crew_work_outcome(status: &super::ConvoyStatus, now: DateTime<Utc>) -
     None
 }
 
-fn roll_up_phase_outcome(status: &super::ConvoyStatus, now: DateTime<Utc>) -> Option<ReconcileOutcome> {
+fn roll_up_phase_outcome(
+    status: &super::ConvoyStatus,
+    no_change_request_outstanding: bool,
+    now: DateTime<Utc>,
+) -> Option<ReconcileOutcome> {
     let all_complete = !status.work.is_empty() && status.work.values().all(|state| state.phase == WorkPhase::Complete);
-    if all_complete && status.phase != ConvoyPhase::Completed {
+    if status.phase == ConvoyPhase::Landing && all_complete && no_change_request_outstanding {
         return Some(ReconcileOutcome {
-            patch: Some(controller_patches::roll_up_phase(ConvoyPhase::Completed, None, Some(now))),
-            events: vec![ConvoyEvent::PhaseChanged { from: status.phase, to: ConvoyPhase::Completed }],
-        });
-    }
-
-    if !all_complete && status.phase == ConvoyPhase::Completed {
-        return Some(ReconcileOutcome {
-            patch: Some(controller_patches::roll_up_phase(ConvoyPhase::Active, None, None)),
-            events: vec![ConvoyEvent::PhaseChanged { from: ConvoyPhase::Completed, to: ConvoyPhase::Active }],
+            patch: Some(controller_patches::roll_up_phase(ConvoyPhase::Landed, None, Some(now))),
+            events: vec![ConvoyEvent::PhaseChanged { from: ConvoyPhase::Landing, to: ConvoyPhase::Landed }],
         });
     }
 
@@ -662,48 +755,88 @@ fn with_cleanup(
     status: &super::ConvoyStatus,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     presentations: &BTreeMap<String, ResourceObject<Presentation>>,
+    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    reclaim_eligible: bool,
     mut outcome: InternalReconcileOutcome,
 ) -> InternalReconcileOutcome {
-    outcome.actuations.extend(cleanup_actuations(convoy, status, vessels, presentations, outcome.patch.as_ref()));
+    let (patch, actuations) = cleanup_plan(convoy, status, vessels, presentations, checkouts, reclaim_eligible, outcome.patch.as_ref());
+    if outcome.patch.is_none() {
+        outcome.patch = patch;
+    }
+    outcome.actuations.extend(actuations);
     outcome
 }
 
-fn cleanup_actuations(
+fn cleanup_plan(
     convoy: &ResourceObject<Convoy>,
     status: &super::ConvoyStatus,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     presentations: &BTreeMap<String, ResourceObject<Presentation>>,
+    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    reclaim_eligible: bool,
     patch: Option<&ConvoyStatusPatch>,
-) -> Vec<Actuation> {
+) -> (Option<ConvoyStatusPatch>, Vec<Actuation>) {
     let mut predicted_status = status.clone();
     if let Some(patch) = patch {
         patch.apply(&mut predicted_status);
     }
 
-    let mut actuations = Vec::new();
-
-    for (work, state) in &predicted_status.work {
-        let resource_name = vessel_resource_name(&convoy.metadata.name, work);
-        match state.phase {
-            WorkPhase::Ready | WorkPhase::Launching | WorkPhase::Running => {
-                if !presentations.contains_key(&resource_name) {
-                    actuations.push(create_presentation_actuation(convoy, work));
-                }
+    if !predicted_status.phase.is_terminal() {
+        let mut actuations = Vec::new();
+        for (work, state) in &predicted_status.work {
+            let resource_name = vessel_resource_name(&convoy.metadata.name, work);
+            if matches!(state.phase, WorkPhase::Ready | WorkPhase::Launching | WorkPhase::Running)
+                && !presentations.contains_key(&resource_name)
+            {
+                actuations.push(create_presentation_actuation(convoy, work));
             }
-            WorkPhase::Complete if predicted_status.crew_work.get(work).is_some_and(|crew| !crew.is_empty()) => {}
-            WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled | WorkPhase::Abandoned => {
-                if presentations.contains_key(&resource_name) {
-                    actuations.push(Actuation::DeletePresentation { name: resource_name.clone() });
-                }
-                if vessels.get(&resource_name).is_some_and(|vessel| vessel.metadata.deletion_timestamp.is_none()) {
-                    actuations.push(Actuation::DeleteVessel { name: resource_name });
-                }
-            }
-            WorkPhase::Pending => {}
         }
+        return (None, actuations);
     }
 
-    actuations
+    if !reclaim_eligible {
+        return (None, Vec::new());
+    }
+
+    let mut actuations = extract_actuations(convoy);
+    actuations.extend(
+        presentations
+            .keys()
+            .cloned()
+            .map(|name| Actuation::DeletePresentation { name })
+            .chain(
+                vessels
+                    .values()
+                    .filter(|vessel| vessel.metadata.deletion_timestamp.is_none())
+                    .map(|vessel| Actuation::DeleteVessel { name: vessel.metadata.name.clone() }),
+            )
+            .chain(
+                checkouts
+                    .values()
+                    .filter(|checkout| checkout.metadata.deletion_timestamp.is_none())
+                    .filter(|checkout| {
+                        !matches!(
+                            checkout.metadata.lifecycle_authority(),
+                            Ok(Some(LifecycleAuthority::Observed | LifecycleAuthority::Adopted))
+                        )
+                    })
+                    .map(|checkout| Actuation::DeleteCheckout { name: checkout.metadata.name.clone() }),
+            ),
+    );
+    actuations.sort_by_key(|actuation| match actuation {
+        Actuation::DeletePresentation { name } => (0, name.clone()),
+        Actuation::DeleteVessel { name } => (1, name.clone()),
+        Actuation::DeleteCheckout { name } => (2, name.clone()),
+        _ => (3, String::new()),
+    });
+    (None, actuations)
+}
+
+/// Reserved extraction stage. Reclamation is deliberately sequenced after
+/// this call so recordings and logs can be exported here without reshaping
+/// terminal cleanup.
+fn extract_actuations(_convoy: &ResourceObject<Convoy>) -> Vec<Actuation> {
+    Vec::new()
 }
 
 fn create_vessel_outcome(convoy: &ResourceObject<Convoy>, vessel: &str, _now: DateTime<Utc>) -> Option<InternalReconcileOutcome> {

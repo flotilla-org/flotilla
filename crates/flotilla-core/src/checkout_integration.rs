@@ -235,11 +235,12 @@ async fn inspect_landed(
                         item.get("number").and_then(serde_json::Value::as_i64).map(|number| number.to_string()).unwrap_or_default();
                     let state = item.get("state").and_then(serde_json::Value::as_str).unwrap_or("unknown");
                     let merged_at = item.get("mergedAt").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
-                    if state.eq_ignore_ascii_case("MERGED") || merged_at.is_some() {
+                    if state.eq_ignore_ascii_case("MERGED") || state.eq_ignore_ascii_case("CLOSED") || merged_at.is_some() {
+                        let outcome = if state.eq_ignore_ascii_case("CLOSED") && merged_at.is_none() { "closed" } else { "merged" };
                         (
                             IntegrationCondition::builder()
                                 .value(ConditionValue::True)
-                                .details(vec![format!("PR #{number} merged")])
+                                .details(vec![format!("PR #{number} {outcome}")])
                                 .observed_at(observed_at.to_string())
                                 .build(),
                             Some(
@@ -259,8 +260,8 @@ async fn inspect_landed(
                 }
                 None => (
                     IntegrationCondition::builder()
-                        .value(ConditionValue::False)
-                        .details(vec!["no PR found for branch".to_string()])
+                        .value(ConditionValue::True)
+                        .details(vec!["no change request exists for branch".to_string()])
                         .observed_at(observed_at.to_string())
                         .build(),
                     None,

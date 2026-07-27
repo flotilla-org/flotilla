@@ -1898,7 +1898,9 @@ fn convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
     match phase {
         ResourceConvoyPhase::Pending => ConvoyPhase::Pending,
         ResourceConvoyPhase::Active => ConvoyPhase::Active,
-        ResourceConvoyPhase::Completed => ConvoyPhase::Completed,
+        ResourceConvoyPhase::Anchored => ConvoyPhase::Anchored,
+        ResourceConvoyPhase::Landing => ConvoyPhase::Landing,
+        ResourceConvoyPhase::Landed => ConvoyPhase::Landed,
         ResourceConvoyPhase::Failed => ConvoyPhase::Failed,
         ResourceConvoyPhase::Cancelled => ConvoyPhase::Cancelled,
         ResourceConvoyPhase::Abandoned => ConvoyPhase::Abandoned,
@@ -1908,7 +1910,7 @@ fn convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
 fn convoy_phase_is_terminal(phase: ResourceConvoyPhase) -> bool {
     matches!(
         phase,
-        ResourceConvoyPhase::Completed | ResourceConvoyPhase::Failed | ResourceConvoyPhase::Cancelled | ResourceConvoyPhase::Abandoned
+        ResourceConvoyPhase::Landed | ResourceConvoyPhase::Failed | ResourceConvoyPhase::Cancelled | ResourceConvoyPhase::Abandoned
     )
 }
 
@@ -2949,7 +2951,7 @@ mod tests {
         let (event_tx, _) = broadcast::channel(4);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
         let now = Utc::now();
-        let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Completed).work_phase(ResourceWorkPhase::Complete).call();
+        let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Landed).work_phase(ResourceWorkPhase::Complete).call();
         convoy.metadata.deletion_timestamp = Some(now);
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
 
@@ -3139,13 +3141,13 @@ mod tests {
             flotilla_protocol::ChangeRequestStatus::Open
         );
 
-        convoy.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Completed, ..Default::default() });
+        convoy.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Landed, ..Default::default() });
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(convoy)).await;
         let DaemonEvent::ResultDelta(phase_delta) = event_rx.recv().await.expect("phase delta") else {
             panic!("expected result delta");
         };
         let phase_row = &phase_delta.changes.as_convoys().expect("convoy changes")[0];
-        assert_eq!(phase_row.phase, ConvoyPhase::Completed);
+        assert_eq!(phase_row.phase, ConvoyPhase::Landed);
         assert_eq!(phase_row.change_request.as_ref().expect("cached change request").status, flotilla_protocol::ChangeRequestStatus::Open);
 
         apply_next_change_request_resolution(&mut aggregator).await;
@@ -3229,7 +3231,7 @@ mod tests {
         apply_next_change_request_resolution(&mut aggregator).await;
 
         durable.spec.r#ref = Some("feat/durable-updated".into());
-        durable.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Completed, ..Default::default() });
+        durable.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Landed, ..Default::default() });
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(durable)).await;
 
         let reference = aggregator.convoy_ref("flotilla", "convoy-a");

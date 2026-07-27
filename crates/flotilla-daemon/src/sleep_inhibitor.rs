@@ -93,7 +93,7 @@ impl ActiveConvoys {
 fn convoy_requires_inhibitor(convoy: &ResourceObject<Convoy>) -> bool {
     !matches!(
         convoy.status.as_ref().map(|status| status.phase),
-        Some(ConvoyPhase::Completed | ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned)
+        Some(ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned)
     )
 }
 
@@ -255,7 +255,7 @@ mod tests {
 
         convoys
             .update_status("first", &first.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Completed,
+                phase: ConvoyPhase::Landed,
                 ..ConvoyStatus::default()
             })
             .await
@@ -264,7 +264,7 @@ mod tests {
 
         convoys
             .update_status("second", &second.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Completed,
+                phase: ConvoyPhase::Landed,
                 ..ConvoyStatus::default()
             })
             .await

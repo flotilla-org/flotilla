@@ -85,31 +85,31 @@ async fn in_memory_controller_loop_drives_convoy_to_completion() {
     let ready_implement = reconcile_once(&convoys, &templates, "convoy-a", timestamp(11)).await.expect("ready patch after bootstrap");
     assert!(matches!(ready_implement, flotilla_resources::ConvoyStatusPatch::AdvanceWorkToReady { .. }));
 
+    let active = reconcile_once(&convoys, &templates, "convoy-a", timestamp(12)).await.expect("active roll-up patch");
+    assert!(matches!(active, flotilla_resources::ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Active, .. }));
+
     apply_status_patch(
         &convoys,
         "convoy-a",
-        &external_patches::force_work_completed("implement".to_string(), timestamp(12), Some("implemented".to_string())),
+        &external_patches::force_work_completed("implement".to_string(), timestamp(13), Some("implemented".to_string())),
     )
     .await
     .expect("implement completion should succeed");
 
-    let ready_review = reconcile_once(&convoys, &templates, "convoy-a", timestamp(13)).await.expect("review should become ready");
+    let ready_review = reconcile_once(&convoys, &templates, "convoy-a", timestamp(14)).await.expect("review should become ready");
     assert!(matches!(ready_review, flotilla_resources::ConvoyStatusPatch::AdvanceWorkToReady { .. }));
 
     apply_status_patch(
         &convoys,
         "convoy-a",
-        &external_patches::force_work_completed("review".to_string(), timestamp(14), Some("reviewed".to_string())),
+        &external_patches::force_work_completed("review".to_string(), timestamp(15), Some("reviewed".to_string())),
     )
     .await
     .expect("review completion should succeed");
 
-    let completed = reconcile_once(&convoys, &templates, "convoy-a", timestamp(15)).await.expect("completed roll-up patch");
-    assert!(matches!(completed, flotilla_resources::ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Completed, .. }));
-
     let final_convoy = convoys.get("convoy-a").await.expect("final convoy get should succeed");
     let final_status = final_convoy.status.expect("convoy status");
-    assert_eq!(final_status.phase, ConvoyPhase::Completed);
+    assert_eq!(final_status.phase, ConvoyPhase::Landing);
     assert_eq!(final_status.work["implement"].phase, flotilla_resources::WorkPhase::Complete);
     assert_eq!(final_status.work["review"].phase, flotilla_resources::WorkPhase::Complete);
 }
@@ -201,7 +201,7 @@ async fn controller_loop_drives_convoy_progression_without_manual_reconcile_call
         loop {
             let convoy = convoys.get("convoy-loop").await.expect("convoy get should succeed");
             let status = convoy.status.expect("convoy status");
-            if status.phase == ConvoyPhase::Completed {
+            if status.phase == ConvoyPhase::Landed {
                 break;
             }
             tokio::task::yield_now().await;

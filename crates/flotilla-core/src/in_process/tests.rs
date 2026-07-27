@@ -1766,7 +1766,7 @@ async fn fleet_list_shows_simultaneous_convoys_on_kiwi_feta_and_udder() {
 }
 
 #[tokio::test]
-async fn fleet_list_reports_local_crewless_failed_convoys() {
+async fn fleet_list_hides_local_crewless_terminal_convoys() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -1781,14 +1781,7 @@ async fn fleet_list_reports_local_crewless_failed_convoys() {
 
     let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
 
-    assert_eq!(response.rows.len(), 1);
-    let row = &response.rows[0];
-    assert_eq!(row.convoy, "convoy-failed");
-    assert_eq!(row.vessel, "-");
-    assert_eq!(row.crew, "-");
-    assert_eq!(row.crew_state, "failed: missing input 'topic'");
-    assert_eq!(row.host, daemon.host_name);
-    assert_eq!(row.staleness, FleetStaleness::Local);
+    assert!(response.rows.is_empty());
 }
 
 #[tokio::test]
@@ -3851,10 +3844,13 @@ async fn convoy_completion_command_updates_convoy_task_status() {
     assert_eq!(result, CommandValue::Ok);
     let convoy = convoys.get("convoy-a").await.expect("convoy get should succeed");
     let status = convoy.status.expect("convoy status should exist");
+    assert_eq!(status.phase, ConvoyPhase::Landing);
     assert_eq!(status.work["implement"].phase, WorkPhase::Complete);
     assert_eq!(status.work["implement"].message.as_deref(), Some("done"));
 
-    for phase in [WorkPhase::Complete, WorkPhase::Failed, WorkPhase::Cancelled] {
+    assert_eq!(force_complete_work(&daemon, &mut events).await, CommandValue::Ok, "duplicate completion is idempotent");
+
+    for phase in [WorkPhase::Failed, WorkPhase::Cancelled, WorkPhase::Abandoned] {
         let current = convoys.get("convoy-a").await.expect("convoy get should succeed");
         let mut status = current.status.expect("convoy status should exist");
         status.work.get_mut("implement").expect("implement work").phase = phase;
@@ -4518,7 +4514,7 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
     let created = convoys.create(&empty_input_meta("completed-convoy"), &convoy_spec).await.expect("convoy create should succeed");
     convoys
         .update_status("completed-convoy", &created.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Completed,
+            phase: ConvoyPhase::Landed,
             workflow_snapshot: None,
             work: BTreeMap::from([("implement".to_string(), WorkState {
                 phase: WorkPhase::Complete,
@@ -4726,7 +4722,7 @@ async fn convoy_delete_allows_env_scoped_checkout_when_environment_is_destroyed(
 }
 
 #[tokio::test]
-async fn convoy_abandon_command_archives_and_deletes_under_abandoned_gate() {
+async fn convoy_abandon_command_archives_and_retains_terminal_record() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -4786,7 +4782,8 @@ async fn convoy_abandon_command_archives_and_deletes_under_abandoned_gate() {
 
     assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
     assert!(runner.saw_cwd(Path::new("/repo")), "abandon should try to archive checkout work from its checkout path");
-    assert!(matches!(convoys.get("active-convoy").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+    let convoy = convoys.get("active-convoy").await.expect("abandoned convoy record should remain durable");
+    assert_eq!(convoy.status.expect("abandoned convoy should have status").phase, ConvoyPhase::Abandoned);
 }
 
 #[tokio::test]

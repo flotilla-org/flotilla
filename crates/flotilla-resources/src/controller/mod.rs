@@ -78,6 +78,7 @@ pub enum Actuation {
     CreatePresentation { meta: InputMeta, spec: PresentationSpec },
     DeletePresentation { name: String },
     DeleteVessel { name: String },
+    DeleteCheckout { name: String },
 }
 
 pub trait SecondaryWatch: Send + Sync {
@@ -313,6 +314,10 @@ impl<R: Reconciler> ControllerLoop<R> {
             }
             Actuation::DeleteVessel { name } => {
                 let resolver = backend.using::<crate::Vessel>(namespace);
+                Self::delete_if_lifecycle_owned(&resolver, &name).await
+            }
+            Actuation::DeleteCheckout { name } => {
+                let resolver = backend.using::<crate::Checkout>(namespace);
                 Self::delete_if_lifecycle_owned(&resolver, &name).await
             }
         }

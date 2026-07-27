@@ -8,7 +8,7 @@ use crate::{resource::define_resource, status_patch::StatusPatch, workflow_templ
 
 mod reconcile;
 
-pub use reconcile::{reconcile, ConvoyEvent, ConvoyReconciler, ReconcileOutcome};
+pub use reconcile::{reconcile, ConvoyEvent, ConvoyReconciler, ConvoyTeardownRuntime, ReconcileOutcome};
 
 define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
 
@@ -146,10 +146,18 @@ pub enum ConvoyPhase {
     #[default]
     Pending,
     Active,
-    Completed,
+    Anchored,
+    Landing,
+    Landed,
     Failed,
     Cancelled,
     Abandoned,
+}
+
+impl ConvoyPhase {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Landed | Self::Failed | Self::Cancelled | Self::Abandoned)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -431,6 +439,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = message.clone();
                 }
+                enter_landing_if_completion_claims_settled(status);
             }
             Self::MarkWorkFailed { work, finished_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
@@ -466,6 +475,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = message.clone();
                 }
+                enter_landing_if_completion_claims_settled(status);
             }
             Self::MarkCrewFailed { vessel, role, finished_at, message } => {
                 if let Some(work) = status.work.get_mut(vessel) {
@@ -597,6 +607,24 @@ pub mod provisioning_patches {
 
     pub fn work_running(work: String, started_at: DateTime<Utc>, launched_roles: BTreeSet<String>) -> ConvoyStatusPatch {
         ConvoyStatusPatch::WorkRunning { work, started_at, launched_roles }
+    }
+}
+
+fn enter_landing_if_completion_claims_settled(status: &mut ConvoyStatus) {
+    if status.phase != ConvoyPhase::Active || status.work.is_empty() {
+        return;
+    }
+
+    let all_work_claimed_complete = status.work.iter().all(|(work, state)| {
+        state.phase == WorkPhase::Complete
+            || (state.completion_authority == WorkCompletionAuthority::CrewRollup
+                && status
+                    .crew_work
+                    .get(work)
+                    .is_some_and(|crew| !crew.is_empty() && crew.values().all(|member| member.phase == CrewWorkPhase::Done)))
+    });
+    if all_work_claimed_complete {
+        status.phase = ConvoyPhase::Landing;
     }
 }
 
