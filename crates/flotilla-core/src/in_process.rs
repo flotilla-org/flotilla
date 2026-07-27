@@ -3819,9 +3819,21 @@ impl InProcessDaemon {
         intent: &flotilla_protocol::ConvoyStartIntent,
         dispatching_principal_ref: &PrincipalRef,
     ) -> Result<String, String> {
+        self.check_local_free_space_floor().await?;
         let admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
         self.create_convoy(namespace, &admission.name, &admission.spec, intent.auto_attach.into()).await?;
         Ok(admission.name)
+    }
+
+    async fn check_local_free_space_floor(&self) -> Result<(), String> {
+        let config = Arc::clone(&self.config);
+        let host_name = self.host_name.to_string();
+        tokio::task::spawn_blocking(move || {
+            let daemon_config = config.load_daemon_config()?;
+            crate::admission::check_free_space_floor(&host_name, config.state_dir().as_path(), daemon_config.admission.free_space_floor_gib)
+        })
+        .await
+        .map_err(|error| format!("free-space check failed on host `{}`: {error}", self.host_name))?
     }
 
     async fn create_convoy(
@@ -3999,6 +4011,10 @@ impl InProcessDaemon {
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
+        // The target daemon is authoritative for its own capacity. Keep this
+        // ahead of the prepared Convoy claim and snapshot persistence so a
+        // refusal cannot leave any partial resource state behind.
+        self.check_local_free_space_floor().await?;
         let mut annotations = BTreeMap::from([(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), start.workflow_name.clone())]);
         if let Some(name) = &start.placement_policy_name {
             annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), name.clone());
@@ -6621,6 +6637,17 @@ impl InProcessDaemon {
                     });
                     return Ok(id);
                 }
+            }
+            if let Err(message) = self.check_local_free_space_floor().await {
+                let result = flotilla_protocol::CommandValue::Error { message };
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    node_id: self.node_id.clone(),
+                    repo_identity: empty_identity,
+                    repo: None,
+                    result,
+                });
+                return Ok(id);
             }
             let workflow = match self
                 .resource_backend

@@ -361,7 +361,28 @@ pub struct DaemonConfig {
     pub machine_id: Option<String>,
     pub host_name: Option<String>,
     #[serde(default)]
+    pub admission: AdmissionConfig,
+    #[serde(default)]
     pub environments: BTreeMap<String, StaticEnvironmentConfig>,
+}
+
+/// Deterministic admission limits enforced by this host.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AdmissionConfig {
+    /// Refuse new convoy placement when the volume containing Flotilla's
+    /// state directory has less than this many GiB available.
+    #[serde(default = "default_free_space_floor_gib")]
+    pub free_space_floor_gib: u64,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self { free_space_floor_gib: default_free_space_floor_gib() }
+    }
+}
+
+const fn default_free_space_floor_gib() -> u64 {
+    20
 }
 
 /// Static SSH-backed direct execution environment configured in `daemon.toml`.

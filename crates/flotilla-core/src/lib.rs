@@ -1,3 +1,4 @@
+mod admission;
 pub mod agent_adapter;
 pub mod agents;
 pub mod aggregator_projection;

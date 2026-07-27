@@ -30,14 +30,23 @@ use flotilla_resources::{
 };
 
 fn test_config_store(config_dir: std::path::PathBuf) -> Arc<ConfigStore> {
+    test_config_store_with_floor(config_dir, None)
+}
+
+fn test_config_store_with_floor(config_dir: std::path::PathBuf, free_space_floor_gib: Option<u64>) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
-    std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let floor = free_space_floor_gib.map(|floor| format!("\n[admission]\nfree_space_floor_gib = {floor}\n")).unwrap_or_default();
+    std::fs::write(config_dir.join("daemon.toml"), format!("machine_id = \"test-machine\"\n{floor}")).expect("write daemon config");
     Arc::new(ConfigStore::with_base(config_dir))
 }
 
 async fn empty_daemon_named(host_name: &str) -> Arc<InProcessDaemon> {
+    empty_daemon_named_with_floor(host_name, None).await
+}
+
+async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Option<u64>) -> Arc<InProcessDaemon> {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let config = test_config_store(tmp.keep());
+    let config = test_config_store_with_floor(tmp.keep(), free_space_floor_gib);
     InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::new(host_name)).await
 }
 
@@ -525,6 +534,115 @@ async fn convoy_start_uses_live_peer_route_when_presentation_membership_is_stale
         .get("remote-work")
         .await
         .expect("convoy should be created on live placement host");
+}
+
+#[tokio::test]
+async fn remote_convoy_start_enforces_target_free_space_floor_without_leaving_prepared_state() {
+    let leader = empty_daemon_named("leader").await;
+    let follower = empty_daemon_named_with_floor("follower", Some(1_000_000)).await;
+    follower.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
+    let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
+    let namespace = "flotilla";
+    let remote_host_id = topology.follower.local_host_id().expect("follower host identity").to_string();
+    let placement_policy = format!("host-direct-{remote_host_id}");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if topology.leader.resource_backend().using::<PlacementPolicy>(namespace).get(&placement_policy).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("peer host summary should materialize placement policy");
+    seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
+
+    let follower_backend = topology.follower.resource_backend();
+    let workflows_before = follower_backend
+        .clone()
+        .using::<WorkflowTemplate>(namespace)
+        .list()
+        .await
+        .expect("list target workflows before dispatch")
+        .items
+        .into_iter()
+        .map(|resource| resource.metadata.name)
+        .collect::<BTreeSet<_>>();
+    let policies_before = follower_backend
+        .clone()
+        .using::<PlacementPolicy>(namespace)
+        .list()
+        .await
+        .expect("list target policies before dispatch")
+        .items
+        .into_iter()
+        .map(|resource| resource.metadata.name)
+        .collect::<BTreeSet<_>>();
+
+    let mut events = topology.leader.subscribe();
+    let command_id = topology
+        .client
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(
+                    ConvoyStartIntent::builder()
+                        .project_ref("flotilla".to_string())
+                        .name("remote-disk-hungry".to_string())
+                        .branch("fix/remote-disk-hungry".to_string())
+                        .placement_policy(placement_policy)
+                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                        .build(),
+                ),
+            },
+        })
+        .await
+        .expect("remote convoy dispatch should be routed");
+
+    let result = await_command_result(&mut events, command_id).await;
+    let CommandValue::Error { message } = result else {
+        panic!("expected target free-space refusal, got {result:?}");
+    };
+    assert!(message.contains("host `follower`"), "{message}");
+    assert!(message.contains("free is below the 1000000.0 GiB floor"), "{message}");
+    assert!(message.contains("reap settled convoys"), "{message}");
+    assert!(message.contains("scripts/prune-target.sh"), "{message}");
+    assert!(message.contains("pick another host"), "{message}");
+
+    assert!(
+        matches!(follower_backend.using::<Convoy>(namespace).get("remote-disk-hungry").await, Err(ResourceError::NotFound { .. })),
+        "refused remote dispatch must not create a Convoy"
+    );
+    assert_eq!(
+        follower_backend
+            .clone()
+            .using::<WorkflowTemplate>(namespace)
+            .list()
+            .await
+            .expect("list target workflows after dispatch")
+            .items
+            .into_iter()
+            .map(|resource| resource.metadata.name)
+            .collect::<BTreeSet<_>>(),
+        workflows_before,
+        "refused remote dispatch must not persist a prepared workflow snapshot"
+    );
+    assert_eq!(
+        follower_backend
+            .using::<PlacementPolicy>(namespace)
+            .list()
+            .await
+            .expect("list target policies after dispatch")
+            .items
+            .into_iter()
+            .map(|resource| resource.metadata.name)
+            .collect::<BTreeSet<_>>(),
+        policies_before,
+        "refused remote dispatch must not persist a prepared placement snapshot"
+    );
 }
 
 /// A stateless remote issue query should return results end-to-end.

@@ -526,11 +526,15 @@ fn parse_daemon_config_follower() {
 follower = true
 machine_id = "my-machine"
 host_name = "my-desktop"
+
+[admission]
+free_space_floor_gib = 50
 "#;
     let config: DaemonConfig = toml::from_str(toml).unwrap();
     assert!(config.follower);
     assert_eq!(config.machine_id, Some("my-machine".into()));
     assert_eq!(config.host_name, Some("my-desktop".into()));
+    assert_eq!(config.admission.free_space_floor_gib, 50);
     assert!(config.environments.is_empty());
 }
 
@@ -540,6 +544,7 @@ fn parse_daemon_config_defaults() {
     assert!(!config.follower);
     assert_eq!(config.machine_id, None);
     assert_eq!(config.host_name, None);
+    assert_eq!(config.admission.free_space_floor_gib, 20);
     assert!(config.environments.is_empty());
 }
 
