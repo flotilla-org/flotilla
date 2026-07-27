@@ -1325,6 +1325,7 @@ impl Aggregator {
                     .branch(spec.r#ref.clone())
                     .host(self.local_host.clone())
                     .authority(authority)
+                    .maybe_for_convoy(checkout.metadata.labels.get(CONVOY_LABEL).cloned())
                     .build())
             })
             .collect::<Result<Vec<_>, ResourceError>>()?;

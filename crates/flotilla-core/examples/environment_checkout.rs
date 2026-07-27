@@ -66,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provisioned_mounts: vec![flotilla_core::providers::environment::ProvisionedMount::new(
             reference_repo.as_path().to_path_buf(),
             "/ref/repo",
+            flotilla_core::providers::environment::ProvisionedMountMode::Ro,
         )],
     };
     let handle = provider.create(env_id, &image, opts).await?;

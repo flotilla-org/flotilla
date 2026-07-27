@@ -7,7 +7,10 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, EnvironmentStatus, HostName, ImageSource};
 
-use super::{docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner, CreateOpts, EnvironmentProvider, ProvisionedMount};
+use super::{
+    docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner, CreateOpts, EnvironmentProvider, ProvisionedMount,
+    ProvisionedMountMode,
+};
 use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
 
 /// A mock CommandRunner that records all (cmd, args, cwd) tuples passed to run/run_output.
@@ -296,7 +299,7 @@ async fn create_preserves_reference_repo_mount_metadata() {
         tokens: vec![],
         daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
         working_directory: None,
-        provisioned_mounts: vec![ProvisionedMount::new(reference_repo.as_path().to_path_buf(), "/ref/repo")],
+        provisioned_mounts: vec![ProvisionedMount::new(reference_repo.as_path().to_path_buf(), "/ref/repo", ProvisionedMountMode::Ro)],
     };
 
     let id = EnvironmentId::new("test-env-metadata");
@@ -304,8 +307,39 @@ async fn create_preserves_reference_repo_mount_metadata() {
 
     assert_eq!(
         handle.provisioned_mounts(),
-        vec![ProvisionedMount::new(reference_repo.as_path().to_path_buf(), "/ref/repo")],
+        vec![ProvisionedMount::new(reference_repo.as_path().to_path_buf(), "/ref/repo", ProvisionedMountMode::Ro,)],
         "docker provisioned environments should retain flotilla-managed bind mount metadata",
+    );
+}
+
+#[tokio::test]
+async fn create_uses_requested_mount_modes_in_docker_arguments() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let image = ImageId::new("ubuntu:22.04");
+    let opts = CreateOpts {
+        tokens: vec![],
+        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        working_directory: None,
+        provisioned_mounts: vec![
+            ProvisionedMount::new("/host/workspace", "/workspace", ProvisionedMountMode::Rw),
+            ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro),
+        ],
+    };
+
+    provider.create(EnvironmentId::new("test-env-mount-modes"), &image, opts).await.expect("create");
+
+    let calls = runner.calls();
+    let (_, args, _) = &calls[0];
+    assert!(
+        args.windows(2).any(|pair| pair == ["-v", "/host/workspace:/workspace:rw"]),
+        "writable workspace mount should be passed to docker as :rw; args: {args:?}",
+    );
+    assert!(
+        args.windows(2).any(|pair| pair == ["-v", "/host/reference-repo:/ref/repo:ro"]),
+        "read-only reference mount should be passed to docker as :ro; args: {args:?}",
     );
 }
 
@@ -317,7 +351,8 @@ async fn list_preserves_reference_repo_mount_metadata() {
         Ok("container-id-123".into()),
         Ok(format!(
             "container-1\ttest-env-list\tubuntu:22.04\t{}\n",
-            serde_json::to_string(&vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo")]).expect("serialize mount metadata")
+            serde_json::to_string(&vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro,)])
+                .expect("serialize mount metadata")
         )),
     ]));
     let provider = DockerEnvironmentProvider::new(runner.clone());
@@ -326,7 +361,7 @@ async fn list_preserves_reference_repo_mount_metadata() {
         tokens: vec![],
         daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
         working_directory: None,
-        provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo")],
+        provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
     };
 
     provider.create(EnvironmentId::new("test-env-list"), &image, opts).await.expect("create");
@@ -335,7 +370,7 @@ async fn list_preserves_reference_repo_mount_metadata() {
     assert_eq!(handles.len(), 1);
     assert_eq!(
         handles[0].provisioned_mounts(),
-        vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo")],
+        vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
         "docker list should preserve flotilla-managed bind mount metadata",
     );
 }
@@ -352,7 +387,7 @@ async fn list_fails_on_malformed_reference_repo_mount_metadata() {
         tokens: vec![],
         daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
         working_directory: None,
-        provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo")],
+        provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
     };
 
     provider.create(EnvironmentId::new("test-env-list-malformed"), &image, opts).await.expect("create");
@@ -372,7 +407,7 @@ async fn list_rejects_missing_reference_repo_mount_metadata() {
         tokens: vec![],
         daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
         working_directory: None,
-        provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo")],
+        provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
     };
 
     provider.create(EnvironmentId::new("test-env-list-missing"), &image, opts).await.expect("create");

@@ -20,7 +20,7 @@ use flotilla_protocol::{
     arg::{flatten, Arg},
     commands::RepositoryIdentityChange,
     qualified_path::{HostId, QualifiedPath},
-    result_set::{ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
+    result_set::{CheckoutRow, ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
     AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, CorrelationKey, CrewCommandContext, CrewListMember,
     CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus,
     FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
@@ -435,6 +435,7 @@ fn fleet_row_attach_reference_label(row: &FleetListRow) -> String {
 enum AttachTarget {
     Local(Box<flotilla_resources::ResourceObject<ResourceTerminalSession>>),
     Replica { row: Box<FleetListRow> },
+    Checkout(Box<CheckoutRow>),
 }
 
 impl AttachTarget {
@@ -471,6 +472,17 @@ impl AttachTarget {
                     .maybe_role(role)
                     .build();
                 Ok(ResolvedAttach { command, binding: Some(binding) })
+            }
+            Self::Checkout(row) => {
+                if !transient {
+                    return Err(format!("checkout '{}' is only available as a transient attach target", row.path));
+                }
+                let command = if row.host == daemon.host_name {
+                    daemon.local_checkout_terminal_command(row).await?
+                } else {
+                    daemon.recursive_attach_command_for_remote(&row.host, reference, true).await?
+                };
+                Ok(ResolvedAttach { command, binding: None })
             }
         }
     }
@@ -654,6 +666,24 @@ fn replica_staleness(entry: &FleetReplicaCacheEntry, now: DateTime<Utc>) -> Flee
         FleetStaleness::Stale { last_sync }
     } else {
         FleetStaleness::Fresh { last_sync }
+    }
+}
+
+fn format_resource_replication_failures(failures: &[ResourceReplicationFailure]) -> Option<String> {
+    if failures.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "resource replication failed: {}",
+        failures.iter().map(|failure| format!("{}: {}", failure.kind, failure.message)).collect::<Vec<_>>().join("; ")
+    ))
+}
+
+fn join_replica_errors(first: Option<&str>, second: Option<&str>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(message), None) | (None, Some(message)) => Some(message.to_string()),
+        (None, None) => None,
     }
 }
 
@@ -1185,6 +1215,12 @@ struct FleetReplicaCacheEntry {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ResourceReplicationFailure {
+    kind: String,
+    message: String,
+}
+
 const SUPERSEDED_BY_ANNOTATION: &str = "flotilla.work/superseded-by";
 
 #[derive(bon::Builder)]
@@ -1504,6 +1540,7 @@ pub struct InProcessDaemon {
     provisioning_namespace: std::sync::RwLock<String>,
     fleet_replica_cache: RwLock<HashMap<HostName, FleetReplicaCacheEntry>>,
     fleet_replica_tx: broadcast::Sender<Vec<FleetReplicaSnapshot>>,
+    resource_replication_failures: RwLock<HashMap<NodeId, BTreeMap<String, String>>>,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
     local_placement_provider_statuses: RwLock<Vec<HostProviderStatus>>,
 }
@@ -1693,6 +1730,7 @@ impl InProcessDaemon {
             provisioning_namespace: std::sync::RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
             fleet_replica_cache: RwLock::new(HashMap::new()),
             fleet_replica_tx,
+            resource_replication_failures: RwLock::new(HashMap::new()),
             repository_inspector: RwLock::new(None),
             local_placement_provider_statuses: RwLock::new(Vec::new()),
         });
@@ -2151,6 +2189,25 @@ impl InProcessDaemon {
             .await;
     }
 
+    pub async fn begin_peer_resource_replication(&self, peer: &NodeId) {
+        self.resource_replication_failures.write().await.remove(peer);
+    }
+
+    pub async fn report_resource_replication_failure(&self, peer: &NodeId, kind: &str, message: &str) {
+        self.resource_replication_failures.write().await.entry(peer.clone()).or_default().insert(kind.to_string(), message.to_string());
+    }
+
+    pub async fn report_resource_replication_healthy(&self, peer: &NodeId, kind: &str) {
+        let mut failures = self.resource_replication_failures.write().await;
+        let Some(peer_failures) = failures.get_mut(peer) else {
+            return;
+        };
+        peer_failures.remove(kind);
+        if peer_failures.is_empty() {
+            failures.remove(peer);
+        }
+    }
+
     pub async fn publish_peer_summary(&self, summary: HostSummary) {
         if let Err(error) = self.materialize_peer_host_direct_placement(&summary).await {
             warn!(peer = %summary.node.node_id, %error, "failed to materialize peer host-direct placement");
@@ -2330,16 +2387,13 @@ impl InProcessDaemon {
             return Err(format!("namespace `{requested_namespace}` is not served by this daemon (configured namespace: `{namespace}`)"));
         }
         let fallback_principal = PrincipalRef::implicit_for_namespace(&namespace);
-        let mut admission =
-            self.prepare_convoy_admission(&namespace, intent, dispatching_principal_ref.unwrap_or(&fallback_principal)).await?;
+        let admission = self.prepare_convoy_admission(&namespace, intent, dispatching_principal_ref.unwrap_or(&fallback_principal)).await?;
         let workflow_value = serde_json::to_value(&admission.workflow).map_err(|error| error.to_string())?;
-        let workflow_name = prepared_snapshot_name(&admission.name, "workflow", &workflow_value)?;
-        admission.spec.workflow_ref.clone_from(&workflow_name);
+        let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
         let (placement_policy_name, placement_policy_spec) = match admission.placement_policy {
             Some(spec) => {
                 let value = serde_json::to_value(spec).map_err(|error| error.to_string())?;
-                let name = prepared_snapshot_name(&admission.name, "placement", &value)?;
-                admission.spec.placement_policy = Some(name.clone());
+                let name = prepared_snapshot_name("placement", &value)?;
                 (Some(name), Some(value))
             }
             None => (None, None),
@@ -3195,11 +3249,11 @@ async fn ensure_default_workflows(backend: &ResourceBackend, namespace: &str) ->
     Ok(())
 }
 
-fn prepared_snapshot_name(convoy_name: &str, kind: &str, spec: &serde_json::Value) -> Result<String, String> {
+fn prepared_snapshot_name(kind: &str, spec: &serde_json::Value) -> Result<String, String> {
     let encoded = serde_json::to_vec(spec).map_err(|error| error.to_string())?;
     let digest = Sha256::digest(encoded);
     let suffix = digest[..6].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-    Ok(format!("{convoy_name}-remote-{kind}-{suffix}"))
+    Ok(format!("{kind}-snapshot-{suffix}"))
 }
 
 async fn ensure_prepared_workflow_snapshot(
@@ -3213,7 +3267,16 @@ async fn ensure_prepared_workflow_snapshot(
         Ok(existing) if existing.spec == *spec => Ok(()),
         Ok(_) => Err(format!("prepared workflow snapshot {name} already exists with different contents")),
         Err(ResourceError::NotFound { .. }) => templates
-            .create(&InputMeta::builder().name(name.to_string()).build(), spec)
+            .create(
+                &InputMeta::builder()
+                    .name(name.to_string())
+                    .labels(BTreeMap::from([(
+                        flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(),
+                        flotilla_resources::WORKFLOW_SNAPSHOT_KIND.to_string(),
+                    )]))
+                    .build(),
+                spec,
+            )
             .await
             .map(|_| ())
             .map_err(|error| error.to_string()),
@@ -3231,9 +3294,20 @@ async fn ensure_prepared_placement_snapshot(
     match policies.get(name).await {
         Ok(existing) if existing.spec == *spec => Ok(()),
         Ok(_) => Err(format!("prepared placement snapshot {name} already exists with different contents")),
-        Err(ResourceError::NotFound { .. }) => {
-            policies.create(&InputMeta::builder().name(name.to_string()).build(), spec).await.map(|_| ()).map_err(|error| error.to_string())
-        }
+        Err(ResourceError::NotFound { .. }) => policies
+            .create(
+                &InputMeta::builder()
+                    .name(name.to_string())
+                    .labels(BTreeMap::from([(
+                        flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(),
+                        flotilla_resources::PLACEMENT_SNAPSHOT_KIND.to_string(),
+                    )]))
+                    .build(),
+                spec,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
         Err(error) => Err(error.to_string()),
     }
 }
@@ -3271,7 +3345,12 @@ async fn ensure_repository_and_default_project_workflow(
     flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(namespace), repository_key, repository_spec)
         .await
         .map_err(|error| error.to_string())?;
-    ensure_default_workflows(backend, namespace).await
+    ensure_default_workflows(backend, namespace).await?;
+    flotilla_resources::PreparedSnapshotGarbageCollector::new(backend.clone(), namespace)
+        .collect(None)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: String) -> Result<ProjectSpec, String> {
@@ -3712,8 +3791,22 @@ impl InProcessDaemon {
         spec: &ConvoySpec,
         dispatch_regard: ConvoyDispatchRegard,
     ) -> Result<(), String> {
+        self.create_convoy_with_annotations(namespace, name, spec, dispatch_regard, BTreeMap::new()).await
+    }
+
+    async fn create_convoy_with_annotations(
+        &self,
+        namespace: &str,
+        name: &str,
+        spec: &ConvoySpec,
+        dispatch_regard: ConvoyDispatchRegard,
+        annotations: BTreeMap<String, String>,
+    ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        convoys.create(&InputMeta::builder().name(name.to_string()).build(), spec).await.map_err(|error| error.to_string())?;
+        convoys
+            .create(&InputMeta::builder().name(name.to_string()).annotations(annotations).build(), spec)
+            .await
+            .map_err(|error| error.to_string())?;
         if dispatch_regard == ConvoyDispatchRegard::Emit {
             if let Err(error) = self.emit_implicit_convoy_regard(namespace, name, &spec.dispatching_principal_ref).await {
                 warn!(%error, %namespace, %name, "failed to emit convoy dispatch regard");
@@ -3829,13 +3922,17 @@ impl InProcessDaemon {
             serde_json::from_value(start.convoy_spec.clone()).map_err(|error| format!("invalid prepared convoy spec: {error}"))?;
         let workflow_spec: WorkflowTemplateSpec =
             serde_json::from_value(start.workflow_spec.clone()).map_err(|error| format!("invalid prepared workflow snapshot: {error}"))?;
-        if convoy_spec.workflow_ref != start.workflow_name {
-            return Err("prepared convoy workflow reference does not match its snapshot name".to_string());
+        let expected_workflow_name = prepared_snapshot_name("workflow", &start.workflow_spec)
+            .map_err(|error| format!("invalid prepared workflow snapshot: {error}"))?;
+        if expected_workflow_name != start.workflow_name {
+            return Err("prepared workflow snapshot name does not match its contents".to_string());
         }
         let placement_spec = match (&start.placement_policy_name, &start.placement_policy_spec) {
             (Some(name), Some(value)) => {
-                if convoy_spec.placement_policy.as_deref() != Some(name) {
-                    return Err("prepared convoy placement reference does not match its snapshot name".to_string());
+                let expected_name =
+                    prepared_snapshot_name("placement", value).map_err(|error| format!("invalid prepared placement snapshot: {error}"))?;
+                if expected_name != *name {
+                    return Err("prepared placement snapshot name does not match its contents".to_string());
                 }
                 let spec: PlacementPolicySpec =
                     serde_json::from_value(value.clone()).map_err(|error| format!("invalid prepared placement snapshot: {error}"))?;
@@ -3862,11 +3959,60 @@ impl InProcessDaemon {
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
-        ensure_prepared_workflow_snapshot(&self.resource_backend, &namespace, &start.workflow_name, &workflow_spec).await?;
-        if let Some((name, spec)) = placement_spec {
-            ensure_prepared_placement_snapshot(&self.resource_backend, &namespace, name, &spec).await?;
+        let mut annotations = BTreeMap::from([(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), start.workflow_name.clone())]);
+        if let Some(name) = &start.placement_policy_name {
+            annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), name.clone());
         }
-        self.create_convoy(&namespace, &start.name, &convoy_spec, start.dispatch_regard).await
+        annotations.insert(flotilla_resources::PREPARED_SNAPSHOT_PENDING_ANNOTATION.to_string(), "true".to_string());
+        self.create_convoy_with_annotations(
+            &namespace,
+            &start.name,
+            &convoy_spec,
+            flotilla_protocol::ConvoyDispatchRegard::Suppress,
+            annotations,
+        )
+        .await?;
+
+        let prepared = async {
+            ensure_prepared_workflow_snapshot(&self.resource_backend, &namespace, &start.workflow_name, &workflow_spec).await?;
+            if let Some((name, spec)) = &placement_spec {
+                ensure_prepared_placement_snapshot(&self.resource_backend, &namespace, name, spec).await?;
+            }
+            self.finish_prepared_convoy_claim(&namespace, &start.name).await
+        }
+        .await;
+        if let Err(error) = prepared {
+            if let Err(cleanup_error) = convoys.delete(&start.name).await {
+                warn!(%cleanup_error, %namespace, convoy = %start.name, "failed to remove incomplete prepared convoy claim");
+            }
+            if let Err(cleanup_error) = flotilla_resources::PreparedSnapshotGarbageCollector::new(self.resource_backend.clone(), &namespace)
+                .collect(Some(&start.name))
+                .await
+            {
+                warn!(%cleanup_error, %namespace, convoy = %start.name, "failed to collect snapshots after prepared convoy admission error");
+            }
+            return Err(error);
+        }
+        if start.dispatch_regard == flotilla_protocol::ConvoyDispatchRegard::Emit {
+            if let Err(error) = self.emit_implicit_convoy_regard(&namespace, &start.name, &convoy_spec.dispatching_principal_ref).await {
+                warn!(%error, %namespace, convoy = %start.name, "failed to emit convoy dispatch regard");
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_prepared_convoy_claim(&self, namespace: &str, name: &str) -> Result<(), String> {
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        loop {
+            let convoy = convoys.get(name).await.map_err(|error| error.to_string())?;
+            let mut meta = InputMeta::from(&convoy.metadata);
+            meta.annotations.remove(flotilla_resources::PREPARED_SNAPSHOT_PENDING_ANNOTATION);
+            match convoys.update(&meta, &convoy.metadata.resource_version, &convoy.spec).await {
+                Ok(_) => return Ok(()),
+                Err(ResourceError::Conflict { .. }) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
     }
 
     async fn supervise_convoy_start(&self, task: ConvoyStartTask) {
@@ -4845,10 +4991,21 @@ impl InProcessDaemon {
         let mut replicas = Vec::new();
         let now = Utc::now();
         let configured_hosts = self.config.load_hosts().map(|hosts| hosts.hosts).unwrap_or_default();
+        let failures = self.resource_replication_failures.read().await.clone();
+        let mut replication_failures_by_host = HashMap::<HostName, Vec<ResourceReplicationFailure>>::new();
+        for (peer, peer_failures) in failures {
+            let host = self.host_registry.host_name_for_node(&peer).await.unwrap_or_else(|| HostName::new(peer.as_str()));
+            replication_failures_by_host
+                .entry(host)
+                .or_default()
+                .extend(peer_failures.into_iter().map(|(kind, message)| ResourceReplicationFailure { kind, message }));
+        }
         let cache = self.fleet_replica_cache.read().await;
 
         for (label, remote) in configured_hosts {
             let host = HostName::new(remote.expected_host_name);
+            let replication_failures = replication_failures_by_host.remove(&host).unwrap_or_default();
+            let replication_error = format_resource_replication_failures(&replication_failures);
             match cache.get(&host) {
                 Some(entry) => {
                     let staleness = replica_staleness(entry, now);
@@ -4858,15 +5015,16 @@ impl InProcessDaemon {
                     }));
                     replicas.push(FleetReplicaStatus {
                         host,
-                        reachable: entry.last_error.is_none(),
+                        reachable: entry.last_error.is_none() && replication_error.is_none(),
                         last_sync: entry.last_sync,
                         generation: entry.generation.clone(),
                         skipped_records: entry.skipped_records,
                         first_parse_error: entry.first_parse_error.clone(),
-                        message: entry.last_error.clone(),
+                        message: join_replica_errors(entry.last_error.as_deref(), replication_error.as_deref()),
                     });
                 }
                 None => {
+                    let unsynced = format!("replica source '{label}' has not synced yet");
                     replicas.push(FleetReplicaStatus {
                         host,
                         reachable: false,
@@ -4874,10 +5032,21 @@ impl InProcessDaemon {
                         generation: None,
                         skipped_records: 0,
                         first_parse_error: None,
-                        message: Some(format!("replica source '{label}' has not synced yet")),
+                        message: join_replica_errors(Some(&unsynced), replication_error.as_deref()),
                     });
                 }
             }
+        }
+        for (host, failures) in replication_failures_by_host {
+            replicas.push(FleetReplicaStatus {
+                host,
+                reachable: false,
+                last_sync: None,
+                generation: None,
+                skipped_records: 0,
+                first_parse_error: None,
+                message: format_resource_replication_failures(&failures),
+            });
         }
 
         rows.sort_by(|left, right| {
@@ -5720,6 +5889,21 @@ impl InProcessDaemon {
             });
         }
 
+        let checkout_set = self
+            .aggregator_projection_state()
+            .await
+            .result_set_for(&flotilla_protocol::QueryId::Checkouts { scope: None })
+            .await
+            .expect("checkout query is always materialized");
+        if let Rows::Checkouts { rows, .. } = checkout_set.rows {
+            candidates.extend(rows.into_iter().filter(|row| row.for_convoy.is_none()).map(|row| AttachCandidate {
+                label: format!("{} ({})", row.path, row.host),
+                references: vec![row.path.clone()],
+                host: row.host.clone(),
+                target: AttachTarget::Checkout(Box::new(row)),
+            }));
+        }
+
         let configured_replica_hosts: HashSet<HostName> = self
             .config
             .load_hosts()
@@ -5785,6 +5969,30 @@ impl InProcessDaemon {
         }
         drop(cache);
         Ok(AttachCandidateIndex::new(candidates))
+    }
+
+    async fn local_checkout_terminal_command(&self, checkout: &CheckoutRow) -> Result<String, String> {
+        let cwd = ExecutionEnvironmentPath::new(&checkout.path);
+        let discovery = discover_repo_for_environment(
+            &self.environment_manager,
+            &self.discovery,
+            &self.config,
+            &self.local_environment_id,
+            &self.local_environment_id,
+            cwd.as_path(),
+        )
+        .await
+        .map_err(|error| format!("checkout {} provider discovery failed: {error}", checkout.path))?;
+        let pool = discovery
+            .registry
+            .terminal_pools
+            .preferred()
+            .cloned()
+            .ok_or_else(|| format!("no terminal pool available for checkout {}", checkout.path))?;
+        let session_name = transient_checkout_session_name(checkout);
+        let command = "${SHELL:-/bin/sh}";
+        pool.ensure_session(&session_name, command, &cwd, &Vec::new(), &[]).await?;
+        pool.attach_command(&session_name, command, &cwd, &Vec::new()).await
     }
 
     /// Resolve the attach command for a locally-known session, returning it
@@ -6884,6 +7092,15 @@ impl InProcessDaemon {
 
         Ok(id)
     }
+}
+
+fn transient_checkout_session_name(checkout: &CheckoutRow) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(checkout.host.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(checkout.path.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!("flotilla-checkout-{}", &digest[..32])
 }
 
 async fn execute_local_remote_step_batch(
