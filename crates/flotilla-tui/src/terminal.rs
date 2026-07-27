@@ -1,9 +1,7 @@
-#[cfg(unix)]
-use std::sync::Once;
 use std::{
     collections::HashSet,
     io::stdout,
-    sync::{LazyLock, Mutex},
+    sync::{LazyLock, Mutex, MutexGuard, Once},
 };
 
 use crossterm::{event::DisableMouseCapture, execute};
@@ -35,6 +33,7 @@ trait AttachCommandRunner {
 struct SystemAttachCommandRunner;
 
 static ACTIVE_ATTACH_BRIDGES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static ATTACH_PANIC_HOOK: Once = Once::new();
 #[cfg(unix)]
 static ATTACH_SIGNAL_HANDLER: Once = Once::new();
 
@@ -44,18 +43,25 @@ impl AttachCommandRunner for SystemAttachCommandRunner {
     }
 }
 
+fn active_attach_bridges() -> MutexGuard<'static, HashSet<String>> {
+    match ACTIVE_ATTACH_BRIDGES.lock() {
+        Ok(bridges) => bridges,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn register_attach_bridge(bridge: &str) {
-    ACTIVE_ATTACH_BRIDGES.lock().expect("active attach bridge lock poisoned").insert(bridge.to_string());
+    active_attach_bridges().insert(bridge.to_string());
 }
 
 fn kill_attach_bridge(bridge: &str, runner: &mut dyn AttachCommandRunner) {
-    if ACTIVE_ATTACH_BRIDGES.lock().expect("active attach bridge lock poisoned").remove(bridge) {
+    if active_attach_bridges().remove(bridge) {
         let _ = runner.status("cleat", &["kill".to_string(), bridge.to_string()]);
     }
 }
 
 fn kill_all_attach_bridges() {
-    let bridges: Vec<_> = ACTIVE_ATTACH_BRIDGES.lock().expect("active attach bridge lock poisoned").drain().collect();
+    let bridges: Vec<_> = active_attach_bridges().drain().collect();
     let mut runner = SystemAttachCommandRunner;
     for bridge in bridges {
         let _ = runner.status("cleat", &["kill".to_string(), bridge]);
@@ -133,7 +139,8 @@ fn run_send_keys_attach(
 /// Execute an interactive attach plan and return the attached process status.
 pub fn run_attach_plan(plan: &ResolvedAttachPlan) -> Result<std::process::ExitStatus, String> {
     // Standalone CLI and convoy auto-attach paths do not pass through TUI
-    // startup, so install the idempotent bridge cleanup handler here too.
+    // startup, so install the idempotent bridge cleanup hooks here too.
+    install_panic_hook();
     #[cfg(unix)]
     install_sigterm_handler();
 
@@ -169,22 +176,25 @@ pub fn run_temporary_attach(plan: &ResolvedAttachPlan) -> (ratatui::DefaultTermi
 
 /// Install a panic hook that restores the terminal before printing the panic.
 ///
-/// Must be called after `ratatui::init()`. Wraps whatever hook is currently
-/// installed (including color_eyre's) so error reporting still works.
+/// Safe to call before terminal initialization and more than once. Wraps
+/// whatever hook is currently installed (including color_eyre's) so error
+/// reporting still works.
 pub fn install_panic_hook() {
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        kill_all_attach_bridges();
-        hook(info);
-    }));
+    ATTACH_PANIC_HOOK.call_once(|| {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            kill_all_attach_bridges();
+            hook(info);
+        }));
+    });
 }
 
 /// Spawn a background task that listens for SIGINT or SIGTERM and cleanly exits.
 ///
-/// Must be called after `ratatui::init()` within a tokio runtime.
-/// Covers the entire process lifetime — including the startup window
-/// before the event loop begins.
+/// Must be called within a tokio runtime. Safe before terminal initialization
+/// and safe to call more than once. Covers the entire process lifetime,
+/// including the startup window before the event loop begins.
 #[cfg(unix)]
 pub fn install_sigterm_handler() {
     ATTACH_SIGNAL_HANDLER.call_once(|| {
