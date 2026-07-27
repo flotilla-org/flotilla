@@ -405,6 +405,7 @@ fn bootstrap_outcome(
                 stance: vessel.stance,
                 depends_on: vessel.depends_on.clone(),
                 repository_refs: vessel.repository_refs.clone(),
+                credential_refs: vessel.credential_refs.clone(),
                 crew: vessel.crew.iter().map(|member| instantiate_process(convoy, member)).collect(),
             })
             .collect(),

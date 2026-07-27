@@ -312,6 +312,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
                     stance: Stance::Trusted,
                     depends_on: Vec::new(),
                     repository_refs: None,
+                    credential_refs: Default::default(),
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
                         .source(CrewSource::Tool { command: "cargo test".to_string() })

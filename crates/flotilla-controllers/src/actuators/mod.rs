@@ -48,6 +48,7 @@ impl DockerEnvironmentActuator {
             daemon_socket_path: self.daemon_socket_path.clone(),
             working_directory: None,
             image_pull_policy: spec.pull_policy.into(),
+            docker_config_dir: None,
             provisioned_mounts: spec.mounts.iter().map(provisioned_mount).collect(),
         }
     }

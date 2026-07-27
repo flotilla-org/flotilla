@@ -8,6 +8,7 @@ use crate::{resource::define_resource, retention::ResourceStoreDiagnostics, stat
 define_resource!(Host, "hosts", HostSpec, HostStatus, HostStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
 
 pub const AGENT_ADAPTERS_CAPABILITY: &str = "agent_adapters";
+pub const HELD_CREDENTIALS_CAPABILITY: &str = "held_credentials";
 pub const TERMINAL_POOLS_CAPABILITY: &str = "terminal_pools";
 pub const HEARTBEAT_READY_TTL_SECS: i64 = 60;
 
@@ -29,6 +30,10 @@ pub struct HostStatus {
 impl HostStatus {
     pub fn agent_adapters(&self) -> Result<BTreeSet<String>, serde_json::Error> {
         self.capabilities.get(AGENT_ADAPTERS_CAPABILITY).cloned().map(serde_json::from_value).transpose().map(Option::unwrap_or_default)
+    }
+
+    pub fn held_credentials(&self) -> Result<BTreeSet<String>, serde_json::Error> {
+        self.capabilities.get(HELD_CREDENTIALS_CAPABILITY).cloned().map(serde_json::from_value).transpose().map(Option::unwrap_or_default)
     }
 
     pub fn apply_heartbeat_readiness(&mut self, now: DateTime<Utc>) {

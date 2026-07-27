@@ -76,7 +76,12 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         let env_id_env = format!("FLOTILLA_ENVIRONMENT_ID={}", env_id_str);
         let socket_env = format!("FLOTILLA_DAEMON_SOCKET={CONTAINER_SOCKET_PATH}");
 
-        let mut args = vec![
+        let docker_config = opts.docker_config_dir.as_ref().map(ToString::to_string);
+        let mut args = Vec::new();
+        if let Some(config) = &docker_config {
+            args.extend(["--config", config.as_str()]);
+        }
+        args.extend([
             "run",
             "-d",
             "--pull",
@@ -93,7 +98,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             &socket_env,
             "-e",
             &env_id_env,
-        ];
+        ]);
 
         let mount_specs: Vec<String> = opts
             .provisioned_mounts
