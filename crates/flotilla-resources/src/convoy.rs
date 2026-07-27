@@ -14,6 +14,7 @@ define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
 
 pub const WORKFLOW_SNAPSHOT_ANNOTATION: &str = "flotilla.work/workflow-snapshot";
 pub const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapshot";
+pub const PREPARED_SNAPSHOT_PENDING_ANNOTATION: &str = "flotilla.work/prepared-snapshot-pending";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoySpec {
@@ -63,6 +64,10 @@ pub fn pinned_workflow_ref(convoy: &crate::ResourceObject<Convoy>) -> &str {
 
 pub fn pinned_placement_ref(convoy: &crate::ResourceObject<Convoy>) -> Option<&str> {
     convoy.metadata.annotations.get(PLACEMENT_SNAPSHOT_ANNOTATION).map(String::as_str).or(convoy.spec.placement_policy.as_deref())
+}
+
+pub fn prepared_snapshot_pending(convoy: &crate::ResourceObject<Convoy>) -> bool {
+    convoy.metadata.annotations.contains_key(PREPARED_SNAPSHOT_PENDING_ANNOTATION)
 }
 
 /// Durable source-qualified issue context captured when a convoy is admitted.

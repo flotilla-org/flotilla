@@ -17,7 +17,7 @@ use crate::{
         SecondaryWatch,
     },
     labels::{CONVOY_LABEL, VESSEL_LABEL},
-    pinned_placement_ref, pinned_workflow_ref,
+    pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending,
     presentation::{Presentation, PresentationSpec},
     resource::ResourceObject,
     status_patch::StatusPatch,
@@ -189,6 +189,9 @@ fn reconcile_internal(
     presentations: &BTreeMap<String, ResourceObject<Presentation>>,
     now: DateTime<Utc>,
 ) -> InternalReconcileOutcome {
+    if prepared_snapshot_pending(convoy) {
+        return InternalReconcileOutcome { patch: None, actuations: Vec::new(), events: Vec::new() };
+    }
     let status = convoy.status.clone().unwrap_or_default();
 
     if matches!(status.phase, ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned) {

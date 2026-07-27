@@ -3902,15 +3902,60 @@ impl InProcessDaemon {
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
-        ensure_prepared_workflow_snapshot(&self.resource_backend, &namespace, &start.workflow_name, &workflow_spec).await?;
-        if let Some((name, spec)) = placement_spec {
-            ensure_prepared_placement_snapshot(&self.resource_backend, &namespace, name, &spec).await?;
-        }
         let mut annotations = BTreeMap::from([(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), start.workflow_name.clone())]);
         if let Some(name) = &start.placement_policy_name {
             annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), name.clone());
         }
-        self.create_convoy_with_annotations(&namespace, &start.name, &convoy_spec, start.dispatch_regard, annotations).await
+        annotations.insert(flotilla_resources::PREPARED_SNAPSHOT_PENDING_ANNOTATION.to_string(), "true".to_string());
+        self.create_convoy_with_annotations(
+            &namespace,
+            &start.name,
+            &convoy_spec,
+            flotilla_protocol::ConvoyDispatchRegard::Suppress,
+            annotations,
+        )
+        .await?;
+
+        let prepared = async {
+            ensure_prepared_workflow_snapshot(&self.resource_backend, &namespace, &start.workflow_name, &workflow_spec).await?;
+            if let Some((name, spec)) = &placement_spec {
+                ensure_prepared_placement_snapshot(&self.resource_backend, &namespace, name, spec).await?;
+            }
+            self.finish_prepared_convoy_claim(&namespace, &start.name).await
+        }
+        .await;
+        if let Err(error) = prepared {
+            if let Err(cleanup_error) = convoys.delete(&start.name).await {
+                warn!(%cleanup_error, namespace, convoy = %start.name, "failed to remove incomplete prepared convoy claim");
+            }
+            if let Err(cleanup_error) = flotilla_resources::PreparedSnapshotGarbageCollector::new(self.resource_backend.clone(), &namespace)
+                .collect(Some(&start.name))
+                .await
+            {
+                warn!(%cleanup_error, namespace, convoy = %start.name, "failed to collect snapshots after prepared convoy admission error");
+            }
+            return Err(error);
+        }
+        if start.dispatch_regard == flotilla_protocol::ConvoyDispatchRegard::Emit {
+            if let Err(error) = self.emit_implicit_convoy_regard(&namespace, &start.name, &convoy_spec.dispatching_principal_ref).await {
+                warn!(%error, namespace, convoy = %start.name, "failed to emit convoy dispatch regard");
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_prepared_convoy_claim(&self, namespace: &str, name: &str) -> Result<(), String> {
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        loop {
+            let convoy = convoys.get(name).await.map_err(|error| error.to_string())?;
+            let mut meta = InputMeta::from(&convoy.metadata);
+            meta.annotations.remove(flotilla_resources::PREPARED_SNAPSHOT_PENDING_ANNOTATION);
+            match convoys.update(&meta, &convoy.metadata.resource_version, &convoy.spec).await {
+                Ok(_) => return Ok(()),
+                Err(ResourceError::Conflict { .. }) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
     }
 
     async fn supervise_convoy_start(&self, task: ConvoyStartTask) {
