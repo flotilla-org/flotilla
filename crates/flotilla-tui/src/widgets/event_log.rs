@@ -380,8 +380,8 @@ fn fleet_age(at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     at.map_or_else(|| "-".to_string(), |at| format!("{}s", now.signed_duration_since(at).num_seconds().max(0)))
 }
 
-fn short_generation(generation: Option<&str>) -> &str {
-    generation.map_or("-", |generation| &generation[..generation.len().min(8)])
+fn short_generation(generation: Option<&str>) -> String {
+    generation.map_or_else(|| "-".to_string(), |generation| generation.chars().take(8).collect())
 }
 
 fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame, area: Rect) {
@@ -447,7 +447,7 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
         Constraint::Length(9),
         Constraint::Length(8),
     ];
-    let header = Row::new(["", "Host", "Daemon v/gen/up", "Link", "Heartbeat", "Replica sync/gen", "Crew/Conv", "Disk", "Row"])
+    let header = Row::new(["", "Host", "Daemon v/gen/up", "Link", "Heartbeat", "Replica sync/gen", "Crew/Conv", "Disk", "Staleness"])
         .style(theme.header_style());
     let table = Table::new(rows, widths).header(header).block(Block::bordered().style(theme.block_style()).title(" Fleet Health "));
     frame.render_widget(table, area);

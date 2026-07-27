@@ -188,7 +188,7 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
         "Crew",
         "Convoys",
         "Disk Free",
-        "Row",
+        "Staleness",
         "Diagnosis",
     ]);
     for host in &response.hosts {
