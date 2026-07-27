@@ -19,16 +19,18 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
-    CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus, Selector, Stance,
-    TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
-    Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
-    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL,
-    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer,
+    CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
+    CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment,
+    EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, LifecycleAuthority,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
+    ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus, Selector, Stance, TerminalBrief, TerminalCrewContext,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase,
+    VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
+    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL,
+    VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -936,6 +938,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
                         stance: Default::default(),
                         depends_on: Vec::new(),
                         repository_refs: None,
+                        credential_refs: BTreeSet::new(),
                         crew: Vec::new(),
                     },
                     VesselRequirement {
@@ -943,6 +946,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
                         stance: Default::default(),
                         depends_on: Vec::new(),
                         repository_refs: None,
+                        credential_refs: BTreeSet::new(),
                         crew: processes,
                     },
                 ],
@@ -5160,4 +5164,80 @@ async fn recreated_issue_materialization_replays_even_when_cursor_matches_initia
 
     let events = daemon.subscribe_queries(subscriber, &[QueryCursor { query, since: Some(1) }]).await.expect("recreated subscription");
     assert!(matches!(events.as_slice(), [DaemonEvent::ResultSet(_)]));
+}
+
+#[tokio::test]
+async fn contained_workflow_grants_default_deny_and_admission_names_an_unheld_credential() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    backend
+        .clone()
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&InputMeta::builder().name("model-api".to_string()).build(), &CredentialSpecSpec {
+            consumer: CredentialConsumer::Codex,
+            source: CredentialSource::File { path: "/host/credential".to_string() },
+            lifecycle: CredentialLifecycle::Static,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("create credential declaration");
+    backend
+        .clone()
+        .definitions::<CredentialGrant>("flotilla")
+        .create(
+            &InputMeta::builder().name("contained-model-api".to_string()).build(),
+            &CredentialGrantSpec::builder()
+                .selector(CredentialGrantSelector::builder().stance(Stance::Contained).build())
+                .credentials(BTreeSet::from(["model-api".to_string()]))
+                .build(),
+        )
+        .await
+        .expect("create credential grant");
+    let mut workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![
+            VesselRequirement::builder().name("contained".to_string()).stance(Stance::Contained).crew(Vec::new()).build(),
+            VesselRequirement::builder().name("trusted".to_string()).stance(Stance::Trusted).crew(Vec::new()).build(),
+        ])
+        .build();
+
+    resolve_workflow_credentials(&backend, "flotilla", "project-a", &[], &mut workflow).await.expect("resolve grants");
+    assert_eq!(workflow.vessels[0].credential_refs, BTreeSet::from(["model-api".to_string()]));
+    assert!(workflow.vessels[1].credential_refs.is_empty(), "uncontained workflow behavior remains unchanged");
+
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.create(&InputMeta::builder().name("host-a".to_string()).build(), &HostSpec {}).await.expect("create host");
+    hosts
+        .update_status("host-a", &host.metadata.resource_version, &HostStatus {
+            ready: true,
+            heartbeat_at: Some(Utc::now()),
+            capabilities: BTreeMap::new(),
+            resource_store: None,
+        })
+        .await
+        .expect("mark host ready");
+    let placement = backend
+        .clone()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &InputMeta::builder().name("docker-host-a".to_string()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
+                    host_ref: "host-a".to_string(),
+                    image: "crew:latest".to_string(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::new(),
+                    default_cwd: None,
+                    env: BTreeMap::new(),
+                    checkout: flotilla_resources::DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                })
+                .build(),
+        )
+        .await
+        .expect("create placement");
+
+    let error = validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect_err("host without granted credential must be refused");
+    assert!(error.contains("model-api"));
+    assert!(error.contains("host-a"));
 }

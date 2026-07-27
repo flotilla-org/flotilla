@@ -32,6 +32,9 @@ pub struct VesselRequirement {
     pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_refs: Option<Vec<RepositoryKey>>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub credential_refs: BTreeSet<String>,
     pub crew: Vec<CrewSpec>,
 }
 

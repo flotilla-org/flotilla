@@ -1065,6 +1065,7 @@ dependencies = [
  "flotilla-protocol",
  "flotilla-resources",
  "rstest",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",
