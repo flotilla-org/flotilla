@@ -601,6 +601,7 @@ fn test_environment_manager() -> &'static EnvironmentManager {
             HostId::new("test-local-host"),
             Arc::new(DiscoveryMockRunner::builder().build()),
             EnvironmentBag::new(),
+            Arc::new(vec![]),
         )
     })
 }
@@ -4734,6 +4735,7 @@ async fn normalize_local_provider_hosts_uses_mount_metadata_for_provisioned_chec
         local_host_id.clone(),
         Arc::new(DiscoveryMockRunner::builder().build()),
         EnvironmentBag::new(),
+        Arc::new(vec![]),
     );
 
     let environment_id = EnvironmentId::new("provisioned-env");
@@ -4810,6 +4812,7 @@ async fn normalize_local_provider_hosts_keeps_environment_qualified_checkout_whe
         local_host_id,
         Arc::new(DiscoveryMockRunner::builder().build()),
         EnvironmentBag::new(),
+        Arc::new(vec![]),
     );
 
     let environment_id = EnvironmentId::new("provisioned-env-no-mount");

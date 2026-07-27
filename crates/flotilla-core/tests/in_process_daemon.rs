@@ -1991,7 +1991,7 @@ fn static_ssh_test_discovery(runner: Arc<dyn CommandRunner>) -> DiscoveryRuntime
     let mut runtime = fake_discovery(false);
     runtime.runner = runner;
     runtime.env = Arc::new(TestEnvVars::default());
-    runtime.host_detectors = vec![Box::new(RunnerEchoHostDetector { probe: "REMOTE_MARKER", assertion_key: "REMOTE_MARKER" })];
+    runtime.host_detectors = Arc::new(vec![Box::new(RunnerEchoHostDetector { probe: "REMOTE_MARKER", assertion_key: "REMOTE_MARKER" })]);
     runtime
 }
 
@@ -2003,7 +2003,7 @@ fn static_ssh_test_discovery_with_env_and_detectors(
     let mut runtime = fake_discovery(false);
     runtime.runner = runner;
     runtime.env = env;
-    runtime.host_detectors = host_detectors;
+    runtime.host_detectors = Arc::new(host_detectors);
     runtime
 }
 
@@ -2156,7 +2156,7 @@ hostname = "buildbox.example"
 
     let mut discovery = fake_discovery(false);
     discovery.runner = ssh_runner;
-    discovery.host_detectors = vec![
+    discovery.host_detectors = Arc::new(vec![
         Box::new(flotilla_core::providers::discovery::detectors::generic::CommandDetector::new(
             "git",
             &["--version"],
@@ -2164,7 +2164,7 @@ hostname = "buildbox.example"
         )),
         Box::new(flotilla_core::providers::discovery::detectors::generic::EnvVarDetector::new("TERM")),
         Box::new(flotilla_core::providers::discovery::detectors::generic::EnvVarDetector::new("COLORTERM")),
-    ];
+    ]);
     let daemon = InProcessDaemon::new(vec![repo], Arc::new(ConfigStore::with_base(config_dir)), discovery, HostName::local()).await;
 
     let remote_env_id = EnvironmentId::new("buildbox-env-id");

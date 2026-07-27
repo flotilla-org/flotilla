@@ -496,7 +496,7 @@ impl FactoryRegistry {
 pub struct DiscoveryRuntime {
     pub runner: Arc<dyn CommandRunner>,
     pub env: Arc<dyn EnvVars>,
-    pub host_detectors: Vec<Box<dyn HostDetector>>,
+    pub host_detectors: Arc<Vec<Box<dyn HostDetector>>>,
     pub repo_detectors: Vec<Box<dyn RepoDetector>>,
     pub factories: FactoryRegistry,
     pub(crate) attachable_store: OnceLock<SharedAttachableStore>,
@@ -633,7 +633,7 @@ impl DiscoveryRuntime {
         Self {
             runner: Arc::new(crate::providers::ProcessCommandRunner),
             env: Arc::new(ProcessEnvVars),
-            host_detectors: detectors::default_host_detectors(),
+            host_detectors: Arc::new(detectors::default_host_detectors()),
             repo_detectors: detectors::default_repo_detectors(),
             factories,
             attachable_store: OnceLock::new(),

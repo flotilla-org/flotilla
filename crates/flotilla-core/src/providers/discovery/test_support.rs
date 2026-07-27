@@ -297,11 +297,11 @@ fn minimal_discovery_runtime(follower: bool, runner: std::sync::Arc<dyn CommandR
     super::DiscoveryRuntime {
         runner,
         env: std::sync::Arc::new(TestEnvVars::default()),
-        host_detectors: vec![Box::new(super::detectors::generic::CommandDetector::new(
+        host_detectors: Arc::new(vec![Box::new(super::detectors::generic::CommandDetector::new(
             "git",
             &["--version"],
             super::detectors::generic::parse_first_dotted_version,
-        ))],
+        ))]),
         repo_detectors: super::detectors::default_repo_detectors(),
         factories,
         attachable_store: OnceLock::new(),
@@ -1264,7 +1264,7 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
     DiscoveryRuntime {
         runner,
         env: Arc::new(TestEnvVars::default()),
-        host_detectors: vec![],
+        host_detectors: Arc::new(vec![]),
         repo_detectors: vec![],
         factories: FactoryRegistry {
             vcs: vec![],
