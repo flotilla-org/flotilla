@@ -2441,7 +2441,10 @@ mod tests {
     #[tokio::test]
     async fn provisioned_environment_discovers_and_registers_interior_agent_adapters() {
         let temp = TempDir::new().expect("tempdir");
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"interior-discovery-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
         discovery.host_detectors = flotilla_core::providers::discovery::detectors::default_host_detectors();
         let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
@@ -2499,7 +2502,10 @@ mod tests {
     #[tokio::test]
     async fn provisioned_environment_is_destroyed_when_declared_adapter_is_missing() {
         let temp = TempDir::new().expect("tempdir");
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"interior-rejection-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
         discovery.host_detectors = flotilla_core::providers::discovery::detectors::default_host_detectors();
         let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;

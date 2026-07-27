@@ -1,29 +1,46 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use sysinfo::Disks;
 
 const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
-pub(crate) fn check_free_space_floor(host: &str, path: &Path, floor_gib: u64) -> Result<(), String> {
+pub(crate) trait AvailableSpaceProbe: Send + Sync {
+    fn measure(&self, path: &Path) -> Option<u64>;
+}
+
+struct SystemAvailableSpaceProbe;
+
+impl AvailableSpaceProbe for SystemAvailableSpaceProbe {
+    fn measure(&self, path: &Path) -> Option<u64> {
+        let disks = Disks::new_with_refreshed_list();
+        disks
+            .list()
+            .iter()
+            .filter(|disk| path.starts_with(disk.mount_point()))
+            .max_by_key(|disk| disk.mount_point().components().count())
+            .map(|disk| disk.available_space())
+    }
+}
+
+pub(crate) fn system_available_space_probe() -> Arc<dyn AvailableSpaceProbe> {
+    Arc::new(SystemAvailableSpaceProbe)
+}
+
+pub(crate) fn check_free_space_floor(probe: &dyn AvailableSpaceProbe, host: &str, path: &Path, floor_gib: u64) -> Result<(), String> {
     if floor_gib == 0 {
         return Ok(());
     }
 
     let floor_bytes =
         floor_gib.checked_mul(BYTES_PER_GIB).ok_or_else(|| format!("free-space floor for host `{host}` is too large: {floor_gib} GiB"))?;
-    let free_bytes = measure_available_space(path)
+    let free_bytes = probe
+        .measure(path)
         .ok_or_else(|| format!("placement refused on host `{host}`: free space could not be measured for {}", path.display()))?;
     check_measured_free_space(host, free_bytes, floor_bytes)
 }
 
 pub fn measure_available_space(path: &Path) -> Option<u64> {
-    let disks = Disks::new_with_refreshed_list();
-    disks
-        .list()
-        .iter()
-        .filter(|disk| path.starts_with(disk.mount_point()))
-        .max_by_key(|disk| disk.mount_point().components().count())
-        .map(|disk| disk.available_space())
+    SystemAvailableSpaceProbe.measure(path)
 }
 
 fn check_measured_free_space(host: &str, free_bytes: u64, floor_bytes: u64) -> Result<(), String> {
@@ -52,9 +69,19 @@ fn format_gib(bytes: u64) -> String {
 mod tests {
     use super::*;
 
+    struct FixedAvailableSpaceProbe(Option<u64>);
+
+    impl AvailableSpaceProbe for FixedAvailableSpaceProbe {
+        fn measure(&self, _path: &Path) -> Option<u64> {
+            self.0
+        }
+    }
+
     #[test]
-    fn below_floor_refusal_is_actionable() {
-        let result = check_measured_free_space("kiwi", 12 * BYTES_PER_GIB, 20 * BYTES_PER_GIB);
+    fn injected_space_below_floor_is_refused_with_actionable_error() {
+        let probe = FixedAvailableSpaceProbe(Some(12 * BYTES_PER_GIB));
+
+        let result = check_free_space_floor(&probe, "kiwi", Path::new("/workspace"), 20);
 
         assert_eq!(
             result,
@@ -65,8 +92,20 @@ mod tests {
     }
 
     #[test]
-    fn space_equal_to_floor_is_admitted() {
-        assert_eq!(check_measured_free_space("kiwi", 20 * BYTES_PER_GIB, 20 * BYTES_PER_GIB), Ok(()));
+    fn injected_space_equal_to_floor_is_admitted() {
+        let probe = FixedAvailableSpaceProbe(Some(20 * BYTES_PER_GIB));
+
+        assert_eq!(check_free_space_floor(&probe, "kiwi", Path::new("/workspace"), 20), Ok(()));
+    }
+
+    #[test]
+    fn injected_unmeasurable_space_is_refused() {
+        let probe = FixedAvailableSpaceProbe(None);
+
+        assert_eq!(
+            check_free_space_floor(&probe, "kiwi", Path::new("/workspace"), 20),
+            Err("placement refused on host `kiwi`: free space could not be measured for /workspace".to_string())
+        );
     }
 
     #[test]
@@ -80,6 +119,8 @@ mod tests {
 
     #[test]
     fn zero_floor_disables_the_probe() {
-        assert_eq!(check_free_space_floor("kiwi", Path::new("/path/that/does/not/exist"), 0), Ok(()));
+        let probe = FixedAvailableSpaceProbe(None);
+
+        assert_eq!(check_free_space_floor(&probe, "kiwi", Path::new("/path/that/does/not/exist"), 0), Ok(()));
     }
 }

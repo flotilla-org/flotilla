@@ -25,6 +25,7 @@ use futures::stream;
 use tokio::sync::OnceCell as AsyncOnceCell;
 
 use crate::{
+    admission::{system_available_space_probe, AvailableSpaceProbe},
     agent_adapter::AgentAdapterRegistry,
     attachable::{shared_file_backed_attachable_store, SharedAttachableStore},
     config::ConfigStore,
@@ -500,6 +501,7 @@ impl FactoryRegistry {
 pub struct DiscoveryRuntime {
     pub runner: Arc<dyn CommandRunner>,
     pub env: Arc<dyn EnvVars>,
+    pub(crate) available_space_probe: Arc<dyn AvailableSpaceProbe>,
     pub host_detectors: Vec<Box<dyn HostDetector>>,
     pub repo_detectors: Vec<Box<dyn RepoDetector>>,
     pub factories: FactoryRegistry,
@@ -637,6 +639,7 @@ impl DiscoveryRuntime {
         Self {
             runner: Arc::new(crate::providers::ProcessCommandRunner),
             env: Arc::new(ProcessEnvVars),
+            available_space_probe: system_available_space_probe(),
             host_detectors: detectors::default_host_detectors(),
             repo_detectors: detectors::default_repo_detectors(),
             factories,
