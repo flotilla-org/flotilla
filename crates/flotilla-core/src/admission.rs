@@ -33,9 +33,14 @@ fn check_measured_free_space(host: &str, free_bytes: u64, floor_bytes: u64) -> R
 
     Err(format!(
         "placement refused on host `{host}`: {} free is below the {} floor; reap settled convoys, run scripts/prune-target.sh, or pick another host",
-        format_gib(free_bytes),
+        format_free_gib(free_bytes),
         format_gib(floor_bytes),
     ))
+}
+
+fn format_free_gib(bytes: u64) -> String {
+    let tenths = u128::from(bytes) * 10 / u128::from(BYTES_PER_GIB);
+    format!("{}.{:01} GiB", tenths / 10, tenths % 10)
 }
 
 fn format_gib(bytes: u64) -> String {
@@ -62,6 +67,15 @@ mod tests {
     #[test]
     fn space_equal_to_floor_is_admitted() {
         assert_eq!(check_measured_free_space("kiwi", 20 * BYTES_PER_GIB, 20 * BYTES_PER_GIB), Ok(()));
+    }
+
+    #[test]
+    fn refusal_does_not_round_free_space_up_to_the_floor() {
+        let just_below_floor = 20 * BYTES_PER_GIB - 1;
+
+        let result = check_measured_free_space("kiwi", just_below_floor, 20 * BYTES_PER_GIB);
+
+        assert!(result.expect_err("space below the floor should be refused").contains("19.9 GiB free is below the 20.0 GiB floor"));
     }
 
     #[test]

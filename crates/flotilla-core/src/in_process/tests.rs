@@ -4010,6 +4010,50 @@ async fn convoy_start_refuses_local_placement_below_configured_free_space_floor_
 }
 
 #[tokio::test]
+async fn convoy_create_refuses_local_placement_below_configured_free_space_floor_without_creating_state() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n\n[admission]\nfree_space_floor_gib = 1000000\n")
+        .expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::new("kiwi")).await;
+    let backend = daemon.resource_backend();
+    create_empty_workflow(&backend, "scratch").await;
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "create-disk-hungry".to_string(),
+                workflow_ref: "scratch".to_string(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    let result = wait_for_command_result(&mut events, command_id).await;
+    let CommandValue::Error { message } = result else {
+        panic!("expected free-space refusal, got {result:?}");
+    };
+    assert!(message.contains("host `kiwi`"), "{message}");
+    assert!(message.contains("free is below the 1000000.0 GiB floor"), "{message}");
+    assert!(
+        matches!(backend.using::<Convoy>("flotilla").get("create-disk-hungry").await, Err(ResourceError::NotFound { .. })),
+        "refused ConvoyCreate dispatch must not create a Convoy"
+    );
+}
+
+#[tokio::test]
 async fn direct_repository_admission_snapshots_its_resolved_default_branch() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");

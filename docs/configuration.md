@@ -60,6 +60,15 @@ per host in that host's `~/.config/flotilla/daemon.toml`:
 free_space_floor_gib = 50
 ```
 
+The state-directory volume is the admission proxy for host capacity; checkout
+paths can be configured on other volumes and are not measured by this check.
+Hosts that separate those volumes should provide an equivalent capacity guard
+for each checkout volume.
+
+If Flotilla cannot identify the state-directory volume or measure its available
+space, placement is refused. This fail-closed behavior prevents an unavailable
+measurement from silently disabling admission.
+
 Set the floor to `0` only when an external system provides an equivalent
 capacity guard.
 
