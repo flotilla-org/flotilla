@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{io::IsTerminal, path::Path, sync::Arc, time::Duration};
 
 use flotilla_core::{
     config::ConfigStore,
@@ -29,7 +29,10 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
     let log_dir = state_dir.join(DAEMON_LOG_DIRECTORY);
     let file_appender = rotating_log_writer(&log_dir, DAEMON_LOG_FILE, daemon_config.logging.max_bytes, daemon_config.logging.generations)
         .map_err(|err| format!("open rotating daemon log: {err}"))?;
-    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    // Detached daemons redirect stderr to an unrotated panic log. Keep the
+    // human-readable layer for interactive runs without duplicating the
+    // structured stream into that file.
+    let stderr_layer = std::io::stderr().is_terminal().then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     let file_layer = tracing_subscriber::fmt::layer().json().with_ansi(false).with_writer(file_appender);
     tracing_subscriber::registry().with(filter).with(stderr_layer).with(file_layer).try_init().ok();
 
