@@ -234,6 +234,21 @@ async fn inspect_landed(
     base_ref: Option<&str>,
     observed_at: &str,
 ) -> (IntegrationCondition, Option<LandedEvidence>) {
+    // Git evidence first: a branch with no commits beyond its base has
+    // nothing to land, so it counts as landed without consulting the forge at
+    // all. This keeps untouched checkouts landable in environments where `gh`
+    // is absent or unauthenticated.
+    let comparison = compare_branch_to_base(runner, checkout_path, base_ref).await;
+    if let BaseComparison::Counted { base_ref, count: 0 } = &comparison {
+        return (
+            IntegrationCondition::builder()
+                .value(ConditionValue::True)
+                .details(vec![format!("branch has no commits beyond {base_ref}")])
+                .observed_at(observed_at.to_string())
+                .build(),
+            None,
+        );
+    }
     match runner
         .run_output(
             "gh",
@@ -278,7 +293,7 @@ async fn inspect_landed(
                         )
                     }
                 }
-                None => (inspect_no_change_request(runner, checkout_path, base_ref, observed_at).await, None),
+                None => (landed_without_change_request(&comparison, observed_at), None),
             },
             Ok(_) | Err(_) => (
                 IntegrationCondition::builder()
@@ -308,59 +323,56 @@ async fn inspect_landed(
     }
 }
 
-async fn inspect_no_change_request(
-    runner: &dyn CommandRunner,
-    checkout_path: &Path,
-    base_ref: Option<&str>,
-    observed_at: &str,
-) -> IntegrationCondition {
+enum BaseComparison {
+    /// Base resolved and the commits beyond it counted.
+    Counted { base_ref: String, count: usize },
+    /// Base could not be resolved or compared.
+    Indeterminate { detail: String },
+}
+
+async fn compare_branch_to_base(runner: &dyn CommandRunner, checkout_path: &Path, base_ref: Option<&str>) -> BaseComparison {
     let base_ref = match base_ref {
         Some(base_ref) => base_ref.to_string(),
         None => match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Noop).await {
             Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
             Ok(output) => {
-                return IntegrationCondition::builder()
-                    .value(ConditionValue::Unknown)
-                    .details(vec![non_empty_output_or("no change request exists and the base ref could not be determined", &output.stderr)])
-                    .observed_at(observed_at.to_string())
-                    .build();
+                return BaseComparison::Indeterminate {
+                    detail: non_empty_output_or("the base ref could not be determined", &output.stderr),
+                };
             }
-            Err(error) => {
-                return IntegrationCondition::builder()
-                    .value(ConditionValue::Unknown)
-                    .details(vec![format!("no change request exists and the base ref could not be determined: {error}")])
-                    .observed_at(observed_at.to_string())
-                    .build();
-            }
+            Err(error) => return BaseComparison::Indeterminate { detail: format!("the base ref could not be determined: {error}") },
         },
     };
     let range = format!("{base_ref}..HEAD");
     match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Noop).await {
         Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
-            Ok(0) => IntegrationCondition::builder()
-                .value(ConditionValue::True)
-                .details(vec![format!("no change request exists; branch has no commits beyond {base_ref}")])
-                .observed_at(observed_at.to_string())
-                .build(),
-            Ok(count) => IntegrationCondition::builder()
-                .value(ConditionValue::False)
-                .details(vec![format!("no change request exists; {count} commit{} beyond {base_ref}", if count == 1 { "" } else { "s" })])
-                .observed_at(observed_at.to_string())
-                .build(),
-            Err(_) => IntegrationCondition::builder()
-                .value(ConditionValue::Unknown)
-                .details(vec![format!("could not parse commit count beyond {base_ref}: {}", output.stdout.trim())])
-                .observed_at(observed_at.to_string())
-                .build(),
+            Ok(count) => BaseComparison::Counted { base_ref, count },
+            Err(_) => BaseComparison::Indeterminate {
+                detail: format!("could not parse commit count beyond {base_ref}: {}", output.stdout.trim()),
+            },
         },
-        Ok(output) => IntegrationCondition::builder()
-            .value(ConditionValue::Unknown)
-            .details(vec![non_empty_output_or(&format!("could not compare branch with base ref {base_ref}"), &output.stderr)])
+        Ok(output) => BaseComparison::Indeterminate {
+            detail: non_empty_output_or(&format!("could not compare branch with base ref {base_ref}"), &output.stderr),
+        },
+        Err(error) => BaseComparison::Indeterminate { detail: format!("could not compare branch with base ref {base_ref}: {error}") },
+    }
+}
+
+/// A branch with no visible change request only counts as landed when it has
+/// no commits beyond its base: "work exists but no change request is visible
+/// yet" is not landed — the observation may simply predate the change request
+/// (absence of evidence, not evidence of absence). The nothing-beyond-base
+/// case is answered before the forge lookup and never reaches here.
+fn landed_without_change_request(comparison: &BaseComparison, observed_at: &str) -> IntegrationCondition {
+    match comparison {
+        BaseComparison::Counted { base_ref, count } => IntegrationCondition::builder()
+            .value(ConditionValue::False)
+            .details(vec![format!("no change request exists; {count} commit{} beyond {base_ref}", if *count == 1 { "" } else { "s" })])
             .observed_at(observed_at.to_string())
             .build(),
-        Err(error) => IntegrationCondition::builder()
+        BaseComparison::Indeterminate { detail } => IntegrationCondition::builder()
             .value(ConditionValue::Unknown)
-            .details(vec![format!("could not compare branch with base ref {base_ref}: {error}")])
+            .details(vec![format!("no change request exists and {detail}")])
             .observed_at(observed_at.to_string())
             .build(),
     }
@@ -372,5 +384,64 @@ fn non_empty_output_or(fallback: &str, output: &str) -> String {
         fallback.to_string()
     } else {
         output.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::testing::MockRunner;
+
+    async fn landed_with_responses(responses: Vec<Result<String, String>>) -> IntegrationCondition {
+        let runner = MockRunner::new(responses);
+        let (landed, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), "2026-07-27T00:00:00Z").await;
+        landed
+    }
+
+    #[tokio::test]
+    async fn untouched_branch_is_landed_without_consulting_the_forge() {
+        // One response only: the MockRunner panics on extra calls, so this
+        // also asserts gh is never invoked for a branch with nothing beyond
+        // its base — landing must not depend on forge availability when there
+        // is nothing to land.
+        let landed = landed_with_responses(vec![Ok("0".into())]).await;
+        assert_eq!(landed.value, ConditionValue::True);
+    }
+
+    #[tokio::test]
+    async fn commits_beyond_base_without_change_request_is_not_landed() {
+        // The branch has commits and gh finds no PR: work exists that no
+        // visible change request accounts for — the observation may simply
+        // predate the change request, so the branch must not count as landed.
+        let landed = landed_with_responses(vec![Ok("2".into()), Ok("[]".into())]).await;
+        assert_eq!(landed.value, ConditionValue::False);
+        assert!(landed.details.iter().any(|detail| detail.contains("2 commits beyond main")), "details: {:?}", landed.details);
+    }
+
+    #[tokio::test]
+    async fn open_change_request_is_not_landed() {
+        let landed = landed_with_responses(vec![
+            Ok("2".into()),
+            Ok(r#"[{"number": 1162, "state": "OPEN", "mergedAt": null, "baseRefName": "main"}]"#.into()),
+        ])
+        .await;
+        assert_eq!(landed.value, ConditionValue::False);
+    }
+
+    #[tokio::test]
+    async fn merged_change_request_is_landed() {
+        let landed = landed_with_responses(vec![
+            Ok("2".into()),
+            Ok(r#"[{"number": 1162, "state": "MERGED", "mergedAt": "2026-07-27T00:00:00Z", "baseRefName": "main"}]"#.into()),
+        ])
+        .await;
+        assert_eq!(landed.value, ConditionValue::True);
+    }
+
+    #[tokio::test]
+    async fn indeterminate_base_without_change_request_is_unknown() {
+        let runner = MockRunner::new(vec![Err("fatal: ambiguous argument".into()), Ok("[]".into())]);
+        let (landed, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", None, "2026-07-27T00:00:00Z").await;
+        assert_eq!(landed.value, ConditionValue::Unknown);
     }
 }

@@ -44,8 +44,8 @@ use crate::{
     providers::{
         discovery::{
             test_support::{
-                fake_discovery, fake_discovery_with_provider_set, git_process_discovery, init_git_repo_with_remote, DiscoveryMockRunner,
-                FakeDiscoveryProviders, FakeTerminalPool, MergedPrProcessRunner,
+                fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_runner, git_process_discovery,
+                init_git_repo_with_remote, DiscoveryMockRunner, FakeDiscoveryProviders, FakeTerminalPool, MergedPrProcessRunner,
             },
             EnvironmentAssertion, EnvironmentBag, HostPlatform,
         },
@@ -4743,22 +4743,7 @@ async fn convoy_delete_allows_multi_repo_convoy_with_work_on_only_one_side() {
             ],
             Ok(r#"[{"number":44,"state":"MERGED","mergedAt":"2026-07-27T12:00:00Z","baseRefName":"main"}]"#.into()),
         )
-        .on_run(
-            "gh",
-            &[
-                "pr",
-                "list",
-                "--head",
-                "feature/one-sided-work",
-                "--state",
-                "all",
-                "--json",
-                "number,state,mergedAt,baseRefName",
-                "--limit",
-                "1",
-            ],
-            Ok("[]".into()),
-        )
+        .on_run("git", &["rev-list", "--count", "main..HEAD"], Ok("2\n".into()))
         .on_run("git", &["rev-list", "--count", "main..HEAD"], Ok("0\n".into()))
         .build();
     let mut discovery = fake_discovery(false);
@@ -5584,4 +5569,87 @@ async fn local_convoy_admission_pins_the_grant_resolved_workflow() {
         .await
         .expect("get standalone resolved workflow snapshot");
     assert_eq!(snapshot.spec.vessels[0].credential_refs, BTreeSet::from(["model-api".to_string()]));
+}
+
+#[tokio::test]
+async fn landing_holds_when_fresh_probe_contradicts_stale_vacuous_landed() {
+    // #1163 replay: a checkout's landed condition was recorded True while the
+    // branch was untouched ("nothing to land"), the crew then pushed and
+    // opened a change request, and the convoy entered Landing before any
+    // re-observation. The landing decision must re-probe, hold on the fresh
+    // open-change-request evidence, and the persisted condition must not be
+    // resurrected to True by the evidence latch.
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["rev-list", "--count", "main..HEAD"], Ok("2".into()))
+        .on_run(
+            "gh",
+            &["pr", "list", "--head", "feature/split", "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
+            Ok(r#"[{"number": 1162, "state": "OPEN", "mergedAt": null, "baseRefName": "main"}]"#.into()),
+        )
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .build();
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(&config_base)),
+        fake_discovery_with_runner(false, Arc::new(runner)),
+        HostName::local(),
+    )
+    .await;
+
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    let convoy_spec = ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build();
+    convoys.create(&empty_input_meta("split-convoy"), &convoy_spec).await.expect("convoy create should succeed");
+
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let checkout = checkouts
+        .create(
+            &input_meta_with_labels("checkout-split", BTreeMap::from([(CONVOY_LABEL.to_string(), "split-convoy".to_string())])),
+            &ResourceCheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+                repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
+                env_ref: "env".to_string(),
+                r#ref: "feature/split".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkout".to_string(),
+                clone_ref: "clone-a".to_string(),
+            }),
+        )
+        .await
+        .expect("checkout create should succeed");
+    let stale_vacuous = flotilla_resources::IntegrationCondition::builder()
+        .value(flotilla_resources::ConditionValue::True)
+        .details(vec!["no change request exists for branch".to_string()])
+        .observed_at((chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339())
+        .build();
+    checkouts
+        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &ResourceCheckoutStatus {
+            phase: ResourceCheckoutPhase::Ready,
+            path: Some("/checkout".to_string()),
+            commit: None,
+            branch_provenance: Default::default(),
+            integration: flotilla_resources::CheckoutIntegrationStatus {
+                clean: stale_vacuous.clone(),
+                pushed: stale_vacuous.clone(),
+                landed: stale_vacuous,
+                landed_evidence: None,
+            },
+            message: None,
+        })
+        .await
+        .expect("checkout status should update");
+
+    // First pass: the stale True is re-probed; the open change request holds
+    // Landing and the fresh False observation is persisted un-latched.
+    assert!(!daemon.convoy_change_requests_settled("flotilla", "split-convoy").await.expect("landing evaluation should succeed"));
+    let stored = checkouts.get("checkout-split").await.expect("checkout should exist").status.expect("checkout status");
+    assert_eq!(stored.integration.landed.value, flotilla_resources::ConditionValue::False);
+
+    // Second pass, within the evidence TTL: the recent False is trusted from
+    // cache and still holds Landing.
+    assert!(!daemon.convoy_change_requests_settled("flotilla", "split-convoy").await.expect("landing evaluation should succeed"));
 }

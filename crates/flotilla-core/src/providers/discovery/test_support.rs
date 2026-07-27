@@ -286,6 +286,12 @@ pub fn fake_discovery(follower: bool) -> super::DiscoveryRuntime {
     )
 }
 
+/// Build a `DiscoveryRuntime` whose local environment runs entirely through
+/// the given (typically mock) command runner.
+pub fn fake_discovery_with_runner(follower: bool, runner: std::sync::Arc<dyn CommandRunner>) -> super::DiscoveryRuntime {
+    minimal_discovery_runtime(follower, runner)
+}
+
 /// Build a `DiscoveryRuntime` that allows real git commands while still
 /// avoiding ambient host-tool probes like gh, Codex, Claude, or cmux.
 pub fn git_process_discovery(follower: bool) -> super::DiscoveryRuntime {
