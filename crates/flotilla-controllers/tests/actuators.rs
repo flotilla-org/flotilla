@@ -104,6 +104,7 @@ async fn environment_actuator_translates_mounts_into_provider_create_opts() {
     let spec = DockerEnvironmentSpec {
         host_ref: "01HXYZ".to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
+        declared_agent_adapters: Default::default(),
         mounts: vec![EnvironmentMount {
             source_path: "/Users/alice/dev/flotilla".to_string(),
             target_path: "/workspace".to_string(),

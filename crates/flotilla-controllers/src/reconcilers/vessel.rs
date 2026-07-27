@@ -165,6 +165,8 @@ impl Reconciler for VesselReconciler {
             Ok(strategy) => strategy,
             Err(message) => return Ok(VesselDeps::failed(message)),
         };
+        let declared_agent_adapters =
+            placement_policy.spec.docker_per_vessel.as_ref().map(|docker| docker.agent_adapters.clone()).unwrap_or_default();
 
         let (vessel_index, requirement) = match convoy
             .status
@@ -273,6 +275,7 @@ impl Reconciler for VesselReconciler {
                                 docker: Some(DockerEnvironmentSpec {
                                     host_ref: host_ref.clone(),
                                     image: image.clone(),
+                                    declared_agent_adapters: declared_agent_adapters.clone(),
                                     mounts: Vec::new(),
                                     env: env.clone(),
                                 }),
@@ -548,6 +551,7 @@ impl Reconciler for VesselReconciler {
                                 docker: Some(DockerEnvironmentSpec {
                                     host_ref: host_ref.clone(),
                                     image: image.clone(),
+                                    declared_agent_adapters: declared_agent_adapters.clone(),
                                     mounts: has_repositories
                                         .then(|| EnvironmentMount {
                                             source_path: workspace_root.clone(),
