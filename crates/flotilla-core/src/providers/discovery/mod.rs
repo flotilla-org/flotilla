@@ -650,7 +650,8 @@ impl DiscoveryRuntime {
     }
 
     pub fn is_follower(&self) -> bool {
-        self.factories.suppressions == ProviderCategory::FOLLOWER_SUPPRESSED
+        self.factories.suppressions.len() == ProviderCategory::FOLLOWER_SUPPRESSED.len()
+            && ProviderCategory::FOLLOWER_SUPPRESSED.iter().all(|category| self.factories.suppressions.contains(category))
     }
 
     pub fn follower_suppressions(&self) -> impl Iterator<Item = ProviderCategory> + '_ {

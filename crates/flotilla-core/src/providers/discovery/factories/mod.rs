@@ -117,4 +117,11 @@ mod tests {
         assert!(!reg.terminal_pools.is_empty());
         assert_eq!(reg.suppressions, super::super::ProviderCategory::FOLLOWER_SUPPRESSED);
     }
+
+    #[test]
+    fn follower_detection_is_independent_of_suppression_order() {
+        let mut runtime = super::super::DiscoveryRuntime::for_process(true);
+        runtime.factories.suppressions.reverse();
+        assert!(runtime.is_follower());
+    }
 }

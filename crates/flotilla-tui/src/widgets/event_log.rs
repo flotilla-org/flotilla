@@ -330,16 +330,7 @@ fn render_hosts_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area:
                     }
                 });
 
-                let providers: String = h
-                    .summary
-                    .providers
-                    .iter()
-                    .map(|p| {
-                        let check = if p.healthy { "\u{2713}" } else { "\u{2717}" };
-                        format!("{} {check}", p.name)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("  ");
+                let providers: String = h.summary.providers.iter().map(format_host_provider_status).collect::<Vec<_>>().join("  ");
 
                 Row::new(vec![
                     Cell::from(Span::styled(format!("{icon} "), icon_style)),
@@ -365,6 +356,16 @@ fn render_hosts_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area:
     frame.render_widget(table, area);
 }
 
+fn format_host_provider_status(provider: &flotilla_protocol::HostProviderStatus) -> String {
+    match provider.disabled_reason.as_deref() {
+        Some(reason) => format!("{} (disabled: {reason})", provider.name),
+        None => {
+            let check = if provider.healthy { "\u{2713}" } else { "\u{2717}" };
+            format!("{} {check}", provider.name)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::layout::Rect;
@@ -378,6 +379,12 @@ mod tests {
         assert_eq!(w.count, 0);
         assert_eq!(w.filter, tracing::Level::INFO);
         assert_eq!(w.filter_area, Rect::default());
+    }
+
+    #[test]
+    fn disabled_host_provider_is_not_rendered_as_healthy() {
+        let provider = flotilla_protocol::HostProviderStatus::disabled("issue_tracker", "Issue Provider", "follower mode");
+        assert_eq!(format_host_provider_status(&provider), "Issue Provider (disabled: follower mode)");
     }
 
     // ── select_next ───────────────────────────────────────────────────
