@@ -19,6 +19,7 @@ use flotilla_core::{
     },
 };
 use flotilla_protocol::{
+    commands::DaemonLogQuery,
     qualified_path::QualifiedPath,
     result_set::{QueryChanges, QueryId, ResultDelta},
     AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachBinding, AttachableId, Checkout, CheckoutTarget, Command,
@@ -1471,7 +1472,7 @@ async fn query_commands_return_directed_response_instead_of_remote_dispatch() {
 }
 
 #[tokio::test]
-async fn request_dispatcher_forwards_remote_query_through_peer_manager() {
+async fn request_dispatcher_forwards_daemon_log_query_through_peer_manager() {
     let (_tmp, daemon) = empty_daemon().await;
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
@@ -1510,7 +1511,13 @@ async fn request_dispatcher_forwards_remote_query_through_peer_manager() {
                         node_id: Some(node("feta")),
                         provisioning_target: None,
                         context_repo: None,
-                        action: CommandAction::QueryHostList {},
+                        action: CommandAction::QueryDaemonLogs {
+                            query: DaemonLogQuery {
+                                since_seconds: Some(7200),
+                                level: Some("warn".into()),
+                                target: Some("flotilla_daemon::peer".into()),
+                            },
+                        },
                     },
                 })
                 .await
@@ -1535,11 +1542,9 @@ async fn request_dispatcher_forwards_remote_query_through_peer_manager() {
 
     // Simulate the remote response arriving via complete_remote_command.
     remote_command_router
-        .complete_remote_command(
-            request_id,
-            node("feta"),
-            CommandValue::HostList(Box::new(flotilla_protocol::HostListResponse { hosts: vec![] })),
-        )
+        .complete_remote_command(request_id, node("feta"), CommandValue::DaemonLogs {
+            lines: vec![r#"{"level":"WARN","target":"flotilla_daemon::peer"}"#.into()],
+        })
         .await;
 
     let response = tokio::time::timeout(StdDuration::from_secs(5), dispatch_handle)
@@ -1549,14 +1554,32 @@ async fn request_dispatcher_forwards_remote_query_through_peer_manager() {
 
     match ok_response(response, 402) {
         Response::QueryResult { value, .. } => {
-            assert!(matches!(value, CommandValue::HostList(_)));
+            assert!(matches!(
+                value,
+                CommandValue::DaemonLogs { lines }
+                    if lines == vec![r#"{"level":"WARN","target":"flotilla_daemon::peer"}"#]
+            ));
         }
         other => panic!("expected QueryResult response, got {:?}", other),
     }
 
     // Verify the query WAS forwarded to the peer manager.
     let sent_msgs = sent.lock().expect("lock");
-    assert!(!sent_msgs.is_empty(), "remote query commands should be routed through peer manager");
+    assert!(sent_msgs.iter().any(|message| matches!(
+        message,
+        PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest {
+            command,
+            ..
+        }) if matches!(
+            command.action,
+            CommandAction::QueryDaemonLogs {
+                query: DaemonLogQuery {
+                    since_seconds: Some(7200),
+                    ..
+                }
+            }
+        )
+    )));
 }
 
 #[tokio::test]

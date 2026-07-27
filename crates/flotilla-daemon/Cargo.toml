@@ -25,7 +25,7 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 visibility = "0.1.1"

@@ -5,13 +5,111 @@ use std::{
     sync::Mutex,
 };
 
+use chrono::{DateTime, Duration, Utc};
+use flotilla_protocol::commands::DaemonLogQuery;
+
 pub const DEFAULT_MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_MAX_LOG_ARCHIVES: usize = 4;
+pub const DAEMON_LOG_DIRECTORY: &str = "log";
+pub const DAEMON_LOG_FILE: &str = "flotillad.jsonl";
 
 pub type LockedSizeRotatingFile = Mutex<SizeRotatingFile>;
 
 pub fn bounded_log_writer(directory: &Path, file_name: &str) -> io::Result<LockedSizeRotatingFile> {
     SizeRotatingFile::open(directory, file_name, DEFAULT_MAX_LOG_BYTES, DEFAULT_MAX_LOG_ARCHIVES).map(Mutex::new)
+}
+
+pub fn rotating_log_writer(directory: &Path, file_name: &str, max_bytes: u64, generations: usize) -> io::Result<LockedSizeRotatingFile> {
+    SizeRotatingFile::open(directory, file_name, max_bytes, generations).map(Mutex::new)
+}
+
+/// Read retained daemon JSON-lines in chronological file order and apply
+/// filters without copying them into any replicated store.
+pub fn read_daemon_logs(state_dir: &Path, generations: usize, query: &DaemonLogQuery) -> Result<Vec<String>, String> {
+    let log_dir = state_dir.join(DAEMON_LOG_DIRECTORY);
+    let current_path = log_dir.join(DAEMON_LOG_FILE);
+    let minimum_level = query.level.as_deref().map(parse_level).transpose()?;
+    let since = query
+        .since_seconds
+        .map(|seconds| {
+            let duration = Duration::from_std(std::time::Duration::from_secs(seconds))
+                .map_err(|_| format!("log duration is too large: {seconds}s"))?;
+            Ok::<_, String>(Utc::now() - duration)
+        })
+        .transpose()?;
+
+    let mut paths = (1..=generations).rev().map(|index| archive_path(&current_path, index)).collect::<Vec<_>>();
+    paths.push(current_path);
+
+    let mut matches = Vec::new();
+    for path in paths {
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("read daemon log {}: {error}", path.display())),
+        };
+        for line in contents.lines() {
+            if log_line_matches(line, since, minimum_level, query.target.as_deref()) {
+                matches.push(line.to_string());
+            }
+        }
+    }
+    Ok(matches)
+}
+
+fn log_line_matches(line: &str, since: Option<DateTime<Utc>>, minimum_level: Option<u8>, target: Option<&str>) -> bool {
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    if let Some(since) = since {
+        let Some(timestamp) = record.get("timestamp").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        let Ok(timestamp) = DateTime::parse_from_rfc3339(timestamp) else {
+            return false;
+        };
+        if timestamp.with_timezone(&Utc) < since {
+            return false;
+        }
+    }
+    if let Some(minimum_level) = minimum_level {
+        let Some(level) = record.get("level").and_then(serde_json::Value::as_str).and_then(level_rank) else {
+            return false;
+        };
+        if level < minimum_level {
+            return false;
+        }
+    }
+    if let Some(target) = target {
+        let Some(record_target) = record.get("target").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        if record_target != target && !record_target.strip_prefix(target).is_some_and(|suffix| suffix.starts_with("::")) {
+            return false;
+        }
+    }
+    true
+}
+
+fn parse_level(level: &str) -> Result<u8, String> {
+    level_rank(level).ok_or_else(|| format!("invalid log level {level:?}; expected trace, debug, info, warn, or error"))
+}
+
+fn level_rank(level: &str) -> Option<u8> {
+    match level.to_ascii_lowercase().as_str() {
+        "trace" => Some(0),
+        "debug" => Some(1),
+        "info" => Some(2),
+        "warn" => Some(3),
+        "error" => Some(4),
+        _ => None,
+    }
+}
+
+fn archive_path(path: &Path, index: usize) -> PathBuf {
+    let mut archived_name = path.as_os_str().to_os_string();
+    archived_name.push(format!(".{index}"));
+    PathBuf::from(archived_name)
 }
 
 #[derive(Debug)]
@@ -40,9 +138,7 @@ impl SizeRotatingFile {
     }
 
     fn archive_path(&self, index: usize) -> PathBuf {
-        let mut archived_name = self.path.as_os_str().to_os_string();
-        archived_name.push(format!(".{index}"));
-        PathBuf::from(archived_name)
+        archive_path(&self.path, index)
     }
 
     fn rotate_if_needed(&mut self, incoming_bytes: usize) -> io::Result<()> {
@@ -134,9 +230,11 @@ impl Write for SizeRotatingFile {
 mod tests {
     use std::{fs, io::Write};
 
+    use chrono::{Duration, Utc};
+    use flotilla_protocol::commands::DaemonLogQuery;
     use tempfile::tempdir;
 
-    use super::SizeRotatingFile;
+    use super::{read_daemon_logs, SizeRotatingFile, DAEMON_LOG_DIRECTORY, DAEMON_LOG_FILE};
 
     #[test]
     fn rotates_by_size_and_removes_archives_beyond_limit() {
@@ -191,5 +289,47 @@ mod tests {
         let _writer = SizeRotatingFile::open(dir.path(), "daemon.log", 4, 1).expect("open rotating log");
 
         assert!(fs::metadata(path).expect("current log metadata").len() <= 4);
+    }
+
+    #[test]
+    fn reads_generations_oldest_first_and_filters_structured_fields() {
+        let state = tempdir().expect("tempdir");
+        let log_dir = state.path().join(DAEMON_LOG_DIRECTORY);
+        fs::create_dir_all(&log_dir).expect("log directory");
+        let old = (Utc::now() - Duration::hours(3)).to_rfc3339();
+        let recent = (Utc::now() - Duration::minutes(10)).to_rfc3339();
+        fs::write(
+            log_dir.join(format!("{DAEMON_LOG_FILE}.1")),
+            format!(
+                "{{\"timestamp\":\"{old}\",\"level\":\"ERROR\",\"target\":\"flotilla_daemon::peer\",\"fields\":{{\"message\":\"old\"}}}}\n\
+                 {{\"timestamp\":\"{recent}\",\"level\":\"WARN\",\"target\":\"flotilla_daemon::peer\",\"fields\":{{\"message\":\"peer\"}}}}\n"
+            ),
+        )
+        .expect("archive");
+        fs::write(
+            log_dir.join(DAEMON_LOG_FILE),
+            format!(
+                "{{\"timestamp\":\"{recent}\",\"level\":\"ERROR\",\"target\":\"flotilla_daemon::server\",\"fields\":{{\"message\":\"server\"}}}}\n"
+            ),
+        )
+        .expect("current");
+
+        let lines = read_daemon_logs(state.path(), 4, &DaemonLogQuery {
+            since_seconds: Some(2 * 60 * 60),
+            level: Some("warn".into()),
+            target: Some("flotilla_daemon::peer".into()),
+        })
+        .expect("read logs");
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"message\":\"peer\""));
+    }
+
+    #[test]
+    fn rejects_unknown_filter_level() {
+        let state = tempdir().expect("tempdir");
+        let error = read_daemon_logs(state.path(), 4, &DaemonLogQuery { since_seconds: None, level: Some("verbose".into()), target: None })
+            .expect_err("unknown level");
+        assert!(error.contains("invalid log level"));
     }
 }

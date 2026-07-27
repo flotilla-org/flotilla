@@ -9,7 +9,7 @@ import pytest
 
 COMPOSE_DIR = Path(__file__).parent
 COMPOSE_FILE = str(COMPOSE_DIR / "docker-compose.yml")
-DAEMON_LOG = "~/.local/state/flotilla/daemon.log"
+DAEMON_LOG = "~/.local/state/flotilla/log/flotillad.jsonl"
 
 
 def docker_exec(
@@ -246,7 +246,7 @@ def topology():
         yield {"node-a": "node-a", "node-b": "node-b"}
 
     finally:
-        # Print daemon logs for debugging (daemon writes to state_dir/daemon.log)
+        # Print daemon logs for debugging (daemon writes to state_dir/log/flotillad.jsonl)
         for node in ("node-a", "node-b"):
             log = daemon_log(node)
             if log:

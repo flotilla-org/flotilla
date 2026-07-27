@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitStatus,
     sync::Arc,
+    time::Duration,
 };
 
 use clap::Parser;
@@ -81,6 +82,21 @@ enum SubCommand {
     Watch,
     /// Show the daemon's current multi-host routing view
     Topology,
+    /// Stream structured daemon logs from this host or a peer
+    Logs {
+        /// Peer host name; omit to read this host
+        #[arg(long)]
+        host: Option<String>,
+        /// Only show records this old or newer (for example `2h` or `30m`)
+        #[arg(long, value_parser = parse_log_duration)]
+        since: Option<Duration>,
+        /// Minimum level: trace, debug, info, warn, or error
+        #[arg(long, value_parser = ["trace", "debug", "info", "warn", "error"])]
+        level: Option<String>,
+        /// Exact tracing module target and its children
+        #[arg(long)]
+        target: Option<String>,
+    },
     /// List convoy vessels and crew sessions
     Ls,
     /// Attach to a running convoy crew session
@@ -313,6 +329,7 @@ async fn main() -> Result<()> {
         Some(SubCommand::Status) => run_status(&cli, format).await,
         Some(SubCommand::Watch) => run_watch(&cli, format).await,
         Some(SubCommand::Topology) => run_topology_command(&cli, format).await,
+        Some(SubCommand::Logs { host, since, level, target }) => run_logs(&cli, host.as_deref(), since, level, target).await,
         Some(SubCommand::Ls) => run_fleet_list(&cli, format).await,
         Some(SubCommand::Attach { reference, transient, host }) => run_attach(&cli, &reference, transient, host.as_deref(), format).await,
         Some(SubCommand::ReplicaSnapshot) => run_replica_snapshot(&cli).await,
@@ -482,7 +499,8 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
 
     // Spawn daemon init on a separate task so full-app startup can run it
     // concurrently with the splash (which uses blocking event polling).
-    let daemon_log_path = paths.state_dir.as_path().join("daemon.log");
+    let daemon_log_path =
+        paths.state_dir.as_path().join(flotilla_core::log_file::DAEMON_LOG_DIRECTORY).join(flotilla_core::log_file::DAEMON_LOG_FILE);
     let daemon_panic_log_path = resolved_config_dir.join("daemon-panic.log");
     let initial_socket_path = socket_path.clone();
     let initial_config_dir = resolved_config_dir.clone();
@@ -1298,6 +1316,44 @@ async fn run_topology_command(cli: &Cli, format: OutputFormat) -> Result<()> {
     flotilla_tui::cli::run_topology(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
+fn parse_log_duration(value: &str) -> Result<Duration, String> {
+    humantime::parse_duration(value).map_err(|error| error.to_string())
+}
+
+async fn run_logs(cli: &Cli, host: Option<&str>, since: Option<Duration>, level: Option<String>, target: Option<String>) -> Result<()> {
+    reset_sigpipe();
+    let node_id = resolve_optional_host_node(cli, host).await?;
+    let daemon = connect_daemon(cli).await?;
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryDaemonLogs {
+                    query: flotilla_protocol::commands::DaemonLogQuery {
+                        since_seconds: since.map(|duration| duration.as_secs()),
+                        level,
+                        target,
+                    },
+                },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    match result {
+        CommandValue::DaemonLogs { lines } => {
+            for line in lines {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        CommandValue::Error { message } => Err(color_eyre::eyre::eyre!(message)),
+        other => Err(color_eyre::eyre::eyre!("unexpected daemon logs response: {other:?}")),
+    }
+}
+
 async fn run_hook(cli: &Cli, harness: &str, event_type: &str) -> Result<()> {
     use std::io::Read;
 
@@ -1747,6 +1803,36 @@ mod tests {
         let cli = Cli::try_parse_from(["flotilla", "topology", "--json"]).expect("topology json should parse");
         assert!(matches!(cli.command, Some(SubCommand::Topology)));
         assert!(cli.json);
+    }
+
+    #[test]
+    fn cli_parses_remote_filtered_logs() {
+        let cli = Cli::try_parse_from([
+            "flotilla",
+            "logs",
+            "--host",
+            "feta",
+            "--since",
+            "2h",
+            "--level",
+            "warn",
+            "--target",
+            "flotilla_daemon::peer",
+        ])
+        .expect("logs cli should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(SubCommand::Logs {
+                host: Some(host),
+                since: Some(since),
+                level: Some(level),
+                target: Some(target),
+            }) if host == "feta"
+                && since == std::time::Duration::from_secs(7200)
+                && level == "warn"
+                && target == "flotilla_daemon::peer"
+        ));
     }
 
     #[test]

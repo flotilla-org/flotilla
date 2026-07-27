@@ -363,7 +363,36 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub admission: AdmissionConfig,
     #[serde(default)]
+    pub logging: DaemonLoggingConfig,
+    #[serde(default)]
     pub environments: BTreeMap<String, StaticEnvironmentConfig>,
+}
+
+/// Host-local structured daemon logging settings.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DaemonLoggingConfig {
+    /// `RUST_LOG`-style directives, for example
+    /// `info,flotilla_daemon::peer=debug`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    #[serde(default = "default_log_max_bytes")]
+    pub max_bytes: u64,
+    #[serde(default = "default_log_generations")]
+    pub generations: usize,
+}
+
+impl Default for DaemonLoggingConfig {
+    fn default() -> Self {
+        Self { filter: None, max_bytes: default_log_max_bytes(), generations: default_log_generations() }
+    }
+}
+
+const fn default_log_max_bytes() -> u64 {
+    crate::log_file::DEFAULT_MAX_LOG_BYTES
+}
+
+const fn default_log_generations() -> usize {
+    crate::log_file::DEFAULT_MAX_LOG_ARCHIVES
 }
 
 /// Deterministic admission limits enforced by this host.

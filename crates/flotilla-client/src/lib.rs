@@ -327,7 +327,8 @@ fn spawn_daemon(config_dir: &Path, config_dir_override: Option<&Path>, socket_ov
             Ok(())
         });
     }
-    // Redirect stdio. Structured logs go to {state_dir}/daemon.log via tracing;
+    // Redirect stdio. Structured logs go to
+    // {state_dir}/log/flotillad.jsonl via tracing;
     // stderr catches only panics and pre-init errors.
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
