@@ -1,4 +1,8 @@
-use std::io::stdout;
+use std::{
+    collections::HashSet,
+    io::stdout,
+    sync::{LazyLock, Mutex},
+};
 
 use crossterm::{event::DisableMouseCapture, execute};
 use flotilla_protocol::{arg, ResolvedAttachAction, ResolvedAttachPlan, SendKeyStep};
@@ -28,9 +32,29 @@ trait AttachCommandRunner {
 
 struct SystemAttachCommandRunner;
 
+static ACTIVE_ATTACH_BRIDGES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
 impl AttachCommandRunner for SystemAttachCommandRunner {
     fn status(&mut self, program: &str, args: &[String]) -> Result<std::process::ExitStatus, String> {
         std::process::Command::new(program).args(args).status().map_err(|error| format!("could not start {program}: {error}"))
+    }
+}
+
+fn register_attach_bridge(bridge: &str) {
+    ACTIVE_ATTACH_BRIDGES.lock().expect("active attach bridge lock poisoned").insert(bridge.to_string());
+}
+
+fn kill_attach_bridge(bridge: &str, runner: &mut dyn AttachCommandRunner) {
+    if ACTIVE_ATTACH_BRIDGES.lock().expect("active attach bridge lock poisoned").remove(bridge) {
+        let _ = runner.status("cleat", &["kill".to_string(), bridge.to_string()]);
+    }
+}
+
+fn kill_all_attach_bridges() {
+    let bridges: Vec<_> = ACTIVE_ATTACH_BRIDGES.lock().expect("active attach bridge lock poisoned").drain().collect();
+    let mut runner = SystemAttachCommandRunner;
+    for bridge in bridges {
+        let _ = runner.status("cleat", &["kill".to_string(), bridge]);
     }
 }
 
@@ -52,9 +76,17 @@ fn run_send_keys_attach(
         return Err("attach plan must end with an outer command".to_string());
     };
     let command = arg::flatten(&args, 0);
+    register_attach_bridge(bridge);
     let launch =
-        runner.status("cleat", &["launch".to_string(), bridge.to_string(), "--record".to_string(), "--cmd".to_string(), command])?;
+        match runner.status("cleat", &["launch".to_string(), bridge.to_string(), "--record".to_string(), "--cmd".to_string(), command]) {
+            Ok(status) => status,
+            Err(error) => {
+                kill_attach_bridge(bridge, runner);
+                return Err(error);
+            }
+        };
     if !launch.success() {
+        kill_attach_bridge(bridge, runner);
         return Err(format!("could not launch attach bridge for outer command (status {launch})"));
     }
 
@@ -90,7 +122,7 @@ fn run_send_keys_attach(
         runner.status("cleat", &["attach".to_string(), bridge.to_string()])
     })();
 
-    let _ = runner.status("cleat", &["kill".to_string(), bridge.to_string()]);
+    kill_attach_bridge(bridge, runner);
     result
 }
 
@@ -134,23 +166,30 @@ pub fn install_panic_hook() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
+        kill_all_attach_bridges();
         hook(info);
     }));
 }
 
-/// Spawn a background task that listens for SIGTERM and cleanly exits.
+/// Spawn a background task that listens for SIGINT or SIGTERM and cleanly exits.
 ///
 /// Must be called after `ratatui::init()` within a tokio runtime.
 /// Covers the entire process lifetime — including the startup window
 /// before the event loop begins.
 #[cfg(unix)]
 pub fn install_sigterm_handler() {
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("failed to register SIGTERM handler");
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
     tokio::spawn(async move {
-        sigterm.recv().await;
+        let exit_code = tokio::select! {
+            _ = sigint.recv() => 130,
+            _ = sigterm.recv() => 0,
+        };
         restore_terminal();
-        std::process::exit(0);
+        kill_all_attach_bridges();
+        std::process::exit(exit_code);
     });
 }
 
@@ -229,7 +268,7 @@ mod tests {
     fn shell_death_while_waiting_names_the_hop() {
         let mut runner = FakeRunner::with_statuses([0, 2, 0]);
 
-        let error = run_send_keys_attach(&two_hop_plan(), "bridge", &mut runner).expect_err("dead shell should fail");
+        let error = run_send_keys_attach(&two_hop_plan(), "dead-bridge", &mut runner).expect_err("dead shell should fail");
 
         assert!(error.contains("docker environment 'crew-box'"), "{error}");
         assert!(error.contains("did not become ready"), "{error}");
@@ -240,7 +279,7 @@ mod tests {
     fn readiness_uses_screen_stability_before_sending_echoed_text() {
         let mut runner = FakeRunner::default();
 
-        run_send_keys_attach(&two_hop_plan(), "bridge", &mut runner).expect("attach plan should run");
+        run_send_keys_attach(&two_hop_plan(), "ready-bridge", &mut runner).expect("attach plan should run");
 
         let commands: Vec<_> = runner.calls.iter().map(|(_, args)| args[0].as_str()).collect();
         assert_eq!(commands, ["launch", "wait", "send", "attach", "kill"]);
