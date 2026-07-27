@@ -22,7 +22,7 @@ use flotilla_core::{
     in_process::InProcessDaemon,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
-        discovery::{run_host_detectors, EnvVars, EnvironmentBag},
+        discovery::{run_provisioned_host_detectors, EnvironmentBag},
         environment::{CreateOpts, EnvironmentHandle},
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool},
@@ -1040,23 +1040,13 @@ async fn probe_provisioned_environment(
     env_id: &EnvironmentId,
     handle: &EnvironmentHandle,
 ) -> Result<(EnvironmentBag, Arc<ProviderRegistry>), String> {
-    let env_vars = InteriorEnvVars { values: handle.env_vars().await? };
+    let env_vars = handle.env_vars().await?;
     let discovery = state.daemon.discovery_runtime();
-    let bag = run_host_detectors(&discovery.host_detectors, &*handle.runner(), &env_vars).await;
+    let bag = run_provisioned_host_detectors(&discovery.host_detectors, &*handle.runner(), &env_vars).await;
     let probe_root = ExecutionEnvironmentPath::new("/workspace");
     let config = ConfigStore::with_base(state.config.base_path().as_path().join(format!("env-discovery/{env_id}")));
     let registry = discovery.factories.probe_all(&bag, &config, &probe_root, handle.runner()).await;
     Ok((bag, Arc::new(registry)))
-}
-
-struct InteriorEnvVars {
-    values: HashMap<String, String>,
-}
-
-impl EnvVars for InteriorEnvVars {
-    fn get(&self, key: &str) -> Option<String> {
-        self.values.get(key).cloned()
-    }
 }
 
 struct CloneControllerRuntime {
@@ -1609,7 +1599,15 @@ mod test_git_repo;
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, fs, process::Command as ProcessCommand, sync::Arc};
+    use std::{
+        collections::HashMap,
+        fs,
+        process::Command as ProcessCommand,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
 
     use flotilla_core::{
         config::ConfigStore,
@@ -1623,7 +1621,7 @@ mod tests {
                 },
                 EnvironmentAssertion, EnvironmentBag,
             },
-            environment::{EnvironmentHandle, ProvisionedEnvironment, ProvisionedMount},
+            environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount},
             CommandRunner, ProcessCommandRunner,
         },
     };
@@ -1650,6 +1648,7 @@ mod tests {
         image: ImageId,
         runner: Arc<dyn CommandRunner>,
         env_vars: HashMap<String, String>,
+        destroyed: Arc<AtomicBool>,
     }
 
     #[async_trait]
@@ -1683,7 +1682,30 @@ mod tests {
         }
 
         async fn destroy(&self) -> Result<(), String> {
+            self.destroyed.store(true, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    struct TestInteriorEnvironmentProvider {
+        handle: Mutex<Option<EnvironmentHandle>>,
+    }
+
+    #[async_trait]
+    impl EnvironmentProvider for TestInteriorEnvironmentProvider {
+        async fn ensure_image(&self, spec: &flotilla_protocol::EnvironmentSpec, _repo_root: &Path) -> Result<ImageId, String> {
+            match &spec.image {
+                ImageSource::Registry(image) => Ok(ImageId::new(image.clone())),
+                ImageSource::Dockerfile { .. } => Err("test provider expects a registry image".to_string()),
+            }
+        }
+
+        async fn create(&self, _id: EnvironmentId, _image: &ImageId, _opts: CreateOpts) -> Result<EnvironmentHandle, String> {
+            self.handle.lock().await.take().ok_or_else(|| "test environment already created".to_string())
+        }
+
+        async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
+            Ok(Vec::new())
         }
     }
 
@@ -2190,6 +2212,7 @@ mod tests {
             image: ImageId::new("contained-image"),
             runner,
             env_vars: HashMap::from([("HOME".to_string(), "/home/crew".to_string())]),
+            destroyed: Arc::new(AtomicBool::new(false)),
         });
 
         let (bag, registry) = probe_provisioned_environment(&state, &env_id, &handle).await.expect("interior discovery should succeed");
@@ -2216,6 +2239,56 @@ mod tests {
         };
         let error = verify_declared_agent_adapters(&spec, &registry).expect_err("missing declared adapter should fail");
         assert_eq!(error, "image `contained-image` declares agent adapter `missing-adapter`, but interior discovery did not find it");
+    }
+
+    #[tokio::test]
+    async fn provisioned_environment_is_destroyed_when_declared_adapter_is_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        discovery.host_detectors = flotilla_core::providers::discovery::detectors::default_host_detectors();
+        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+            id: EnvironmentId::new("contained-rejected"),
+            image: ImageId::new("contained-image"),
+            runner: Arc::new(DiscoveryMockRunner::builder().build()),
+            env_vars: HashMap::from([("HOME".to_string(), "/home/crew".to_string())]),
+            destroyed: Arc::clone(&destroyed),
+        });
+        let mut local_registry = ProviderRegistry::new();
+        local_registry.environment_providers.insert(
+            "docker",
+            flotilla_core::providers::discovery::ProviderDescriptor::named(
+                flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+                "docker",
+            ),
+            Arc::new(TestInteriorEnvironmentProvider { handle: Mutex::new(Some(handle)) }),
+        );
+        let state = Arc::new(ControllerRuntimeState::new(
+            daemon,
+            config,
+            Arc::new(local_registry),
+            Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+            "host-test".to_string(),
+            None,
+            "host-direct-host-test".to_string(),
+        ));
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host-test".to_string(),
+            image: "contained-image".to_string(),
+            declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
+            mounts: Vec::new(),
+            env: BTreeMap::new(),
+        };
+
+        let error = DockerControllerRuntime { state }
+            .provision("contained-rejected", &spec)
+            .await
+            .expect_err("missing declared adapter should reject the environment");
+
+        assert_eq!(error, "image `contained-image` declares agent adapter `codex`, but interior discovery did not find it");
+        assert!(destroyed.load(Ordering::SeqCst), "rejected environment should be destroyed");
     }
 
     #[tokio::test]

@@ -672,6 +672,30 @@ pub async fn run_host_detectors(detectors: &[Box<dyn HostDetector>], runner: &dy
     stream::iter(detectors).fold(EnvironmentBag::new(), |bag, det| async move { bag.extend(det.detect(runner, env).await) }).await
 }
 
+/// Build a provisioned environment's host bag from its complete environment,
+/// then add assertions detected through its interior command runner.
+pub async fn run_provisioned_host_detectors(
+    detectors: &[Box<dyn HostDetector>],
+    runner: &dyn CommandRunner,
+    env_vars: &HashMap<String, String>,
+) -> EnvironmentBag {
+    struct ProvisionedEnvVars<'a> {
+        values: &'a HashMap<String, String>,
+    }
+
+    impl EnvVars for ProvisionedEnvVars<'_> {
+        fn get(&self, key: &str) -> Option<String> {
+            self.values.get(key).cloned()
+        }
+    }
+
+    let bag = env_vars
+        .iter()
+        .fold(EnvironmentBag::new(), |bag, (key, value)| bag.with(EnvironmentAssertion::env_var(key.clone(), value.clone())));
+    let detected = run_host_detectors(detectors, runner, &ProvisionedEnvVars { values: env_vars }).await;
+    bag.extend(detected.assertions().iter().cloned())
+}
+
 pub async fn discover_providers(
     host_bag: &EnvironmentBag,
     repo_root: &ExecutionEnvironmentPath,
@@ -1061,5 +1085,20 @@ mod orchestrator_tests {
 
         // At minimum, git binary should be detected
         assert!(bag.find_binary("git").is_some(), "host detectors should find git binary");
+    }
+
+    #[tokio::test]
+    async fn provisioned_host_detection_preserves_all_env_vars_and_adds_binary_assertions() {
+        let runner = DiscoveryMockRunner::builder().on_run("codex", &["--version"], Ok("codex-cli 1.2.3".to_string())).build();
+        let env_vars = HashMap::from([
+            ("HOME".to_string(), "/home/crew".to_string()),
+            ("FLOTILLA_ENVIRONMENT_ID".to_string(), "contained-work".to_string()),
+        ]);
+
+        let bag = run_provisioned_host_detectors(&detectors::default_host_detectors(), &runner, &env_vars).await;
+
+        assert_eq!(bag.find_env_var("FLOTILLA_ENVIRONMENT_ID"), Some("contained-work"));
+        assert_eq!(bag.find_env_var("HOME"), Some("/home/crew"));
+        assert!(bag.find_binary("codex").is_some());
     }
 }
