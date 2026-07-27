@@ -23,7 +23,7 @@ use flotilla_core::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{EnvironmentAssertion, EnvironmentBag},
-        environment::{CreateOpts, EnvironmentHandle, ProvisionedMount},
+        environment::{CreateOpts, EnvironmentHandle},
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool},
         vcs::{CloneProvisioner, GitCloneProvisioner},
@@ -41,7 +41,7 @@ use flotilla_resources::{
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
-use tracing::warn;
+use tracing::{debug, error, info, warn};
 
 use crate::{
     sleep_inhibitor,
@@ -49,6 +49,10 @@ use crate::{
     Aggregator, AggregatorResolvers,
 };
 
+/// Cadence of the liveness marker (see `spawn_liveness_watchdog_task`). Long
+/// enough to be quiet in a healthy log, short enough to bound how much time a
+/// wedge can hide in.
+const LIVENESS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 
@@ -75,6 +79,9 @@ impl Default for RuntimeOptions {
 
 pub struct DaemonRuntime {
     tasks: Vec<JoinHandle<()>>,
+    /// Set by `shutdown` so `Drop` can tell an intended stop from a runtime
+    /// that vanished while the daemon was meant to keep working.
+    stop_expected: bool,
 }
 
 impl DaemonRuntime {
@@ -102,6 +109,10 @@ impl DaemonRuntime {
         let profile = build_local_profile(&daemon, &local_registry)?;
         daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools).await;
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
+        flotilla_resources::PreparedSnapshotGarbageCollector::new(daemon.resource_backend(), &options.namespace)
+            .recover_pending_claims()
+            .await
+            .map_err(|error| format!("recover prepared convoy admissions: {error}"))?;
         apply_host_heartbeat(&daemon, &options.namespace, &profile).await?;
         if let Err(error) = daemon.reconcile_adopted_checkouts(&options.namespace).await {
             warn!(%error, "failed to restore adopted checkout observations during startup; periodic reconciliation will retry");
@@ -139,12 +150,43 @@ impl DaemonRuntime {
             ));
         }
 
-        Ok(Self { tasks })
+        // +1 for the watchdog's own handle, pushed below, so this count matches
+        // `self.tasks.len()` at drop time.
+        let supervisory_tasks = tasks.len() + 1;
+        tasks.push(spawn_liveness_watchdog_task(supervisory_tasks, LIVENESS_WATCHDOG_INTERVAL));
+
+        Ok(Self { tasks, stop_expected: false })
+    }
+}
+
+impl DaemonRuntime {
+    /// Stop the supervisory tasks deliberately. Every routine daemon exit —
+    /// SIGTERM, SIGINT, idle timeout, explicit shutdown — should call this, so
+    /// that `Drop`'s ERROR path stays reserved for a runtime that disappeared
+    /// while the daemon was still meant to be working.
+    pub fn shutdown(mut self) {
+        self.stop_expected = true;
+        info!(tasks = self.tasks.len(), "daemon runtime stopping; aborting supervisory tasks");
     }
 }
 
 impl Drop for DaemonRuntime {
     fn drop(&mut self) {
+        // Dropping this value aborts every supervisory task — heartbeat, replica
+        // refresh, aggregator, controllers. A daemon whose runtime is dropped
+        // while its accept loop keeps running looks alive (process up, socket
+        // accepting) but serves nothing, and until this log existed it left no
+        // trace whatsoever (flotilla#1111). An expected stop goes through
+        // `shutdown` and logs at INFO there; reaching here without that flag is
+        // the case worth shouting about.
+        if self.stop_expected {
+            debug!(tasks = self.tasks.len(), "daemon runtime dropped after expected shutdown");
+        } else {
+            error!(
+                tasks = self.tasks.len(),
+                "daemon runtime dropped unexpectedly; aborting supervisory tasks — the daemon can no longer do background work"
+            );
+        }
         for task in &self.tasks {
             task.abort();
         }
@@ -536,6 +578,17 @@ enum PeriodicTaskStart {
     AfterInterval,
 }
 
+/// Emits one liveness line per interval so a daemon that stops scheduling is
+/// visible in the log by the *absence* of a known-cadence marker, rather than by
+/// the absence of incidental chatter. Added after flotilla#1111, where the only
+/// evidence of a wedged daemon was that unrelated debug lines stopped.
+fn spawn_liveness_watchdog_task(tasks: usize, interval: Duration) -> JoinHandle<()> {
+    let started = tokio::time::Instant::now();
+    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || async move {
+        info!(uptime_secs = started.elapsed().as_secs(), supervisory_tasks = tasks, "daemon alive");
+    })
+}
+
 fn spawn_periodic_task<Operation, OperationFuture>(interval: Duration, start: PeriodicTaskStart, mut operation: Operation) -> JoinHandle<()>
 where
     Operation: FnMut() -> OperationFuture + Send + 'static,
@@ -832,7 +885,11 @@ fn spawn_controller_loops(
                             reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
                                 .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                                 .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
-                                .with_checkouts(backend.clone().using::<Checkout>(&namespace_string)),
+                                .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
+                                .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
+                                    backend.clone(),
+                                    &namespace_string,
+                                )),
                             resync_interval: controller_resync_interval,
                             backend,
                         }
@@ -920,11 +977,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 tokens: Vec::new(),
                 daemon_socket_path,
                 working_directory: None,
-                provisioned_mounts: spec
-                    .mounts
-                    .iter()
-                    .map(|mount| ProvisionedMount::new(mount.source_path.clone(), mount.target_path.clone()))
-                    .collect(),
+                provisioned_mounts: spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount).collect(),
             })
             .await?;
 

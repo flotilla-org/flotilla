@@ -11,7 +11,7 @@ use flotilla_protocol::{
         AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, ConvoyPhase, ConvoyRow,
         IndependentRow, SessionPhase, VesselRow, WorkPhase,
     },
-    ViewAddress,
+    ViewAddress, AWARENESS_REL_FOR_CONVOY,
 };
 
 use crate::{
@@ -376,6 +376,15 @@ fn awareness_project_recipe(node: &AwarenessNode, mint: &dyn RecipeMint) -> Opti
 fn awareness_entry_recipe(entry: &AwarenessEntry, convoys: &[ConvoyRow], mint: &dyn RecipeMint) -> Option<(Recipe, EntityRef)> {
     if matches!(entry.kind, AwarenessKind::Issue) {
         return None;
+    }
+    if matches!(entry.kind, AwarenessKind::Checkout) {
+        if entry.links.iter().any(|link| link.rel == AWARENESS_REL_FOR_CONVOY) {
+            return None;
+        }
+        let path = entry.annotations.get(KEY_CHECKOUT_PATH)?;
+        let host = entry.refs.iter().find_map(|reference| reference.host.as_ref())?;
+        let target = entity::checkout(&entry.id);
+        return mint.checkout_terminal(path, host).map(|recipe| (recipe, target));
     }
     match entry.id.parse().ok()? {
         ViewAddress::Project { namespace, name } => {

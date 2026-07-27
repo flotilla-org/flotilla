@@ -14,7 +14,7 @@ use crate::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{run_host_detectors, DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, FactoryRegistry},
-        environment::{CreateOpts, EnvironmentHandle, ProvisionedMount},
+        environment::{CreateOpts, EnvironmentHandle, ProvisionedMount, ProvisionedMountMode},
         registry::ProviderRegistry,
         CommandRunner,
     },
@@ -265,7 +265,7 @@ impl EnvironmentManager {
 
         let provisioned_mounts = reference_repo
             .as_ref()
-            .map(|repo| vec![ProvisionedMount::new(repo.as_path().to_path_buf(), PathBuf::from("/ref/repo"))])
+            .map(|repo| vec![ProvisionedMount::new(repo.as_path().to_path_buf(), PathBuf::from("/ref/repo"), ProvisionedMountMode::Ro)])
             .unwrap_or_default();
         let opts = CreateOpts { tokens, daemon_socket_path: daemon_socket_path.clone(), working_directory: None, provisioned_mounts };
         let handle = env_provider.create(env_id.clone(), &image, opts).await?;
@@ -588,7 +588,7 @@ mod tests {
     }
 
     fn reference_repo_mount() -> ProvisionedMount {
-        ProvisionedMount::new("/host/reference-repo", "/ref/repo")
+        ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)
     }
 
     #[tokio::test]

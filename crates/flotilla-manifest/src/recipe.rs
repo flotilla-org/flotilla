@@ -29,6 +29,8 @@ pub trait RecipeMint: Send + Sync {
     /// running session into a workspace; `attach_ref` is any reference the
     /// daemon accepts (rows expose it as a capability fact).
     fn attach(&self, attach_ref: &str, host: &HostName) -> Option<Recipe>;
+    /// Recipe opening a transient shell rooted at a standing checkout.
+    fn checkout_terminal(&self, path: &str, host: &HostName) -> Option<Recipe>;
     /// Recipe materialising a scoped view of an entity with no live session.
     fn scoped_view(&self, target: &flotilla_protocol::ViewAddress) -> Option<Recipe>;
 }
@@ -48,6 +50,15 @@ impl FlotillaRecipes {
 impl RecipeMint for FlotillaRecipes {
     fn attach(&self, attach_ref: &str, host: &HostName) -> Option<Recipe> {
         Some(Recipe::Command(format!("{} attach --host {} {}", self.flotilla_bin, shell_quote(host.as_str()), shell_quote(attach_ref))))
+    }
+
+    fn checkout_terminal(&self, path: &str, host: &HostName) -> Option<Recipe> {
+        Some(Recipe::Command(format!(
+            "{} attach --transient --host {} {}",
+            self.flotilla_bin,
+            shell_quote(host.as_str()),
+            shell_quote(path)
+        )))
     }
 
     fn scoped_view(&self, target: &flotilla_protocol::ViewAddress) -> Option<Recipe> {
@@ -73,6 +84,10 @@ mod tests {
                 vessel: "implement".to_owned(),
             }),
             Some(Recipe::Command("flotilla view 'vessel/dev/manifest-extraction/implement'".to_owned()))
+        );
+        assert_eq!(
+            mint.checkout_terminal("/work/flotilla's checkout", &HostName::new("kiwi")),
+            Some(Recipe::Command("flotilla attach --transient --host 'kiwi' '/work/flotilla'\\''s checkout'".to_owned()))
         );
     }
 }

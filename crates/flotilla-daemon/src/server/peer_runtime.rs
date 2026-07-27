@@ -670,7 +670,7 @@ impl PeerRuntime {
                             notice.peer.clone(),
                             notice.generation,
                             notice.resource_socket_path,
-                        );
+                        ).await;
                         send_local_to_peer(
                             &outbound_daemon,
                             &outbound_peer_manager,

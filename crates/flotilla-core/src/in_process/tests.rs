@@ -46,7 +46,7 @@ use crate::{
             },
             EnvironmentAssertion, EnvironmentBag, HostPlatform,
         },
-        environment::{EnvironmentHandle, ProvisionedEnvironment, ProvisionedMount},
+        environment::{EnvironmentHandle, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
         ChannelLabel, CommandOutput, CommandRunner,
     },
 };
@@ -250,13 +250,11 @@ async fn convoy_admission_uses_only_fresh_cached_issue_snapshots() {
 
 #[test]
 fn prepared_snapshot_names_are_content_addressed_for_safe_convoy_name_reuse() {
-    let first =
-        prepared_snapshot_name("remote-work", "workflow", &serde_json::json!({ "vessels": ["implement"] })).expect("first snapshot name");
-    let second =
-        prepared_snapshot_name("remote-work", "workflow", &serde_json::json!({ "vessels": ["review"] })).expect("second snapshot name");
+    let first = prepared_snapshot_name("workflow", &serde_json::json!({ "vessels": ["implement"] })).expect("first snapshot name");
+    let second = prepared_snapshot_name("workflow", &serde_json::json!({ "vessels": ["review"] })).expect("second snapshot name");
 
     assert_ne!(first, second);
-    assert!(first.starts_with("remote-work-remote-workflow-"));
+    assert!(first.starts_with("workflow-snapshot-"));
 }
 
 #[tokio::test]
@@ -1859,6 +1857,35 @@ async fn fleet_list_preserves_stale_rows_when_replica_is_unreachable() {
 }
 
 #[tokio::test]
+async fn fleet_list_reports_a_connected_peer_with_failed_resource_replication() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let peer = NodeId::new("feta-node");
+    daemon.set_configured_peers(vec![NodeInfo::new(peer.clone(), "feta")]).await;
+    publish_attach_host_summary(&daemon, "feta", "feta").await;
+    daemon.report_resource_replication_failure(&peer, "Convoy", "watch resourceVersion 7676 expired").await;
+
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+
+    assert_eq!(response.replicas.len(), 1);
+    assert_eq!(response.replicas[0].host, HostName::new("feta"));
+    assert!(!response.replicas[0].reachable);
+    assert!(
+        response.replicas[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("Convoy") && message.contains("watch resourceVersion 7676 expired")),
+        "the failed peer must have an explicit resource-replication error: {:?}",
+        response.replicas[0]
+    );
+}
+
+#[tokio::test]
 async fn replica_refresh_replaces_rows_when_generation_changes() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
@@ -2684,6 +2711,102 @@ async fn transient_attach_selects_the_displayed_host_for_result_set_only_indepen
     assert!(command.contains("--transient"), "recursive attach must preserve the no-stamp mode: {command}");
     assert!(command.contains("--host"), "recursive attach must preserve the owning host: {command}");
     assert!(!command.contains(&other_hostname), "same-named row on another host must not make selection ambiguous: {command}");
+}
+
+#[tokio::test]
+async fn transient_attach_resolves_standing_checkout_paths_locally_and_deterministically() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let checkout_path = temp.path().join("standing-checkout");
+    std::fs::create_dir_all(&checkout_path).expect("create checkout");
+    let (daemon, terminal_pool) = new_attach_test_daemon_with_pool(&config_base).await;
+    let row = CheckoutRow::builder()
+        .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "dev", "standing").on_host(HostName::new(TEST_LOCAL_ATTACH_HOST)))
+        .repo(RepositoryKey("repo-standing".to_owned()))
+        .repo_label("standing")
+        .path(checkout_path.display().to_string())
+        .branch("main")
+        .host(HostName::new(TEST_LOCAL_ATTACH_HOST))
+        .authority(LifecycleAuthority::Observed)
+        .build();
+    daemon.aggregator_projection_state().await.replace_local_checkout_rows(vec![row]).await;
+
+    let mut resolved = Vec::new();
+    for _ in 0..2 {
+        let result = daemon
+            .execute_query(
+                Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::AttachTransient {
+                        reference: checkout_path.display().to_string(),
+                        host: Some(HostName::new(TEST_LOCAL_ATTACH_HOST)),
+                    },
+                },
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("transient attach query should execute");
+        let CommandValue::AttachCommandResolved { command, binding } = result else {
+            panic!("expected attach command, got {result:?}");
+        };
+        assert!(binding.is_none(), "standing checkout terminals are deliberately not stamped as convoy sessions");
+        resolved.push(command);
+    }
+    assert_eq!(resolved[0], resolved[1], "the same checkout must resolve to the same terminal target");
+    let ensured = terminal_pool.ensured.lock().await;
+    assert_eq!(ensured.len(), 1, "re-opening a checkout reuses its terminal-pool session");
+    assert_eq!(ensured[0].cwd.as_path(), checkout_path);
+    assert_eq!(ensured[0].command, "${SHELL:-/bin/sh}");
+}
+
+#[tokio::test]
+async fn transient_attach_routes_standing_checkout_paths_to_the_displayed_remote_host() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let (remote_host, _) = non_local_attach_hosts();
+    let remote_hostname = format!("{remote_host}.local");
+    write_attach_hosts_config(&config_base, &[(remote_host, &remote_hostname, Some("alice"))]);
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let row = CheckoutRow::builder()
+        .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "dev", "standing").on_host(HostName::new(remote_host)))
+        .repo(RepositoryKey("repo-standing".to_owned()))
+        .repo_label("standing")
+        .path("/work/standing")
+        .branch("main")
+        .host(HostName::new(remote_host))
+        .authority(LifecycleAuthority::Observed)
+        .build();
+    daemon
+        .aggregator_projection_state()
+        .await
+        .replace_checkout_replica_rows(HashMap::from([(HostName::new(remote_host), vec![row])]))
+        .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::AttachTransient { reference: "/work/standing".to_owned(), host: Some(HostName::new(remote_host)) },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("transient attach query should execute");
+    let CommandValue::AttachCommandResolved { command, binding } = result else {
+        panic!("expected attach command, got {result:?}");
+    };
+    assert!(binding.is_none());
+    assert!(command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")));
+    assert!(command.contains("--transient"));
+    assert!(command.contains("/work/standing"));
 }
 
 #[tokio::test]
@@ -4624,7 +4747,7 @@ async fn normalize_local_provider_hosts_uses_mount_metadata_for_provisioned_chec
         id: environment_id.clone(),
         image: ImageId::new("image:test"),
         runner: Arc::new(DiscoveryMockRunner::builder().build()),
-        mounts: vec![ProvisionedMount::new("/host/reference-repo", "/workspace/repo")],
+        mounts: vec![ProvisionedMount::new("/host/reference-repo", "/workspace/repo", ProvisionedMountMode::Ro)],
     });
     environment_manager
         .register_provisioned_environment(environment_id.clone(), handle, EnvironmentBag::new(), None)
