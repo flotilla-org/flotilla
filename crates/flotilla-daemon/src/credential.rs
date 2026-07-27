@@ -144,10 +144,29 @@ impl CredentialStore {
             }
             .await;
             let cleanup_result = tokio::fs::remove_dir_all(&config_dir).await;
-            cleanup_result.map_err(|error| bounded_adapter_error(name, "docker-registry", &format!("remove writable cache: {error}")))?;
-            operation.map_err(|error| bounded_adapter_error(name, "docker-registry", &error))?;
+            match (operation, cleanup_result) {
+                (Err(operation_error), Err(cleanup_error)) => {
+                    return Err(bounded_adapter_error(
+                        name,
+                        "docker-registry",
+                        &format!("{operation_error}; additionally failed to remove writable cache: {cleanup_error}"),
+                    ));
+                }
+                (Err(operation_error), Ok(())) => {
+                    return Err(bounded_adapter_error(name, "docker-registry", &operation_error));
+                }
+                (Ok(_), Err(cleanup_error)) => {
+                    return Err(bounded_adapter_error(name, "docker-registry", &format!("remove writable cache: {cleanup_error}")));
+                }
+                (Ok(_), Ok(())) => {}
+            }
         }
         Ok(matched)
+    }
+
+    pub(crate) async fn forget_environment(&self, environment_ref: &str) {
+        self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
+        self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
     }
 
     async fn spec(&self, name: &str) -> Result<CredentialSpecSpec, String> {
@@ -482,6 +501,36 @@ mod tests {
         );
 
         assert_eq!(store.held_credentials().await.expect("resolve held credentials"), BTreeSet::from(["model-api".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn forgetting_an_environment_evicts_material_and_preflight_state() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            Arc::new(RecordingRunner::default()),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+        store
+            .prepared
+            .lock()
+            .await
+            .extend([("env-a".to_string(), "model-api".to_string()), ("env-b".to_string(), "model-api".to_string())]);
+        store.materials.lock().await.extend([
+            (("env-a".to_string(), "model-api".to_string()), "secret-a".to_string()),
+            (("env-b".to_string(), "model-api".to_string()), "secret-b".to_string()),
+        ]);
+
+        store.forget_environment("env-a").await;
+
+        assert_eq!(store.prepared.lock().await.clone(), BTreeSet::from([("env-b".to_string(), "model-api".to_string())]));
+        assert_eq!(
+            store.materials.lock().await.clone(),
+            BTreeMap::from([(("env-b".to_string(), "model-api".to_string()), "secret-b".to_string())])
+        );
     }
 
     #[tokio::test]

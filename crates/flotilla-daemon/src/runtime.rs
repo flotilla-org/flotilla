@@ -1106,6 +1106,9 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         };
         active.handle.destroy().await?;
         let _ = self.state.daemon.remove_provisioned_environment(&active.env_id);
+        if let Some(store) = &self.state.credential_store {
+            store.forget_environment(active.env_id.as_str()).await;
+        }
         Ok(())
     }
 }

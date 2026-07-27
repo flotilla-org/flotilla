@@ -3562,7 +3562,7 @@ async fn validate_workflow_agent_adapters(
 async fn resolve_workflow_credentials(
     backend: &ResourceBackend,
     namespace: &str,
-    project_ref: &str,
+    project_ref: Option<&str>,
     repositories: &[ConvoyRepositorySpec],
     workflow: &mut WorkflowTemplateSpec,
 ) -> Result<(), String> {
@@ -3596,7 +3596,7 @@ async fn resolve_workflow_credentials(
             .unwrap_or_else(|| all_repositories.clone());
         let granted = grants
             .iter()
-            .filter(|grant| grant.spec.selector.matches(vessel.stance, Some(project_ref), &vessel_repositories))
+            .filter(|grant| grant.spec.selector.matches(vessel.stance, project_ref, &vessel_repositories))
             .flat_map(|grant| grant.spec.credentials.iter().cloned())
             .collect::<BTreeSet<_>>();
         if let Some(missing) = granted.iter().find(|name| !specs.contains(*name)) {
@@ -3882,7 +3882,7 @@ impl InProcessDaemon {
             .await
             .map_err(|error| format!("workflow template {workflow_ref}: {error}"))?;
         validate_fork_workflow_admission(&self.resource_backend, namespace, &repositories, &workflow_ref, &workflow.spec).await?;
-        resolve_workflow_credentials(&self.resource_backend, namespace, project_ref, &repositories, &mut workflow.spec).await?;
+        resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), &repositories, &mut workflow.spec).await?;
 
         let fallback_slug = convoy_issues_fallback_slug(&issues, &project.spec.display_name, project_ref);
         let generated = if intent.name.is_none() || intent.branch.is_none() {
@@ -3952,7 +3952,14 @@ impl InProcessDaemon {
     ) -> Result<String, String> {
         self.check_local_free_space_floor().await?;
         let admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
-        self.create_convoy(namespace, &admission.name, &admission.spec, intent.auto_attach.into()).await?;
+        self.create_convoy_with_workflow_snapshot(
+            namespace,
+            &admission.name,
+            &admission.spec,
+            &admission.workflow,
+            intent.auto_attach.into(),
+        )
+        .await?;
         Ok(admission.name)
     }
 
@@ -3967,14 +3974,25 @@ impl InProcessDaemon {
         .map_err(|error| format!("free-space check failed on host `{}`: {error}", self.host_name))?
     }
 
-    async fn create_convoy(
+    async fn create_convoy_with_workflow_snapshot(
         &self,
         namespace: &str,
         name: &str,
         spec: &ConvoySpec,
+        workflow: &WorkflowTemplateSpec,
         dispatch_regard: ConvoyDispatchRegard,
     ) -> Result<(), String> {
-        self.create_convoy_with_annotations(namespace, name, spec, dispatch_regard, BTreeMap::new()).await
+        let workflow_value = serde_json::to_value(workflow).map_err(|error| error.to_string())?;
+        let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
+        ensure_prepared_workflow_snapshot(&self.resource_backend, namespace, &workflow_name, workflow).await?;
+        self.create_convoy_with_annotations(
+            namespace,
+            name,
+            spec,
+            dispatch_regard,
+            BTreeMap::from([(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name)]),
+        )
+        .await
     }
 
     async fn create_convoy_with_annotations(
@@ -6802,7 +6820,7 @@ impl InProcessDaemon {
                 });
                 return Ok(id);
             }
-            let workflow = match self
+            let mut workflow = match self
                 .resource_backend
                 .clone()
                 .using::<WorkflowTemplate>(&namespace)
@@ -6822,20 +6840,6 @@ impl InProcessDaemon {
                     return Ok(id);
                 }
             };
-            let placement_policy =
-                match self.resolve_and_validate_convoy_placement(&namespace, &workflow.spec, placement_policy.as_deref()).await {
-                    Ok(placement) => placement.map(|placement| placement.metadata.name),
-                    Err(message) => {
-                        let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                            command_id: id,
-                            node_id: self.node_id.clone(),
-                            repo_identity: empty_identity,
-                            repo: None,
-                            result: flotilla_protocol::CommandValue::Error { message },
-                        });
-                        return Ok(id);
-                    }
-                };
             let project_repositories = if let Some(project_ref) = project_ref {
                 match self.snapshot_project_repositories(&namespace, project_ref).await {
                     Ok(repositories) => Some(repositories),
@@ -6975,6 +6979,33 @@ impl InProcessDaemon {
                 }
                 adopted_checkout_refs.insert(repo_ref, checkout_ref);
             }
+            if let Err(message) =
+                resolve_workflow_credentials(&self.resource_backend, &namespace, project_ref.as_deref(), &repositories, &mut workflow.spec)
+                    .await
+            {
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    node_id: self.node_id.clone(),
+                    repo_identity: empty_identity,
+                    repo: None,
+                    result: flotilla_protocol::CommandValue::Error { message },
+                });
+                return Ok(id);
+            }
+            let placement_policy =
+                match self.resolve_and_validate_convoy_placement(&namespace, &workflow.spec, placement_policy.as_deref()).await {
+                    Ok(placement) => placement.map(|placement| placement.metadata.name),
+                    Err(message) => {
+                        let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                            command_id: id,
+                            node_id: self.node_id.clone(),
+                            repo_identity: empty_identity,
+                            repo: None,
+                            result: flotilla_protocol::CommandValue::Error { message },
+                        });
+                        return Ok(id);
+                    }
+                };
             let spec = ConvoySpec {
                 workflow_ref: workflow_ref.clone(),
                 dispatching_principal_ref: dispatching_principal_ref
@@ -6989,7 +7020,10 @@ impl InProcessDaemon {
                 issues: Vec::new(),
                 instruction: None,
             };
-            let result = match self.create_convoy(&namespace, name, &spec, ConvoyDispatchRegard::Emit).await {
+            let result = match self
+                .create_convoy_with_workflow_snapshot(&namespace, name, &spec, &workflow.spec, ConvoyDispatchRegard::Emit)
+                .await
+            {
                 Ok(()) => flotilla_protocol::CommandValue::ConvoyCreated { name: name.clone() },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
