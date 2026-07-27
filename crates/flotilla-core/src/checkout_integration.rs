@@ -222,7 +222,7 @@ async fn inspect_landed(
     match runner
         .run_output(
             "gh",
-            &["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
+            &["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
             checkout_path,
             &ChannelLabel::Noop,
         )
@@ -235,6 +235,7 @@ async fn inspect_landed(
                         item.get("number").and_then(serde_json::Value::as_i64).map(|number| number.to_string()).unwrap_or_default();
                     let state = item.get("state").and_then(serde_json::Value::as_str).unwrap_or("unknown");
                     let merged_at = item.get("mergedAt").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
+                    let target_ref = item.get("baseRefName").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
                     if state.eq_ignore_ascii_case("MERGED") || state.eq_ignore_ascii_case("CLOSED") || merged_at.is_some() {
                         let outcome = if state.eq_ignore_ascii_case("CLOSED") && merged_at.is_none() { "closed" } else { "merged" };
                         (
@@ -244,7 +245,11 @@ async fn inspect_landed(
                                 .observed_at(observed_at.to_string())
                                 .build(),
                             Some(
-                                LandedEvidence::builder().change_request_id(number).maybe_merged_at(merged_at.map(str::to_string)).build(),
+                                LandedEvidence::builder()
+                                    .change_request_id(number)
+                                    .maybe_merged_at(merged_at.map(str::to_string))
+                                    .maybe_target_ref(if outcome == "merged" { target_ref.map(str::to_string) } else { None })
+                                    .build(),
                             ),
                         )
                     } else {

@@ -4185,11 +4185,11 @@ impl InProcessDaemon {
                             continue;
                         }
                     };
-                    let base_ref = entry.default_branch.clone().or_else(|| repository.status.as_ref()?.default_branch.clone());
+                    let default_ref = entry.default_branch.clone().or_else(|| repository.status.as_ref()?.default_branch.clone());
                     let snapshot = snapshots
                         .entry(entry.repo.clone())
-                        .or_insert_with(|| (url, repository.spec.clone(), base_ref.clone(), BTreeSet::new()));
-                    if snapshot.2 != base_ref {
+                        .or_insert_with(|| (url, repository.spec.clone(), default_ref.clone(), BTreeSet::new()));
+                    if snapshot.2 != default_ref {
                         unresolved.push(format!("repository {} has conflicting project default branches", entry.repo));
                     }
                     if let Some(subpath) = &entry.subpath {
@@ -4199,8 +4199,8 @@ impl InProcessDaemon {
                 Err(error) => unresolved.push(format!("repository {}: {error}", entry.repo)),
             }
         }
-        for (repo_ref, (_, _, base_ref, _)) in &snapshots {
-            if base_ref.is_none() {
+        for (repo_ref, (_, _, default_ref, _)) in &snapshots {
+            if default_ref.is_none() {
                 unresolved.push(format!("repository {repo_ref} has no resolved default branch"));
             }
         }
@@ -4211,12 +4211,16 @@ impl InProcessDaemon {
         let workspace_slugs = flotilla_resources::repository_workspace_slugs(snapshots.iter().map(|(key, (_, spec, _, _))| (key, spec)));
         let mut repositories = snapshots
             .into_iter()
-            .map(|(repo_ref, (url, _, base_ref, subpaths))| ConvoyRepositorySpec {
-                url,
-                workspace_slug: workspace_slugs[&repo_ref].clone(),
-                repo_ref,
-                base_ref: base_ref.expect("missing base refs were rejected"),
-                subpaths: subpaths.into_iter().collect(),
+            .map(|(repo_ref, (url, _, default_ref, subpaths))| {
+                let default_ref = default_ref.expect("missing default refs were rejected");
+                ConvoyRepositorySpec {
+                    url,
+                    workspace_slug: workspace_slugs[&repo_ref].clone(),
+                    repo_ref,
+                    source_ref: default_ref.clone(),
+                    target_ref: default_ref,
+                    subpaths: subpaths.into_iter().collect(),
+                }
             })
             .collect::<Vec<_>>();
         repositories.sort_by(|left, right| left.workspace_slug.cmp(&right.workspace_slug).then_with(|| left.repo_ref.cmp(&right.repo_ref)));
@@ -6832,7 +6836,7 @@ impl InProcessDaemon {
                     )
                     .await
                     .map_err(|error| error.to_string())?;
-                    let base_ref = repository
+                    let default_ref = repository
                         .status
                         .as_ref()
                         .and_then(|status| status.default_branch.clone())
@@ -6841,7 +6845,14 @@ impl InProcessDaemon {
                     let workspace_slug = flotilla_resources::repository_workspace_slugs([(&repo_ref, &repository_spec)])
                         .remove(&repo_ref)
                         .expect("repository slug should resolve");
-                    Ok::<_, String>(vec![ConvoyRepositorySpec { url, repo_ref, base_ref, workspace_slug, subpaths: Vec::new() }])
+                    Ok::<_, String>(vec![ConvoyRepositorySpec {
+                        url,
+                        repo_ref,
+                        source_ref: default_ref.clone(),
+                        target_ref: default_ref,
+                        workspace_slug,
+                        subpaths: Vec::new(),
+                    }])
                 }
                 .await;
                 match resolved {

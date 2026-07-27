@@ -54,6 +54,7 @@ define_patch_kinds! {
     ConvoyAdvanceWorkToReady => DUPLICATE,
     ConvoyFail => DUPLICATE_RESETTLEMENT,
     ConvoyRollUpPhase => DUPLICATE_CONTINUATION_RESETTLEMENT,
+    ConvoySettle => DUPLICATE_RESETTLEMENT,
     ConvoyWorkLaunching => DUPLICATE,
     ConvoyWorkRunning => DUPLICATE,
     ConvoyForceWorkCompleted => DUPLICATE,
@@ -88,6 +89,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::AdvanceWorkToReady { .. } => PatchKind::ConvoyAdvanceWorkToReady,
         ConvoyStatusPatch::FailConvoy { .. } => PatchKind::ConvoyFail,
         ConvoyStatusPatch::RollUpPhase { .. } => PatchKind::ConvoyRollUpPhase,
+        ConvoyStatusPatch::Settle { .. } => PatchKind::ConvoySettle,
         ConvoyStatusPatch::WorkLaunching { .. } => PatchKind::ConvoyWorkLaunching,
         ConvoyStatusPatch::WorkRunning { .. } => PatchKind::ConvoyWorkRunning,
         ConvoyStatusPatch::ForceWorkCompleted { .. } => PatchKind::ConvoyForceWorkCompleted,
@@ -193,6 +195,7 @@ fn active_convoy_status() -> ConvoyStatus {
         finished_at: None,
         observed_workflow_ref: None,
         observed_workflows: None,
+        target_mismatches: Vec::new(),
     }
 }
 
@@ -375,6 +378,17 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 let mut status = settled_convoy_status();
                 let before = convoy_timestamps(&status);
                 let patch = ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Landed, started_at: None, finished_at: Some(ts(30)) };
+                apply_and_replay(&mut status, &patch);
+                (before, convoy_timestamps(&status))
+            },
+        },
+        LifecycleCase {
+            name: "convoy settlement with target facts",
+            kind: PatchKind::ConvoySettle,
+            exercise: || {
+                let mut status = settled_convoy_status();
+                let before = convoy_timestamps(&status);
+                let patch = ConvoyStatusPatch::Settle { target_mismatches: Vec::new(), finished_at: ts(30) };
                 apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
             },
@@ -779,6 +793,18 @@ fn settling_again_after_a_continuation_records_the_new_outcome_time() {
                 status.phase = ConvoyPhase::Failed;
                 let before = convoy_timestamps(&status);
                 let patch = ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Landed, started_at: None, finished_at: Some(ts(30)) };
+                apply_and_replay(&mut status, &patch);
+                (before, convoy_timestamps(&status))
+            },
+        },
+        LifecycleCase {
+            name: "convoy target settlement changes settled outcome",
+            kind: PatchKind::ConvoySettle,
+            exercise: || {
+                let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Failed;
+                let before = convoy_timestamps(&status);
+                let patch = ConvoyStatusPatch::Settle { target_mismatches: Vec::new(), finished_at: ts(30) };
                 apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
             },

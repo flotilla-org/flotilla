@@ -96,7 +96,8 @@ pub struct IssueSnapshot {
 pub struct ConvoyRepositorySpec {
     pub url: String,
     pub repo_ref: RepositoryKey,
-    pub base_ref: String,
+    pub source_ref: String,
+    pub target_ref: String,
     pub workspace_slug: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subpaths: Vec<String>,
@@ -134,6 +135,19 @@ pub struct ConvoyStatus {
     pub observed_workflow_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_workflows: Option<BTreeMap<String, String>>,
+    /// Observed change requests that landed somewhere other than their
+    /// repository's declared target. These facts are advisory: the observed
+    /// landing still wins and the convoy becomes Landed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_mismatches: Vec<TargetMismatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct TargetMismatch {
+    pub repo_ref: RepositoryKey,
+    pub change_request_id: String,
+    pub declared_target_ref: String,
+    pub observed_target_ref: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +285,10 @@ pub enum ConvoyStatusPatch {
         started_at: Option<DateTime<Utc>>,
         finished_at: Option<DateTime<Utc>>,
     },
+    Settle {
+        target_mismatches: Vec<TargetMismatch>,
+        finished_at: DateTime<Utc>,
+    },
     WorkLaunching {
         work: String,
         started_at: DateTime<Utc>,
@@ -407,6 +425,15 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     }
                     status.finished_at.get_or_insert(*finished_at);
                 }
+            }
+            Self::Settle { target_mismatches, finished_at } => {
+                let previous_phase = status.phase;
+                status.phase = ConvoyPhase::Landed;
+                status.target_mismatches = target_mismatches.clone();
+                if previous_phase != ConvoyPhase::Landed {
+                    status.finished_at = None;
+                }
+                status.finished_at.get_or_insert(*finished_at);
             }
             Self::WorkLaunching { work, started_at, placement } => {
                 if let Some(state) = status.work.get_mut(work) {
@@ -591,6 +618,10 @@ pub mod controller_patches {
 
     pub fn roll_up_phase(phase: ConvoyPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> ConvoyStatusPatch {
         ConvoyStatusPatch::RollUpPhase { phase, started_at, finished_at }
+    }
+
+    pub fn settle(target_mismatches: Vec<TargetMismatch>, finished_at: DateTime<Utc>) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::Settle { target_mismatches, finished_at }
     }
 
     pub fn roll_up_work(work: String, phase: WorkPhase, transitioned_at: DateTime<Utc>, message: Option<String>) -> ConvoyStatusPatch {

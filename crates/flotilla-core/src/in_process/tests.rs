@@ -1058,14 +1058,16 @@ async fn handoff_brief_for_demo_repository_scope(repository_refs: Option<Vec<Rep
         ConvoyRepositorySpec::builder()
             .url("https://github.com/flotilla-org/flotilla".to_string())
             .repo_ref(flotilla_repo.clone())
-            .base_ref("main".to_string())
+            .source_ref("main".to_string())
+            .target_ref("main".to_string())
             .workspace_slug("flotilla".to_string())
             .subpaths(Vec::new())
             .build(),
         ConvoyRepositorySpec::builder()
             .url("https://github.com/flotilla-org/cleat".to_string())
             .repo_ref(cleat_repo)
-            .base_ref("main".to_string())
+            .source_ref("main".to_string())
+            .target_ref("main".to_string())
             .workspace_slug("cleat".to_string())
             .subpaths(Vec::new())
             .build(),
@@ -1127,7 +1129,8 @@ async fn fork_review_handoff_launches_reviewer_with_diff_review_and_fork_brief()
     spec.repositories = vec![ConvoyRepositorySpec::builder()
         .url("https://forgejo.lab/fork-issues/zellij".to_string())
         .repo_ref(repository.key())
-        .base_ref("stack/base".to_string())
+        .source_ref("main".to_string())
+        .target_ref("stack/base".to_string())
         .workspace_slug("zellij".to_string())
         .subpaths(Vec::new())
         .build()];
@@ -1464,16 +1467,16 @@ async fn handoff_rejects_self_and_unknown_targets_without_delivery() {
 async fn handoff_brief_uses_vessel_repository_scope() {
     let brief = handoff_brief_for_demo_repository_scope(Some(vec![RepositoryKey("repo-flotilla".into())])).await;
 
-    assert!(brief.contains("  - `repo-flotilla` — https://github.com/flotilla-org/flotilla\n"));
-    assert!(!brief.contains("  - `repo-cleat` — https://github.com/flotilla-org/cleat\n"));
+    assert!(brief.contains("  - `repo-flotilla` — https://github.com/flotilla-org/flotilla (target `main`)\n"));
+    assert!(!brief.contains("  - `repo-cleat` — https://github.com/flotilla-org/cleat (target `main`)\n"));
 }
 
 #[tokio::test]
 async fn handoff_brief_for_unscoped_vessel_lists_all_repositories() {
     let brief = handoff_brief_for_demo_repository_scope(None).await;
 
-    assert!(brief.contains("  - `repo-flotilla` — https://github.com/flotilla-org/flotilla\n"));
-    assert!(brief.contains("  - `repo-cleat` — https://github.com/flotilla-org/cleat\n"));
+    assert!(brief.contains("  - `repo-flotilla` — https://github.com/flotilla-org/flotilla (target `main`)\n"));
+    assert!(brief.contains("  - `repo-cleat` — https://github.com/flotilla-org/cleat (target `main`)\n"));
 }
 
 #[tokio::test]
@@ -3865,6 +3868,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             finished_at: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
+            target_mismatches: Vec::new(),
         })
         .await
         .expect("convoy status update should succeed");
@@ -3962,11 +3966,13 @@ async fn convoy_admission_snapshots_every_project_repository() {
     let convoy = backend.using::<Convoy>("flotilla").get("multi-repo").await.expect("convoy should exist");
     assert_eq!(convoy.spec.repositories.len(), 2);
     assert_eq!(convoy.spec.repositories[0].repo_ref, cleat.key());
-    assert_eq!(convoy.spec.repositories[0].base_ref, "stable");
+    assert_eq!(convoy.spec.repositories[0].source_ref, "stable");
+    assert_eq!(convoy.spec.repositories[0].target_ref, "stable");
     assert_eq!(convoy.spec.repositories[0].workspace_slug, "cleat");
     assert!(convoy.spec.repositories[0].subpaths.is_empty());
     assert_eq!(convoy.spec.repositories[1].repo_ref, flotilla.key());
-    assert_eq!(convoy.spec.repositories[1].base_ref, "main");
+    assert_eq!(convoy.spec.repositories[1].source_ref, "main");
+    assert_eq!(convoy.spec.repositories[1].target_ref, "main");
     assert_eq!(convoy.spec.repositories[1].workspace_slug, "flotilla");
     assert_eq!(convoy.spec.repositories[1].subpaths, ["crates/flotilla-core", "crates/flotilla-tui"]);
 }
@@ -4125,7 +4131,8 @@ async fn direct_repository_admission_snapshots_its_resolved_default_branch() {
         name: "direct-repository".to_string()
     });
     let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("direct-repository").await.expect("convoy");
-    assert_eq!(convoy.spec.repositories[0].base_ref, "main");
+    assert_eq!(convoy.spec.repositories[0].source_ref, "main");
+    assert_eq!(convoy.spec.repositories[0].target_ref, "main");
 }
 
 #[tokio::test]
@@ -4426,6 +4433,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             finished_at: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
+            target_mismatches: Vec::new(),
         })
         .await
         .expect("convoy status update should succeed");
@@ -4531,8 +4539,19 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
         .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("1\n".into()))
         .on_run(
             "gh",
-            &["pr", "list", "--head", "feature/missing-push", "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
-            Ok(r#"[{"number":812,"state":"MERGED","mergedAt":"2026-07-22T00:00:00Z"}]"#.into()),
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/missing-push",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName",
+                "--limit",
+                "1",
+            ],
+            Ok(r#"[{"number":812,"state":"MERGED","mergedAt":"2026-07-22T00:00:00Z","baseRefName":"main"}]"#.into()),
         )
         .build();
     let mut discovery = fake_discovery(false);
@@ -4562,6 +4581,7 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
             finished_at: Some(chrono::Utc::now()),
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
+            target_mismatches: Vec::new(),
         })
         .await
         .expect("convoy status should update");
@@ -4790,6 +4810,7 @@ async fn convoy_abandon_command_archives_and_retains_terminal_record() {
             finished_at: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
+            target_mismatches: Vec::new(),
         })
         .await
         .expect("convoy status should update");

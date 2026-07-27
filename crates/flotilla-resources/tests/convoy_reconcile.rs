@@ -11,10 +11,11 @@ use common::{
 use flotilla_resources::{
     controller::{Actuation, Reconciler},
     controller_patches, interactive_single_workflow_spec, reconcile, Checkout, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
-    CheckoutStatus, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch, ConvoyTeardownRuntime,
-    CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, ObservedCheckoutSpec, OwnerReference,
-    Presentation, PresentationSpec, RepositoryKey, ResourceBackend, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus,
-    WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
+    CheckoutStatus, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatus, ConvoyStatusPatch,
+    ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, LandedEvidence,
+    ObservedCheckoutSpec, OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, StatusPatch, TargetMismatch,
+    ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate,
+    CONVOY_LABEL, VESSEL_LABEL,
 };
 
 struct AlwaysEligible;
@@ -91,6 +92,7 @@ async fn reconcile_once_with_resources(
 
 async fn reconcile_landing_with_observed_change_request(
     condition: Option<ConditionValue>,
+    observed_target_ref: Option<&str>,
 ) -> flotilla_resources::controller::ReconcileOutcome<Convoy> {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
@@ -106,7 +108,16 @@ async fn reconcile_landing_with_observed_change_request(
             member.phase = CrewWorkPhase::Done;
         }
     }
-    let source = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
+    let mut spec = valid_convoy_spec();
+    spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec::builder()
+        .url("https://example.com/repo-a".to_string())
+        .repo_ref(RepositoryKey("repo-a".to_string()))
+        .source_ref("main".to_string())
+        .target_ref("main".to_string())
+        .workspace_slug("repo-a".to_string())
+        .subpaths(Vec::new())
+        .build()];
+    let source = convoy_object("convoy-a", spec, Some(status));
     let created = convoys.create(&convoy_meta("convoy-a"), &source.spec).await.expect("convoy create");
     convoys
         .update_status("convoy-a", &created.metadata.resource_version, source.status.as_ref().expect("status"))
@@ -142,7 +153,9 @@ async fn reconcile_landing_with_observed_change_request(
                     clean: Default::default(),
                     pushed: Default::default(),
                     landed: IntegrationCondition::builder().value(value).build(),
-                    landed_evidence: None,
+                    landed_evidence: observed_target_ref.map(|target_ref| {
+                        LandedEvidence::builder().change_request_id("42".to_string()).target_ref(target_ref.to_string()).build()
+                    }),
                 },
                 message: None,
             })
@@ -544,7 +557,7 @@ fn reconciler_does_not_write_the_completion_claim_edge() {
 
 #[tokio::test]
 async fn landing_with_open_change_request_stays_warm() {
-    let outcome = reconcile_landing_with_observed_change_request(Some(ConditionValue::False)).await;
+    let outcome = reconcile_landing_with_observed_change_request(Some(ConditionValue::False), None).await;
 
     assert_eq!(outcome.patch, None);
     assert!(!outcome.actuations.iter().any(|actuation| matches!(
@@ -555,16 +568,33 @@ async fn landing_with_open_change_request_stays_warm() {
 
 #[tokio::test]
 async fn landing_with_settled_change_request_becomes_landed() {
-    let outcome = reconcile_landing_with_observed_change_request(Some(ConditionValue::True)).await;
+    let outcome = reconcile_landing_with_observed_change_request(Some(ConditionValue::True), Some("main")).await;
 
-    assert_eq!(outcome.patch, Some(controller_patches::roll_up_phase(ConvoyPhase::Landed, None, Some(timestamp(40)))));
+    assert_eq!(outcome.patch, Some(controller_patches::settle(Vec::new(), timestamp(40))));
+}
+
+#[tokio::test]
+async fn landing_on_a_different_target_records_a_fact_and_still_becomes_landed() {
+    let outcome = reconcile_landing_with_observed_change_request(Some(ConditionValue::True), Some("release")).await;
+
+    let expected_mismatch = TargetMismatch::builder()
+        .repo_ref(RepositoryKey("repo-a".to_string()))
+        .change_request_id("42".to_string())
+        .declared_target_ref("main".to_string())
+        .observed_target_ref("release".to_string())
+        .build();
+    assert_eq!(outcome.patch, Some(controller_patches::settle(vec![expected_mismatch.clone()], timestamp(40))));
+    let mut status = ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() };
+    outcome.patch.expect("settlement patch").apply(&mut status);
+    assert_eq!(status.phase, ConvoyPhase::Landed);
+    assert_eq!(status.target_mismatches, [expected_mismatch]);
 }
 
 #[tokio::test]
 async fn landing_without_a_change_request_becomes_landed_on_first_evaluation() {
-    let outcome = reconcile_landing_with_observed_change_request(None).await;
+    let outcome = reconcile_landing_with_observed_change_request(None, None).await;
 
-    assert_eq!(outcome.patch, Some(controller_patches::roll_up_phase(ConvoyPhase::Landed, None, Some(timestamp(40)))));
+    assert_eq!(outcome.patch, Some(controller_patches::settle(Vec::new(), timestamp(40))));
 }
 
 #[test]

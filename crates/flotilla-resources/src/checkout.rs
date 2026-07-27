@@ -165,6 +165,8 @@ pub struct LandedEvidence {
     pub change_request_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

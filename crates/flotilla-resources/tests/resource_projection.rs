@@ -46,7 +46,8 @@ fn convoy_repository_snapshot_roundtrips_every_repository_field() {
     spec.repositories = vec![ConvoyRepositorySpec {
         url: "https://github.com/flotilla-org/flotilla".to_string(),
         repo_ref: repo_ref.clone(),
-        base_ref: "main".to_string(),
+        source_ref: "main".to_string(),
+        target_ref: "release".to_string(),
         workspace_slug: "flotilla".to_string(),
         subpaths: vec!["crates/core".to_string(), "crates/tui".to_string()],
     }];
@@ -67,6 +68,9 @@ fn convoy_crd_allows_omitted_empty_repository_subpaths() {
         .expect("repository required fields");
 
     assert!(!required.iter().any(|field| field == "subpaths"));
+    assert!(required.iter().any(|field| field == "source_ref"));
+    assert!(required.iter().any(|field| field == "target_ref"));
+    assert!(!required.iter().any(|field| field == "base_ref"));
 }
 
 #[test]

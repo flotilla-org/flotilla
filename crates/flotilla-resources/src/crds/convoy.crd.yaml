@@ -53,7 +53,7 @@ spec:
                   type: array
                   items:
                     type: object
-                    required: [url, repo_ref, base_ref, workspace_slug]
+                    required: [url, repo_ref, source_ref, target_ref, workspace_slug]
                     properties:
                       url:
                         type: string
@@ -61,7 +61,10 @@ spec:
                       repo_ref:
                         type: string
                         minLength: 1
-                      base_ref:
+                      source_ref:
+                        type: string
+                        minLength: 1
+                      target_ref:
                         type: string
                         minLength: 1
                       workspace_slug:
@@ -139,6 +142,24 @@ spec:
                   type: object
                   additionalProperties:
                     type: string
+                target_mismatches:
+                  type: array
+                  items:
+                    type: object
+                    required: [repo_ref, change_request_id, declared_target_ref, observed_target_ref]
+                    properties:
+                      repo_ref:
+                        type: string
+                        minLength: 1
+                      change_request_id:
+                        type: string
+                        minLength: 1
+                      declared_target_ref:
+                        type: string
+                        minLength: 1
+                      observed_target_ref:
+                        type: string
+                        minLength: 1
                 workflow_snapshot:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true

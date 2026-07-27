@@ -284,14 +284,16 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
                 ConvoyRepositorySpec::builder()
                     .url("https://github.com/flotilla-org/flotilla".to_string())
                     .repo_ref(known.key())
-                    .base_ref("main".to_string())
+                    .source_ref("main".to_string())
+                    .target_ref("main".to_string())
                     .workspace_slug("flotilla".to_string())
                     .subpaths(Vec::new())
                     .build(),
                 ConvoyRepositorySpec::builder()
                     .url("https://github.com/flotilla-org/cleat".to_string())
                     .repo_ref(missing.key())
-                    .base_ref("main".to_string())
+                    .source_ref("main".to_string())
+                    .target_ref("main".to_string())
                     .workspace_slug("cleat".to_string())
                     .subpaths(Vec::new())
                     .build(),

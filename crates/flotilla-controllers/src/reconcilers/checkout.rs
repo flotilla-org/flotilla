@@ -70,7 +70,7 @@ impl<R> CheckoutReconciler<R> {
 pub enum CheckoutDeps {
     None,
     Ready { prepared: PreparedCheckout },
-    Integration { status: CheckoutIntegrationStatus },
+    Integration { status: Box<CheckoutIntegrationStatus> },
     Waiting,
     Failed(String),
 }
@@ -102,7 +102,7 @@ where
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) != CheckoutPhase::Pending {
             if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready && !integration_is_fresh(status, Utc::now())) {
                 return Ok(match self.runtime.inspect_integration(obj).await {
-                    Ok(status) => CheckoutDeps::Integration { status },
+                    Ok(status) => CheckoutDeps::Integration { status: Box::new(status) },
                     Err(err) => CheckoutDeps::Failed(err),
                 });
             }
@@ -158,7 +158,9 @@ where
             }
         } else if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) {
             match deps {
-                CheckoutDeps::Integration { status } => Some(CheckoutStatusPatch::UpdateIntegration { integration: status.clone() }),
+                CheckoutDeps::Integration { status } => {
+                    Some(CheckoutStatusPatch::UpdateIntegration { integration: status.as_ref().clone() })
+                }
                 CheckoutDeps::Failed(message) => Some(CheckoutStatusPatch::UpdateIntegration {
                     integration: CheckoutIntegrationStatus {
                         clean: flotilla_resources::IntegrationCondition::builder()
