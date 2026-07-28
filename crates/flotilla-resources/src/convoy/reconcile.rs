@@ -249,11 +249,11 @@ impl Reconciler for ConvoyReconciler {
         if let Some(presentations) = &self.presentations {
             delete_lifecycle_owned_matching(presentations, &selector).await?;
         }
-        if let Some(terminal_sessions) = &self.terminal_sessions {
-            delete_lifecycle_owned_matching(terminal_sessions, &selector).await?;
-        }
         if let Some(vessels) = &self.vessels {
             delete_lifecycle_owned_matching(vessels, &selector).await?;
+        }
+        if let Some(terminal_sessions) = &self.terminal_sessions {
+            delete_lifecycle_owned_matching(terminal_sessions, &selector).await?;
         }
         if let Some(checkouts) = &self.checkouts {
             delete_lifecycle_owned_matching(checkouts, &selector).await?;
