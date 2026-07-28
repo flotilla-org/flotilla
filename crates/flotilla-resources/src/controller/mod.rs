@@ -54,12 +54,11 @@ pub trait Reconciler: Send + Sync + 'static {
 
     fn finalizer_name(&self) -> Option<&'static str>;
 
-    /// Map an object-scoped reconciliation error to a status update.
+    /// Map a finalizer failure to a status update.
     ///
-    /// The controller loop isolates errors to the named object regardless of
-    /// whether a reconciler supplies a patch. Reconcilers with a failed/degraded
-    /// status should override this so the affected object reports the error.
-    fn error_patch(
+    /// Other object-scoped errors remain isolated and are retried on a later
+    /// event or resync without forcing the resource into a terminal state.
+    fn finalizer_error_patch(
         &self,
         _obj: &ResourceObject<Self::Resource>,
         _error: &ResourceError,
@@ -503,7 +502,21 @@ impl<R: Reconciler> ControllerLoop<R> {
                             && object.metadata.finalizers.iter().any(|finalizer| finalizer == finalizer_name)
                         {
                             if lifecycle_owned {
-                                reconciler.run_finalizer(&object).await?;
+                                if let Err(err) = reconciler.run_finalizer(&object).await {
+                                    if let Some(patch) = reconciler.finalizer_error_patch(&object, &err) {
+                                        if let Err(patch_error) =
+                                            Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await
+                                        {
+                                            warn!(
+                                                resource_kind = R::Resource::API_PATHS.kind,
+                                                resource = %name,
+                                                %patch_error,
+                                                "controller failed to record object finalizer error",
+                                            );
+                                        }
+                                    }
+                                    return Err(err);
+                                }
                             }
                             let meta = InputMeta::from(&object.metadata).without_finalizer(finalizer_name);
                             Self::write_tolerating_not_found(primary.update(&meta, &object.metadata.resource_version, &object.spec))
@@ -548,16 +561,6 @@ impl<R: Reconciler> ControllerLoop<R> {
                         %err,
                         "controller failed to reconcile object; other objects will continue",
                     );
-                    if let Some(patch) = reconciler.error_patch(&object, &err) {
-                        if let Err(patch_error) = Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await {
-                            warn!(
-                                resource_kind = R::Resource::API_PATHS.kind,
-                                resource = %name,
-                                %patch_error,
-                                "controller failed to record object reconciliation error",
-                            );
-                        }
-                    }
                 }
                 continue;
             }
