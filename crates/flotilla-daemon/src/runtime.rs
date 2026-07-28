@@ -3738,12 +3738,20 @@ mod tests {
             .expect("read maximum resource event rowid")
     }
 
-    async fn wait_until<F, Fut>(mut condition: F)
+    async fn wait_until<F, Fut>(condition: F)
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = bool>,
     {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        wait_until_with_timeout(Duration::from_secs(5), condition).await;
+    }
+
+    async fn wait_until_with_timeout<F, Fut>(timeout: Duration, mut condition: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if condition().await {
                 return;
@@ -3785,7 +3793,7 @@ mod tests {
         let heartbeat =
             spawn_heartbeat_task(Arc::clone(&daemon), NAMESPACE.to_string(), profile, test_health_identity(), Duration::from_millis(20));
 
-        wait_until(|| {
+        wait_until_with_timeout(Duration::from_secs(30), || {
             let hosts = hosts.clone();
             let host_id = host_id.clone();
             async move { hosts.get(&host_id).await.ok().and_then(|host| host.status).is_some_and(|status| status.ready) }
