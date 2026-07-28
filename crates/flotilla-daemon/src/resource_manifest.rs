@@ -166,6 +166,7 @@ impl ResourceManifestReconciler {
             report.unmanaged += 1;
             return Ok(());
         }
+        self.warned_unmanaged.remove(&identity);
 
         let annotations = string_map(&existing, "annotations")?;
         let live_hash = resource_document_spec_hash(&existing).map_err(|error| format!("{identity}: {error}"))?;
@@ -492,6 +493,43 @@ mod tests {
         assert_eq!(report.unmanaged, 1);
         assert_eq!(object.spec.pool, "live");
         assert!(!object.metadata.labels.contains_key(MANAGED_BY_LABEL));
+    }
+
+    #[tokio::test]
+    async fn unmanaged_warning_is_rearmed_after_ownership_is_restored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir.path().join("policy.yaml"), &manifest("unmanaged", "manifest"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        resolver
+            .create(
+                &InputMeta::builder().name("unmanaged".to_string()).build(),
+                &PlacementPolicySpec::builder().pool("live".to_string()).build(),
+            )
+            .await
+            .expect("unmanaged policy");
+        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
+        let identity =
+            ObjectIdentity { kind: "PlacementPolicy".to_string(), namespace: NAMESPACE.to_string(), name: "unmanaged".to_string() };
+
+        reconciler.reconcile_once().await.expect("initial unmanaged pass");
+        assert!(reconciler.warned_unmanaged.contains(&identity));
+
+        let object = resolver.get("unmanaged").await.expect("policy");
+        let mut meta = InputMeta::from(&object.metadata);
+        meta.labels.insert(MANAGED_BY_LABEL.to_string(), MANIFEST_MANAGED_BY_VALUE.to_string());
+        resolver.update(&meta, &object.metadata.resource_version, &object.spec).await.expect("restore ownership");
+        reconciler.reconcile_once().await.expect("managed pass");
+        assert!(!reconciler.warned_unmanaged.contains(&identity));
+
+        let object = resolver.get("unmanaged").await.expect("policy");
+        let mut meta = InputMeta::from(&object.metadata);
+        meta.labels.remove(MANAGED_BY_LABEL);
+        resolver.update(&meta, &object.metadata.resource_version, &object.spec).await.expect("remove ownership");
+        let report = reconciler.reconcile_once().await.expect("unmanaged again");
+
+        assert_eq!(report.unmanaged, 1);
+        assert!(reconciler.warned_unmanaged.contains(&identity));
     }
 
     #[tokio::test]
