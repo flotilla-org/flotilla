@@ -47,6 +47,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     credential::CredentialStore,
+    manifest::ManifestReconciler,
     sleep_inhibitor,
     supervisor::{supervise, ControllerSupervision},
     Aggregator, AggregatorResolvers,
@@ -56,6 +57,7 @@ use crate::{
 /// enough to be quiet in a healthy log, short enough to bound how much time a
 /// wedge can hide in.
 const LIVENESS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+const MANIFEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 const BUILTIN_MANAGED_BY_VALUE: &str = "builtin";
@@ -195,6 +197,7 @@ impl DaemonRuntime {
         }
         daemon.set_provisioning_namespace(options.namespace.clone()).await;
         let aggregator_projection_state = daemon.aggregator_projection_state().await;
+        let manifests = config.load_daemon_config()?.manifests;
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
@@ -247,6 +250,15 @@ impl DaemonRuntime {
                 options.controller_supervision.clone(),
             ),
         ];
+        if let Some(manifests) = manifests {
+            tasks.push(spawn_manifest_reconciler_task(
+                daemon.resource_backend(),
+                options.namespace.clone(),
+                manifests.dir,
+                MANIFEST_RECONCILE_INTERVAL,
+                options.controller_supervision.clone(),
+            ));
+        }
 
         if options.start_controllers {
             let local_repo_root = daemon.tracked_repo_paths().await.into_iter().next().map(ExecutionEnvironmentPath::new);
@@ -277,6 +289,22 @@ impl DaemonRuntime {
 
         Ok(Self { tasks, stop_expected: false })
     }
+}
+
+fn spawn_manifest_reconciler_task(
+    backend: ResourceBackend,
+    namespace: String,
+    root: PathBuf,
+    interval: Duration,
+    supervision: ControllerSupervision,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        supervise("manifest", supervision, move || {
+            let reconciler = ManifestReconciler::new(backend.clone(), namespace.clone(), root.clone());
+            async move { reconciler.run(interval).await }
+        })
+        .await;
+    })
 }
 
 impl DaemonRuntime {
