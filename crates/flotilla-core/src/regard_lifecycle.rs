@@ -43,10 +43,6 @@ impl RegardLifecycle {
         Self::builder().backend(backend).clock(clock).decay_window(decay_window).build()
     }
 
-    pub fn with_system_clock(backend: ResourceBackend) -> Self {
-        Self::new(backend, Arc::new(SystemClock), Duration::seconds(DEFAULT_REGARD_DECAY_SECONDS))
-    }
-
     pub fn connect_surface(&self, surface_id: Uuid, declaration: SurfaceDeclaration) {
         self.surfaces
             .lock()
