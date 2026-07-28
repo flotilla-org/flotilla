@@ -726,6 +726,30 @@ fork-stance crew and a trusted-repo crew must not be co-tenants — that is a
 placement constraint, not a directory-layout problem, and no amount of `HOME`
 juggling fixes it.
 
+## Recommendation revised: one vessel home (Robert, 2026-07-28)
+
+The per-crew-home layout below is **superseded** — it is isolation-lens residue.
+The decisive observation: running N concurrent sessions of the same CLI from
+one home directory is these tools' *native mode* — it is exactly a developer
+workstation, where multiple claude/codex sessions share one `~/.claude` /
+`~/.codex` continuously. The CLIs already handle concurrent-session state
+(per-session ids, transcripts, locks) because that is their primary deployment.
+
+**Revised default: one home per vessel.** Seed every agent's config into the
+single vessel home (`~/.codex`, `~/.claude`, `~/.cursor`, `~/.pi` side by
+side) so the container is simply a correctly-onboarded workstation. Apply
+per-crew differences as **per-process environment at session spawn** only
+where identity or behaviour genuinely differs per crew member: API key
+(cost/identity attribution), model selection, role-specific settings
+overlays. The collision inventory below remains valuable as the checklist of
+*what the CLIs already multiplex per session* (and the TMPDIR/socket notes
+matter if concurrent instances misbehave in practice — verify empirically,
+not preemptively). Per-crew homes remain an available *option* for the rare
+case of two same-CLI crew members needing divergent persistent config, not
+the default.
+
+The original per-crew layout is retained below for reference.
+
 ## Recommended container layout
 
 **Mechanism: one home directory per crew member, same unix user, with narrow
