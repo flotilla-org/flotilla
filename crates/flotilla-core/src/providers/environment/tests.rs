@@ -298,6 +298,35 @@ async fn create_returns_handle() {
     assert!(args.iter().any(|a| a.starts_with("GITHUB_TOKEN=")), "token env var should be passed");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn create_runs_container_as_the_host_user() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let image = ImageId::new("ubuntu:22.04");
+    let opts = CreateOpts {
+        tokens: Vec::new(),
+        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        working_directory: None,
+        provisioned_mounts: Vec::new(),
+        image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
+    };
+
+    provider.create(EnvironmentId::new("host-user"), &image, opts).await.expect("create environment as host user");
+
+    let calls = runner.calls();
+    let (_, args, _) = &calls[0];
+    // SAFETY: getuid and getgid are side-effect-free process identity queries.
+    let host_user = unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) };
+    assert!(
+        args.windows(2).any(|pair| pair == ["--user", host_user.as_str()]),
+        "docker container should run as the host uid:gid; args: {args:?}",
+    );
+}
+
 #[tokio::test]
 async fn create_removes_container_when_image_digest_cannot_be_resolved() {
     use flotilla_protocol::ImageId;
