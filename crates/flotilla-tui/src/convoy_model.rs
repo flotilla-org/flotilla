@@ -4,7 +4,7 @@
 //! ([`flotilla_protocol::result_set`]). This adapter model is intentionally
 //! surface-owned and may evolve with consumer-side view requirements.
 
-use flotilla_protocol::{result_set as wire, CheckoutRef, HostName, PrincipalRef, RepoKey, ResourceRef};
+use flotilla_protocol::{result_set as wire, CheckoutRef, HostName, PlacementDecision, PrincipalRef, RepoKey, ResourceRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConvoyId(String);
@@ -143,6 +143,7 @@ pub struct VesselSummary {
     pub name: String,
     pub depends_on: Vec<String>,
     pub phase: WorkPhase,
+    pub placement_decision: Option<PlacementDecision>,
     pub crew: Vec<ProcessSummary>,
     pub host: Option<HostName>,
     pub checkout: Option<CheckoutRef>,
@@ -167,6 +168,7 @@ pub struct ConvoySummary {
     #[builder(default)]
     pub dispatching_principal_ref: PrincipalRef,
     pub phase: ConvoyPhase,
+    pub placement_decision: Option<PlacementDecision>,
     pub message: Option<String>,
     pub repo_hint: Option<RepoKey>,
     /// The Project this convoy belongs to (`ConvoySpec.project_ref`).
@@ -193,6 +195,7 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
             workflow_ref: row.workflow_ref.clone(),
             dispatching_principal_ref: row.dispatching_principal_ref.clone(),
             phase: row.phase.into(),
+            placement_decision: row.placement_decision.clone(),
             message: row.message.clone(),
             repo_hint: row.repo.clone(),
             project_ref: row.project_ref.clone(),
@@ -218,6 +221,7 @@ fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSumm
         name: vessel.name.clone(),
         depends_on: vessel.depends_on.clone(),
         phase: vessel.phase.into(),
+        placement_decision: vessel.placement_decision.clone(),
         crew,
         host: Some(vessel.host.clone()),
         // The convoys query does not yet expose checkout allocation.

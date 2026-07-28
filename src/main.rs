@@ -250,6 +250,8 @@ enum ResourceSubCommand {
     Apply(ResourceApplyArgs),
     /// Get one resource by name
     Get(ResourceGetArgs),
+    /// Delete exactly one raw resource object, bypassing lifecycle gates
+    Delete(ResourceDeleteArgs),
     /// Watch resources of a kind
     Watch(ResourceListArgs),
 }
@@ -281,6 +283,17 @@ struct ResourceGetArgs {
     /// Route the query to a peer host
     #[arg(long)]
     host: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct ResourceDeleteArgs {
+    /// Exact resource kind or plural name
+    kind: String,
+    /// Exact resource name
+    name: String,
+    /// Resource namespace
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
 }
 
 #[derive(clap::Args)]
@@ -894,7 +907,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
             let result = daemon
                 .execute_query(
                     Command {
-                        node_id,
+                        node_id: node_id.clone(),
                         provisioning_target: None,
                         context_repo: None,
                         action: CommandAction::QueryResourceList {
@@ -907,7 +920,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 )
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!(e))?;
-            print_resource_query_result(result, format)
+            print_resource_query_result(daemon.as_ref(), node_id, result, format).await
         }
         ResourceSubCommand::Get(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
@@ -915,7 +928,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
             let result = daemon
                 .execute_query(
                     Command {
-                        node_id,
+                        node_id: node_id.clone(),
                         provisioning_target: None,
                         context_repo: None,
                         action: CommandAction::QueryResourceGet { namespace: args.namespace, kind: args.kind, name: args.name },
@@ -924,7 +937,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 )
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!(e))?;
-            print_resource_query_result(result, format)
+            print_resource_query_result(daemon.as_ref(), node_id, result, format).await
         }
         ResourceSubCommand::Apply(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
@@ -944,6 +957,19 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
             )
             .await
         }
+        ResourceSubCommand::Delete(args) => {
+            run_control_command(
+                cli,
+                Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::ResourceDelete { namespace: args.namespace, kind: args.kind, name: args.name },
+                },
+                format,
+            )
+            .await
+        }
         ResourceSubCommand::Watch(args) => run_resource_watch(cli, args, format).await,
     }
 }
@@ -958,14 +984,19 @@ async fn resolve_optional_host_node(cli: &Cli, host: Option<&str>) -> Result<Opt
     }
 }
 
-fn print_resource_query_result(result: CommandValue, format: OutputFormat) -> Result<()> {
+async fn print_resource_query_result(
+    daemon: &dyn DaemonHandle,
+    node_id: Option<flotilla_protocol::NodeId>,
+    result: CommandValue,
+    format: OutputFormat,
+) -> Result<()> {
     match result {
         CommandValue::ResourceList(response) => {
-            println!("{}", flotilla_protocol::output::json_pretty(&response.value));
+            println!("{}", format_resource_value(daemon, node_id, response.value, format).await?);
             Ok(())
         }
         CommandValue::ResourceObject(response) => {
-            println!("{}", flotilla_protocol::output::json_pretty(&response.value));
+            println!("{}", format_resource_value(daemon, node_id, response.value, format).await?);
             Ok(())
         }
         CommandValue::Error { message } => match format {
@@ -976,6 +1007,59 @@ fn print_resource_query_result(result: CommandValue, format: OutputFormat) -> Re
             OutputFormat::Human => Err(color_eyre::eyre::eyre!(message)),
         },
         other => Err(color_eyre::eyre::eyre!("unexpected resource response: {other:?}")),
+    }
+}
+
+async fn format_resource_value(
+    daemon: &dyn DaemonHandle,
+    node_id: Option<flotilla_protocol::NodeId>,
+    mut value: serde_json::Value,
+    format: OutputFormat,
+) -> Result<String> {
+    if format == OutputFormat::Json {
+        return Ok(flotilla_protocol::output::json_pretty(&value));
+    }
+    let hosts = daemon
+        .execute_query(
+            Command { node_id, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    let CommandValue::HostList(hosts) = hosts else {
+        return Ok(flotilla_protocol::output::json_pretty(&value));
+    };
+    let names = hosts
+        .hosts
+        .iter()
+        .filter_map(|host| {
+            let host_id = host.environment_id.as_ref()?.host_id()?.to_string();
+            let display_name = host.node.as_ref().map(|node| node.display_name.clone()).unwrap_or_else(|| host.host_name.to_string());
+            Some((host_id, display_name))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    replace_host_ids(&mut value, &names);
+    Ok(flotilla_protocol::output::json_pretty(&value))
+}
+
+fn replace_host_ids(value: &mut serde_json::Value, names: &std::collections::HashMap<String, String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(display_name) = names.get(text) {
+                *text = display_name.clone();
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                replace_host_ids(value, names);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for value in fields.values_mut() {
+                replace_host_ids(value, names);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1649,9 +1733,10 @@ mod tests {
     };
 
     use super::{
-        attach_exit_disposition, confirm_command, default_project_landing, provisioning_target_for_environment, run_replica_snapshot,
-        select_host_target, select_startup_repo_roots, should_reexec_for_incompatible_daemon, show_startup_splash, AttachExitDisposition,
-        Cli, ResourceApplyArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, SubCommand,
+        attach_exit_disposition, confirm_command, default_project_landing, provisioning_target_for_environment, replace_host_ids,
+        run_replica_snapshot, select_host_target, select_startup_repo_roots, should_reexec_for_incompatible_daemon, show_startup_splash,
+        AttachExitDisposition, Cli, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand,
+        SubCommand,
     };
 
     fn landing_repo(path: &str, name: &str, key: Option<&str>) -> RepoInfo {
@@ -1872,6 +1957,15 @@ mod tests {
             }) if kind == "convoys" && name == "demo" && namespace == "ops"
         ));
 
+        let delete = Cli::try_parse_from(["flotilla", "resource", "delete", "workflowtemplates", "scratch", "--namespace", "ops"])
+            .expect("resource delete should parse");
+        assert!(matches!(
+            delete.command,
+            Some(SubCommand::Resource {
+                command: ResourceSubCommand::Delete(ResourceDeleteArgs { kind, name, namespace })
+            }) if kind == "workflowtemplates" && name == "scratch" && namespace == "ops"
+        ));
+
         let apply = Cli::try_parse_from(["flotilla", "resource", "apply", "-f", "demand.yaml", "--namespace", "ops"])
             .expect("resource apply should parse");
         assert!(matches!(
@@ -1890,6 +1984,20 @@ mod tests {
                 command: ResourceSubCommand::Watch(ResourceListArgs { kind, namespace, host: None, include_replicas: false })
             }) if kind == "terminalsessions" && namespace == "flotilla"
         ));
+    }
+
+    #[test]
+    fn human_resource_rendering_replaces_exact_host_ids_but_not_embedded_object_names() {
+        let mut value = serde_json::json!({
+            "spec": {"host_ref": "01HXYZ"},
+            "metadata": {"name": "host-direct-01HXYZ"},
+            "status": {"placement_decision": {"target_host": {"ref": "01HXYZ", "display_name": "kiwi"}}}
+        });
+        replace_host_ids(&mut value, &std::collections::HashMap::from([("01HXYZ".to_string(), "kiwi".to_string())]));
+
+        assert_eq!(value["spec"]["host_ref"], "kiwi");
+        assert_eq!(value["status"]["placement_decision"]["target_host"]["ref"], "kiwi");
+        assert_eq!(value["metadata"]["name"], "host-direct-01HXYZ");
     }
 
     #[tokio::test]

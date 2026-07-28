@@ -51,6 +51,12 @@ Fleet truth comes from daemon surfaces, never from reading a local store
 directly — remote-placed convoys are home-bound in their placement host's
 store, and a local view is not the fleet.
 
+`flotilla resource delete <kind> <name> [--namespace <namespace>]` is the
+sharp recovery tool for deleting one exact object. It bypasses lifecycle and
+teardown gates, but still uses the resource store's normal watch, tombstone,
+and replication path. Prefer the orchestrated verbs in routine operation.
+Controllers may recreate code-owned objects after a raw delete.
+
 ## Dispatching
 
 1. **The issue body alone must be a dispatchable contract** — scope,

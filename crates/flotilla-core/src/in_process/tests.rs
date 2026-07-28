@@ -290,7 +290,7 @@ fn prepared_snapshot_names_are_content_addressed_for_safe_convoy_name_reuse() {
 async fn agent_adapter_admission_rejects_a_host_that_does_not_advertise_the_required_adapter() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host = hosts.create(&InputMeta::builder().name("host-test".to_string()).build(), &HostSpec {}).await.expect("host create");
+    let host = hosts.create(&InputMeta::builder().name("host-test".to_string()).build(), &HostSpec::default()).await.expect("host create");
     hosts
         .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
             capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["claude-code"]))].into_iter().collect(),
@@ -330,7 +330,7 @@ async fn agent_adapter_admission_rejects_a_host_that_does_not_advertise_the_requ
 async fn agent_adapter_admission_rejects_a_host_with_stale_heartbeat() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host = hosts.create(&InputMeta::builder().name("host-test".to_string()).build(), &HostSpec {}).await.expect("host create");
+    let host = hosts.create(&InputMeta::builder().name("host-test".to_string()).build(), &HostSpec::default()).await.expect("host create");
     hosts
         .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
             capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
@@ -368,7 +368,7 @@ async fn agent_adapter_admission_rejects_a_host_with_stale_heartbeat() {
 
 async fn create_host_direct_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, agent_adapters: BTreeSet<String>) {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host = hosts.create(&empty_input_meta(host_ref), &HostSpec {}).await.expect("host create");
+    let host = hosts.create(&empty_input_meta(host_ref), &HostSpec { display_name: host_ref.to_string() }).await.expect("host create");
     hosts
         .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
             capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),
@@ -411,6 +411,7 @@ async fn default_placement_prefers_the_viable_local_host() {
     let placement = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), Some("local-host"))
         .await
         .expect("default placement")
+        .selected
         .expect("viable placement");
 
     assert_eq!(placement.metadata.name, "host-direct-z-local");
@@ -422,12 +423,18 @@ async fn default_placement_never_selects_a_host_without_the_required_adapter() {
     create_host_direct_placement(&backend, "host-direct-a-no-adapters", "empty-host", BTreeSet::new()).await;
     create_host_direct_placement(&backend, "host-direct-z-codex", "codex-host", BTreeSet::from(["codex".to_string()])).await;
 
-    let placement = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), Some("unrelated-local-host"))
+    let resolution = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), Some("unrelated-local-host"))
         .await
-        .expect("default placement")
-        .expect("viable placement");
+        .expect("default placement");
+    let placement = resolution.selected.expect("viable placement");
 
     assert_eq!(placement.metadata.name, "host-direct-z-codex");
+    assert_eq!(resolution.refused_candidates.len(), 1);
+    assert_eq!(resolution.refused_candidates[0].policy_name, "host-direct-a-no-adapters");
+    assert_eq!(
+        resolution.refused_candidates[0].reason,
+        "workflow requires agent adapter `codex`, which is not available in placement `host-direct-a-no-adapters` (host `empty-host`)"
+    );
 }
 
 #[tokio::test]
@@ -1859,7 +1866,7 @@ async fn fleet_health_keeps_link_heartbeat_and_generation_disagreements_visible(
     let source = ResourceBackend::InMemory(InMemoryBackend::default());
     let source_hosts = source.using::<ResourceHost>("flotilla");
     let remote = source_hosts
-        .create(&InputMeta::builder().name("feta-feta-host".to_string()).build(), &HostSpec {})
+        .create(&InputMeta::builder().name("feta-feta-host".to_string()).build(), &HostSpec::default())
         .await
         .expect("create source host");
     let frozen_heartbeat = Utc::now() - ChronoDuration::seconds(HEARTBEAT_READY_TTL_SECS + 1);
@@ -3980,6 +3987,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
         .expect("convoy create should succeed");
     convoys
         .update_status("convoy-a", &created.metadata.resource_version, &ConvoyStatus {
+            placement_decision: None,
             phase: ConvoyPhase::Active,
             workflow_snapshot: None,
             work: [("implement".to_string(), WorkState {
@@ -4545,6 +4553,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
         .expect("convoy create should succeed");
     convoys
         .update_status("convoy-a", &created.metadata.resource_version, &ConvoyStatus {
+            placement_decision: None,
             phase: ConvoyPhase::Active,
             workflow_snapshot: None,
             work: [("implement".to_string(), WorkState {
@@ -4695,6 +4704,7 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
     let created = convoys.create(&empty_input_meta("completed-convoy"), &convoy_spec).await.expect("convoy create should succeed");
     convoys
         .update_status("completed-convoy", &created.metadata.resource_version, &ConvoyStatus {
+            placement_decision: None,
             phase: ConvoyPhase::Landed,
             workflow_snapshot: None,
             work: BTreeMap::from([("implement".to_string(), WorkState {
@@ -5142,6 +5152,7 @@ async fn convoy_abandon_command_archives_and_retains_terminal_record() {
     let created = convoys.create(&empty_input_meta("active-convoy"), &convoy_spec).await.expect("convoy create should succeed");
     convoys
         .update_status("active-convoy", &created.metadata.resource_version, &ConvoyStatus {
+            placement_decision: None,
             phase: ConvoyPhase::Active,
             workflow_snapshot: None,
             work: BTreeMap::from([("implement".to_string(), WorkState {
@@ -5570,7 +5581,7 @@ async fn contained_workflow_grants_default_deny_and_admission_names_an_unheld_cr
     assert!(workflow.vessels[1].credential_refs.is_empty(), "uncontained workflow behavior remains unchanged");
 
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host = hosts.create(&InputMeta::builder().name("host-a".to_string()).build(), &HostSpec {}).await.expect("create host");
+    let host = hosts.create(&InputMeta::builder().name("host-a".to_string()).build(), &HostSpec::default()).await.expect("create host");
     hosts
         .update_status("host-a", &host.metadata.resource_version, &HostStatus {
             ready: true,
@@ -5660,7 +5671,7 @@ async fn local_convoy_admission_pins_the_grant_resolved_workflow() {
         .await
         .expect("create credential grant");
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host = hosts.create(&empty_input_meta("host-a"), &HostSpec {}).await.expect("create host");
+    let host = hosts.create(&empty_input_meta("host-a"), &HostSpec { display_name: "kiwi".to_string() }).await.expect("create host");
     hosts
         .update_status("host-a", &host.metadata.resource_version, &HostStatus {
             ready: true,
@@ -5702,6 +5713,15 @@ async fn local_convoy_admission_pins_the_grant_resolved_workflow() {
     daemon.admit_convoy_start("flotilla", &intent, &PrincipalRef::implicit_for_namespace("flotilla")).await.expect("admit local convoy");
 
     let convoy = backend.using::<Convoy>("flotilla").get("credential-convoy").await.expect("get convoy");
+    let decision = convoy
+        .status
+        .as_ref()
+        .and_then(|status| status.placement_decision.as_ref())
+        .expect("admission should write the placement decision");
+    assert_eq!(decision.policy_name, "docker-host-a");
+    assert_eq!(decision.target_host.reference, "host-a");
+    assert_eq!(decision.target_host.display_name, "kiwi");
+    assert!(decision.refused_candidates.is_empty());
     let snapshot_ref = convoy
         .metadata
         .annotations

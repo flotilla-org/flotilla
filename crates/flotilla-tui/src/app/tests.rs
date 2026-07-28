@@ -1874,6 +1874,7 @@ fn test_convoy(
     initializing: bool,
 ) -> crate::convoy_model::ConvoySummary {
     crate::convoy_model::ConvoySummary {
+        placement_decision: None,
         id: crate::convoy_model::ConvoyId::new(namespace, name),
         namespace: namespace.into(),
         name: name.into(),
@@ -2289,6 +2290,7 @@ fn convoy_with_vessels(name: &str, vessel_names: &[&str]) -> crate::convoy_model
     convoy.vessels = vessel_names
         .iter()
         .map(|vessel_name| crate::convoy_model::VesselSummary {
+            placement_decision: None,
             name: (*vessel_name).into(),
             depends_on: vec![],
             phase: crate::convoy_model::WorkPhase::Running,

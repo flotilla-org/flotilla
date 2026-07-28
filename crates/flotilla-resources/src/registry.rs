@@ -190,6 +190,15 @@ pub async fn get_resource_kind(
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, get_typed(backend, namespace, name).await)
 }
 
+pub async fn delete_resource_kind(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    name: &str,
+) -> Result<DynamicResourceObject, ResourceError> {
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, delete_typed(backend, namespace, name).await)
+}
+
 pub async fn watch_resource_kind(
     backend: &ResourceBackend,
     namespace: &str,
@@ -363,6 +372,18 @@ async fn get_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name
     } else {
         backend.using::<T>(namespace).get(name).await?
     };
+    Ok(DynamicResourceObject {
+        kind: T::API_PATHS.kind.to_string(),
+        plural: T::API_PATHS.plural.to_string(),
+        namespace: namespace.to_string(),
+        value: object_value(&object)?,
+    })
+}
+
+async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceObject, ResourceError> {
+    let resolver = backend.using::<T>(namespace);
+    let object = resolver.get(name).await?;
+    resolver.delete(name).await?;
     Ok(DynamicResourceObject {
         kind: T::API_PATHS.kind.to_string(),
         plural: T::API_PATHS.plural.to_string(),
@@ -611,10 +632,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_delete_emits_the_normal_event_and_drops_an_in_memory_peer_replica() {
+        let source = ResourceBackend::InMemory(InMemoryBackend::default());
+        let peer = ResourceBackend::InMemory(InMemoryBackend::default());
+        let convoys = source.using::<Convoy>("flotilla");
+        convoys
+            .create(&InputMeta::builder().name("ghost".to_string()).build(), &ConvoySpec::builder().workflow_ref("wf".to_string()).build())
+            .await
+            .expect("create source convoy");
+        let listed = convoys.list().await.expect("list source convoys");
+        let origin = NodeId::new("kiwi-root");
+        let replica = peer.replica_writer::<Convoy>(origin, "flotilla");
+        replica.replace(&listed, Utc::now()).await.expect("seed peer replica");
+        let mut watch = convoys.watch(WatchStart::resuming_from(&listed)).await.expect("watch source");
+
+        let deleted = delete_resource_kind(&source, "flotilla", "convoys", "ghost").await.expect("delete exact convoy");
+        assert_eq!(deleted.value["metadata"]["name"], "ghost");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), watch.next())
+            .await
+            .expect("delete watch event timeout")
+            .expect("delete watch ended")
+            .expect("delete watch event");
+        assert!(matches!(event, WatchEvent::Deleted(ref object) if object.metadata.name == "ghost"));
+        replica.apply(event, Utc::now()).await.expect("apply delete to peer");
+
+        let replicas = peer.including_replicas::<Convoy>("flotilla").list().await.expect("list peer replicas");
+        assert!(replicas.items.is_empty(), "normal delete propagation must remove the peer replica");
+    }
+
+    #[tokio::test]
     async fn host_resource_list_marks_stale_heartbeat_not_ready() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let hosts = backend.using::<Host>("flotilla");
-        let host = hosts.create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec {}).await.expect("create host");
+        let host = hosts.create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec::default()).await.expect("create host");
         hosts
             .update_status("feta", &host.metadata.resource_version, &HostStatus {
                 capabilities: BTreeMap::new(),
@@ -636,8 +686,10 @@ mod tests {
     async fn host_replica_resource_list_derives_ready_from_origin_heartbeat() {
         let source = ResourceBackend::InMemory(InMemoryBackend::default());
         let source_hosts = source.using::<Host>("flotilla");
-        let host =
-            source_hosts.create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec {}).await.expect("create source host");
+        let host = source_hosts
+            .create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec::default())
+            .await
+            .expect("create source host");
         source_hosts
             .update_status("feta", &host.metadata.resource_version, &HostStatus {
                 capabilities: BTreeMap::new(),

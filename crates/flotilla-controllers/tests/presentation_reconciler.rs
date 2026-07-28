@@ -681,7 +681,7 @@ fn temp_config_base() -> DaemonHostPath {
 
 async fn create_ready_host(backend: &ResourceBackend, name: &str) {
     let hosts = backend.clone().using::<Host>(NAMESPACE);
-    let created = hosts.create(&meta(name), &HostSpec {}).await.expect("host create should succeed");
+    let created = hosts.create(&meta(name), &HostSpec::default()).await.expect("host create should succeed");
     let mut status = HostStatus::default();
     HostStatusPatch::Heartbeat {
         capabilities: BTreeMap::new(),

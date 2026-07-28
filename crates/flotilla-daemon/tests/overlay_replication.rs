@@ -39,7 +39,7 @@ async fn sqlite_daemons_expose_remote_host_self_report_in_fleet_health() {
     let heartbeat_at = chrono::Utc::now();
     let feta_hosts = feta.resource_backend().using::<Host>("flotilla");
     let feta_host = feta_hosts
-        .create(&InputMeta::builder().name(feta_host_id.clone()).build(), &HostSpec {})
+        .create(&InputMeta::builder().name(feta_host_id.clone()).build(), &HostSpec::default())
         .await
         .expect("create feta host self-report");
     feta_hosts

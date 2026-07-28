@@ -24,11 +24,12 @@ use flotilla_protocol::{
     AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, CorrelationKey, CrewCommandContext, CrewListMember,
     CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse,
     FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
-    HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PrincipalRef,
-    ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse,
-    RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedAttachAction, ResolvedAttachPlan,
-    ResourceJsonResponse, ResourceRef, ResourceWatchResponse, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo,
-    ToolInventory, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
+    PlacementRefusal, PlacementTargetHost, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData,
+    ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary,
+    RepoWorkResponse, ResolvedAttachAction, ResolvedAttachPlan, ResourceJsonResponse, ResourceRef, ResourceWatchResponse, StatusResponse,
+    StepStatus, StreamKey, SurfaceDeclaration, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress,
+    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -595,6 +596,7 @@ fn append_crewless_convoy_rows(
                     .crew("-")
                     .crew_state(convoy_state_label(row))
                     .host(host.clone())
+                    .maybe_placement_decision(row.placement_decision.clone())
                     .namespace(target_namespace)
                     .staleness(staleness.clone())
                     .build(),
@@ -926,26 +928,69 @@ async fn persist_adopted_checkout(
     }
 }
 
+#[derive(Debug)]
+struct PlacementResolution {
+    selected: Option<ResourceObject<PlacementPolicy>>,
+    refused_candidates: Vec<PlacementRefusal>,
+}
+
+fn placement_host_ref(policy: &ResourceObject<PlacementPolicy>) -> Option<&str> {
+    policy
+        .spec
+        .host_direct
+        .as_ref()
+        .map(|spec| spec.host_ref.as_str())
+        .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|spec| spec.host_ref.as_str()))
+}
+
+async fn placement_target_host(
+    backend: &ResourceBackend,
+    namespace: &str,
+    policy: &ResourceObject<PlacementPolicy>,
+) -> Result<PlacementTargetHost, String> {
+    let host_ref = placement_host_ref(policy).ok_or_else(|| format!("placement `{}` has no target host", policy.metadata.name))?;
+    let display_name = backend
+        .clone()
+        .using::<ResourceHost>(namespace)
+        .get(host_ref)
+        .await
+        .ok()
+        .and_then(|host| (!host.spec.display_name.is_empty()).then_some(host.spec.display_name))
+        .unwrap_or_else(|| host_ref.to_string());
+    Ok(PlacementTargetHost { reference: host_ref.to_string(), display_name })
+}
+
 async fn default_convoy_placement_policy(
     backend: &ResourceBackend,
     namespace: &str,
     workflow: &WorkflowTemplateSpec,
     local_host_ref: Option<&str>,
-) -> Result<Option<ResourceObject<PlacementPolicy>>, String> {
+) -> Result<PlacementResolution, String> {
     let contained = workflow.vessels.iter().any(|vessel| vessel.stance == flotilla_resources::Stance::Contained);
     let mut policies = match backend.clone().using::<PlacementPolicy>(namespace).list().await {
         Ok(list) => list.items,
         Err(err) => {
             warn!(%namespace, error = %err, "failed to list placement policies; convoy will remain Pending until one is registered");
-            return Ok(None);
+            return Ok(PlacementResolution { selected: None, refused_candidates: Vec::new() });
         }
     };
     policies.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
-    let candidates = policies.into_iter().filter(|policy| !contained || policy.spec.docker_per_vessel.is_some()).collect::<Vec<_>>();
-    let candidate_names = candidates.iter().map(|policy| policy.metadata.name.clone()).collect::<Vec<_>>();
+    let candidate_names = policies.iter().map(|policy| policy.metadata.name.clone()).collect::<Vec<_>>();
     let mut viable = Vec::new();
-    for policy in candidates {
-        if validate_workflow_agent_adapters(backend, namespace, workflow, Some(&policy)).await.is_ok() {
+    let mut refused_candidates = Vec::new();
+    for policy in policies {
+        let refusal = if contained && policy.spec.docker_per_vessel.is_none() {
+            Some(format!("contained workflow requires a docker placement policy, but {} is not contained", policy.metadata.name))
+        } else if let Err(reason) = validate_workflow_agent_adapters(backend, namespace, workflow, Some(&policy)).await {
+            Some(reason)
+        } else {
+            validate_workflow_credentials(backend, namespace, workflow, Some(&policy)).await.err()
+        };
+        if let Some(reason) = refusal {
+            if let Ok(target_host) = placement_target_host(backend, namespace, &policy).await {
+                refused_candidates.push(PlacementRefusal { policy_name: policy.metadata.name.clone(), target_host, reason });
+            }
+        } else {
             viable.push(policy);
         }
     }
@@ -961,7 +1006,7 @@ async fn default_convoy_placement_policy(
         (!is_local, !is_host_direct, policy.metadata.name.clone())
     });
     if let Some(policy) = viable.into_iter().next() {
-        return Ok(Some(policy));
+        return Ok(PlacementResolution { selected: Some(policy), refused_candidates });
     }
 
     let required_adapters = required_workflow_agent_adapters(workflow)?;
@@ -978,7 +1023,7 @@ async fn default_convoy_placement_policy(
     if candidate_names.is_empty() {
         warn!(%namespace, "no placement policy found; convoy will remain Pending until one is registered");
     }
-    Ok(None)
+    Ok(PlacementResolution { selected: None, refused_candidates })
 }
 
 fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla_protocol::RepoIdentity {
@@ -1400,6 +1445,7 @@ struct ConvoyAdmission {
     spec: ConvoySpec,
     workflow: WorkflowTemplateSpec,
     placement_policy: Option<PlacementPolicySpec>,
+    placement_decision: Option<PlacementDecision>,
 }
 
 /// An issue body is the crew's contract, so admission may only reuse a
@@ -2326,9 +2372,17 @@ impl InProcessDaemon {
         let hosts = self.resource_backend.clone().using::<ResourceHost>(&namespace);
         let host_name = host_id.to_string();
         let host = match hosts.get(&host_name).await {
-            Ok(host) => host,
+            Ok(host) if host.spec.display_name == summary.node.display_name => host,
+            Ok(host) => hosts
+                .update(&InputMeta::from(&host.metadata), &host.metadata.resource_version, &flotilla_resources::HostSpec {
+                    display_name: summary.node.display_name.clone(),
+                })
+                .await
+                .map_err(|error| error.to_string())?,
             Err(ResourceError::NotFound { .. }) => hosts
-                .create(&InputMeta::builder().name(host_name.clone()).build(), &flotilla_resources::HostSpec {})
+                .create(&InputMeta::builder().name(host_name.clone()).build(), &flotilla_resources::HostSpec {
+                    display_name: summary.node.display_name.clone(),
+                })
                 .await
                 .map_err(|error| error.to_string())?,
             Err(error) => return Err(error.to_string()),
@@ -2494,6 +2548,7 @@ impl InProcessDaemon {
             .workflow_spec(workflow_value)
             .maybe_placement_policy_name(placement_policy_name)
             .maybe_placement_policy_spec(placement_policy_spec)
+            .maybe_placement_decision(admission.placement_decision)
             .auto_attach(self.should_auto_attach(intent.auto_attach))
             .dispatch_regard(intent.auto_attach.into())
             .build())
@@ -3698,19 +3753,20 @@ async fn validate_workflow_credentials(
         .using::<ResourceHost>(namespace)
         .get(host_ref)
         .await
-        .map_err(|error| format!("placement `{}` host `{host_ref}` is not ready: {error}", placement.metadata.name))?;
+        .map_err(|error| format!("placement `{}` target host is not ready: {error}", placement.metadata.name))?;
+    let host_label = if host.spec.display_name.is_empty() { host_ref.to_string() } else { host.spec.display_name.clone() };
     let mut status =
-        host.status.ok_or_else(|| format!("placement `{}` host `{host_ref}` has no observed status", placement.metadata.name))?;
+        host.status.ok_or_else(|| format!("placement `{}` host `{host_label}` has no observed status", placement.metadata.name))?;
     status.apply_heartbeat_readiness(Utc::now());
     if !status.ready {
-        return Err(format!("placement `{}` host `{host_ref}` is not ready", placement.metadata.name));
+        return Err(format!("placement `{}` host `{host_label}` is not ready", placement.metadata.name));
     }
     let held = status.held_credentials().map_err(|error| {
-        format!("placement `{}` host `{host_ref}` has invalid held-credential capability: {error}", placement.metadata.name)
+        format!("placement `{}` host `{host_label}` has invalid held-credential capability: {error}", placement.metadata.name)
     })?;
     if let Some(missing) = required.iter().find(|credential| !held.contains(*credential)) {
         return Err(format!(
-            "workflow requires credential `{missing}`, which placement `{}` host `{host_ref}` does not hold",
+            "workflow requires credential `{missing}`, which placement `{}` host `{host_label}` does not hold",
             placement.metadata.name
         ));
     }
@@ -3736,24 +3792,23 @@ async fn placement_agent_adapters(
     if let Some(docker) = &placement.spec.docker_per_vessel {
         Ok((docker.agent_adapters.clone(), format!("image `{}`", docker.image)))
     } else if let Some(host_direct) = &placement.spec.host_direct {
-        let host =
-            backend.clone().using::<ResourceHost>(namespace).get(&host_direct.host_ref).await.map_err(|error| {
-                format!("placement `{}` host `{}` is not ready: {error}", placement.metadata.name, host_direct.host_ref)
-            })?;
-        let mut status = host
-            .status
-            .ok_or_else(|| format!("placement `{}` host `{}` has no observed status", placement.metadata.name, host_direct.host_ref))?;
+        let host = backend
+            .clone()
+            .using::<ResourceHost>(namespace)
+            .get(&host_direct.host_ref)
+            .await
+            .map_err(|error| format!("placement `{}` target host is not ready: {error}", placement.metadata.name))?;
+        let host_label = if host.spec.display_name.is_empty() { host_direct.host_ref.clone() } else { host.spec.display_name.clone() };
+        let mut status =
+            host.status.ok_or_else(|| format!("placement `{}` host `{host_label}` has no observed status", placement.metadata.name))?;
         status.apply_heartbeat_readiness(Utc::now());
         if !status.ready {
-            return Err(format!("placement `{}` host `{}` is not ready", placement.metadata.name, host_direct.host_ref));
+            return Err(format!("placement `{}` host `{host_label}` is not ready", placement.metadata.name));
         }
         let available_adapters = status.agent_adapters().map_err(|error| {
-            format!(
-                "placement `{}` host `{}` has invalid agent adapter capabilities: {error}",
-                placement.metadata.name, host_direct.host_ref
-            )
+            format!("placement `{}` host `{}` has invalid agent adapter capabilities: {error}", placement.metadata.name, host_label)
         })?;
-        Ok((available_adapters, format!("host `{}`", host_direct.host_ref)))
+        Ok((available_adapters, format!("host `{host_label}`")))
     } else {
         Ok((BTreeSet::new(), "unknown target environment".to_string()))
     }
@@ -3984,7 +4039,15 @@ impl InProcessDaemon {
             Err(error) => return Err(error.to_string()),
         }
         let placement = self.resolve_and_validate_convoy_placement(namespace, &workflow.spec, intent.placement_policy.as_deref()).await?;
-        let placement_policy = placement.as_ref().map(|placement| placement.metadata.name.clone());
+        let placement_policy = placement.selected.as_ref().map(|placement| placement.metadata.name.clone());
+        let placement_decision = match placement.selected.as_ref() {
+            Some(selected) => Some(PlacementDecision {
+                policy_name: selected.metadata.name.clone(),
+                target_host: placement_target_host(&self.resource_backend, namespace, selected).await?,
+                refused_candidates: placement.refused_candidates,
+            }),
+            None => None,
+        };
         let spec = ConvoySpec {
             workflow_ref,
             dispatching_principal_ref: dispatching_principal_ref.clone(),
@@ -4001,7 +4064,8 @@ impl InProcessDaemon {
             .name(name)
             .spec(spec)
             .workflow(workflow.spec)
-            .maybe_placement_policy(placement.map(|placement| placement.spec))
+            .maybe_placement_policy(placement.selected.map(|placement| placement.spec))
+            .maybe_placement_decision(placement_decision)
             .build())
     }
 
@@ -4018,6 +4082,7 @@ impl InProcessDaemon {
             &admission.name,
             &admission.spec,
             &admission.workflow,
+            admission.placement_decision,
             intent.auto_attach.into(),
         )
         .await?;
@@ -4047,6 +4112,7 @@ impl InProcessDaemon {
         name: &str,
         spec: &ConvoySpec,
         workflow: &WorkflowTemplateSpec,
+        placement_decision: Option<PlacementDecision>,
         dispatch_regard: ConvoyDispatchRegard,
     ) -> Result<(), String> {
         let workflow_value = serde_json::to_value(workflow).map_err(|error| error.to_string())?;
@@ -4056,6 +4122,7 @@ impl InProcessDaemon {
             namespace,
             name,
             spec,
+            placement_decision,
             dispatch_regard,
             BTreeMap::from([(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name)]),
         )
@@ -4067,14 +4134,24 @@ impl InProcessDaemon {
         namespace: &str,
         name: &str,
         spec: &ConvoySpec,
+        placement_decision: Option<PlacementDecision>,
         dispatch_regard: ConvoyDispatchRegard,
         annotations: BTreeMap<String, String>,
     ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        convoys
+        let convoy = convoys
             .create(&InputMeta::builder().name(name.to_string()).annotations(annotations).build(), spec)
             .await
             .map_err(|error| error.to_string())?;
+        if let Some(placement_decision) = placement_decision {
+            convoys
+                .update_status(name, &convoy.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+                    placement_decision: Some(placement_decision),
+                    ..flotilla_resources::ConvoyStatus::default()
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         if dispatch_regard == ConvoyDispatchRegard::Emit {
             if let Err(error) = self.emit_implicit_convoy_regard(namespace, name, &spec.dispatching_principal_ref).await {
                 warn!(%error, %namespace, %name, "failed to emit convoy dispatch regard");
@@ -4103,7 +4180,7 @@ impl InProcessDaemon {
         namespace: &str,
         workflow: &WorkflowTemplateSpec,
         placement_policy: Option<&str>,
-    ) -> Result<Option<ResourceObject<PlacementPolicy>>, String> {
+    ) -> Result<PlacementResolution, String> {
         let contained = workflow.vessels.iter().any(|vessel| vessel.stance == flotilla_resources::Stance::Contained);
         let placement = match placement_policy {
             Some(policy) => {
@@ -4118,7 +4195,7 @@ impl InProcessDaemon {
                 if contained && resolved.spec.docker_per_vessel.is_none() {
                     return Err(format!("contained workflow requires a docker placement policy, but {policy} is not contained"));
                 }
-                Some(resolved)
+                PlacementResolution { selected: Some(resolved), refused_candidates: Vec::new() }
             }
             None => {
                 let local_host_id = self.local_host_id();
@@ -4129,14 +4206,14 @@ impl InProcessDaemon {
                     local_host_id.as_ref().map(HostId::as_str),
                 )
                 .await?;
-                if contained && placement.is_none() {
+                if contained && placement.selected.is_none() {
                     return Err("contained workflow requires an available docker placement policy".to_string());
                 }
                 placement
             }
         };
-        validate_workflow_agent_adapters(&self.resource_backend, namespace, workflow, placement.as_ref()).await?;
-        validate_workflow_credentials(&self.resource_backend, namespace, workflow, placement.as_ref()).await?;
+        validate_workflow_agent_adapters(&self.resource_backend, namespace, workflow, placement.selected.as_ref()).await?;
+        validate_workflow_credentials(&self.resource_backend, namespace, workflow, placement.selected.as_ref()).await?;
         Ok(placement)
     }
 
@@ -4239,6 +4316,7 @@ impl InProcessDaemon {
             &namespace,
             &start.name,
             &convoy_spec,
+            start.placement_decision.clone(),
             flotilla_protocol::ConvoyDispatchRegard::Suppress,
             annotations,
         )
@@ -6179,6 +6257,13 @@ impl InProcessDaemon {
 
         let session_list = terminal_sessions.list().await.map_err(|err| err.to_string())?;
         let observed_generation = observed_checkouts.list().await.map_err(|err| err.to_string())?.generation;
+        let result_sets = self.aggregator_projection_state().await.local_result_sets().await;
+        let placement_by_convoy = result_sets
+            .iter()
+            .filter_map(|result_set| result_set.rows.as_convoys())
+            .flatten()
+            .filter_map(|convoy| convoy.placement_decision.clone().map(|decision| (convoy.name.clone(), decision)))
+            .collect::<HashMap<_, _>>();
         let environment_map: HashMap<_, _> = environments
             .list()
             .await
@@ -6225,13 +6310,13 @@ impl InProcessDaemon {
                     .crew(crew)
                     .crew_state(session_status_label(session.status.as_ref().map(|status| status.phase)))
                     .host(host)
+                    .maybe_placement_decision(placement_by_convoy.get(&convoy).cloned())
                     .namespace(session.metadata.namespace.clone())
                     .session(session.metadata.name.clone())
                     .staleness(FleetStaleness::Local)
                     .build(),
             );
         }
-        let result_sets = self.aggregator_projection_state().await.local_result_sets().await;
         append_crewless_convoy_rows(&mut rows, namespace, &result_sets, &self.host_name, FleetStaleness::Local);
         rows.sort_by(|left, right| {
             (&left.convoy, left.host.as_str(), &left.vessel, &left.crew).cmp(&(
@@ -6802,6 +6887,21 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
+        if let flotilla_protocol::CommandAction::ResourceDelete { namespace, kind, name } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let result = match flotilla_resources::delete_resource_kind(&self.resource_backend, namespace, kind, name).await {
+                Ok(deleted) => flotilla_protocol::CommandValue::ResourceDeleted(Box::new(ResourceJsonResponse {
+                    kind: deleted.kind,
+                    plural: deleted.plural,
+                    namespace: deleted.namespace,
+                    value: deleted.value,
+                })),
+                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
         if let flotilla_protocol::CommandAction::ResourceWatch { namespace, kind, include_replicas, replica_sources, cursor } =
             command.action
         {
@@ -7299,9 +7399,27 @@ impl InProcessDaemon {
                 });
                 return Ok(id);
             }
-            let placement_policy =
-                match self.resolve_and_validate_convoy_placement(&namespace, &workflow.spec, placement_policy.as_deref()).await {
-                    Ok(placement) => placement.map(|placement| placement.metadata.name),
+            let placement = match self.resolve_and_validate_convoy_placement(&namespace, &workflow.spec, placement_policy.as_deref()).await
+            {
+                Ok(placement) => placement,
+                Err(message) => {
+                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                        command_id: id,
+                        node_id: self.node_id.clone(),
+                        repo_identity: empty_identity,
+                        repo: None,
+                        result: flotilla_protocol::CommandValue::Error { message },
+                    });
+                    return Ok(id);
+                }
+            };
+            let placement_decision = match placement.selected.as_ref() {
+                Some(selected) => match placement_target_host(&self.resource_backend, &namespace, selected).await {
+                    Ok(target_host) => Some(PlacementDecision {
+                        policy_name: selected.metadata.name.clone(),
+                        target_host,
+                        refused_candidates: placement.refused_candidates,
+                    }),
                     Err(message) => {
                         let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                             command_id: id,
@@ -7312,7 +7430,10 @@ impl InProcessDaemon {
                         });
                         return Ok(id);
                     }
-                };
+                },
+                None => None,
+            };
+            let placement_policy = placement.selected.map(|placement| placement.metadata.name);
             let spec = ConvoySpec {
                 workflow_ref: workflow_ref.clone(),
                 dispatching_principal_ref: dispatching_principal_ref
@@ -7328,7 +7449,14 @@ impl InProcessDaemon {
                 instruction: None,
             };
             let result = match self
-                .create_convoy_with_workflow_snapshot(&namespace, name, &spec, &workflow.spec, ConvoyDispatchRegard::Emit)
+                .create_convoy_with_workflow_snapshot(
+                    &namespace,
+                    name,
+                    &spec,
+                    &workflow.spec,
+                    placement_decision,
+                    ConvoyDispatchRegard::Emit,
+                )
                 .await
             {
                 Ok(()) => flotilla_protocol::CommandValue::ConvoyCreated { name: name.clone() },

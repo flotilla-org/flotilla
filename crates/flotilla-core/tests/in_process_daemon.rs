@@ -1087,7 +1087,7 @@ async fn create_test_host_direct_policy(
     agent_adapters: BTreeSet<String>,
 ) {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host = hosts.create(&InputMeta::builder().name(host_ref.to_string()).build(), &HostSpec {}).await.expect("host create");
+    let host = hosts.create(&InputMeta::builder().name(host_ref.to_string()).build(), &HostSpec::default()).await.expect("host create");
     hosts
         .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
             capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),

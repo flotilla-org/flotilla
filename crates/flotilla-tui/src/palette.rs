@@ -806,6 +806,7 @@ mod tests {
     fn namespaces_with_convoy(name: &str, vessels: &[&str]) -> crate::app::NamespaceMap {
         use crate::convoy_model::{ConvoyId, ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase};
         let convoy = ConvoySummary {
+            placement_decision: None,
             id: ConvoyId::new("flotilla", name),
             namespace: "flotilla".into(),
             name: name.into(),
@@ -821,6 +822,7 @@ mod tests {
             vessels: vessels
                 .iter()
                 .map(|t| VesselSummary {
+                    placement_decision: None,
                     name: (*t).into(),
                     depends_on: vec![],
                     phase: WorkPhase::Pending,
