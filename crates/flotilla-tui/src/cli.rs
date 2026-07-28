@@ -436,7 +436,12 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
                         } else {
                             format!("; {} refused", decision.refused_candidates.len())
                         };
-                        format!("{} on {}{refusals}", decision.policy_name, decision.target_host.display_name)
+                        let viable = if decision.viable_not_selected.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; {} viable not selected", decision.viable_not_selected.len())
+                        };
+                        format!("{} on {}{refusals}{viable}", decision.policy_name, decision.target_host.display_name)
                     },
                 )),
                 Cell::new(format_fleet_staleness(&row.staleness)),

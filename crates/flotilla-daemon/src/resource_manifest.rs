@@ -332,7 +332,7 @@ mod tests {
         write(&nested.join("policies.yaml"), &format!("{}---\n{}", manifest("alpha", "one"), manifest("gamma", "three")));
         write(
             &dir.path().join("beta.json"),
-            r#"{"apiVersion":"flotilla.work/v1","kind":"PlacementPolicy","metadata":{"name":"beta"},"spec":{"pool":"two"}}"#,
+            r#"{"apiVersion":"flotilla.work/v1","kind":"PlacementPolicy","metadata":{"name":"beta"},"spec":{"pool":"two","priority":100}}"#,
         );
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
@@ -352,6 +352,7 @@ mod tests {
                 )
             );
         }
+        assert_eq!(backend.using::<PlacementPolicy>(NAMESPACE).get("beta").await.expect("beta policy").spec.priority, 100);
     }
 
     #[tokio::test]

@@ -45,6 +45,7 @@ async fn placement_policy_roundtrips_without_status() {
     let resolver = ResourceBackend::InMemory(InMemoryBackend::default()).using::<PlacementPolicy>("flotilla");
     let spec = PlacementPolicySpec::builder()
         .pool("cleat".to_string())
+        .priority(100)
         .host_direct(HostDirectPlacementPolicySpec {
             host_ref: "01HXYZ".to_string(),
             checkout: HostDirectPlacementPolicyCheckout::Worktree,
@@ -57,6 +58,7 @@ async fn placement_policy_roundtrips_without_status() {
     assert_eq!(created.metadata.name, "host-direct-01HXYZ");
     assert_eq!(created.status, None);
     assert_eq!(fetched.spec.pool, "cleat");
+    assert_eq!(fetched.spec.priority, 100);
     assert!(fetched.spec.host_direct.is_some());
 }
 

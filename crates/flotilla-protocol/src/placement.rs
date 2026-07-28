@@ -15,10 +15,20 @@ pub struct PlacementRefusal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct PlacementViableCandidate {
+    pub policy_name: String,
+    pub target_host: PlacementTargetHost,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct PlacementDecision {
     pub policy_name: String,
     pub target_host: PlacementTargetHost,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused_candidates: Vec<PlacementRefusal>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viable_not_selected: Vec<PlacementViableCandidate>,
 }

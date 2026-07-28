@@ -38,7 +38,7 @@ pub use host_summary::{
 pub use lifecycle::LifecycleAuthority;
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
-pub use placement::{PlacementDecision, PlacementRefusal, PlacementTargetHost};
+pub use placement::{PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate};
 pub use provisioning_target::ProvisioningTarget;
 pub use repository::{RepositoryKey, UNKNOWN_REPOSITORY_LABEL};
 pub use step::{CheckoutIntent, Step, StepAction, StepExecutionContext, StepOutcome};

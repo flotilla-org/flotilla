@@ -80,11 +80,13 @@ fn placement_decision_is_written_once_without_overwriting_concurrent_status() {
         policy_name: "host-direct-kiwi".to_string(),
         target_host: PlacementTargetHost { reference: "kiwi-id".to_string(), display_name: "kiwi".to_string() },
         refused_candidates: Vec::new(),
+        viable_not_selected: Vec::new(),
     };
     let second = PlacementDecision {
         policy_name: "host-direct-feta".to_string(),
         target_host: PlacementTargetHost { reference: "feta-id".to_string(), display_name: "feta".to_string() },
         refused_candidates: Vec::new(),
+        viable_not_selected: Vec::new(),
     };
     let mut status =
         ConvoyStatus { phase: ConvoyPhase::Active, observed_workflow_ref: Some("scratch".to_string()), ..ConvoyStatus::default() };

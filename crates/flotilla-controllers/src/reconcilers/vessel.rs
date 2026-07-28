@@ -1119,6 +1119,7 @@ mod tests {
             policy_name: "host-direct-test".to_string(),
             target_host: PlacementTargetHost { reference: "01HXYZ".to_string(), display_name: "kiwi".to_string() },
             refused_candidates: Vec::new(),
+            viable_not_selected: Vec::new(),
         };
 
         assert_eq!(

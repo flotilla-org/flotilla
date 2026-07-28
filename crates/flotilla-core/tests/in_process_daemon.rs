@@ -1085,6 +1085,7 @@ async fn create_test_host_direct_policy(
     backend: &flotilla_resources::ResourceBackend,
     policy_name: &str,
     host_ref: &str,
+    priority: i32,
     agent_adapters: BTreeSet<String>,
 ) {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
@@ -1106,6 +1107,7 @@ async fn create_test_host_direct_policy(
             &InputMeta::builder().name(policy_name.to_string()).build(),
             &PlacementPolicySpec::builder()
                 .pool("passthrough".to_string())
+                .priority(priority)
                 .host_direct(HostDirectPlacementPolicySpec {
                     host_ref: host_ref.to_string(),
                     checkout: HostDirectPlacementPolicyCheckout::Worktree,
@@ -1117,7 +1119,7 @@ async fn create_test_host_direct_policy(
 }
 
 #[tokio::test]
-async fn bare_convoy_start_uses_the_viable_local_host_direct_policy() {
+async fn bare_convoy_start_uses_priority_and_records_every_placement_candidate() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -1152,9 +1154,9 @@ async fn bare_convoy_start_uses_the_viable_local_host_direct_policy() {
         })
         .await
         .expect("project create");
-    create_test_host_direct_policy(&backend, "host-direct-a-empty", "empty-host", BTreeSet::new()).await;
-    create_test_host_direct_policy(&backend, "host-direct-b-remote", "remote-host", BTreeSet::from(["codex".to_string()])).await;
-    create_test_host_direct_policy(&backend, "host-direct-z-local", &local_host_ref, BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_policy(&backend, "host-direct-a-empty", "empty-host", 200, BTreeSet::new()).await;
+    create_test_host_direct_policy(&backend, "host-direct-b-remote", "remote-host", 100, BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_policy(&backend, "host-direct-z-local", &local_host_ref, -100, BTreeSet::from(["codex".to_string()])).await;
 
     let mut events = daemon.subscribe();
     let command_id = daemon
@@ -1193,7 +1195,15 @@ async fn bare_convoy_start_uses_the_viable_local_host_direct_policy() {
     .expect("start command should finish");
     assert_eq!(result, CommandValue::ConvoyStarted { name: "local-default".into(), attach_plan: None, binding: None });
     let convoy = backend.using::<ResourceConvoy>("flotilla").get("local-default").await.expect("persisted convoy");
-    assert_eq!(convoy.spec.placement_policy.as_deref(), Some("host-direct-z-local"));
+    assert_eq!(convoy.spec.placement_policy.as_deref(), Some("host-direct-b-remote"));
+    let decision =
+        convoy.status.and_then(|status| status.placement_decision).expect("admission should persist the complete placement decision");
+    assert_eq!(decision.policy_name, "host-direct-b-remote");
+    assert_eq!(decision.refused_candidates.len(), 1);
+    assert_eq!(decision.refused_candidates[0].policy_name, "host-direct-a-empty");
+    assert_eq!(decision.viable_not_selected.len(), 1);
+    assert_eq!(decision.viable_not_selected[0].policy_name, "host-direct-z-local");
+    assert_eq!(decision.viable_not_selected[0].reason, "priority -100 is lower than selected policy `host-direct-b-remote` priority 100");
 }
 
 #[tokio::test]
