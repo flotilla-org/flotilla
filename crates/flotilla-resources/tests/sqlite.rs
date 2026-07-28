@@ -15,6 +15,7 @@ use common::{
         assert_identical_update_is_noop_with_backend, assert_metadata_roundtrip_with_backend, assert_namespace_isolation_with_backend,
         assert_project_definition_causal_merge_with_backend, assert_project_definition_delete_conflicts_with_concurrent_edit_with_backend,
         assert_project_definition_edit_converges_with_backend, assert_project_definition_edit_preserves_unrelated_conflict_with_backend,
+        assert_project_definition_metadata_edit_converges_with_backend,
         assert_project_definition_optional_field_can_be_cleared_with_backend,
         assert_repeated_delete_with_pending_finalizers_is_noop_with_backend,
         assert_replica_events_ignore_stale_writes_and_deletes_with_backend, assert_replica_read_view_contract,
@@ -187,6 +188,11 @@ async fn replica_events_ignore_stale_writes_and_deletes() {
 #[tokio::test]
 async fn project_definition_edit_converges() {
     assert_project_definition_edit_converges_with_backend(backend()).await;
+}
+
+#[tokio::test]
+async fn project_definition_metadata_edit_converges() {
+    assert_project_definition_metadata_edit_converges_with_backend(backend()).await;
 }
 
 #[tokio::test]
