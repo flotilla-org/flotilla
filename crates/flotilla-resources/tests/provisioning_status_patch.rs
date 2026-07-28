@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Utc};
-use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
+use flotilla_protocol::{PlacementDecision, PlacementTargetHost, SleepInhibitionHealth};
 use flotilla_resources::{
     CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus,
     CloneStatusPatch, ConditionValue, EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch, HostStatus, HostStatusPatch,
@@ -24,6 +24,13 @@ fn host_status_patch_updates_heartbeat_snapshot() {
     assert_eq!(status.capabilities.get("docker"), Some(&serde_json::Value::Bool(true)));
     assert!(status.heartbeat_at.is_some());
     assert!(status.ready);
+
+    HostStatusPatch::SleepInhibition {
+        health: SleepInhibitionHealth::Failed { consecutive_failures: 3, message: "polkit denied".to_string() },
+    }
+    .apply(&mut status);
+
+    assert_eq!(status.sleep_inhibition, SleepInhibitionHealth::Failed { consecutive_failures: 3, message: "polkit denied".to_string() });
 }
 
 #[test]

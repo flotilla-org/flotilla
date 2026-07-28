@@ -47,12 +47,13 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     apply_status_patch, controller_patches as convoy_controller_patches, implement_review_workflow_spec,
-    single_agent_contained_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
-    CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
-    HostStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
-    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryRelation, RepositorySpec, Stance, TypedResolver,
-    WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL,
+    single_agent_contained_workflow_spec, Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase,
+    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy as ResourceConvoy, ConvoyPhase,
+    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, IntegrationCondition, LifecycleAuthority, ObservedCheckoutSpec,
+    PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource,
+    Repository, RepositoryKey, RepositoryRelation, RepositorySpec, Stance, TypedResolver, VirtualClock, WorkPhase, WorkState,
+    WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
 };
 use tokio::sync::Notify;
 
@@ -6646,5 +6647,69 @@ async fn two_commands_can_run_concurrently() {
     assert!(
         !matches!(archive_result, CommandValue::Error { .. }),
         "ArchiveSession should complete successfully after release, got: {archive_result:?}"
+    );
+}
+
+#[tokio::test]
+async fn convoy_landing_reprobes_after_injected_clock_crosses_evidence_ttl() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let backend = flotilla_resources::ResourceBackend::InMemory(Default::default());
+    let now = chrono::DateTime::parse_from_rfc3339("2026-07-28T12:00:00Z").expect("timestamp").with_timezone(&chrono::Utc);
+    let clock = Arc::new(VirtualClock::new(now));
+    let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        backend.clone(),
+        clock.clone() as Arc<dyn flotilla_resources::Clock>,
+    )
+    .await;
+    let checkouts = backend.using::<ResourceCheckout>("flotilla");
+    let checkout = checkouts
+        .create(
+            &InputMeta {
+                name: "checkout-a".to_string(),
+                labels: [(CONVOY_LABEL.to_string(), "convoy-a".to_string())].into_iter().collect(),
+                ..Default::default()
+            },
+            &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "feature/liveness".to_string(),
+                path: "/path/that/does/not/exist".to_string(),
+                repo_ref: RepositoryKey("repo-a".to_string()),
+                host_ref: "host-a".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("create checkout");
+    let observed_at = now.to_rfc3339();
+    checkouts
+        .update_status("checkout-a", &checkout.metadata.resource_version, &ResourceCheckoutStatus {
+            phase: ResourceCheckoutPhase::Ready,
+            path: Some("/path/that/does/not/exist".to_string()),
+            commit: None,
+            branch_provenance: Default::default(),
+            integration: CheckoutIntegrationStatus {
+                clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                landed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at).build(),
+                landed_evidence: None,
+            },
+            message: None,
+        })
+        .await
+        .expect("record cached landing evidence");
+
+    assert!(
+        daemon.convoy_change_requests_settled("flotilla", "convoy-a").await.expect("fresh decision"),
+        "fresh cached evidence should be consumed"
+    );
+
+    clock.advance(chrono::Duration::seconds(31));
+
+    assert!(
+        !daemon.convoy_change_requests_settled("flotilla", "convoy-a").await.expect("stale decision"),
+        "stale cached evidence must be re-probed and a missing path must hold Landing"
     );
 }

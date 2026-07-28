@@ -202,6 +202,22 @@ pub struct FleetHealthResponse {
     pub hosts: Vec<FleetHostRow>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SleepInhibitionHealth {
+    #[default]
+    NotRequired,
+    Held,
+    Acquiring {
+        consecutive_failures: u32,
+        message: String,
+    },
+    Failed {
+        consecutive_failures: u32,
+        message: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct FleetHostRow {
@@ -225,6 +241,9 @@ pub struct FleetHostRow {
     pub convoy_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_bytes: Option<u64>,
+    #[serde(default)]
+    #[builder(default)]
+    pub sleep_inhibition: SleepInhibitionHealth,
     pub staleness: FleetHostStaleness,
     pub observation_agreement: FleetObservationAgreement,
     #[builder(default)]

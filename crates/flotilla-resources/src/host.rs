@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
+use flotilla_protocol::SleepInhibitionHealth;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -41,6 +42,9 @@ pub struct HostStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub conditions: Vec<HostCondition>,
+    #[serde(default)]
+    #[builder(default)]
+    pub sleep_inhibition: SleepInhibitionHealth,
 }
 
 impl HostStatus {
@@ -91,6 +95,9 @@ pub enum HostStatusPatch {
         daemon_started_at: Option<DateTime<Utc>>,
         disk_free_bytes: Option<u64>,
     },
+    SleepInhibition {
+        health: SleepInhibitionHealth,
+    },
 }
 
 impl StatusPatch<HostStatus> for HostStatusPatch {
@@ -113,6 +120,7 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 status.daemon_started_at = *daemon_started_at;
                 status.disk_free_bytes = *disk_free_bytes;
             }
+            Self::SleepInhibition { health } => status.sleep_inhibition.clone_from(health),
         }
     }
 }
