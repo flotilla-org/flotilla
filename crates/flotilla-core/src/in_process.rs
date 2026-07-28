@@ -3339,9 +3339,7 @@ async fn ensure_default_workflows(backend: &ResourceBackend, namespace: &str) ->
 }
 
 fn prepared_snapshot_name(kind: &str, spec: &serde_json::Value) -> Result<String, String> {
-    let encoded = serde_json::to_vec(spec).map_err(|error| error.to_string())?;
-    let digest = Sha256::digest(encoded);
-    let suffix = digest[..6].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let suffix = flotilla_resources::content_hash(spec).map_err(|error| error.to_string())?;
     Ok(format!("{kind}-snapshot-{suffix}"))
 }
 

@@ -366,6 +366,15 @@ pub struct DaemonConfig {
     pub logging: DaemonLoggingConfig,
     #[serde(default)]
     pub environments: BTreeMap<String, StaticEnvironmentConfig>,
+    #[serde(default)]
+    pub manifests: Option<ResourceManifestsConfig>,
+}
+
+/// Host-local directory whose resource documents are continuously applied as
+/// additive desired state.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ResourceManifestsConfig {
+    pub dir: PathBuf,
 }
 
 /// Host-local structured daemon logging settings.
