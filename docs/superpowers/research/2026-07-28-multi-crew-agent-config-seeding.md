@@ -19,6 +19,23 @@ one load-bearing claim in that document and in
 — see "Correction" below. Container plumbing status is in
 [`2026-07-27-contained-vessel-plumbing.md`](2026-07-27-contained-vessel-plumbing.md).
 
+## Framing correction (Robert, 2026-07-28 — read first)
+
+This document's mechanics are right but its original lens was wrong. The goal
+of a multi-crew vessel is **not** to isolate crew members from each other — it
+is to set up one sandbox where every agent CLI is correctly configured and the
+crews **interact freely**: shared workspace, coder/reviewer handoffs, common
+project context. Read the per-crew homes, TMPDIRs, and narrow env vars below as
+**collision avoidance** (two instances of one CLI must not clobber each other's
+session stores, sockets, or history), never as a trust boundary. The
+"same-uid is not a security boundary" finding is therefore *by design*, not a
+caveat to engineer around: crews sharing a vessel are trusted with each other;
+mutually untrusted work belongs in separate vessels. Workspace-anchored state
+(project `.mcp.json`, `AGENTS.md`/`CLAUDE.md`, `.claude/settings.local.json`)
+being shared across crews in one checkout is likewise mostly a *feature* —
+shared project context — with per-crew worktrees an option where independent
+git state is wanted, not a hygiene requirement.
+
 ## Executive summary
 
 Every one of the five agent CLIs can be isolated per crew member by
