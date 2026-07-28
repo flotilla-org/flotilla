@@ -3,17 +3,22 @@
 // behavior that is clearer to assert directly than through controller-loop tests.
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use common::{create_ready_clone, meta};
+use common::{create_ready_checkout, create_ready_clone, meta};
 use flotilla_controllers::reconcilers::{
     checkout::CheckoutDeps, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
 use flotilla_resources::{
-    controller::Reconciler, repo_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatus,
-    CheckoutWorktreeSpec, ConditionValue, IntegrationCondition, RepositoryKey, ResourceBackend, ResourceObject,
+    controller::{ControllerLoop, Reconciler},
+    repo_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, ConditionValue,
+    FreshCloneCheckoutSpec, IntegrationCondition, RepositoryKey, ResourceBackend, ResourceError, ResourceObject, StatusPatch,
 };
+use tokio::time::timeout;
 
 const NAMESPACE: &str = "flotilla";
 const REPO_URL: &str = "https://github.com/flotilla-org/flotilla";
@@ -22,6 +27,7 @@ const REPO_URL: &str = "https://github.com/flotilla-org/flotilla";
 struct RecordingCheckoutRuntime {
     removals: Mutex<Vec<CheckoutRemoval>>,
     inspections: Mutex<usize>,
+    failed_removal_target: Option<String>,
 }
 
 #[async_trait]
@@ -64,8 +70,125 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
 
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
         self.removals.lock().expect("removals lock").push(removal.clone());
+        let target_path = match removal {
+            CheckoutRemoval::Worktree { target_path, .. } | CheckoutRemoval::FreshClone { target_path } => target_path,
+        };
+        if self.failed_removal_target.as_deref() == Some(target_path) {
+            return Err("permission denied removing root-owned debris".to_string());
+        }
         Ok(CheckoutRemovalOutcome::Removed)
     }
+}
+
+#[tokio::test]
+async fn finalizer_error_maps_to_failed_checkout_status() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let checkout = create_ready_checkout(
+        &backend,
+        NAMESPACE,
+        common::ReadyCheckoutFixture::builder()
+            .name("checkout-a".to_string())
+            .env_ref("host-direct-a".to_string())
+            .git_ref("feature/cleanup".to_string())
+            .path("/checkouts/convoy-a/repo.feature-cleanup".to_string())
+            .fresh_clone(FreshCloneCheckoutSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-a".to_string(),
+                r#ref: "feature/cleanup".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/convoy-a/repo.feature-cleanup".to_string(),
+                url: REPO_URL.to_string(),
+            })
+            .build(),
+    )
+    .await;
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE);
+    let error = ResourceError::other("remove worktree: permission denied");
+
+    let patch =
+        reconciler.finalizer_error_patch(&checkout, &error).expect("checkout finalizer errors should produce a failed status patch");
+    let mut status = checkout.status.expect("ready checkout should have status");
+    patch.apply(&mut status);
+
+    assert_eq!(status.phase, CheckoutPhase::Failed);
+    assert_eq!(status.message.as_deref(), Some("checkout teardown failed: remove worktree: permission denied"));
+}
+
+async fn create_deleting_checkout(backend: &ResourceBackend, name: &str, target_path: &str) {
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let meta = common::controller_meta()
+        .name(name)
+        .finalizers(vec!["flotilla.work/checkout-cleanup".to_string()])
+        .deletion_timestamp(chrono::Utc::now())
+        .call();
+    let created = checkouts
+        .create(
+            &meta,
+            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-a".to_string(),
+                r#ref: format!("feature/{name}"),
+                base_ref: Some("main".to_string()),
+                target_path: target_path.to_string(),
+                url: REPO_URL.to_string(),
+            }),
+        )
+        .await
+        .expect("deleting checkout create should succeed");
+    checkouts
+        .update_status(name, &created.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Ready,
+            path: Some(target_path.to_string()),
+            commit: Some("base-commit".to_string()),
+            branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
+            integration: Default::default(),
+            message: None,
+        })
+        .await
+        .expect("deleting checkout status update should succeed");
+}
+
+#[tokio::test]
+async fn failed_checkout_teardown_marks_only_that_checkout_failed_and_controller_continues() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    create_deleting_checkout(&backend, "alpha-failing", "/checkouts/alpha").await;
+    create_deleting_checkout(&backend, "beta-healthy", "/checkouts/beta").await;
+    let reconciler = CheckoutReconciler::new(
+        Arc::new(RecordingCheckoutRuntime { failed_removal_target: Some("/checkouts/alpha".to_string()), ..Default::default() }),
+        backend.clone(),
+        NAMESPACE,
+    );
+    let controller = tokio::spawn(
+        ControllerLoop {
+            primary: checkouts.clone(),
+            secondaries: Vec::new(),
+            reconciler,
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let failing = checkouts.get("alpha-failing").await.expect("failing checkout should remain for retry");
+            let failed_with_message = failing.status.as_ref().is_some_and(|status| {
+                status.phase == CheckoutPhase::Failed
+                    && status.message.as_deref() == Some("checkout teardown failed: permission denied removing root-owned debris")
+            });
+            let healthy_removed = matches!(checkouts.get("beta-healthy").await, Err(ResourceError::NotFound { .. }));
+            if failed_with_message && healthy_removed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed checkout should degrade while healthy checkout teardown completes");
+
+    controller.abort();
+    let _ = controller.await;
 }
 
 #[tokio::test]

@@ -6,6 +6,13 @@ use std::{future::Future, time::Duration};
 use flotilla_resources::ResourceError;
 use tracing::{error, warn};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestartBudgetExhausted {
+    pub controller: &'static str,
+    pub error: ResourceError,
+    pub attempts: usize,
+}
+
 /// Bounded restart + exponential backoff config for [`supervise`].
 #[derive(Debug, Clone)]
 pub struct ControllerSupervision {
@@ -36,7 +43,7 @@ impl Default for ControllerSupervision {
 ///
 /// Returns when the controller returns `Ok(())` (clean shutdown — all watch
 /// streams closed) or when the consecutive-failure budget is exhausted.
-pub async fn supervise<F, Fut>(name: &'static str, config: ControllerSupervision, mut make_run: F)
+pub async fn supervise<F, Fut>(name: &'static str, config: ControllerSupervision, mut make_run: F) -> Result<(), RestartBudgetExhausted>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<(), ResourceError>>,
@@ -46,7 +53,7 @@ where
     loop {
         let started_at = tokio::time::Instant::now();
         match make_run().await {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(err) => {
                 if started_at.elapsed() >= config.success_reset_after {
                     consecutive_failures = 0;
@@ -60,7 +67,7 @@ where
                         attempts = consecutive_failures,
                         "controller exhausted restart budget; provisioning disabled until daemon restart",
                     );
-                    return;
+                    return Err(RestartBudgetExhausted { controller: name, error: err, attempts: consecutive_failures });
                 }
                 warn!(
                     controller = name,
@@ -107,7 +114,8 @@ mod tests {
                 }
             }
         })
-        .await;
+        .await
+        .expect("clean run should not exhaust its budget");
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
@@ -128,14 +136,15 @@ mod tests {
                 }
             }
         })
-        .await;
+        .await
+        .expect("eventually successful run should not exhaust its budget");
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
     async fn supervise_gives_up_after_max_consecutive_failures() {
         let attempts = Arc::new(AtomicUsize::new(0));
-        supervise("test", fast_config(2), {
+        let exhausted = supervise("test", fast_config(2), {
             let attempts = Arc::clone(&attempts);
             move || {
                 let attempts = Arc::clone(&attempts);
@@ -145,9 +154,13 @@ mod tests {
                 }
             }
         })
-        .await;
+        .await
+        .expect_err("permanent failure should exhaust its budget");
         // Budget of 2 means: 1st failure (cf=1, 1>=2 false) retries; 2nd (cf=2, 2>=2) gives up.
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(exhausted.controller, "test");
+        assert_eq!(exhausted.attempts, 2);
+        assert_eq!(exhausted.error, ResourceError::other("permanent"));
     }
 
     #[tokio::test]
@@ -176,7 +189,8 @@ mod tests {
                 }
             }
         })
-        .await;
+        .await
+        .expect_err("third failure should exhaust the reset budget");
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 }
