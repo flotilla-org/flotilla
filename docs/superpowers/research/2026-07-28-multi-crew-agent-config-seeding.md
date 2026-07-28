@@ -471,6 +471,88 @@ endpoint, Moonshot's own Codex guidance routes through a local
 protocol-converting proxy — an extra sidecar process and port per container.
 **A Kimi-backed reviewer should be pi or Claude Code, not Codex.**
 
+## Onboarding suppression sets
+
+This section answers the operative question directly: **what must be seeded so a
+freshly spawned crew reaches its brief with zero interactive prompts.** Gemini
+is excluded (ruled dead/superseded).
+
+Method: each CLI was run against a throwaway `HOME` and config home under
+`scratchpad/ob/`, in a scratch git repo, under a real PTY via `tmux-cli`, and the
+first screen captured. "Verified" below means the prompt was observed and then
+observed to disappear once the pre-answer was seeded. Nothing wrote to real
+config; dummy API keys were used throughout.
+
+Two failure shapes matter, and only the first is a literal prompt:
+
+- **Blocking prompt** — the CLI stops and waits for a keypress. Fails the
+  acceptance test outright.
+- **Silent capability downgrade** — no prompt, but the agent starts in a
+  degraded mode (read-only sandbox, project config ignored) because a trust
+  decision was never recorded. Passes a naive "no prompt" check and then fails
+  the brief. This is the more dangerous of the two, because it looks like success.
+
+### Codex
+
+| Prompt / first-run surface | Pre-answer mechanism | Citation | Status |
+|---|---|---|---|
+| Welcome + sign-in picker ("1. Sign in with ChatGPT / 2. Device Code / 3. Provide your own API key") | **`auth.json` must exist** — `printf '%s' "$KEY" \| codex login --with-api-key` into the crew's `CODEX_HOME`. **`OPENAI_API_KEY` in the environment does *not* suppress it.** | `should_show_login_screen` returns true when `login_status == NotAuthenticated`, computed from `app_server.read_account()`, not from the env (`codex-rs/tui/src/lib.rs:1721-1729`, `:1650-1665`); probe below | **Verified** |
+| Directory trust ("Do you trust the contents of this directory?") | `[projects."<path>"]` / `trust_level = "trusted"` in `$CODEX_HOME/config.toml` | `should_show_trust_screen` is exactly `config.active_project.trust_level.is_none()` (`codex-rs/tui/src/lib.rs:1705-1707`); `ProjectConfig`/`TrustLevel` at `codex-rs/config/src/config_toml.rs:531-543` and `codex-rs/protocol/src/config_types.rs:457-464`, serialised lowercase | **Verified** |
+| *(no prompt)* read-only sandbox when trust is unset | Same `trust_level = "trusted"` entry | Probe: identical `codex exec` run reported `sandbox: read-only` without the entry and `sandbox: workspace-write [workdir, /tmp, $TMPDIR]` with it | **Verified** |
+| *(no prompt)* project-local config, hooks and exec policies not loaded | Same entry — the trust dialog's own text says trusting "allows project-local config, hooks, and exec policies to load"; the config loader marks the cwd/tree/repo layers "loaded but disabled when the directory is untrusted" | `codex-rs/config/src/loader/mod.rs:70-95`; observed dialog text | **Verified** |
+| `codex exec` blocks reading stdin | Redirect `< /dev/null`, or pass the prompt as an argument and close stdin | Probe: `codex exec` prints `Reading additional input from stdin...` before starting | **Verified** |
+| Update / version notice | `version.json` is written into `CODEX_HOME` on first run; no prompt observed | Observed file creation; no interactive update gate seen | Unverified (no update was pending during the probe) |
+
+Three onboarding steps exist and no more — `Step::Welcome`, `Step::Auth`,
+`Step::TrustDirectory` (`codex-rs/tui/src/onboarding/onboarding_screen.rs:54-58`),
+gated by `should_show_onboarding = show_trust_screen || show_login_screen`
+(`:1709-1719`). There is no separate telemetry, theme or model-picker gate.
+
+**The env-var finding is the important one, and it refines the correction made
+earlier in this document.** `OPENAI_API_KEY` *is* honoured by `codex exec` and
+`codex doctor` — but *not* by the TUI's onboarding gate, which asks the app
+server for an account record. Captured with a fresh home, a seeded trust entry,
+and `OPENAI_API_KEY=sk-dummy-not-real`:
+
+```text
+> 1. Sign in with ChatGPT
+  2. Sign in with Device Code
+  3. Provide your own API key
+  Press enter to continue
+```
+
+After `codex login --with-api-key` wrote `auth.json` into the same home
+(accepted without validating the dummy key — "Successfully logged in"), the same
+launch in the trusted directory went straight to the composer:
+
+```text
+╭─────────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.145.0)                              │
+│ model:     gpt-5.6-sol   /model to change               │
+│ directory: /.../scratchpad/ob/work                      │
+╰─────────────────────────────────────────────────────────╯
+```
+
+So **#1156's `codex login --with-api-key` transformation is still required** for
+any interactive crew, and the writable per-crew `CODEX_HOME` it needs is
+non-negotiable. The earlier correction stands only for `codex exec`. A crew
+spawned in exec mode can skip the login step; a crew spawned into the TUI cannot.
+
+Codex seed set, minimal:
+
+```sh
+mkdir -p "$CODEX_HOME"                       # must pre-exist
+printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key   # writes auth.json
+cat >> "$CODEX_HOME/config.toml" <<EOF
+[projects."/workspace/repo"]
+trust_level = "trusted"
+EOF
+```
+
+The trust key is looked up against the resolved cwd first and the git repo root
+second (`codex-rs/config/src/config_toml.rs:798-822`), so a single entry keyed on
+the repo root covers every subdirectory a crew might start in.
+
 ## What beyond credentials is per-crew
 
 Grouping by what moves it, since that is what the seeder must act on:
