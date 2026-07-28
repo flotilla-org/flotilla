@@ -169,6 +169,19 @@ fn format_disk_free(bytes: Option<u64>) -> String {
     bytes.map_or_else(|| "-".to_string(), |bytes| format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0)))
 }
 
+fn format_sleep_inhibition(health: &flotilla_protocol::SleepInhibitionHealth) -> String {
+    match health {
+        flotilla_protocol::SleepInhibitionHealth::NotRequired => "not required".to_string(),
+        flotilla_protocol::SleepInhibitionHealth::Held => "held".to_string(),
+        flotilla_protocol::SleepInhibitionHealth::Acquiring { consecutive_failures, .. } => {
+            format!("acquiring ({consecutive_failures} failures)")
+        }
+        flotilla_protocol::SleepInhibitionHealth::Failed { consecutive_failures, message } => {
+            format!("FAILED ({consecutive_failures}): {message}")
+        }
+    }
+}
+
 pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> String {
     if response.hosts.is_empty() {
         return "No hosts known.\n".to_string();
@@ -188,6 +201,7 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
         "Crew",
         "Convoys",
         "Disk Free",
+        "Sleep Inhibition",
         "Staleness",
         "Diagnosis",
     ]);
@@ -198,14 +212,23 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
             FleetHostStaleness::Stale => "STALE",
             FleetHostStaleness::Unknown => "unknown",
         };
-        let diagnosis = if !host.degraded_conditions.is_empty() {
-            format!("⚠ DEGRADED: {}", host.degraded_conditions.join("; "))
-        } else {
+        let mut diagnoses = Vec::new();
+        if !host.degraded_conditions.is_empty() {
+            diagnoses.push(format!("⚠ DEGRADED: {}", host.degraded_conditions.join("; ")));
+        }
+        if matches!(&host.sleep_inhibition, flotilla_protocol::SleepInhibitionHealth::Failed { .. }) {
+            diagnoses.push("⚠ SLEEP INHIBITION FAILED".to_string());
+        }
+        if host.observation_agreement == FleetObservationAgreement::Disagree {
+            diagnoses.push("⚠ DISAGREE".to_string());
+        }
+        let diagnosis = if diagnoses.is_empty() {
             match host.observation_agreement {
-                FleetObservationAgreement::Agree => "agree".to_string(),
-                FleetObservationAgreement::Disagree => "⚠ DISAGREE".to_string(),
                 FleetObservationAgreement::Unknown => "unknown".to_string(),
+                FleetObservationAgreement::Agree | FleetObservationAgreement::Disagree => "agree".to_string(),
             }
+        } else {
+            diagnoses.join("; ")
         };
         table.add_row(vec![
             Cell::new(name),
@@ -219,6 +242,7 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
             Cell::new(host.crew_count),
             Cell::new(host.convoy_count),
             Cell::new(format_disk_free(host.disk_free_bytes)),
+            Cell::new(format_sleep_inhibition(&host.sleep_inhibition)),
             Cell::new(row),
             Cell::new(diagnosis),
         ]);

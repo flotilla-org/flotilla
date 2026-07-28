@@ -2,7 +2,7 @@ use std::{any::Any, collections::HashMap};
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{FleetHostRow, FleetHostStaleness, FleetObservationAgreement, PeerConnectionState};
+use flotilla_protocol::{FleetHostRow, FleetHostStaleness, FleetObservationAgreement, PeerConnectionState, SleepInhibitionHealth};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
@@ -389,14 +389,15 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
     let rows = hosts.iter().map(|host| {
         let degraded = !host.degraded_conditions.is_empty();
         let disagreement = host.observation_agreement == FleetObservationAgreement::Disagree;
-        let icon = if degraded || disagreement {
+        let inhibition_failed = matches!(host.sleep_inhibition, SleepInhibitionHealth::Failed { .. });
+        let icon = if degraded || disagreement || inhibition_failed {
             "⚠"
         } else if host.staleness == FleetHostStaleness::Current {
             "●"
         } else {
             "○"
         };
-        let style = if degraded || disagreement {
+        let style = if degraded || disagreement || inhibition_failed {
             Style::default().fg(theme.warning)
         } else if host.staleness == FleetHostStaleness::Current {
             Style::default().fg(theme.status_ok)
@@ -429,6 +430,12 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
                 FleetHostStaleness::Unknown => "unknown",
             }
         };
+        let sleep = match &host.sleep_inhibition {
+            SleepInhibitionHealth::NotRequired => "-",
+            SleepInhibitionHealth::Held => "held",
+            SleepInhibitionHealth::Acquiring { .. } => "acquiring",
+            SleepInhibitionHealth::Failed { .. } => "FAILED",
+        };
         Row::new(vec![
             Cell::from(Span::styled(icon, style)),
             Cell::from(name),
@@ -438,6 +445,7 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
             Cell::from(replica),
             Cell::from(format!("{}/{}", host.crew_count, host.convoy_count)),
             Cell::from(disk),
+            Cell::from(sleep),
             Cell::from(stale),
         ])
     });
@@ -450,10 +458,12 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
         Constraint::Length(19),
         Constraint::Length(9),
         Constraint::Length(9),
+        Constraint::Length(10),
         Constraint::Length(8),
     ];
-    let header = Row::new(["", "Host", "Daemon v/gen/up", "Link", "Heartbeat", "Replica sync/gen", "Crew/Conv", "Disk", "Staleness"])
-        .style(theme.header_style());
+    let header =
+        Row::new(["", "Host", "Daemon v/gen/up", "Link", "Heartbeat", "Replica sync/gen", "Crew/Conv", "Disk", "Sleep", "Staleness"])
+            .style(theme.header_style());
     let table = Table::new(rows, widths).header(header).block(Block::bordered().style(theme.block_style()).title(" Fleet Health "));
     frame.render_widget(table, area);
 }

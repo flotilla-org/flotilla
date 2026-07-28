@@ -5339,6 +5339,7 @@ impl InProcessDaemon {
                     .crew_count(crew_count)
                     .convoy_count(convoys.len())
                     .maybe_disk_free_bytes(status.and_then(|status| status.disk_free_bytes))
+                    .sleep_inhibition(status.map(|status| status.sleep_inhibition.clone()).unwrap_or_default())
                     .staleness(staleness)
                     .observation_agreement(observation_agreement)
                     .degraded_conditions(degraded_conditions)
