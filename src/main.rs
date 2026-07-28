@@ -1013,7 +1013,7 @@ async fn print_resource_query_result(
 async fn format_resource_value(
     daemon: &dyn DaemonHandle,
     node_id: Option<flotilla_protocol::NodeId>,
-    mut value: serde_json::Value,
+    value: serde_json::Value,
     format: OutputFormat,
 ) -> Result<String> {
     if format == OutputFormat::Json {
@@ -1024,10 +1024,13 @@ async fn format_resource_value(
             Command { node_id, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
             uuid::Uuid::new_v4(),
         )
-        .await
-        .map_err(|error| color_eyre::eyre::eyre!(error))?;
-    let CommandValue::HostList(hosts) = hosts else {
-        return Ok(flotilla_protocol::output::json_pretty(&value));
+        .await;
+    Ok(format_human_resource_value(value, hosts))
+}
+
+fn format_human_resource_value<E>(mut value: serde_json::Value, hosts: std::result::Result<CommandValue, E>) -> String {
+    let Ok(CommandValue::HostList(hosts)) = hosts else {
+        return flotilla_protocol::output::json_pretty(&value);
     };
     let names = hosts
         .hosts
@@ -1039,7 +1042,7 @@ async fn format_resource_value(
         })
         .collect::<std::collections::HashMap<_, _>>();
     replace_host_ids(&mut value, &names);
-    Ok(flotilla_protocol::output::json_pretty(&value))
+    flotilla_protocol::output::json_pretty(&value)
 }
 
 fn replace_host_ids(value: &mut serde_json::Value, names: &std::collections::HashMap<String, String>) {
@@ -1733,10 +1736,10 @@ mod tests {
     };
 
     use super::{
-        attach_exit_disposition, confirm_command, default_project_landing, provisioning_target_for_environment, replace_host_ids,
-        run_replica_snapshot, select_host_target, select_startup_repo_roots, should_reexec_for_incompatible_daemon, show_startup_splash,
-        AttachExitDisposition, Cli, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand,
-        SubCommand,
+        attach_exit_disposition, confirm_command, default_project_landing, format_human_resource_value,
+        provisioning_target_for_environment, replace_host_ids, run_replica_snapshot, select_host_target, select_startup_repo_roots,
+        should_reexec_for_incompatible_daemon, show_startup_splash, AttachExitDisposition, Cli, CommandValue, ResourceApplyArgs,
+        ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, SubCommand,
     };
 
     fn landing_repo(path: &str, name: &str, key: Option<&str>) -> RepoInfo {
@@ -1998,6 +2001,18 @@ mod tests {
         assert_eq!(value["spec"]["host_ref"], "kiwi");
         assert_eq!(value["status"]["placement_decision"]["target_host"]["ref"], "kiwi");
         assert_eq!(value["metadata"]["name"], "host-direct-01HXYZ");
+    }
+
+    #[test]
+    fn human_resource_rendering_falls_back_to_raw_json_when_host_lookup_fails() {
+        let value = serde_json::json!({
+            "spec": {"host_ref": "01HXYZ"},
+            "metadata": {"name": "demo"}
+        });
+
+        let rendered = format_human_resource_value(value.clone(), Err::<CommandValue, _>("transient host lookup failure"));
+
+        assert_eq!(rendered, flotilla_protocol::output::json_pretty(&value));
     }
 
     #[tokio::test]
