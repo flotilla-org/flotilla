@@ -111,7 +111,7 @@ async fn alias_transport_uses_typed_repository_identity_for_clone_name() {
 }
 
 #[tokio::test]
-async fn clone_failure_remains_an_honest_retrying_state_after_repository_registration() {
+async fn clone_failure_retries_once_before_marking_failed() {
     let backend = ResourceBackend::InMemory(Default::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/private").expect("repository spec");
     let repository_key = repository_spec.key();
@@ -133,14 +133,28 @@ async fn clone_failure_remains_an_honest_retrying_state_after_repository_registr
         .expect("clone should create");
     let reconciler = CloneReconciler::new(Arc::new(FailingCloneRuntime), backend.using("flotilla"));
 
-    let deps = reconciler.fetch_dependencies(&clone).await.expect("deps should load");
+    let deps = reconciler.fetch_dependencies(&clone).await.expect("first deps should load");
     let outcome = reconciler.reconcile(&clone, &deps, chrono::Utc::now());
 
     assert!(matches!(
-        outcome.patch,
+        outcome.patch.as_ref(),
         Some(flotilla_resources::CloneStatusPatch::MarkRetrying { message }) if message == "authentication failed"
     ));
     assert!(outcome.requeue_after.is_some());
+
+    let clones = backend.clone().using::<flotilla_resources::Clone>("flotilla");
+    let retrying =
+        flotilla_resources::apply_status_patch(&clones, &clone_name, &outcome.patch.expect("first failure should record retry state"))
+            .await
+            .expect("retry state should apply");
+    let repeated_deps = reconciler.fetch_dependencies(&retrying).await.expect("repeated deps should load");
+    let repeated_outcome = reconciler.reconcile(&retrying, &repeated_deps, chrono::Utc::now());
+
+    assert!(matches!(
+        repeated_outcome.patch,
+        Some(flotilla_resources::CloneStatusPatch::MarkFailed { message }) if message == "authentication failed"
+    ));
+    assert!(repeated_outcome.requeue_after.is_none());
 }
 
 #[tokio::test]

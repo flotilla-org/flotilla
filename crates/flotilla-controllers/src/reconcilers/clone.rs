@@ -69,7 +69,8 @@ where
         };
         Ok(match result {
             Ok(default_branch) => CloneDeps::Ready { default_branch },
-            Err(err) => CloneDeps::Retrying(err),
+            Err(err) if phase == ClonePhase::Pending => CloneDeps::Retrying(err),
+            Err(err) => CloneDeps::Failed(err),
         })
     }
 

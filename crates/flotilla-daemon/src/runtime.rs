@@ -1568,10 +1568,11 @@ impl CloneRuntime for CloneControllerRuntime {
         };
         if let Err(error) = tokio::fs::rename(&staging_path, target_path).await {
             let error = cleanup_failed_checkout(&*self.runner, &staging_path, format!("publish clone: {error}")).await;
-            if let Some(inspection) = recover_existing_clone(Arc::clone(&self.runner), repo_url, target_path).await? {
-                return Ok(inspection.default_branch);
-            }
-            return Err(error);
+            return match recover_existing_clone(Arc::clone(&self.runner), repo_url, target_path).await {
+                Ok(Some(inspection)) => Ok(inspection.default_branch),
+                Ok(None) => Err(error),
+                Err(adoption_error) => Err(format!("{error}; additionally failed to adopt clone at target: {adoption_error}")),
+            };
         }
         Ok(inspection.default_branch)
     }
@@ -1592,10 +1593,15 @@ async fn recover_existing_clone(
         return Ok(None);
     }
 
+    verify_clone_origin(&*runner, repo_url, target_path, "clone target").await?;
+    GitCloneProvisioner::new(runner).inspect_clone(&ExecutionEnvironmentPath::new(target_path)).await.map(Some)
+}
+
+async fn verify_clone_origin(runner: &dyn CommandRunner, repo_url: &str, target_path: &str, target_label: &str) -> Result<(), String> {
     let origin = runner
         .run("git", &["-C", target_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop)
         .await
-        .map_err(|error| format!("clone target {target_path} already exists but is not a reusable clone: {error}"))?;
+        .map_err(|error| format!("{target_label} {target_path} already exists but is not a reusable clone: {error}"))?;
     let origin = origin.trim();
     let same_origin = origin == repo_url
         || canonicalize_repo_url(origin)
@@ -1603,10 +1609,10 @@ async fn recover_existing_clone(
             .zip(canonicalize_repo_url(repo_url).ok())
             .is_some_and(|(origin, expected)| origin == expected);
     if !same_origin {
-        return Err(format!("clone target {target_path} already exists with origin {origin}, expected {repo_url}"));
+        return Err(format!("{target_label} {target_path} already exists with origin {origin}, expected {repo_url}"));
     }
 
-    GitCloneProvisioner::new(runner).inspect_clone(&ExecutionEnvironmentPath::new(target_path)).await.map(Some)
+    Ok(())
 }
 
 struct CheckoutControllerRuntime {
@@ -1919,19 +1925,7 @@ async fn recover_existing_fresh_clone(
         return Ok(None);
     }
 
-    let origin = runner
-        .run("git", &["-C", target_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop)
-        .await
-        .map_err(|error| format!("checkout target {target_path} already exists but is not a reusable clone: {error}"))?;
-    let origin = origin.trim();
-    let same_origin = origin == repo_url
-        || canonicalize_repo_url(origin)
-            .ok()
-            .zip(canonicalize_repo_url(repo_url).ok())
-            .is_some_and(|(origin, expected)| origin == expected);
-    if !same_origin {
-        return Err(format!("checkout target {target_path} already exists with origin {origin}, expected {repo_url}"));
-    }
+    verify_clone_origin(runner, repo_url, target_path, "checkout target").await?;
 
     if branch != "HEAD" {
         let current_branch = runner
@@ -2498,6 +2492,41 @@ mod tests {
         assert_eq!(first.expect("first clone should succeed").as_deref(), Some("main"));
         assert_eq!(second.expect("second clone should succeed").as_deref(), Some("main"));
         assert_eq!(runner.clone_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn clone_runtime_adopts_a_matching_clone_that_wins_an_external_flight() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let target = temp.path().join("clone");
+        let runner = Arc::new(BlockingCloneProcessRunner {
+            clone_attempts: AtomicUsize::new(0),
+            clone_started: Notify::new(),
+            release_clone: Notify::new(),
+        });
+        let first_runtime = Arc::new(CloneControllerRuntime { runner: runner.clone(), flights: Arc::new(CloneFlights::default()) });
+        let external_runtime = Arc::new(CloneControllerRuntime { runner: runner.clone(), flights: Arc::new(CloneFlights::default()) });
+        let repo_url = source.path().to_str().expect("utf-8 source path").to_string();
+        let target_path = target.to_str().expect("utf-8 target path").to_string();
+
+        let first = tokio::spawn({
+            let runtime = Arc::clone(&first_runtime);
+            let repo_url = repo_url.clone();
+            let target_path = target_path.clone();
+            async move { runtime.clone_and_inspect(&repo_url, &target_path).await }
+        });
+        runner.clone_started.notified().await;
+        let external = tokio::spawn({
+            let runtime = Arc::clone(&external_runtime);
+            async move { runtime.clone_and_inspect(&repo_url, &target_path).await }
+        });
+        let external = external.await.expect("external clone task should join");
+        runner.release_clone.notify_one();
+        let first = first.await.expect("first clone task should join");
+
+        assert_eq!(external.expect("external clone should succeed").as_deref(), Some("main"));
+        assert_eq!(first.expect("losing flight should adopt the external clone").as_deref(), Some("main"));
+        assert_eq!(runner.clone_attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
