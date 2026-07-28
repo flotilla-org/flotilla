@@ -84,13 +84,6 @@ where
         let patch = if matches!(phase, ClonePhase::Pending | ClonePhase::Cloning) {
             match deps {
                 CloneDeps::Ready { default_branch } => Some(CloneStatusPatch::MarkReady { default_branch: default_branch.clone() }),
-                CloneDeps::Retrying(message)
-                    if obj.status.as_ref().is_some_and(|status| {
-                        status.phase == ClonePhase::Cloning && status.message.as_deref() == Some(message.as_str())
-                    }) =>
-                {
-                    None
-                }
                 CloneDeps::Retrying(message) => Some(CloneStatusPatch::MarkRetrying { message: message.clone() }),
                 CloneDeps::Failed(message) => Some(CloneStatusPatch::MarkFailed { message: message.clone() }),
                 CloneDeps::None => None,
