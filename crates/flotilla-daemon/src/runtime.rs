@@ -38,7 +38,7 @@ use flotilla_resources::{
     Demand, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host, HostCondition,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
     InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend, ResourceError,
-    ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
     AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
 };
 use serde_json::json;
@@ -1249,6 +1249,7 @@ fn spawn_controller_loops(
                             secondaries: ConvoyReconciler::secondary_watches(),
                             reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
                                 .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
+                                .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
                                 .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
                                 .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
                                 .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))

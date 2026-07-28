@@ -79,6 +79,7 @@ pub enum Actuation {
     CreateCheckout { meta: InputMeta, spec: CheckoutSpec },
     CreateTerminalSession { meta: InputMeta, spec: TerminalSessionSpec },
     RestartTerminalSession { name: String },
+    DeleteTerminalSession { name: String },
     CreateVessel { meta: InputMeta, spec: VesselSpec },
     CreatePresentation { meta: InputMeta, spec: PresentationSpec },
     DeletePresentation { name: String },
@@ -308,6 +309,10 @@ impl<R: Reconciler> ControllerLoop<R> {
             Actuation::RestartTerminalSession { name } => {
                 let resolver = backend.using::<crate::TerminalSession>(namespace);
                 crate::apply_status_patch(&resolver, &name, &crate::TerminalSessionStatusPatch::MarkStarting).await.map(|_| ())
+            }
+            Actuation::DeleteTerminalSession { name } => {
+                let resolver = backend.using::<crate::TerminalSession>(namespace);
+                Self::delete_if_lifecycle_owned(&resolver, &name).await
             }
             Actuation::CreateVessel { meta, spec } => {
                 let resolver = backend.using::<crate::Vessel>(namespace);
