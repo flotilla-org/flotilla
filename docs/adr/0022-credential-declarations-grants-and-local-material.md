@@ -143,9 +143,15 @@ bookkeeping is the operator's login inventory**.
 
 ### Corrections to recorded facts
 
-- Codex ≥0.145 accepts `OPENAI_API_KEY`/`CODEX_API_KEY` ambiently; the
-  `login --with-api-key` transformation is an optional hardening, not a
-  requirement (original text listed it as required).
+- Codex ≥0.145 accepts `OPENAI_API_KEY`/`CODEX_API_KEY` ambiently **for
+  non-interactive surfaces** (`codex exec`, `codex doctor`) — there the
+  `login --with-api-key` transformation becomes optional. **The interactive
+  TUI ignores the env keys** and uses whatever login the home holds, so for
+  interactive crews (today's crews) seeded login material or the login
+  transformation remains required (original text listed the transformation as
+  required for all cases; the truth is this split). Corollary: two
+  *interactive* crews on two *different* accounts in one vessel is the one
+  narrow case that genuinely revives per-crew `CODEX_HOME`s.
 - Consumer adapters gain the seeding duty with a hard acceptance test: a
   spawned crew reaches its brief with **zero interactive prompts**.
 
