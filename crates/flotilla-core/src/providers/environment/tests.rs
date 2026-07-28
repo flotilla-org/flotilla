@@ -446,6 +446,32 @@ async fn create_reports_infrastructure_and_requested_mount_metadata() {
 }
 
 #[tokio::test]
+async fn create_rejects_a_mount_targeting_the_reserved_daemon_socket_path() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let image = ImageId::new("ubuntu:22.04");
+    let opts = CreateOpts {
+        tokens: vec![],
+        daemon_socket_path: DaemonHostPath::new("/host/flotilla.sock"),
+        working_directory: None,
+        provisioned_mounts: vec![ProvisionedMount::new("/host/replacement.sock", "/run/flotilla.sock", ProvisionedMountMode::Rw)],
+        image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
+    };
+
+    let error = provider
+        .create(EnvironmentId::new("test-env-reserved-socket"), &image, opts)
+        .await
+        .err()
+        .expect("reserved socket mount should be rejected");
+
+    assert_eq!(error, "mount target /run/flotilla.sock is reserved for the daemon socket");
+    assert!(runner.calls().is_empty(), "reserved mount collisions should fail before invoking docker");
+}
+
+#[tokio::test]
 async fn create_uses_requested_mount_modes_in_docker_arguments() {
     use flotilla_protocol::ImageId;
 

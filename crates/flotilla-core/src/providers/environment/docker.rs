@@ -72,6 +72,9 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
     async fn create(&self, id: EnvironmentId, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String> {
         let container_name = format!("flotilla-env-{}", id);
 
+        if opts.provisioned_mounts.iter().any(|mount| mount.environment_path.as_path() == Path::new(CONTAINER_SOCKET_PATH)) {
+            return Err(format!("mount target {CONTAINER_SOCKET_PATH} is reserved for the daemon socket"));
+        }
         let mut provisioned_mounts = Vec::with_capacity(opts.provisioned_mounts.len() + 1);
         provisioned_mounts.push(ProvisionedMount::new(
             opts.daemon_socket_path.as_path().to_path_buf(),
