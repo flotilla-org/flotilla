@@ -14,8 +14,8 @@ use flotilla_resources::{
     CheckoutStatus, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatus, ConvoyStatusPatch,
     ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, LandedEvidence,
     ObservedCheckoutSpec, OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, StatusPatch, TargetMismatch,
-    ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate,
-    CONVOY_LABEL, VESSEL_LABEL,
+    TerminalSession, TerminalSessionSource, TerminalSessionSpec, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus,
+    WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
 };
 
 struct AlwaysEligible;
@@ -167,6 +167,38 @@ async fn reconcile_landing_with_observed_change_request(
     let reconciler = ConvoyReconciler::new(templates).with_checkouts(checkouts);
     let deps = reconciler.fetch_dependencies(&current).await.expect("dependencies");
     reconciler.reconcile(&current, &deps, timestamp(40))
+}
+
+#[tokio::test]
+async fn convoy_finalizer_deletes_orphaned_terminal_sessions() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let convoy = convoys.create(&convoy_meta("convoy-a"), &valid_convoy_spec()).await.expect("convoy create should succeed");
+    sessions
+        .create(
+            &InputMeta::builder()
+                .name("terminal-convoy-a-work-coder".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.metadata.name.clone())]))
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "host-direct-feta".to_string(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("terminal create should succeed");
+
+    ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+        .with_terminal_sessions(sessions.clone())
+        .run_finalizer(&convoy)
+        .await
+        .expect("convoy finalizer should succeed");
+
+    assert!(matches!(sessions.get("terminal-convoy-a-work-coder").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
 }
 
 fn vessel_meta(name: &str, convoy_name: &str, task: &str) -> InputMeta {

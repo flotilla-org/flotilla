@@ -1356,8 +1356,14 @@ async fn child_failure_propagates_to_workspace_failure() {
     ));
 }
 
+#[rstest]
+#[case(WorkPhase::Running, CrewWorkPhase::Working)]
+#[case(WorkPhase::Launching, CrewWorkPhase::Pending)]
 #[tokio::test]
-async fn stopped_agent_session_interrupts_the_vessel_and_requests_a_restart() {
+async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_restart(
+    #[case] work_phase: WorkPhase,
+    #[case] crew_phase: CrewWorkPhase,
+) {
     let backend = ResourceBackend::InMemory(Default::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-recover", "implement", REPO_URL, GIT_REF).await;
     let mut status = convoy.status.expect("convoy status");
@@ -1367,11 +1373,10 @@ async fn stopped_agent_session_interrupts_the_vessel_and_requests_a_restart() {
         brief_template: None,
     };
     status.phase = ConvoyPhase::Active;
-    status.work.insert("implement".to_string(), WorkState::builder().phase(WorkPhase::Running).build());
-    status.crew_work.insert(
-        "implement".to_string(),
-        BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-    );
+    status.work.insert("implement".to_string(), WorkState::builder().phase(work_phase).build());
+    status
+        .crew_work
+        .insert("implement".to_string(), BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(crew_phase).build())]));
     backend
         .clone()
         .using::<Convoy>(NAMESPACE)

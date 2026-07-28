@@ -7,13 +7,14 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
 use flotilla_resources::{
-    controller::Reconciler, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta,
-    ResourceBackend, StatusPatch, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSessionPhase,
-    TerminalSessionSpec, CONVOY_LABEL, VESSEL_REF_LABEL,
+    controller::{Actuation, Reconciler},
+    EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta, ResourceBackend, StatusPatch,
+    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSessionPhase, TerminalSessionSpec, CONVOY_LABEL,
+    VESSEL_REF_LABEL,
 };
 
 mod common;
-use common::meta;
+use common::{create_convoy_with_single_task, meta};
 
 #[tokio::test]
 async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
@@ -80,6 +81,50 @@ impl TerminalRuntime for FailingTerminalRuntime {
 }
 
 #[tokio::test]
+async fn orphaned_convoy_session_is_deleted_without_relaunching() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
+    let session = sessions
+        .create(
+            &InputMeta::builder()
+                .name("terminal-deleted-convoy-work-coder".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "deleted-convoy".to_string())]))
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "host-direct-feta".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector { capability: "coding".to_string() },
+                    brief: flotilla_resources::TerminalBrief {
+                        path: ".flotilla/briefs/coder.md".to_string(),
+                        content: "brief".to_string(),
+                        copies: Vec::new(),
+                    },
+                    context: flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "deleted-convoy".to_string(),
+                        vessel_ref: "deleted-convoy-work".to_string(),
+                    },
+                    message: None,
+                },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("session create should succeed");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(MissingTerminalRuntime), backend, "flotilla");
+
+    let deps = reconciler.fetch_dependencies(&session).await.expect("orphan dependencies should load");
+    let outcome = reconciler.reconcile(&session, &deps, Utc::now());
+
+    assert!(matches!(
+        outcome.actuations.as_slice(),
+        [Actuation::DeleteTerminalSession { name }] if name == "terminal-deleted-convoy-work-coder"
+    ));
+}
+
+#[tokio::test]
 async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
     let backend = ResourceBackend::InMemory(Default::default());
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
@@ -138,6 +183,7 @@ impl TerminalRuntime for RecordingTerminalRuntime {
 #[tokio::test]
 async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
     let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let env = environments
@@ -207,6 +253,7 @@ impl TerminalRuntime for TagRecordingRuntime {
 #[tokio::test]
 async fn a_disappeared_running_session_is_observed_as_stopped() {
     let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "implement", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
         .create(&meta("term-a"), &TerminalSessionSpec {
@@ -279,6 +326,7 @@ impl TerminalRuntime for MissingTerminalRuntime {
 #[tokio::test]
 async fn a_message_queued_during_startup_is_delivered_before_attention_observation() {
     let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
         .create(&meta("term-a"), &TerminalSessionSpec {

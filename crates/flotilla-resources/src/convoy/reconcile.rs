@@ -23,6 +23,7 @@ use crate::{
     presentation::{Presentation, PresentationSpec},
     resource::ResourceObject,
     status_patch::StatusPatch,
+    terminal_session::TerminalSession,
     vessel::{Vessel, VesselPhase},
     workflow_template::{validate, visit_template_tokens, CrewSource, CrewSpec, ValidationError, WorkflowTemplate},
     InputMeta, InputValue, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, Resource, ResourceError, TypedResolver,
@@ -80,6 +81,7 @@ pub enum ConvoyEvent {
 pub struct ConvoyReconciler {
     templates: TypedResolver<WorkflowTemplate>,
     vessels: Option<TypedResolver<Vessel>>,
+    terminal_sessions: Option<TypedResolver<TerminalSession>>,
     presentations: Option<TypedResolver<Presentation>>,
     checkouts: Option<TypedResolver<Checkout>>,
     prepared_snapshot_gc: Option<PreparedSnapshotGarbageCollector>,
@@ -98,11 +100,24 @@ pub struct ConvoyDependencies {
 
 impl ConvoyReconciler {
     pub fn new(templates: TypedResolver<WorkflowTemplate>) -> Self {
-        Self { templates, vessels: None, presentations: None, checkouts: None, prepared_snapshot_gc: None, teardown_runtime: None }
+        Self {
+            templates,
+            vessels: None,
+            terminal_sessions: None,
+            presentations: None,
+            checkouts: None,
+            prepared_snapshot_gc: None,
+            teardown_runtime: None,
+        }
     }
 
     pub fn with_vessels(mut self, vessels: TypedResolver<Vessel>) -> Self {
         self.vessels = Some(vessels);
+        self
+    }
+
+    pub fn with_terminal_sessions(mut self, terminal_sessions: TypedResolver<TerminalSession>) -> Self {
+        self.terminal_sessions = Some(terminal_sessions);
         self
     }
 
@@ -233,6 +248,9 @@ impl Reconciler for ConvoyReconciler {
         let selector = BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]);
         if let Some(presentations) = &self.presentations {
             delete_lifecycle_owned_matching(presentations, &selector).await?;
+        }
+        if let Some(terminal_sessions) = &self.terminal_sessions {
+            delete_lifecycle_owned_matching(terminal_sessions, &selector).await?;
         }
         if let Some(vessels) = &self.vessels {
             delete_lifecycle_owned_matching(vessels, &selector).await?;
