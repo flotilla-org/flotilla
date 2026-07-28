@@ -1080,6 +1080,7 @@ fn convoy_phase(row: &ConvoySummary) -> CellValue {
     let tone = match row.phase {
         ConvoyPhase::Pending => CellTone::Muted,
         ConvoyPhase::Active => CellTone::Plain,
+        ConvoyPhase::Interrupted => CellTone::Warning,
         ConvoyPhase::Landed => CellTone::Success,
         ConvoyPhase::Anchored | ConvoyPhase::Landing => CellTone::Plain,
         ConvoyPhase::Failed => CellTone::Error,
@@ -1243,6 +1244,7 @@ fn vessel_phase(row: &VesselProjection) -> CellValue {
         WorkPhase::Ready => ("ready", CellTone::Warning),
         WorkPhase::Launching => ("launching", CellTone::Warning),
         WorkPhase::Running => ("running", CellTone::Plain),
+        WorkPhase::Interrupted => ("interrupted", CellTone::Warning),
         WorkPhase::Complete => ("complete", CellTone::Success),
         WorkPhase::Failed => ("failed", CellTone::Error),
         WorkPhase::Cancelled => ("cancelled", CellTone::Muted),

@@ -78,6 +78,7 @@ pub enum Actuation {
     CreateClone { meta: InputMeta, spec: CloneSpec },
     CreateCheckout { meta: InputMeta, spec: CheckoutSpec },
     CreateTerminalSession { meta: InputMeta, spec: TerminalSessionSpec },
+    RestartTerminalSession { name: String },
     CreateVessel { meta: InputMeta, spec: VesselSpec },
     CreatePresentation { meta: InputMeta, spec: PresentationSpec },
     DeletePresentation { name: String },
@@ -303,6 +304,10 @@ impl<R: Reconciler> ControllerLoop<R> {
             Actuation::CreateTerminalSession { meta, spec } => {
                 let resolver = backend.using::<crate::TerminalSession>(namespace);
                 Self::create_if_missing(&resolver, meta, spec).await
+            }
+            Actuation::RestartTerminalSession { name } => {
+                let resolver = backend.using::<crate::TerminalSession>(namespace);
+                crate::apply_status_patch(&resolver, &name, &crate::TerminalSessionStatusPatch::MarkStarting).await.map(|_| ())
             }
             Actuation::CreateVessel { meta, spec } => {
                 let resolver = backend.using::<crate::Vessel>(namespace);

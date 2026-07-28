@@ -258,6 +258,7 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
             image_digest: Some("sha256:test-image".to_string()),
             checkout_refs: Default::default(),
             terminal_session_refs: vec!["terminal-implement-coder".to_string()],
+            interrupted_roles: Default::default(),
             started_at: Some(timestamp(18)),
             ready_at: Some(timestamp(19)),
             requested_stance: None,

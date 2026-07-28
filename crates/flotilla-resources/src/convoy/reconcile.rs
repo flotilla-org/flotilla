@@ -683,6 +683,20 @@ fn roll_up_phase_outcome(
         });
     }
 
+    let any_interrupted = status.work.values().any(|state| state.phase == WorkPhase::Interrupted);
+    if any_interrupted && status.phase != ConvoyPhase::Interrupted {
+        return Some(ReconcileOutcome {
+            patch: Some(controller_patches::roll_up_phase(ConvoyPhase::Interrupted, None, None)),
+            events: vec![ConvoyEvent::PhaseChanged { from: status.phase, to: ConvoyPhase::Interrupted }],
+        });
+    }
+    if !any_interrupted && status.phase == ConvoyPhase::Interrupted {
+        return Some(ReconcileOutcome {
+            patch: Some(controller_patches::roll_up_phase(ConvoyPhase::Active, None, None)),
+            events: vec![ConvoyEvent::PhaseChanged { from: ConvoyPhase::Interrupted, to: ConvoyPhase::Active }],
+        });
+    }
+
     let any_progressed = status.work.values().any(|state| state.phase != WorkPhase::Pending);
     if any_progressed && status.phase == ConvoyPhase::Pending {
         return Some(ReconcileOutcome {
@@ -762,9 +776,68 @@ fn vessel_outcome(
                 }
             }
             WorkPhase::Running => {
-                if let Some(vessel) = vessel.filter(|vessel| vessel.status.as_ref().map(|status| status.phase) == Some(VesselPhase::Failed))
-                {
-                    return work_failed_outcome(requirement.name.clone(), state.phase, vessel_failure_message(vessel), now, actuations);
+                if let Some(vessel) = vessel {
+                    match vessel.status.as_ref().map(|status| status.phase) {
+                        Some(VesselPhase::Failed) => {
+                            return work_failed_outcome(
+                                requirement.name.clone(),
+                                state.phase,
+                                vessel_failure_message(vessel),
+                                now,
+                                actuations,
+                            );
+                        }
+                        Some(VesselPhase::Interrupted) => {
+                            let vessel_status = vessel.status.as_ref().expect("interrupted vessel has status");
+                            let message =
+                                vessel_status.message.clone().unwrap_or_else(|| format!("vessel {} was interrupted", vessel.metadata.name));
+                            return InternalReconcileOutcome {
+                                patch: Some(provisioning_patches::work_interrupted(
+                                    requirement.name.clone(),
+                                    vessel_status.interrupted_roles.clone(),
+                                    message,
+                                )),
+                                actuations,
+                                events: vec![ConvoyEvent::WorkPhaseChanged {
+                                    work: requirement.name.clone(),
+                                    from: WorkPhase::Running,
+                                    to: WorkPhase::Interrupted,
+                                }],
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            WorkPhase::Interrupted => {
+                if let Some(vessel) = vessel {
+                    match vessel.status.as_ref().map(|status| status.phase) {
+                        Some(VesselPhase::Failed) => {
+                            return work_failed_outcome(
+                                requirement.name.clone(),
+                                state.phase,
+                                vessel_failure_message(vessel),
+                                now,
+                                actuations,
+                            );
+                        }
+                        Some(VesselPhase::Ready) => {
+                            return InternalReconcileOutcome {
+                                patch: Some(provisioning_patches::work_running(
+                                    requirement.name.clone(),
+                                    now,
+                                    requirement.eagerly_started_roles(),
+                                )),
+                                actuations,
+                                events: vec![ConvoyEvent::WorkPhaseChanged {
+                                    work: requirement.name.clone(),
+                                    from: WorkPhase::Interrupted,
+                                    to: WorkPhase::Running,
+                                }],
+                            };
+                        }
+                        _ => {}
+                    }
                 }
             }
             WorkPhase::Pending | WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled | WorkPhase::Abandoned => {}

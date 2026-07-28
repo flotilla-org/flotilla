@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, marker::PhantomData, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    marker::PhantomData,
+    path::PathBuf,
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 use flotilla_core::agent_adapter::{
@@ -10,18 +15,19 @@ use flotilla_resources::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
     repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
-    CrewSource, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentMount, EnvironmentMountMode,
-    EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta,
-    LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey,
-    RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, CONVOY_LABEL,
-    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, VESSEL_REF_LABEL,
+    CrewSource, CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentMount,
+    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository,
+    RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase,
+    CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
 const REPO_LABEL: &str = "flotilla.work/repo";
 const ENV_LABEL: &str = "flotilla.work/env";
 const VESSEL_PROVISIONING_REQUEUE_AFTER: Duration = Duration::from_secs(5);
+const VESSEL_INTERRUPTED_REQUEUE_AFTER: Duration = Duration::from_millis(250);
 const VESSEL_PROVISIONING_STUCK_SECONDS: i64 = 2 * 60;
 
 #[derive(bon::Builder)]
@@ -108,6 +114,10 @@ enum PlannedPatch {
         requested_stance: Stance,
         effective_stance: Stance,
     },
+    Interrupted {
+        roles: BTreeSet<String>,
+        message: String,
+    },
     Failed {
         message: String,
     },
@@ -155,6 +165,19 @@ impl VesselDeps {
 
     fn failed(message: impl Into<String>) -> Self {
         Self { patch: PlannedPatch::Failed { message: message.into() }, actuations: Vec::new() }
+    }
+
+    fn interrupted(role: String, terminal_name: &str, restart: bool, mut actuations: Vec<Actuation>) -> Self {
+        if restart {
+            actuations.push(Actuation::RestartTerminalSession { name: terminal_name.to_string() });
+        }
+        Self {
+            patch: PlannedPatch::Interrupted {
+                roles: BTreeSet::from([role]),
+                message: format!("crew terminal session {terminal_name} disappeared; relaunching from its durable brief"),
+            },
+            actuations,
+        }
     }
 }
 
@@ -666,9 +689,7 @@ impl Reconciler for VesselReconciler {
                 Ok(existing) => {
                     terminal_refs.push(terminal_name.clone());
                     let phase = existing.status.as_ref().map(|status| status.phase);
-                    if phase == Some(TerminalSessionPhase::Failed)
-                        || (phase == Some(TerminalSessionPhase::Stopped) && matches!(process.source, CrewSource::Tool { .. }))
-                    {
+                    if phase == Some(TerminalSessionPhase::Failed) {
                         let message = existing
                             .status
                             .as_ref()
@@ -677,9 +698,35 @@ impl Reconciler for VesselReconciler {
                         return Ok(VesselDeps::failed(message));
                     }
                     if phase == Some(TerminalSessionPhase::Stopped) {
-                        continue;
+                        if matches!(process.source, CrewSource::Agent { .. }) {
+                            let work_phase =
+                                convoy.status.as_ref().and_then(|status| status.work.get(&obj.spec.vessel_name)).map(|work| work.phase);
+                            let crew_phase = convoy
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.crew_work.get(&obj.spec.vessel_name))
+                                .and_then(|crew| crew.get(&process.role))
+                                .map(|work| work.phase);
+                            let active = matches!(crew_phase, Some(CrewWorkPhase::Working | CrewWorkPhase::Interrupted))
+                                || (crew_phase.is_none() && should_start && work_phase == Some(WorkPhase::Running));
+                            if !active {
+                                continue;
+                            }
+                            return Ok(VesselDeps::interrupted(
+                                process.role.clone(),
+                                &terminal_name,
+                                work_phase != Some(WorkPhase::Running),
+                                actuations,
+                            ));
+                        }
+                        let message = existing
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.message.clone())
+                            .unwrap_or_else(|| format!("terminal session {terminal_name} stopped"));
+                        return Ok(VesselDeps::failed(message));
                     }
-                    if should_start && phase != Some(TerminalSessionPhase::Running) {
+                    if phase == Some(TerminalSessionPhase::Starting) || (should_start && phase != Some(TerminalSessionPhase::Running)) {
                         return Ok(VesselDeps::provisioning(
                             &placement_policy,
                             format!("terminal session {terminal_name} to become running"),
@@ -802,12 +849,24 @@ impl Reconciler for VesselReconciler {
                     ready_at: now,
                 })
             }
+            PlannedPatch::Interrupted { roles, message }
+                if obj.status.as_ref().is_none_or(|status| {
+                    status.phase != VesselPhase::Interrupted
+                        || status.interrupted_roles != *roles
+                        || status.message.as_deref() != Some(message.as_str())
+                }) =>
+            {
+                Some(VesselStatusPatch::MarkInterrupted { roles: roles.clone(), message: message.clone() })
+            }
+            PlannedPatch::Interrupted { .. } => None,
             PlannedPatch::Failed { message } => Some(VesselStatusPatch::MarkFailed { message: message.clone() }),
         };
 
         let mut outcome = ReconcileOutcome::with_actuations(patch, deps.actuations.clone());
         if matches!(&deps.patch, PlannedPatch::Provisioning { .. }) {
             outcome.requeue_after = Some(VESSEL_PROVISIONING_REQUEUE_AFTER);
+        } else if matches!(&deps.patch, PlannedPatch::Interrupted { .. }) {
+            outcome.requeue_after = Some(VESSEL_INTERRUPTED_REQUEUE_AFTER);
         }
         outcome
     }

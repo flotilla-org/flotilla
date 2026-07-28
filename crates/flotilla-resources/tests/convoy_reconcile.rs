@@ -224,6 +224,7 @@ fn vessel_object_with_image_digest(
             image_digest: Some(image_digest.to_string()),
             checkout_refs: BTreeMap::from([(repository_key, format!("checkout-{task}"))]),
             terminal_session_refs: vec![format!("terminal-{task}-coder")],
+            interrupted_roles: (phase == VesselPhase::Interrupted).then(|| "coder".to_string()).into_iter().collect(),
             started_at: Some(timestamp(16)),
             ready_at: (phase == VesselPhase::Ready).then(|| timestamp(18)),
             requested_stance: None,
@@ -1081,6 +1082,56 @@ async fn running_task_with_failed_workspace_marks_task_failed() {
         outcome.patch,
         Some(ConvoyStatusPatch::MarkWorkFailed { ref work, finished_at, ref message })
             if work == "implement" && finished_at == timestamp(21) && message == "terminal session crashed"
+    ));
+}
+
+#[tokio::test]
+async fn running_agent_work_with_an_interrupted_vessel_becomes_recoverable() {
+    let mut status = bootstrapped_convoy_status();
+    status.phase = ConvoyPhase::Active;
+    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Running;
+    status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
+    status.crew_work.get_mut("implement").expect("implement crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
+    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+
+    let outcome = reconcile_once_with_resources(
+        &convoy,
+        None,
+        vec![vessel_object("convoy-a", "implement", VesselPhase::Interrupted, Some("crew terminal session disappeared; relaunching"))],
+        Vec::new(),
+        timestamp(21),
+    )
+    .await;
+
+    let Some(ConvoyStatusPatch::WorkInterrupted { work, roles, message }) = outcome.patch else {
+        panic!("expected interrupted work patch");
+    };
+    assert_eq!(work, "implement");
+    assert_eq!(roles, ["coder".to_string()].into_iter().collect());
+    assert_eq!(message, "crew terminal session disappeared; relaunching");
+}
+
+#[tokio::test]
+async fn interrupted_agent_work_returns_to_running_only_after_its_vessel_is_ready() {
+    let mut status = bootstrapped_convoy_status();
+    status.phase = ConvoyPhase::Interrupted;
+    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Interrupted;
+    status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
+    status.crew_work.get_mut("implement").expect("implement crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Interrupted;
+    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+
+    let outcome = reconcile_once_with_resources(
+        &convoy,
+        None,
+        vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)],
+        Vec::new(),
+        timestamp(22),
+    )
+    .await;
+
+    assert!(matches!(
+        outcome.patch,
+        Some(ConvoyStatusPatch::WorkRunning { ref work, .. }) if work == "implement"
     ));
 }
 

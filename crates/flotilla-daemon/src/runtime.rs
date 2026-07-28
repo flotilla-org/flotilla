@@ -1995,6 +1995,7 @@ mod tests {
         TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement, WorkPhase, WorkflowTemplate,
         WorkflowTemplateSpec,
     };
+    use futures::StreamExt;
     use tempfile::TempDir;
 
     use super::{test_git_repo::TestGitRepo, *};
@@ -2828,12 +2829,18 @@ mod tests {
     }
 
     async fn crew_daemon(config: Arc<ConfigStore>) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
+        crew_daemon_with_backend(config, ResourceBackend::InMemory(Default::default())).await
+    }
+
+    async fn crew_daemon_with_backend(config: Arc<ConfigStore>, backend: ResourceBackend) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
         let pool = Arc::new(FakeTerminalPool::new());
         let discovery = fake_discovery_with_provider_set(
             FakeDiscoveryProviders::new()
                 .with_terminal_pool(Arc::clone(&pool) as Arc<dyn flotilla_core::providers::terminal::TerminalPool>),
         );
-        let daemon = InProcessDaemon::new(Vec::new(), config, discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let daemon =
+            InProcessDaemon::new_with_resource_backend(Vec::new(), config, discovery, flotilla_protocol::HostName::new("dinghy"), backend)
+                .await;
         daemon
             .replace_local_environment_bag_for_test(
                 EnvironmentBag::new()
@@ -3588,7 +3595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crew_provisioning_runs_coder_reviewer_handoffs_and_rejects_unknown_capabilities() {
+    async fn crew_provisioning_recovers_lost_session_after_in_process_daemon_restart_and_runs_handoffs() {
         let temp = TempDir::new().expect("tempdir");
         let repo = TestGitRepo::init(temp.path().join("repo"))
             .with_initial_commit()
@@ -3834,72 +3841,94 @@ mod tests {
         assert_eq!(reopened.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
         assert_eq!(reopened.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::HandedBack);
 
+        for handle in controller_handles {
+            handle.abort();
+            let _ = handle.await;
+        }
         pool.remove_session(&coder.metadata.name).await;
-        wait_until(|| {
-            let terminals = terminals.clone();
-            let name = coder.metadata.name.clone();
-            async move {
-                terminals
-                    .get(&name)
-                    .await
-                    .ok()
-                    .and_then(|session| session.status)
-                    .is_some_and(|status| status.phase == TerminalSessionPhase::Stopped)
-            }
-        })
-        .await;
-        assert!(matches!(
-            convoys.get("crew-convoy").await.expect("crew convoy").status.and_then(|status| status.work.get("implement").cloned()),
-            Some(task) if task.phase == WorkPhase::Running
-        ));
-        let stopped_list = daemon
-            .execute_query(
-                Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::QueryCrewList {
-                        context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
-                    },
-                },
-                uuid::Uuid::new_v4(),
-            )
+        let listed_before_restart = convoys.list().await.expect("convoys before daemon restart");
+        let mut convoy_watch =
+            convoys.watch(flotilla_resources::WatchStart::resuming_from(&listed_before_restart)).await.expect("watch convoy recovery");
+        let (daemon, pool) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
+        let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry after restart");
+        let profile = build_local_profile(&daemon, &local_registry).expect("local profile after restart");
+        let surviving_sessions = terminals
+            .list()
             .await
-            .expect("stopped crew list");
-        let CommandValue::CrewList(stopped_list) = stopped_list else { panic!("expected stopped crew list") };
-        assert_eq!(stopped_list.members.iter().find(|member| member.role == "coder").map(|member| member.state.as_str()), Some("stopped"));
-        let mut rx = daemon.subscribe();
-        let revive_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewHandoff {
-                    context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
-                    target: "coder".to_string(),
-                    message: "Resume after review".to_string(),
-                },
+            .expect("persisted terminal resources")
+            .items
+            .into_iter()
+            .filter(|session| session.metadata.name != coder.metadata.name)
+            .map(|session| {
+                flotilla_core::providers::terminal::TerminalSession::builder()
+                    .session_name(session.metadata.name)
+                    .status(TerminalStatus::Running)
+                    .command("persisted process".to_string())
+                    .working_directory(ExecutionEnvironmentPath::new(session.spec.cwd))
+                    .build()
             })
-            .await
-            .expect("revive coder");
-        assert_eq!(wait_for_command_result(&mut rx, revive_id).await, CommandValue::Ok);
+            .collect();
+        pool.add_sessions(surviving_sessions).await;
+        let state = Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            Arc::clone(&config),
+            local_registry,
+            None,
+            profile.host_id.clone(),
+            Some(ExecutionEnvironmentPath::new(&repo)),
+            profile.host_direct_environment_name(),
+        ));
+        let controller_handles =
+            spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(20), ControllerSupervision::default());
         wait_until(|| {
             let terminals = terminals.clone();
             let name = coder.metadata.name.clone();
             let old_id = coder_id.clone();
             async move {
-                terminals
-                    .get(&name)
-                    .await
-                    .ok()
-                    .and_then(|session| session.status)
-                    .and_then(|status| status.crew)
-                    .is_some_and(|crew| crew.id != old_id)
+                terminals.get(&name).await.ok().and_then(|session| session.status).is_some_and(|status| {
+                    status.phase == TerminalSessionPhase::Running && status.crew.is_some_and(|crew| crew.id != old_id)
+                })
             }
         })
         .await;
+        wait_until(|| {
+            let convoys = convoys.clone();
+            async move {
+                convoys.get("crew-convoy").await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
+                    status.phase == ConvoyPhase::Active
+                        && status.work["implement"].phase == WorkPhase::Running
+                        && status.crew_work["implement"]["coder"].phase == flotilla_resources::CrewWorkPhase::Working
+                })
+            }
+        })
+        .await;
+        let mut saw_interrupted_work = false;
+        let mut saw_interrupted_convoy = false;
+        while !(saw_interrupted_work && saw_interrupted_convoy) {
+            let event = tokio::time::timeout(Duration::from_secs(1), convoy_watch.next())
+                .await
+                .expect("interruption should be durably observable")
+                .expect("convoy watch should remain open")
+                .expect("convoy watch event");
+            let convoy = match event {
+                flotilla_resources::WatchEvent::Added(convoy) | flotilla_resources::WatchEvent::Modified(convoy) => convoy,
+                flotilla_resources::WatchEvent::Deleted(_) => continue,
+            };
+            let Some(status) = convoy.status else { continue };
+            saw_interrupted_work |= status.work.get("implement").is_some_and(|work| work.phase == WorkPhase::Interrupted);
+            saw_interrupted_convoy |= status.phase == ConvoyPhase::Interrupted;
+        }
         let revived_coder = terminals.get(&coder.metadata.name).await.expect("revived coder");
         let revived_coder_id = revived_coder.status.as_ref().and_then(|status| status.crew.as_ref()).expect("revived identity").id.clone();
+        let reviewer = terminals
+            .list()
+            .await
+            .expect("terminal list after restart")
+            .items
+            .into_iter()
+            .find(|session| session.spec.role == "reviewer")
+            .expect("reviewer session after restart");
+        let reviewer_id = reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).expect("revived reviewer identity").id.clone();
 
         let attach = daemon.resolve_attach_command_internal("crew-convoy/implement/coder").await.expect("attach coder");
         let [flotilla_protocol::ResolvedAttachAction::Command(args)] = attach.plan.0.as_slice() else {
