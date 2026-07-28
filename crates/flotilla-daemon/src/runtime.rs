@@ -1486,7 +1486,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         if let Some(prepared) = recover_existing_fresh_clone(&*runner, repo_url, branch, target_path).await? {
             return Ok(prepared);
         }
-        let staging_path = format!("{target_path}.flotilla-clone-partial");
+        let staging_path = fresh_clone_staging_path(target_path);
         remove_checkout_path(&*runner, &staging_path).await?;
         let clone_ref = base_ref.unwrap_or(branch);
         let prepare = async {
@@ -1523,7 +1523,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 return Err(cleanup_failed_checkout(&*runner, &staging_path, error).await);
             }
         };
-        if let Err(error) = runner.run("mv", &[&staging_path, target_path], Path::new("/"), &ChannelLabel::Noop).await {
+        if let Err(error) = runner.run("mv", &["-T", &staging_path, target_path], Path::new("/"), &ChannelLabel::Noop).await {
             return Err(cleanup_failed_checkout(&*runner, &staging_path, error).await);
         }
         Ok(PreparedCheckout { commit, branch_provenance: CheckoutBranchProvenance::PreExisting })
@@ -1537,7 +1537,9 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         let runner = self.local_runner()?;
         match removal {
             CheckoutRemoval::FreshClone { target_path } => {
-                remove_checkout_path(&*runner, utf8_path(target_path)?).await?;
+                let target_path = utf8_path(target_path)?;
+                remove_checkout_path(&*runner, target_path).await?;
+                remove_checkout_path(&*runner, &fresh_clone_staging_path(target_path)).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
             CheckoutRemoval::Worktree { clone_path, branch, target_path } => {
@@ -1715,6 +1717,10 @@ async fn cleanup_failed_checkout(runner: &dyn CommandRunner, target_path: &str, 
         Ok(()) => error,
         Err(cleanup_error) => format!("{error}; additionally failed to remove partial checkout: {cleanup_error}"),
     }
+}
+
+fn fresh_clone_staging_path(target_path: &str) -> String {
+    format!("{target_path}.flotilla-clone-partial")
 }
 
 async fn remove_empty_checkout_parents(clone_path: &str, target_path: &str) -> Result<(), String> {
@@ -2673,6 +2679,7 @@ mod tests {
             )
             .await
             .expect_err("interrupted clone should fail its first actuation");
+        assert!(!Path::new(&fresh_clone_staging_path(target.to_str().expect("utf-8 target path"))).exists());
 
         runtime
             .create_fresh_clone(
@@ -2690,6 +2697,25 @@ mod tests {
             .expect("git should inspect the retried clone");
         assert!(branch.status.success());
         assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/redrive");
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_removes_an_interrupted_fresh_clone() {
+        let temp = TempDir::new().expect("tempdir");
+        let target = temp.path().join("fresh-clone");
+        let target = target.to_str().expect("utf-8 target path");
+        let staging_path = fresh_clone_staging_path(target);
+        fs::create_dir_all(&staging_path).expect("create partial clone directory");
+        fs::write(Path::new(&staging_path).join("partial"), "incomplete clone").expect("write partial clone content");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        let outcome = runtime
+            .remove_checkout(&CheckoutRemoval::FreshClone { target_path: target.to_string() })
+            .await
+            .expect("fresh clone removal should clean staging");
+
+        assert_eq!(outcome, CheckoutRemovalOutcome::Removed);
+        assert!(!Path::new(&staging_path).exists());
     }
 
     #[tokio::test]
