@@ -103,6 +103,27 @@ impl RepositoryInspector for FailingInspector {
     }
 }
 
+#[derive(Clone)]
+struct WorktreeInspector {
+    spec: RepositorySpec,
+    checkouts: Arc<RwLock<Vec<LocalCheckoutInspection>>>,
+}
+
+#[async_trait]
+impl RepositoryInspector for WorktreeInspector {
+    async fn inspect_path(&self, _path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        Ok(RepositoryInspection {
+            spec: self.spec.clone(),
+            checkout: self.checkouts.read().expect("checkout inspection lock should not be poisoned")[0].clone(),
+            transport_url: None,
+        })
+    }
+
+    async fn inspect_checkouts(&self, _inspection: &RepositoryInspection) -> Result<Vec<LocalCheckoutInspection>, String> {
+        Ok(self.checkouts.read().expect("checkout inspection lock should not be poisoned").clone())
+    }
+}
+
 async fn track_repository(daemon: &Arc<InProcessDaemon>, tmp: &tempfile::TempDir, directory_name: &str, remote: &str) -> RepositoryKey {
     let repository_spec = RepositorySpec::remote(remote).expect("repository spec");
     let repository_key = repository_spec.key();
@@ -710,6 +731,129 @@ async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_p
         subpath: None,
         default_branch: None,
     }]);
+}
+
+async fn project_checkout_set_with_store_history(tmp: &tempfile::TempDir, with_history: bool) -> Vec<CheckoutSpec> {
+    let config = test_config(tmp.path().join(if with_history { "history-config" } else { "cold-config" }));
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+    let options = RuntimeOptions {
+        namespace: "flotilla".to_string(),
+        heartbeat_interval: Duration::from_secs(300),
+        controller_resync_interval: Duration::from_secs(300),
+        start_controllers: false,
+        ..RuntimeOptions::default()
+    };
+    let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime start");
+    let spec = RepositorySpec::remote("https://github.com/org/view-only.git").expect("repository spec");
+    let key = spec.key();
+    let main_path = tmp.path().join("view-only");
+    let worktree_path = tmp.path().join("view-only.feature");
+    std::fs::create_dir_all(&main_path).expect("main checkout");
+    std::fs::create_dir_all(&worktree_path).expect("worktree checkout");
+    let checkouts = Arc::new(RwLock::new(vec![
+        LocalCheckoutInspection { path: main_path.clone(), host_ref: "host-01".to_string(), git_ref: "main".to_string(), is_main: true },
+        LocalCheckoutInspection { path: worktree_path, host_ref: "host-01".to_string(), git_ref: "feature".to_string(), is_main: false },
+    ]));
+    daemon.set_repository_inspector(Arc::new(WorktreeInspector { spec: spec.clone(), checkouts })).await;
+
+    if with_history {
+        backend
+            .clone()
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
+            .await
+            .expect("historical repository");
+        backend
+            .clone()
+            .using::<Project>("flotilla")
+            .create(
+                &InputMeta::builder().name("view-only".to_string()).build(),
+                &ProjectSpec::builder()
+                    .display_name("view-only".to_string())
+                    .default_workflow_ref("single-agent-trusted".to_string())
+                    .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(key).build()])
+                    .build(),
+            )
+            .await
+            .expect("historical project");
+    }
+
+    let mut rx = daemon.subscribe();
+    assert_eq!(
+        execute_project_add(&daemon, &mut rx, main_path.to_string_lossy().into_owned(), None, None).await,
+        CommandValue::ProjectAdded { name: "view-only".into() }
+    );
+    assert!(daemon.tracked_repo_paths().await.is_empty(), "project materialization must not depend on Plane-A tracking");
+    let mut specs = daemon
+        .observed_resource_backend()
+        .using::<Checkout>("flotilla")
+        .list()
+        .await
+        .expect("checkout list")
+        .items
+        .into_iter()
+        .map(|checkout| checkout.spec)
+        .collect::<Vec<_>>();
+    specs.sort_by_key(|spec| spec.target_path().map(str::to_string));
+    specs
+}
+
+#[tokio::test]
+async fn view_only_project_rebuilds_the_same_checkout_set_on_an_empty_store() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+
+    let cold = project_checkout_set_with_store_history(&tmp, false).await;
+    let historical = project_checkout_set_with_store_history(&tmp, true).await;
+
+    assert_eq!(cold, historical);
+    assert_eq!(cold.len(), 2);
+}
+
+#[tokio::test]
+async fn repeated_project_materialization_updates_and_retracts_worktree_observations() {
+    let (daemon, _backend, _config, _runtime, tmp) = start_daemon().await;
+    let spec = RepositorySpec::remote("https://github.com/org/reconciled.git").expect("repository spec");
+    let main_path = tmp.path().join("reconciled");
+    let worktree_path = tmp.path().join("reconciled.feature");
+    std::fs::create_dir_all(&main_path).expect("main checkout");
+    std::fs::create_dir_all(&worktree_path).expect("worktree checkout");
+    let checkouts = Arc::new(RwLock::new(vec![
+        LocalCheckoutInspection { path: main_path.clone(), host_ref: "host-01".to_string(), git_ref: "main".to_string(), is_main: true },
+        LocalCheckoutInspection {
+            path: worktree_path.clone(),
+            host_ref: "host-01".to_string(),
+            git_ref: "feature".to_string(),
+            is_main: false,
+        },
+    ]));
+    daemon.set_repository_inspector(Arc::new(WorktreeInspector { spec, checkouts: Arc::clone(&checkouts) })).await;
+    let mut rx = daemon.subscribe();
+
+    execute_project_add(&daemon, &mut rx, main_path.to_string_lossy().into_owned(), None, None).await;
+    checkouts.write().expect("checkout inspection lock should not be poisoned")[1].git_ref = "renamed-feature".to_string();
+    execute_project_add(&daemon, &mut rx, main_path.to_string_lossy().into_owned(), None, None).await;
+
+    let observed = daemon.observed_resource_backend().using::<Checkout>("flotilla");
+    let after_update = observed.list().await.expect("updated checkout list").items;
+    assert_eq!(after_update.len(), 2);
+    assert!(after_update.iter().any(|checkout| {
+        matches!(&checkout.spec, CheckoutSpec::Observed(spec) if spec.path == worktree_path.to_string_lossy() && spec.r#ref == "renamed-feature")
+    }));
+
+    checkouts.write().expect("checkout inspection lock should not be poisoned").pop();
+    execute_project_add(&daemon, &mut rx, main_path.to_string_lossy().into_owned(), None, None).await;
+
+    let after_removal = observed.list().await.expect("checkout list after removal").items;
+    assert_eq!(after_removal.len(), 1);
+    assert!(matches!(&after_removal[0].spec, CheckoutSpec::Observed(spec) if spec.path == main_path.to_string_lossy()));
 }
 
 #[tokio::test]
