@@ -587,6 +587,30 @@ than the surgical `CODEX_HOME`/`CLAUDE_CONFIG_DIR`: it also relocates the home
 dir seen by anything the CLI subprocess itself spawns (`git`, `npm`, `node`,
 shells)" (`openhands-sdk/openhands/sdk/agent/acp_agent.py:2293-2300`).
 
+## Prior art — empirical grading (Robert + governor, 2026-07-28)
+
+The collision claims below were tested against the strongest available
+counter-evidence: kiwi itself, which at grading time ran **21 concurrent
+claude processes and 13 concurrent codex processes against one home each**,
+with `/tmp/cc-daemon-<uid>/` holding exactly one supervisor socket serving all
+claude sessions — i.e. the "supervisor socket collision" is a shared daemon
+**by design**, and same-provider concurrency from one home demonstrably does
+not break. These CLIs' primary deployment *is* many sessions, one home.
+
+The OpenHands citation is real but its problem is not ours: OpenHands is
+effectively **multi-tenant** — different conversations may carry different
+credentials, materialised into the shared home at spawn — so their
+per-provider dir isolation is *tenant credential separation*, not a fix for
+CLI breakage. Under flotilla's cohabitation ruling (one operator's trusted
+crews per vessel) that concern does not transfer; and the narrow real case
+(two crews, same provider, different keys) is served by per-process ambient
+env keys with no home separation at all.
+
+What does transfer from OpenHands, and matches this repo's independent
+rulings: **seed-if-absent** (never clobber existing state), secrets named
+identically to the env var the CLI reads, and durable (non-tmpfs) homes
+because CLIs write back refreshed tokens.
+
 ## Prior art
 
 **OpenHands is the closest match and hit this exact bug.** Its ACP agent-server
