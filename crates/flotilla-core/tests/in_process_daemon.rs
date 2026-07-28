@@ -1073,29 +1073,35 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
         .expect("project create");
 
     let mut events = daemon.subscribe();
-    let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".to_string(),
-                    change_request: Some("1071".to_string()),
-                    issues: Vec::new(),
-                    name: None,
-                    branch: None,
-                    workflow_ref: None,
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+    let start = |issues| Command {
+        node_id: None,
+        provisioning_target: None,
+        context_repo: None,
+        action: CommandAction::ConvoyStart {
+            intent: Box::new(ConvoyStartIntent {
+                namespace: None,
+                project_ref: "flotilla".to_string(),
+                change_request: Some("1071".to_string()),
+                issues,
+                name: None,
+                branch: None,
+                workflow_ref: None,
+                inputs: Vec::new(),
+                instruction: None,
+                placement_policy: None,
+                auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+            }),
+        },
+    };
+    let rejected_id = daemon
+        .execute(start(vec![IssueSelector::Id("42".to_string())]))
         .await
-        .expect("PR adoption command accepted");
+        .expect("conflicting protocol command accepted for admission");
+    assert_eq!(recv_command_finished(&mut events, rejected_id).await, CommandValue::Error {
+        message: "change request adoption is PR-first; do not also provide issues".to_string(),
+    });
+
+    let command_id = daemon.execute(start(Vec::new())).await.expect("PR adoption command accepted");
 
     assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::ConvoyStarted {
         name: "convoy-adoption-of-an-existing-pr-1071".to_string(),
