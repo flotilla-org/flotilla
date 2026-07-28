@@ -987,9 +987,10 @@ async fn default_convoy_placement_policy(
             validate_workflow_credentials(backend, namespace, workflow, Some(&policy)).await.err()
         };
         if let Some(reason) = refusal {
-            if let Ok(target_host) = placement_target_host(backend, namespace, &policy).await {
-                refused_candidates.push(PlacementRefusal { policy_name: policy.metadata.name.clone(), target_host, reason });
-            }
+            let target_host = placement_target_host(backend, namespace, &policy)
+                .await
+                .unwrap_or_else(|_| PlacementTargetHost { reference: String::new(), display_name: "no target host".to_string() });
+            refused_candidates.push(PlacementRefusal { policy_name: policy.metadata.name.clone(), target_host, reason });
         } else {
             viable.push(policy);
         }

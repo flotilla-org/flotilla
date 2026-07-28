@@ -56,6 +56,8 @@ sharp recovery tool for deleting one exact object. It bypasses lifecycle and
 teardown gates, but still uses the resource store's normal watch, tombstone,
 and replication path. Prefer the orchestrated verbs in routine operation.
 Controllers may recreate code-owned objects after a raw delete.
+The verb currently targets the connected daemon's local store; peer command
+routing remains part of the federation work tracked in #1188.
 
 ## Dispatching
 

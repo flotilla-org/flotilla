@@ -149,10 +149,7 @@ impl VesselDeps {
         waiting_for: impl Into<String>,
         actuations: Vec<Actuation>,
     ) -> Self {
-        let mut waiting_for = waiting_for.into();
-        if let Some(decision) = &placement_decision {
-            waiting_for = waiting_for.replace(&decision.target_host.reference, &decision.target_host.display_name);
-        }
+        let waiting_for = legible_waiting_for(waiting_for.into(), placement_decision.as_ref());
         Self { patch: provisioning_patch(placement_policy, placement_decision, waiting_for), actuations }
     }
 
@@ -981,6 +978,15 @@ fn host_direct_environment_name(host_ref: &str) -> String {
     format!("host-direct-{host_ref}")
 }
 
+fn legible_waiting_for(mut waiting_for: String, placement_decision: Option<&PlacementDecision>) -> String {
+    if let Some(decision) = placement_decision {
+        let target_environment = host_direct_environment_name(&decision.target_host.reference);
+        let display_environment = host_direct_environment_name(&decision.target_host.display_name);
+        waiting_for = waiting_for.replace(&target_environment, &display_environment);
+    }
+    waiting_for
+}
+
 fn environment_name(vessel_name: &str) -> String {
     format!("env-{vessel_name}")
 }
@@ -1096,5 +1102,31 @@ impl PlacementStrategy {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
+
+    use super::legible_waiting_for;
+
+    #[test]
+    fn waiting_message_replaces_the_structured_host_direct_environment_name() {
+        let decision = PlacementDecision {
+            policy_name: "host-direct-test".to_string(),
+            target_host: PlacementTargetHost { reference: "01HXYZ".to_string(), display_name: "kiwi".to_string() },
+            refused_candidates: Vec::new(),
+        };
+
+        assert_eq!(
+            legible_waiting_for("environment host-direct-01HXYZ to become ready".to_string(), Some(&decision)),
+            "environment host-direct-kiwi to become ready"
+        );
+        assert_eq!(
+            legible_waiting_for("checkout checkout-01HXYZ to become ready".to_string(), Some(&decision)),
+            "checkout checkout-01HXYZ to become ready",
+            "unrelated names containing the host ref must not be rewritten"
+        );
     }
 }

@@ -396,6 +396,43 @@ async fn create_host_direct_placement(backend: &ResourceBackend, policy_name: &s
         .expect("placement create");
 }
 
+async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, held_credentials: BTreeSet<String>) {
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.create(&empty_input_meta(host_ref), &HostSpec { display_name: host_ref.to_string() }).await.expect("host create");
+    hosts
+        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
+            capabilities: [(flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials))]
+                .into_iter()
+                .collect(),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            resource_store: None,
+            ..HostStatus::default()
+        })
+        .await
+        .expect("host status update");
+    backend
+        .clone()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &empty_input_meta(policy_name),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
+                    host_ref: host_ref.to_string(),
+                    image: "crew:latest".to_string(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::from(["codex".to_string()]),
+                    default_cwd: None,
+                    env: BTreeMap::new(),
+                    checkout: flotilla_resources::DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                })
+                .build(),
+        )
+        .await
+        .expect("placement create");
+}
+
 fn trusted_codex_workflow() -> WorkflowTemplateSpec {
     let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
     workflow.vessels[0].stance = Stance::Trusted;
@@ -434,6 +471,49 @@ async fn default_placement_never_selects_a_host_without_the_required_adapter() {
     assert_eq!(
         resolution.refused_candidates[0].reason,
         "workflow requires agent adapter `codex`, which is not available in placement `host-direct-a-no-adapters` (host `empty-host`)"
+    );
+}
+
+#[tokio::test]
+async fn default_placement_preserves_a_refusal_for_a_policy_without_a_target_host() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    backend
+        .clone()
+        .using::<PlacementPolicy>("flotilla")
+        .create(&empty_input_meta("a-malformed"), &PlacementPolicySpec::builder().pool("passthrough".to_string()).build())
+        .await
+        .expect("malformed placement create");
+    create_host_direct_placement(&backend, "z-viable", "codex-host", BTreeSet::from(["codex".to_string()])).await;
+
+    let resolution =
+        default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), None).await.expect("default placement");
+
+    assert_eq!(resolution.selected.expect("viable placement").metadata.name, "z-viable");
+    assert_eq!(resolution.refused_candidates.len(), 1);
+    assert_eq!(resolution.refused_candidates[0].policy_name, "a-malformed");
+    assert_eq!(resolution.refused_candidates[0].target_host.display_name, "no target host");
+    assert_eq!(
+        resolution.refused_candidates[0].reason,
+        "workflow requires agent adapter `codex`, which is not available in placement `a-malformed` (unknown target environment)"
+    );
+}
+
+#[tokio::test]
+async fn default_placement_falls_back_after_a_credential_refusal_and_records_the_exact_reason() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    create_docker_placement(&backend, "a-missing-credential", "empty-host", BTreeSet::new()).await;
+    create_docker_placement(&backend, "z-holds-credential", "credential-host", BTreeSet::from(["model-api".to_string()])).await;
+    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
+    workflow.vessels[0].credential_refs = BTreeSet::from(["model-api".to_string()]);
+
+    let resolution = default_convoy_placement_policy(&backend, "flotilla", &workflow, None).await.expect("default placement");
+
+    assert_eq!(resolution.selected.expect("credential-capable placement").metadata.name, "z-holds-credential");
+    assert_eq!(resolution.refused_candidates.len(), 1);
+    assert_eq!(resolution.refused_candidates[0].policy_name, "a-missing-credential");
+    assert_eq!(
+        resolution.refused_candidates[0].reason,
+        "workflow requires credential `model-api`, which placement `a-missing-credential` host `empty-host` does not hold"
     );
 }
 
