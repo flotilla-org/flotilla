@@ -1673,35 +1673,47 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         if let Some(prepared) = recover_existing_fresh_clone(&*runner, repo_url, branch, target_path).await? {
             return Ok(prepared);
         }
+        let staging_path = fresh_clone_staging_path(target_path);
+        remove_checkout_path(&*runner, &staging_path).await?;
         let clone_ref = base_ref.unwrap_or(branch);
-        if clone_ref == "HEAD" {
-            runner.run("git", &["clone", repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
-        } else {
-            runner.run("git", &["clone", "--branch", clone_ref, repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
-        }
-        if clone_ref != branch {
-            let remote_ref = format!("refs/remotes/origin/{branch}");
-            let remote_exists = runner
-                .run("git", &["-C", target_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
-                .await
-                .is_ok();
-            if remote_exists {
-                runner
-                    .run(
-                        "git",
-                        &["-C", target_path, "switch", "-c", branch, "--track", &format!("origin/{branch}")],
-                        Path::new("/"),
-                        &ChannelLabel::Noop,
-                    )
-                    .await?;
+        let prepare = async {
+            if clone_ref == "HEAD" {
+                runner.run("git", &["clone", repo_url, &staging_path], Path::new("/"), &ChannelLabel::Noop).await?;
             } else {
-                runner.run("git", &["-C", target_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Noop).await?;
+                runner.run("git", &["clone", "--branch", clone_ref, repo_url, &staging_path], Path::new("/"), &ChannelLabel::Noop).await?;
             }
+            if clone_ref != branch {
+                let remote_ref = format!("refs/remotes/origin/{branch}");
+                let remote_exists = runner
+                    .run("git", &["-C", &staging_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
+                    .await
+                    .is_ok();
+                if remote_exists {
+                    runner
+                        .run(
+                            "git",
+                            &["-C", &staging_path, "switch", "-c", branch, "--track", &format!("origin/{branch}")],
+                            Path::new("/"),
+                            &ChannelLabel::Noop,
+                        )
+                        .await?;
+                } else {
+                    runner.run("git", &["-C", &staging_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Noop).await?;
+                }
+            }
+            resolve_head_commit(&*runner, &staging_path).await
         }
-        Ok(PreparedCheckout {
-            commit: resolve_head_commit(&*runner, target_path).await?,
-            branch_provenance: CheckoutBranchProvenance::PreExisting,
-        })
+        .await;
+        let commit = match prepare {
+            Ok(commit) => commit,
+            Err(error) => {
+                return Err(cleanup_failed_checkout(&*runner, &staging_path, error).await);
+            }
+        };
+        if let Err(error) = tokio::fs::rename(&staging_path, target_path).await {
+            return Err(cleanup_failed_checkout(&*runner, &staging_path, format!("publish fresh clone: {error}")).await);
+        }
+        Ok(PreparedCheckout { commit, branch_provenance: CheckoutBranchProvenance::PreExisting })
     }
 
     async fn inspect_integration(&self, checkout: &ResourceObject<Checkout>) -> Result<CheckoutIntegrationStatus, String> {
@@ -1712,7 +1724,9 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         let runner = self.local_runner()?;
         match removal {
             CheckoutRemoval::FreshClone { target_path } => {
-                remove_checkout_path(&*runner, utf8_path(target_path)?).await?;
+                let target_path = utf8_path(target_path)?;
+                remove_checkout_path(&*runner, target_path).await?;
+                remove_checkout_path(&*runner, &fresh_clone_staging_path(target_path)).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
             CheckoutRemoval::Worktree { clone_path, branch, target_path } => {
@@ -1883,6 +1897,17 @@ async fn remove_checkout_path(runner: &dyn CommandRunner, target_path: &str) -> 
         }
     }
     Ok(())
+}
+
+async fn cleanup_failed_checkout(runner: &dyn CommandRunner, target_path: &str, error: String) -> String {
+    match remove_checkout_path(runner, target_path).await {
+        Ok(()) => error,
+        Err(cleanup_error) => format!("{error}; additionally failed to remove partial checkout: {cleanup_error}"),
+    }
+}
+
+fn fresh_clone_staging_path(target_path: &str) -> String {
+    format!("{target_path}.flotilla-clone-partial")
 }
 
 async fn remove_empty_checkout_parents(clone_path: &str, target_path: &str) -> Result<(), String> {
@@ -2257,6 +2282,32 @@ mod tests {
             } else {
                 ProcessCommandRunner.run_output(cmd, args, cwd, label).await
             }
+        }
+
+        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+            ProcessCommandRunner.exists(cmd, args).await
+        }
+    }
+
+    struct FailFirstCloneProcessRunner {
+        failed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl CommandRunner for FailFirstCloneProcessRunner {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            if cmd == "git" && args.first() == Some(&"clone") && !self.failed.swap(true, Ordering::SeqCst) {
+                let destination = args.last().expect("git clone should have a destination");
+                fs::create_dir_all(destination).expect("failed clone should create its partial destination");
+                fs::write(Path::new(destination).join("partial"), "incomplete clone").expect("failed clone should leave partial content");
+                Err("simulated interrupted clone".to_string())
+            } else {
+                ProcessCommandRunner.run(cmd, args, cwd, label).await
+            }
+        }
+
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            ProcessCommandRunner.run_output(cmd, args, cwd, label).await
         }
 
         async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
@@ -2797,6 +2848,61 @@ mod tests {
             .expect("redrive should recover the clone already created on disk");
 
         assert_eq!(recovered, first);
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_retries_after_an_interrupted_fresh_clone() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let target = temp.path().join("fresh-clone");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(FailFirstCloneProcessRunner { failed: AtomicBool::new(false) }) };
+
+        runtime
+            .create_fresh_clone(
+                source.path().to_str().expect("utf-8 source path"),
+                "feature/redrive",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect_err("interrupted clone should fail its first actuation");
+        assert!(!Path::new(&fresh_clone_staging_path(target.to_str().expect("utf-8 target path"))).exists());
+
+        runtime
+            .create_fresh_clone(
+                source.path().to_str().expect("utf-8 source path"),
+                "feature/redrive",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("redrive should replace the interrupted clone");
+
+        let branch = ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("utf-8 target path"), "branch", "--show-current"])
+            .output()
+            .expect("git should inspect the retried clone");
+        assert!(branch.status.success());
+        assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/redrive");
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_removes_an_interrupted_fresh_clone() {
+        let temp = TempDir::new().expect("tempdir");
+        let target = temp.path().join("fresh-clone");
+        let target = target.to_str().expect("utf-8 target path");
+        let staging_path = fresh_clone_staging_path(target);
+        fs::create_dir_all(&staging_path).expect("create partial clone directory");
+        fs::write(Path::new(&staging_path).join("partial"), "incomplete clone").expect("write partial clone content");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        let outcome = runtime
+            .remove_checkout(&CheckoutRemoval::FreshClone { target_path: target.to_string() })
+            .await
+            .expect("fresh clone removal should clean staging");
+
+        assert_eq!(outcome, CheckoutRemovalOutcome::Removed);
+        assert!(!Path::new(&staging_path).exists());
     }
 
     #[tokio::test]
