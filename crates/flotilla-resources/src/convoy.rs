@@ -454,6 +454,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Running;
                     state.completion_authority = WorkCompletionAuthority::CrewRollup;
+                    state.message = None;
                 }
                 if let Some(crew) = status.crew_work.get_mut(work) {
                     // Only the crew the vessel launched are working. A latent

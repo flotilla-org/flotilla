@@ -1117,7 +1117,10 @@ async fn interrupted_agent_work_returns_to_running_only_after_its_vessel_is_read
     status.phase = ConvoyPhase::Interrupted;
     status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Interrupted;
     status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
+    status.work.get_mut("implement").expect("implement task").message = Some("crew terminal session disappeared; relaunching".to_string());
     status.crew_work.get_mut("implement").expect("implement crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Interrupted;
+    status.crew_work.get_mut("implement").expect("implement crew").get_mut("coder").expect("coder").message =
+        Some("crew session for `coder` was interrupted".to_string());
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
 
     let outcome = reconcile_once_with_resources(
@@ -1129,10 +1132,14 @@ async fn interrupted_agent_work_returns_to_running_only_after_its_vessel_is_read
     )
     .await;
 
-    assert!(matches!(
-        outcome.patch,
-        Some(ConvoyStatusPatch::WorkRunning { ref work, .. }) if work == "implement"
-    ));
+    let patch = outcome.patch.expect("running work patch");
+    assert!(matches!(patch, ConvoyStatusPatch::WorkRunning { ref work, .. } if work == "implement"));
+    let mut recovered = convoy.status.expect("convoy status");
+    patch.apply(&mut recovered);
+    assert_eq!(recovered.work["implement"].phase, WorkPhase::Running);
+    assert_eq!(recovered.work["implement"].message, None);
+    assert_eq!(recovered.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(recovered.crew_work["implement"]["coder"].message, None);
 }
 
 #[tokio::test]
