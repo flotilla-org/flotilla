@@ -96,7 +96,7 @@ async fn do_client_hello_with_surface(session: &MessageSession, surface: Option<
         }
         Some(Message::Hello { display_name, .. }) => {
             let daemon_generation = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
-            if daemon_generation != BUILD_ID {
+            if !flotilla_protocol::wire_generations_match(daemon_generation, BUILD_ID) {
                 return Err(format!(
                     "wire generation mismatch: client generation {}, daemon generation {daemon_generation} — rebuild or use the \
                      daemon's paired CLI",

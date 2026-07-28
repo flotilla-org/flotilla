@@ -1,8 +1,5 @@
 use std::{future::Future, time::Duration};
 
-use flotilla_core::daemon::DaemonHandle;
-use tracing::warn;
-
 const INITIAL_DELAY: Duration = Duration::from_millis(500);
 const MAX_DELAY: Duration = Duration::from_secs(30);
 pub const REEXEC_BUILD_ENV: &str = "FLOTILLA_REEXEC_BUILD";
@@ -46,11 +43,6 @@ pub fn is_incompatible_daemon_error(error: &str) -> bool {
     error.contains("protocol version mismatch") || error.contains("wire generation mismatch")
 }
 
-pub fn build_mismatch(daemon: &dyn DaemonHandle) -> Option<String> {
-    let daemon_build = daemon.build_id()?;
-    (daemon_build != crate::BUILD_ID).then(|| format!("daemon build {daemon_build} differs from this client ({})", crate::BUILD_ID))
-}
-
 /// Connect to a daemon with the shared retry policy used by every long-lived
 /// client. Callers choose how to narrate each attempt.
 pub async fn connect_with_retry<Connect, ConnectFuture, Connected, Notify>(
@@ -79,12 +71,6 @@ where
                 attempt += 1;
             }
         }
-    }
-}
-
-pub fn warn_on_build_mismatch(daemon: &dyn DaemonHandle) {
-    if let Some(message) = build_mismatch(daemon) {
-        warn!(%message, "connected daemon and client builds differ");
     }
 }
 

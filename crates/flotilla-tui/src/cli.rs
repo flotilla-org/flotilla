@@ -858,7 +858,6 @@ pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), S
             },
         )
         .await?;
-        flotilla_client::reconnect::warn_on_build_mismatch(daemon.as_ref());
         if let Err(error) = run_watch_connection(daemon, format).await {
             eprintln!("{error}; reconnecting...");
         }

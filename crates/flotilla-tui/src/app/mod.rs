@@ -651,7 +651,6 @@ impl App {
         views.bind_repository_keys(&repository_keys);
         model.active_repo = views.active_repo_identity().cloned();
         let mut ui = UiState::new(&model.repo_order);
-        ui.command_echo = flotilla_client::reconnect::build_mismatch(daemon.as_ref());
         let loaded_config = config.load_config();
         ui.view_layout = match loaded_config.ui.preview.layout {
             RepoViewLayoutConfig::Auto => RepoViewLayout::Auto,
@@ -801,9 +800,7 @@ impl App {
         self.pending_cancel = None;
         self.subscriptions_dirty = true;
 
-        let reconnect_note = flotilla_client::reconnect::build_mismatch(self.daemon.as_ref())
-            .map_or_else(|| "Reconnected to daemon".to_string(), |mismatch| format!("Reconnected — {mismatch}"));
-        self.ui.command_echo = Some(reconnect_note);
+        self.ui.command_echo = Some("Reconnected to daemon".to_string());
     }
 
     /// Construct an `App` in scoped mode: exactly the one View at `address`,

@@ -55,7 +55,6 @@ where
             }
         })
         .await?;
-        flotilla_client::reconnect::warn_on_build_mismatch(daemon.as_ref());
         info!("connected to daemon");
         if let Err(error) = run_connected(daemon).await {
             info!(%error, "daemon connection ended; reconnecting");

@@ -544,7 +544,7 @@ async fn handle_client_session(
                     warn!(expected = PROTOCOL_VERSION, got = protocol_version, %node_id, "rejecting client with protocol version mismatch");
                     return;
                 }
-                if client_generation != BUILD_ID {
+                if !flotilla_protocol::wire_generations_match(client_generation, BUILD_ID) {
                     warn!(
                         expected = BUILD_ID,
                         got = client_generation,
