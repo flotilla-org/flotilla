@@ -309,6 +309,10 @@ config dir under one supervisor, which is the opposite of independent crews.
 
 ### Gemini
 
+> **Status note (Robert, 2026-07-28): Gemini CLI is dead/superseded — retained
+> below for reference only; exclude it from the adapter set and layout sizing.**
+
+
 `Storage.getGlobalGeminiDir()` joins `homedir()` with `.gemini`, where
 `homedir()` is a project helper, not `os.homedir()`:
 
