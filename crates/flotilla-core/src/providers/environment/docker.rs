@@ -72,13 +72,18 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
     async fn create(&self, id: EnvironmentId, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String> {
         let container_name = format!("flotilla-env-{}", id);
 
-        let socket_str = opts.daemon_socket_path.to_string();
+        let mut provisioned_mounts = Vec::with_capacity(opts.provisioned_mounts.len() + 1);
+        provisioned_mounts.push(ProvisionedMount::new(
+            opts.daemon_socket_path.as_path().to_path_buf(),
+            CONTAINER_SOCKET_PATH,
+            ProvisionedMountMode::Rw,
+        ));
+        provisioned_mounts.extend(opts.provisioned_mounts);
         let env_id_str = id.to_string();
         let image_str = image.as_str().to_string();
         let label_val = format!("flotilla.environment={}", id);
         let mounts_label_val =
-            format!("flotilla.provisioned_mounts={}", serde_json::to_string(&opts.provisioned_mounts).map_err(|err| err.to_string())?);
-        let socket_mount = format!("{}:{CONTAINER_SOCKET_PATH}", socket_str);
+            format!("flotilla.provisioned_mounts={}", serde_json::to_string(&provisioned_mounts).map_err(|err| err.to_string())?);
         let env_id_env = format!("FLOTILLA_ENVIRONMENT_ID={}", env_id_str);
         let socket_env = format!("FLOTILLA_DAEMON_SOCKET={CONTAINER_SOCKET_PATH}");
         #[cfg(unix)]
@@ -100,8 +105,6 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             &label_val,
             "--label",
             &mounts_label_val,
-            "-v",
-            &socket_mount,
             "-e",
             &socket_env,
             "-e",
@@ -110,8 +113,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         #[cfg(unix)]
         args.extend(["--user", user.as_str()]);
 
-        let mount_specs: Vec<String> = opts
-            .provisioned_mounts
+        let mount_specs: Vec<String> = provisioned_mounts
             .iter()
             .map(|mount| {
                 let mode = match mount.mode {
@@ -149,7 +151,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             }
         };
 
-        Ok(self.inner.provisioned_environment(id, image.clone(), Some(image_digest), container_name, opts.provisioned_mounts))
+        Ok(self.inner.provisioned_environment(id, image.clone(), Some(image_digest), container_name, provisioned_mounts))
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
