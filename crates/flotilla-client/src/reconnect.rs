@@ -43,7 +43,7 @@ pub enum ReconnectNotice {
 }
 
 pub fn is_incompatible_daemon_error(error: &str) -> bool {
-    error.contains("protocol version mismatch")
+    error.contains("protocol version mismatch") || error.contains("wire generation mismatch")
 }
 
 pub fn build_mismatch(daemon: &dyn DaemonHandle) -> Option<String> {
@@ -136,5 +136,22 @@ mod tests {
             ReconnectNotice::Retry { attempt: 2, .. },
             ReconnectNotice::Attempt { attempt: 3 },
         ]));
+    }
+
+    #[tokio::test]
+    async fn wire_generation_mismatch_is_refused_without_retrying() {
+        let mut attempts = 0;
+        let error = connect_with_retry(
+            || {
+                attempts += 1;
+                async { Err::<(), _>("wire generation mismatch: client generation old, daemon generation new".to_string()) }
+            },
+            |_| {},
+        )
+        .await
+        .expect_err("incompatible generations should be terminal");
+
+        assert_eq!(attempts, 1);
+        assert!(error.contains("wire generation mismatch"));
     }
 }

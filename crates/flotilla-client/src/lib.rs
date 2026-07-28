@@ -89,11 +89,22 @@ async fn do_client_hello_with_surface(session: &MessageSession, surface: Option<
         Some(Message::Hello { protocol_version, display_name, .. }) if protocol_version != PROTOCOL_VERSION => {
             let daemon_build = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
             Err(format!(
-                "daemon protocol version mismatch: daemon has {protocol_version} ({daemon_build}), client has {PROTOCOL_VERSION} ({})",
-                BUILD_ID
+                "daemon protocol version mismatch: client generation {} uses protocol {PROTOCOL_VERSION}, daemon generation \
+                 {daemon_build} uses protocol {protocol_version} — rebuild or use the daemon's paired CLI",
+                BUILD_ID,
             ))
         }
-        Some(Message::Hello { display_name, .. }) => Ok(flotilla_protocol::hello_build_id(&display_name).map(str::to_owned)),
+        Some(Message::Hello { display_name, .. }) => {
+            let daemon_generation = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
+            if daemon_generation != BUILD_ID {
+                return Err(format!(
+                    "wire generation mismatch: client generation {}, daemon generation {daemon_generation} — rebuild or use the \
+                     daemon's paired CLI",
+                    BUILD_ID,
+                ));
+            }
+            Ok(Some(daemon_generation.to_owned()))
+        }
         Some(other) => Err(format!("expected Hello reply, got: {other:?}")),
         None => Err("connection closed before Hello reply".into()),
     }
@@ -231,6 +242,16 @@ impl SocketDaemon {
         });
 
         Ok(daemon)
+    }
+
+    /// Deliver a one-shot agent hook through the same generation-checked
+    /// connection used by CLI and TUI requests.
+    pub async fn send_agent_hook(&self, event: flotilla_protocol::AgentHookEvent) -> Result<(), String> {
+        let result = send_request(&self.session, &self.pending, &self.next_id, Request::AgentHook { event }).await?;
+        match into_success_response(result)? {
+            Response::AgentHook => Ok(()),
+            other => Err(format!("unexpected agent hook response: {other:?}")),
+        }
     }
 
     /// Send a request to the daemon and wait for the matching response.

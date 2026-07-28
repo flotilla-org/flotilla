@@ -430,6 +430,22 @@ async fn read_session_message(session: &MessageSession) -> Message {
     session.read().await.expect("read session message").expect("session message")
 }
 
+fn current_client_hello() -> Message {
+    Message::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        node_id: NodeId::new("client"),
+        display_name: flotilla_protocol::hello_display_name("client", env!("FLOTILLA_BUILD_ID")),
+        session_id: uuid::Uuid::nil(),
+        connection_role: Some(flotilla_protocol::ConnectionRole::Client),
+        surface: None,
+    }
+}
+
+async fn complete_client_hello(session: &MessageSession) {
+    session.write(current_client_hello()).await.expect("write client hello");
+    assert!(matches!(read_session_message(session).await, Message::Hello { protocol_version: PROTOCOL_VERSION, .. }));
+}
+
 async fn empty_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     empty_daemon_named("local").await
 }
@@ -3104,6 +3120,13 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
     let mut reader = BufReader::new(read_half).lines();
     let mut writer = BufWriter::new(write_half);
 
+    flotilla_protocol::framing::write_message_line(&mut writer, &current_client_hello()).await.expect("write client hello");
+    let hello_line = reader.next_line().await.expect("read hello response").expect("hello response line");
+    assert!(matches!(serde_json::from_str::<Message>(&hello_line).expect("parse hello response"), Message::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        ..
+    }));
+
     let request = Message::Request { id: 1, request: Request::ListRepos };
     flotilla_protocol::framing::write_message_line(&mut writer, &request).await.expect("write request");
 
@@ -3182,6 +3205,7 @@ async fn handle_client_session_dispatches_request_messages() {
         .await;
     });
 
+    complete_client_hello(&client_session).await;
     client_session.write(Message::Request { id: 1, request: Request::ListRepos }).await.expect("write request");
 
     match ok_response(read_session_message(&client_session).await, 1) {
@@ -3226,6 +3250,7 @@ async fn handle_client_session_streams_daemon_events_to_request_clients() {
         .await;
     });
 
+    complete_client_hello(&client_session).await;
     client_session.write(Message::Request { id: 1, request: Request::ListRepos }).await.expect("write request");
 
     match ok_response(read_session_message(&client_session).await, 1) {
@@ -3262,8 +3287,7 @@ async fn handle_client_session_streams_daemon_events_to_request_clients() {
     assert_eq!(client_count.load(Ordering::SeqCst), 0, "request client should be removed after disconnect");
 }
 
-#[tokio::test]
-async fn handle_client_rejects_client_hello_with_version_mismatch() {
+async fn assert_client_hello_rejected(protocol_version: u32, display_name: String, mismatch: &str) {
     let (_tmp, daemon) = empty_daemon().await;
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -3300,9 +3324,9 @@ async fn handle_client_rejects_client_hello_with_version_mismatch() {
     let mut writer = BufWriter::new(write_half);
 
     let hello = Message::Hello {
-        protocol_version: PROTOCOL_VERSION + 1,
+        protocol_version,
         node_id: NodeId::new("client"),
-        display_name: "client".into(),
+        display_name,
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
@@ -3322,8 +3346,23 @@ async fn handle_client_rejects_client_hello_with_version_mismatch() {
         .await
         .expect("server should close the mismatched connection promptly")
         .expect("read after hello");
-    assert!(eof.is_none(), "expected EOF after version-mismatch hello, got {eof:?}");
+    assert!(eof.is_none(), "expected EOF after {mismatch}-mismatch hello, got {eof:?}");
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
+
+#[tokio::test]
+async fn handle_client_rejects_client_hello_with_version_mismatch() {
+    assert_client_hello_rejected(PROTOCOL_VERSION + 1, "client".into(), "version").await;
+}
+
+#[tokio::test]
+async fn handle_client_rejects_client_hello_with_wire_generation_mismatch() {
+    assert_client_hello_rejected(
+        PROTOCOL_VERSION,
+        flotilla_protocol::hello_display_name("client", "stale-client-generation"),
+        "wire generation",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -3359,7 +3398,8 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
         .await;
     });
 
-    // Establish the session (and thus the event relay) with a first request.
+    complete_client_hello(&client_session).await;
+    // Establish the event relay with a first request.
     client_session.write(Message::Request { id: 1, request: Request::ListRepos }).await.expect("write request");
     match ok_response(read_session_message(&client_session).await, 1) {
         Response::ListRepos(_) => {}
