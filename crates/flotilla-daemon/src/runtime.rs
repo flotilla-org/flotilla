@@ -478,6 +478,7 @@ fn builtin_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
         ("implement-review", flotilla_resources::implement_review_workflow_spec()),
         ("interactive-single", flotilla_resources::interactive_single_workflow_spec()),
         ("single-agent-contained", flotilla_resources::single_agent_contained_workflow_spec()),
+        ("single-agent-trusted", flotilla_resources::single_agent_trusted_workflow_spec()),
     ]
 }
 
