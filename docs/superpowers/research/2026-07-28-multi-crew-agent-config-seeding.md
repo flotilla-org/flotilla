@@ -706,6 +706,82 @@ export CURSOR_API_KEY=…            # or the hidden --auth-token
 # headless crews additionally: agent -p --trust --approve-mcps
 ```
 
+### pi
+
+pi is the quietest of the four, and on the installed version it needs **no
+onboarding seed at all**. Launched with a fresh `PI_CODING_AGENT_DIR`, in a
+directory containing an `AGENTS.md`, with no credentials present, it went
+straight to the composer — no auth prompt, no trust prompt, and it loaded the
+project context unasked:
+
+```text
+ pi v0.70.6
+ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
+[Context]
+  AGENTS.md
+```
+
+It created `auth.json` (`{}`), an empty `sessions/`, and
+`settings.json` containing exactly `{"lastChangelogVersion": "0.70.6"}`.
+
+| Prompt / first-run surface | Pre-answer mechanism | Citation | Status |
+|---|---|---|---|
+| Login / provider selection | None needed — provider credentials are read from env (`KIMI_API_KEY`, `MOONSHOT_API_KEY`, `ANTHROPIC_API_KEY`, …) or `auth.json`, with no interactive gate at startup | Probe above; resolution order in `packages/coding-agent/docs/providers.md` | **Verified** — no prompt on a fresh dir with no credentials |
+| Project trust | `trust.json` in the agent dir: a flat map of canonical cwd → boolean, e.g. `{"/workspace/repo": true}` | `packages/coding-agent/src/core/trust-manager.ts:124-150` (`ProjectTrustStore`, `normalizeCwd` keys); `docs/security.md` | **Verified absent on 0.70.6** — the feature postdates the installed build; mechanism verified in source for ≥0.79 |
+| Project trust, non-interactive | No prompt in `-p` / `--mode json` / `--mode rpc`; **but project-local inputs are silently ignored** without a saved decision unless `--approve`/`-a` is passed | `docs/security.md`: "Non-interactive modes … do not show a trust prompt. Without a saved trust decision, they ignore project-local inputs unless `--approve`/`-a` is passed" | Unverified on 0.70.6 (flags absent from `pi --help`) |
+| Changelog / "Update Available" panel | `"lastChangelogVersion": "<version>"` in `settings.json` | Probe: written automatically on first run | **Verified** — the update banner is informational and does not block the composer |
+
+The version skew here is load-bearing and worth stating plainly. The installed
+0.70.6 has **no trust machinery whatsoever** — `grep -rl "trust.json"` across its
+`dist/` returns nothing, and `pi --help` has no `--approve` or `--trust` flag.
+The trust system exists in the newer source checkout (0.79.0 at
+`/Users/robert/dev/pi-mono`) and in the current published package. So pi's seed
+set is empty *today* and becomes `trust.json` the moment the crew image picks up
+a current pi — which it should, since 0.70.6 also predates the scope rename and
+the current Kimi model IDs.
+
+pi's trust semantics are the mirror of Codex's, and share the same trap: the
+non-interactive path does not prompt, it **silently drops project context**. A
+reviewer crew running `pi -p` in an untrusted directory would read no
+`AGENTS.md` and no `CLAUDE.md` and produce a confidently context-free review.
+That is the same silent-capability-downgrade shape as Codex's read-only sandbox,
+and it is why the acceptance test must be "reaches its brief correctly
+configured", not merely "shows no prompt".
+
+pi seed set (for a current pi; empty for 0.70.6):
+
+```json
+// $PI_CODING_AGENT_DIR/trust.json
+{ "/workspace/repo": true }
+```
+
+```json
+// $PI_CODING_AGENT_DIR/settings.json
+{ "lastChangelogVersion": "<installed version>" }
+```
+
+### Summary: the four seed sets
+
+| | Blocking prompts on a fresh home | Seed location | Silent downgrade if unseeded |
+|---|---|---|---|
+| **Codex** | 2 — sign-in picker, directory trust | `$CODEX_HOME/auth.json` + `config.toml` `[projects."…"]` | Yes — read-only sandbox, project config/hooks/exec-policies not loaded |
+| **Claude Code** | 3 — theme picker, workspace trust, custom-API-key approval | `.claude.json` (all three) | No — the trust dialog blocks rather than degrading |
+| **Cursor** | ≥1 — workspace trust; MCP and command approvals likely | `<workspace>/.cursor/.workspace-trusted` + `cli-config.json`; key via env | Unknown — server-driven onboarding not enumerable offline |
+| **pi** | 0 on 0.70.6; 1 (project trust) on current versions | `$PI_CODING_AGENT_DIR/trust.json` | Yes on current versions — project-local inputs silently ignored in `-p` mode |
+
+Two conclusions for the seeding implementation:
+
+1. **Every agent's trust decision is keyed by workspace path**, in four different
+   files with four different shapes. This is the one piece of per-agent seeding
+   that cannot be baked into the crew image, because it depends on where the
+   crew's checkout lands. It belongs in the vessel-provision step, after the
+   workspace path is known.
+2. **"Zero prompts" is necessary but not sufficient as an acceptance test.**
+   Codex and pi both pass a naive prompt check while silently dropping the
+   capability or context the brief depends on. The test should assert the
+   positive: Codex reports `sandbox: workspace-write`, pi and Claude report the
+   project context loaded.
+
 ## What beyond credentials is per-crew
 
 Grouping by what moves it, since that is what the seeder must act on:
