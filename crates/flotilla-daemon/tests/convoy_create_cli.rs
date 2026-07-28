@@ -10,7 +10,7 @@ use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, PrincipalRef};
 use flotilla_resources::{
     single_agent_contained_workflow_spec, Convoy, ConvoyPhase, CrewSource, InMemoryBackend, InputMeta, PlacementPolicy, ResourceBackend,
-    SqliteBackend, Stance, WorkflowTemplate,
+    SqliteBackend, Stance, WorkflowTemplate, MANAGED_BY_LABEL,
 };
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -91,6 +91,7 @@ async fn scratch_workflow_template_is_seeded_at_startup() {
     let templates = backend.using::<WorkflowTemplate>("flotilla");
     let scratch = templates.get("scratch").await.expect("scratch template should be seeded");
     assert_eq!(scratch.metadata.name, "scratch");
+    assert_eq!(scratch.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("builtin"));
     assert_eq!(scratch.spec.vessels.len(), 1);
     assert_eq!(scratch.spec.vessels[0].name, "work");
 
