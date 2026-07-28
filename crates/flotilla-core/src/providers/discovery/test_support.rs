@@ -307,6 +307,7 @@ fn minimal_discovery_runtime(follower: bool, runner: std::sync::Arc<dyn CommandR
     super::DiscoveryRuntime {
         runner,
         env: std::sync::Arc::new(TestEnvVars::default()),
+        available_space_probe: fixed_available_space_probe(),
         host_detectors: vec![Box::new(super::detectors::generic::CommandDetector::new(
             "git",
             &["--version"],
@@ -1274,6 +1275,7 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
     DiscoveryRuntime {
         runner,
         env: Arc::new(TestEnvVars::default()),
+        available_space_probe: fixed_available_space_probe(),
         host_detectors: vec![],
         repo_detectors: vec![],
         factories: FactoryRegistry {
@@ -1291,6 +1293,18 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
         attachable_store,
         host_scoped_providers: Default::default(),
     }
+}
+
+fn fixed_available_space_probe() -> Arc<dyn crate::admission::AvailableSpaceProbe> {
+    struct FixedAvailableSpaceProbe;
+
+    impl crate::admission::AvailableSpaceProbe for FixedAvailableSpaceProbe {
+        fn measure(&self, _path: &Path) -> Option<u64> {
+            Some(100 * 1024 * 1024 * 1024)
+        }
+    }
+
+    Arc::new(FixedAvailableSpaceProbe)
 }
 
 /// Build a [`DiscoveryRuntime`] with [`FakeVcs`] and [`FakeCheckoutManager`]

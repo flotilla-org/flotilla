@@ -4024,10 +4024,16 @@ impl InProcessDaemon {
 
     async fn check_local_free_space_floor(&self) -> Result<(), String> {
         let config = Arc::clone(&self.config);
+        let available_space_probe = Arc::clone(&self.discovery.available_space_probe);
         let host_name = self.host_name.to_string();
         tokio::task::spawn_blocking(move || {
             let daemon_config = config.load_daemon_config()?;
-            crate::admission::check_free_space_floor(&host_name, config.state_dir().as_path(), daemon_config.admission.free_space_floor_gib)
+            crate::admission::check_free_space_floor(
+                &*available_space_probe,
+                &host_name,
+                config.state_dir().as_path(),
+                daemon_config.admission.free_space_floor_gib,
+            )
         })
         .await
         .map_err(|error| format!("free-space check failed on host `{}`: {error}", self.host_name))?

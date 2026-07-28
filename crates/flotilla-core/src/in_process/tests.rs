@@ -178,6 +178,7 @@ async fn adopted_checkout_with_explicit_transport_applies_fork_stance_config() {
     let config_base = temp.path().join("config");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo");
+    let repo = std::fs::canonicalize(repo).expect("canonicalize repo");
     std::fs::create_dir_all(&config_base).expect("create config dir");
     std::fs::write(config_base.join("daemon.toml"), "machine_id = \"adopted-fork-test\"\n").expect("write daemon config");
     overwrite_single_saved_repo_config(
