@@ -85,9 +85,9 @@ pub use project::{
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use registry::{
     apply_resource_document, get_resource_kind, list_resource_kind, list_resource_kind_including_replicas,
-    list_resource_kind_replica_sources, resource_list_api_version, watch_resource_kind, watch_resource_kind_from,
-    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceList, DynamicResourceObject,
-    DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
+    list_resource_kind_replica_sources, resource_document_spec_hash, resource_list_api_version, watch_resource_kind,
+    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceList,
+    DynamicResourceObject, DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
 };
 pub use replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass, ResourceProvenance};
 pub use repository::{

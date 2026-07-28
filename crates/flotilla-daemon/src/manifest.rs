@@ -10,7 +10,9 @@ use std::{
     time::Duration,
 };
 
-use flotilla_resources::{apply_resource_document, content_hash, get_resource_kind, ResourceBackend, ResourceError, MANAGED_BY_LABEL};
+use flotilla_resources::{
+    apply_resource_document, get_resource_kind, resource_document_spec_hash, ResourceBackend, ResourceError, MANAGED_BY_LABEL,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use tracing::{info, warn};
@@ -119,8 +121,7 @@ impl ManifestReconciler {
 
     async fn reconcile_document(&mut self, source: &Path, mut document: Value, report: &mut ManifestPassReport) -> Result<(), String> {
         let identity = document_identity(&document, &self.default_namespace)?;
-        let desired_hash =
-            content_hash(document.get("spec").ok_or_else(|| format!("{identity}: missing spec"))?).map_err(|error| error.to_string())?;
+        let desired_hash = resource_document_spec_hash(&document).map_err(|error| format!("{identity}: {error}"))?;
         stamp_manifest_metadata(&mut document, source, &desired_hash)?;
 
         let existing = match get_resource_kind(&self.backend, &identity.namespace, &identity.kind, &identity.name).await {
@@ -146,8 +147,7 @@ impl ManifestReconciler {
         }
 
         let annotations = string_map(&existing, "annotations")?;
-        let live_hash = content_hash(existing.get("spec").ok_or_else(|| format!("{identity}: stored object has no spec"))?)
-            .map_err(|error| error.to_string())?;
+        let live_hash = resource_document_spec_hash(&existing).map_err(|error| format!("{identity}: {error}"))?;
         let last_applied = annotations.get(LAST_APPLIED_HASH_ANNOTATION).cloned().unwrap_or_else(|| "<missing>".to_string());
         if live_hash != last_applied {
             if self.warned_drift.insert((identity.clone(), live_hash.clone(), last_applied.clone())) {
@@ -169,6 +169,7 @@ impl ManifestReconciler {
             return Ok(());
         }
 
+        preserve_external_metadata(&mut document, &existing)?;
         apply_resource_document(&self.backend, &self.default_namespace, document).await.map_err(|error| format!("{identity}: {error}"))?;
         self.warned_drift.retain(|(warned, _, _)| warned != &identity);
         report.updated += 1;
@@ -246,6 +247,25 @@ fn insert_metadata_value(metadata: &mut Map<String, Value>, field: &str, key: &s
     Ok(())
 }
 
+fn preserve_external_metadata(document: &mut Value, existing: &Value) -> Result<(), String> {
+    let desired =
+        document.get_mut("metadata").and_then(Value::as_object_mut).ok_or_else(|| "missing or non-object metadata".to_string())?;
+    let stored = existing
+        .get("metadata")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "stored object has missing or non-object metadata".to_string())?;
+    for field in ["labels", "annotations"] {
+        let desired_values = desired.entry(field).or_insert_with(|| Value::Object(Map::new()));
+        let desired_values = desired_values.as_object_mut().ok_or_else(|| format!("metadata.{field} must be an object"))?;
+        if let Some(stored_values) = stored.get(field).and_then(Value::as_object) {
+            for (key, value) in stored_values {
+                desired_values.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn string_map(document: &Value, field: &str) -> Result<BTreeMap<String, String>, String> {
     let value = document.get("metadata").and_then(|metadata| metadata.get(field)).cloned().unwrap_or_else(|| Value::Object(Map::new()));
     serde_json::from_value(value).map_err(|error| format!("stored metadata.{field} is invalid: {error}"))
@@ -255,7 +275,9 @@ fn string_map(document: &Value, field: &str) -> Result<BTreeMap<String, String>,
 mod tests {
     use std::time::Duration;
 
-    use flotilla_resources::{InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend, WatchStart};
+    use flotilla_resources::{
+        InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend, WatchStart, WorkflowTemplate,
+    };
     use futures::StreamExt;
 
     use super::*;
@@ -290,7 +312,10 @@ mod tests {
             assert_eq!(object.metadata.annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str), Some(source));
             assert_eq!(
                 object.metadata.annotations.get(LAST_APPLIED_HASH_ANNOTATION),
-                Some(&content_hash(&serde_json::to_value(&object.spec).expect("spec value")).expect("spec digest"))
+                Some(
+                    &resource_document_spec_hash(&serde_json::to_value(object.to_k8s_object()).expect("resource document"))
+                        .expect("spec digest")
+                )
             );
         }
     }
@@ -322,13 +347,44 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let mut reconciler = ManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once().await.expect("initial pass");
+        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let applied = resolver.get("moving").await.expect("policy");
+        let mut live_meta = InputMeta::from(&applied.metadata);
+        live_meta.labels.insert("another-controller/observation".to_string(), "kept".to_string());
+        resolver.update(&live_meta, &applied.metadata.resource_version, &applied.spec).await.expect("add external metadata");
 
         write(&path, &manifest("moving", "two"));
         let report = reconciler.reconcile_once().await.expect("fast-forward pass");
-        let object = backend.using::<PlacementPolicy>(NAMESPACE).get("moving").await.expect("policy");
+        let object = resolver.get("moving").await.expect("policy");
 
         assert_eq!(report.updated, 1);
         assert_eq!(object.spec.pool, "two");
+        assert_eq!(object.metadata.labels.get("another-controller/observation").map(String::as_str), Some("kept"));
+    }
+
+    #[tokio::test]
+    async fn omitted_serde_defaults_remain_steady_and_can_fast_forward() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workflow.yaml");
+        let workflow = |command: &str| {
+            format!(
+                "apiVersion: flotilla.work/v1\nkind: WorkflowTemplate\nmetadata:\n  name: defaults\nspec:\n  vessels:\n    - name: work\n      crew:\n        - role: coder\n          command: {command}\n"
+            )
+        };
+        write(&path, &workflow("echo-one"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let mut reconciler = ManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        reconciler.reconcile_once().await.expect("initial pass");
+
+        let steady = reconciler.reconcile_once().await.expect("steady pass");
+        write(&path, &workflow("echo-two"));
+        let updated = reconciler.reconcile_once().await.expect("fast-forward pass");
+        let object = backend.using::<WorkflowTemplate>(NAMESPACE).get("defaults").await.expect("workflow");
+
+        assert_eq!(steady.unchanged, 1);
+        assert_eq!(steady.drifted, 0);
+        assert_eq!(updated.updated, 1);
+        assert_eq!(serde_json::to_value(&object.spec).expect("workflow spec")["vessels"][0]["crew"][0]["command"], "echo-two");
     }
 
     #[tokio::test]
