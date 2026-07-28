@@ -416,7 +416,7 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
     } else {
         let mut table = Table::new();
         table.load_preset(UTF8_FULL_CONDENSED);
-        table.set_header(vec!["Convoy", "Vessel", "Crew", "State", "Host", "Staleness"]);
+        table.set_header(vec!["Convoy", "Vessel", "Crew", "State", "Host", "Placement", "Staleness"]);
         for row in &response.rows {
             let vessel = match &row.authority {
                 Some(authority) => format!("{} ({authority})", row.vessel),
@@ -428,6 +428,17 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
                 Cell::new(&row.crew),
                 Cell::new(&row.crew_state),
                 Cell::new(row.host.as_str()),
+                Cell::new(row.placement_decision.as_ref().map_or_else(
+                    || "-".to_string(),
+                    |decision| {
+                        let refusals = if decision.refused_candidates.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; {} refused", decision.refused_candidates.len())
+                        };
+                        format!("{} on {}{refusals}", decision.policy_name, decision.target_host.display_name)
+                    },
+                )),
                 Cell::new(format_fleet_staleness(&row.staleness)),
             ]);
         }
@@ -572,6 +583,11 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::DaemonLogs { lines } => lines.join("\n"),
         CommandValue::ResourceList(response) | CommandValue::ResourceObject(response) => {
             flotilla_protocol::output::json_pretty(&response.value)
+        }
+        CommandValue::ResourceDeleted(response) => {
+            let name = response.value["metadata"]["name"].as_str().unwrap_or("<unknown>");
+            let api_version = response.value["apiVersion"].as_str().unwrap_or("<unknown>");
+            format!("deleted {api_version}/{}/{}/{name}\nControllers may recreate code-owned objects.", response.kind, response.namespace,)
         }
         CommandValue::ResourceWatchEvent(response) => flotilla_protocol::output::json_pretty(&response.event),
         CommandValue::EnvironmentSpecRead { .. } => "environment spec read".to_string(),

@@ -1125,6 +1125,21 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
         DetailField { label: "Message", value: row.message.clone().unwrap_or_default() },
         DetailField { label: "Vessels", value: convoy_progress(row).text },
     ];
+    if let Some(decision) = &row.placement_decision {
+        fields
+            .push(DetailField { label: "Placement", value: format!("{} on {}", decision.policy_name, decision.target_host.display_name) });
+        if !decision.refused_candidates.is_empty() {
+            fields.push(DetailField {
+                label: "Placement refusals",
+                value: decision
+                    .refused_candidates
+                    .iter()
+                    .map(|refusal| format!("{} on {}: {}", refusal.policy_name, refusal.target_host.display_name, refusal.reason))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            });
+        }
+    }
     if let Some(change_request) = &row.change_request {
         fields.push(DetailField { label: "Pull request", value: format!("#{} · {}", change_request.id, change_request.status) });
     }
@@ -1254,7 +1269,7 @@ fn vessel_phase(row: &VesselProjection) -> CellValue {
 }
 
 fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
-    vec![
+    let mut fields = vec![
         DetailField { label: "Namespace", value: row.namespace.to_string() },
         DetailField { label: "Convoy", value: row.convoy.to_string() },
         DetailField { label: "Vessel", value: row.vessel.name.clone() },
@@ -1265,7 +1280,23 @@ fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
         DetailField { label: "Image ref", value: row.vessel.image_ref.clone().unwrap_or_default() },
         DetailField { label: "Image digest", value: row.vessel.image_digest.clone().unwrap_or_default() },
         DetailField { label: "Message", value: row.vessel.message.clone().unwrap_or_default() },
-    ]
+    ];
+    if let Some(decision) = &row.vessel.placement_decision {
+        fields
+            .push(DetailField { label: "Placement", value: format!("{} on {}", decision.policy_name, decision.target_host.display_name) });
+        if !decision.refused_candidates.is_empty() {
+            fields.push(DetailField {
+                label: "Placement refusals",
+                value: decision
+                    .refused_candidates
+                    .iter()
+                    .map(|refusal| format!("{} on {}: {}", refusal.policy_name, refusal.target_host.display_name, refusal.reason))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            });
+        }
+    }
+    fields
 }
 
 fn attach_vessel(row: &VesselProjection) -> Option<TableIntent> {
@@ -1340,6 +1371,7 @@ mod tests {
 
     fn vessel(name: &str, depends_on: &[&str], phase: WorkPhase) -> VesselSummary {
         VesselSummary {
+            placement_decision: None,
             name: name.into(),
             depends_on: depends_on.iter().map(ToString::to_string).collect(),
             phase,
@@ -1360,6 +1392,7 @@ mod tests {
 
     fn convoy(vessels: Vec<VesselSummary>) -> ConvoySummary {
         ConvoySummary {
+            placement_decision: None,
             id: ConvoyId::new("dev", "tables"),
             namespace: "dev".into(),
             name: "tables".into(),
@@ -1405,6 +1438,32 @@ mod tests {
         assert_eq!(view.rows[0].cells[2], CellValue::toned("failed", CellTone::Error));
         assert_eq!(view.rows[0].cells[6].text, "workspace launch failed: disk full");
         assert_eq!(view.rows[0].drill, Some("convoy/dev/tables".parse().expect("valid address")));
+    }
+
+    #[test]
+    fn convoy_and_vessel_details_render_placement_decisions_with_refusals() {
+        let decision = flotilla_protocol::PlacementDecision {
+            policy_name: "host-direct-kiwi".into(),
+            target_host: flotilla_protocol::PlacementTargetHost { reference: "01HXYZ".into(), display_name: "kiwi".into() },
+            refused_candidates: vec![flotilla_protocol::PlacementRefusal {
+                policy_name: "host-direct-feta".into(),
+                target_host: flotilla_protocol::PlacementTargetHost { reference: "02HXYZ".into(), display_name: "feta".into() },
+                reason: "disk below admission floor".into(),
+            }],
+        };
+        let mut vessel = vessel("implement", &[], WorkPhase::Running);
+        vessel.placement_decision = Some(decision.clone());
+        let mut convoy = convoy(vec![vessel]);
+        convoy.placement_decision = Some(decision);
+
+        let convoy_view = project_convoys("convoys/dev", &[&convoy]).expect("convoy table");
+        assert!(convoy_view.rows[0].describe.contains(&DetailField { label: "Placement", value: "host-direct-kiwi on kiwi".into() }));
+        assert!(convoy_view.rows[0]
+            .describe
+            .contains(&DetailField { label: "Placement refusals", value: "host-direct-feta on feta: disk below admission floor".into() }));
+
+        let vessel_view = project_convoys("vessel/dev/tables/implement", &[&convoy]).expect("vessel table");
+        assert!(vessel_view.rows[0].describe.contains(&DetailField { label: "Placement", value: "host-direct-kiwi on kiwi".into() }));
     }
 
     #[test]

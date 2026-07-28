@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Utc};
-use flotilla_protocol::SleepInhibitionHealth;
+use flotilla_protocol::{PlacementDecision, PlacementTargetHost, SleepInhibitionHealth};
 use flotilla_resources::{
     CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus,
     CloneStatusPatch, ConditionValue, EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch, HostStatus, HostStatusPatch,
@@ -195,8 +195,14 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     let mut status = VesselStatus::default();
     let started_at = Utc.timestamp_opt(10, 0).single().expect("timestamp");
     let ready_at = Utc.timestamp_opt(20, 0).single().expect("timestamp");
+    let placement_decision = PlacementDecision {
+        policy_name: "docker-on-01HXYZ".to_string(),
+        target_host: PlacementTargetHost { reference: "01HXYZ".to_string(), display_name: "kiwi".to_string() },
+        refused_candidates: Vec::new(),
+    };
 
     VesselStatusPatch::MarkProvisioning {
+        placement_decision: Some(placement_decision.clone()),
         observed_policy_ref: "docker-on-01HXYZ".to_string(),
         observed_policy_version: "12".to_string(),
         started_at,
@@ -205,8 +211,14 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     .apply(&mut status);
     assert_eq!(status.phase, VesselPhase::Provisioning);
     assert_eq!(status.observed_policy_ref.as_deref(), Some("docker-on-01HXYZ"));
+    assert_eq!(status.placement_decision.as_ref(), Some(&placement_decision));
 
     VesselStatusPatch::MarkProvisioning {
+        placement_decision: Some(PlacementDecision {
+            policy_name: "replacement-must-not-win".to_string(),
+            target_host: PlacementTargetHost { reference: "other".to_string(), display_name: "feta".to_string() },
+            refused_candidates: Vec::new(),
+        }),
         observed_policy_ref: "docker-on-01HXYZ".to_string(),
         observed_policy_version: "13".to_string(),
         started_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
@@ -215,8 +227,10 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     .apply(&mut status);
     assert_eq!(status.started_at, Some(started_at), "reconcile must not restamp an in-progress transition");
     assert_eq!(status.message.as_deref(), Some("still waiting"));
+    assert_eq!(status.placement_decision.as_ref(), Some(&placement_decision), "placement decision is write-once");
 
     VesselStatusPatch::MarkReady {
+        placement_decision: None,
         environment_ref: Some("env-a".to_string()),
         image_ref: Some("registry.example/crew:latest".to_string()),
         image_digest: Some("sha256:test-image".to_string()),
@@ -233,6 +247,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     assert_eq!(status.image_digest.as_deref(), Some("sha256:test-image"));
 
     VesselStatusPatch::MarkReady {
+        placement_decision: None,
         environment_ref: Some("env-a".to_string()),
         image_ref: Some("registry.example/crew:latest".to_string()),
         image_digest: Some("sha256:test-image".to_string()),

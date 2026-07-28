@@ -403,6 +403,7 @@ impl Drop for DaemonRuntime {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalProvisioningProfile {
     host_id: String,
+    display_name: String,
     repo_default_dir: String,
     host_direct_pool: String,
     docker_pool: String,
@@ -520,6 +521,7 @@ fn build_local_profile(daemon: &Arc<InProcessDaemon>, local_registry: &ProviderR
 
     Ok(LocalProvisioningProfile {
         host_id,
+        display_name: daemon.host_name().to_string(),
         repo_default_dir,
         host_direct_pool,
         docker_pool,
@@ -535,7 +537,7 @@ async fn register_startup_resources(
     profile: &LocalProvisioningProfile,
 ) -> Result<(), String> {
     let backend = daemon.resource_backend();
-    ensure_host_exists(&backend, namespace, &profile.host_id).await?;
+    ensure_host_exists(&backend, namespace, &profile.host_id, &profile.display_name).await?;
     ensure_host_direct_environment_exists(&backend, namespace, profile).await?;
     discover_local_clones(daemon, &backend, namespace, profile).await?;
     ensure_default_policies(&backend, namespace, profile).await?;
@@ -612,14 +614,27 @@ async fn reconcile_builtin_workflow_templates(backend: &ResourceBackend, namespa
     Ok(())
 }
 
-async fn ensure_host_exists(backend: &ResourceBackend, namespace: &str, host_name: &str) -> Result<(), String> {
+async fn ensure_host_exists(backend: &ResourceBackend, namespace: &str, host_name: &str, display_name: &str) -> Result<(), String> {
     let hosts = backend.clone().using::<Host>(namespace);
     match hosts.get(host_name).await {
-        Ok(_) => return Ok(()),
+        Ok(existing) if existing.spec.display_name == display_name => return Ok(()),
+        Ok(existing) => {
+            return hosts
+                .update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &HostSpec {
+                    display_name: display_name.to_string(),
+                })
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        }
         Err(ResourceError::NotFound { .. }) => {}
         Err(err) => return Err(format!("check host {host_name}: {err}")),
     }
-    hosts.create(&empty_meta(host_name), &HostSpec {}).await.map(|_| ()).map_err(|err| err.to_string())
+    hosts
+        .create(&empty_meta(host_name), &HostSpec { display_name: display_name.to_string() })
+        .await
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 async fn ensure_host_direct_environment_exists(
@@ -974,7 +989,7 @@ async fn apply_host_heartbeat_with_credentials(
     health: &DaemonHealthIdentity,
     runtime_health: &RuntimeHealth,
 ) -> Result<(), String> {
-    ensure_host_exists(&daemon.resource_backend(), namespace, &profile.host_id).await?;
+    ensure_host_exists(&daemon.resource_backend(), namespace, &profile.host_id, &profile.display_name).await?;
     let backend = daemon.resource_backend();
     let hosts = backend.using::<Host>(namespace);
     let host = hosts.get(&profile.host_id).await.map_err(|err| err.to_string())?;
@@ -3133,6 +3148,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleted_code_owned_builtin_is_reconciled_back() {
+        let backend = ResourceBackend::InMemory(Default::default());
+        reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("initial builtin reconciliation should succeed");
+
+        let deleted = flotilla_resources::delete_resource_kind(&backend, NAMESPACE, "workflowtemplates", "single-agent-contained")
+            .await
+            .expect("raw delete should remove builtin");
+        assert_eq!(deleted.value["metadata"]["name"], "single-agent-contained");
+        assert!(matches!(
+            backend.using::<WorkflowTemplate>(NAMESPACE).get("single-agent-contained").await,
+            Err(ResourceError::NotFound { .. })
+        ));
+
+        reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("level-triggered reconciliation should recreate builtin");
+        let recreated =
+            backend.using::<WorkflowTemplate>(NAMESPACE).get("single-agent-contained").await.expect("builtin should be recreated");
+        assert_eq!(recreated.spec, flotilla_resources::single_agent_contained_workflow_spec());
+        assert_eq!(recreated.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(BUILTIN_MANAGED_BY_VALUE));
+    }
+
+    #[tokio::test]
     async fn startup_seeding_labels_matching_unlabelled_builtin_template_once() {
         const NAMESPACE: &str = "test";
         let backend = ResourceBackend::InMemory(Default::default());
@@ -3158,6 +3194,7 @@ mod tests {
     fn manual_profile(host_id: &str, docker_available: bool) -> LocalProvisioningProfile {
         LocalProvisioningProfile {
             host_id: host_id.to_string(),
+            display_name: "kiwi".to_string(),
             repo_default_dir: "/Users/tester/dev/flotilla-repos".to_string(),
             host_direct_pool: "passthrough".to_string(),
             docker_pool: "passthrough".to_string(),
@@ -3552,7 +3589,7 @@ mod tests {
         let host_id = daemon.local_host_id().expect("local host id").to_string();
         let profile = manual_profile(&host_id, false);
 
-        ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id).await.expect("host registration should succeed");
+        ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration should succeed");
         let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
         flotilla_resources::apply_status_patch(&hosts, &host_id, &flotilla_resources::HostStatusPatch::SleepInhibition {
             health: flotilla_protocol::SleepInhibitionHealth::Failed { consecutive_failures: 3, message: "polkit denied".to_string() },

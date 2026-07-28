@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{IssueRef, IssueState, PrincipalRef};
+use flotilla_protocol::{IssueRef, IssueState, PlacementDecision, PrincipalRef};
 use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::StatusPatch, workflow_template::VesselRequirement, ReplicationClass, RepositoryKey};
@@ -114,6 +114,8 @@ pub enum InputValue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ConvoyStatus {
     pub phase: ConvoyPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_decision: Option<PlacementDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_snapshot: Option<WorkflowSnapshot>,
     /// Work aboard each declared vessel, keyed by vessel (requirement) name.
@@ -257,6 +259,9 @@ pub struct PlacementStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyStatusPatch {
+    SetPlacementDecision {
+        placement_decision: PlacementDecision,
+    },
     Bootstrap {
         workflow_snapshot: WorkflowSnapshot,
         observed_workflow_ref: String,
@@ -364,6 +369,9 @@ pub enum ConvoyStatusPatch {
 impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
     fn apply(&self, status: &mut ConvoyStatus) {
         match self {
+            Self::SetPlacementDecision { placement_decision } => {
+                status.placement_decision.get_or_insert_with(|| placement_decision.clone());
+            }
             Self::Bootstrap { workflow_snapshot, observed_workflow_ref, observed_workflows, work, crew_work, phase, started_at } => {
                 status.workflow_snapshot = Some(workflow_snapshot.clone());
                 status.observed_workflow_ref = Some(observed_workflow_ref.clone());

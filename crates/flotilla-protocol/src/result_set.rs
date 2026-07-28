@@ -787,6 +787,8 @@ pub struct ConvoyRow {
     #[serde(default)]
     pub dispatching_principal_ref: PrincipalRef,
     pub phase: ConvoyPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_decision: Option<crate::PlacementDecision>,
     /// The convoy has no workflow snapshot yet and is not terminal.
     #[builder(default)]
     pub initializing: bool,
@@ -846,6 +848,8 @@ pub struct VesselRow {
     pub vessel_resource: Option<ResourceRef>,
     pub name: String,
     pub phase: WorkPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_decision: Option<crate::PlacementDecision>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub crew: Vec<CrewMemberSummary>,

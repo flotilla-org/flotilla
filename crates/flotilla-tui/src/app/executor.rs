@@ -271,6 +271,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::DaemonLogs { .. }
         | CommandValue::ResourceList(_)
         | CommandValue::ResourceObject(_)
+        | CommandValue::ResourceDeleted(_)
         | CommandValue::ResourceWatchEvent(_) => {
             tracing::warn!("query result reached TUI handler — should be handled by CLI");
         }

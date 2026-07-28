@@ -247,6 +247,7 @@ fn vessel_object_with_image_digest(
             adopted_checkout_refs: Default::default(),
         },
         status: Some(VesselStatus {
+            placement_decision: None,
             phase,
             message: message.map(str::to_string),
             observed_policy_ref: Some("laptop-docker".to_string()),

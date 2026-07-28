@@ -1038,7 +1038,7 @@ fn full_controller_harness(backend: ResourceBackend) -> ControllerLoopHarness {
 
 async fn create_ready_host(backend: &ResourceBackend, name: &str) {
     let hosts = backend.clone().using::<Host>(NAMESPACE);
-    let created = hosts.create(&controller_meta().name(name).call(), &HostSpec {}).await.expect("host create should succeed");
+    let created = hosts.create(&controller_meta().name(name).call(), &HostSpec::default()).await.expect("host create should succeed");
     hosts
         .update_status(name, &created.metadata.resource_version, &HostStatus {
             capabilities: Default::default(),

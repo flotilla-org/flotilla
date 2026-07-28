@@ -16,7 +16,10 @@ pub const TERMINAL_POOLS_CAPABILITY: &str = "terminal_pools";
 pub const HEARTBEAT_READY_TTL_SECS: i64 = 60;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostSpec {}
+pub struct HostSpec {
+    #[serde(default)]
+    pub display_name: String,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct HostStatus {

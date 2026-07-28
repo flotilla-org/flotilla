@@ -1676,7 +1676,14 @@ impl Aggregator {
     fn vessel_host(&self, convoy_ref: &ResourceRef, state: Option<&WorkState>) -> HostName {
         state
             .and_then(|state| state.placement.as_ref())
-            .and_then(|placement| placement.fields.get("host"))
+            .and_then(|placement| {
+                placement
+                    .fields
+                    .get("placement_decision")
+                    .and_then(|decision| decision.get("target_host"))
+                    .and_then(|host| host.get("display_name"))
+                    .or_else(|| placement.fields.get("host"))
+            })
             .and_then(serde_json::Value::as_str)
             .map(HostName::new)
             .or_else(|| convoy_ref.host.clone())
@@ -1722,6 +1729,7 @@ impl Aggregator {
             .workflow_ref(&convoy.spec.workflow_ref)
             .dispatching_principal_ref(convoy.spec.dispatching_principal_ref.clone())
             .phase(convoy_phase(phase))
+            .maybe_placement_decision(status.and_then(|status| status.placement_decision.clone()))
             .initializing(convoy_is_initializing(status))
             .maybe_message(status.and_then(|status| status.message.clone()))
             .maybe_repo(self.convoy_repo_fact(convoy).map(flotilla_protocol::RepoKey))
@@ -1758,6 +1766,9 @@ impl Aggregator {
     fn summarize_vessel(&self, convoy_ref: &ResourceRef, definition: &VesselRequirement, state: Option<&WorkState>) -> VesselRow {
         let requested_stance = definition.stance.to_string();
         let placement = state.and_then(|state| state.placement.as_ref());
+        let placement_decision = placement
+            .and_then(|placement| placement.fields.get("placement_decision"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
         let vessel_host = self.vessel_host(convoy_ref, state);
         let vessel_resource =
             placement.and_then(|placement| placement.fields.get("vessel_ref")).and_then(serde_json::Value::as_str).map(|name| {
@@ -1808,6 +1819,7 @@ impl Aggregator {
             .maybe_vessel_resource(vessel_resource)
             .name(&definition.name)
             .phase(work_phase(state.map(|state| state.phase).unwrap_or(ResourceWorkPhase::Pending)))
+            .maybe_placement_decision(placement_decision)
             .crew(crew)
             .maybe_ready_at(state.and_then(|state| state.ready_at))
             .maybe_started_at(state.and_then(|state| state.started_at))

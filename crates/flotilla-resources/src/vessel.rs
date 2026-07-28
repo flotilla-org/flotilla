@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
+use flotilla_protocol::PlacementDecision;
 use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::StatusPatch, ReplicationClass, RepositoryKey, Stance};
@@ -31,6 +32,8 @@ pub enum VesselPhase {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VesselStatus {
     pub phase: VesselPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_decision: Option<PlacementDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,10 +67,12 @@ pub enum VesselStatusPatch {
     MarkProvisioning {
         observed_policy_ref: String,
         observed_policy_version: String,
+        placement_decision: Option<PlacementDecision>,
         started_at: DateTime<Utc>,
         message: Option<String>,
     },
     MarkReady {
+        placement_decision: Option<PlacementDecision>,
         environment_ref: Option<String>,
         image_ref: Option<String>,
         image_digest: Option<String>,
@@ -90,14 +95,18 @@ pub enum VesselStatusPatch {
 impl StatusPatch<VesselStatus> for VesselStatusPatch {
     fn apply(&self, status: &mut VesselStatus) {
         match self {
-            Self::MarkProvisioning { observed_policy_ref, observed_policy_version, started_at, message } => {
+            Self::MarkProvisioning { observed_policy_ref, observed_policy_version, placement_decision, started_at, message } => {
                 status.phase = VesselPhase::Provisioning;
                 status.observed_policy_ref = Some(observed_policy_ref.clone());
                 status.observed_policy_version = Some(observed_policy_version.clone());
+                if let Some(placement_decision) = placement_decision {
+                    status.placement_decision.get_or_insert_with(|| placement_decision.clone());
+                }
                 status.started_at.get_or_insert(*started_at);
                 status.message = message.clone();
             }
             Self::MarkReady {
+                placement_decision,
                 environment_ref,
                 image_ref,
                 image_digest,
@@ -108,6 +117,9 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 ready_at,
             } => {
                 status.phase = VesselPhase::Ready;
+                if let Some(placement_decision) = placement_decision {
+                    status.placement_decision.get_or_insert_with(|| placement_decision.clone());
+                }
                 status.environment_ref = environment_ref.clone();
                 status.image_ref = image_ref.clone();
                 status.image_digest = image_digest.clone();

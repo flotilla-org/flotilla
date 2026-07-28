@@ -1057,6 +1057,9 @@ fn vessel_failure_message(vessel: &ResourceObject<Vessel>) -> String {
 fn placement_status(workspace: &ResourceObject<Vessel>) -> PlacementStatus {
     let mut fields = BTreeMap::from([("vessel_ref".to_string(), json!(workspace.metadata.name))]);
     if let Some(status) = workspace.status.as_ref() {
+        if let Some(decision) = &status.placement_decision {
+            fields.insert("placement_decision".to_string(), json!(decision));
+        }
         insert_optional_field(&mut fields, "environment_ref", status.environment_ref.clone());
         insert_optional_field(&mut fields, "image_ref", status.image_ref.clone());
         insert_optional_field(&mut fields, "image_digest", status.image_digest.clone());

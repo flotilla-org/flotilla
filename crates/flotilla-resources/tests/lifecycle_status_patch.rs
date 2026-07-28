@@ -48,6 +48,7 @@ macro_rules! define_patch_kinds {
 }
 
 define_patch_kinds! {
+    ConvoySetPlacementDecision => NONE,
     ConvoyBootstrap => DUPLICATE,
     ConvoyBackfillCrewWork => NONE,
     ConvoyFailInit => DUPLICATE,
@@ -85,6 +86,7 @@ define_patch_kinds! {
 
 fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
     match patch {
+        ConvoyStatusPatch::SetPlacementDecision { .. } => PatchKind::ConvoySetPlacementDecision,
         ConvoyStatusPatch::Bootstrap { .. } => PatchKind::ConvoyBootstrap,
         ConvoyStatusPatch::BackfillCrewWork { .. } => PatchKind::ConvoyBackfillCrewWork,
         ConvoyStatusPatch::FailInit { .. } => PatchKind::ConvoyFailInit,
@@ -187,6 +189,7 @@ fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_
 
 fn active_convoy_status() -> ConvoyStatus {
     ConvoyStatus {
+        placement_decision: None,
         phase: ConvoyPhase::Active,
         workflow_snapshot: None,
         work: BTreeMap::from([("implement".to_string(), work_state(WorkPhase::Running, Some(ts(10)), None))]),
@@ -246,6 +249,7 @@ fn patch_variants_exhaustively_declare_their_lifecycle_classes() {
     assert_eq!(terminal_session_patch_kind(&TerminalSessionStatusPatch::MarkStarting), PatchKind::TerminalMarkStarting);
     assert_eq!(
         vessel_patch_kind(&VesselStatusPatch::MarkProvisioning {
+            placement_decision: None,
             observed_policy_ref: "docker".to_string(),
             observed_policy_version: "2".to_string(),
             started_at: ts(30),
@@ -602,6 +606,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 let mut status = VesselStatus { phase: VesselPhase::Provisioning, started_at: Some(ts(10)), ..VesselStatus::default() };
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
                 let patch = VesselStatusPatch::MarkProvisioning {
+                    placement_decision: None,
                     observed_policy_ref: "docker".to_string(),
                     observed_policy_version: "2".to_string(),
                     started_at: ts(30),
@@ -620,6 +625,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     VesselStatus { phase: VesselPhase::Ready, started_at: Some(ts(10)), ready_at: Some(ts(20)), ..VesselStatus::default() };
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
                 let patch = VesselStatusPatch::MarkReady {
+                    placement_decision: None,
                     environment_ref: Some("env-a".to_string()),
                     image_ref: Some("registry.example/crew:latest".to_string()),
                     image_digest: Some("sha256:test-image".to_string()),

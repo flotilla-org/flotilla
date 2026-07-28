@@ -222,6 +222,8 @@ pub struct PreparedConvoyStart {
     pub placement_policy_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_policy_spec: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_decision: Option<crate::PlacementDecision>,
     #[builder(default)]
     #[serde(default)]
     pub auto_attach: bool,
@@ -462,6 +464,11 @@ pub enum CommandAction {
         namespace: String,
         document: serde_json::Value,
     },
+    ResourceDelete {
+        namespace: String,
+        kind: String,
+        name: String,
+    },
     ResourceWatch {
         namespace: String,
         kind: String,
@@ -559,6 +566,7 @@ impl Command {
             CommandAction::QueryResourceList { .. } => "query resource list",
             CommandAction::QueryResourceGet { .. } => "query resource get",
             CommandAction::ResourceApply { .. } => "apply resource",
+            CommandAction::ResourceDelete { .. } => "delete resource",
             CommandAction::ResourceWatch { .. } => "watch resources",
         }
     }
@@ -673,6 +681,7 @@ pub enum CommandValue {
     },
     ResourceList(Box<ResourceJsonResponse>),
     ResourceObject(Box<ResourceJsonResponse>),
+    ResourceDeleted(Box<ResourceJsonResponse>),
     ResourceWatchEvent(Box<ResourceWatchResponse>),
     EnvironmentSpecRead {
         spec: crate::EnvironmentSpec,

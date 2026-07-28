@@ -424,7 +424,7 @@ mod tests {
     }
 
     async fn create_host(hosts: &TypedResolver<Host>) {
-        hosts.create(&InputMeta::builder().name("test-host".to_string()).build(), &HostSpec {}).await.expect("create host");
+        hosts.create(&InputMeta::builder().name("test-host".to_string()).build(), &HostSpec::default()).await.expect("create host");
     }
 
     async fn next_state(states: &mut mpsc::UnboundedReceiver<bool>) -> bool {

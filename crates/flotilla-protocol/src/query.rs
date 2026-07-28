@@ -284,6 +284,8 @@ pub struct FleetListRow {
     pub crew: String,
     pub crew_state: String,
     pub host: HostName,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_decision: Option<crate::PlacementDecision>,
     /// Namespace the crew session lives in on its owning host.
     pub namespace: String,
     /// Crew session name — with `host` and `namespace` this is the
