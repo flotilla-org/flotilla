@@ -1,6 +1,9 @@
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
 
-use chrono::{DateTime, Duration, Utc};
+#[cfg(any(test, feature = "test-support"))]
+use chrono::Duration;
+use chrono::{DateTime, Utc};
 
 /// Supplies wall-clock time to decisions whose freshness behavior must be
 /// deterministic under test.
@@ -18,11 +21,13 @@ impl Clock for SystemClock {
 }
 
 /// A manually advanced clock for controller and decision-edge tests.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct VirtualClock {
     now: Mutex<DateTime<Utc>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl VirtualClock {
     pub fn new(now: DateTime<Utc>) -> Self {
         Self { now: Mutex::new(now) }
@@ -39,6 +44,7 @@ impl VirtualClock {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Clock for VirtualClock {
     fn now(&self) -> DateTime<Utc> {
         *self.now.lock().expect("virtual clock lock poisoned")

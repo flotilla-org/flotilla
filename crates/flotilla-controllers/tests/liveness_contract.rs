@@ -287,6 +287,7 @@ struct ConvoyWorld {
     reconciler: ConvoyReconciler,
     runtime: Arc<LandingRuntime>,
     contradictory: bool,
+    passes: usize,
 }
 
 struct ConvoyWorldBuilder {
@@ -364,7 +365,7 @@ impl WorldBuilder for ConvoyWorldBuilder {
         let reconciler = ConvoyReconciler::new(inner.using(NAMESPACE))
             .with_checkouts(inner.using(NAMESPACE))
             .with_teardown_runtime(Arc::clone(&runtime) as Arc<dyn ConvoyTeardownRuntime>);
-        Ok(ConvoyWorld { backend, current, reconciler, runtime, contradictory })
+        Ok(ConvoyWorld { backend, current, reconciler, runtime, contradictory, passes: 0 })
     }
 }
 
@@ -378,6 +379,7 @@ impl ReconcileStep<ConvoyWorld> for ConvoyStep {
     async fn reconcile_step(&self, world: &mut ConvoyWorld) -> Result<LivenessStep<Self::Patch, Self::Actuation>, String> {
         let deps = world.reconciler.fetch_dependencies(&world.current).await.map_err(|error| error.to_string())?;
         let outcome = world.reconciler.reconcile(&world.current, &deps, world.runtime.clock.now());
+        world.passes += 1;
         Ok(LivenessStep::new(outcome.patch, outcome.actuations))
     }
 
@@ -397,6 +399,7 @@ struct ConvoyFixpoint;
 impl FixpointPredicate<ConvoyWorld> for ConvoyFixpoint {
     fn at_fixpoint(&self, world: &ConvoyWorld) -> bool {
         !world.contradictory
+            && world.passes > 0
             && world.current.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landing | ConvoyPhase::Landed))
     }
 

@@ -8,7 +8,7 @@ license.workspace = true
 default = []
 aws-lc-provider = ["flotilla-resources/aws-lc-provider"]
 replay = []
-test-support = ["flotilla-protocol/test-support"]
+test-support = ["flotilla-protocol/test-support", "flotilla-resources/test-support"]
 
 [dependencies]
 flotilla-manifest = { path = "../flotilla-manifest" }
