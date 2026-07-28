@@ -7456,8 +7456,13 @@ impl InProcessDaemon {
             let result = match validate_project_name(name).and_then(|_| parse_project_yaml(spec_yaml)) {
                 Ok(spec) => match normalize_project_spec(spec) {
                     Ok(spec) => {
-                        let meta = InputMeta::builder().name(name.clone()).build();
-                        let outcome = projects.apply(&meta, &spec).await.map(|_| ());
+                        let outcome = match projects.get(name).await {
+                            Ok(existing) => projects.apply(&InputMeta::from(&existing.metadata), &spec).await.map(|_| ()),
+                            Err(ResourceError::NotFound { .. }) => {
+                                projects.apply(&InputMeta::builder().name(name.clone()).build(), &spec).await.map(|_| ())
+                            }
+                            Err(error) => Err(error),
+                        };
                         match outcome {
                             Ok(()) => flotilla_protocol::CommandValue::ProjectApplied { name: name.clone() },
                             Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },

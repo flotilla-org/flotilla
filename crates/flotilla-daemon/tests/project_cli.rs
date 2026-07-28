@@ -1116,6 +1116,61 @@ repositories:
 }
 
 #[tokio::test]
+async fn project_apply_preserves_existing_metadata() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+    let projects = backend.definitions::<Project>("flotilla");
+    projects
+        .create(
+            &InputMeta::builder()
+                .name("labelled".to_string())
+                .labels(BTreeMap::from([
+                    (MANAGED_BY_LABEL.to_string(), "whole-repository-project".to_string()),
+                    ("example.com/preserved".to_string(), "true".to_string()),
+                ]))
+                .annotations(BTreeMap::from([("example.com/note".to_string(), "keep".to_string())]))
+                .build(),
+            &ProjectSpec::builder()
+                .display_name("Before".to_string())
+                .default_workflow_ref("single-agent-trusted".to_string())
+                .repositories(vec![flotilla_resources::ProjectRepositorySpec {
+                    repo: RepositoryKey("repository".to_string()),
+                    subpath: None,
+                    default_branch: None,
+                }])
+                .build(),
+        )
+        .await
+        .expect("labelled Project should be created");
+    let mut rx = daemon.subscribe();
+    let yaml = r#"
+display_name: After
+default_workflow_ref: single-agent-trusted
+issue_source:
+  service: https://linear.app
+  scope: KEEP
+repositories:
+  - repo: repository
+"#;
+
+    let id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ProjectApply { name: "labelled".into(), spec_yaml: yaml.into() },
+        })
+        .await
+        .expect("execute");
+
+    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ProjectApplied { name: "labelled".into() });
+    let project = projects.get("labelled").await.expect("Project should remain");
+    assert_eq!(project.spec.display_name, "After");
+    assert_eq!(project.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("whole-repository-project"));
+    assert_eq!(project.metadata.labels.get("example.com/preserved").map(String::as_str), Some("true"));
+    assert_eq!(project.metadata.annotations.get("example.com/note").map(String::as_str), Some("keep"));
+}
+
+#[tokio::test]
 async fn convoy_create_carries_project_ref() {
     let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
