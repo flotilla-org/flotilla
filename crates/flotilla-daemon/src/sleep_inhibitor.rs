@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeSet,
+    process::{Output, Stdio},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use flotilla_protocol::SleepInhibitionHealth;
@@ -12,9 +16,12 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-const RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+const HEALTHY_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
+const ACQUISITION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const FAILED_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 const ACQUISITION_CONFIRMATION: Duration = Duration::from_millis(250);
 const KDE_INHIBITION_ENFORCEMENT_DELAY: Duration = Duration::from_millis(5_250);
+const KDE_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(3);
 const FAILURE_THRESHOLD: u32 = 3;
 const INHIBITOR_REASON: &str = "Flotilla vessel crew is active";
 
@@ -39,9 +46,8 @@ async fn run_with_inhibitor<I: SleepInhibitor>(
     maintain_and_publish(&mut inhibitor, active.required(), &mut health, &hosts, &host_id).await?;
 
     let mut watch = convoys.watch(WatchStart::resuming_from(&listed)).await?;
-    let mut recheck = tokio::time::interval(RECHECK_INTERVAL);
-    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    recheck.tick().await;
+    let recheck = tokio::time::sleep(health.recheck_interval());
+    tokio::pin!(recheck);
 
     loop {
         tokio::select! {
@@ -50,13 +56,15 @@ async fn run_with_inhibitor<I: SleepInhibitor>(
                     Some(Ok(event)) => {
                         active.apply(event);
                         maintain_and_publish(&mut inhibitor, active.required(), &mut health, &hosts, &host_id).await?;
+                        recheck.as_mut().reset(tokio::time::Instant::now() + health.recheck_interval());
                     }
                     Some(Err(error)) => return Err(error),
                     None => return Err(ResourceError::other("sleep inhibitor convoy watch ended")),
                 }
             }
-            _ = recheck.tick() => {
+            _ = &mut recheck => {
                 maintain_and_publish(&mut inhibitor, active.required(), &mut health, &hosts, &host_id).await?;
+                recheck.as_mut().reset(tokio::time::Instant::now() + health.recheck_interval());
             }
         }
     }
@@ -113,7 +121,7 @@ impl InhibitionHealthTracker {
                     SleepInhibitionHealth::Acquiring { consecutive_failures: self.consecutive_failures, message: error.clone() }
                 };
                 let log = if self.consecutive_failures == FAILURE_THRESHOLD
-                    && !matches!(self.published, Some(SleepInhibitionHealth::Failed { .. }))
+                    && (!matches!(self.published, Some(SleepInhibitionHealth::Failed { .. })) || error_changed)
                 {
                     FailureLog::Degraded
                 } else if self.consecutive_failures == 1 || error_changed {
@@ -129,6 +137,14 @@ impl InhibitionHealthTracker {
             health
         });
         HealthObservation { changed, log, error }
+    }
+
+    fn recheck_interval(&self) -> Duration {
+        match self.published.as_ref() {
+            Some(SleepInhibitionHealth::Acquiring { .. }) => ACQUISITION_RETRY_INTERVAL,
+            Some(SleepInhibitionHealth::Failed { .. }) => FAILED_RETRY_INTERVAL,
+            _ => HEALTHY_RECHECK_INTERVAL,
+        }
     }
 }
 
@@ -279,15 +295,13 @@ enum InhibitorVerification {
 }
 
 async fn verify_kde_power_inhibition() -> Result<(), String> {
-    let output = Command::new("qdbus6")
-        .args([
-            "org.freedesktop.PowerManagement.Inhibit",
-            "/org/freedesktop/PowerManagement/Inhibit",
-            "org.freedesktop.PowerManagement.Inhibit.HasInhibit",
-        ])
-        .output()
-        .await
-        .map_err(|error| format!("verify KDE power inhibition with qdbus6: {error}"))?;
+    let mut command = Command::new("qdbus6");
+    command.args([
+        "org.freedesktop.PowerManagement.Inhibit",
+        "/org/freedesktop/PowerManagement/Inhibit",
+        "org.freedesktop.PowerManagement.Inhibit.HasInhibit",
+    ]);
+    let output = command_output_with_timeout(command, KDE_VERIFICATION_TIMEOUT, "verify KDE power inhibition with qdbus6").await?;
     if !output.status.success() {
         return Err(format!("verify KDE power inhibition with qdbus6: {}", String::from_utf8_lossy(&output.stderr).trim()));
     }
@@ -295,6 +309,14 @@ async fn verify_kde_power_inhibition() -> Result<(), String> {
         return Err("KDE power inhibition was not active after its enforcement delay".to_string());
     }
     Ok(())
+}
+
+async fn command_output_with_timeout(mut command: Command, timeout: Duration, description: &str) -> Result<Output, String> {
+    command.kill_on_drop(true);
+    tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| format!("{description}: timed out after {}s", timeout.as_secs_f64()))?
+        .map_err(|error| format!("{description}: {error}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -470,6 +492,7 @@ mod tests {
         assert_eq!(third, SleepInhibitionHealth::Failed { consecutive_failures: FAILURE_THRESHOLD, message: "polkit denied".to_string() });
 
         assert!(tracker.observe(Err("polkit denied".to_string())).changed.is_none(), "identical failures should stay deduplicated");
+        assert_eq!(tracker.recheck_interval(), FAILED_RETRY_INTERVAL);
     }
 
     #[tokio::test]
@@ -506,6 +529,18 @@ mod tests {
         assert!(error.contains("exited during acquisition confirmation with exit status: 1"), "{error}");
         assert!(error.contains("polkit denied"), "{error}");
         assert!(inhibitor.child.is_none());
+    }
+
+    #[tokio::test]
+    async fn external_verification_command_is_bounded_by_a_timeout() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+
+        let error = command_output_with_timeout(command, Duration::from_millis(10), "test verification")
+            .await
+            .expect_err("slow verification should time out");
+
+        assert!(error.contains("test verification: timed out"), "{error}");
     }
 
     #[test]
