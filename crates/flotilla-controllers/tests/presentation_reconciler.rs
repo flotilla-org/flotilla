@@ -687,10 +687,12 @@ async fn create_ready_host(backend: &ResourceBackend, name: &str) {
         capabilities: BTreeMap::new(),
         heartbeat_at: Utc::now(),
         ready: true,
+        resource_store: None,
         daemon_generation: None,
         daemon_version: None,
         daemon_started_at: None,
         disk_free_bytes: None,
+        conditions: Vec::new(),
     }
     .apply(&mut status);
     hosts.update_status(name, &created.metadata.resource_version, &status).await.expect("host status update should succeed");

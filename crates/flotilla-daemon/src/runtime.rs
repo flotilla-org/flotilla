@@ -36,9 +36,10 @@ use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance,
     CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy, ConvoyReconciler, ConvoyTeardownRuntime, CrewSource, CrewSpec,
     Demand, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host, HostCondition,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
-    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend, ResourceError,
-    ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch,
+    InputDefinition, InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend,
+    ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate,
+    WorkflowTemplateSpec,
     AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
 };
 use serde_json::json;
@@ -943,7 +944,6 @@ async fn apply_host_heartbeat_with_credentials(
     ensure_host_exists(&daemon.resource_backend(), namespace, &profile.host_id).await?;
     let backend = daemon.resource_backend();
     let hosts = backend.using::<Host>(namespace);
-    let host = hosts.get(&profile.host_id).await.map_err(|err| err.to_string())?;
     let summary = daemon.local_host_summary().await;
     let resource_store = backend.diagnostics().await.map_err(|err| err.to_string())?;
     if let Some(diagnostics) = resource_store.as_ref().filter(|diagnostics| !diagnostics.warnings.is_empty()) {
@@ -965,9 +965,9 @@ async fn apply_host_heartbeat_with_credentials(
         .await
         .map_err(|error| format!("measure available disk space: {error}"))?;
     let conditions = runtime_health.conditions();
-    let status = HostStatus {
+    let patch = HostStatusPatch::Heartbeat {
         capabilities: host_capabilities(&summary, profile, &held_credentials),
-        heartbeat_at: Some(Utc::now()),
+        heartbeat_at: Utc::now(),
         ready: conditions.is_empty(),
         resource_store,
         daemon_generation: health.generation.clone(),
@@ -976,7 +976,7 @@ async fn apply_host_heartbeat_with_credentials(
         disk_free_bytes,
         conditions,
     };
-    hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|err| err.to_string())?;
+    flotilla_resources::apply_status_patch(&hosts, &profile.host_id, &patch).await.map_err(|err| err.to_string())?;
     daemon.refresh_connected_peer_host_heartbeats().await;
     Ok(())
 }

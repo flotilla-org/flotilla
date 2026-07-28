@@ -77,16 +77,24 @@ pub struct HostCondition {
     pub observed_at: DateTime<Utc>,
 }
 
+/// Heartbeat-owned fields cover everything the periodic heartbeat tick computes:
+/// liveness, capabilities, daemon identity, disk/resource-store diagnostics, and
+/// runtime-health conditions. Applying this patch through [`crate::apply_status_patch`]
+/// merges those fields onto the latest observed status rather than reconstructing the
+/// whole [`HostStatus`] from a possibly-stale read, so a concurrent writer of a
+/// status field this patch does not list survives a heartbeat tick instead of racing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostStatusPatch {
     Heartbeat {
         capabilities: BTreeMap<String, serde_json::Value>,
         heartbeat_at: DateTime<Utc>,
         ready: bool,
+        resource_store: Option<ResourceStoreDiagnostics>,
         daemon_generation: Option<String>,
         daemon_version: Option<String>,
         daemon_started_at: Option<DateTime<Utc>>,
         disk_free_bytes: Option<u64>,
+        conditions: Vec<HostCondition>,
     },
 }
 
@@ -97,18 +105,22 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 capabilities,
                 heartbeat_at,
                 ready,
+                resource_store,
                 daemon_generation,
                 daemon_version,
                 daemon_started_at,
                 disk_free_bytes,
+                conditions,
             } => {
                 status.capabilities = capabilities.clone();
                 status.heartbeat_at = Some(*heartbeat_at);
                 status.ready = *ready;
+                status.resource_store.clone_from(resource_store);
                 status.daemon_generation.clone_from(daemon_generation);
                 status.daemon_version.clone_from(daemon_version);
                 status.daemon_started_at = *daemon_started_at;
                 status.disk_free_bytes = *disk_free_bytes;
+                status.conditions.clone_from(conditions);
             }
         }
     }

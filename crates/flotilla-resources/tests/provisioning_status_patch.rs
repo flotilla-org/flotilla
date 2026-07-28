@@ -1,28 +1,40 @@
 use chrono::{TimeZone, Utc};
 use flotilla_resources::{
     CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus,
-    CloneStatusPatch, ConditionValue, EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch, HostStatus, HostStatusPatch,
-    InnerCommandStatus, IntegrationCondition, LandedEvidence, PresentationPhase, PresentationStatus, PresentationStatusPatch, Stance,
-    StatusPatch, TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch, VesselPhase, VesselStatus, VesselStatusPatch,
+    CloneStatusPatch, ConditionValue, EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch, HostCondition, HostStatus,
+    HostStatusPatch, InnerCommandStatus, IntegrationCondition, LandedEvidence, PresentationPhase, PresentationStatus,
+    PresentationStatusPatch, ResourceStoreDiagnostics, Stance, StatusPatch, TerminalSessionPhase, TerminalSessionStatus,
+    TerminalSessionStatusPatch, VesselPhase, VesselStatus, VesselStatusPatch,
 };
 
 #[test]
 fn host_status_patch_updates_heartbeat_snapshot() {
     let mut status = HostStatus::default();
+    let condition = HostCondition::builder()
+        .condition_type("Controller/checkout")
+        .value(ConditionValue::True)
+        .reason("Running")
+        .message("checkout controller healthy")
+        .observed_at(Utc::now())
+        .build();
     HostStatusPatch::Heartbeat {
         capabilities: [("docker".to_string(), serde_json::Value::Bool(true))].into_iter().collect(),
         heartbeat_at: Utc::now(),
         ready: true,
+        resource_store: Some(ResourceStoreDiagnostics::default()),
         daemon_generation: None,
         daemon_version: None,
         daemon_started_at: None,
         disk_free_bytes: None,
+        conditions: vec![condition.clone()],
     }
     .apply(&mut status);
 
     assert_eq!(status.capabilities.get("docker"), Some(&serde_json::Value::Bool(true)));
     assert!(status.heartbeat_at.is_some());
     assert!(status.ready);
+    assert_eq!(status.resource_store, Some(ResourceStoreDiagnostics::default()));
+    assert_eq!(status.conditions, vec![condition]);
 }
 
 #[test]
