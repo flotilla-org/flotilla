@@ -36,6 +36,17 @@ being shared across crews in one checkout is likewise mostly a *feature* —
 shared project context — with per-crew worktrees an option where independent
 git state is wanted, not a hygiene requirement.
 
+**The operative question (Robert, 2026-07-28):** what config does each agent
+need to **get on with working instead of thinking it needs to onboard itself**?
+Every CLI has a first-run surface — login flows, trust/permission dialogs, theme
+and telemetry prompts, model pickers — and the seed set per agent is exactly
+whatever pre-answers all of it. Acceptance test for any seeding implementation:
+**a freshly spawned crew session reaches its brief with zero interactive
+prompts.** Any prompt observed is a missing item in that agent's seed set, not
+crew behaviour to work around. The per-agent sections below should be read as
+inventories toward that set (auth material first, but equally
+first-run/onboarding flags, workspace trust, and default model/settings).
+
 ## Executive summary
 
 Every one of the five agent CLIs can be isolated per crew member by
