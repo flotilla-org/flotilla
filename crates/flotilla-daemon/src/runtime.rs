@@ -494,16 +494,23 @@ async fn reconcile_builtin_workflow_templates(backend: &ResourceBackend, namespa
         match templates.get(name).await {
             Ok(existing) => {
                 let spec_diverged = existing.spec != spec;
+                let managed_by_builtin =
+                    existing.metadata.labels.get(MANAGED_BY_LABEL).is_some_and(|value| value == BUILTIN_MANAGED_BY_VALUE);
+                if !spec_diverged && managed_by_builtin {
+                    continue;
+                }
                 if !spec_diverged {
+                    templates
+                        .update(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &existing.metadata.resource_version, &spec)
+                        .await
+                        .map_err(|err| format!("reconcile builtin workflow template {name}: {err}"))?;
                     continue;
                 }
                 templates
                     .update(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &existing.metadata.resource_version, &spec)
                     .await
                     .map_err(|err| format!("reconcile builtin workflow template {name}: {err}"))?;
-                if spec_diverged {
-                    warn!(template = %name, "stored spec diverged from code builtin; overwriting");
-                }
+                warn!(template = %name, "stored spec diverged from code builtin; overwriting");
             }
             Err(ResourceError::NotFound { .. }) => {
                 templates
@@ -2832,7 +2839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_seeding_does_not_update_matching_unlabelled_builtin_template() {
+    async fn startup_seeding_labels_matching_unlabelled_builtin_template_once() {
         const NAMESPACE: &str = "test";
         let backend = ResourceBackend::InMemory(Default::default());
         let templates = backend.clone().using::<WorkflowTemplate>(NAMESPACE);
@@ -2844,9 +2851,14 @@ mod tests {
 
         reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("startup reconciliation should succeed");
 
+        let labelled = templates.get("single-agent-contained").await.expect("template should remain");
+        assert_ne!(labelled.metadata.resource_version, existing.metadata.resource_version);
+        assert_eq!(labelled.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(BUILTIN_MANAGED_BY_VALUE));
+
+        reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("restart reconciliation should succeed");
+
         let unchanged = templates.get("single-agent-contained").await.expect("template should remain");
-        assert_eq!(unchanged.metadata.resource_version, existing.metadata.resource_version);
-        assert!(!unchanged.metadata.labels.contains_key(MANAGED_BY_LABEL));
+        assert_eq!(unchanged.metadata.resource_version, labelled.metadata.resource_version);
     }
 
     fn manual_profile(host_id: &str, docker_available: bool) -> LocalProvisioningProfile {
