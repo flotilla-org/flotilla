@@ -692,6 +692,29 @@ mod command_result_human {
     }
 
     #[test]
+    fn fleet_health_shows_degraded_host_conditions() {
+        let result = CommandValue::FleetHealth(Box::new(FleetHealthResponse {
+            hosts: vec![FleetHostRow::builder()
+                .host(HostName::new("feta"))
+                .is_local(false)
+                .configured(true)
+                .link(PeerConnectionState::Connected)
+                .crew_count(0)
+                .convoy_count(4)
+                .staleness(FleetHostStaleness::Current)
+                .observation_agreement(FleetObservationAgreement::Agree)
+                .degraded_conditions(vec!["Controller/checkout: checkout controller stopped after 10 consecutive failures".to_string()])
+                .build()],
+        }));
+
+        let output = format_command_result(&result);
+
+        assert!(output.contains("⚠ DEGRADED"), "expected degraded diagnosis:\n{output}");
+        assert!(output.contains("Controller/checkout"), "expected named controller condition:\n{output}");
+        assert!(output.contains("10 consecutive failures"), "expected condition detail:\n{output}");
+    }
+
+    #[test]
     fn fleet_list_shows_crewless_failed_convoy() {
         let result = CommandValue::FleetList(Box::new(FleetListResponse {
             rows: vec![FleetListRow::builder()

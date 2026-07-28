@@ -378,6 +378,10 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
     let remote = ResourceBackend::Http(http).using::<T>(REPLICATION_NAMESPACE);
     let writer = daemon.resource_backend().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut listed = remote.list().await.map_err(|error| error.to_string())?;
+    // Validate the persisted cache before trusting its cursor. The SQLite
+    // backend quarantines an undecodable replica partition and removes this
+    // cursor, turning a cache schema mismatch into the full relist below.
+    daemon.resource_backend().including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
     let cursor = writer.cursor().await.map_err(|error| error.to_string())?;
     if let Some(cursor) = cursor.clone().filter(|cursor| cursor.generation == listed.generation) {
         let start = match cursor.generation {
@@ -433,6 +437,7 @@ async fn replicate_kind_over_routed_watch<T: Resource>(
     peer: &NodeId,
 ) -> Result<(), String> {
     let writer = daemon.resource_backend().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
+    daemon.resource_backend().including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
     let cursor = writer.cursor().await.map_err(|error| error.to_string())?;
     match run_routed_watch::<T>(router, daemon, peer, cursor.clone()).await {
         Ok(()) => Ok(()),
