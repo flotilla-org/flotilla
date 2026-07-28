@@ -398,8 +398,7 @@ struct ConvoyFixpoint;
 
 impl FixpointPredicate<ConvoyWorld> for ConvoyFixpoint {
     fn at_fixpoint(&self, world: &ConvoyWorld) -> bool {
-        !world.contradictory
-            && world.passes > 0
+        world.passes > 0
             && world.current.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landing | ConvoyPhase::Landed))
     }
 
