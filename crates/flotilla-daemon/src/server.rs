@@ -514,11 +514,6 @@ async fn handle_client_session(
     };
 
     match first_msg {
-        Message::Request { id, request } => {
-            ClientConnection::new(daemon, shutdown_rx, remote_command_router, client_count, client_notify, agent_state_store)
-                .run(Arc::clone(&session), id, request)
-                .await;
-        }
         Message::Hello { protocol_version, node_id, display_name, session_id, connection_role, surface } => {
             if environment_context.is_some() {
                 warn!("peer/client hello on per-environment socket is unsupported");
@@ -528,8 +523,8 @@ async fn handle_client_session(
             if connection_role == Some(ConnectionRole::Client) {
                 // Stateful client handshake: reply with server Hello, then enter
                 // stateful client loop (session_id used for cursor ownership).
-                // The reply is sent even on version mismatch so the client can
-                // report which versions disagreed.
+                // The reply is sent even on a generation/version mismatch so
+                // the client can report which two binaries disagreed.
                 if session
                     .write(Message::Hello {
                         protocol_version: PROTOCOL_VERSION,
@@ -544,8 +539,18 @@ async fn handle_client_session(
                 {
                     return;
                 }
+                let client_generation = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
                 if protocol_version != PROTOCOL_VERSION {
                     warn!(expected = PROTOCOL_VERSION, got = protocol_version, %node_id, "rejecting client with protocol version mismatch");
+                    return;
+                }
+                if !flotilla_protocol::wire_generations_match(client_generation, BUILD_ID) {
+                    warn!(
+                        expected = BUILD_ID,
+                        got = client_generation,
+                        %node_id,
+                        "rejecting client with wire generation mismatch"
+                    );
                     return;
                 }
                 let surface = match surface {
@@ -563,7 +568,7 @@ async fn handle_client_session(
             }
         }
         other => {
-            warn!(msg = ?other, "unexpected first message type from client");
+            warn!(msg = ?other, "rejecting connection without Hello handshake");
         }
     }
 }

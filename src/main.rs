@@ -1500,35 +1500,10 @@ async fn run_hook(cli: &Cli, harness: &str, event_type: &str) -> Result<()> {
 
 /// One-shot client: connect to daemon, send an AgentHook request, read one response, exit.
 async fn send_hook_event(socket_path: &std::path::Path, event: AgentHookEvent) -> Result<()> {
-    use flotilla_protocol::{framing, Message, Request, ResponseResult};
-    use tokio::{
-        io::{AsyncBufReadExt, BufReader},
-        net::UnixStream,
-    };
-
-    let stream = UnixStream::connect(socket_path)
+    let daemon = flotilla_tui::socket::SocketDaemon::connect(socket_path)
         .await
-        .map_err(|e| color_eyre::eyre::eyre!("failed to connect to daemon at {}: {e}", socket_path.display()))?;
-
-    let (reader, mut writer) = stream.into_split();
-
-    // Send request
-    let msg = Message::Request { id: 1, request: Request::AgentHook { event } };
-    framing::write_message_line(&mut writer, &msg).await.map_err(|e| color_eyre::eyre::eyre!("write error: {e}"))?;
-
-    // Read response
-    let mut buf_reader = BufReader::new(reader);
-    let mut line = String::new();
-    buf_reader.read_line(&mut line).await.map_err(|e| color_eyre::eyre::eyre!("read error: {e}"))?;
-
-    let response: Message = serde_json::from_str(line.trim()).map_err(|e| color_eyre::eyre::eyre!("parse response: {e}"))?;
-    match response {
-        Message::Response { response, .. } => match *response {
-            ResponseResult::Ok { .. } => Ok(()),
-            ResponseResult::Err { message } => Err(color_eyre::eyre::eyre!("daemon error: {message}")),
-        },
-        other => Err(color_eyre::eyre::eyre!("unexpected response: {other:?}")),
-    }
+        .map_err(|error| color_eyre::eyre::eyre!("failed to connect to daemon at {}: {error}", socket_path.display()))?;
+    daemon.send_agent_hook(event).await.map_err(|error| color_eyre::eyre::eyre!("daemon error: {error}"))
 }
 
 async fn run_hooks_command(command: &HooksSubCommand) -> Result<()> {

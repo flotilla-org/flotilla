@@ -7,7 +7,7 @@ use std::{
 };
 
 use flotilla_core::{agents::SharedAgentStateStore, daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_protocol::{DaemonEvent, Message, QueryId, Request, SurfaceDeclaration};
+use flotilla_protocol::{DaemonEvent, Message, QueryId, SurfaceDeclaration};
 use flotilla_transport::message::MessageSession;
 use tokio::sync::{watch, Notify};
 use tracing::{error, info, warn};
@@ -37,10 +37,6 @@ pub(super) struct ClientConnection {
 }
 
 impl ClientConnection {
-    async fn default_surface(&self) -> SurfaceDeclaration {
-        SurfaceDeclaration::focal_for_namespace(self.daemon.provisioning_namespace().await)
-    }
-
     pub(super) fn new(
         daemon: Arc<InProcessDaemon>,
         shutdown_rx: watch::Receiver<bool>,
@@ -52,24 +48,10 @@ impl ClientConnection {
         Self { daemon, shutdown_rx, remote_command_router, client_count, client_notify, agent_state_store }
     }
 
-    pub(super) async fn run(self, session: Arc<MessageSession>, first_id: u64, first_request: Request) {
-        // Legacy clients without Hello handshake get a random session ID.
-        let session_id = uuid::Uuid::new_v4();
-        let surface = self.default_surface().await;
-        let (event_task, request_dispatcher, mut shutdown_rx) = self.start_session(&session, session_id, surface);
-
-        let first_response = request_dispatcher.dispatch(first_id, first_request).await;
-        if session.write(first_response).await.is_ok() {
-            request_loop(&session, &request_dispatcher, &mut shutdown_rx).await;
-        }
-
-        self.finish_session(event_task, session_id).await;
-    }
-
     /// Run a stateful client session that began with a Hello handshake.
     ///
-    /// Unlike `run`, the first message (Hello) has already been consumed and
-    /// replied to, so the loop starts by awaiting the next message.
+    /// The first message (Hello) has already been consumed and replied to, so
+    /// the loop starts by awaiting the next message.
     pub(super) async fn run_stateful(self, session: Arc<MessageSession>, client_session_id: uuid::Uuid, surface: SurfaceDeclaration) {
         let (event_task, request_dispatcher, mut shutdown_rx) = self.start_session(&session, client_session_id, surface);
         request_loop(&session, &request_dispatcher, &mut shutdown_rx).await;

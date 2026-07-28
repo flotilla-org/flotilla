@@ -704,3 +704,11 @@ fn hello_display_name_carries_build_identity_without_changing_the_envelope() {
     assert_eq!(hello_build_id(&display_name), Some("abc123"));
     assert_eq!(hello_build_id("legacy-daemon"), None);
 }
+
+#[test]
+fn wire_generation_match_requires_equal_known_stamps() {
+    assert!(wire_generations_match("abc123", "abc123"));
+    assert!(!wire_generations_match("abc123", "def456"));
+    assert!(!wire_generations_match("unknown", "unknown"));
+    assert!(!wire_generations_match("abc123", "unknown"));
+}

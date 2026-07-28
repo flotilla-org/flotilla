@@ -1,8 +1,5 @@
 use std::{future::Future, time::Duration};
 
-use flotilla_core::daemon::DaemonHandle;
-use tracing::warn;
-
 const INITIAL_DELAY: Duration = Duration::from_millis(500);
 const MAX_DELAY: Duration = Duration::from_secs(30);
 pub const REEXEC_BUILD_ENV: &str = "FLOTILLA_REEXEC_BUILD";
@@ -43,12 +40,7 @@ pub enum ReconnectNotice {
 }
 
 pub fn is_incompatible_daemon_error(error: &str) -> bool {
-    error.contains("protocol version mismatch")
-}
-
-pub fn build_mismatch(daemon: &dyn DaemonHandle) -> Option<String> {
-    let daemon_build = daemon.build_id()?;
-    (daemon_build != crate::BUILD_ID).then(|| format!("daemon build {daemon_build} differs from this client ({})", crate::BUILD_ID))
+    error.contains("protocol version mismatch") || error.contains("wire generation mismatch")
 }
 
 /// Connect to a daemon with the shared retry policy used by every long-lived
@@ -79,12 +71,6 @@ where
                 attempt += 1;
             }
         }
-    }
-}
-
-pub fn warn_on_build_mismatch(daemon: &dyn DaemonHandle) {
-    if let Some(message) = build_mismatch(daemon) {
-        warn!(%message, "connected daemon and client builds differ");
     }
 }
 
@@ -136,5 +122,22 @@ mod tests {
             ReconnectNotice::Retry { attempt: 2, .. },
             ReconnectNotice::Attempt { attempt: 3 },
         ]));
+    }
+
+    #[tokio::test]
+    async fn wire_generation_mismatch_is_refused_without_retrying() {
+        let mut attempts = 0;
+        let error = connect_with_retry(
+            || {
+                attempts += 1;
+                async { Err::<(), _>("wire generation mismatch: client generation old, daemon generation new".to_string()) }
+            },
+            |_| {},
+        )
+        .await
+        .expect_err("incompatible generations should be terminal");
+
+        assert_eq!(attempts, 1);
+        assert!(error.contains("wire generation mismatch"));
     }
 }

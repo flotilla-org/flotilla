@@ -195,6 +195,13 @@ pub fn hello_build_id(display_name: &str) -> Option<&str> {
     display_name.rsplit_once(BUILD_ID_SEPARATOR).map(|(_, build_id)| build_id).filter(|build_id| !build_id.is_empty())
 }
 
+/// Whether two build stamps identify the same known wire generation.
+///
+/// An unknown stamp cannot prove compatibility, even when both sides report it.
+pub fn wire_generations_match(left: &str, right: &str) -> bool {
+    left != "unknown" && right != "unknown" && left == right
+}
+
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -269,13 +269,39 @@ async fn client_hello_rejects_daemon_protocol_version_mismatch() {
 }
 
 #[tokio::test]
-async fn connect_rejects_daemon_protocol_version_mismatch() {
+async fn client_hello_rejects_daemon_wire_generation_mismatch() {
+    let (client, server) = message_session_pair();
+    let server_task = tokio::spawn(async move {
+        let hello = server.read().await.expect("read client hello").expect("client hello");
+        assert!(matches!(hello, Message::Hello { protocol_version: PROTOCOL_VERSION, .. }));
+        server
+            .write(Message::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                node_id: NodeId::new("daemon"),
+                display_name: flotilla_protocol::hello_display_name("daemon", "stale-daemon-generation"),
+                session_id: uuid::Uuid::new_v4(),
+                connection_role: Some(ConnectionRole::Client),
+                surface: None,
+            })
+            .await
+            .expect("write stale daemon hello");
+    });
+
+    let error = do_client_hello(&client).await.expect_err("wire generation mismatch should reject the daemon");
+    assert!(error.contains(&format!("client generation {BUILD_ID}")), "error should report the client generation: {error}");
+    assert!(error.contains("daemon generation stale-daemon-generation"), "error should report the daemon generation: {error}");
+    assert!(error.contains("rebuild or use the daemon's paired CLI"), "error should provide an actionable recovery: {error}");
+    assert!(!error.contains("failed to parse message"), "error should come from the handshake: {error}");
+    server_task.await.expect("join server task");
+}
+
+async fn assert_connect_rejects_daemon_hello(protocol_version: u32, display_name: String, expected_error: &str) {
     let dir = TestSocketDir::new();
     let socket_path = dir.socket_path("daemon.sock");
     let listener = match UnixListener::bind(&socket_path) {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!("skipping connect_rejects_daemon_protocol_version_mismatch: unix socket bind not permitted: {err}");
+            eprintln!("skipping daemon hello rejection test: unix socket bind not permitted: {err}");
             return;
         }
         Err(err) => panic!("bind listener: {err}"),
@@ -288,9 +314,9 @@ async fn connect_rejects_daemon_protocol_version_mismatch() {
         assert!(matches!(hello, Message::Hello { protocol_version: PROTOCOL_VERSION, .. }));
         session
             .write(Message::Hello {
-                protocol_version: PROTOCOL_VERSION - 1,
+                protocol_version,
                 node_id: NodeId::new("stale-daemon"),
-                display_name: "stale daemon".into(),
+                display_name,
                 session_id: uuid::Uuid::new_v4(),
                 connection_role: Some(ConnectionRole::Client),
                 surface: None,
@@ -306,8 +332,25 @@ async fn connect_rejects_daemon_protocol_version_mismatch() {
         }
         Err(error) => error,
     };
-    assert!(error.contains("protocol version mismatch"), "unexpected error: {error}");
+    assert!(error.contains(expected_error), "unexpected error: {error}");
+    assert!(error.contains("rebuild or use the daemon's paired CLI"), "error should provide an actionable recovery: {error}");
+    assert!(!error.contains("failed to parse message"), "error should come from the handshake: {error}");
     server_task.await.expect("join server task");
+}
+
+#[tokio::test]
+async fn connect_rejects_daemon_protocol_version_mismatch() {
+    assert_connect_rejects_daemon_hello(PROTOCOL_VERSION - 1, "stale daemon".into(), "protocol version mismatch").await;
+}
+
+#[tokio::test]
+async fn connect_rejects_daemon_wire_generation_mismatch() {
+    assert_connect_rejects_daemon_hello(
+        PROTOCOL_VERSION,
+        flotilla_protocol::hello_display_name("stale daemon", "stale-daemon-generation"),
+        "wire generation mismatch",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -490,7 +533,7 @@ async fn dropping_socket_daemon_closes_connection_promptly() {
             .write(Message::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 node_id: NodeId::new("daemon"),
-                display_name: "daemon".into(),
+                display_name: flotilla_protocol::hello_display_name("daemon", BUILD_ID),
                 session_id: uuid::Uuid::new_v4(),
                 connection_role: Some(ConnectionRole::Client),
                 surface: None,
