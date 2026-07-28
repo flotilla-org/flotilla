@@ -59,6 +59,10 @@ fn clone_status_patch_marks_cloning_and_ready() {
     CloneStatusPatch::MarkCloning.apply(&mut status);
     assert_eq!(status.phase, ClonePhase::Cloning);
 
+    CloneStatusPatch::MarkRetrying { message: "clone interrupted".to_string() }.apply(&mut status);
+    assert_eq!(status.phase, ClonePhase::Cloning);
+    assert_eq!(status.message.as_deref(), Some("clone interrupted"));
+
     CloneStatusPatch::MarkReady { default_branch: Some("main".to_string()) }.apply(&mut status);
     assert_eq!(status.phase, ClonePhase::Ready);
     assert_eq!(status.default_branch.as_deref(), Some("main"));

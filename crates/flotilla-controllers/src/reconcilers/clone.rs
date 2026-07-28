@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use flotilla_resources::{
@@ -6,6 +6,8 @@ use flotilla_resources::{
     controller::{ReconcileOutcome, Reconciler},
     Clone, ClonePhase, CloneStatusPatch, Repository, RepositoryIdentity, ResourceError, ResourceObject, TypedResolver,
 };
+
+const CLONE_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[async_trait]
 pub trait CloneRuntime: Send + Sync {
@@ -27,6 +29,7 @@ impl<R> CloneReconciler<R> {
 pub enum CloneDeps {
     None,
     Ready { default_branch: Option<String> },
+    Retrying(String),
     Failed(String),
 }
 
@@ -54,7 +57,8 @@ where
         if obj.metadata.name != expected_name {
             return Ok(CloneDeps::Failed(format!("clone name mismatch: expected {expected_name}")));
         }
-        if obj.status.as_ref().map(|status| status.phase).unwrap_or(ClonePhase::Pending) != ClonePhase::Pending {
+        let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(ClonePhase::Pending);
+        if !matches!(phase, ClonePhase::Pending | ClonePhase::Cloning) {
             return Ok(CloneDeps::None);
         }
 
@@ -65,6 +69,7 @@ where
         };
         Ok(match result {
             Ok(default_branch) => CloneDeps::Ready { default_branch },
+            Err(err) if phase == ClonePhase::Pending => CloneDeps::Retrying(err),
             Err(err) => CloneDeps::Failed(err),
         })
     }
@@ -75,9 +80,11 @@ where
         deps: &Self::Dependencies,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
-        let patch = if obj.status.as_ref().map(|status| status.phase).unwrap_or(ClonePhase::Pending) == ClonePhase::Pending {
+        let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(ClonePhase::Pending);
+        let patch = if matches!(phase, ClonePhase::Pending | ClonePhase::Cloning) {
             match deps {
                 CloneDeps::Ready { default_branch } => Some(CloneStatusPatch::MarkReady { default_branch: default_branch.clone() }),
+                CloneDeps::Retrying(message) => Some(CloneStatusPatch::MarkRetrying { message: message.clone() }),
                 CloneDeps::Failed(message) => Some(CloneStatusPatch::MarkFailed { message: message.clone() }),
                 CloneDeps::None => None,
             }
@@ -85,7 +92,11 @@ where
             None
         };
 
-        ReconcileOutcome::new(patch)
+        let mut outcome = ReconcileOutcome::new(patch);
+        if matches!(deps, CloneDeps::Retrying(_)) {
+            outcome.requeue_after = Some(CLONE_RETRY_AFTER);
+        }
+        outcome
     }
 
     async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {

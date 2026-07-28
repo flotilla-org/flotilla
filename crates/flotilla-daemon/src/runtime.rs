@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, Weak},
     time::Duration,
 };
 
@@ -27,7 +27,7 @@ use flotilla_core::{
         environment::{CreateOpts, EnvironmentHandle},
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool},
-        vcs::{CloneProvisioner, GitCloneProvisioner},
+        vcs::{CloneInspection, CloneProvisioner, GitCloneProvisioner},
         ChannelLabel, CommandRunner,
     },
 };
@@ -436,6 +436,7 @@ struct ControllerRuntimeState {
     host_direct_environment_name: String,
     credential_store: Option<Arc<CredentialStore>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
+    clone_flights: Arc<CloneFlights>,
 }
 
 struct GhForgeDefaultBranchResolver {
@@ -475,6 +476,7 @@ impl ControllerRuntimeState {
             host_direct_environment_name,
             credential_store: None,
             provisioned_environments: Mutex::new(HashMap::new()),
+            clone_flights: Arc::new(CloneFlights::default()),
         }
     }
 
@@ -1128,12 +1130,13 @@ fn spawn_controller_loops(
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
                     let runner = state.daemon.local_command_runner().expect("local runner should exist");
+                    let flights = Arc::clone(&state.clone_flights);
                     async move {
                         ControllerLoop {
                             primary: backend.clone().using::<Clone>(&namespace_string),
                             secondaries: vec![],
                             reconciler: CloneReconciler::new(
-                                Arc::new(CloneControllerRuntime { runner }),
+                                Arc::new(CloneControllerRuntime { runner, flights }),
                                 backend.clone().using::<Repository>(&namespace_string),
                             ),
                             resync_interval: controller_resync_interval,
@@ -1533,17 +1536,59 @@ async fn probe_provisioned_environment(
     Ok((bag, Arc::new(registry)))
 }
 
+#[derive(Default)]
+struct CloneFlights {
+    by_target: StdMutex<HashMap<String, Weak<Mutex<()>>>>,
+}
+
+impl CloneFlights {
+    fn for_target(&self, target_path: &str) -> Arc<Mutex<()>> {
+        let mut by_target = self.by_target.lock().expect("clone flights lock poisoned");
+        by_target.retain(|_, flight| flight.strong_count() > 0);
+        if let Some(flight) = by_target.get(target_path).and_then(Weak::upgrade) {
+            return flight;
+        }
+        let flight = Arc::new(Mutex::new(()));
+        by_target.insert(target_path.to_string(), Arc::downgrade(&flight));
+        flight
+    }
+}
+
 struct CloneControllerRuntime {
     runner: Arc<dyn CommandRunner>,
+    flights: Arc<CloneFlights>,
 }
 
 #[async_trait]
 impl CloneRuntime for CloneControllerRuntime {
     async fn clone_and_inspect(&self, repo_url: &str, target_path: &str) -> Result<Option<String>, String> {
+        let flight = self.flights.for_target(target_path);
+        let _flight_guard = flight.lock().await;
+        if let Some(inspection) = recover_existing_clone(Arc::clone(&self.runner), repo_url, target_path).await? {
+            return Ok(inspection.default_branch);
+        }
+
+        let staging_path = clone_staging_path(target_path);
+        remove_checkout_path(&*self.runner, &staging_path).await?;
         let provisioner = GitCloneProvisioner::new(Arc::clone(&self.runner));
-        let target_path = ExecutionEnvironmentPath::new(target_path);
-        provisioner.clone_repo(repo_url, &target_path).await?;
-        let inspection = provisioner.inspect_clone(&target_path).await?;
+        let staging = ExecutionEnvironmentPath::new(&staging_path);
+        let prepare = async {
+            provisioner.clone_repo(repo_url, &staging).await?;
+            provisioner.inspect_clone(&staging).await
+        }
+        .await;
+        let inspection = match prepare {
+            Ok(inspection) => inspection,
+            Err(error) => return Err(cleanup_failed_checkout(&*self.runner, &staging_path, error).await),
+        };
+        if let Err(error) = tokio::fs::rename(&staging_path, target_path).await {
+            let error = cleanup_failed_checkout(&*self.runner, &staging_path, format!("publish clone: {error}")).await;
+            return match recover_existing_clone(Arc::clone(&self.runner), repo_url, target_path).await {
+                Ok(Some(inspection)) => Ok(inspection.default_branch),
+                Ok(None) => Err(error),
+                Err(adoption_error) => Err(format!("{error}; additionally failed to adopt clone at target: {adoption_error}")),
+            };
+        }
         Ok(inspection.default_branch)
     }
 
@@ -1552,6 +1597,37 @@ impl CloneRuntime for CloneControllerRuntime {
         let inspection = provisioner.inspect_clone(&ExecutionEnvironmentPath::new(target_path)).await?;
         Ok(inspection.default_branch)
     }
+}
+
+async fn recover_existing_clone(
+    runner: Arc<dyn CommandRunner>,
+    repo_url: &str,
+    target_path: &str,
+) -> Result<Option<CloneInspection>, String> {
+    if !runner.path_exists(Path::new(target_path)).await? {
+        return Ok(None);
+    }
+
+    verify_clone_origin(&*runner, repo_url, target_path, "clone target").await?;
+    GitCloneProvisioner::new(runner).inspect_clone(&ExecutionEnvironmentPath::new(target_path)).await.map(Some)
+}
+
+async fn verify_clone_origin(runner: &dyn CommandRunner, repo_url: &str, target_path: &str, target_label: &str) -> Result<(), String> {
+    let origin = runner
+        .run("git", &["-C", target_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop)
+        .await
+        .map_err(|error| format!("{target_label} {target_path} already exists but is not a reusable clone: {error}"))?;
+    let origin = origin.trim();
+    let same_origin = origin == repo_url
+        || canonicalize_repo_url(origin)
+            .ok()
+            .zip(canonicalize_repo_url(repo_url).ok())
+            .is_some_and(|(origin, expected)| origin == expected);
+    if !same_origin {
+        return Err(format!("{target_label} {target_path} already exists with origin {origin}, expected {repo_url}"));
+    }
+
+    Ok(())
 }
 
 struct CheckoutControllerRuntime {
@@ -1688,7 +1764,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         if let Some(prepared) = recover_existing_fresh_clone(&*runner, repo_url, branch, target_path).await? {
             return Ok(prepared);
         }
-        let staging_path = fresh_clone_staging_path(target_path);
+        let staging_path = clone_staging_path(target_path);
         remove_checkout_path(&*runner, &staging_path).await?;
         let clone_ref = base_ref.unwrap_or(branch);
         let prepare = async {
@@ -1741,7 +1817,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             CheckoutRemoval::FreshClone { target_path } => {
                 let target_path = utf8_path(target_path)?;
                 remove_checkout_path(&*runner, target_path).await?;
-                remove_checkout_path(&*runner, &fresh_clone_staging_path(target_path)).await?;
+                remove_checkout_path(&*runner, &clone_staging_path(target_path)).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
             CheckoutRemoval::Worktree { clone_path, branch, target_path } => {
@@ -1864,19 +1940,7 @@ async fn recover_existing_fresh_clone(
         return Ok(None);
     }
 
-    let origin = runner
-        .run("git", &["-C", target_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop)
-        .await
-        .map_err(|error| format!("checkout target {target_path} already exists but is not a reusable clone: {error}"))?;
-    let origin = origin.trim();
-    let same_origin = origin == repo_url
-        || canonicalize_repo_url(origin)
-            .ok()
-            .zip(canonicalize_repo_url(repo_url).ok())
-            .is_some_and(|(origin, expected)| origin == expected);
-    if !same_origin {
-        return Err(format!("checkout target {target_path} already exists with origin {origin}, expected {repo_url}"));
-    }
+    verify_clone_origin(runner, repo_url, target_path, "checkout target").await?;
 
     if branch != "HEAD" {
         let current_branch = runner
@@ -1921,7 +1985,7 @@ async fn cleanup_failed_checkout(runner: &dyn CommandRunner, target_path: &str, 
     }
 }
 
-fn fresh_clone_staging_path(target_path: &str) -> String {
+fn clone_staging_path(target_path: &str) -> String {
     format!("{target_path}.flotilla-clone-partial")
 }
 
@@ -2225,7 +2289,7 @@ mod tests {
         fs,
         process::Command as ProcessCommand,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
     };
@@ -2256,6 +2320,7 @@ mod tests {
     };
     use futures::StreamExt;
     use tempfile::TempDir;
+    use tokio::sync::Notify;
 
     use super::{test_git_repo::TestGitRepo, *};
 
@@ -2330,6 +2395,34 @@ mod tests {
         }
     }
 
+    struct BlockingCloneProcessRunner {
+        clone_attempts: AtomicUsize,
+        clone_started: Notify,
+        release_clone: Notify,
+    }
+
+    #[async_trait]
+    impl CommandRunner for BlockingCloneProcessRunner {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            if cmd == "git" && args.first() == Some(&"clone") {
+                let attempt = self.clone_attempts.fetch_add(1, Ordering::SeqCst);
+                self.clone_started.notify_one();
+                if attempt == 0 {
+                    self.release_clone.notified().await;
+                }
+            }
+            ProcessCommandRunner.run(cmd, args, cwd, label).await
+        }
+
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+        }
+
+        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+            ProcessCommandRunner.exists(cmd, args).await
+        }
+    }
+
     struct TestInteriorEnvironment {
         id: EnvironmentId,
         image: ImageId,
@@ -2376,6 +2469,99 @@ mod tests {
             self.destroyed.store(true, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn clone_runtime_single_flights_concurrent_requests_for_the_same_target() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let target = temp.path().join("clone");
+        let runner = Arc::new(BlockingCloneProcessRunner {
+            clone_attempts: AtomicUsize::new(0),
+            clone_started: Notify::new(),
+            release_clone: Notify::new(),
+        });
+        let flights = Arc::new(CloneFlights::default());
+        let first_runtime = Arc::new(CloneControllerRuntime { runner: runner.clone(), flights: Arc::clone(&flights) });
+        let second_runtime = Arc::new(CloneControllerRuntime { runner: runner.clone(), flights });
+        let repo_url = source.path().to_str().expect("utf-8 source path").to_string();
+        let target_path = target.to_str().expect("utf-8 target path").to_string();
+
+        let first = tokio::spawn({
+            let runtime = Arc::clone(&first_runtime);
+            let repo_url = repo_url.clone();
+            let target_path = target_path.clone();
+            async move { runtime.clone_and_inspect(&repo_url, &target_path).await }
+        });
+        runner.clone_started.notified().await;
+        let second = tokio::spawn({
+            let runtime = Arc::clone(&second_runtime);
+            async move { runtime.clone_and_inspect(&repo_url, &target_path).await }
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        runner.release_clone.notify_one();
+
+        let first = first.await.expect("first clone task should join");
+        let second = second.await.expect("second clone task should join");
+
+        assert_eq!(first.expect("first clone should succeed").as_deref(), Some("main"));
+        assert_eq!(second.expect("second clone should succeed").as_deref(), Some("main"));
+        assert_eq!(runner.clone_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn clone_runtime_adopts_a_matching_clone_that_wins_an_external_flight() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let target = temp.path().join("clone");
+        let runner = Arc::new(BlockingCloneProcessRunner {
+            clone_attempts: AtomicUsize::new(0),
+            clone_started: Notify::new(),
+            release_clone: Notify::new(),
+        });
+        let first_runtime = Arc::new(CloneControllerRuntime { runner: runner.clone(), flights: Arc::new(CloneFlights::default()) });
+        let external_runtime = Arc::new(CloneControllerRuntime { runner: runner.clone(), flights: Arc::new(CloneFlights::default()) });
+        let repo_url = source.path().to_str().expect("utf-8 source path").to_string();
+        let target_path = target.to_str().expect("utf-8 target path").to_string();
+
+        let first = tokio::spawn({
+            let runtime = Arc::clone(&first_runtime);
+            let repo_url = repo_url.clone();
+            let target_path = target_path.clone();
+            async move { runtime.clone_and_inspect(&repo_url, &target_path).await }
+        });
+        runner.clone_started.notified().await;
+        let external = tokio::spawn({
+            let runtime = Arc::clone(&external_runtime);
+            async move { runtime.clone_and_inspect(&repo_url, &target_path).await }
+        });
+        let external = external.await.expect("external clone task should join");
+        runner.release_clone.notify_one();
+        let first = first.await.expect("first clone task should join");
+
+        assert_eq!(external.expect("external clone should succeed").as_deref(), Some("main"));
+        assert_eq!(first.expect("losing flight should adopt the external clone").as_deref(), Some("main"));
+        assert_eq!(runner.clone_attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn clone_runtime_retries_after_an_interrupted_clone() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let target = temp.path().join("clone");
+        let runtime = CloneControllerRuntime {
+            runner: Arc::new(FailFirstCloneProcessRunner { failed: AtomicBool::new(false) }),
+            flights: Arc::new(CloneFlights::default()),
+        };
+        let repo_url = source.path().to_str().expect("utf-8 source path");
+        let target_path = target.to_str().expect("utf-8 target path");
+
+        runtime.clone_and_inspect(repo_url, target_path).await.expect_err("interrupted clone should fail its first actuation");
+        assert!(!target.exists(), "failed clone debris should be removed");
+
+        let default_branch = runtime.clone_and_inspect(repo_url, target_path).await.expect("redrive should replace the interrupted clone");
+
+        assert_eq!(default_branch.as_deref(), Some("main"));
     }
 
     struct TestInteriorEnvironmentProvider {
@@ -2881,7 +3067,7 @@ mod tests {
             )
             .await
             .expect_err("interrupted clone should fail its first actuation");
-        assert!(!Path::new(&fresh_clone_staging_path(target.to_str().expect("utf-8 target path"))).exists());
+        assert!(!Path::new(&clone_staging_path(target.to_str().expect("utf-8 target path"))).exists());
 
         runtime
             .create_fresh_clone(
@@ -2906,7 +3092,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let target = temp.path().join("fresh-clone");
         let target = target.to_str().expect("utf-8 target path");
-        let staging_path = fresh_clone_staging_path(target);
+        let staging_path = clone_staging_path(target);
         fs::create_dir_all(&staging_path).expect("create partial clone directory");
         fs::write(Path::new(&staging_path).join("partial"), "incomplete clone").expect("write partial clone content");
         let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
