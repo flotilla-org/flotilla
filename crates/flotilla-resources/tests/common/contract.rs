@@ -350,6 +350,22 @@ pub async fn assert_project_definition_edit_converges_with_backend(backend: Reso
     assert!(converged_on_kiwi.metadata.merge.as_ref().expect("definition merge metadata").conflicts.is_empty());
 }
 
+pub async fn assert_project_definition_metadata_edit_converges_with_backend(backend: ResourceBackend) {
+    let backend = backend.with_local_root(flotilla_protocol::NodeId::new("local-root"));
+    let projects = backend.definitions::<Project>("flotilla");
+    let spec = project_spec("Widgets", "default");
+    let created = projects.apply(&InputMeta::builder().name("widgets".to_string()).build(), &spec).await.expect("create Project baseline");
+    let mut labelled_meta = InputMeta::from(&created.metadata);
+    labelled_meta.labels.insert("flotilla.work/managed-by".to_string(), "generator".to_string());
+
+    let labelled = projects.apply(&labelled_meta, &spec).await.expect("apply Project metadata");
+    assert_ne!(labelled.metadata.resource_version, created.metadata.resource_version);
+    assert_eq!(labelled.metadata.labels.get("flotilla.work/managed-by").map(String::as_str), Some("generator"));
+
+    let unchanged = projects.apply(&labelled_meta, &spec).await.expect("reapply matching Project metadata");
+    assert_eq!(unchanged.metadata.resource_version, labelled.metadata.resource_version);
+}
+
 pub async fn assert_project_definition_causal_merge_with_backend(backend: ResourceBackend) {
     let kiwi_root = flotilla_protocol::NodeId::new("kiwi-root");
     let feta_root = flotilla_protocol::NodeId::new("feta-root");

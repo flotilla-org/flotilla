@@ -45,8 +45,8 @@ use flotilla_resources::{
     ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, ROLE_LABEL,
-    VESSEL_LABEL, VESSEL_REF_LABEL,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -3451,6 +3451,48 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
     })
 }
 
+const WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE: &str = "whole-repository-project";
+
+fn whole_repository_project_meta(name: impl Into<String>) -> InputMeta {
+    InputMeta::builder()
+        .name(name.into())
+        .labels(BTreeMap::from([(MANAGED_BY_LABEL.to_string(), WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE.to_string())]))
+        .build()
+}
+
+/// Converges the fields owned by the whole-repository generator while leaving
+/// user-owned presentation and issue-routing fields intact.
+async fn reconcile_whole_repository_project_definition(
+    projects: &flotilla_resources::DefinitionResolver<Project>,
+    existing: ResourceObject<Project>,
+    generated: &ProjectSpec,
+) -> Result<ResourceObject<Project>, String> {
+    let generator_fields_diverged =
+        existing.spec.default_workflow_ref != generated.default_workflow_ref || existing.spec.repositories != generated.repositories;
+    let managed_by_generator =
+        existing.metadata.labels.get(MANAGED_BY_LABEL).is_some_and(|value| value == WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE);
+    if !generator_fields_diverged && managed_by_generator {
+        return Ok(existing);
+    }
+
+    let mut reconciled_spec = existing.spec.clone();
+    reconciled_spec.default_workflow_ref.clone_from(&generated.default_workflow_ref);
+    reconciled_spec.repositories.clone_from(&generated.repositories);
+    let mut meta = InputMeta::from(&existing.metadata);
+    meta.labels.insert(MANAGED_BY_LABEL.to_string(), WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE.to_string());
+    let reconciled = projects
+        .apply(&meta, &reconciled_spec)
+        .await
+        .map_err(|error| format!("reconcile generated whole-repository Project {}: {error}", existing.metadata.name))?;
+    if generator_fields_diverged {
+        warn!(
+            project = %existing.metadata.name,
+            "stored generator-owned whole-repository Project fields diverged; overwriting"
+        );
+    }
+    Ok(reconciled)
+}
+
 fn is_whole_repository_project(spec: &ProjectSpec, repository_key: &RepositoryKey) -> bool {
     matches!(
         spec.repositories.as_slice(),
@@ -4493,6 +4535,8 @@ impl InProcessDaemon {
                         existing.spec.display_name
                     ));
                 }
+                let generated = whole_repository_project_spec(key, existing.spec.display_name.clone())?;
+                reconcile_whole_repository_project_definition(&projects, existing, &generated).await?;
                 return Ok(project_name);
             }
             Err(ResourceError::NotFound { .. }) => {}
@@ -4500,7 +4544,7 @@ impl InProcessDaemon {
         }
 
         let spec = whole_repository_project_spec(key, explicit_display_name.map(str::to_string).unwrap_or(default_name))?;
-        projects.apply(&InputMeta::builder().name(project_name.clone()).build(), &spec).await.map_err(|error| error.to_string())?;
+        projects.apply(&whole_repository_project_meta(project_name.clone()), &spec).await.map_err(|error| error.to_string())?;
         Ok(project_name)
     }
 
@@ -4614,6 +4658,11 @@ impl InProcessDaemon {
             })
             .map(|project| project.metadata.name.clone());
         if let Some(primary_name) = &primary_name {
+            let primary = project_objects
+                .iter_mut()
+                .find(|project| project.metadata.name == *primary_name)
+                .expect("selected primary Project should remain in the listed objects");
+            *primary = reconcile_whole_repository_project_definition(&projects, primary.clone(), &spec).await?;
             for duplicate in project_objects.iter().filter(|project| {
                 project.metadata.name != *primary_name
                     && generated_names.contains(&project.metadata.name)
@@ -4666,11 +4715,12 @@ impl InProcessDaemon {
         }
 
         for project_name in whole_repository_project_names(repository_spec)? {
-            match projects.create(&InputMeta::builder().name(project_name.clone()).build(), &spec).await {
+            match projects.create(&whole_repository_project_meta(project_name.clone()), &spec).await {
                 Ok(_) => return Ok(identity_change),
                 Err(ResourceError::Conflict { .. }) => {
                     let existing = projects.get(&project_name).await.map_err(|error| error.to_string())?;
                     if is_whole_repository_project(&existing.spec, &repository_key) {
+                        reconcile_whole_repository_project_definition(&projects, existing, &spec).await?;
                         return Ok(identity_change);
                     }
                 }

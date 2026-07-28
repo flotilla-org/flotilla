@@ -80,9 +80,12 @@ impl<T: Resource> DefinitionResolver<T> {
         let local_root = self.backend.local_root()?;
         let sources = self.sources_for_name(&meta.name).await?;
         let current = (!sources.is_empty()).then(|| merge_sources(&sources)).transpose()?;
+        let mut admitted_meta = meta.clone();
+        admitted_meta.deletion_timestamp = None;
         let requested = spec_object(spec)?;
         let current_spec = current.as_ref().map(|object| spec_object(&object.spec)).transpose()?;
-        let mut changed = current_spec.is_none();
+        let metadata_changed = current.as_ref().is_some_and(|object| InputMeta::from(&object.metadata) != admitted_meta);
+        let mut changed = current_spec.is_none() || metadata_changed;
         let mut merge = current.as_ref().and_then(|object| object.metadata.merge.clone()).unwrap_or_else(|| MergeMetadata {
             fields: BTreeMap::new(),
             seen: BTreeMap::new(),
@@ -123,8 +126,6 @@ impl<T: Resource> DefinitionResolver<T> {
         merge.seen.insert(local_root, next_counter);
         merge.conflicts.clear();
 
-        let mut admitted_meta = meta.clone();
-        admitted_meta.deletion_timestamp = None;
         match self.backend.using::<T>(&self.namespace).get(&meta.name).await {
             Ok(local) => match &self.backend {
                 ResourceBackend::InMemory(backend) => {
