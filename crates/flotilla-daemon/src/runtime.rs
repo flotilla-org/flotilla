@@ -1523,7 +1523,10 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 return Err(cleanup_failed_checkout(&*runner, &staging_path, error).await);
             }
         };
-        if let Err(error) = runner.run("mv", &["-T", &staging_path, target_path], Path::new("/"), &ChannelLabel::Noop).await {
+        // Checkout actuation is serialized and recovery established that the
+        // target is absent. Plain `mv` is therefore an atomic sibling rename
+        // while remaining portable across GNU and BSD hosts.
+        if let Err(error) = runner.run("mv", &[&staging_path, target_path], Path::new("/"), &ChannelLabel::Noop).await {
             return Err(cleanup_failed_checkout(&*runner, &staging_path, error).await);
         }
         Ok(PreparedCheckout { commit, branch_provenance: CheckoutBranchProvenance::PreExisting })
