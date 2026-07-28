@@ -24,7 +24,7 @@ use flotilla_core::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{run_provisioned_host_detectors, EnvironmentBag},
-        environment::{CreateOpts, EnvironmentHandle},
+        environment::{CreateOpts, EnvironmentHandle, ProvisionedMount, ProvisionedMountMode},
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool},
         vcs::{CloneInspection, CloneProvisioner, GitCloneProvisioner},
@@ -61,6 +61,41 @@ const MANIFEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 const BUILTIN_MANAGED_BY_VALUE: &str = "builtin";
+const CONTAINER_FLOTILLA_PATH: &str = "/usr/local/bin/flotilla";
+
+#[cfg(any(target_os = "linux", test))]
+fn adjacent_flotilla_binary(daemon_binary: &Path) -> Result<DaemonHostPath, String> {
+    let parent = daemon_binary.parent().ok_or_else(|| format!("daemon binary has no parent directory: {}", daemon_binary.display()))?;
+    let flotilla_binary = parent.join("flotilla");
+    if !flotilla_binary.is_file() {
+        return Err(format!("flotilla binary not found next to daemon at {}", flotilla_binary.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let permissions = std::fs::metadata(&flotilla_binary)
+            .map_err(|error| format!("inspect flotilla binary at {}: {error}", flotilla_binary.display()))?
+            .permissions();
+        if permissions.mode() & 0o111 == 0 {
+            return Err(format!("flotilla binary is not executable: {}", flotilla_binary.display()));
+        }
+    }
+    Ok(DaemonHostPath::new(flotilla_binary))
+}
+
+fn running_daemon_flotilla_binary() -> Result<DaemonHostPath, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let daemon_binary = std::env::current_exe().map_err(|error| format!("resolve running daemon binary: {error}"))?;
+        adjacent_flotilla_binary(&daemon_binary)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("daemon-adjacent flotilla injection requires a Linux host; generation-addressed container binaries are not available yet"
+            .to_string())
+    }
+}
 
 struct DaemonConvoyTeardownRuntime {
     daemon: Arc<InProcessDaemon>,
@@ -434,6 +469,7 @@ struct ControllerRuntimeState {
     local_host_ref: String,
     local_repo_root: Option<ExecutionEnvironmentPath>,
     host_direct_environment_name: String,
+    flotilla_binary_path: Result<DaemonHostPath, String>,
     credential_store: Option<Arc<CredentialStore>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     clone_flights: Arc<CloneFlights>,
@@ -474,6 +510,7 @@ impl ControllerRuntimeState {
             local_host_ref,
             local_repo_root,
             host_direct_environment_name,
+            flotilla_binary_path: running_daemon_flotilla_binary(),
             credential_store: None,
             provisioned_environments: Mutex::new(HashMap::new()),
             clone_flights: Arc::new(CloneFlights::default()),
@@ -482,6 +519,12 @@ impl ControllerRuntimeState {
 
     fn with_credential_store(mut self, credential_store: Arc<CredentialStore>) -> Self {
         self.credential_store = Some(credential_store);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_flotilla_binary_path(mut self, flotilla_binary_path: DaemonHostPath) -> Self {
+        self.flotilla_binary_path = Ok(flotilla_binary_path);
         self
     }
 }
@@ -1377,12 +1420,20 @@ struct DockerControllerRuntime {
 #[async_trait]
 impl DockerEnvironmentRuntime for DockerControllerRuntime {
     async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+        if spec.mounts.iter().any(|mount| Path::new(&mount.target_path) == Path::new(CONTAINER_FLOTILLA_PATH)) {
+            return Err(format!("mount target {CONTAINER_FLOTILLA_PATH} is reserved for the flotilla CLI"));
+        }
         let credential_refs = credential_refs_from_environment(spec)?;
         let daemon_socket_path = self
             .state
             .daemon_socket_path
             .clone()
             .ok_or_else(|| "daemon socket path unavailable for docker environment provisioning".to_string())?;
+        let flotilla_binary_path = self
+            .state
+            .flotilla_binary_path
+            .clone()
+            .map_err(|error| format!("flotilla CLI unavailable for docker environment provisioning: {error}"))?;
         let (_, provider) = self
             .state
             .local_registry
@@ -1398,13 +1449,20 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         };
         let image = ImageId::new(spec.image.clone());
         let env_id = EnvironmentId::new(name.to_string());
+        let mut provisioned_mounts = Vec::with_capacity(spec.mounts.len() + 1);
+        provisioned_mounts.push(ProvisionedMount::new(
+            flotilla_binary_path.as_path().to_path_buf(),
+            CONTAINER_FLOTILLA_PATH,
+            ProvisionedMountMode::Ro,
+        ));
+        provisioned_mounts.extend(spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount));
         let handle = match provider
             .create(env_id.clone(), &image, CreateOpts {
                 tokens: Vec::new(),
                 daemon_socket_path,
                 working_directory: None,
                 image_pull_policy: spec.pull_policy.into(),
-                provisioned_mounts: spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount).collect(),
+                provisioned_mounts,
                 docker_config_dir,
             })
             .await
@@ -2306,7 +2364,7 @@ mod tests {
                 },
                 EnvironmentAssertion, EnvironmentBag,
             },
-            environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount},
+            environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
             ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
         },
     };
@@ -2323,6 +2381,41 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{test_git_repo::TestGitRepo, *};
+
+    #[test]
+    fn resolves_flotilla_binary_adjacent_to_daemon() {
+        let temp = TempDir::new().expect("tempdir");
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir(&bin_dir).expect("bin directory");
+        let daemon_binary = bin_dir.join("flotillad");
+        let flotilla_binary = bin_dir.join("flotilla");
+        fs::write(&daemon_binary, "").expect("daemon binary");
+        fs::write(&flotilla_binary, "").expect("flotilla binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&flotilla_binary).expect("flotilla metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&flotilla_binary, permissions).expect("executable flotilla binary");
+        }
+
+        assert_eq!(adjacent_flotilla_binary(&daemon_binary).expect("adjacent flotilla binary"), DaemonHostPath::new(flotilla_binary),);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_executable_flotilla_binary_adjacent_to_daemon() {
+        let temp = TempDir::new().expect("tempdir");
+        let daemon_binary = temp.path().join("flotillad");
+        let flotilla_binary = temp.path().join("flotilla");
+        fs::write(&daemon_binary, "").expect("daemon binary");
+        fs::write(&flotilla_binary, "").expect("flotilla binary");
+
+        let error = adjacent_flotilla_binary(&daemon_binary).expect_err("non-executable flotilla binary should be rejected");
+
+        assert_eq!(error, format!("flotilla binary is not executable: {}", flotilla_binary.display()));
+    }
 
     #[derive(Clone, Copy)]
     enum CompletionAction {
@@ -2584,6 +2677,167 @@ mod tests {
         async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
             Ok(Vec::new())
         }
+    }
+
+    struct CapturingFailingEnvironmentProvider {
+        create_opts: Mutex<Option<CreateOpts>>,
+    }
+
+    #[async_trait]
+    impl EnvironmentProvider for CapturingFailingEnvironmentProvider {
+        async fn ensure_image(&self, _spec: &flotilla_protocol::EnvironmentSpec, _repo_root: &Path) -> Result<ImageId, String> {
+            Err("not used".to_string())
+        }
+
+        async fn create(&self, _id: EnvironmentId, _image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String> {
+            *self.create_opts.lock().await = Some(opts);
+            Err("stop after capturing create options".to_string())
+        }
+
+        async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
+            Err("not used".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn docker_provisioning_mounts_daemon_adjacent_cli_read_only() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"cli-mount-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None) });
+        let mut local_registry = ProviderRegistry::new();
+        local_registry.environment_providers.insert(
+            "docker",
+            flotilla_core::providers::discovery::ProviderDescriptor::named(
+                flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+                "docker",
+            ),
+            Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
+        );
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                daemon,
+                config,
+                Arc::new(local_registry),
+                Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+                "host-test".to_string(),
+                None,
+                "host-direct-host-test".to_string(),
+            )
+            .with_flotilla_binary_path(DaemonHostPath::new("/opt/flotilla/bin/flotilla")),
+        );
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host-test".to_string(),
+            image: "contained-image".to_string(),
+            declared_agent_adapters: BTreeSet::new(),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: BTreeMap::new(),
+        };
+
+        let error =
+            DockerControllerRuntime { state }.provision("contained-work", &spec).await.expect_err("capture provider should stop provision");
+
+        assert_eq!(error, "stop after capturing create options");
+        let opts = provider.create_opts.lock().await.take().expect("captured create options");
+        assert_eq!(opts.provisioned_mounts, vec![ProvisionedMount::new(
+            "/opt/flotilla/bin/flotilla",
+            "/usr/local/bin/flotilla",
+            ProvisionedMountMode::Ro,
+        )],);
+    }
+
+    #[tokio::test]
+    async fn docker_provisioning_reports_unavailable_flotilla_cli() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"cli-unavailable-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let state = Arc::new(ControllerRuntimeState::new(
+            daemon,
+            config,
+            Arc::new(ProviderRegistry::new()),
+            Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+            "host-test".to_string(),
+            None,
+            "host-direct-host-test".to_string(),
+        ));
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host-test".to_string(),
+            image: "contained-image".to_string(),
+            declared_agent_adapters: BTreeSet::new(),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: BTreeMap::new(),
+        };
+
+        let error =
+            DockerControllerRuntime { state }.provision("contained-work", &spec).await.expect_err("missing CLI should fail provision");
+
+        assert!(
+            error.starts_with("flotilla CLI unavailable for docker environment provisioning: "),
+            "unavailable CLI resolution should retain its clear provisioning context: {error}",
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_provisioning_rejects_a_mount_targeting_the_reserved_cli_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"cli-collision-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None) });
+        let mut local_registry = ProviderRegistry::new();
+        local_registry.environment_providers.insert(
+            "docker",
+            flotilla_core::providers::discovery::ProviderDescriptor::named(
+                flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+                "docker",
+            ),
+            Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
+        );
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                daemon,
+                config,
+                Arc::new(local_registry),
+                Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+                "host-test".to_string(),
+                None,
+                "host-direct-host-test".to_string(),
+            )
+            .with_flotilla_binary_path(DaemonHostPath::new("/opt/flotilla/bin/flotilla")),
+        );
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host-test".to_string(),
+            image: "contained-image".to_string(),
+            declared_agent_adapters: BTreeSet::new(),
+            pull_policy: Default::default(),
+            mounts: vec![flotilla_resources::EnvironmentMount {
+                source_path: "/host/replacement-flotilla".to_string(),
+                target_path: "/usr/local/bin/flotilla".to_string(),
+                mode: flotilla_resources::EnvironmentMountMode::Ro,
+            }],
+            env: BTreeMap::new(),
+        };
+
+        let error = DockerControllerRuntime { state }
+            .provision("contained-work", &spec)
+            .await
+            .expect_err("reserved CLI mount should fail provision");
+
+        assert_eq!(error, "mount target /usr/local/bin/flotilla is reserved for the flotilla CLI");
+        assert!(provider.create_opts.lock().await.is_none(), "reserved mount collisions should fail before invoking the provider");
     }
 
     #[tokio::test]
@@ -3262,15 +3516,18 @@ mod tests {
             ),
             Arc::new(TestInteriorEnvironmentProvider { handle: Mutex::new(Some(handle)) }),
         );
-        let state = Arc::new(ControllerRuntimeState::new(
-            daemon,
-            config,
-            Arc::new(local_registry),
-            Some(DaemonHostPath::new("/tmp/flotilla.sock")),
-            "host-test".to_string(),
-            None,
-            "host-direct-host-test".to_string(),
-        ));
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                daemon,
+                config,
+                Arc::new(local_registry),
+                Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+                "host-test".to_string(),
+                None,
+                "host-direct-host-test".to_string(),
+            )
+            .with_flotilla_binary_path(DaemonHostPath::new("/usr/local/bin/flotilla")),
+        );
         let spec = flotilla_resources::DockerEnvironmentSpec {
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
