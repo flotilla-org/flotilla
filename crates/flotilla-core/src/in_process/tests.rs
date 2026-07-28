@@ -15,8 +15,9 @@ use flotilla_protocol::{
     test_support::TestIssue,
     AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, ConvoyStartIntent,
     CrewCommandContext, DaemonEvent, EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostProviderStatus, HostSummary, ImageId,
-    Issue, IssueRef, IssueSource, IssueState, QueryCursor, QueryScope, RepoSelector, RepositoryKey, ResourceRef, ResultSetCondition,
-    SystemInfo, ToolInventory, TopologyRoute, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    Issue, IssueRef, IssueSource, IssueState, PlacementDecision, PlacementTargetHost, QueryCursor, QueryScope, RepoSelector, RepositoryKey,
+    ResourceRef, ResultSetCondition, SystemInfo, ToolInventory, TopologyRoute, AGENT_ADAPTER_PROVIDER_CATEGORY,
+    TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
@@ -2058,6 +2059,36 @@ async fn fleet_list_does_not_add_crewless_row_when_convoy_has_crew() {
     assert_eq!(response.rows[0].convoy, "convoy-a");
     assert_eq!(response.rows[0].crew, "implement/coder");
     assert_eq!(response.rows[0].crew_state, "running");
+}
+
+#[tokio::test]
+async fn fleet_list_scopes_crew_session_placement_decisions_by_namespace_and_convoy() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_running_attach_session(&daemon, &env_ref, "terminal-shared-implement-coder", "session-a", "shared", "implement", "coder").await;
+    let placement = |policy: &str, host: &str| PlacementDecision {
+        policy_name: policy.to_string(),
+        target_host: PlacementTargetHost { reference: format!("{host}-id"), display_name: host.to_string() },
+        refused_candidates: Vec::new(),
+    };
+    let mut local = convoy_row("flotilla", "shared", WireConvoyPhase::Active, None);
+    local.placement_decision = Some(placement("local-policy", "kiwi"));
+    let mut other = convoy_row("zzz", "shared", WireConvoyPhase::Active, None);
+    other.placement_decision = Some(placement("other-policy", "feta"));
+    set_local_convoy_rows(&daemon, 1, vec![local, other]).await;
+
+    let (rows, _) = daemon.local_fleet_rows("flotilla").await.expect("local fleet rows");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].namespace, "flotilla");
+    let decision = rows[0].placement_decision.as_ref().expect("placement decision");
+    assert_eq!(decision.policy_name, "local-policy");
+    assert_eq!(decision.target_host.display_name, "kiwi");
 }
 
 #[tokio::test]

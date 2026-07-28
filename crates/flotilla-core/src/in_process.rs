@@ -6300,7 +6300,9 @@ impl InProcessDaemon {
             .iter()
             .filter_map(|result_set| result_set.rows.as_convoys())
             .flatten()
-            .filter_map(|convoy| convoy.placement_decision.clone().map(|decision| (convoy.name.clone(), decision)))
+            .filter_map(|convoy| {
+                convoy.placement_decision.clone().map(|decision| ((convoy.resource.namespace.clone(), convoy.name.clone()), decision))
+            })
             .collect::<HashMap<_, _>>();
         let environment_map: HashMap<_, _> = environments
             .list()
@@ -6335,6 +6337,7 @@ impl InProcessDaemon {
                 Some(task) => format!("{task}/{role}"),
                 None => role,
             };
+            let convoy_key = (session.metadata.namespace.clone(), convoy.clone());
             let host = environment_map
                 .get(&session.spec.env_ref)
                 .and_then(|environment| resource_environment_host_ref(environment))
@@ -6348,7 +6351,7 @@ impl InProcessDaemon {
                     .crew(crew)
                     .crew_state(session_status_label(session.status.as_ref().map(|status| status.phase)))
                     .host(host)
-                    .maybe_placement_decision(placement_by_convoy.get(&convoy).cloned())
+                    .maybe_placement_decision(placement_by_convoy.get(&convoy_key).cloned())
                     .namespace(session.metadata.namespace.clone())
                     .session(session.metadata.name.clone())
                     .staleness(FleetStaleness::Local)
