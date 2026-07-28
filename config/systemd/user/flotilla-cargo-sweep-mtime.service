@@ -3,4 +3,6 @@ Description=Flotilla mtime-based Cargo artifact sweep
 
 [Service]
 Type=oneshot
+# cargo-sweep spawns `cargo`; the systemd user manager's PATH has no ~/.cargo/bin unless the host configures environment.d
+Environment=PATH=%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=%h/.local/libexec/flotilla/cargo-sweep-mtime.sh

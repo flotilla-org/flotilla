@@ -8,7 +8,7 @@
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>exec "$HOME/.local/libexec/flotilla/cargo-sweep-mtime.sh"</string>
+    <string>PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" exec "$HOME/.local/libexec/flotilla/cargo-sweep-mtime.sh"</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
