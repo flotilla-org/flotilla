@@ -705,6 +705,7 @@ pub enum ConvoyPhase {
     #[default]
     Pending,
     Active,
+    Interrupted,
     Anchored,
     Landing,
     Landed,
@@ -718,6 +719,7 @@ impl ConvoyPhase {
         match self {
             Self::Pending => "pending",
             Self::Active => "active",
+            Self::Interrupted => "interrupted",
             Self::Anchored => "anchored",
             Self::Landing => "landing",
             Self::Landed => "landed",
@@ -743,6 +745,7 @@ pub enum WorkPhase {
     Ready,
     Launching,
     Running,
+    Interrupted,
     Complete,
     Failed,
     Cancelled,
@@ -756,6 +759,7 @@ impl WorkPhase {
             Self::Ready => "ready",
             Self::Launching => "launching",
             Self::Running => "running",
+            Self::Interrupted => "interrupted",
             Self::Complete => "complete",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",

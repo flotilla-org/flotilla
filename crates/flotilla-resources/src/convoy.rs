@@ -160,6 +160,7 @@ pub enum ConvoyPhase {
     #[default]
     Pending,
     Active,
+    Interrupted,
     Anchored,
     Landing,
     Landed,
@@ -200,6 +201,7 @@ pub enum WorkPhase {
     Ready,
     Launching,
     Running,
+    Interrupted,
     Complete,
     Failed,
     Cancelled,
@@ -241,6 +243,7 @@ pub enum CrewWorkPhase {
     #[default]
     Pending,
     Working,
+    Interrupted,
     Done,
     HandedBack,
     Failed,
@@ -300,6 +303,11 @@ pub enum ConvoyStatusPatch {
         /// Crew whose sessions the vessel actually launched. Latent agents are
         /// absent and stay `Pending` until a handoff starts them.
         launched_roles: BTreeSet<String>,
+    },
+    WorkInterrupted {
+        work: String,
+        roles: BTreeSet<String>,
+        message: String,
     },
     ForceWorkCompleted {
         work: String,
@@ -446,6 +454,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Running;
                     state.completion_authority = WorkCompletionAuthority::CrewRollup;
+                    state.message = None;
                 }
                 if let Some(crew) = status.crew_work.get_mut(work) {
                     // Only the crew the vessel launched are working. A latent
@@ -456,6 +465,27 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     {
                         state.phase = CrewWorkPhase::Working;
                         state.started_at.get_or_insert(*started_at);
+                    }
+                    for state in crew.values_mut().filter(|state| state.phase == CrewWorkPhase::Interrupted) {
+                        state.phase = CrewWorkPhase::Working;
+                        state.message = None;
+                    }
+                }
+            }
+            Self::WorkInterrupted { work, roles, message } => {
+                if let Some(state) = status.work.get_mut(work) {
+                    state.phase = WorkPhase::Interrupted;
+                    state.completion_authority = WorkCompletionAuthority::CrewRollup;
+                    state.message = Some(message.clone());
+                    state.finished_at = None;
+                }
+                if let Some(crew) = status.crew_work.get_mut(work) {
+                    for (role, state) in crew.iter_mut().filter(|(role, state)| {
+                        roles.contains(*role) && matches!(state.phase, CrewWorkPhase::Working | CrewWorkPhase::Interrupted)
+                    }) {
+                        state.phase = CrewWorkPhase::Interrupted;
+                        state.message = Some(format!("crew session for `{role}` was interrupted"));
+                        state.finished_at = None;
                     }
                 }
             }
@@ -568,7 +598,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                             }
                             state.finished_at.get_or_insert(*transitioned_at);
                         }
-                        WorkPhase::Pending | WorkPhase::Ready | WorkPhase::Launching | WorkPhase::Running => {
+                        WorkPhase::Pending | WorkPhase::Ready | WorkPhase::Launching | WorkPhase::Running | WorkPhase::Interrupted => {
                             state.finished_at = None;
                         }
                     }
@@ -638,6 +668,10 @@ pub mod provisioning_patches {
 
     pub fn work_running(work: String, started_at: DateTime<Utc>, launched_roles: BTreeSet<String>) -> ConvoyStatusPatch {
         ConvoyStatusPatch::WorkRunning { work, started_at, launched_roles }
+    }
+
+    pub fn work_interrupted(work: String, roles: BTreeSet<String>, message: String) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::WorkInterrupted { work, roles, message }
     }
 }
 

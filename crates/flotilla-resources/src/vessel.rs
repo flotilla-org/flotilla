@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ pub enum VesselPhase {
     Pending,
     Provisioning,
     Ready,
+    Interrupted,
     TearingDown,
     Failed,
 }
@@ -46,6 +47,8 @@ pub struct VesselStatus {
     pub checkout_refs: BTreeMap<RepositoryKey, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub terminal_session_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub interrupted_roles: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,6 +76,10 @@ pub enum VesselStatusPatch {
         requested_stance: Stance,
         effective_stance: Stance,
         ready_at: DateTime<Utc>,
+    },
+    MarkInterrupted {
+        roles: BTreeSet<String>,
+        message: String,
     },
     MarkTearingDown,
     MarkFailed {
@@ -106,10 +113,16 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 status.image_digest = image_digest.clone();
                 status.checkout_refs = checkout_refs.clone();
                 status.terminal_session_refs = terminal_session_refs.clone();
+                status.interrupted_roles.clear();
                 status.requested_stance = Some(*requested_stance);
                 status.effective_stance = Some(*effective_stance);
                 status.ready_at.get_or_insert(*ready_at);
                 status.message = None;
+            }
+            Self::MarkInterrupted { roles, message } => {
+                status.phase = VesselPhase::Interrupted;
+                status.interrupted_roles = roles.clone();
+                status.message = Some(message.clone());
             }
             Self::MarkTearingDown => {
                 status.phase = VesselPhase::TearingDown;

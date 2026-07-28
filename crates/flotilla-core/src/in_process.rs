@@ -1470,6 +1470,7 @@ fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<Strin
         flotilla_resources::ConvoyPhase::Cancelled => Some(format!("convoy {} was cancelled while starting", convoy.metadata.name)),
         flotilla_resources::ConvoyPhase::Pending
         | flotilla_resources::ConvoyPhase::Active
+        | flotilla_resources::ConvoyPhase::Interrupted
         | flotilla_resources::ConvoyPhase::Anchored
         | flotilla_resources::ConvoyPhase::Landing
         | flotilla_resources::ConvoyPhase::Landed

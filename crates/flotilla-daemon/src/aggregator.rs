@@ -1912,6 +1912,7 @@ fn convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
     match phase {
         ResourceConvoyPhase::Pending => ConvoyPhase::Pending,
         ResourceConvoyPhase::Active => ConvoyPhase::Active,
+        ResourceConvoyPhase::Interrupted => ConvoyPhase::Interrupted,
         ResourceConvoyPhase::Anchored => ConvoyPhase::Anchored,
         ResourceConvoyPhase::Landing => ConvoyPhase::Landing,
         ResourceConvoyPhase::Landed => ConvoyPhase::Landed,
@@ -1938,6 +1939,7 @@ fn work_phase(phase: ResourceWorkPhase) -> WorkPhase {
         ResourceWorkPhase::Ready => WorkPhase::Ready,
         ResourceWorkPhase::Launching => WorkPhase::Launching,
         ResourceWorkPhase::Running => WorkPhase::Running,
+        ResourceWorkPhase::Interrupted => WorkPhase::Interrupted,
         ResourceWorkPhase::Complete => WorkPhase::Complete,
         ResourceWorkPhase::Failed => WorkPhase::Failed,
         ResourceWorkPhase::Cancelled => WorkPhase::Cancelled,

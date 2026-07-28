@@ -1696,6 +1696,7 @@ fn wire_convoy_phase(phase: crate::convoy_model::ConvoyPhase) -> flotilla_protoc
     match phase {
         crate::convoy_model::ConvoyPhase::Pending => Wire::Pending,
         crate::convoy_model::ConvoyPhase::Active => Wire::Active,
+        crate::convoy_model::ConvoyPhase::Interrupted => Wire::Interrupted,
         crate::convoy_model::ConvoyPhase::Anchored => Wire::Anchored,
         crate::convoy_model::ConvoyPhase::Landing => Wire::Landing,
         crate::convoy_model::ConvoyPhase::Landed => Wire::Landed,
@@ -1712,6 +1713,7 @@ fn wire_work_phase(phase: crate::convoy_model::WorkPhase) -> flotilla_protocol::
         crate::convoy_model::WorkPhase::Ready => Wire::Ready,
         crate::convoy_model::WorkPhase::Launching => Wire::Launching,
         crate::convoy_model::WorkPhase::Running => Wire::Running,
+        crate::convoy_model::WorkPhase::Interrupted => Wire::Interrupted,
         crate::convoy_model::WorkPhase::Complete => Wire::Complete,
         crate::convoy_model::WorkPhase::Failed => Wire::Failed,
         crate::convoy_model::WorkPhase::Cancelled => Wire::Cancelled,

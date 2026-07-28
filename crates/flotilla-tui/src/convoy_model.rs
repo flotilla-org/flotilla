@@ -49,6 +49,7 @@ impl ConvoyId {
 pub enum ConvoyPhase {
     Pending,
     Active,
+    Interrupted,
     Anchored,
     Landing,
     Landed,
@@ -62,6 +63,7 @@ impl From<wire::ConvoyPhase> for ConvoyPhase {
         match phase {
             wire::ConvoyPhase::Pending => Self::Pending,
             wire::ConvoyPhase::Active => Self::Active,
+            wire::ConvoyPhase::Interrupted => Self::Interrupted,
             wire::ConvoyPhase::Anchored => Self::Anchored,
             wire::ConvoyPhase::Landing => Self::Landing,
             wire::ConvoyPhase::Landed => Self::Landed,
@@ -81,6 +83,7 @@ impl ConvoyPhase {
         match self {
             Self::Pending => "pending",
             Self::Active => "active",
+            Self::Interrupted => "interrupted",
             Self::Anchored => "anchored",
             Self::Landing => "landing",
             Self::Landed => "landed",
@@ -97,6 +100,7 @@ pub enum WorkPhase {
     Ready,
     Launching,
     Running,
+    Interrupted,
     Complete,
     Failed,
     Cancelled,
@@ -110,6 +114,7 @@ impl From<wire::WorkPhase> for WorkPhase {
             wire::WorkPhase::Ready => Self::Ready,
             wire::WorkPhase::Launching => Self::Launching,
             wire::WorkPhase::Running => Self::Running,
+            wire::WorkPhase::Interrupted => Self::Interrupted,
             wire::WorkPhase::Complete => Self::Complete,
             wire::WorkPhase::Failed => Self::Failed,
             wire::WorkPhase::Cancelled => Self::Cancelled,

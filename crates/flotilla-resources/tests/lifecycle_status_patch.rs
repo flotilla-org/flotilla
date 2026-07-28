@@ -57,6 +57,7 @@ define_patch_kinds! {
     ConvoySettle => DUPLICATE_RESETTLEMENT,
     ConvoyWorkLaunching => DUPLICATE,
     ConvoyWorkRunning => DUPLICATE,
+    ConvoyWorkInterrupted => CONTINUATION,
     ConvoyForceWorkCompleted => DUPLICATE,
     ConvoyMarkWorkFailed => DUPLICATE,
     ConvoyMarkWorkCancelled => DUPLICATE,
@@ -74,6 +75,7 @@ define_patch_kinds! {
     TerminalMarkFailed => DUPLICATE,
     VesselMarkProvisioning => DUPLICATE,
     VesselMarkReady => DUPLICATE,
+    VesselMarkInterrupted => NONE,
     VesselMarkTearingDown => NONE,
     VesselMarkFailed => NONE,
     PresentationMarkActive => DUPLICATE_NEW_ATTEMPT,
@@ -92,6 +94,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::Settle { .. } => PatchKind::ConvoySettle,
         ConvoyStatusPatch::WorkLaunching { .. } => PatchKind::ConvoyWorkLaunching,
         ConvoyStatusPatch::WorkRunning { .. } => PatchKind::ConvoyWorkRunning,
+        ConvoyStatusPatch::WorkInterrupted { .. } => PatchKind::ConvoyWorkInterrupted,
         ConvoyStatusPatch::ForceWorkCompleted { .. } => PatchKind::ConvoyForceWorkCompleted,
         ConvoyStatusPatch::MarkWorkFailed { .. } => PatchKind::ConvoyMarkWorkFailed,
         ConvoyStatusPatch::MarkWorkCancelled { .. } => PatchKind::ConvoyMarkWorkCancelled,
@@ -119,6 +122,7 @@ fn vessel_patch_kind(patch: &VesselStatusPatch) -> PatchKind {
     match patch {
         VesselStatusPatch::MarkProvisioning { .. } => PatchKind::VesselMarkProvisioning,
         VesselStatusPatch::MarkReady { .. } => PatchKind::VesselMarkReady,
+        VesselStatusPatch::MarkInterrupted { .. } => PatchKind::VesselMarkInterrupted,
         VesselStatusPatch::MarkTearingDown => PatchKind::VesselMarkTearingDown,
         VesselStatusPatch::MarkFailed { .. } => PatchKind::VesselMarkFailed,
     }
@@ -682,6 +686,21 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                     phase: WorkPhase::Running,
                     transitioned_at: ts(30),
                     message: None,
+                };
+                apply_and_replay(&mut status, &patch);
+                (before, work_timestamps(&status))
+            },
+        },
+        LifecycleCase {
+            name: "work interrupted",
+            kind: PatchKind::ConvoyWorkInterrupted,
+            exercise: || {
+                let mut status = settled_convoy_status();
+                let before = work_timestamps(&status);
+                let patch = ConvoyStatusPatch::WorkInterrupted {
+                    work: "implement".to_string(),
+                    roles: BTreeSet::from(["coder".to_string()]),
+                    message: "crew session disappeared".to_string(),
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, work_timestamps(&status))

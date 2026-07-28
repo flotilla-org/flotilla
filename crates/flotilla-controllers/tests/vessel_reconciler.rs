@@ -19,12 +19,13 @@ use flotilla_resources::{
     controller::{Actuation, Reconciler},
     ensure_repository, interactive_single_workflow_spec, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec,
     Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CrewSource,
-    CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment,
-    EnvironmentSpec, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus,
-    InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend,
-    ResourceError, Selector, Stance, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkflowSnapshot, WorkflowTemplate,
-    CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    CrewSpec, CrewWorkPhase, CrewWorkState, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy,
+    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec,
+    PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend, ResourceError, Selector, Stance, TerminalBrief, TerminalCrewContext,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase,
+    VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
+    CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use rstest::rstest;
 
@@ -127,7 +128,7 @@ async fn contained_requirement_rejects_host_direct_placement() {
     let workspace =
         create_workspace(&backend, NAMESPACE, "workspace-contained", "convoy-contained", "implement", "policy-host", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -175,7 +176,7 @@ async fn ready_vessel_records_requested_and_effective_stance() {
     let workspace =
         create_workspace(&backend, NAMESPACE, "workspace-stance", "convoy-stance", "implement", "policy-stance", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -1352,6 +1353,122 @@ async fn child_failure_propagates_to_workspace_failure() {
     assert!(matches!(
         outcome.patch,
         Some(flotilla_resources::VesselStatusPatch::MarkFailed { ref message }) if message == "boom"
+    ));
+}
+
+#[tokio::test]
+async fn stopped_agent_session_interrupts_the_vessel_and_requests_a_restart() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-recover", "implement", REPO_URL, GIT_REF).await;
+    let mut status = convoy.status.expect("convoy status");
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0].crew[0].source = CrewSource::Agent {
+        selector: Selector { capability: "coding".to_string() },
+        prompt: Some("Finish the issue.".to_string()),
+        brief_template: None,
+    };
+    status.phase = ConvoyPhase::Active;
+    status.work.insert("implement".to_string(), WorkState::builder().phase(WorkPhase::Running).build());
+    status.crew_work.insert(
+        "implement".to_string(),
+        BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+    );
+    backend
+        .clone()
+        .using::<Convoy>(NAMESPACE)
+        .update_status("convoy-recover", &convoy.metadata.resource_version, &status)
+        .await
+        .expect("agent crew status");
+    create_host_direct_policy(&backend, NAMESPACE, "policy-recover", HOST_REF, "cleat").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    let clone_name =
+        format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
+    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
+    let checkout_path = "/Users/alice/dev/flotilla-repos/convoy-recover";
+    create_ready_checkout(
+        &backend,
+        NAMESPACE,
+        ReadyCheckoutFixture::builder()
+            .name("checkout-convoy-recover".to_string())
+            .env_ref(host_direct_env_name())
+            .git_ref(GIT_REF.to_string())
+            .path(checkout_path.to_string())
+            .maybe_worktree(Some(worktree_checkout_spec(&host_direct_env_name(), GIT_REF, checkout_path, &clone_name)))
+            .build(),
+    )
+    .await;
+    let workspace =
+        create_workspace(&backend, NAMESPACE, "workspace-recover", "convoy-recover", "implement", "policy-recover", REPO_URL).await;
+    let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
+    let terminal_name = "terminal-workspace-recover-coder";
+    let terminal = sessions
+        .create(&meta(terminal_name), &TerminalSessionSpec {
+            env_ref: host_direct_env_name(),
+            role: "coder".to_string(),
+            source: TerminalSessionSource::Agent {
+                selector: Selector { capability: "coding".to_string() },
+                brief: TerminalBrief {
+                    path: ".flotilla/briefs/coder.md".to_string(),
+                    content: "Finish the issue.".to_string(),
+                    copies: Vec::new(),
+                },
+                context: TerminalCrewContext {
+                    namespace: NAMESPACE.to_string(),
+                    convoy: "convoy-recover".to_string(),
+                    vessel_ref: "workspace-recover".to_string(),
+                },
+                message: None,
+            },
+            cwd: checkout_path.to_string(),
+            pool: "cleat".to_string(),
+        })
+        .await
+        .expect("terminal create");
+    sessions
+        .update_status(terminal_name, &terminal.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Stopped,
+            session_id: Some(terminal_name.to_string()),
+            message: Some("session missing from cleat".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("terminal stopped");
+
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
+    let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
+
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::VesselStatusPatch::MarkInterrupted { ref roles, ref message })
+            if roles == &BTreeSet::from(["coder".to_string()])
+                && message.contains("disappeared")
+                && message.contains("relaunching")
+    ));
+    assert!(
+        outcome.actuations.is_empty(),
+        "the session must not restart before its interruption contradicts the durable Running work state"
+    );
+
+    flotilla_resources::apply_status_patch(
+        &backend.clone().using::<Vessel>(NAMESPACE),
+        &workspace.metadata.name,
+        outcome.patch.as_ref().expect("interrupted vessel patch"),
+    )
+    .await
+    .expect("persist vessel interruption");
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    let convoy = convoys.get("convoy-recover").await.expect("convoy after vessel interruption");
+    let mut status = convoy.status.expect("convoy status");
+    status.work.get_mut("implement").expect("work").phase = WorkPhase::Interrupted;
+    status.crew_work.get_mut("implement").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Interrupted;
+    convoys.update_status("convoy-recover", &convoy.metadata.resource_version, &status).await.expect("persist work interruption");
+    let workspace = backend.clone().using::<Vessel>(NAMESPACE).get("workspace-recover").await.expect("interrupted vessel");
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("recovery deps should load");
+    let recovery = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
+
+    assert!(matches!(
+        recovery.actuations.as_slice(),
+        [Actuation::RestartTerminalSession { name }] if name == terminal_name
     ));
 }
 

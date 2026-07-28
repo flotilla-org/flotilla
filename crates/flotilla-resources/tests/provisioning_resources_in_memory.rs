@@ -81,6 +81,7 @@ async fn vessel_metadata_and_status_roundtrip() {
             image_digest: Some("sha256:test-image".to_string()),
             checkout_refs: Default::default(),
             terminal_session_refs: vec!["term-a".to_string()],
+            interrupted_roles: Default::default(),
             started_at: Some(Utc::now()),
             ready_at: Some(Utc::now()),
             requested_stance: Some(flotilla_resources::Stance::WorkspaceWrite),
