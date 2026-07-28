@@ -451,12 +451,12 @@ async fn register_startup_resources(
     ensure_host_direct_environment_exists(&backend, namespace, profile).await?;
     discover_local_clones(daemon, &backend, namespace, profile).await?;
     ensure_default_policies(&backend, namespace, profile).await?;
-    ensure_default_workflow_templates(&backend, namespace).await?;
+    reconcile_builtin_workflow_templates(&backend, namespace).await?;
     daemon.materialize_tracked_repo_projects().await?;
     Ok(())
 }
 
-fn default_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
+fn builtin_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
     vec![
         (
             "scratch",
@@ -480,15 +480,21 @@ fn default_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
     ]
 }
 
-async fn ensure_default_workflow_templates(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
+async fn reconcile_builtin_workflow_templates(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
     let templates = backend.clone().using::<WorkflowTemplate>(namespace);
-    for (name, spec) in default_workflow_templates() {
+    for (name, spec) in builtin_workflow_templates() {
         match templates.get(name).await {
-            Ok(_) => continue,
-            Err(ResourceError::NotFound { .. }) => {}
+            Ok(existing) => {
+                templates
+                    .update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &spec)
+                    .await
+                    .map_err(|err| format!("reconcile builtin workflow template {name}: {err}"))?;
+            }
+            Err(ResourceError::NotFound { .. }) => {
+                templates.create(&empty_meta(name), &spec).await.map_err(|err| format!("seed builtin workflow template {name}: {err}"))?;
+            }
             Err(err) => return Err(format!("check workflow template {name}: {err}")),
         }
-        templates.create(&empty_meta(name), &spec).await.map(|_| ()).map_err(|err| format!("seed workflow template {name}: {err}"))?;
     }
     Ok(())
 }
@@ -2750,30 +2756,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_seeding_preserves_existing_contained_template_definition() {
+    async fn startup_seeding_reconciles_existing_builtin_template_definition() {
         let backend = ResourceBackend::InMemory(Default::default());
         let templates = backend.clone().using::<WorkflowTemplate>(NAMESPACE);
-        let custom = WorkflowTemplateSpec::builder()
-            .vessels(vec![VesselRequirement::builder()
-                .name("custom".to_string())
-                .stance(Stance::Contained)
-                .crew(vec![CrewSpec::builder()
-                    .role("maintainer".to_string())
-                    .source(CrewSource::Agent {
-                        selector: Selector { capability: "custom-code".to_string() },
-                        prompt: Some("Keep this definition".to_string()),
-                        brief_template: None,
-                    })
-                    .build()])
-                .build()])
-            .build();
-        templates.create(&empty_meta("single-agent-contained"), &custom).await.expect("custom template create should succeed");
+        let mut stale = flotilla_resources::single_agent_contained_workflow_spec();
+        stale.vessels[0].stance = Stance::Trusted;
+        templates.create(&empty_meta("single-agent-contained"), &stale).await.expect("stale template create should succeed");
 
-        ensure_default_workflow_templates(&backend, NAMESPACE).await.expect("startup seeding should succeed");
-        ensure_default_workflow_templates(&backend, NAMESPACE).await.expect("restart seeding should succeed");
+        reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("startup reconciliation should succeed");
+        reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("restart reconciliation should succeed");
 
-        let preserved = templates.get("single-agent-contained").await.expect("template should remain");
-        assert_eq!(preserved.spec, custom);
+        let reconciled = templates.get("single-agent-contained").await.expect("template should remain");
+        assert_eq!(reconciled.spec, flotilla_resources::single_agent_contained_workflow_spec());
     }
 
     fn manual_profile(host_id: &str, docker_available: bool) -> LocalProvisioningProfile {
