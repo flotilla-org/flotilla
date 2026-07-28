@@ -5215,7 +5215,19 @@ impl InProcessDaemon {
                 }
                 ResourceProvenance::Local => None,
                 ResourceProvenance::Replica { origin_root, .. } => {
-                    self.host_registry.host_name_for_node(origin_root).await.or_else(|| configured_by_node.get(origin_root).cloned())
+                    // An origin replicates every Host it observes, including this daemon's Host.
+                    // Only the Host matching the origin's canonical environment is its self-report.
+                    let is_self_report = self
+                        .host_registry
+                        .environment_id_for_node(origin_root)
+                        .await
+                        .and_then(|environment_id| environment_id.host_id().map(ToString::to_string))
+                        .is_some_and(|host_id| host_id == resource_host.object.metadata.name);
+                    if !is_self_report {
+                        None
+                    } else {
+                        self.host_registry.host_name_for_node(origin_root).await.or_else(|| configured_by_node.get(origin_root).cloned())
+                    }
                 }
             };
             let (Some(host), Some(status)) = (host, resource_host.object.status) else {
