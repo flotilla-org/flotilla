@@ -33,6 +33,7 @@ pub struct CloneStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloneStatusPatch {
     MarkCloning,
+    MarkRetrying { message: String },
     MarkReady { default_branch: Option<String> },
     MarkFailed { message: String },
 }
@@ -43,6 +44,10 @@ impl StatusPatch<CloneStatus> for CloneStatusPatch {
             Self::MarkCloning => {
                 status.phase = ClonePhase::Cloning;
                 status.message = None;
+            }
+            Self::MarkRetrying { message } => {
+                status.phase = ClonePhase::Cloning;
+                status.message = Some(message.clone());
             }
             Self::MarkReady { default_branch } => {
                 status.phase = ClonePhase::Ready;
