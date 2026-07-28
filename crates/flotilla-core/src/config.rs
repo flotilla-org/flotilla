@@ -367,13 +367,13 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub environments: BTreeMap<String, StaticEnvironmentConfig>,
     #[serde(default)]
-    pub manifests: Option<ManifestsConfig>,
+    pub manifests: Option<ResourceManifestsConfig>,
 }
 
 /// Host-local directory whose resource documents are continuously applied as
 /// additive desired state.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ManifestsConfig {
+pub struct ResourceManifestsConfig {
     pub dir: PathBuf,
 }
 

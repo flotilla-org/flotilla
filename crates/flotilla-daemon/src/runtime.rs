@@ -47,7 +47,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     credential::CredentialStore,
-    manifest::ManifestReconciler,
+    resource_manifest::ResourceManifestReconciler,
     sleep_inhibitor,
     supervisor::{supervise, ControllerSupervision},
     Aggregator, AggregatorResolvers,
@@ -300,7 +300,7 @@ fn spawn_manifest_reconciler_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         supervise("manifest", supervision, move || {
-            let reconciler = ManifestReconciler::new(backend.clone(), namespace.clone(), root.clone());
+            let reconciler = ResourceManifestReconciler::new(backend.clone(), namespace.clone(), root.clone());
             async move { reconciler.run(interval).await }
         })
         .await;

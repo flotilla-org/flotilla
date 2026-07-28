@@ -21,6 +21,8 @@ pub const MANIFEST_MANAGED_BY_VALUE: &str = "manifest";
 pub const MANIFEST_SOURCE_ANNOTATION: &str = "flotilla.work/manifest-source";
 pub const LAST_APPLIED_HASH_ANNOTATION: &str = "flotilla.work/last-applied-hash";
 
+type LoadedManifestFile = (PathBuf, Result<Vec<Value>, String>);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ObjectIdentity {
     kind: String,
@@ -56,7 +58,7 @@ pub struct ManifestPassReport {
     pub errors: Vec<ManifestDocumentError>,
 }
 
-pub struct ManifestReconciler {
+pub struct ResourceManifestReconciler {
     backend: ResourceBackend,
     default_namespace: String,
     root: PathBuf,
@@ -64,7 +66,7 @@ pub struct ManifestReconciler {
     warned_drift: HashSet<(ObjectIdentity, String, String)>,
 }
 
-impl ManifestReconciler {
+impl ResourceManifestReconciler {
     pub fn new(backend: ResourceBackend, default_namespace: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         Self {
             backend,
@@ -114,11 +116,14 @@ impl ManifestReconciler {
     }
 
     pub async fn reconcile_once(&mut self) -> Result<ManifestPassReport, String> {
-        let files = manifest_files(&self.root)?;
+        let root = self.root.clone();
+        let files = tokio::task::spawn_blocking(move || load_manifest_files(&root))
+            .await
+            .map_err(|error| format!("manifest file loading task failed: {error}"))??;
         let mut report = ManifestPassReport::default();
-        for path in files {
+        for (path, documents) in files {
             let relative = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
-            let documents = match parse_documents(&path) {
+            let documents = match documents {
                 Ok(documents) => documents,
                 Err(reason) => {
                     report.errors.push(ManifestDocumentError { path: relative, reason });
@@ -220,6 +225,16 @@ fn manifest_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+fn load_manifest_files(root: &Path) -> Result<Vec<LoadedManifestFile>, String> {
+    Ok(manifest_files(root)?
+        .into_iter()
+        .map(|path| {
+            let documents = parse_documents(&path);
+            (path, documents)
+        })
+        .collect())
+}
+
 fn parse_documents(path: &Path) -> Result<Vec<Value>, String> {
     let content = std::fs::read_to_string(path).map_err(|error| format!("read file: {error}"))?;
     if path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("json")) {
@@ -319,7 +334,7 @@ mod tests {
             r#"{"apiVersion":"flotilla.work/v1","kind":"PlacementPolicy","metadata":{"name":"beta"},"spec":{"pool":"two"}}"#,
         );
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let mut reconciler = ManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once().await.expect("manifest pass");
 
@@ -343,12 +358,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("steady", "one"));
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let mut first = ManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut first = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         first.reconcile_once().await.expect("initial pass");
         let before = backend.using::<PlacementPolicy>(NAMESPACE).get("steady").await.expect("policy");
 
         let mut events = backend.using::<PlacementPolicy>(NAMESPACE).watch(WatchStart::Now).await.expect("watch");
-        let mut restarted = ManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut restarted = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         let report = restarted.reconcile_once().await.expect("restart pass");
         let after = backend.using::<PlacementPolicy>(NAMESPACE).get("steady").await.expect("policy");
 
@@ -362,7 +377,7 @@ mod tests {
         let parent = tempfile::tempdir().expect("tempdir");
         let root = parent.path().join("not-created-yet");
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let task = tokio::spawn(ManifestReconciler::new(backend.clone(), NAMESPACE, root.clone()).run(Duration::from_millis(5)));
+        let task = tokio::spawn(ResourceManifestReconciler::new(backend.clone(), NAMESPACE, root.clone()).run(Duration::from_millis(5)));
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         std::fs::create_dir(&root).expect("create manifest directory");
@@ -387,7 +402,7 @@ mod tests {
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("moving", "one"));
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let mut reconciler = ManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once().await.expect("initial pass");
         let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
         let applied = resolver.get("moving").await.expect("policy");
@@ -415,7 +430,7 @@ mod tests {
         };
         write(&path, &workflow("echo-one"));
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let mut reconciler = ManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once().await.expect("initial pass");
 
         let steady = reconciler.reconcile_once().await.expect("steady pass");
@@ -435,7 +450,7 @@ mod tests {
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("drifted", "one"));
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let mut reconciler = ManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once().await.expect("initial pass");
         let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
         let applied = resolver.get("drifted").await.expect("policy");
@@ -469,7 +484,7 @@ mod tests {
             )
             .await
             .expect("unmanaged policy");
-        let mut reconciler = ManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once().await.expect("manifest pass");
         let object = backend.using::<PlacementPolicy>(NAMESPACE).get("unmanaged").await.expect("policy");
@@ -485,7 +500,7 @@ mod tests {
         write(&dir.path().join("broken.yaml"), "kind: [");
         write(&dir.path().join("valid.yaml"), &manifest("valid", "one"));
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let mut reconciler = ManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once().await.expect("manifest pass");
 
@@ -502,7 +517,7 @@ mod tests {
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("retained", "one"));
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let mut reconciler = ManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once().await.expect("initial pass");
         std::fs::remove_file(path).expect("remove manifest");
 
