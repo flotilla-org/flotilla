@@ -1139,6 +1139,17 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
                     .join("\n"),
             });
         }
+        if !decision.viable_not_selected.is_empty() {
+            fields.push(DetailField {
+                label: "Viable placements not selected",
+                value: decision
+                    .viable_not_selected
+                    .iter()
+                    .map(|candidate| format!("{} on {}: {}", candidate.policy_name, candidate.target_host.display_name, candidate.reason))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            });
+        }
     }
     if let Some(change_request) = &row.change_request {
         fields.push(DetailField { label: "Pull request", value: format!("#{} · {}", change_request.id, change_request.status) });
@@ -1291,6 +1302,17 @@ fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
                     .refused_candidates
                     .iter()
                     .map(|refusal| format!("{} on {}: {}", refusal.policy_name, refusal.target_host.display_name, refusal.reason))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            });
+        }
+        if !decision.viable_not_selected.is_empty() {
+            fields.push(DetailField {
+                label: "Viable placements not selected",
+                value: decision
+                    .viable_not_selected
+                    .iter()
+                    .map(|candidate| format!("{} on {}: {}", candidate.policy_name, candidate.target_host.display_name, candidate.reason))
                     .collect::<Vec<_>>()
                     .join("\n"),
             });
@@ -1450,6 +1472,11 @@ mod tests {
                 target_host: flotilla_protocol::PlacementTargetHost { reference: "02HXYZ".into(), display_name: "feta".into() },
                 reason: "disk below admission floor".into(),
             }],
+            viable_not_selected: vec![flotilla_protocol::PlacementViableCandidate {
+                policy_name: "host-direct-gouda".into(),
+                target_host: flotilla_protocol::PlacementTargetHost { reference: "03HXYZ".into(), display_name: "gouda".into() },
+                reason: "priority 0 is lower than selected policy `host-direct-kiwi` priority 100".into(),
+            }],
         };
         let mut vessel = vessel("implement", &[], WorkPhase::Running);
         vessel.placement_decision = Some(decision.clone());
@@ -1461,9 +1488,17 @@ mod tests {
         assert!(convoy_view.rows[0]
             .describe
             .contains(&DetailField { label: "Placement refusals", value: "host-direct-feta on feta: disk below admission floor".into() }));
+        assert!(convoy_view.rows[0].describe.contains(&DetailField {
+            label: "Viable placements not selected",
+            value: "host-direct-gouda on gouda: priority 0 is lower than selected policy `host-direct-kiwi` priority 100".into(),
+        }));
 
         let vessel_view = project_convoys("vessel/dev/tables/implement", &[&convoy]).expect("vessel table");
         assert!(vessel_view.rows[0].describe.contains(&DetailField { label: "Placement", value: "host-direct-kiwi on kiwi".into() }));
+        assert!(vessel_view.rows[0].describe.contains(&DetailField {
+            label: "Viable placements not selected",
+            value: "host-direct-gouda on gouda: priority 0 is lower than selected policy `host-direct-kiwi` priority 100".into(),
+        }));
     }
 
     #[test]

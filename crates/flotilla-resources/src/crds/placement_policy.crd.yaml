@@ -17,6 +17,9 @@ spec:
         - name: Pool
           type: string
           jsonPath: .spec.pool
+        - name: Priority
+          type: integer
+          jsonPath: .spec.priority
       schema:
         openAPIV3Schema:
           type: object

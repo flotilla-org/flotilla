@@ -9,10 +9,17 @@ define_resource!(PlacementPolicy, "placementpolicies", PlacementPolicySpec, (), 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct PlacementPolicySpec {
     pub pool: String,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub priority: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_direct: Option<HostDirectPlacementPolicySpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker_per_vessel: Option<DockerPerVesselPlacementPolicySpec>,
+}
+
+fn is_zero(value: &i32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -4,6 +4,7 @@
 //! and broadcasts events — all within the same process.
 
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
@@ -25,11 +26,11 @@ use flotilla_protocol::{
     CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse,
     FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
     HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
-    PlacementRefusal, PlacementTargetHost, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData,
-    ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary,
-    RepoWorkResponse, ResolvedAttachAction, ResolvedAttachPlan, ResourceJsonResponse, ResourceRef, ResourceWatchResponse, StatusResponse,
-    StepStatus, StreamKey, SurfaceDeclaration, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress,
-    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
+    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo,
+    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedAttachAction, ResolvedAttachPlan, ResourceJsonResponse,
+    ResourceRef, ResourceWatchResponse, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo, ToolInventory,
+    TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -933,6 +934,7 @@ async fn persist_adopted_checkout(
 struct PlacementResolution {
     selected: Option<ResourceObject<PlacementPolicy>>,
     refused_candidates: Vec<PlacementRefusal>,
+    viable_not_selected: Vec<PlacementViableCandidate>,
 }
 
 fn placement_host_ref(policy: &ResourceObject<PlacementPolicy>) -> Option<&str> {
@@ -972,7 +974,7 @@ async fn default_convoy_placement_policy(
         Ok(list) => list.items,
         Err(err) => {
             warn!(%namespace, error = %err, "failed to list placement policies; convoy will remain Pending until one is registered");
-            return Ok(PlacementResolution { selected: None, refused_candidates: Vec::new() });
+            return Ok(PlacementResolution { selected: None, refused_candidates: Vec::new(), viable_not_selected: Vec::new() });
         }
     };
     policies.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
@@ -997,18 +999,22 @@ async fn default_convoy_placement_policy(
         }
     }
     viable.sort_by_key(|policy| {
-        let target_host = policy
-            .spec
-            .host_direct
-            .as_ref()
-            .map(|spec| spec.host_ref.as_str())
-            .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|spec| spec.host_ref.as_str()));
+        let target_host = placement_host_ref(policy);
         let is_local = local_host_ref.is_some_and(|local| target_host == Some(local));
         let is_host_direct = policy.spec.host_direct.is_some();
-        (!is_local, !is_host_direct, policy.metadata.name.clone())
+        (Reverse(policy.spec.priority), !is_local, !is_host_direct, policy.metadata.name.clone())
     });
-    if let Some(policy) = viable.into_iter().next() {
-        return Ok(PlacementResolution { selected: Some(policy), refused_candidates });
+    if !viable.is_empty() {
+        let selected = viable.remove(0);
+        let mut viable_not_selected = Vec::with_capacity(viable.len());
+        for policy in viable {
+            let target_host = placement_target_host(backend, namespace, &policy)
+                .await
+                .unwrap_or_else(|_| PlacementTargetHost { reference: String::new(), display_name: "no target host".to_string() });
+            let reason = placement_ordering_reason(&selected, &policy, local_host_ref);
+            viable_not_selected.push(PlacementViableCandidate { policy_name: policy.metadata.name.clone(), target_host, reason });
+        }
+        return Ok(PlacementResolution { selected: Some(selected), refused_candidates, viable_not_selected });
     }
 
     let required_adapters = required_workflow_agent_adapters(workflow)?;
@@ -1025,7 +1031,32 @@ async fn default_convoy_placement_policy(
     if candidate_names.is_empty() {
         warn!(%namespace, "no placement policy found; convoy will remain Pending until one is registered");
     }
-    Ok(PlacementResolution { selected: None, refused_candidates })
+    Ok(PlacementResolution { selected: None, refused_candidates, viable_not_selected: Vec::new() })
+}
+
+fn placement_ordering_reason(
+    selected: &ResourceObject<PlacementPolicy>,
+    candidate: &ResourceObject<PlacementPolicy>,
+    local_host_ref: Option<&str>,
+) -> String {
+    if candidate.spec.priority != selected.spec.priority {
+        return format!(
+            "priority {} is lower than selected policy `{}` priority {}",
+            candidate.spec.priority, selected.metadata.name, selected.spec.priority
+        );
+    }
+
+    let selected_host = placement_host_ref(selected);
+    let candidate_host = placement_host_ref(candidate);
+    let selected_is_local = local_host_ref.is_some_and(|local| selected_host == Some(local));
+    let candidate_is_local = local_host_ref.is_some_and(|local| candidate_host == Some(local));
+    if selected_is_local && !candidate_is_local {
+        return format!("fallback ordering preferred local policy `{}`", selected.metadata.name);
+    }
+    if selected.spec.host_direct.is_some() && candidate.spec.host_direct.is_none() {
+        return format!("fallback ordering preferred host-direct policy `{}`", selected.metadata.name);
+    }
+    format!("fallback ordering preferred policy `{}` by name", selected.metadata.name)
 }
 
 fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla_protocol::RepoIdentity {
@@ -4227,6 +4258,7 @@ impl InProcessDaemon {
                 policy_name: selected.metadata.name.clone(),
                 target_host: placement_target_host(&self.resource_backend, namespace, selected).await?,
                 refused_candidates: placement.refused_candidates,
+                viable_not_selected: placement.viable_not_selected,
             }),
             None => None,
         };
@@ -4374,7 +4406,7 @@ impl InProcessDaemon {
                 if contained && resolved.spec.docker_per_vessel.is_none() {
                     return Err(format!("contained workflow requires a docker placement policy, but {policy} is not contained"));
                 }
-                PlacementResolution { selected: Some(resolved), refused_candidates: Vec::new() }
+                PlacementResolution { selected: Some(resolved), refused_candidates: Vec::new(), viable_not_selected: Vec::new() }
             }
             None => {
                 let local_host_id = self.local_host_id();
@@ -7611,6 +7643,7 @@ impl InProcessDaemon {
                         policy_name: selected.metadata.name.clone(),
                         target_host,
                         refused_candidates: placement.refused_candidates,
+                        viable_not_selected: placement.viable_not_selected,
                     }),
                     Err(message) => {
                         let _ = self.event_tx.send(DaemonEvent::CommandFinished {
