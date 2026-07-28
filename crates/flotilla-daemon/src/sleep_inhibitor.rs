@@ -267,6 +267,13 @@ impl SystemSleepInhibitor {
                 return Err(error);
             }
         }
+        if let Some(mut stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                if let Err(error) = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await {
+                    warn!(%error, "failed to drain sleep inhibitor error output");
+                }
+            });
+        }
         self.child = Some(child);
         info!(program = %command_spec.program, reason = INHIBITOR_REASON, "acquired system sleep inhibitor");
         Ok(())

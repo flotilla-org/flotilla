@@ -212,14 +212,24 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
             FleetHostStaleness::Stale => "STALE",
             FleetHostStaleness::Unknown => "unknown",
         };
-        let diagnosis = if !host.degraded_conditions.is_empty() {
-            format!("⚠ DEGRADED: {}", host.degraded_conditions.join("; "))
-        } else {
+        let mut diagnoses = Vec::new();
+        if !host.degraded_conditions.is_empty() {
+            diagnoses.push(format!("⚠ DEGRADED: {}", host.degraded_conditions.join("; ")));
+        }
+        if matches!(&host.sleep_inhibition, flotilla_protocol::SleepInhibitionHealth::Failed { .. }) {
+            diagnoses.push("⚠ SLEEP INHIBITION FAILED".to_string());
+        }
+        if host.observation_agreement == FleetObservationAgreement::Disagree {
+            diagnoses.push("⚠ DISAGREE".to_string());
+        }
+        let diagnosis = if diagnoses.is_empty() {
             match host.observation_agreement {
                 FleetObservationAgreement::Agree => "agree".to_string(),
-                FleetObservationAgreement::Disagree => "⚠ DISAGREE".to_string(),
+                FleetObservationAgreement::Disagree => unreachable!("disagreement should have produced a diagnosis"),
                 FleetObservationAgreement::Unknown => "unknown".to_string(),
             }
+        } else {
+            diagnoses.join("; ")
         };
         table.add_row(vec![
             Cell::new(name),

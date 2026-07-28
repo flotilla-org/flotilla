@@ -700,6 +700,7 @@ mod command_result_human {
             "42.0 GiB",
             "FAILED (3): polkit denied",
             "STALE",
+            "⚠ SLEEP INHIBITION FAILED",
             "⚠ DISAGREE",
         ] {
             assert!(output.contains(expected), "expected fleet health output to contain {expected:?}:\n{output}");
