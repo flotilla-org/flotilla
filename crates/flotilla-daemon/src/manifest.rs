@@ -76,8 +76,24 @@ impl ManifestReconciler {
     }
 
     pub async fn run(mut self, interval: Duration) -> Result<(), ResourceError> {
+        let mut last_root_error = None;
         loop {
-            let report = self.reconcile_once().await.map_err(ResourceError::other)?;
+            let report = match self.reconcile_once().await {
+                Ok(report) => {
+                    if let Some(previous) = last_root_error.take() {
+                        info!(root = %self.root.display(), %previous, "manifest directory recovered");
+                    }
+                    report
+                }
+                Err(error) => {
+                    if last_root_error.as_deref() != Some(error.as_str()) {
+                        warn!(root = %self.root.display(), %error, "manifest directory unavailable; reconciliation will retry");
+                        last_root_error = Some(error);
+                    }
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
+            };
             for error in &report.errors {
                 warn!(path = %error.path.display(), reason = %error.reason, "manifest document rejected");
             }
@@ -295,7 +311,9 @@ mod tests {
     #[tokio::test]
     async fn fresh_directory_applies_all_documents_with_ownership_and_source() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write(&dir.path().join("alpha.yaml"), &manifest("alpha", "one"));
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).expect("nested manifest directory");
+        write(&nested.join("policies.yaml"), &format!("{}---\n{}", manifest("alpha", "one"), manifest("gamma", "three")));
         write(
             &dir.path().join("beta.json"),
             r#"{"apiVersion":"flotilla.work/v1","kind":"PlacementPolicy","metadata":{"name":"beta"},"spec":{"pool":"two"}}"#,
@@ -305,8 +323,8 @@ mod tests {
 
         let report = reconciler.reconcile_once().await.expect("manifest pass");
 
-        assert_eq!(report.created, 2);
-        for (name, source) in [("alpha", "alpha.yaml"), ("beta", "beta.json")] {
+        assert_eq!(report.created, 3);
+        for (name, source) in [("alpha", "nested/policies.yaml"), ("gamma", "nested/policies.yaml"), ("beta", "beta.json")] {
             let object = backend.using::<PlacementPolicy>(NAMESPACE).get(name).await.expect("manifest object");
             assert_eq!(object.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(MANIFEST_MANAGED_BY_VALUE));
             assert_eq!(object.metadata.annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str), Some(source));
@@ -337,6 +355,30 @@ mod tests {
         assert_eq!(report.unchanged, 1);
         assert_eq!(before.metadata.resource_version, after.metadata.resource_version);
         assert!(tokio::time::timeout(Duration::from_millis(20), events.next()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn loop_recovers_when_manifest_directory_appears_later() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let root = parent.path().join("not-created-yet");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let task = tokio::spawn(ManifestReconciler::new(backend.clone(), NAMESPACE, root.clone()).run(Duration::from_millis(5)));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        std::fs::create_dir(&root).expect("create manifest directory");
+        write(&root.join("policy.yaml"), &manifest("late", "one"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if backend.using::<PlacementPolicy>(NAMESPACE).get("late").await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("manifest loop should recover");
+
+        task.abort();
     }
 
     #[tokio::test]
