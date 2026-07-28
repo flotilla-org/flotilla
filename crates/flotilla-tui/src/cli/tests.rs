@@ -679,6 +679,10 @@ mod command_result_human {
                 .crew_count(3)
                 .convoy_count(2)
                 .disk_free_bytes(42 * 1024 * 1024 * 1024)
+                .sleep_inhibition(flotilla_protocol::SleepInhibitionHealth::Failed {
+                    consecutive_failures: 3,
+                    message: "polkit denied".to_string(),
+                })
                 .staleness(FleetHostStaleness::Stale)
                 .observation_agreement(FleetObservationAgreement::Disagree)
                 .build()],
@@ -686,7 +690,18 @@ mod command_result_human {
 
         let output = format_command_result(&result);
 
-        for expected in ["feta", "connected", "old-generation", "new-generation", "0.9.0", "7200s", "42.0 GiB", "STALE", "⚠ DISAGREE"] {
+        for expected in [
+            "feta",
+            "connected",
+            "old-generation",
+            "new-generation",
+            "0.9.0",
+            "7200s",
+            "42.0 GiB",
+            "FAILED (3): polkit denied",
+            "STALE",
+            "⚠ DISAGREE",
+        ] {
             assert!(output.contains(expected), "expected fleet health output to contain {expected:?}:\n{output}");
         }
     }

@@ -291,6 +291,7 @@ impl DaemonRuntime {
             spawn_sleep_inhibitor_task(
                 daemon.resource_backend(),
                 options.namespace.clone(),
+                profile.host_id.clone(),
                 options.controller_supervision.clone(),
                 runtime_health.clone(),
             ),
@@ -749,13 +750,16 @@ where
 fn spawn_sleep_inhibitor_task(
     backend: ResourceBackend,
     namespace: String,
+    host_id: String,
     supervision: ControllerSupervision,
     runtime_health: RuntimeHealth,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         supervise_controller("sleep_inhibitor", supervision, runtime_health, move || {
             let convoys = backend.clone().using::<Convoy>(&namespace);
-            async move { sleep_inhibitor::run(convoys).await }
+            let hosts = backend.clone().using::<Host>(&namespace);
+            let host_id = host_id.clone();
+            async move { sleep_inhibitor::run(convoys, hosts, host_id).await }
         })
         .await;
     })
@@ -975,6 +979,7 @@ async fn apply_host_heartbeat_with_credentials(
         daemon_started_at: Some(health.started_at),
         disk_free_bytes,
         conditions,
+        sleep_inhibition: host.status.as_ref().map(|status| status.sleep_inhibition.clone()).unwrap_or_default(),
     };
     hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|err| err.to_string())?;
     daemon.refresh_connected_peer_host_heartbeats().await;
@@ -2176,7 +2181,7 @@ mod tests {
         Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
         CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, LifecycleAuthority,
         ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec, Selector, SqliteBackend,
-        TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement, WorkPhase, WorkflowTemplate,
+        TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, WorkPhase, WorkflowTemplate,
         WorkflowTemplateSpec,
     };
     use futures::StreamExt;
@@ -3367,18 +3372,6 @@ mod tests {
         }
     }
 
-    async fn wait_for_host_status(hosts: &TypedResolver<Host>, name: &str) -> HostStatus {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let host = hosts.get(name).await.expect("host get should succeed");
-            if let Some(status) = host.status {
-                return status;
-            }
-            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for host status");
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-
     fn sqlite_max_event_rowid(path: &Path) -> u64 {
         let connection = rusqlite::Connection::open(path).expect("open SQLite store for idle inspection");
         connection
@@ -3424,11 +3417,22 @@ mod tests {
         let profile = manual_profile(&host_id, false);
 
         ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id).await.expect("host registration should succeed");
+        let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
+        flotilla_resources::apply_status_patch(&hosts, &host_id, &flotilla_resources::HostStatusPatch::SleepInhibition {
+            health: flotilla_protocol::SleepInhibitionHealth::Failed { consecutive_failures: 3, message: "polkit denied".to_string() },
+        })
+        .await
+        .expect("seed sleep inhibition health");
         let heartbeat =
             spawn_heartbeat_task(Arc::clone(&daemon), NAMESPACE.to_string(), profile, test_health_identity(), Duration::from_millis(20));
-        let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
 
-        let status = wait_for_host_status(&hosts, &host_id).await;
+        wait_until(|| {
+            let hosts = hosts.clone();
+            let host_id = host_id.clone();
+            async move { hosts.get(&host_id).await.ok().and_then(|host| host.status).is_some_and(|status| status.ready) }
+        })
+        .await;
+        let status = hosts.get(&host_id).await.expect("get host").status.expect("host status");
         assert!(status.ready, "heartbeat should mark host ready");
         assert_eq!(status.agent_adapters().expect("valid agent adapter capability"), BTreeSet::new());
         assert_eq!(status.capabilities.get("docker"), Some(&json!(false)));
@@ -3437,6 +3441,7 @@ mod tests {
         assert_eq!(status.daemon_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
         assert!(status.daemon_started_at.is_some());
         assert!(status.disk_free_bytes.is_some());
+        assert!(matches!(status.sleep_inhibition, flotilla_protocol::SleepInhibitionHealth::Failed { consecutive_failures: 3, .. }));
         assert!(
             status.resource_store.expect("heartbeat should publish resource store diagnostics").event_log_within_retention(),
             "heartbeat should report a bounded resource event log"
