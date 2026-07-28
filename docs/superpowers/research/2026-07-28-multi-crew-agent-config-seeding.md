@@ -471,6 +471,225 @@ endpoint, Moonshot's own Codex guidance routes through a local
 protocol-converting proxy — an extra sidecar process and port per container.
 **A Kimi-backed reviewer should be pi or Claude Code, not Codex.**
 
+## Subscription logins are the primary auth path (Robert, 2026-07-28)
+
+**Priority correction.** This document was written API-key-first. That is
+backwards for the actual user: solo developers, homelabs and small teams run
+crews on their existing **Claude and ChatGPT plan logins**, not on separately
+billed API keys. Subscription-login seeding is the primary path; API keys are
+the alternative. Everything below is re-derived under that priority.
+
+The headline result is a hazard, not a mechanism:
+
+> **A single subscription login copied into N homes will invalidate itself.**
+> Codex's OAuth refresh tokens rotate and are single-use. The refresh path
+> persists a *new* refresh token back into `auth.json`, and the error taxonomy
+> has a dedicated permanent-failure reason for reuse. Two copies of one
+> `auth.json` that both refresh will race, and the loser is logged out for good.
+
+This makes the durable-home and seed-if-absent findings **doubly load-bearing**:
+a subscription login is not static material that can be stamped into an image.
+It is live, mutating state that must be written back to durable storage, and it
+tolerates exactly one writer.
+
+### Codex — relocatable, but single-writer
+
+`auth.json` for a ChatGPT subscription login holds `auth_mode`, `last_refresh`,
+a null `OPENAI_API_KEY` slot, and `tokens.{access_token, id_token,
+refresh_token, account_id}` (structure read from the local file; no values
+inspected or transmitted).
+
+**Relocation works.** Copying the real `~/.codex/auth.json` into a fresh
+`CODEX_HOME` and running a status-only command against it:
+
+```console
+$ env -u OPENAI_API_KEY -u CODEX_API_KEY HOME=$TMP/home CODEX_HOME=$TMP/reloc codex login status
+Logged in using ChatGPT
+```
+
+The original was not modified (mtime unchanged). `codex login status` is
+safe for this test: for ChatGPT mode it prints from the loaded record without
+calling `get_token()`, so it performs no refresh
+(`codex-rs/cli/src/login.rs:365-389`).
+
+**But the rotation hazard is real.** On refresh, `persist_tokens` overwrites
+`tokens.refresh_token` with any newly issued one and updates `last_refresh`,
+then saves (`codex-rs/login/src/auth/manager.rs:780-804`). Reuse is detected
+server-side and classified as *permanent*:
+
+```rust
+Some("refresh_token_expired")     => RefreshTokenFailedReason::Expired,
+Some("refresh_token_reused")      => RefreshTokenFailedReason::Exhausted,
+Some("refresh_token_invalidated") => RefreshTokenFailedReason::Revoked,
+```
+(`codex-rs/login/src/auth/manager.rs:851-858`)
+
+Consequences for vessel seeding, in order of importance:
+
+1. **Do not copy one desk login into multiple vessels.** The first vessel to
+   refresh rotates the token; the desk and every other copy then fail
+   permanently with `refresh_token_reused`. Under one-vessel-home this is
+   naturally respected — one home, one copy, one writer — provided vessels do
+   not each get a copy of the same login.
+2. **The vessel home must be durable.** If a vessel's `~/.codex` is ephemeral,
+   the rotated refresh token dies with the container while the desk copy has
+   already been invalidated. The login is then dead everywhere.
+3. **Seed-if-absent is mandatory, not stylistic.** Re-seeding a stale copy over
+   a home that has since refreshed would overwrite a live token with an
+   exhausted one.
+
+**Unverified:** whether *every* refresh rotates the token, or only some.
+`request_chatgpt_token_refresh` returns an `Option<refresh_token>`, so rotation
+is optional per response; the reuse error code proves detection exists. Settling
+this needs a live refresh, which I did not run — a rotation triggered from a copy
+would invalidate Robert's actual desk login. Verify with a throwaway account if
+it matters.
+
+### Claude — keychain on macOS, file on Linux, token is the clean path
+
+| Platform | Where the subscription login lives | Relocatable? |
+|---|---|---|
+| macOS | Login keychain, service `Claude Code-credentials` | **No** — see probe below |
+| Linux | `.credentials.json`, mode 0600, under the config dir (so `CLAUDE_CONFIG_DIR` moves it) | Yes — plain file |
+| Windows | `%USERPROFILE%\.claude\.credentials.json` | Yes |
+
+macOS storage confirmed without reading the secret:
+
+```console
+$ security find-generic-password -s "Claude Code-credentials"
+keychain: "/Users/robert/Library/Keychains/login.keychain-db"
+```
+
+**The keychain leaks through every isolation lever**, which is a trap for anyone
+testing seeding on a Mac. With a throwaway `HOME`, a throwaway
+`CLAUDE_CONFIG_DIR`, and `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` /
+`CLAUDE_CODE_OAUTH_TOKEN` all unset, Claude still started authenticated:
+
+```text
+╭─── Claude Code v2.1.220 ──────────────────────────────
+│                Welcome back!
+│   Opus 5 (1M context) · API Usage Billing
+```
+
+So on macOS neither `HOME` nor `CLAUDE_CONFIG_DIR` isolates credentials — only
+the Linux/container path does. **Do not use a Mac to validate credential
+seeding; the result is meaningless.**
+
+**The recommended subscription path for Claude is not to copy the login at
+all.** `claude setup-token` — "Set up a long-lived authentication token
+(requires Claude subscription)" (`claude setup-token --help`) — mints a
+long-lived token delivered through `CLAUDE_CODE_OAUTH_TOKEN`, documented as an
+"alternative to `/login` for SDK and automated environments" that "takes
+precedence over keychain-stored credentials" (`env-vars.md:275`). That gives a
+subscription-backed crew:
+
+- no file to copy and no keychain to extract, so the macOS/Linux format question
+  never arises;
+- no rotation hazard, because it is not a rotating refresh token;
+- per-process delivery, so two crews *can* hold two different subscription
+  identities from one shared home.
+
+This is strictly better than seeding `.credentials.json` and should be the
+default for Claude subscription crews.
+
+**Unverified:** whether a macOS keychain blob can be reshaped into a Linux
+`.credentials.json` at all. Establishing it requires extracting the secret,
+which I did not do. The `setup-token` path makes the question moot.
+
+### Cursor — keychain on macOS blocks even running
+
+Already established above: on macOS the credential manager shells out to
+`/usr/bin/security`, and a relocated `HOME` kills the process outright
+(`Error: Security command failed: Security process exited with code: 154`). On
+Linux the login is `${XDG_CONFIG_HOME:-$HOME/.config}/cursor/auth.json`
+containing `{accessToken, refreshToken, apiKey, bedrockCredentials}` — a
+copyable file, with the same rotation caution as Codex since it holds a refresh
+token. **Unverified:** whether Cursor rotates refresh tokens or detects reuse.
+
+### Auth precedence (secondary question)
+
+Asked to settle whether "two accounts in one vessel" works via per-process env
+from one shared home. **The answer differs by invocation path, and that
+distinction is the whole answer.**
+
+Codex resolution order (`load_auth`,
+`codex-rs/login/src/auth/manager.rs:724-770`), with the source's own comment:
+
+```rust
+// API key via env var takes precedence over any other auth method.
+if enable_codex_api_key_env && let Some(api_key) = read_codex_api_key_from_env() { … }
+```
+
+1. `CODEX_API_KEY` env — **only when the caller passes `enable_codex_api_key_env: true`**
+2. ephemeral store (external ChatGPT auth tokens)
+3. `CODEX_ACCESS_TOKEN` env (agent-identity JWT)
+4. persistent store — `auth.json` file or OS keyring
+
+And that flag is **not** uniform across entry points. Counting call sites in the
+current source: 4 pass `true`, 59 pass `false`. The ones that matter:
+
+| Entry point | `enable_codex_api_key_env` | Effect |
+|---|---|---|
+| `codex exec` | **true** (`codex-rs/exec/src/lib.rs:528`) | Per-process `CODEX_API_KEY` **overrides** the home's stored login |
+| `codex` TUI | **false** (`codex-rs/tui/src/lib.rs:510`, `:825`) | Env key **ignored**; the home-resident login binds the process |
+| `codex login status` | **false** (`manager.rs:241-253`) | Reports the stored login, not the env — which is why the status probe above is trustworthy |
+
+**So the load-bearing answer is split:**
+
+- **Non-interactive crews (`codex exec`): per-process env is sufficient.** Two
+  crews with two different keys work from one shared home. No home split needed.
+- **Interactive/TUI crews: it is not.** The TUI ignores `CODEX_API_KEY` and uses
+  whatever login the home holds. Two TUI crews from one home are necessarily the
+  same identity.
+
+Combine that with the subscription priority and the conclusion sharpens: **plan
+logins live in `auth.json`, and the TUI is the path that consumes them.** A
+vessel running two *interactive* crews on two *different* subscription accounts
+therefore does require split `CODEX_HOME`s — this is the one case that genuinely
+revives the home-split option. It is narrow, and it is not today's case (one
+operator, one plan), but it is real and should be recorded rather than designed
+away.
+
+I did not probe the exec-vs-TUI precedence live: doing so with the real
+subscription `auth.json` present risks either a rotation (if the stored login
+won) or an actual model request. The source evidence is unusually direct — a
+literal `true` at the exec call site, `false` at the TUI's, and an explicit
+precedence comment — so this is **verified by source, not by live probe**, and
+flagged as such.
+
+Claude precedence is documented rather than inferred: cloud-provider credentials
+→ `ANTHROPIC_AUTH_TOKEN` → `ANTHROPIC_API_KEY` → `apiKeyHelper` →
+`CLAUDE_CODE_OAUTH_TOKEN` → stored OAuth. Every env form outranks the stored
+login, and `CLAUDE_CODE_OAUTH_TOKEN` explicitly "takes precedence over
+keychain-stored credentials". **Verified in the direction that matters**: an
+earlier probe with `ANTHROPIC_API_KEY` set showed "API Usage Billing" while the
+same throwaway config dir with no env credentials showed the keychain login. So
+for Claude, two identities from one home work on *both* interactive and
+non-interactive paths — better than Codex.
+
+Cursor: `CURSOR_API_KEY` (or hidden `--auth-token`) is read per process and, on
+the observed macOS path, short-circuits the credential manager entirely — an
+invalid env key failed before the keychain was consulted. Per-process identity
+therefore appears to work, but the Linux precedence against a resident
+`auth.json` is **unverified**.
+
+### Net effect on the one-vessel-home recommendation
+
+One home per vessel survives, and the subscription framing mostly strengthens it
+— one home means one copy of a rotating login, which is exactly what the token
+lifecycle demands. Three things change:
+
+1. **The vessel home must be durable storage**, not a tmpfs or a rebuilt image
+   layer. This was previously a nice-to-have; with rotating subscription tokens
+   it is a correctness requirement.
+2. **Do not fan one plan login out across vessels.** Either give each vessel its
+   own login, or accept that vessels sharing an identity must share a home on one
+   host. This is a placement constraint that did not previously exist.
+3. **Prefer minted long-lived tokens over copied logins** where the vendor offers
+   them. `claude setup-token` is the model: subscription-backed, per-process,
+   no rotation, no file. Codex's nearest equivalent is a Business/Enterprise
+   access token, which is plan-gated and not available here.
+
 ## Onboarding suppression sets
 
 This section answers the operative question directly: **what must be seeded so a
