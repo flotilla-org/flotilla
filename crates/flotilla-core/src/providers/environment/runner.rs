@@ -9,8 +9,8 @@ use crate::providers::{
 };
 
 /// A `CommandRunner` decorator that executes all commands inside a Docker container
-/// via `docker exec`. The caller's working directory (a path inside the container)
-/// is forwarded as a `-w` flag; the host-side cwd is always `/` (irrelevant).
+/// via `docker exec`. Absolute working directories are forwarded as `-w`; relative
+/// paths use the container's configured working directory. The host-side cwd is `/`.
 pub struct DockerEnvironmentRunner {
     container_name: String,
     inner: Arc<dyn CommandRunner>,
@@ -126,6 +126,15 @@ mod tests {
                 .expect("version probe should succeed");
 
         assert_eq!(output, "git version 2.51.0\n");
+    }
+
+    #[test]
+    fn interactive_exec_forwards_absolute_workdir() {
+        let runner = DockerEnvironmentRunner::new("my-container".into(), Arc::new(MockRunner::new(Vec::new())));
+
+        let args = runner.docker_exec_args("sh", &["-lc", "pwd"], Path::new("/workspace"), true);
+
+        assert_eq!(args, ["exec", "-i", "-w", "/workspace", "my-container", "sh", "-lc", "pwd"]);
     }
 
     #[tokio::test]
