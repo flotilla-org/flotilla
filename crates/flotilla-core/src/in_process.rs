@@ -998,12 +998,7 @@ async fn default_convoy_placement_policy(
         }
     }
     viable.sort_by_key(|policy| {
-        let target_host = policy
-            .spec
-            .host_direct
-            .as_ref()
-            .map(|spec| spec.host_ref.as_str())
-            .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|spec| spec.host_ref.as_str()));
+        let target_host = placement_host_ref(policy);
         let is_local = local_host_ref.is_some_and(|local| target_host == Some(local));
         let is_host_direct = policy.spec.host_direct.is_some();
         (Reverse(policy.spec.priority), !is_local, !is_host_direct, policy.metadata.name.clone())
