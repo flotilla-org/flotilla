@@ -5267,6 +5267,12 @@ impl InProcessDaemon {
                 is_local,
             );
             let (crew_count, convoys) = counts.remove(&host).unwrap_or_default();
+            let degraded_conditions = status
+                .into_iter()
+                .flat_map(|status| status.conditions.iter())
+                .filter(|condition| condition.value == ConditionValue::False)
+                .map(|condition| format!("{}: {}", condition.condition_type, condition.message))
+                .collect();
 
             rows.push(
                 FleetHostRow::builder()
@@ -5287,6 +5293,7 @@ impl InProcessDaemon {
                     .maybe_disk_free_bytes(status.and_then(|status| status.disk_free_bytes))
                     .staleness(staleness)
                     .observation_agreement(observation_agreement)
+                    .degraded_conditions(degraded_conditions)
                     .build(),
             );
         }
