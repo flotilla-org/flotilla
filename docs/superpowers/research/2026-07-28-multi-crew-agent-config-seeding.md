@@ -492,6 +492,17 @@ Two failure shapes matter, and only the first is a literal prompt:
   decision was never recorded. Passes a naive "no prompt" check and then fails
   the brief. This is the more dangerous of the two, because it looks like success.
 
+Under the revised **one-vessel-home** recommendation, everything below is seeded
+once into the single vessel home (`~/.codex`, `~/.claude`, …) — at image build
+or vessel provision — using seed-if-absent. Two categories are exceptions that
+must be written at *session spawn* instead, because they are properties of the
+grant or the workspace rather than of the image:
+
+- **credential-derived entries** — Codex's `auth.json` and Claude's
+  `customApiKeyResponses.approved` tail both depend on the key actually granted;
+- **workspace-keyed entries** — Codex's `[projects."<path>"]` and Claude's
+  `projects["<cwd>"]` both depend on where the crew starts.
+
 ### Codex
 
 | Prompt / first-run surface | Pre-answer mechanism | Citation | Status |
@@ -534,9 +545,14 @@ launch in the trusted directory went straight to the composer:
 ```
 
 So **#1156's `codex login --with-api-key` transformation is still required** for
-any interactive crew, and the writable per-crew `CODEX_HOME` it needs is
-non-negotiable. The earlier correction stands only for `codex exec`. A crew
+any interactive crew, and the `CODEX_HOME` it writes into must be writable and
+must already exist. The earlier correction stands only for `codex exec`. A crew
 spawned in exec mode can skip the login step; a crew spawned into the TUI cannot.
+Under one vessel home this is the vessel's own `~/.codex`, seeded once — not a
+per-crew directory. It only needs splitting in the narrow case the grading note
+identifies: two same-CLI crew members holding *different* keys, where the TUI
+path forces the key into `auth.json` and so cannot be separated by ambient env
+alone.
 
 Codex seed set, minimal:
 
@@ -552,6 +568,90 @@ EOF
 The trust key is looked up against the resolved cwd first and the git repo root
 second (`codex-rs/config/src/config_toml.rs:798-822`), so a single entry keyed on
 the repo root covers every subdirectory a crew might start in.
+
+### Claude Code
+
+Claude raises **three** blocking prompts in sequence on a fresh config dir, each
+independently verified by seeding its flag and watching the prompt disappear.
+All three live in `.claude.json` — which, under `CLAUDE_CONFIG_DIR`, is
+`$CLAUDE_CONFIG_DIR/.claude.json`, not `$HOME/.claude.json`.
+
+| Prompt / first-run surface | Pre-answer mechanism | Citation | Status |
+|---|---|---|---|
+| Theme picker — "Welcome to Claude Code v2.1.220 / Let's get started / Choose the text style that looks best with your terminal" | `"hasCompletedOnboarding": true` in `.claude.json`. **Setting `theme` in `settings.json` does *not* suppress it**, despite `theme` being a documented `settings.json` key | Probe below; flag name from `strings` on the installed 2.1.220 binary | **Verified** |
+| Workspace trust — "Quick safety check: Is this a project you created or one you trust? … Claude Code'll be able to read, edit, and execute files here." | `projects["<cwd>"].hasTrustDialogAccepted = true` in `.claude.json` | Probe below; key confirmed present in a real `.claude.json` project entry | **Verified** |
+| API-key approval — "Detected a custom API key in your environment / ANTHROPIC_API_KEY: sk-ant-… / Do you want to use this API key? 1. Yes / 2. No (recommended)" | `customApiKeyResponses.approved` must contain the key's truncated tail — the same string the prompt displays after `sk-ant-…` | Probe below; field name from `strings`, shape `{approved: [], rejected: []}` confirmed against a real `.claude.json` | **Verified** |
+| "What's new" changelog panel | `"lastOnboardingVersion": "<version>"`. **Not blocking** — it renders beside the composer and the prompt is usable | Probe: panel present under the minimal seed, absent once the key was set | **Verified** |
+| Bypass-permissions acceptance | `bypassPermissionsModeAccepted` in `.claude.json`; also refusable outright via `permissions.disableBypassPermissionsMode: "disable"` in managed settings | Flag name from `strings`; managed-settings key from `settings.md` | Unverified — not triggered; crews should not use bypass mode |
+| CLAUDE.md external-includes approval | `projects["<cwd>"].hasClaudeMdExternalIncludesApproved` | Key present in a real project entry | Unverified — only fires when a `CLAUDE.md` uses external includes |
+| IDE auto-connect / extension install | `autoConnectIde`, `autoInstallIdeExtension` in `.claude.json`; env overrides `CLAUDE_CODE_AUTO_CONNECT_IDE`, `CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL=1` | `settings.md`, "Global config settings" table | Unverified — no IDE present in the probe |
+
+The documented file split matters for seeding and is easy to get wrong: "These
+settings are stored in `~/.claude.json` rather than `settings.json`. **If you add
+these keys to `settings.json`, Claude Code silently ignores them at startup**"
+(`settings.md`). My first attempt seeded `{"theme":"dark"}` into `settings.json`
+and the theme picker appeared anyway — a silent no-op, exactly as documented.
+
+The API-key prompt is the one most likely to be missed, because it appears only
+*after* the other two are suppressed and only in interactive mode. The docs say
+`ANTHROPIC_API_KEY` "in non-interactive mode (`-p`) … is always used when
+present" while interactive mode "prompts once and remembers the choice" — so an
+interactive crew handed a key blocks on approval. With `hasCompletedOnboarding`
+and trust seeded but no approval entry:
+
+```text
+  Detected a custom API key in your environment
+  ANTHROPIC_API_KEY: sk-ant-...sk-ant-dummy
+  Do you want to use this API key?
+    1. Yes
+  ❯ 2. No (recommended)
+```
+
+Adding the tail to `customApiKeyResponses.approved` reached the composer
+directly:
+
+```text
+▐▛███▜▌   Claude Code v2.1.220
+▝▜█████▛▘  Opus 5 (1M context) · API Usage Billing
+❯ Try "fix lint errors"
+```
+
+Removing only the project trust entry from that same seed brought the trust
+dialog back, confirming each flag gates exactly one prompt.
+
+Claude seed set, minimal (`.claude.json` in the vessel home):
+
+```json
+{
+  "hasCompletedOnboarding": true,
+  "lastOnboardingVersion": "2.1.220",
+  "customApiKeyResponses": { "approved": ["<key tail as displayed>"], "rejected": [] },
+  "projects": {
+    "/workspace/repo": {
+      "hasTrustDialogAccepted": true,
+      "hasCompletedProjectOnboarding": true
+    }
+  }
+}
+```
+
+Three caveats for the seeder. The project key is the **exact cwd string**, so a
+crew starting in a subdirectory of the seeded path may re-prompt — seed every
+directory a crew may start in, or seed the repo root and start there.
+`lastOnboardingVersion` is version-pinned, so an adapter upgrade in the crew
+image can re-introduce the changelog panel; harmless, but refresh it with the
+image. And the API-key tail is a property of the credential, so it must be
+written at spawn from the material actually granted — it cannot be baked in.
+
+`IS_DEMO=1` is documented to skip onboarding wholesale, but it also hides the
+account email and organisation from the header and `/status`, so it is a
+recording aid rather than a provisioning mechanism. Prefer the explicit flags.
+
+Note that `.claude.json` is also the file the collision inventory flags as
+racy — every session rewrites it. Under one vessel home that is the CLIs' native
+mode and kiwi's 21 concurrent sessions say it holds; but the seeder should still
+write these flags **before** any crew starts, not into a live file, so a
+first-write race cannot drop them.
 
 ## What beyond credentials is per-crew
 
