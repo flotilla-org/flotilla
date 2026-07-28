@@ -191,6 +191,8 @@ impl RepositoryInspector for GitRepositoryInspector {
     }
 
     async fn inspect_checkouts(&self, inspection: &RepositoryInspection) -> Result<Vec<LocalCheckoutInspection>, String> {
+        // The path template is used only when creating a worktree;
+        // enumeration reads Git's existing worktree registry.
         let manager = GitCheckoutManager::new(crate::config::default_checkout_path(), Arc::clone(&self.runner));
         manager.list_checkouts(&ExecutionEnvironmentPath::new(&inspection.checkout.path)).await.map(|checkouts| {
             checkouts
@@ -225,9 +227,9 @@ fn ssh_remote_host(remote: &str) -> Option<&str> {
 mod tests {
     use std::sync::Arc;
 
-    use flotilla_resources::RepositoryIdentity;
+    use flotilla_resources::{RepositoryIdentity, RepositorySpec};
 
-    use super::{GitRepositoryInspector, RepositoryInspector};
+    use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryInspection, RepositoryInspector};
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
 
     fn git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -236,6 +238,40 @@ mod tests {
         std::fs::create_dir(&root).expect("repo dir");
         std::fs::create_dir(root.join(".git")).expect("git dir");
         (temp, root)
+    }
+
+    #[tokio::test]
+    async fn git_inspection_enumerates_main_and_linked_worktree_checkouts() {
+        let (_temp, root) = git_repo();
+        let feature = root.parent().expect("repo parent").join("repo.feature");
+        let porcelain = format!(
+            "worktree {}\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbranch refs/heads/main\n\n\
+             worktree {}\nHEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nbranch refs/heads/feature\n",
+            root.display(),
+            feature.display()
+        );
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["worktree", "list", "--porcelain"], Ok(porcelain))
+            .on_run("git", &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"], Ok("origin/main\n".to_string()))
+            .build();
+        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let inspection = RepositoryInspection {
+            spec: RepositorySpec::remote("https://github.com/org/repo").expect("repository spec"),
+            checkout: LocalCheckoutInspection {
+                path: root.clone(),
+                host_ref: "host-01".to_string(),
+                git_ref: "main".to_string(),
+                is_main: true,
+            },
+            transport_url: None,
+        };
+
+        let checkouts = inspector.inspect_checkouts(&inspection).await.expect("checkout inspection");
+
+        assert_eq!(checkouts, vec![
+            LocalCheckoutInspection { path: root, host_ref: "host-01".to_string(), git_ref: "main".to_string(), is_main: true },
+            LocalCheckoutInspection { path: feature, host_ref: "host-01".to_string(), git_ref: "feature".to_string(), is_main: false },
+        ]);
     }
 
     #[tokio::test]
