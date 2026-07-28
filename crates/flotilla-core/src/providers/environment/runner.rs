@@ -21,6 +21,19 @@ impl DockerEnvironmentRunner {
         Self { container_name, inner }
     }
 
+    fn docker_exec_args(&self, cmd: &str, args: &[&str], cwd: &Path, interactive: bool) -> Vec<String> {
+        let mut docker_args = vec!["exec".to_string()];
+        if interactive {
+            docker_args.push("-i".to_string());
+        }
+        if cwd.is_absolute() {
+            docker_args.extend(["-w".to_string(), cwd.to_string_lossy().into_owned()]);
+        }
+        docker_args.extend([self.container_name.clone(), cmd.to_string()]);
+        docker_args.extend(args.iter().map(|arg| (*arg).to_string()));
+        docker_args
+    }
+
     fn docker_exec_prefix(&self) -> Vec<&str> {
         vec!["exec", &self.container_name]
     }
@@ -29,24 +42,21 @@ impl DockerEnvironmentRunner {
 #[async_trait]
 impl CommandRunner for DockerEnvironmentRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-        let cwd_str = cwd.to_string_lossy();
-        let mut docker_args = vec!["exec", "-w", &cwd_str, &self.container_name, cmd];
-        docker_args.extend_from_slice(args);
-        self.inner.run("docker", &docker_args, Path::new("/"), label).await
+        let docker_args = self.docker_exec_args(cmd, args, cwd, false);
+        let arg_refs = docker_args.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner.run("docker", &arg_refs, Path::new("/"), label).await
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-        let cwd_str = cwd.to_string_lossy();
-        let mut docker_args = vec!["exec", "-w", &cwd_str, &self.container_name, cmd];
-        docker_args.extend_from_slice(args);
-        self.inner.run_output("docker", &docker_args, Path::new("/"), label).await
+        let docker_args = self.docker_exec_args(cmd, args, cwd, false);
+        let arg_refs = docker_args.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner.run_output("docker", &arg_refs, Path::new("/"), label).await
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
-        let cwd_str = cwd.to_string_lossy();
-        let mut docker_args = vec!["exec", "-i", "-w", &cwd_str, &self.container_name, cmd];
-        docker_args.extend_from_slice(args);
-        self.inner.run_with_input("docker", &docker_args, Path::new("/"), label, input).await
+        let docker_args = self.docker_exec_args(cmd, args, cwd, true);
+        let arg_refs = docker_args.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner.run_with_input("docker", &arg_refs, Path::new("/"), label, input).await
     }
 
     async fn exists(&self, cmd: &str, _args: &[&str]) -> bool {
@@ -76,10 +86,47 @@ impl CommandRunner for DockerEnvironmentRunner {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use std::{future, path::Path, sync::Arc, time::Duration};
+
+    use async_trait::async_trait;
 
     use super::DockerEnvironmentRunner;
-    use crate::providers::{testing::MockRunner, CommandRunner};
+    use crate::providers::{testing::MockRunner, ChannelLabel, CommandOutput, CommandRunner};
+
+    struct InvalidWorkdirHangingRunner;
+
+    #[async_trait]
+    impl CommandRunner for InvalidWorkdirHangingRunner {
+        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            assert_eq!(cmd, "docker");
+            if args.windows(2).any(|pair| pair == ["-w", "."]) {
+                return future::pending().await;
+            }
+            assert_eq!(args, ["exec", "my-container", "git", "--version"]);
+            Ok("git version 2.51.0\n".to_string())
+        }
+
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            self.run(cmd, args, cwd, label).await.map(|stdout| CommandOutput { stdout, stderr: String::new(), success: true })
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn relative_cwd_version_probe_does_not_hang() {
+        let runner = DockerEnvironmentRunner::new("my-container".into(), Arc::new(InvalidWorkdirHangingRunner));
+
+        let output =
+            tokio::time::timeout(Duration::from_millis(100), runner.run("git", &["--version"], Path::new("."), &ChannelLabel::Noop))
+                .await
+                .expect("relative-cwd docker exec should be reaped")
+                .expect("version probe should succeed");
+
+        assert_eq!(output, "git version 2.51.0\n");
+    }
 
     #[tokio::test]
     async fn ensure_file_delegates_via_docker_exec_sh() {
