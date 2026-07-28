@@ -653,6 +653,59 @@ mode and kiwi's 21 concurrent sessions say it holds; but the seeder should still
 write these flags **before** any crew starts, not into a live file, so a
 first-write race cannot drop them.
 
+### Cursor Agent
+
+**Verification limit, stated up front.** Cursor's *interactive* prompts could not
+be observed on this machine, so this table is weaker than the Codex and Claude
+ones. On macOS the credential manager shells out to `/usr/bin/security` against
+the login keychain, and with a relocated `HOME` the CLI dies before rendering
+anything:
+
+```text
+Error: Security command failed: Security process exited with code: 154
+```
+
+Supplying `CURSOR_API_KEY` short-circuits the keychain but then exits on the
+invalid dummy key. Observing the interactive first-run therefore needs either a
+valid key or a Linux container — and on Linux the credential path is the
+`auth.json` file rather than the keychain, so this particular failure is
+macOS-only and does not affect vessels. The entries below are from `agent --help`
+on the installed 2026.04.17 build and from constants read out of its shipped
+bundle; the two marked Verified were observed.
+
+| Prompt / first-run surface | Pre-answer mechanism | Citation | Status |
+|---|---|---|---|
+| Workspace trust | Write `<workspace>/.cursor/.workspace-trusted`. The read is `existsSync(join(<cwd>/.cursor, ".workspace-trusted"))`; the CLI's own writer creates the directory then writes JSON `{trustedAt, workspacePath, trustMethod}` | Bundle: `const _=".workspace-trusted"; function y(e){…existsSync(join(cursorDir,_))…}` and its writer `C(e,t)` | Unverified (mechanism read from source; prompt not observed) |
+| Workspace trust, headless only | `--trust` — "Trust the current workspace without prompting (**only works with `--print`/headless mode**)" | `agent --help` | Unverified |
+| MCP server approval | `--approve-mcps` — "Automatically approve all MCP servers"; persistent form is `mcp-approvals.json` under the per-project data dir | `agent --help`; `mcp-approvals` string in bundle | Unverified |
+| Command approval | `-f`/`--force` (alias `--yolo`) — "Force allow commands unless explicitly denied"; persistent form is the `permissions` block in `cli-config.json` / project `.cursor/cli.json` | `agent --help`; documented at cursor.com/docs/cli/reference/configuration | Unverified |
+| Sandbox mode | `--sandbox enabled\|disabled` "(overrides config)"; config key `cliSandboxDefaultEnabled` | `agent --help`; bundle field name | Unverified |
+| Login | `CURSOR_API_KEY`, or the hidden `--auth-token` | `agent --help` | **Verified** — no prompt; an invalid key produces a clean bounded failure ("⚠ Warning: The provided API key is invalid. The API key was loaded from the CURSOR_API_KEY environment variable.") and exits, in both `-p` and interactive mode |
+| macOS keychain dependency | none — relocating `HOME` breaks the CLI outright on macOS | Probe above | **Verified** |
+| Server-driven onboarding | none available offline | The bundle's `GetServerConfigResponse` carries an `onboardingConfig` field alongside `modelPickerNudge` and `terminalTipConfig`, so some first-run surface is delivered by Cursor's server at runtime and cannot be enumerated from the binary | Unverified, and **not fully enumerable** without a live authenticated session |
+
+That last row is the important caveat: because part of Cursor's first-run
+experience is server-configured, **no static seed set can be proven complete for
+Cursor**. The other three CLIs can be reasoned about entirely from local state.
+
+The trust marker is also the odd one out architecturally: it is
+**workspace-anchored**, written into the checkout at `.cursor/.workspace-trusted`
+rather than into any home. Under one vessel home with a shared checkout that is
+convenient — one write covers every crew — but it means the seeder must touch the
+workspace, and the marker will show up as an untracked file in the repo unless
+ignored.
+
+Cursor seed set, best available:
+
+```sh
+mkdir -p "$WORKSPACE/.cursor"
+printf '{"trustedAt":"%s","workspacePath":"%s","trustMethod":"seeded"}' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$WORKSPACE" \
+  > "$WORKSPACE/.cursor/.workspace-trusted"
+export CURSOR_API_KEY=…            # or the hidden --auth-token
+# headless crews additionally: agent -p --trust --approve-mcps
+```
+
 ## What beyond credentials is per-crew
 
 Grouping by what moves it, since that is what the seeder must act on:
