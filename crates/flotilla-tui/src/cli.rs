@@ -198,10 +198,14 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
             FleetHostStaleness::Stale => "STALE",
             FleetHostStaleness::Unknown => "unknown",
         };
-        let diagnosis = match host.observation_agreement {
-            FleetObservationAgreement::Agree => "agree",
-            FleetObservationAgreement::Disagree => "⚠ DISAGREE",
-            FleetObservationAgreement::Unknown => "unknown",
+        let diagnosis = if !host.degraded_conditions.is_empty() {
+            format!("⚠ DEGRADED: {}", host.degraded_conditions.join("; "))
+        } else {
+            match host.observation_agreement {
+                FleetObservationAgreement::Agree => "agree".to_string(),
+                FleetObservationAgreement::Disagree => "⚠ DISAGREE".to_string(),
+                FleetObservationAgreement::Unknown => "unknown".to_string(),
+            }
         };
         table.add_row(vec![
             Cell::new(name),

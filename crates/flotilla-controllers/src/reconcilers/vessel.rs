@@ -708,14 +708,16 @@ impl Reconciler for VesselReconciler {
                                 .and_then(|crew| crew.get(&process.role))
                                 .map(|work| work.phase);
                             let active = matches!(crew_phase, Some(CrewWorkPhase::Working | CrewWorkPhase::Interrupted))
-                                || (crew_phase.is_none() && should_start && work_phase == Some(WorkPhase::Running));
+                                || (matches!(crew_phase, None | Some(CrewWorkPhase::Pending))
+                                    && should_start
+                                    && matches!(work_phase, Some(WorkPhase::Launching | WorkPhase::Running)));
                             if !active {
                                 continue;
                             }
                             return Ok(VesselDeps::interrupted(
                                 process.role.clone(),
                                 &terminal_name,
-                                work_phase != Some(WorkPhase::Running),
+                                work_phase == Some(WorkPhase::Interrupted),
                                 actuations,
                             ));
                         }

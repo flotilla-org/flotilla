@@ -15,6 +15,7 @@ use common::{
         assert_identical_update_is_noop_with_backend, assert_metadata_roundtrip_with_backend, assert_namespace_isolation_with_backend,
         assert_project_definition_causal_merge_with_backend, assert_project_definition_delete_conflicts_with_concurrent_edit_with_backend,
         assert_project_definition_edit_converges_with_backend, assert_project_definition_edit_preserves_unrelated_conflict_with_backend,
+        assert_project_definition_metadata_edit_converges_with_backend,
         assert_project_definition_optional_field_can_be_cleared_with_backend,
         assert_repeated_delete_with_pending_finalizers_is_noop_with_backend,
         assert_replica_events_ignore_stale_writes_and_deletes_with_backend, assert_replica_read_view_contract,
@@ -190,6 +191,11 @@ async fn project_definition_edit_converges() {
 }
 
 #[tokio::test]
+async fn project_definition_metadata_edit_converges() {
+    assert_project_definition_metadata_edit_converges_with_backend(backend()).await;
+}
+
+#[tokio::test]
 async fn project_definition_causal_merge() {
     assert_project_definition_causal_merge_with_backend(backend()).await;
 }
@@ -230,6 +236,45 @@ async fn replica_rows_and_cursor_survive_backend_restart() {
     let cursor =
         reopened.replica_writer::<Convoy>(origin, "flotilla").cursor().await.expect("read persisted cursor").expect("persisted cursor");
     assert_eq!(cursor.resource_version, listed.resource_version);
+}
+
+#[tokio::test]
+async fn undecodable_replica_partition_is_dropped_and_forces_full_resync() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("resources.sqlite");
+    let origin = flotilla_protocol::NodeId::new("feta-root");
+    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    source.using::<Convoy>("flotilla").create(&convoy_meta("remote"), &convoy_spec("template")).await.expect("create source convoy");
+    let listed = source.using::<Convoy>("flotilla").list().await.expect("list source convoy");
+
+    {
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("open sqlite backend"));
+        backend.replica_writer::<Convoy>(origin.clone(), "flotilla").replace(&listed, Utc::now()).await.expect("persist replica");
+    }
+    {
+        let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
+        connection
+            .execute("UPDATE replica_objects SET body_json = '{}' WHERE origin_root = ?1 AND name = ?2", rusqlite::params![
+                origin.to_string(),
+                "remote"
+            ])
+            .expect("corrupt cached replica");
+    }
+
+    let reopened = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("reopen sqlite backend"));
+    let replicas = reopened.including_replicas::<Convoy>("flotilla").list().await.expect("quarantine invalid replica cache");
+    assert!(replicas.items.is_empty(), "an invalid cache partition must contribute no partial rows");
+    assert!(
+        reopened.replica_writer::<Convoy>(origin.clone(), "flotilla").cursor().await.expect("read cursor").is_none(),
+        "dropping the cursor makes the replicator relist the origin"
+    );
+
+    reopened
+        .replica_writer::<Convoy>(origin, "flotilla")
+        .replace(&listed, Utc::now())
+        .await
+        .expect("full resync should repopulate the partition");
+    assert_eq!(reopened.including_replicas::<Convoy>("flotilla").list().await.expect("list resynced replica").items.len(), 1);
 }
 
 #[tokio::test]

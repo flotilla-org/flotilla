@@ -225,4 +225,12 @@ where
     fn finalizer_name(&self) -> Option<&'static str> {
         Some("flotilla.work/checkout-cleanup")
     }
+
+    fn finalizer_error_patch(&self, obj: &ResourceObject<Self::Resource>, error: &ResourceError) -> Option<CheckoutStatusPatch> {
+        let message = format!("checkout teardown failed: {error}");
+        if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Failed && status.message.as_deref() == Some(&message)) {
+            return None;
+        }
+        Some(CheckoutStatusPatch::MarkFailed { message })
+    }
 }

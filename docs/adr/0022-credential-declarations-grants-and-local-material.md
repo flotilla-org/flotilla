@@ -1,6 +1,6 @@
 # Credentials: replicated declarations, host-local material, stance-first grants
 
-**Status:** Accepted
+**Status:** Accepted — amended 2026-07-28 (see Amendment below)
 **Date:** 2026-07-27
 **Relates to:** ADR 0016 (replication classes — declarations and grants ride
 the definitions class), ADR 0010 (Hull/Crew boundary — credential state is
@@ -97,3 +97,67 @@ is a bounded provisioning failure, never a silently retrying crew.
 4. Ambient inheritance in crew provisioning is then **removed**, not
    discouraged: reaching a human identity afterwards requires escaping
    the allowlist, not being handed it.
+
+## Amendment (2026-07-28): subscriptions primary, lease-located material, forge/model split
+
+Ruled during the #1140 seeding design (rulings and evidence in that issue;
+mechanics in `docs/superpowers/research/2026-07-28-multi-crew-agent-config-seeding.md`).
+
+### Forge identity and model identity are different categories
+
+"Crews never carry a human's forge identity" **stands unchanged** — forge
+credentials are the crew's own (GitHub App `flotilla-crew`, Forgejo crew
+user). But **model-provider auth may deliberately be the operator's
+subscription**: solo devs, homelabs, and small teams are the primary target,
+and their economics are plan subscriptions, not metered API keys. This ADR's
+original framing listed "harness logins are copied caches of personal
+subscriptions" among the problems; the amendment sharpens it — the defect was
+*ambient, unmanaged* copying, not subscription-backed crews. Subscriptions are
+the **primary** auth driver; API keys are the secondary/alternative.
+
+### Material is lease-located, not host-pinned
+
+The original text said material is "owned by the host that provisions vessels
+with them." Generalized: **material resides wherever its lease is currently
+held** — it moves point-to-point at lease transfer and still never rides the
+resource log, replicas, or snapshots. Rotating login material (a codex
+ChatGPT login's refresh chain is single-use — reuse is a permanent,
+server-detected failure) is managed as a **pool of exclusively-leased homes**:
+mint up to a concurrency high-watermark, lease one to one holder at a time
+(bind-mount the durable slot directory into the vessel so refresh write-back
+lands in the store copy — single-writer enforced by lease exclusivity, not
+discipline). Pool exhaustion is in-system semantics: the demander *waits
+visibly*, and exhaustion offers minting another slot. Non-rotating material
+(a `claude setup-token` long-lived token) needs no lease — one mint serves N
+crews per-process.
+
+### Minting is HITL, up-front, and in-system
+
+Subscription logins require a browser: `codex login --device-auth` (one-time
+account-level enablement; link + one-time code enterable anywhere) and
+`claude setup-token`. These are **first-class flotilla flows** — an
+interactive mint vessel surfaces the link/code through the normal attach
+path — never per-task steps and never pasted incantations. Because providers'
+own consoles cannot usefully enumerate active logins, **flotilla's pool
+bookkeeping is the operator's login inventory**.
+
+### Corrections to recorded facts
+
+- Codex ≥0.145 accepts `OPENAI_API_KEY`/`CODEX_API_KEY` ambiently **for
+  non-interactive surfaces** (`codex exec`, `codex doctor`) — there the
+  `login --with-api-key` transformation becomes optional. **The interactive
+  TUI ignores the env keys** and uses whatever login the home holds, so for
+  interactive crews (today's crews) seeded login material or the login
+  transformation remains required (original text listed the transformation as
+  required for all cases; the truth is this split). Corollary: two
+  *interactive* crews on two *different* accounts in one vessel is the one
+  narrow case that genuinely revives per-crew `CODEX_HOME`s.
+- Consumer adapters gain the seeding duty with a hard acceptance test: a
+  spawned crew reaches its brief with **zero interactive prompts**.
+
+### Proxying is not precluded
+
+"Material in vessel" and "endpoint plus proxy-held auth" are two
+implementations of the same delivery interface; a future model-API proxy
+(per-crew attribution at the proxy, no material in vessels) must slot in
+without reshaping `CredentialSpec`.

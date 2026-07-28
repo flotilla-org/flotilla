@@ -227,6 +227,9 @@ pub struct FleetHostRow {
     pub disk_free_bytes: Option<u64>,
     pub staleness: FleetHostStaleness,
     pub observation_agreement: FleetObservationAgreement,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_conditions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
