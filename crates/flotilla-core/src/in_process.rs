@@ -45,8 +45,8 @@ use flotilla_resources::{
     ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, REPO_KEY_LABEL,
-    REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, ROLE_LABEL,
+    VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -4475,7 +4475,7 @@ impl InProcessDaemon {
 
         ensure_repository_and_default_project_workflow(&self.resource_backend, &namespace, &key, &repository_spec).await?;
         if let Some(checkout) = checkout {
-            self.ensure_project_checkout(&namespace, &key, &repository_spec, checkout).await?;
+            self.reconcile_project_checkouts(&namespace, &key, &repository_spec, checkout).await?;
         }
 
         let default_name = normalize_project_name(&repository_spec.leaf_slug())?;
@@ -4512,6 +4512,7 @@ impl InProcessDaemon {
         let repository_spec = &inspection.spec;
         let repository_key = repository_spec.key();
         ensure_repository_and_default_project_workflow(&self.resource_backend, &namespace, &repository_key, repository_spec).await?;
+        self.reconcile_project_checkouts(&namespace, &repository_key, repository_spec, inspection.checkout.clone()).await?;
         let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
         let stored = repositories.get(&repository_key.to_string()).await.map_err(|error| error.to_string())?;
         if stored.spec != *repository_spec {
@@ -4716,59 +4717,40 @@ impl InProcessDaemon {
         Ok(())
     }
 
-    async fn ensure_project_checkout(
+    async fn reconcile_project_checkouts(
         &self,
         namespace: &str,
         repository_key: &RepositoryKey,
         repository_spec: &RepositorySpec,
         checkout: crate::repository_inspection::LocalCheckoutInspection,
     ) -> Result<(), String> {
-        let checkouts = self.observed_resource_backend.clone().using::<ResourceCheckout>(namespace);
-        let checkout_name = format!(
-            "checkout-{}",
-            flotilla_resources::repo_key(&format!("{}\0{}\0{}", repository_key, checkout.host_ref, checkout.path.display()))
-        );
-        let spec = ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-            r#ref: checkout.git_ref,
-            path: checkout.path.to_string_lossy().into_owned(),
-            repo_ref: repository_key.clone(),
-            host_ref: checkout.host_ref,
-            is_main: checkout.is_main,
-        });
-        let meta = InputMeta::builder()
-            .name(checkout_name.clone())
-            .labels(BTreeMap::from([
-                (REPO_KEY_LABEL.to_string(), repository_key.to_string()),
-                (REPO_LABEL.to_string(), repository_spec.catalog_slug()),
-            ]))
-            .build()
-            .with_lifecycle_authority(LifecycleAuthority::Observed);
-        let stored = match checkouts.create(&meta, &spec).await {
-            Ok(created) => created,
-            Err(ResourceError::Conflict { .. }) => {
-                let existing = checkouts.get(&checkout_name).await.map_err(|error| error.to_string())?;
-                if existing.spec != spec {
-                    return Err(format!("checkout {checkout_name} already exists with a different observation"));
-                }
-                existing
-            }
-            Err(error) => return Err(error.to_string()),
-        };
-        checkouts
-            .update_status(&checkout_name, &stored.metadata.resource_version, &ResourceCheckoutStatus {
-                phase: ResourceCheckoutPhase::Ready,
-                path: spec.target_path().map(str::to_string).or_else(|| match &spec {
-                    ResourceCheckoutSpec::Observed(observed) => Some(observed.path.clone()),
-                    _ => None,
-                }),
-                commit: None,
-                branch_provenance: Default::default(),
-                integration: Default::default(),
-                message: None,
-            })
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        let inspection = RepositoryInspection { spec: repository_spec.clone(), checkout, transport_url: None };
+        let inspector = self.repository_inspector().await?;
+        let mut providers = ProviderData::default();
+        for checkout in inspector.inspect_checkouts(&inspection).await? {
+            providers.checkouts.insert(QualifiedPath::host(HostId::new(checkout.host_ref), checkout.path), flotilla_protocol::Checkout {
+                branch: checkout.git_ref,
+                is_main: checkout.is_main,
+                trunk_ahead_behind: None,
+                remote_ahead_behind: None,
+                working_tree: None,
+                last_commit: None,
+                correlation_keys: Vec::new(),
+                association_keys: Vec::new(),
+                host_name: None,
+                environment_id: None,
+            });
+        }
+        crate::observed_resources::reconcile_checkouts(
+            &self.observed_resource_backend,
+            namespace,
+            repository_key,
+            &repository_spec.catalog_slug(),
+            &providers,
+            &inspection.checkout.host_ref,
+        )
+        .await
+        .map_err(|error| error.to_string())
     }
 
     pub async fn refresh(&self, repo: &flotilla_protocol::RepoSelector) -> Result<Option<RepositoryIdentityChange>, String> {
