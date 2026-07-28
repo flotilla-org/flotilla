@@ -3,29 +3,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::Duration;
 use flotilla_protocol::{PrincipalRef, ResourceRef, SurfaceCharacter, SurfaceDeclaration};
 use flotilla_resources::{
     apply_status_patch, InputMeta, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatusPatch, ResourceBackend, ResourceError,
 };
+pub use flotilla_resources::{Clock, SystemClock};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const DEFAULT_REGARD_DECAY_SECONDS: i64 = 300;
 pub const DEFAULT_REGARD_REFRESH_SECONDS: u64 = 60;
-
-pub trait Clock: Send + Sync {
-    fn now(&self) -> DateTime<Utc>;
-}
-
-#[derive(Debug, Default)]
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&self) -> DateTime<Utc> {
-        Utc::now()
-    }
-}
 
 #[derive(Debug, Clone)]
 struct SurfaceState {

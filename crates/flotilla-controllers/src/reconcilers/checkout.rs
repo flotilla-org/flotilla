@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
     controller::{ReconcileOutcome, Reconciler},
-    Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, Clone,
-    ClonePhase, IntegrationCondition, ResourceBackend, ResourceError, ResourceObject, TypedResolver,
+    Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, Clock,
+    Clone, ClonePhase, IntegrationCondition, ResourceBackend, ResourceError, ResourceObject, SystemClock, TypedResolver,
 };
 use tracing::warn;
 
@@ -60,11 +60,16 @@ pub trait CheckoutRuntime: Send + Sync {
 pub struct CheckoutReconciler<R> {
     runtime: Arc<R>,
     clones: TypedResolver<Clone>,
+    clock: Arc<dyn Clock>,
 }
 
 impl<R> CheckoutReconciler<R> {
     pub fn new(runtime: Arc<R>, backend: ResourceBackend, namespace: &str) -> Self {
-        Self { runtime, clones: backend.using::<Clone>(namespace) }
+        Self::with_clock(runtime, backend, namespace, Arc::new(SystemClock))
+    }
+
+    pub fn with_clock(runtime: Arc<R>, backend: ResourceBackend, namespace: &str, clock: Arc<dyn Clock>) -> Self {
+        Self { runtime, clones: backend.using::<Clone>(namespace), clock }
     }
 }
 
@@ -101,7 +106,11 @@ where
 
     async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) != CheckoutPhase::Pending {
-            if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready && !integration_is_fresh(status, Utc::now())) {
+            if obj
+                .status
+                .as_ref()
+                .is_some_and(|status| status.phase == CheckoutPhase::Ready && !integration_is_fresh(status, self.clock.now()))
+            {
                 return Ok(match self.runtime.inspect_integration(obj).await {
                     Ok(status) => CheckoutDeps::Integration { status: Box::new(status) },
                     Err(err) => CheckoutDeps::Failed(err),

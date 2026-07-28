@@ -36,17 +36,17 @@ use flotilla_resources::{
     list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec, repository_display_labels,
     resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from,
     watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
-    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue,
-    Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec,
-    CrewSource, Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
-    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
-    PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource,
-    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
-    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, REPO_KEY_LABEL,
-    REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
+    ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialGrant,
+    CredentialSpec, CrewSource, Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta,
+    InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
+    ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
+    SystemClock, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
+    Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
+    CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -89,7 +89,7 @@ use crate::{
         ChannelLabel, CommandRunner,
     },
     refresh::RefreshSnapshot,
-    regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome, DEFAULT_REGARD_REFRESH_SECONDS},
+    regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome, DEFAULT_REGARD_DECAY_SECONDS, DEFAULT_REGARD_REFRESH_SECONDS},
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
     repository_inspection::{GitRepositoryInspector, RepositoryInspection, RepositoryInspector},
     step::{
@@ -1585,6 +1585,7 @@ pub struct InProcessDaemon {
     /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
+    clock: Arc<dyn Clock>,
     regard_lifecycle: RegardLifecycle,
     observed_resource_backend: ResourceBackend,
     /// Serializes observed Checkout publication with repository removal so a
@@ -1661,6 +1662,17 @@ impl InProcessDaemon {
         discovery: DiscoveryRuntime,
         host_name: HostName,
         resource_backend: ResourceBackend,
+    ) -> Arc<Self> {
+        Self::new_with_resource_backend_and_clock(repo_paths, config, discovery, host_name, resource_backend, Arc::new(SystemClock)).await
+    }
+
+    pub async fn new_with_resource_backend_and_clock(
+        repo_paths: Vec<PathBuf>,
+        config: Arc<ConfigStore>,
+        discovery: DiscoveryRuntime,
+        host_name: HostName,
+        resource_backend: ResourceBackend,
+        clock: Arc<dyn Clock>,
     ) -> Arc<Self> {
         use crate::providers::discovery::DiscoveryResult;
 
@@ -1779,7 +1791,8 @@ impl InProcessDaemon {
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
-            regard_lifecycle: RegardLifecycle::with_system_clock(resource_backend.clone()),
+            clock: Arc::clone(&clock),
+            regard_lifecycle: RegardLifecycle::new(resource_backend.clone(), clock, ChronoDuration::seconds(DEFAULT_REGARD_DECAY_SECONDS)),
             resource_backend,
             observed_resource_backend: ResourceBackend::InMemory(InMemoryBackend::observed()),
             observed_checkout_reconciliation: Mutex::new(()),
@@ -5635,7 +5648,7 @@ impl InProcessDaemon {
                     .observed_at
                     .as_deref()
                     .and_then(|observed_at| chrono::DateTime::parse_from_rfc3339(observed_at).ok())
-                    .is_some_and(|observed_at| Utc::now().signed_duration_since(observed_at) < LANDING_EVIDENCE_TTL);
+                    .is_some_and(|observed_at| self.clock.now().signed_duration_since(observed_at) < LANDING_EVIDENCE_TTL);
                 if recent {
                     if condition_is_true(landed) {
                         continue;
