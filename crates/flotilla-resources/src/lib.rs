@@ -1,5 +1,6 @@
 mod backend;
 mod checkout;
+mod clock;
 mod clone;
 pub mod controller;
 mod convoy;
@@ -25,6 +26,8 @@ mod retention;
 mod sqlite;
 mod status_patch;
 mod terminal_session;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod tls;
 mod vessel;
 mod watch;
@@ -35,6 +38,9 @@ pub use checkout::{
     Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch,
     CheckoutWorktreeSpec, ConditionValue, FreshCloneCheckoutSpec, IntegrationCondition, LandedEvidence, ObservedCheckoutSpec,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use clock::VirtualClock;
+pub use clock::{Clock, SystemClock};
 pub use clone::{Clone, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use convoy::{
     controller_patches, external_patches, pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending, provisioning_patches,

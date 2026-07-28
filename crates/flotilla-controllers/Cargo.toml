@@ -19,6 +19,7 @@ sha2 = "0.10"
 serde_json = { workspace = true }
 
 [dev-dependencies]
+flotilla-resources = { path = "../flotilla-resources", features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 rstest = { workspace = true }
 tempfile = "3"
