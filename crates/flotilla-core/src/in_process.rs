@@ -4475,7 +4475,7 @@ impl InProcessDaemon {
 
         ensure_repository_and_default_project_workflow(&self.resource_backend, &namespace, &key, &repository_spec).await?;
         if let Some(checkout) = checkout {
-            self.ensure_project_checkout(&namespace, &key, &repository_spec, checkout).await?;
+            self.reconcile_project_checkouts(&namespace, &key, &repository_spec, checkout).await?;
         }
 
         let default_name = normalize_project_name(&repository_spec.leaf_slug())?;
@@ -4512,6 +4512,7 @@ impl InProcessDaemon {
         let repository_spec = &inspection.spec;
         let repository_key = repository_spec.key();
         ensure_repository_and_default_project_workflow(&self.resource_backend, &namespace, &repository_key, repository_spec).await?;
+        self.reconcile_project_checkouts(&namespace, &repository_key, repository_spec, inspection.checkout.clone()).await?;
         let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
         let stored = repositories.get(&repository_key.to_string()).await.map_err(|error| error.to_string())?;
         if stored.spec != *repository_spec {
@@ -4769,6 +4770,21 @@ impl InProcessDaemon {
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    async fn reconcile_project_checkouts(
+        &self,
+        namespace: &str,
+        repository_key: &RepositoryKey,
+        repository_spec: &RepositorySpec,
+        checkout: crate::repository_inspection::LocalCheckoutInspection,
+    ) -> Result<(), String> {
+        let inspection = RepositoryInspection { spec: repository_spec.clone(), checkout, transport_url: None };
+        let inspector = self.repository_inspector().await?;
+        for checkout in inspector.inspect_checkouts(&inspection).await? {
+            self.ensure_project_checkout(namespace, repository_key, repository_spec, checkout).await?;
+        }
+        Ok(())
     }
 
     pub async fn refresh(&self, repo: &flotilla_protocol::RepoSelector) -> Result<Option<RepositoryIdentityChange>, String> {

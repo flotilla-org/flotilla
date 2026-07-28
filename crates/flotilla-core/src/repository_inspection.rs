@@ -6,7 +6,13 @@ use std::{
 use async_trait::async_trait;
 use flotilla_resources::{RepositoryKey, RepositorySpec};
 
-use crate::providers::{ChannelLabel, CommandRunner};
+use crate::{
+    path_context::ExecutionEnvironmentPath,
+    providers::{
+        vcs::{git_worktree::GitCheckoutManager, CheckoutManager},
+        ChannelLabel, CommandRunner,
+    },
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct LocalCheckoutInspection {
@@ -32,6 +38,15 @@ impl RepositoryInspection {
 #[async_trait]
 pub trait RepositoryInspector: Send + Sync {
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String>;
+
+    /// Enumerate every local checkout that belongs to an inspected repository.
+    ///
+    /// Test and non-git inspectors may only know about the checkout used to
+    /// establish repository identity. Git-backed inspection overrides this to
+    /// include every worktree.
+    async fn inspect_checkouts(&self, inspection: &RepositoryInspection) -> Result<Vec<LocalCheckoutInspection>, String> {
+        Ok(vec![inspection.checkout.clone()])
+    }
 
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         RepositorySpec::remote(remote)
@@ -173,6 +188,21 @@ impl RepositoryInspector for GitRepositoryInspector {
 
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         RepositorySpec::remote(self.canonical_remote(Path::new("/"), remote).await?)
+    }
+
+    async fn inspect_checkouts(&self, inspection: &RepositoryInspection) -> Result<Vec<LocalCheckoutInspection>, String> {
+        let manager = GitCheckoutManager::new(crate::config::default_checkout_path(), Arc::clone(&self.runner));
+        manager.list_checkouts(&ExecutionEnvironmentPath::new(&inspection.checkout.path)).await.map(|checkouts| {
+            checkouts
+                .into_iter()
+                .map(|(path, checkout)| LocalCheckoutInspection {
+                    path: path.into_path_buf(),
+                    host_ref: self.host_ref.clone(),
+                    git_ref: checkout.branch,
+                    is_main: checkout.is_main,
+                })
+                .collect()
+        })
     }
 }
 
