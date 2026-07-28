@@ -492,6 +492,28 @@ a subscription login is not static material that can be stamped into an image.
 It is live, mutating state that must be written back to durable storage, and it
 tolerates exactly one writer.
 
+### Codex — official auth flows for headless hosts (added from vendor docs)
+
+Per https://learn.chatgpt.com/docs/auth (redirect target of
+developers.openai.com/codex/auth), verified against `codex login --help` on
+0.145.0 (`--device-auth` present, Beta):
+
+- **`codex login`** uses a same-machine browser with a **localhost:1455
+  callback** — structurally impossible headless.
+- **`codex login --device-auth`** (Beta) is the headless flow: verification
+  link + one-time code entered in any browser. **Prerequisite: device code
+  login must be enabled in the account's ChatGPT security settings.** This is
+  the pool-slot minting flow.
+- **Copying `auth.json` is officially sanctioned** ("Auth Cache Transfer",
+  with an ssh example; "Treat `~/.codex/auth.json` like a password"). Note the
+  vendor docs do **not** mention refresh rotation — the single-writer hazard
+  documented below is this research's addition and remains load-bearing.
+- Fallback: ssh port-forward 1455 and run the normal login through the tunnel.
+- Watch-items: `--with-access-token` / `CODEX_ACCESS_TOKEN` (enterprise;
+  "trusted scripts, schedulers, and private CI runners" with ChatGPT workspace
+  access — likely short-lived, no auto-refresh) and `cli_auth_credentials_store`
+  (plaintext vs OS store — Linux vessels get plaintext by design).
+
 ### Codex — relocatable, but single-writer
 
 `auth.json` for a ChatGPT subscription login holds `auth_mode`, `last_refresh`,
