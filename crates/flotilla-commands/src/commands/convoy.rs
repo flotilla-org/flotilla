@@ -59,7 +59,11 @@ pub enum ConvoyVerb {
         #[arg(long)]
         project: String,
         /// Existing pull request number to adopt
-        #[arg(long = "pr", conflicts_with = "branch", value_parser = parse_pr_number)]
+        #[arg(
+            long = "pr",
+            conflicts_with_all = ["branch", "issue", "issue_service", "issue_scope"],
+            value_parser = parse_pr_number
+        )]
         change_request: Option<String>,
         /// Opaque external issue ID
         #[arg(long)]
@@ -742,6 +746,10 @@ mod tests {
         assert!(
             ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--pr", "1071", "--branch", "feat/wrong",]).is_err(),
             "--pr must be the branch identity authority"
+        );
+        assert!(
+            ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--pr", "1071", "--issue", "42"]).is_err(),
+            "--pr adoption must remain PR-first"
         );
     }
 

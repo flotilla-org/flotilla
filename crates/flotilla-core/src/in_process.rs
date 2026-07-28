@@ -4133,6 +4133,9 @@ impl InProcessDaemon {
         if intent.change_request.is_some() && intent.branch.is_some() {
             return Err("change request adoption derives the branch from --pr; do not also provide a branch".to_string());
         }
+        if intent.change_request.is_some() && !intent.issues.is_empty() {
+            return Err("change request adoption is PR-first; do not also provide issues".to_string());
+        }
         let change_request = match intent.change_request.as_deref() {
             Some(id) => {
                 let id = required_admission_value(id, "change request")?;
