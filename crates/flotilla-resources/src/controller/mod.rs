@@ -13,6 +13,7 @@ use tokio::{
     sync::{mpsc, Mutex},
     task::JoinHandle,
 };
+use tracing::warn;
 
 use crate::{
     apply_status_patch,
@@ -52,6 +53,19 @@ pub trait Reconciler: Send + Sync + 'static {
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError>;
 
     fn finalizer_name(&self) -> Option<&'static str>;
+
+    /// Map an object-scoped reconciliation error to a status update.
+    ///
+    /// The controller loop isolates errors to the named object regardless of
+    /// whether a reconciler supplies a patch. Reconcilers with a failed/degraded
+    /// status should override this so the affected object reports the error.
+    fn error_patch(
+        &self,
+        _obj: &ResourceObject<Self::Resource>,
+        _error: &ResourceError,
+    ) -> Option<<Self::Resource as Resource>::StatusPatch> {
+        None
+    }
 }
 
 pub struct ReconcileOutcome<T: Resource> {
@@ -463,53 +477,86 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let object = match primary.get(&name).await {
                     Ok(object) => object,
                     Err(ResourceError::NotFound { .. }) => continue,
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        warn!(
+                            resource_kind = R::Resource::API_PATHS.kind,
+                            resource = %name,
+                            %err,
+                            "controller failed to read object; leaving it for a later resync",
+                        );
+                        continue;
+                    }
                 };
-                let lifecycle_owned = is_lifecycle_owned(object.metadata.lifecycle_authority()?);
-                if let Some(finalizer_name) = reconciler.finalizer_name() {
-                    if object.metadata.deletion_timestamp.is_none()
-                        && object.metadata.finalizers.iter().all(|finalizer| finalizer != finalizer_name)
-                        && lifecycle_owned
-                    {
-                        let meta = InputMeta::from(&object.metadata).with_added_finalizer(finalizer_name);
-                        Self::write_tolerating_not_found(primary.update(&meta, &object.metadata.resource_version, &object.spec)).await?;
-                        continue;
-                    }
-                    if object.metadata.deletion_timestamp.is_some()
-                        && object.metadata.finalizers.iter().any(|finalizer| finalizer == finalizer_name)
-                    {
-                        if lifecycle_owned {
-                            reconciler.run_finalizer(&object).await?;
+                let result = async {
+                    let lifecycle_owned = is_lifecycle_owned(object.metadata.lifecycle_authority()?);
+                    if let Some(finalizer_name) = reconciler.finalizer_name() {
+                        if object.metadata.deletion_timestamp.is_none()
+                            && object.metadata.finalizers.iter().all(|finalizer| finalizer != finalizer_name)
+                            && lifecycle_owned
+                        {
+                            let meta = InputMeta::from(&object.metadata).with_added_finalizer(finalizer_name);
+                            Self::write_tolerating_not_found(primary.update(&meta, &object.metadata.resource_version, &object.spec))
+                                .await?;
+                            return Ok(());
                         }
-                        let meta = InputMeta::from(&object.metadata).without_finalizer(finalizer_name);
-                        Self::write_tolerating_not_found(primary.update(&meta, &object.metadata.resource_version, &object.spec)).await?;
-                        continue;
+                        if object.metadata.deletion_timestamp.is_some()
+                            && object.metadata.finalizers.iter().any(|finalizer| finalizer == finalizer_name)
+                        {
+                            if lifecycle_owned {
+                                reconciler.run_finalizer(&object).await?;
+                            }
+                            let meta = InputMeta::from(&object.metadata).without_finalizer(finalizer_name);
+                            Self::write_tolerating_not_found(primary.update(&meta, &object.metadata.resource_version, &object.spec))
+                                .await?;
+                            return Ok(());
+                        }
                     }
+                    if object.metadata.deletion_timestamp.is_some() {
+                        return Ok(());
+                    }
+                    if !lifecycle_owned {
+                        return Ok(());
+                    }
+                    let deps = reconciler.fetch_dependencies(&object).await?;
+                    let outcome = reconciler.reconcile(&object, &deps, Utc::now());
+                    for actuation in outcome.actuations {
+                        Self::apply_actuation(&primary.backend, &primary.namespace, actuation).await?;
+                    }
+                    if let Some(patch) = outcome.patch {
+                        Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await?;
+                    }
+                    if let Some(delay) = outcome.requeue_after {
+                        let mut scheduled = scheduled_requeues.lock().await;
+                        if scheduled.insert(name.clone()) {
+                            let scheduled_requeues = Arc::clone(&scheduled_requeues);
+                            let sender = sender.clone();
+                            let name = name.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                scheduled_requeues.lock().await.remove(&name);
+                                let _ = sender.send(name).await;
+                            });
+                        }
+                    }
+                    Ok(())
                 }
-                if object.metadata.deletion_timestamp.is_some() {
-                    continue;
-                }
-                if !lifecycle_owned {
-                    continue;
-                }
-                let deps = reconciler.fetch_dependencies(&object).await?;
-                let outcome = reconciler.reconcile(&object, &deps, Utc::now());
-                for actuation in outcome.actuations {
-                    Self::apply_actuation(&primary.backend, &primary.namespace, actuation).await?;
-                }
-                if let Some(patch) = outcome.patch {
-                    Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await?;
-                }
-                if let Some(delay) = outcome.requeue_after {
-                    let mut scheduled = scheduled_requeues.lock().await;
-                    if scheduled.insert(name.clone()) {
-                        let scheduled_requeues = Arc::clone(&scheduled_requeues);
-                        let sender = sender.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(delay).await;
-                            scheduled_requeues.lock().await.remove(&name);
-                            let _ = sender.send(name).await;
-                        });
+                .await;
+                if let Err(err) = result {
+                    warn!(
+                        resource_kind = R::Resource::API_PATHS.kind,
+                        resource = %name,
+                        %err,
+                        "controller failed to reconcile object; other objects will continue",
+                    );
+                    if let Some(patch) = reconciler.error_patch(&object, &err) {
+                        if let Err(patch_error) = Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await {
+                            warn!(
+                                resource_kind = R::Resource::API_PATHS.kind,
+                                resource = %name,
+                                %patch_error,
+                                "controller failed to record object reconciliation error",
+                            );
+                        }
                     }
                 }
                 continue;

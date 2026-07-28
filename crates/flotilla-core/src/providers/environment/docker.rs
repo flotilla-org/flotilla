@@ -35,6 +35,12 @@ impl DockerEnvironmentProvider {
     }
 }
 
+#[cfg(unix)]
+fn host_user() -> String {
+    // SAFETY: getuid and getgid are side-effect-free process identity queries.
+    unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) }
+}
+
 #[async_trait]
 impl EnvironmentProvider for DockerEnvironmentProvider {
     // TODO: This fingerprints the Dockerfile contents plus the spec path only.
@@ -75,6 +81,8 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         let socket_mount = format!("{}:{CONTAINER_SOCKET_PATH}", socket_str);
         let env_id_env = format!("FLOTILLA_ENVIRONMENT_ID={}", env_id_str);
         let socket_env = format!("FLOTILLA_DAEMON_SOCKET={CONTAINER_SOCKET_PATH}");
+        #[cfg(unix)]
+        let user = host_user();
 
         let docker_config = opts.docker_config_dir.as_ref().map(ToString::to_string);
         let mut args = Vec::new();
@@ -99,6 +107,8 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             "-e",
             &env_id_env,
         ]);
+        #[cfg(unix)]
+        args.extend(["--user", user.as_str()]);
 
         let mount_specs: Vec<String> = opts
             .provisioned_mounts

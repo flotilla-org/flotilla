@@ -6,13 +6,14 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use common::{create_ready_clone, meta};
+use common::{create_ready_checkout, create_ready_clone, meta};
 use flotilla_controllers::reconcilers::{
     checkout::CheckoutDeps, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
 use flotilla_resources::{
     controller::Reconciler, repo_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatus,
-    CheckoutWorktreeSpec, ConditionValue, IntegrationCondition, RepositoryKey, ResourceBackend, ResourceObject,
+    CheckoutWorktreeSpec, ConditionValue, FreshCloneCheckoutSpec, IntegrationCondition, RepositoryKey, ResourceBackend, ResourceError,
+    ResourceObject, StatusPatch,
 };
 
 const NAMESPACE: &str = "flotilla";
@@ -66,6 +67,39 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         self.removals.lock().expect("removals lock").push(removal.clone());
         Ok(CheckoutRemovalOutcome::Removed)
     }
+}
+
+#[tokio::test]
+async fn object_error_marks_only_the_checkout_failed() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let checkout = create_ready_checkout(
+        &backend,
+        NAMESPACE,
+        common::ReadyCheckoutFixture::builder()
+            .name("checkout-a".to_string())
+            .env_ref("host-direct-a".to_string())
+            .git_ref("feature/cleanup".to_string())
+            .path("/checkouts/convoy-a/repo.feature-cleanup".to_string())
+            .fresh_clone(FreshCloneCheckoutSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-a".to_string(),
+                r#ref: "feature/cleanup".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/convoy-a/repo.feature-cleanup".to_string(),
+                url: REPO_URL.to_string(),
+            })
+            .build(),
+    )
+    .await;
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE);
+    let error = ResourceError::other("remove worktree: permission denied");
+
+    let patch = reconciler.error_patch(&checkout, &error).expect("checkout errors should produce a failed status patch");
+    let mut status = checkout.status.expect("ready checkout should have status");
+    patch.apply(&mut status);
+
+    assert_eq!(status.phase, CheckoutPhase::Failed);
+    assert_eq!(status.message.as_deref(), Some("checkout reconciliation failed: remove worktree: permission denied"));
 }
 
 #[tokio::test]
