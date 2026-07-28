@@ -8,7 +8,10 @@ use flotilla_core::{
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, PrincipalRef};
-use flotilla_resources::{Convoy, ConvoyPhase, CrewSource, InMemoryBackend, ResourceBackend, SqliteBackend, Stance, WorkflowTemplate};
+use flotilla_resources::{
+    single_agent_contained_workflow_spec, Convoy, ConvoyPhase, CrewSource, InMemoryBackend, InputMeta, PlacementPolicy, ResourceBackend,
+    SqliteBackend, Stance, WorkflowTemplate, MANAGED_BY_LABEL,
+};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&dir).expect("create config dir");
@@ -17,9 +20,14 @@ fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
 }
 
 async fn start_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigStore>, DaemonRuntime, tempfile::TempDir) {
+    start_daemon_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await
+}
+
+async fn start_daemon_with_backend(
+    backend: ResourceBackend,
+) -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigStore>, DaemonRuntime, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -83,6 +91,7 @@ async fn scratch_workflow_template_is_seeded_at_startup() {
     let templates = backend.using::<WorkflowTemplate>("flotilla");
     let scratch = templates.get("scratch").await.expect("scratch template should be seeded");
     assert_eq!(scratch.metadata.name, "scratch");
+    assert_eq!(scratch.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("builtin"));
     assert_eq!(scratch.spec.vessels.len(), 1);
     assert_eq!(scratch.spec.vessels[0].name, "work");
 
@@ -113,6 +122,57 @@ async fn scratch_workflow_template_is_seeded_at_startup() {
                     } if selector.capability == "code" && brief_template == "interactive-session"
                 )
     ));
+}
+
+#[tokio::test]
+async fn stale_builtin_is_reconciled_before_contained_dispatch() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let mut stale = single_agent_contained_workflow_spec();
+    stale.vessels[0].stance = Stance::Trusted;
+    templates
+        .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &stale)
+        .await
+        .expect("stale template should be created");
+
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon_with_backend(backend).await;
+    let reconciled = templates.get("single-agent-contained").await.expect("builtin should remain");
+    assert_eq!(reconciled.spec, single_agent_contained_workflow_spec());
+
+    let host_direct_policy = backend
+        .using::<PlacementPolicy>("flotilla")
+        .list()
+        .await
+        .expect("placement policies should list")
+        .items
+        .into_iter()
+        .find(|policy| policy.spec.host_direct.is_some())
+        .expect("host-direct policy should be seeded")
+        .metadata
+        .name;
+    let mut rx = daemon.subscribe();
+    let id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "must-remain-contained".into(),
+                workflow_ref: "single-agent-contained".into(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: Some(host_direct_policy.clone()),
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("execute");
+
+    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::Error {
+        message: format!("contained workflow requires a docker placement policy, but {host_direct_policy} is not contained"),
+    });
 }
 
 #[tokio::test]

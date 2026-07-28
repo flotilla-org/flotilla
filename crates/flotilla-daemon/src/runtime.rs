@@ -39,7 +39,7 @@ use flotilla_resources::{
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
     InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend, ResourceError,
     ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
+    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -58,6 +58,7 @@ use crate::{
 const LIVENESS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
+const BUILTIN_MANAGED_BY_VALUE: &str = "builtin";
 
 struct DaemonConvoyTeardownRuntime {
     daemon: Arc<InProcessDaemon>,
@@ -451,12 +452,12 @@ async fn register_startup_resources(
     ensure_host_direct_environment_exists(&backend, namespace, profile).await?;
     discover_local_clones(daemon, &backend, namespace, profile).await?;
     ensure_default_policies(&backend, namespace, profile).await?;
-    ensure_default_workflow_templates(&backend, namespace).await?;
+    reconcile_builtin_workflow_templates(&backend, namespace).await?;
     daemon.materialize_tracked_repo_projects().await?;
     Ok(())
 }
 
-fn default_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
+fn builtin_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
     vec![
         (
             "scratch",
@@ -480,15 +481,45 @@ fn default_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
     ]
 }
 
-async fn ensure_default_workflow_templates(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
+fn mark_builtin_managed(mut meta: InputMeta) -> InputMeta {
+    meta.labels.insert(MANAGED_BY_LABEL.to_string(), BUILTIN_MANAGED_BY_VALUE.to_string());
+    meta
+}
+
+/// Reconciles code-owned manifests as the builtin special case of the ruled
+/// manifest loop in https://github.com/flotilla-org/flotilla/issues/1192.
+async fn reconcile_builtin_workflow_templates(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
     let templates = backend.clone().using::<WorkflowTemplate>(namespace);
-    for (name, spec) in default_workflow_templates() {
+    for (name, spec) in builtin_workflow_templates() {
         match templates.get(name).await {
-            Ok(_) => continue,
-            Err(ResourceError::NotFound { .. }) => {}
+            Ok(existing) => {
+                let spec_diverged = existing.spec != spec;
+                let managed_by_builtin =
+                    existing.metadata.labels.get(MANAGED_BY_LABEL).is_some_and(|value| value == BUILTIN_MANAGED_BY_VALUE);
+                if !spec_diverged && managed_by_builtin {
+                    continue;
+                }
+                if !spec_diverged {
+                    templates
+                        .update(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &existing.metadata.resource_version, &spec)
+                        .await
+                        .map_err(|err| format!("reconcile builtin workflow template {name}: {err}"))?;
+                    continue;
+                }
+                templates
+                    .update(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &existing.metadata.resource_version, &spec)
+                    .await
+                    .map_err(|err| format!("reconcile builtin workflow template {name}: {err}"))?;
+                warn!(template = %name, "stored spec diverged from code builtin; overwriting");
+            }
+            Err(ResourceError::NotFound { .. }) => {
+                templates
+                    .create(&mark_builtin_managed(empty_meta(name)), &spec)
+                    .await
+                    .map_err(|err| format!("seed builtin workflow template {name}: {err}"))?;
+            }
             Err(err) => return Err(format!("check workflow template {name}: {err}")),
         }
-        templates.create(&empty_meta(name), &spec).await.map(|_| ()).map_err(|err| format!("seed workflow template {name}: {err}"))?;
     }
     Ok(())
 }
@@ -2006,6 +2037,20 @@ mod tests {
         Delete,
     }
 
+    #[derive(Clone)]
+    struct LogCaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log output lock should be healthy").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     struct NoPrProcessRunner;
 
     #[async_trait]
@@ -2750,30 +2795,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_seeding_preserves_existing_contained_template_definition() {
+    async fn startup_seeding_reconciles_existing_builtin_template_definition() {
         let backend = ResourceBackend::InMemory(Default::default());
         let templates = backend.clone().using::<WorkflowTemplate>(NAMESPACE);
-        let custom = WorkflowTemplateSpec::builder()
-            .vessels(vec![VesselRequirement::builder()
-                .name("custom".to_string())
-                .stance(Stance::Contained)
-                .crew(vec![CrewSpec::builder()
-                    .role("maintainer".to_string())
-                    .source(CrewSource::Agent {
-                        selector: Selector { capability: "custom-code".to_string() },
-                        prompt: Some("Keep this definition".to_string()),
-                        brief_template: None,
-                    })
-                    .build()])
-                .build()])
-            .build();
-        templates.create(&empty_meta("single-agent-contained"), &custom).await.expect("custom template create should succeed");
+        let mut stale = flotilla_resources::single_agent_contained_workflow_spec();
+        stale.vessels[0].stance = Stance::Trusted;
+        templates
+            .create(
+                &empty_meta_with_labels(
+                    "single-agent-contained",
+                    BTreeMap::from([("example.com/preserved".to_string(), "true".to_string())]),
+                ),
+                &stale,
+            )
+            .await
+            .expect("stale template create should succeed");
 
-        ensure_default_workflow_templates(&backend, NAMESPACE).await.expect("startup seeding should succeed");
-        ensure_default_workflow_templates(&backend, NAMESPACE).await.expect("restart seeding should succeed");
+        let log_output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let writer = LogCaptureWriter(Arc::clone(&log_output));
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("startup reconciliation should succeed");
+        }
 
-        let preserved = templates.get("single-agent-contained").await.expect("template should remain");
-        assert_eq!(preserved.spec, custom);
+        let reconciled = templates.get("single-agent-contained").await.expect("template should remain");
+        assert_eq!(reconciled.spec, flotilla_resources::single_agent_contained_workflow_spec());
+        assert_eq!(reconciled.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(BUILTIN_MANAGED_BY_VALUE));
+        assert_eq!(reconciled.metadata.labels.get("example.com/preserved").map(String::as_str), Some("true"));
+        let logs = String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+        assert!(logs.contains("stored spec diverged from code builtin; overwriting"), "missing overwrite warning: {logs}");
+        assert!(logs.contains("single-agent-contained"), "warning should name the template: {logs}");
+
+        reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("restart reconciliation should succeed");
+        let unchanged = templates.get("single-agent-contained").await.expect("template should remain");
+        assert_eq!(unchanged.metadata.resource_version, reconciled.metadata.resource_version);
+    }
+
+    #[tokio::test]
+    async fn startup_seeding_labels_matching_unlabelled_builtin_template_once() {
+        const NAMESPACE: &str = "test";
+        let backend = ResourceBackend::InMemory(Default::default());
+        let templates = backend.clone().using::<WorkflowTemplate>(NAMESPACE);
+        templates
+            .create(&empty_meta("single-agent-contained"), &flotilla_resources::single_agent_contained_workflow_spec())
+            .await
+            .expect("matching template create should succeed");
+        let existing = templates.get("single-agent-contained").await.expect("template should exist");
+
+        reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("startup reconciliation should succeed");
+
+        let labelled = templates.get("single-agent-contained").await.expect("template should remain");
+        assert_ne!(labelled.metadata.resource_version, existing.metadata.resource_version);
+        assert_eq!(labelled.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(BUILTIN_MANAGED_BY_VALUE));
+
+        reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("restart reconciliation should succeed");
+
+        let unchanged = templates.get("single-agent-contained").await.expect("template should remain");
+        assert_eq!(unchanged.metadata.resource_version, labelled.metadata.resource_version);
     }
 
     fn manual_profile(host_id: &str, docker_available: bool) -> LocalProvisioningProfile {
