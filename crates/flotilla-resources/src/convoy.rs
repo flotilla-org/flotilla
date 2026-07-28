@@ -41,6 +41,9 @@ pub struct ConvoySpec {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<ConvoyIssue>,
+    /// Change request explicitly bound when the convoy was admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_request: Option<BoundChangeRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
 }
@@ -90,6 +93,13 @@ pub struct IssueSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
     pub as_of: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct BoundChangeRequest {
+    pub id: String,
+    pub repository_ref: RepositoryKey,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

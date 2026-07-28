@@ -143,6 +143,23 @@ pub fn single_agent_trusted_workflow_spec() -> WorkflowTemplateSpec {
         .build()
 }
 
+pub fn single_agent_shepherd_workflow_spec() -> WorkflowTemplateSpec {
+    WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder()
+            .name("work".to_string())
+            .stance(Stance::Trusted)
+            .crew(vec![CrewSpec::builder()
+                .role("shepherd".to_string())
+                .source(CrewSource::Agent {
+                    selector: Selector { capability: "code".to_string() },
+                    prompt: None,
+                    brief_template: Some("shepherd".to_string()),
+                })
+                .build()])
+            .build()])
+        .build()
+}
+
 pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder()

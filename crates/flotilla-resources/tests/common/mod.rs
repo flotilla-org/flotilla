@@ -212,6 +212,7 @@ pub fn valid_convoy_spec() -> RealConvoySpec {
         project_ref: None,
         adopted_checkout_refs: BTreeMap::new(),
         issues: Vec::new(),
+        change_request: None,
         instruction: None,
     }
 }

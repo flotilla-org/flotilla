@@ -983,6 +983,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
             intent: Box::new(ConvoyStartIntent {
                 namespace: None,
                 project_ref: "zellij".into(),
+                change_request: None,
                 issues: Vec::new(),
                 name: Some(name.to_string()),
                 branch: Some(format!("stack/{name}")),
@@ -1031,6 +1032,90 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         flotilla_resources::CrewSource::Agent { selector, brief_template: Some(template), .. }
             if selector.capability == "code-review" && template == "diff-review"
     ));
+}
+
+#[tokio::test]
+async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
+    let provider = Arc::new(FakeChangeRequest::new());
+    provider
+        .add_change_requests(vec![("1071".to_string(), ChangeRequest {
+            title: "Convoy adoption of an existing PR".to_string(),
+            branch: "feat/existing-pr".to_string(),
+            status: flotilla_protocol::ChangeRequestStatus::Open,
+            body: Some("Existing implementation work.".to_string()),
+            correlation_keys: Vec::new(),
+            association_keys: Vec::new(),
+            provider_name: "fake-cr".to_string(),
+            provider_display_name: "Fake PRs".to_string(),
+        })])
+        .await;
+    let discovery =
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_change_request(provider as Arc<dyn ChangeRequestTracker>));
+    let (_temp, repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repository");
+    let repository_key = daemon.repository_key_for_path(&repo).await.expect("repository key");
+    let backend = daemon.resource_backend();
+    create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            display_name: "Flotilla".to_string(),
+            default_workflow_ref: "single-agent-contained".to_string(),
+            issue_source: None,
+            repositories: vec![ProjectRepositorySpec {
+                repo: repository_key.clone(),
+                subpath: None,
+                default_branch: Some("trunk".to_string()),
+            }],
+        })
+        .await
+        .expect("project create");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "flotilla".to_string(),
+                    change_request: Some("1071".to_string()),
+                    issues: Vec::new(),
+                    name: None,
+                    branch: None,
+                    workflow_ref: None,
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: None,
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                }),
+            },
+        })
+        .await
+        .expect("PR adoption command accepted");
+
+    assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::ConvoyStarted {
+        name: "convoy-adoption-of-an-existing-pr-1071".to_string(),
+        attach_plan: None,
+        binding: None,
+    });
+    let convoy =
+        backend.using::<ResourceConvoy>("flotilla").get("convoy-adoption-of-an-existing-pr-1071").await.expect("persisted adopted convoy");
+    assert_eq!(convoy.spec.workflow_ref, "single-agent-shepherd");
+    assert_eq!(convoy.spec.r#ref.as_deref(), Some("feat/existing-pr"));
+    assert_eq!(
+        convoy.spec.change_request,
+        Some(flotilla_resources::BoundChangeRequest {
+            id: "1071".to_string(),
+            repository_ref: repository_key,
+            title: "Convoy adoption of an existing PR".to_string(),
+        })
+    );
+    assert_eq!(convoy.spec.repositories[0].source_ref, "main");
+    assert_eq!(convoy.spec.repositories[0].target_ref, "main");
 }
 
 #[tokio::test]
@@ -1166,6 +1251,7 @@ async fn bare_convoy_start_uses_the_viable_local_host_direct_policy() {
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
+                    change_request: None,
                     issues: Vec::new(),
                     name: Some("local-default".into()),
                     branch: Some("fix/local-default".into()),
@@ -1238,6 +1324,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
+                    change_request: None,
                     issues: Vec::new(),
                     name: Some("missing-adapter".into()),
                     branch: Some("fix/missing-adapter".into()),
@@ -1369,6 +1456,7 @@ async fn convoy_start_accepts_project_list_identifier() {
                     intent: Box::new(ConvoyStartIntent {
                         namespace: None,
                         project_ref,
+                        change_request: None,
                         issues: Vec::new(),
                         name: Some(name.clone()),
                         branch: Some(format!("fix/{name}")),
@@ -1409,6 +1497,7 @@ async fn convoy_start_unknown_project_reports_resolved_reference_tried() {
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "missing".into(),
+                    change_request: None,
                     issues: Vec::new(),
                     name: Some("unknown-project".into()),
                     branch: Some("fix/unknown-project".into()),
@@ -1486,6 +1575,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
+                    change_request: None,
                     issues: vec![IssueSelector::Reference(reference.clone())],
                     name: Some("issue-732".into()),
                     branch: Some("fix/issue-732".into()),
@@ -1541,6 +1631,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
+                    change_request: None,
                     issues: Vec::new(),
                     name: Some("default-regard".into()),
                     branch: Some("fix/default-regard".into()),
@@ -1576,6 +1667,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
+                    change_request: None,
                     issues: vec![
                         IssueSelector::Reference(reference.clone()),
                         IssueSelector::Reference(reference_two.clone()),
@@ -1624,6 +1716,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
+                    change_request: None,
                     issues: vec![IssueSelector::Reference(reference)],
                     name: None,
                     branch: None,
@@ -1677,6 +1770,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 intent: Box::new(ConvoyStartIntent {
                     namespace: Some("flotilla".into()),
                     project_ref: "explicit-workflow".into(),
+                    change_request: None,
                     issues: Vec::new(),
                     name: Some("explicit-workflow".into()),
                     branch: Some("fix/explicit-workflow".into()),
@@ -1712,6 +1806,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 intent: Box::new(ConvoyStartIntent {
                     namespace: Some("other".into()),
                     project_ref: "flotilla".into(),
+                    change_request: None,
                     issues: Vec::new(),
                     name: Some("wrong-namespace".into()),
                     branch: Some("fix/wrong-namespace".into()),
@@ -1751,6 +1846,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
+                    change_request: None,
                     issues: Vec::new(),
                     name: Some("invalid-branch".into()),
                     branch: Some("bad branch".into()),
@@ -1827,6 +1923,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
+                    change_request: None,
                     issues: Vec::new(),
                     name: None,
                     branch: None,
@@ -1879,6 +1976,7 @@ async fn convoy_start_acknowledges_while_admission_is_in_flight() {
                         intent: Box::new(ConvoyStartIntent {
                             namespace: None,
                             project_ref: "flotilla".into(),
+                            change_request: None,
                             issues: Vec::new(),
                             name: None,
                             branch: None,
@@ -1943,6 +2041,7 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
             intent: Box::new(ConvoyStartIntent {
                 namespace: None,
                 project_ref: "flotilla".into(),
+                change_request: None,
                 issues: vec![IssueSelector::Reference(reference)],
                 name: None,
                 branch: None,
@@ -2037,6 +2136,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
+                    change_request: None,
                     issues: Vec::new(),
                     name: Some("bootstrap-failure".into()),
                     branch: Some("fix/bootstrap-failure".into()),

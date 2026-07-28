@@ -36,18 +36,19 @@ use flotilla_resources::{
     apply_status_patch_checked as apply_resource_status_patch_checked, external_patches as convoy_external_patches, get_resource_kind,
     list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec, repository_display_labels,
     resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from,
-    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
-    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
-    ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialGrant,
-    CredentialSpec, CrewSource, Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta,
-    InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
-    ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
-    SystemClock, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
-    Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
-    CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout,
+    CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec,
+    ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewSource, Environment as ResourceEnvironment, EnvironmentPhase,
+    Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
+    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
+    ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
+    ResourceObject, ResourceProvenance, SystemClock, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -1350,6 +1351,7 @@ fn handoff_crew_brief(
     let assignment = match prompt {
         Some(prompt) => crate::agent_adapter::CrewAssignment::Prompt(prompt),
         None if !convoy.spec.issues.is_empty() => crate::agent_adapter::CrewAssignment::CarriedIssue,
+        None if convoy.spec.change_request.is_some() => crate::agent_adapter::CrewAssignment::CarriedChangeRequest,
         None => crate::agent_adapter::CrewAssignment::Unassigned,
     };
     let brief = crate::agent_adapter::build_crew_brief_with_options(
@@ -1472,6 +1474,7 @@ struct ConvoyStartKey {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum ConvoyStartSubject {
+    ChangeRequest(String),
     Issues(Vec<flotilla_protocol::IssueSelector>),
     Name(String),
     Anonymous {
@@ -1485,7 +1488,9 @@ enum ConvoyStartSubject {
 
 impl ConvoyStartKey {
     fn new(namespace: String, intent: &flotilla_protocol::ConvoyStartIntent) -> Self {
-        let subject = if intent.issues.is_empty() {
+        let subject = if let Some(change_request) = &intent.change_request {
+            ConvoyStartSubject::ChangeRequest(change_request.clone())
+        } else if intent.issues.is_empty() {
             match &intent.name {
                 Some(name) => ConvoyStartSubject::Name(name.clone()),
                 None => ConvoyStartSubject::Anonymous {
@@ -1501,6 +1506,12 @@ impl ConvoyStartKey {
         };
         Self { namespace, project_ref: intent.project_ref.clone(), subject }
     }
+}
+
+struct ResolvedConvoyChangeRequestAdmission {
+    binding: BoundChangeRequest,
+    branch: String,
+    base_ref: String,
 }
 
 fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<String> {
@@ -2213,7 +2224,13 @@ impl InProcessDaemon {
                 continue;
             };
             let runner = self.runner_for_resource_checkout(&checkout).await?;
-            let mut integration = inspect_checkout_integration(&*runner, Path::new(path), &checkout.spec).await;
+            let mut integration = inspect_checkout_integration(
+                &*runner,
+                Path::new(path),
+                &checkout.spec,
+                checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
+            )
+            .await;
             if let Some(existing) = checkout
                 .status
                 .as_ref()
@@ -2815,12 +2832,86 @@ impl InProcessDaemon {
         Some((providers, state.local_data_version()))
     }
 
+    /// Resolve an explicitly requested change request across the project's
+    /// snapshotted repositories and capture its admission identity.
+    async fn resolve_convoy_change_request_admission(
+        &self,
+        repository_keys: &[RepositoryKey],
+        requested_id: &str,
+    ) -> Result<ResolvedConvoyChangeRequestAdmission, String> {
+        let candidates = {
+            let keys_by_path = self.repository_keys_by_path.read().await;
+            let repos = self.repos.read().await;
+            let order = self.repo_order.read().await;
+            let mut seen = HashSet::new();
+            let mut candidates = Vec::new();
+            for identity in order.iter() {
+                let Some(state) = repos.get(identity) else { continue };
+                for root in &state.roots {
+                    let Some(repository) = keys_by_path.get(&root.path).filter(|repository| repository_keys.contains(repository)) else {
+                        continue;
+                    };
+                    if seen.contains(repository) {
+                        continue;
+                    }
+                    let providers =
+                        root.model.registry.change_requests.iter().map(|(_, provider)| Arc::clone(provider)).collect::<Vec<_>>();
+                    if !providers.is_empty() {
+                        seen.insert(repository.clone());
+                        candidates.push((repository.clone(), root.path.clone(), providers));
+                    }
+                }
+            }
+            candidates
+        };
+
+        let mut matches = Vec::new();
+        let mut failures = Vec::new();
+        for (repository, path, providers) in candidates {
+            let mut matched = None;
+            for provider in providers {
+                match provider.get_change_request_for_admission(&path, requested_id).await {
+                    Ok(admission) => {
+                        let Some(base_ref) = admission.base_ref else {
+                            failures.push(format!("repository {repository}: change request {} did not report a base ref", admission.id));
+                            continue;
+                        };
+                        matched = Some(ResolvedConvoyChangeRequestAdmission {
+                            binding: BoundChangeRequest {
+                                id: admission.id,
+                                repository_ref: repository.clone(),
+                                title: admission.change_request.title,
+                            },
+                            branch: admission.change_request.branch,
+                            base_ref,
+                        });
+                        break;
+                    }
+                    Err(error) => failures.push(format!("repository {repository}: {error}")),
+                }
+            }
+            if let Some(matched) = matched {
+                matches.push(matched);
+            }
+        }
+
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            0 => Err(format!(
+                "change request {requested_id} was not found in project repositories{}",
+                if failures.is_empty() { String::new() } else { format!(": {}", failures.join("; ")) }
+            )),
+            count => Err(format!("change request {requested_id} is ambiguous across {count} project repositories")),
+        }
+    }
+
     /// Resolve the first change request whose head matches a convoy branch
     /// across the convoy's snapshotted repositories.
     pub async fn resolve_convoy_change_request(
         &self,
         repository_keys: &[RepositoryKey],
         branch: &str,
+        change_request_id: Option<&str>,
     ) -> Result<Option<ConvoyChangeRequest>, String> {
         let (live_candidates, cached_candidates) = {
             let keys_by_path = self.repository_keys_by_path.read().await;
@@ -2855,9 +2946,10 @@ impl InProcessDaemon {
                     }
                 }
 
-                if let Some((id, request)) =
-                    state.cached_snapshot().and_then(|snapshot| cached_change_request_by_branch(&snapshot.providers, branch))
-                {
+                if let Some((id, request)) = state.cached_snapshot().and_then(|snapshot| match change_request_id {
+                    Some(id) => snapshot.providers.change_requests.get(id).cloned().map(|request| (id.to_string(), request)),
+                    None => cached_change_request_by_branch(&snapshot.providers, branch),
+                }) {
                     cached_by_key.entry(repository).or_insert((id, request));
                 }
             }
@@ -2876,7 +2968,11 @@ impl InProcessDaemon {
         let mut first_error = None;
         for (repository, path, providers) in live_candidates {
             for provider in providers {
-                match provider.find_change_request_by_branch(&path, branch).await {
+                let resolved = match change_request_id {
+                    Some(id) => provider.get_change_request(&path, id).await.map(Some),
+                    None => provider.find_change_request_by_branch(&path, branch).await,
+                };
+                match resolved {
                     Ok(Some((id, request))) => {
                         return Ok(Some(ConvoyChangeRequest { id, status: request.status, repository_key: repository }));
                     }
@@ -3395,6 +3491,7 @@ async fn ensure_default_workflows(backend: &ResourceBackend, namespace: &str) ->
     let templates = backend.clone().using::<WorkflowTemplate>(namespace);
     for (name, spec) in [
         ("single-agent-contained", flotilla_resources::single_agent_contained_workflow_spec()),
+        ("single-agent-shepherd", flotilla_resources::single_agent_shepherd_workflow_spec()),
         ("single-agent-trusted", flotilla_resources::single_agent_trusted_workflow_spec()),
         ("implement-review", flotilla_resources::implement_review_workflow_spec()),
     ] {
@@ -4032,7 +4129,29 @@ impl InProcessDaemon {
             .get(project_ref)
             .await
             .map_err(|error| project_not_ready_error(namespace, project_ref, error))?;
-        let repositories = self.snapshot_project_repositories(namespace, project_ref).await?;
+        let mut repositories = self.snapshot_project_repositories(namespace, project_ref).await?;
+        if intent.change_request.is_some() && intent.branch.is_some() {
+            return Err("change request adoption derives the branch from --pr; do not also provide a branch".to_string());
+        }
+        let change_request = match intent.change_request.as_deref() {
+            Some(id) => {
+                let id = required_admission_value(id, "change request")?;
+                let resolved = self
+                    .resolve_convoy_change_request_admission(
+                        &repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>(),
+                        id,
+                    )
+                    .await?;
+                let repository = repositories
+                    .iter_mut()
+                    .find(|repository| repository.repo_ref == resolved.binding.repository_ref)
+                    .expect("admission resolution only returns project repositories");
+                repository.source_ref = resolved.base_ref.clone();
+                repository.target_ref = resolved.base_ref.clone();
+                Some(resolved)
+            }
+            None => None,
+        };
         let mut seen_issue_selectors = HashSet::new();
         let mut issues = Vec::with_capacity(intent.issues.len());
         for selector in &intent.issues {
@@ -4042,6 +4161,7 @@ impl InProcessDaemon {
         }
         let workflow_ref = match intent.workflow_ref.as_deref() {
             Some(workflow_ref) => required_admission_value(workflow_ref, "workflow")?.to_string(),
+            None if change_request.is_some() => "single-agent-shepherd".to_string(),
             None => project.spec.default_workflow_ref.clone(),
         };
         let mut workflow = self
@@ -4054,8 +4174,11 @@ impl InProcessDaemon {
         validate_fork_workflow_admission(&self.resource_backend, namespace, &repositories, &workflow_ref, &workflow.spec).await?;
         resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), &repositories, &mut workflow.spec).await?;
 
-        let fallback_slug = convoy_issues_fallback_slug(&issues, &project.spec.display_name, project_ref);
-        let generated = if intent.name.is_none() || intent.branch.is_none() {
+        let fallback_slug = change_request
+            .as_ref()
+            .map(|change_request| convoy_fallback_slug(&change_request.binding.title, &change_request.binding.id))
+            .unwrap_or_else(|| convoy_issues_fallback_slug(&issues, &project.spec.display_name, project_ref));
+        let generated = if change_request.is_none() && (intent.name.is_none() || intent.branch.is_none()) {
             let issue_context = (!issues.is_empty()).then(|| issues.iter().map(convoy_issue_name_context).collect::<Vec<_>>().join("\n\n"));
             let context = [
                 Some(format!("Project: {}", project.spec.display_name)),
@@ -4081,9 +4204,11 @@ impl InProcessDaemon {
             .transpose()?
             .unwrap_or_else(|| convoy_fallback_slug(&generated.name, "").trim_end_matches('-').to_string());
         validate_convoy_name(&name)?;
-        let branch = match intent.branch.as_deref() {
-            Some(branch) => required_admission_value(branch, "branch")?.to_string(),
-            None => required_admission_value(&generated.branch, "generated branch")?.to_string(),
+        let branch = match (change_request.as_ref(), intent.branch.as_deref()) {
+            (Some(change_request), None) => change_request.branch.clone(),
+            (Some(_), Some(_)) => unreachable!("change request plus branch was rejected"),
+            (None, Some(branch)) => required_admission_value(branch, "branch")?.to_string(),
+            (None, None) => required_admission_value(&generated.branch, "generated branch")?.to_string(),
         };
         validate_convoy_branch(&branch)?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
@@ -4112,6 +4237,7 @@ impl InProcessDaemon {
             project_ref: Some(project_ref.to_string()),
             adopted_checkout_refs: BTreeMap::new(),
             issues,
+            change_request: change_request.map(|change_request| change_request.binding),
             instruction: intent.instruction.clone(),
         };
         Ok(ConvoyAdmission::builder()
@@ -5776,7 +5902,13 @@ impl InProcessDaemon {
                 Ok(runner) => runner,
                 Err(_) => return Ok(false),
             };
-            let integration = inspect_checkout_integration(&*runner, &path, &checkout.spec).await;
+            let integration = inspect_checkout_integration(
+                &*runner,
+                &path,
+                &checkout.spec,
+                checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
+            )
+            .await;
             if let Err(error) = apply_resource_status_patch(
                 &checkouts,
                 &checkout.metadata.name,
@@ -5867,7 +5999,13 @@ impl InProcessDaemon {
                     continue;
                 }
             }
-            let mut integration = inspect_checkout_integration(&*runner, &path, &checkout.spec).await;
+            let mut integration = inspect_checkout_integration(
+                &*runner,
+                &path,
+                &checkout.spec,
+                checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
+            )
+            .await;
             if let Some(existing) = checkout
                 .status
                 .as_ref()
@@ -7497,6 +7635,7 @@ impl InProcessDaemon {
                 project_ref: project_ref.clone(),
                 adopted_checkout_refs,
                 issues: Vec::new(),
+                change_request: None,
                 instruction: None,
             };
             let result = match self

@@ -493,6 +493,7 @@ impl App {
                     intent: Box::new(ConvoyStartIntent {
                         namespace: Some(namespace),
                         project_ref: project,
+                        change_request: None,
                         issues: vec![IssueSelector::Reference(issue.issue)],
                         name: None,
                         branch: None,
@@ -512,6 +513,7 @@ impl App {
                         intent: Box::new(ConvoyStartIntent {
                             namespace: Some(namespace.clone()),
                             project_ref: project.clone(),
+                            change_request: None,
                             issues: vec![IssueSelector::Reference(issue.issue.clone())],
                             name: None,
                             branch: None,
@@ -546,6 +548,7 @@ impl App {
                     intent: Box::new(ConvoyStartIntent {
                         namespace: Some(namespace),
                         project_ref: project,
+                        change_request: None,
                         issues: issues.into_iter().map(|issue| IssueSelector::Reference(issue.issue)).collect(),
                         name: None,
                         branch: None,

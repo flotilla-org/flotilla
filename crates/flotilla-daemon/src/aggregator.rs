@@ -126,13 +126,23 @@ pub(crate) trait AttachCapabilityResolver: Send + Sync {
 
 #[async_trait]
 pub(crate) trait ConvoyChangeRequestResolver: Send + Sync {
-    async fn resolve_change_request(&self, repositories: &[RepositoryKey], branch: &str) -> Result<Option<ConvoyChangeRequest>, String>;
+    async fn resolve_change_request(
+        &self,
+        repositories: &[RepositoryKey],
+        branch: &str,
+        change_request_id: Option<&str>,
+    ) -> Result<Option<ConvoyChangeRequest>, String>;
 }
 
 #[async_trait]
 impl ConvoyChangeRequestResolver for InProcessDaemon {
-    async fn resolve_change_request(&self, repositories: &[RepositoryKey], branch: &str) -> Result<Option<ConvoyChangeRequest>, String> {
-        self.resolve_convoy_change_request(repositories, branch).await
+    async fn resolve_change_request(
+        &self,
+        repositories: &[RepositoryKey],
+        branch: &str,
+        change_request_id: Option<&str>,
+    ) -> Result<Option<ConvoyChangeRequest>, String> {
+        self.resolve_convoy_change_request(repositories, branch, change_request_id).await
     }
 }
 
@@ -911,8 +921,8 @@ impl Aggregator {
     }
 
     fn convoy_association_changed(previous: Option<&ResourceObject<Convoy>>, current: Option<&ResourceObject<Convoy>>) -> bool {
-        previous.map(|convoy| (&convoy.spec.r#ref, &convoy.spec.repositories))
-            != current.map(|convoy| (&convoy.spec.r#ref, &convoy.spec.repositories))
+        previous.map(|convoy| (&convoy.spec.r#ref, &convoy.spec.repositories, &convoy.spec.change_request))
+            != current.map(|convoy| (&convoy.spec.r#ref, &convoy.spec.repositories, &convoy.spec.change_request))
     }
 
     fn convoy_phase_changed(previous: Option<&ResourceObject<Convoy>>, current: Option<&ResourceObject<Convoy>>) -> bool {
@@ -939,7 +949,10 @@ impl Aggregator {
             self.convoy_change_requests.remove(&reference);
             return;
         };
-        let repositories = convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>();
+        let (repositories, change_request_id) = match &convoy.spec.change_request {
+            Some(change_request) => (vec![change_request.repository_ref.clone()], Some(change_request.id.clone())),
+            None => (convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>(), None),
+        };
         if repositories.is_empty() {
             self.convoy_change_requests.remove(&reference);
             return;
@@ -950,7 +963,7 @@ impl Aggregator {
         let refresh_tx = self.change_request_refresh_queue.tx.clone();
         let task_reference = reference.clone();
         let task = tokio::spawn(async move {
-            let result = resolver.resolve_change_request(&repositories, &branch).await;
+            let result = resolver.resolve_change_request(&repositories, &branch, change_request_id.as_deref()).await;
             let _ = refresh_tx.send(ChangeRequestResolution { reference: task_reference, generation, branch, result });
         });
         self.change_request_refresh_tasks.insert(reference, task);
@@ -994,7 +1007,7 @@ impl Aggregator {
     fn schedule_change_request_refresh_pass(&mut self, convoys: impl IntoIterator<Item = (ResourceRef, ResourceObject<Convoy>)>) {
         // Repository order is resolver precedence, so only identical ordered
         // repository lists may safely share one lookup.
-        let mut lookups = HashMap::<(Vec<RepositoryKey>, String), Vec<(ResourceRef, uuid::Uuid)>>::new();
+        let mut lookups = HashMap::<(Vec<RepositoryKey>, String, Option<String>), Vec<(ResourceRef, uuid::Uuid)>>::new();
         for (reference, convoy) in convoys {
             let generation = uuid::Uuid::new_v4();
             self.change_request_refresh_generations.insert(reference.clone(), generation);
@@ -1005,21 +1018,26 @@ impl Aggregator {
                 self.convoy_change_requests.remove(&reference);
                 continue;
             };
-            let repositories = convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>();
+            let (repositories, change_request_id) = match &convoy.spec.change_request {
+                Some(change_request) => (vec![change_request.repository_ref.clone()], Some(change_request.id.clone())),
+                None => (convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>(), None),
+            };
             if repositories.is_empty() {
                 self.convoy_change_requests.remove(&reference);
                 continue;
             }
-            lookups.entry((repositories, branch)).or_default().push((reference, generation));
+            lookups.entry((repositories, branch, change_request_id)).or_default().push((reference, generation));
         }
 
         let Some(resolver) = self.change_request_resolver.clone() else {
             return;
         };
-        for ((repositories, branch), targets) in lookups {
+        for ((repositories, branch, change_request_id), targets) in lookups {
             let resolver = Arc::clone(&resolver);
             let lookup_branch = branch.clone();
-            let lookup = async move { resolver.resolve_change_request(&repositories, &lookup_branch).await }.boxed().shared();
+            let lookup = async move { resolver.resolve_change_request(&repositories, &lookup_branch, change_request_id.as_deref()).await }
+                .boxed()
+                .shared();
             for (reference, generation) in targets {
                 let lookup = lookup.clone();
                 let refresh_tx = self.change_request_refresh_queue.tx.clone();
@@ -1976,11 +1994,11 @@ mod tests {
         PrincipalRef,
     };
     use flotilla_resources::{
-        ConvoyRepositorySpec, ConvoySpec, CrewSpec, DemandKind, DemandSpec, DemandStatus, DemandTransition, EnvironmentSpec,
-        HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta, ObservedCheckoutSpec, PlacementStatus, PresentationPhase,
-        PresentationSpec, PresentationStatus, PrincipalRef as AttentionPrincipalRef, ProjectSpec, RegardSource, RegardSpec, RegardStatus,
-        RepositorySpec, ResourceBackend, Stance, TerminalAttention, TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec,
-        TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
+        BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DemandKind, DemandSpec, DemandStatus, DemandTransition,
+        EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta, ObservedCheckoutSpec, PlacementStatus,
+        PresentationPhase, PresentationSpec, PresentationStatus, PrincipalRef as AttentionPrincipalRef, ProjectSpec, RegardSource,
+        RegardSpec, RegardStatus, RepositorySpec, ResourceBackend, Stance, TerminalAttention, TerminalAttentionSource,
+        TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
     use futures::stream;
     use tokio::{sync::Mutex, time::timeout};
@@ -2490,6 +2508,12 @@ mod tests {
 
     struct BlockingChangeRequestResolver;
 
+    type BoundChangeRequestLookup = (Vec<RepositoryKey>, String, Option<String>);
+
+    struct RecordingBoundChangeRequestResolver {
+        calls: Mutex<Vec<BoundChangeRequestLookup>>,
+    }
+
     impl CountingAttachResolver {
         fn new() -> Self {
             Self { calls: AtomicUsize::new(0), origin_hosts: HashMap::new() }
@@ -2509,6 +2533,7 @@ mod tests {
             &self,
             _repositories: &[RepositoryKey],
             _branch: &str,
+            _change_request_id: Option<&str>,
         ) -> Result<Option<flotilla_protocol::ConvoyChangeRequest>, String> {
             std::future::pending().await
         }
@@ -2520,11 +2545,29 @@ mod tests {
             &self,
             repositories: &[RepositoryKey],
             branch: &str,
+            _change_request_id: Option<&str>,
         ) -> Result<Option<flotilla_protocol::ConvoyChangeRequest>, String> {
             assert_eq!(repositories, [RepositoryKey("repo_flotilla".into())]);
             self.branches.lock().await.push(branch.to_string());
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.results.lock().await.pop_front().unwrap_or(Ok(None))
+        }
+    }
+
+    #[async_trait]
+    impl ConvoyChangeRequestResolver for RecordingBoundChangeRequestResolver {
+        async fn resolve_change_request(
+            &self,
+            repositories: &[RepositoryKey],
+            branch: &str,
+            change_request_id: Option<&str>,
+        ) -> Result<Option<flotilla_protocol::ConvoyChangeRequest>, String> {
+            self.calls.lock().await.push((repositories.to_vec(), branch.to_string(), change_request_id.map(str::to_string)));
+            Ok(Some(flotilla_protocol::ConvoyChangeRequest {
+                id: change_request_id.expect("bound lookup should carry an id").to_string(),
+                status: flotilla_protocol::ChangeRequestStatus::Open,
+                repository_key: repositories[0].clone(),
+            }))
         }
     }
 
@@ -3198,6 +3241,34 @@ mod tests {
             flotilla_protocol::ChangeRequestStatus::Merged
         );
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn bound_convoy_enrichment_looks_up_the_admitted_pr_by_id() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        let resolver = Arc::new(RecordingBoundChangeRequestResolver { calls: Mutex::new(Vec::new()) });
+        let mut aggregator = Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
+        let mut convoy = convoy_with_branch("convoy-a").await;
+        convoy.spec.change_request = Some(BoundChangeRequest {
+            id: "1071".to_string(),
+            repository_ref: RepositoryKey("repo_flotilla".to_string()),
+            title: "Existing PR".to_string(),
+        });
+
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        let _ = event_rx.recv().await.expect("initial result set");
+        apply_next_change_request_resolution(&mut aggregator).await;
+        let DaemonEvent::ResultDelta(delta) = event_rx.recv().await.expect("bound PR delta") else {
+            panic!("expected result delta");
+        };
+
+        assert_eq!(delta.changes.as_convoys().expect("convoy changes")[0].change_request.as_ref().expect("bound PR").id, "1071");
+        assert_eq!(resolver.calls.lock().await.as_slice(), &[(
+            vec![RepositoryKey("repo_flotilla".to_string())],
+            "feat/convoy".to_string(),
+            Some("1071".to_string()),
+        )]);
     }
 
     #[tokio::test]

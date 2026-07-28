@@ -184,6 +184,10 @@ pub struct ConvoyStartIntent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     pub project_ref: String,
+    /// Existing change request to adopt. Admission resolves all remaining
+    /// checkout identity from this provider-native ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_request: Option<String>,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<IssueSelector>,
