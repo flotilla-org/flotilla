@@ -4835,7 +4835,7 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
                 "--state",
                 "all",
                 "--json",
-                "number,state,mergedAt,baseRefName",
+                "number,state,mergedAt,baseRefName,mergeable",
                 "--limit",
                 "1",
             ],
@@ -4932,7 +4932,18 @@ async fn convoy_delete_refuses_diverged_checkout_without_a_change_request() {
         .on_run("git", &["rev-list", "--count", "origin/feature/diverged..HEAD"], Ok("0\n".into()))
         .on_run(
             "gh",
-            &["pr", "list", "--head", "feature/diverged", "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/diverged",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName,mergeable",
+                "--limit",
+                "1",
+            ],
             Ok("[]".into()),
         )
         .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
@@ -4973,12 +4984,34 @@ async fn repeated_identical_reclaim_refusal_does_not_rewrite_checkout_status() {
         .on_run("git", &["rev-list", "--count", "origin/feature/diverged..HEAD"], Ok("0\n".into()))
         .on_run(
             "gh",
-            &["pr", "list", "--head", "feature/diverged", "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/diverged",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName,mergeable",
+                "--limit",
+                "1",
+            ],
             Ok("[]".into()),
         )
         .on_run(
             "gh",
-            &["pr", "list", "--head", "feature/diverged", "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/diverged",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName,mergeable",
+                "--limit",
+                "1",
+            ],
             Ok("[]".into()),
         )
         .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
@@ -5070,7 +5103,7 @@ async fn convoy_delete_allows_multi_repo_convoy_with_work_on_only_one_side() {
                 "--state",
                 "all",
                 "--json",
-                "number,state,mergedAt,baseRefName",
+                "number,state,mergedAt,baseRefName,mergeable",
                 "--limit",
                 "1",
             ],
@@ -5934,7 +5967,18 @@ async fn landing_holds_when_fresh_probe_contradicts_stale_vacuous_landed() {
         .on_run("git", &["rev-list", "--count", "main..HEAD"], Ok("2".into()))
         .on_run(
             "gh",
-            &["pr", "list", "--head", "feature/split", "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/split",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName,mergeable",
+                "--limit",
+                "1",
+            ],
             Ok(r#"[{"number": 1162, "state": "OPEN", "mergedAt": null, "baseRefName": "main"}]"#.into()),
         )
         .on_run("git", &["status", "--porcelain"], Ok(String::new()))
@@ -5982,6 +6026,7 @@ async fn landing_holds_when_fresh_probe_contradicts_stale_vacuous_landed() {
                 pushed: stale_vacuous.clone(),
                 landed: stale_vacuous,
                 landed_evidence: None,
+                change_request: None,
             },
             message: None,
         })

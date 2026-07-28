@@ -134,6 +134,8 @@ pub struct CheckoutIntegrationStatus {
     pub landed: IntegrationCondition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landed_evidence: Option<LandedEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_request: Option<ChangeRequestObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -169,13 +171,39 @@ pub struct LandedEvidence {
     pub target_ref: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ChangeRequestObservation {
+    pub id: String,
+    pub state: ChangeRequestState,
+    pub mergeability: ChangeRequestMergeability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ref: Option<String>,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeRequestState {
+    Open,
+    Closed,
+    Merged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeRequestMergeability {
+    Mergeable,
+    Conflicting,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutStatusPatch {
     MarkPreparing,
     MarkReady { path: String, commit: Option<String>, branch_provenance: CheckoutBranchProvenance },
     MarkTerminating,
     MarkFailed { message: String },
-    UpdateIntegration { integration: CheckoutIntegrationStatus },
+    UpdateIntegration { integration: Box<CheckoutIntegrationStatus> },
 }
 
 impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
@@ -209,7 +237,7 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
                 let landed_was_latched =
                     status.integration.landed.value == ConditionValue::True && status.integration.landed_evidence.is_some();
                 let landed_evidence = status.integration.landed_evidence.clone();
-                status.integration = integration.clone();
+                status.integration = integration.as_ref().clone();
                 if landed_was_latched {
                     status.integration.landed.value = ConditionValue::True;
                     if status.integration.landed_evidence.is_none() {
@@ -235,6 +263,7 @@ mod tests {
             pushed: condition(ConditionValue::True),
             landed: condition(landed),
             landed_evidence,
+            change_request: None,
         }
     }
 
@@ -244,7 +273,7 @@ mod tests {
         // untouched branch) is not a landing fact; a later observation that
         // finds an open change request must lower it (#1163).
         let mut status = CheckoutStatus { integration: integration(ConditionValue::True, None), ..Default::default() };
-        CheckoutStatusPatch::UpdateIntegration { integration: integration(ConditionValue::False, None) }.apply(&mut status);
+        CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration(ConditionValue::False, None)) }.apply(&mut status);
         assert_eq!(status.integration.landed.value, ConditionValue::False);
     }
 
@@ -254,7 +283,7 @@ mod tests {
         // stay landed even if a later probe cannot see the change request.
         let evidence = LandedEvidence::builder().change_request_id("1162".to_string()).build();
         let mut status = CheckoutStatus { integration: integration(ConditionValue::True, Some(evidence.clone())), ..Default::default() };
-        CheckoutStatusPatch::UpdateIntegration { integration: integration(ConditionValue::False, None) }.apply(&mut status);
+        CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration(ConditionValue::False, None)) }.apply(&mut status);
         assert_eq!(status.integration.landed.value, ConditionValue::True);
         assert_eq!(status.integration.landed_evidence, Some(evidence));
     }

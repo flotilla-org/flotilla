@@ -4,7 +4,10 @@ use std::{
 };
 
 use chrono::Utc;
-use flotilla_resources::{CheckoutIntegrationStatus, CheckoutSpec, CheckoutStatus, ConditionValue, IntegrationCondition, LandedEvidence};
+use flotilla_resources::{
+    ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, CheckoutIntegrationStatus, CheckoutSpec, CheckoutStatus,
+    ConditionValue, IntegrationCondition, LandedEvidence,
+};
 
 use crate::providers::{ChannelLabel, CommandRunner};
 
@@ -63,7 +66,7 @@ pub async fn inspect_checkout_integration(
     let observed_at = Utc::now().to_rfc3339();
     let clean = inspect_clean(runner, checkout_path, &observed_at).await;
     let pushed = inspect_pushed(runner, checkout_path, &observed_at).await;
-    let (landed, landed_evidence) = inspect_landed(
+    let (landed, landed_evidence, change_request) = inspect_landed(
         runner,
         checkout_path,
         checkout_branch_from_spec(spec),
@@ -72,7 +75,7 @@ pub async fn inspect_checkout_integration(
         &observed_at,
     )
     .await;
-    CheckoutIntegrationStatus { clean, pushed, landed, landed_evidence }
+    CheckoutIntegrationStatus { clean, pushed, landed, landed_evidence, change_request }
 }
 
 async fn inspect_clean(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
@@ -242,7 +245,7 @@ async fn inspect_landed(
     base_ref: Option<&str>,
     change_request_id: Option<&str>,
     observed_at: &str,
-) -> (IntegrationCondition, Option<LandedEvidence>) {
+) -> (IntegrationCondition, Option<LandedEvidence>, Option<ChangeRequestObservation>) {
     // Git evidence first: a branch with no commits beyond its base has
     // nothing to land, so it counts as landed without consulting the forge at
     // all. This keeps untouched checkouts landable in environments where `gh`
@@ -257,12 +260,15 @@ async fn inspect_landed(
                     .observed_at(observed_at.to_string())
                     .build(),
                 None,
+                None,
             );
         }
     }
     let args = match change_request_id {
-        Some(id) => vec!["pr", "view", id, "--json", "number,state,mergedAt,baseRefName"],
-        None => vec!["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
+        Some(id) => vec!["pr", "view", id, "--json", "number,state,mergedAt,baseRefName,mergeable"],
+        None => {
+            vec!["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt,baseRefName,mergeable", "--limit", "1"]
+        }
     };
     match runner.run_output("gh", &args, checkout_path, &ChannelLabel::Noop).await {
         Ok(output) if output.success => match serde_json::from_str::<serde_json::Value>(&output.stdout) {
@@ -279,8 +285,27 @@ async fn inspect_landed(
                         let state = item.get("state").and_then(serde_json::Value::as_str).unwrap_or("unknown");
                         let merged_at = item.get("mergedAt").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
                         let target_ref = item.get("baseRefName").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
-                        if state.eq_ignore_ascii_case("MERGED") || state.eq_ignore_ascii_case("CLOSED") || merged_at.is_some() {
-                            let outcome = if state.eq_ignore_ascii_case("CLOSED") && merged_at.is_none() { "closed" } else { "merged" };
+                        let state = if state.eq_ignore_ascii_case("MERGED") || merged_at.is_some() {
+                            ChangeRequestState::Merged
+                        } else if state.eq_ignore_ascii_case("CLOSED") {
+                            ChangeRequestState::Closed
+                        } else {
+                            ChangeRequestState::Open
+                        };
+                        let mergeability = match item.get("mergeable").and_then(serde_json::Value::as_str) {
+                            Some(value) if value.eq_ignore_ascii_case("MERGEABLE") => ChangeRequestMergeability::Mergeable,
+                            Some(value) if value.eq_ignore_ascii_case("CONFLICTING") => ChangeRequestMergeability::Conflicting,
+                            _ => ChangeRequestMergeability::Unknown,
+                        };
+                        let observation = ChangeRequestObservation::builder()
+                            .id(number.clone())
+                            .state(state)
+                            .mergeability(mergeability)
+                            .maybe_target_ref(target_ref.map(str::to_string))
+                            .observed_at(observed_at.to_string())
+                            .build();
+                        if state != ChangeRequestState::Open {
+                            let outcome = if state == ChangeRequestState::Closed { "closed" } else { "merged" };
                             (
                                 IntegrationCondition::builder()
                                     .value(ConditionValue::True)
@@ -294,19 +319,21 @@ async fn inspect_landed(
                                         .maybe_target_ref(if outcome == "merged" { target_ref.map(str::to_string) } else { None })
                                         .build(),
                                 ),
+                                Some(observation),
                             )
                         } else {
                             (
                                 IntegrationCondition::builder()
                                     .value(ConditionValue::False)
-                                    .details(vec![format!("PR #{number} {state}, not merged")])
+                                    .details(vec![format!("PR #{number} OPEN, not merged")])
                                     .observed_at(observed_at.to_string())
                                     .build(),
                                 None,
+                                Some(observation),
                             )
                         }
                     }
-                    None => (landed_without_change_request(&comparison, observed_at), None),
+                    None => (landed_without_change_request(&comparison, observed_at), None, None),
                 }
             }
             Err(_) => (
@@ -315,6 +342,7 @@ async fn inspect_landed(
                     .details(vec!["could not parse gh PR lookup output".to_string()])
                     .observed_at(observed_at.to_string())
                     .build(),
+                None,
                 None,
             ),
         },
@@ -325,6 +353,7 @@ async fn inspect_landed(
                 .observed_at(observed_at.to_string())
                 .build(),
             None,
+            None,
         ),
         Err(error) => (
             IntegrationCondition::builder()
@@ -332,6 +361,7 @@ async fn inspect_landed(
                 .details(vec![format!("gh PR lookup could not run: {error}")])
                 .observed_at(observed_at.to_string())
                 .build(),
+            None,
             None,
         ),
     }
@@ -408,7 +438,7 @@ mod tests {
 
     async fn landed_with_responses(responses: Vec<Result<String, String>>) -> IntegrationCondition {
         let runner = MockRunner::new(responses);
-        let (landed, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, "2026-07-27T00:00:00Z").await;
+        let (landed, _, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, "2026-07-27T00:00:00Z").await;
         landed
     }
 
@@ -448,12 +478,13 @@ mod tests {
             Ok("0".into()),
             Ok(r#"{"number":1071,"state":"MERGED","mergedAt":"2026-07-27T12:00:00Z","baseRefName":"main"}"#.into()),
         ]);
-        let (landed, evidence) =
+        let (landed, evidence, change_request) =
             inspect_landed(&runner, Path::new("/checkout"), "renamed-head", Some("main"), Some("1071"), "2026-07-27T00:00:00Z").await;
 
         assert_eq!(landed.value, ConditionValue::True);
         assert_eq!(evidence.as_ref().map(|evidence| evidence.change_request_id.as_str()), Some("1071"));
         assert_eq!(evidence.as_ref().and_then(|evidence| evidence.target_ref.as_deref()), Some("main"));
+        assert_eq!(change_request.expect("bound change request should be observed").state, ChangeRequestState::Merged);
         assert_eq!(
             runner.calls()[1],
             ("gh".to_string(), vec![
@@ -461,9 +492,22 @@ mod tests {
                 "view".to_string(),
                 "1071".to_string(),
                 "--json".to_string(),
-                "number,state,mergedAt,baseRefName".to_string(),
+                "number,state,mergedAt,baseRefName,mergeable".to_string(),
             ],)
         );
+    }
+
+    #[tokio::test]
+    async fn conflicting_change_request_is_part_of_the_integration_observation() {
+        let runner = MockRunner::new(vec![
+            Ok("2".into()),
+            Ok(r#"[{"number": 1162, "state": "OPEN", "mergedAt": null, "baseRefName": "main", "mergeable": "CONFLICTING"}]"#.into()),
+        ]);
+
+        let (_, _, change_request) =
+            inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, "2026-07-27T00:00:00Z").await;
+
+        assert_eq!(change_request.expect("open change request should be observed").mergeability, ChangeRequestMergeability::Conflicting);
     }
 
     #[tokio::test]
@@ -479,7 +523,7 @@ mod tests {
     #[tokio::test]
     async fn indeterminate_base_without_change_request_is_unknown() {
         let runner = MockRunner::new(vec![Err("fatal: ambiguous argument".into()), Ok("[]".into())]);
-        let (landed, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", None, None, "2026-07-27T00:00:00Z").await;
+        let (landed, _, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", None, None, "2026-07-27T00:00:00Z").await;
         assert_eq!(landed.value, ConditionValue::Unknown);
     }
 }

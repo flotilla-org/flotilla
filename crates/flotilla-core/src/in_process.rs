@@ -1612,6 +1612,16 @@ fn integration_observation_matches(left: &CheckoutIntegrationStatus, right: &Che
         .into_iter()
         .all(|(left, right)| left.value == right.value && left.details == right.details)
         && left.landed_evidence == right.landed_evidence
+        && match (&left.change_request, &right.change_request) {
+            (Some(left), Some(right)) => {
+                left.id == right.id
+                    && left.state == right.state
+                    && left.mergeability == right.mergeability
+                    && left.target_ref == right.target_ref
+            }
+            (None, None) => true,
+            _ => false,
+        }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2273,7 +2283,7 @@ impl InProcessDaemon {
                 }
             }
             apply_resource_status_patch(&checkouts, &checkout.metadata.name, &flotilla_resources::CheckoutStatusPatch::UpdateIntegration {
-                integration,
+                integration: Box::new(integration),
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -5947,7 +5957,7 @@ impl InProcessDaemon {
             if let Err(error) = apply_resource_status_patch(
                 &checkouts,
                 &checkout.metadata.name,
-                &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: integration.clone() },
+                &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration.clone()) },
             )
             .await
             {
@@ -6055,7 +6065,7 @@ impl InProcessDaemon {
                 if let Err(error) = apply_resource_status_patch(
                     &checkouts,
                     &checkout.metadata.name,
-                    &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: integration.clone() },
+                    &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration.clone()) },
                 )
                 .await
                 {

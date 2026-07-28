@@ -35,8 +35,9 @@ mod workflow_template;
 
 pub use backend::{ReplicaReadResolver, ReplicaWriter, ResourceBackend, TypedResolver};
 pub use checkout::{
-    Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch,
-    CheckoutWorktreeSpec, ConditionValue, FreshCloneCheckoutSpec, IntegrationCondition, LandedEvidence, ObservedCheckoutSpec,
+    ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus,
+    CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, CheckoutWorktreeSpec, ConditionValue, FreshCloneCheckoutSpec,
+    IntegrationCondition, LandedEvidence, ObservedCheckoutSpec,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use clock::VirtualClock;
