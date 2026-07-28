@@ -312,6 +312,7 @@ impl DaemonRuntime {
                 manifests.dir,
                 MANIFEST_RECONCILE_INTERVAL,
                 options.controller_supervision.clone(),
+                runtime_health.clone(),
             ));
         }
 
@@ -353,9 +354,10 @@ fn spawn_manifest_reconciler_task(
     root: PathBuf,
     interval: Duration,
     supervision: ControllerSupervision,
+    runtime_health: RuntimeHealth,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        supervise("manifest", supervision, move || {
+        supervise_controller("manifest", supervision, runtime_health, move || {
             let reconciler = ResourceManifestReconciler::new(backend.clone(), namespace.clone(), root.clone());
             async move { reconciler.run(interval).await }
         })
