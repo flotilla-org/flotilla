@@ -48,6 +48,7 @@ macro_rules! define_patch_kinds {
 }
 
 define_patch_kinds! {
+    ConvoySetPlacementDecision => NONE,
     ConvoyBootstrap => DUPLICATE,
     ConvoyBackfillCrewWork => NONE,
     ConvoyFailInit => DUPLICATE,
@@ -85,6 +86,7 @@ define_patch_kinds! {
 
 fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
     match patch {
+        ConvoyStatusPatch::SetPlacementDecision { .. } => PatchKind::ConvoySetPlacementDecision,
         ConvoyStatusPatch::Bootstrap { .. } => PatchKind::ConvoyBootstrap,
         ConvoyStatusPatch::BackfillCrewWork { .. } => PatchKind::ConvoyBackfillCrewWork,
         ConvoyStatusPatch::FailInit { .. } => PatchKind::ConvoyFailInit,

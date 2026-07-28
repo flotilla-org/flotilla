@@ -4180,16 +4180,12 @@ impl InProcessDaemon {
         annotations: BTreeMap<String, String>,
     ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let convoy = convoys
+        convoys
             .create(&InputMeta::builder().name(name.to_string()).annotations(annotations).build(), spec)
             .await
             .map_err(|error| error.to_string())?;
         if let Some(placement_decision) = placement_decision {
-            convoys
-                .update_status(name, &convoy.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-                    placement_decision: Some(placement_decision),
-                    ..flotilla_resources::ConvoyStatus::default()
-                })
+            apply_resource_status_patch(&convoys, name, &ConvoyStatusPatch::SetPlacementDecision { placement_decision })
                 .await
                 .map_err(|error| error.to_string())?;
         }

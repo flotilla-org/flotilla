@@ -259,6 +259,9 @@ pub struct PlacementStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyStatusPatch {
+    SetPlacementDecision {
+        placement_decision: PlacementDecision,
+    },
     Bootstrap {
         workflow_snapshot: WorkflowSnapshot,
         observed_workflow_ref: String,
@@ -366,6 +369,9 @@ pub enum ConvoyStatusPatch {
 impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
     fn apply(&self, status: &mut ConvoyStatus) {
         match self {
+            Self::SetPlacementDecision { placement_decision } => {
+                status.placement_decision.get_or_insert_with(|| placement_decision.clone());
+            }
             Self::Bootstrap { workflow_snapshot, observed_workflow_ref, observed_workflows, work, crew_work, phase, started_at } => {
                 status.workflow_snapshot = Some(workflow_snapshot.clone());
                 status.observed_workflow_ref = Some(observed_workflow_ref.clone());

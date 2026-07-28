@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{TimeZone, Utc};
+use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     controller_patches, external_patches, provisioning_patches, ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec,
     CrewWorkPhase, CrewWorkState, Selector, StatusPatch, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState,
@@ -71,6 +72,29 @@ fn pending_work() -> WorkState {
 
 fn crew_work(phase: CrewWorkPhase) -> CrewWorkState {
     CrewWorkState::builder().phase(phase).started_at(ts(10)).build()
+}
+
+#[test]
+fn placement_decision_is_written_once_without_overwriting_concurrent_status() {
+    let first = PlacementDecision {
+        policy_name: "host-direct-kiwi".to_string(),
+        target_host: PlacementTargetHost { reference: "kiwi-id".to_string(), display_name: "kiwi".to_string() },
+        refused_candidates: Vec::new(),
+    };
+    let second = PlacementDecision {
+        policy_name: "host-direct-feta".to_string(),
+        target_host: PlacementTargetHost { reference: "feta-id".to_string(), display_name: "feta".to_string() },
+        refused_candidates: Vec::new(),
+    };
+    let mut status =
+        ConvoyStatus { phase: ConvoyPhase::Active, observed_workflow_ref: Some("scratch".to_string()), ..ConvoyStatus::default() };
+
+    ConvoyStatusPatch::SetPlacementDecision { placement_decision: first.clone() }.apply(&mut status);
+    ConvoyStatusPatch::SetPlacementDecision { placement_decision: second }.apply(&mut status);
+
+    assert_eq!(status.placement_decision, Some(first));
+    assert_eq!(status.phase, ConvoyPhase::Active);
+    assert_eq!(status.observed_workflow_ref.as_deref(), Some("scratch"));
 }
 
 #[test]
