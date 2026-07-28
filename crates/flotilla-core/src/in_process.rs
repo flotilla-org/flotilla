@@ -3326,6 +3326,7 @@ async fn ensure_default_workflows(backend: &ResourceBackend, namespace: &str) ->
     let templates = backend.clone().using::<WorkflowTemplate>(namespace);
     for (name, spec) in [
         ("single-agent-contained", flotilla_resources::single_agent_contained_workflow_spec()),
+        ("single-agent-trusted", flotilla_resources::single_agent_trusted_workflow_spec()),
         ("implement-review", flotilla_resources::implement_review_workflow_spec()),
     ] {
         let meta = InputMeta::builder().name(name.to_string()).build();
@@ -3444,7 +3445,7 @@ async fn ensure_repository_and_default_project_workflow(
 fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: String) -> Result<ProjectSpec, String> {
     normalize_project_spec(ProjectSpec {
         display_name,
-        default_workflow_ref: "single-agent-contained".to_string(),
+        default_workflow_ref: "single-agent-trusted".to_string(),
         issue_source: None,
         repositories: vec![ProjectRepositorySpec { repo: repository_key, subpath: None, default_branch: None }],
     })

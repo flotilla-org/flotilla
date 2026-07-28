@@ -157,7 +157,7 @@ async fn tracking_repo_materializes_whole_repo_project() {
 
     let project = backend.using::<Project>("flotilla").get("tracked").await.expect("whole-repository project should exist");
     assert_eq!(project.spec.display_name, "tracked");
-    assert_eq!(project.spec.default_workflow_ref, "single-agent-contained");
+    assert_eq!(project.spec.default_workflow_ref, "single-agent-trusted");
     assert_eq!(project.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
         repo: repository_key,
         subpath: None,
@@ -704,7 +704,7 @@ async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_p
     assert_eq!(checkouts.items.len(), 1);
     let project = backend.using::<Project>("flotilla").get("my-project").await.expect("project should exist");
     assert_eq!(project.spec.display_name, "My Project");
-    assert_eq!(project.spec.default_workflow_ref, "single-agent-contained");
+    assert_eq!(project.spec.default_workflow_ref, "single-agent-trusted");
     assert_eq!(project.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
         repo: repository_key,
         subpath: None,

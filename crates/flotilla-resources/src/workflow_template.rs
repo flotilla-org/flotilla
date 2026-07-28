@@ -126,6 +126,23 @@ pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
         .build()
 }
 
+/// Interim default while contained crews lack credential seeding
+/// (flotilla-org/flotilla#1140): the single-agent coding workflow with a
+/// trusted stance. Retire in favour of `single-agent-contained` once the
+/// contained smoke passes with credentials.
+pub fn single_agent_trusted_workflow_spec() -> WorkflowTemplateSpec {
+    WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder()
+            .name("work".to_string())
+            .stance(Stance::Trusted)
+            .crew(vec![CrewSpec::builder()
+                .role("coder".to_string())
+                .source(CrewSource::Agent { selector: Selector { capability: "code".to_string() }, prompt: None, brief_template: None })
+                .build()])
+            .build()])
+        .build()
+}
+
 pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder()
