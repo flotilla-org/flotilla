@@ -1517,6 +1517,13 @@ fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, int
     }
 }
 
+fn integration_observation_matches(left: &CheckoutIntegrationStatus, right: &CheckoutIntegrationStatus) -> bool {
+    [(&left.clean, &right.clean), (&left.pushed, &right.pushed), (&left.landed, &right.landed)]
+        .into_iter()
+        .all(|(left, right)| left.value == right.value && left.details == right.details)
+        && left.landed_evidence == right.landed_evidence
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExistingConvoyTarget {
     pub home: HostName,
@@ -5695,6 +5702,25 @@ impl InProcessDaemon {
                     continue;
                 }
             };
+            match runner.path_exists(&path).await {
+                Ok(false) => {
+                    warn!(
+                        checkout = %checkout.metadata.name,
+                        path = %path.display(),
+                        "checkout path is already gone; allowing reclaim to finish"
+                    );
+                    continue;
+                }
+                Ok(true) => {}
+                Err(error) => {
+                    refusals.push(format!(
+                        "{} [{}]: Clean=Unknown (checkout path could not be probed: {error})",
+                        checkout.metadata.name,
+                        path.display()
+                    ));
+                    continue;
+                }
+            }
             let mut integration = inspect_checkout_integration(&*runner, &path, &checkout.spec).await;
             if let Some(existing) = checkout
                 .status
@@ -5706,14 +5732,20 @@ impl InProcessDaemon {
                     integration.landed_evidence = existing.integration.landed_evidence.clone();
                 }
             }
-            if let Err(error) = apply_resource_status_patch(
-                &checkouts,
-                &checkout.metadata.name,
-                &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: integration.clone() },
-            )
-            .await
-            {
-                warn!(checkout = %checkout.metadata.name, %error, "failed to persist checkout integration conditions during teardown gate");
+            if !checkout.status.as_ref().is_some_and(|status| integration_observation_matches(&status.integration, &integration)) {
+                if let Err(error) = apply_resource_status_patch(
+                    &checkouts,
+                    &checkout.metadata.name,
+                    &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: integration.clone() },
+                )
+                .await
+                {
+                    warn!(
+                        checkout = %checkout.metadata.name,
+                        %error,
+                        "failed to persist checkout integration conditions during teardown gate"
+                    );
+                }
             }
             if is_adopted {
                 if let Some(summary) = checkout_integration_summary(&checkout, &integration) {
@@ -5731,6 +5763,7 @@ impl InProcessDaemon {
         if refusals.is_empty() {
             Ok(())
         } else {
+            refusals.sort();
             Err(format!("convoy {namespace}/{name} is not safe to delete:\n{}", refusals.join("\n")))
         }
     }

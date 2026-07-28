@@ -4795,6 +4795,95 @@ async fn convoy_delete_refuses_diverged_checkout_without_a_change_request() {
 }
 
 #[tokio::test]
+async fn repeated_identical_reclaim_refusal_does_not_rewrite_checkout_status() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/diverged\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/diverged\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/diverged..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/diverged..HEAD"], Ok("0\n".into()))
+        .on_run(
+            "gh",
+            &["pr", "list", "--head", "feature/diverged", "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
+            Ok("[]".into()),
+        )
+        .on_run(
+            "gh",
+            &["pr", "list", "--head", "feature/diverged", "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
+            Ok("[]".into()),
+        )
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("1\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("1\n".into()))
+        .build();
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(&config_base)),
+        fake_discovery_with_runner(false, Arc::new(runner)),
+        HostName::local(),
+    )
+    .await;
+    daemon
+        .resource_backend()
+        .using::<Convoy>("flotilla")
+        .create(&empty_input_meta("refused-convoy"), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
+        .await
+        .expect("convoy create should succeed");
+    create_ready_observed_checkout_for_convoy(&daemon, "flotilla", "refused-convoy", "checkout-refused", "/repo", "feature/diverged").await;
+
+    daemon.verify_convoy_teardown_gate("flotilla", "refused-convoy", false).await.expect_err("first reclaim should refuse");
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let first = checkouts.get("checkout-refused").await.expect("checkout after first refusal");
+    daemon.verify_convoy_teardown_gate("flotilla", "refused-convoy", false).await.expect_err("second reclaim should refuse");
+    let second = checkouts.get("checkout-refused").await.expect("checkout after second refusal");
+
+    assert_eq!(
+        second.metadata.resource_version, first.metadata.resource_version,
+        "an identical refusal must not emit a status write that immediately requeues the convoy"
+    );
+}
+
+#[tokio::test]
+async fn convoy_reclaim_allows_managed_checkout_whose_path_is_already_gone() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), git_process_discovery(false), HostName::local()).await;
+    daemon
+        .resource_backend()
+        .using::<Convoy>("flotilla")
+        .create(&empty_input_meta("half-reclaimed"), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
+        .await
+        .expect("convoy create should succeed");
+    let missing_path = temp.path().join("already-removed");
+    create_ready_observed_checkout_for_convoy(
+        &daemon,
+        "flotilla",
+        "half-reclaimed",
+        "checkout-already-removed",
+        missing_path.to_str().expect("utf-8 path"),
+        "feature/already-removed",
+    )
+    .await;
+
+    daemon
+        .verify_convoy_teardown_gate("flotilla", "half-reclaimed", false)
+        .await
+        .expect("a missing checkout path has no integration work left to protect");
+}
+
+#[tokio::test]
 async fn convoy_delete_allows_multi_repo_convoy_with_work_on_only_one_side() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");

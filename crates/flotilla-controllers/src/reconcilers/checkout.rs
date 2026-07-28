@@ -10,6 +10,7 @@ use flotilla_resources::{
 use tracing::warn;
 
 const CHECKOUT_INTEGRATION_REFRESH_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
+const CHECKOUT_PROVISIONING_REQUEUE_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutRemoval {
@@ -187,7 +188,13 @@ where
             None
         };
 
-        ReconcileOutcome::new(patch)
+        let mut outcome = ReconcileOutcome::new(patch);
+        if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) == CheckoutPhase::Pending
+            && !matches!(deps, CheckoutDeps::Failed(_))
+        {
+            outcome.requeue_after = Some(CHECKOUT_PROVISIONING_REQUEUE_AFTER);
+        }
+        outcome
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {

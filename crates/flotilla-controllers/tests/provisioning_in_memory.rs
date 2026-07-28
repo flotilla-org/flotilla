@@ -2,7 +2,10 @@ mod common;
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -13,9 +16,10 @@ use common::{
     create_workspace, ControllerLoopHarness,
 };
 use flotilla_controllers::reconcilers::{
-    CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime,
-    DockerProvisioning, EnvironmentReconciler, HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler,
-    ProviderPresentationRuntime, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
+    checkout::CheckoutDeps, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
+    DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, HopChainContext, PreparedCheckout, PresentationPolicyRegistry,
+    PresentationReconciler, ProviderPresentationRuntime, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler,
+    VesselReconciler,
 };
 use flotilla_core::{
     path_context::DaemonHostPath,
@@ -29,12 +33,14 @@ use flotilla_core::{
     HostName,
 };
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key, controller::ControllerLoop, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec,
-    CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
-    DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host,
-    HostDirectEnvironmentSpec, HostSpec, HostStatus, Presentation, PresentationPhase, PresentationSpec, Repository, RepositorySpec,
-    ResourceBackend, ResourceError, Stance, StatusPatch, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement,
-    CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    canonicalize_repo_url, clone_key,
+    controller::{ControllerLoop, ReconcileOutcome, Reconciler},
+    Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, Environment, EnvironmentMount,
+    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, Presentation,
+    PresentationPhase, PresentationSpec, Repository, RepositorySpec, ResourceBackend, ResourceError, ResourceObject, Stance, StatusPatch,
+    TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_ORDINAL_LABEL,
+    VESSEL_REF_LABEL,
 };
 
 const NAMESPACE: &str = "flotilla";
@@ -108,6 +114,82 @@ impl CheckoutRuntime for FakeCheckoutRuntime {
 
     async fn remove_checkout(&self, _removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
         Ok(CheckoutRemovalOutcome::Removed)
+    }
+}
+
+#[derive(Default)]
+struct CountingCheckoutRuntime {
+    attempts: AtomicUsize,
+}
+
+#[async_trait]
+impl CheckoutRuntime for CountingCheckoutRuntime {
+    async fn create_worktree(
+        &self,
+        _clone_path: &str,
+        _branch: &str,
+        _base_ref: Option<&str>,
+        _target_path: &str,
+    ) -> Result<PreparedCheckout, String> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Ok(PreparedCheckout { commit: Some("44982740".to_string()), branch_provenance: CheckoutBranchProvenance::CreatedForConvoy })
+    }
+
+    async fn create_fresh_clone(
+        &self,
+        _repo_url: &str,
+        _branch: &str,
+        _base_ref: Option<&str>,
+        _target_path: &str,
+    ) -> Result<PreparedCheckout, String> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Ok(PreparedCheckout { commit: Some("44982740".to_string()), branch_provenance: CheckoutBranchProvenance::PreExisting })
+    }
+
+    async fn inspect_integration(
+        &self,
+        _checkout: &ResourceObject<Checkout>,
+    ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String> {
+        Ok(flotilla_resources::CheckoutIntegrationStatus::default())
+    }
+
+    async fn remove_checkout(&self, _removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+        Ok(CheckoutRemovalOutcome::Removed)
+    }
+}
+
+struct DropFirstCheckoutCompletion {
+    inner: CheckoutReconciler<CountingCheckoutRuntime>,
+    dropped: AtomicBool,
+}
+
+impl Reconciler for DropFirstCheckoutCompletion {
+    type Resource = Checkout;
+    type Dependencies = CheckoutDeps;
+
+    async fn fetch_dependencies(&self, obj: &ResourceObject<Checkout>) -> Result<Self::Dependencies, ResourceError> {
+        self.inner.fetch_dependencies(obj).await
+    }
+
+    fn reconcile(
+        &self,
+        obj: &ResourceObject<Checkout>,
+        deps: &Self::Dependencies,
+        now: chrono::DateTime<Utc>,
+    ) -> ReconcileOutcome<Checkout> {
+        let mut outcome = self.inner.reconcile(obj, deps, now);
+        if !self.dropped.swap(true, Ordering::SeqCst) {
+            outcome.patch = None;
+        }
+        outcome
+    }
+
+    async fn run_finalizer(&self, obj: &ResourceObject<Checkout>) -> Result<(), ResourceError> {
+        self.inner.run_finalizer(obj).await
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        self.inner.finalizer_name()
     }
 }
 
@@ -497,6 +579,69 @@ async fn checkout_controller_marks_worktree_checkout_ready() {
             }
         })
         .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn checkout_controller_requeues_when_first_completion_is_dropped() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_clone(
+        &backend,
+        NAMESPACE,
+        "clone-a",
+        "git@github.com:flotilla-org/flotilla.git",
+        "host-direct-01HXYZ",
+        "/Users/alice/dev/flotilla",
+    )
+    .await;
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    checkouts
+        .create(
+            &controller_meta().name("checkout-redrive").call(),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key("https://github.com/flotilla-org/flotilla")),
+                env_ref: "host-direct-01HXYZ".to_string(),
+                r#ref: "feat/actuation-recovery".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/Users/alice/dev/flotilla.feat-actuation-recovery".to_string(),
+                clone_ref: "clone-a".to_string(),
+            }),
+        )
+        .await
+        .expect("checkout create should succeed");
+
+    let runtime = Arc::new(CountingCheckoutRuntime::default());
+    let reconciler = DropFirstCheckoutCompletion {
+        inner: CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE),
+        dropped: AtomicBool::new(false),
+    };
+    let mut harness = ControllerLoopHarness::new(backend.clone());
+    harness.spawn(
+        ControllerLoop {
+            primary: checkouts.clone(),
+            secondaries: vec![],
+            reconciler,
+            // The point retry must recover without waiting for the ordinary
+            // production resync or restarting the controller.
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    harness
+        .wait_until(Duration::from_secs(3), || {
+            let checkouts = checkouts.clone();
+            async move {
+                matches!(
+                    checkouts.get("checkout-redrive").await.ok().and_then(|checkout| checkout.status),
+                    Some(status) if status.phase == CheckoutPhase::Ready
+                )
+            }
+        })
+        .await;
+    assert!(runtime.attempts.load(Ordering::SeqCst) >= 2, "dropped checkout completion should be re-driven");
 
     harness.shutdown().await;
 }

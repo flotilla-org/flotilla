@@ -1,14 +1,18 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     future::Future,
     marker::PhantomData,
     pin::Pin,
+    sync::Arc,
     time::Duration,
 };
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, Mutex},
+    task::JoinHandle,
+};
 
 use crate::{
     apply_status_patch,
@@ -447,6 +451,7 @@ impl<R: Reconciler> ControllerLoop<R> {
         let mut resync = tokio::time::interval(resync_interval);
         resync.tick().await;
         let mut pending: VecDeque<String> = VecDeque::new();
+        let scheduled_requeues = Arc::new(Mutex::new(HashSet::new()));
 
         loop {
             if let Some(name) = pending.pop_front() {
@@ -489,6 +494,18 @@ impl<R: Reconciler> ControllerLoop<R> {
                 }
                 if let Some(patch) = outcome.patch {
                     Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await?;
+                }
+                if let Some(delay) = outcome.requeue_after {
+                    let mut scheduled = scheduled_requeues.lock().await;
+                    if scheduled.insert(name.clone()) {
+                        let scheduled_requeues = Arc::clone(&scheduled_requeues);
+                        let sender = sender.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            scheduled_requeues.lock().await.remove(&name);
+                            let _ = sender.send(name).await;
+                        });
+                    }
                 }
                 continue;
             }

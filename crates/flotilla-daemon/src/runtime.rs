@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -33,13 +33,13 @@ use flotilla_core::{
 };
 use flotilla_protocol::{EnvironmentId, HostSummary, ImageId, TerminalStatus};
 use flotilla_resources::{
-    clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone,
-    CloneSpec, Convoy, ConvoyReconciler, ConvoyTeardownRuntime, CrewSource, CrewSpec, Demand, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy,
-    PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend, ResourceError, ResourceObject, Stance,
-    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
-    CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
+    canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance,
+    CheckoutIntegrationStatus, Clone, CloneSpec, Convoy, ConvoyReconciler, ConvoyTeardownRuntime, CrewSource, CrewSpec, Demand,
+    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
+    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend, ResourceError,
+    ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -61,6 +61,18 @@ const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 
 struct DaemonConvoyTeardownRuntime {
     daemon: Arc<InProcessDaemon>,
+    reclaim_refusals: StdMutex<HashMap<String, ReclaimRefusal>>,
+}
+
+struct ReclaimRefusal {
+    error: String,
+    attempts: u64,
+}
+
+impl DaemonConvoyTeardownRuntime {
+    fn new(daemon: Arc<InProcessDaemon>) -> Self {
+        Self { daemon, reclaim_refusals: StdMutex::new(HashMap::new()) }
+    }
 }
 
 #[async_trait]
@@ -75,13 +87,44 @@ impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
 
     async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
         let result = self.daemon.verify_convoy_teardown_gate(&convoy.metadata.namespace, &convoy.metadata.name, false).await;
-        if let Err(error) = &result {
-            warn!(
-                namespace = %convoy.metadata.namespace,
-                convoy = %convoy.metadata.name,
-                %error,
-                "automatic convoy reclaim refused"
-            );
+        let key = format!("{}/{}", convoy.metadata.namespace, convoy.metadata.name);
+        match &result {
+            Err(error) => {
+                let attempts = {
+                    let mut refusals = self.reclaim_refusals.lock().expect("reclaim refusal lock poisoned");
+                    match refusals.get_mut(&key) {
+                        Some(refusal) if refusal.error == *error => {
+                            refusal.attempts += 1;
+                            refusal.attempts
+                        }
+                        _ => {
+                            refusals.insert(key, ReclaimRefusal { error: error.clone(), attempts: 1 });
+                            1
+                        }
+                    }
+                };
+                if attempts == 1 {
+                    warn!(
+                        namespace = %convoy.metadata.namespace,
+                        convoy = %convoy.metadata.name,
+                        attempts,
+                        %error,
+                        "automatic convoy reclaim refused"
+                    );
+                }
+            }
+            Ok(()) => {
+                if let Some(refusal) = self.reclaim_refusals.lock().expect("reclaim refusal lock poisoned").remove(&key) {
+                    if refusal.attempts > 1 {
+                        info!(
+                            namespace = %convoy.metadata.namespace,
+                            convoy = %convoy.metadata.name,
+                            refused_attempts = refusal.attempts,
+                            "automatic convoy reclaim recovered after repeated refusal"
+                        );
+                    }
+                }
+            }
         }
         result
     }
@@ -1026,7 +1069,7 @@ fn spawn_controller_loops(
                                 .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                                 .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
                                 .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
-                                .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime { daemon }))
+                                .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
                                 .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
                                     backend.clone(),
                                     &namespace_string,
@@ -1304,6 +1347,9 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         let runner = self.local_runner()?;
         let clone_path = utf8_path(clone_path)?;
         let target_path = utf8_path(target_path)?;
+        if let Some(prepared) = recover_existing_worktree(&*runner, clone_path, branch, target_path).await? {
+            return Ok(prepared);
+        }
 
         let local_ref = format!("refs/heads/{branch}");
         let remote_ref = format!("refs/remotes/origin/{branch}");
@@ -1405,6 +1451,9 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
     ) -> Result<PreparedCheckout, String> {
         let runner = self.local_runner()?;
         let target_path = utf8_path(target_path)?;
+        if let Some(prepared) = recover_existing_fresh_clone(&*runner, repo_url, branch, target_path).await? {
+            return Ok(prepared);
+        }
         let clone_ref = base_ref.unwrap_or(branch);
         if clone_ref == "HEAD" {
             runner.run("git", &["clone", repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
@@ -1507,6 +1556,94 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             }
         }
     }
+}
+
+async fn recover_existing_worktree(
+    runner: &dyn CommandRunner,
+    clone_path: &str,
+    branch: &str,
+    target_path: &str,
+) -> Result<Option<PreparedCheckout>, String> {
+    if !runner.path_exists(Path::new(target_path)).await? {
+        return Ok(None);
+    }
+
+    let target_common_dir = runner
+        .run("git", &["-C", target_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Noop)
+        .await
+        .map_err(|error| format!("checkout target {target_path} already exists but is not a reusable git worktree: {error}"))?;
+    let clone_common_dir = runner
+        .run("git", &["-C", clone_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Noop)
+        .await?;
+    if target_common_dir.trim() != clone_common_dir.trim() {
+        return Err(format!("checkout target {target_path} already exists but belongs to a different git repository"));
+    }
+
+    let current_branch =
+        runner.run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Noop).await;
+    if current_branch.as_deref().map(str::trim) != Ok(branch) {
+        let target_commit = resolve_head_commit(runner, target_path).await?;
+        let expected_commit = runner.run("git", &["-C", clone_path, "rev-parse", branch], Path::new("/"), &ChannelLabel::Noop).await?;
+        if target_commit.as_deref() != Some(expected_commit.trim()) {
+            return Err(format!("checkout target {target_path} already exists at a different ref than {branch}"));
+        }
+    }
+
+    let branch_provenance = if runner
+        .run(
+            "git",
+            &["-C", clone_path, "show-ref", "--verify", "--quiet", &bootstrap_branch_ref(branch)],
+            Path::new("/"),
+            &ChannelLabel::Noop,
+        )
+        .await
+        .is_ok()
+    {
+        CheckoutBranchProvenance::CreatedForConvoy
+    } else {
+        CheckoutBranchProvenance::PreExisting
+    };
+    Ok(Some(PreparedCheckout { commit: resolve_head_commit(runner, target_path).await?, branch_provenance }))
+}
+
+async fn recover_existing_fresh_clone(
+    runner: &dyn CommandRunner,
+    repo_url: &str,
+    branch: &str,
+    target_path: &str,
+) -> Result<Option<PreparedCheckout>, String> {
+    if !runner.path_exists(Path::new(target_path)).await? {
+        return Ok(None);
+    }
+
+    let origin = runner
+        .run("git", &["-C", target_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop)
+        .await
+        .map_err(|error| format!("checkout target {target_path} already exists but is not a reusable clone: {error}"))?;
+    let origin = origin.trim();
+    let same_origin = origin == repo_url
+        || canonicalize_repo_url(origin)
+            .ok()
+            .zip(canonicalize_repo_url(repo_url).ok())
+            .is_some_and(|(origin, expected)| origin == expected);
+    if !same_origin {
+        return Err(format!("checkout target {target_path} already exists with origin {origin}, expected {repo_url}"));
+    }
+
+    if branch != "HEAD" {
+        let current_branch = runner
+            .run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Noop)
+            .await
+            .map_err(|error| format!("checkout target {target_path} already exists but its branch cannot be resolved: {error}"))?;
+        if current_branch.trim() != branch {
+            return Err(format!("checkout target {target_path} already exists on branch {}, expected {branch}", current_branch.trim()));
+        }
+    }
+
+    Ok(Some(PreparedCheckout {
+        commit: resolve_head_commit(runner, target_path).await?,
+        branch_provenance: CheckoutBranchProvenance::PreExisting,
+    }))
 }
 
 fn bootstrap_branch_ref(branch: &str) -> String {
@@ -1989,6 +2126,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkout_runtime_recovers_a_worktree_after_its_completion_is_lost() {
+        let temp = TempDir::new().expect("tempdir");
+        let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
+        let target = temp.path().join("workspace/flotilla");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        let first = runtime
+            .create_worktree(
+                clone.path().to_str().expect("utf-8 clone path"),
+                "feature/redrive",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("first worktree actuation should succeed");
+        let recovered = runtime
+            .create_worktree(
+                clone.path().to_str().expect("utf-8 clone path"),
+                "feature/redrive",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("redrive should recover the worktree already created on disk");
+
+        assert_eq!(recovered, first);
+    }
+
+    #[tokio::test]
     async fn checkout_runtime_removes_zero_commit_worktree_without_git_or_directory_debris() {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
@@ -2368,6 +2534,35 @@ mod tests {
             .expect("git should run");
         assert!(branch.status.success());
         assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/multi-repo");
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_recovers_a_fresh_clone_after_its_completion_is_lost() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let target = temp.path().join("fresh-clone");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        let first = runtime
+            .create_fresh_clone(
+                source.path().to_str().expect("utf-8 source path"),
+                "feature/redrive",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("first clone actuation should succeed");
+        let recovered = runtime
+            .create_fresh_clone(
+                source.path().to_str().expect("utf-8 source path"),
+                "feature/redrive",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("redrive should recover the clone already created on disk");
+
+        assert_eq!(recovered, first);
     }
 
     #[tokio::test]
