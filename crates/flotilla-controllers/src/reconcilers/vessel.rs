@@ -21,7 +21,7 @@ use flotilla_resources::{
     HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository,
     RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession,
     TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase,
-    CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, VESSEL_REF_LABEL,
+    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -527,7 +527,7 @@ impl Reconciler for VesselReconciler {
                             })
                         }
                         PlacementStrategy::DockerFreshCloneInContainer { .. } => CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
-                            repo_ref: repository_key,
+                            repo_ref: repository_key.clone(),
                             env_ref: precreated_environment
                                 .as_ref()
                                 .map(|(environment_ref, _)| environment_ref.clone())
@@ -539,7 +539,12 @@ impl Reconciler for VesselReconciler {
                         }),
                     };
                     let env_ref = spec.env_ref().expect("managed checkout should have an env_ref").to_string();
-                    let labels = BTreeMap::from([(ENV_LABEL.to_string(), env_ref), (REPO_KEY_LABEL.to_string(), repo_key)]);
+                    let mut labels = BTreeMap::from([(ENV_LABEL.to_string(), env_ref), (REPO_KEY_LABEL.to_string(), repo_key)]);
+                    if let Some(change_request) =
+                        convoy.spec.change_request.as_ref().filter(|change_request| change_request.repository_ref == repository_key)
+                    {
+                        labels.insert(CHANGE_REQUEST_ID_LABEL.to_string(), change_request.id.clone());
+                    }
                     let meta = match &strategy {
                         PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
                             convoy_owned_child_meta(&checkout_name, &convoy, labels)
@@ -768,6 +773,7 @@ impl Reconciler for VesselReconciler {
                             let assignment = match prompt.as_deref() {
                                 Some(prompt) => CrewAssignment::Prompt(prompt),
                                 None if !convoy.spec.issues.is_empty() => CrewAssignment::CarriedIssue,
+                                None if convoy.spec.change_request.is_some() => CrewAssignment::CarriedChangeRequest,
                                 None => CrewAssignment::Unassigned,
                             };
                             let render_options = self.brief_templates.render_options_with_fork_stance(

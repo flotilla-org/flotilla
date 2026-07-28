@@ -22,6 +22,7 @@ struct GhPr {
     number: i64,
     title: String,
     head_ref_name: String,
+    base_ref_name: Option<String>,
     state: String,
     body: Option<String>,
     is_draft: bool,
@@ -72,6 +73,7 @@ impl GitHubChangeRequest {
                 .number(value["number"].as_i64()?)
                 .title(value["title"].as_str()?.to_string())
                 .head_ref_name(value["head"]["ref"].as_str()?.to_string())
+                .maybe_base_ref_name(value["base"]["ref"].as_str().map(str::to_string))
                 .state(value["state"].as_str().unwrap_or("open").to_string())
                 .maybe_body(value["body"].as_str().map(str::to_string))
                 .is_draft(value["draft"].as_bool().unwrap_or(false))
@@ -155,6 +157,15 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
 
         let pr = Self::parse_pull_request(&v).ok_or("malformed pull request")?;
         Ok(self.gh_pr_to_change_request(&pr))
+    }
+
+    async fn get_change_request_for_admission(&self, repo_root: &Path, id: &str) -> Result<super::ChangeRequestAdmission, String> {
+        let endpoint = format!("repos/{}/pulls/{}", self.repo_slug, id);
+        let body = gh_api_get!(self.api, &endpoint, repo_root)?;
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+        let pull_request = Self::parse_pull_request(&value).ok_or("malformed pull request")?;
+        let (id, change_request) = self.gh_pr_to_change_request(&pull_request);
+        Ok(super::ChangeRequestAdmission { id, change_request, base_ref: pull_request.base_ref_name })
     }
 
     async fn open_in_browser(&self, repo_root: &Path, id: &str) -> Result<(), String> {
@@ -403,6 +414,7 @@ mod tests {
             .number(number)
             .title("Add feature".to_string())
             .head_ref_name("feat/add-feature".to_string())
+            .base_ref_name("main".to_string())
             .state("OPEN".to_string())
             .is_draft(false)
             .build()

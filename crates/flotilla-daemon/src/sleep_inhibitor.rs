@@ -411,6 +411,7 @@ mod tests {
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
             issues: vec![],
+            change_request: None,
             instruction: None,
         }
     }

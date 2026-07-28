@@ -93,6 +93,7 @@ pub async fn create_convoy_with_single_task(
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
             issues: Vec::new(),
+            change_request: None,
             instruction: None,
         })
         .await

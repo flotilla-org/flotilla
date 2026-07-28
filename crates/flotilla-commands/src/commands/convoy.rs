@@ -58,6 +58,13 @@ pub enum ConvoyVerb {
         /// Project whose definitions and repository set admission snapshots
         #[arg(long)]
         project: String,
+        /// Existing pull request number to adopt
+        #[arg(
+            long = "pr",
+            conflicts_with_all = ["branch", "issue", "issue_service", "issue_scope"],
+            value_parser = parse_pr_number
+        )]
+        change_request: Option<String>,
         /// Opaque external issue ID
         #[arg(long)]
         issue: Option<String>,
@@ -124,6 +131,13 @@ fn parse_input_kv(raw: &str) -> Result<(String, String), String> {
         return Err(format!("input key cannot be empty: {raw}"));
     }
     Ok((key.to_string(), value.to_string()))
+}
+
+fn parse_pr_number(raw: &str) -> Result<String, String> {
+    match raw.parse::<u64>() {
+        Ok(number) if number > 0 => Ok(number.to_string()),
+        _ => Err(format!("pull request number must be a positive integer: {raw}")),
+    }
 }
 
 fn resolve_adopted_checkout(path: PathBuf) -> Result<Box<PathBuf>, String> {
@@ -225,6 +239,7 @@ impl ConvoyNoun {
             }
             ConvoyVerb::Start {
                 project,
+                change_request,
                 issue,
                 issue_service,
                 issue_scope,
@@ -262,6 +277,7 @@ impl ConvoyNoun {
                             intent: Box::new(ConvoyStartIntent {
                                 namespace: None,
                                 project_ref: project,
+                                change_request,
                                 issues,
                                 name,
                                 branch,
@@ -294,6 +310,7 @@ impl ConvoyNoun {
                                 intent: Box::new(ConvoyStartIntent {
                                     namespace: None,
                                     project_ref: project_ref.clone(),
+                                    change_request: None,
                                     issues: Vec::new(),
                                     name: Some(name),
                                     branch: r#ref,
@@ -374,6 +391,7 @@ impl std::fmt::Display for ConvoyNoun {
             }
             ConvoyVerb::Start {
                 project,
+                change_request,
                 issue,
                 issue_service,
                 issue_scope,
@@ -387,6 +405,9 @@ impl std::fmt::Display for ConvoyNoun {
                 attach,
             } => {
                 write!(f, " start --project {}", quote_value(project))?;
+                if let Some(change_request) = change_request {
+                    write!(f, " --pr {}", quote_value(change_request))?;
+                }
                 if let Some(issue) = issue {
                     write!(f, " --issue {}", quote_value(issue))?;
                 }
@@ -611,6 +632,7 @@ mod tests {
                     intent: Box::new(ConvoyStartIntent {
                         namespace: None,
                         project_ref: "widgets".into(),
+                        change_request: None,
                         issues: vec![IssueSelector::Reference(IssueRef {
                             source: IssueSource { service: "https://linear.app".into(), scope: "WIDGET".into() },
                             id: "WIDGET-732".into(),
@@ -645,6 +667,7 @@ mod tests {
                     intent: Box::new(ConvoyStartIntent {
                         namespace: None,
                         project_ref: "flotilla".into(),
+                        change_request: None,
                         issues: vec![IssueSelector::Id("834".into())],
                         name: None,
                         branch: None,
@@ -674,6 +697,7 @@ mod tests {
                     intent: Box::new(ConvoyStartIntent {
                         namespace: None,
                         project_ref: "flotilla".into(),
+                        change_request: None,
                         issues: vec![IssueSelector::Id("834".into())],
                         name: None,
                         branch: None,
@@ -688,6 +712,45 @@ mod tests {
             repo: RepoContext::None,
             host: HostResolution::Local,
         });
+    }
+
+    #[test]
+    fn convoy_start_pr_adoption_resolves_without_branch_discovery() {
+        let resolved =
+            parse(&["convoy", "start", "--project", "flotilla", "--pr", "1071", "--no-attach"]).resolve().expect("resolve PR adoption");
+
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: Some("1071".into()),
+                        issues: Vec::new(),
+                        name: None,
+                        branch: None,
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        auto_attach: ConvoyAutoAttach::Never,
+                    }),
+                },
+            },
+            repo: RepoContext::None,
+            host: HostResolution::Local,
+        });
+        assert!(
+            ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--pr", "1071", "--branch", "feat/wrong",]).is_err(),
+            "--pr must be the branch identity authority"
+        );
+        assert!(
+            ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--pr", "1071", "--issue", "42"]).is_err(),
+            "--pr adoption must remain PR-first"
+        );
     }
 
     #[test]
@@ -793,6 +856,7 @@ mod tests {
             intent: Box::new(ConvoyStartIntent {
                 namespace: None,
                 project_ref: "widgets".into(),
+                change_request: None,
                 issues: Vec::new(),
                 name: Some("project-work".into()),
                 branch: Some("fix/widgets".into()),

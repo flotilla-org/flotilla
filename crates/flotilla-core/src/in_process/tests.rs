@@ -1039,6 +1039,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
             issues: Vec::new(),
+            change_request: None,
             instruction: None,
         })
         .await
@@ -3898,7 +3899,7 @@ async fn convoy_change_request_resolves_from_peer_data_for_virtual_repo() {
         .expect("add virtual repo");
 
     let resolved = daemon
-        .resolve_convoy_change_request(std::slice::from_ref(&repository_key), "fix/remote-pr-ref")
+        .resolve_convoy_change_request(std::slice::from_ref(&repository_key), "fix/remote-pr-ref", None)
         .await
         .expect("resolve change request")
         .expect("peer-backed change request");
@@ -4100,6 +4101,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
             issues: Vec::new(),
+            change_request: None,
             instruction: None,
         })
         .await
@@ -4666,6 +4668,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
             issues: Vec::new(),
+            change_request: None,
             instruction: None,
         })
         .await

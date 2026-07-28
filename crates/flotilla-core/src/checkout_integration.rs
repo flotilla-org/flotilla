@@ -58,12 +58,20 @@ pub async fn inspect_checkout_integration(
     runner: &dyn CommandRunner,
     checkout_path: &Path,
     spec: &CheckoutSpec,
+    change_request_id: Option<&str>,
 ) -> CheckoutIntegrationStatus {
     let observed_at = Utc::now().to_rfc3339();
     let clean = inspect_clean(runner, checkout_path, &observed_at).await;
     let pushed = inspect_pushed(runner, checkout_path, &observed_at).await;
-    let (landed, landed_evidence) =
-        inspect_landed(runner, checkout_path, checkout_branch_from_spec(spec), checkout_base_ref_from_spec(spec), &observed_at).await;
+    let (landed, landed_evidence) = inspect_landed(
+        runner,
+        checkout_path,
+        checkout_branch_from_spec(spec),
+        checkout_base_ref_from_spec(spec),
+        change_request_id,
+        &observed_at,
+    )
+    .await;
     CheckoutIntegrationStatus { clean, pushed, landed, landed_evidence }
 }
 
@@ -232,6 +240,7 @@ async fn inspect_landed(
     checkout_path: &Path,
     branch: &str,
     base_ref: Option<&str>,
+    change_request_id: Option<&str>,
     observed_at: &str,
 ) -> (IntegrationCondition, Option<LandedEvidence>) {
     // Git evidence first: a branch with no commits beyond its base has
@@ -239,63 +248,68 @@ async fn inspect_landed(
     // all. This keeps untouched checkouts landable in environments where `gh`
     // is absent or unauthenticated.
     let comparison = compare_branch_to_base(runner, checkout_path, base_ref).await;
-    if let BaseComparison::Counted { base_ref, count: 0 } = &comparison {
-        return (
-            IntegrationCondition::builder()
-                .value(ConditionValue::True)
-                .details(vec![format!("branch has no commits beyond {base_ref}")])
-                .observed_at(observed_at.to_string())
-                .build(),
-            None,
-        );
+    if change_request_id.is_none() {
+        if let BaseComparison::Counted { base_ref, count: 0 } = &comparison {
+            return (
+                IntegrationCondition::builder()
+                    .value(ConditionValue::True)
+                    .details(vec![format!("branch has no commits beyond {base_ref}")])
+                    .observed_at(observed_at.to_string())
+                    .build(),
+                None,
+            );
+        }
     }
-    match runner
-        .run_output(
-            "gh",
-            &["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
-            checkout_path,
-            &ChannelLabel::Noop,
-        )
-        .await
-    {
+    let args = match change_request_id {
+        Some(id) => vec!["pr", "view", id, "--json", "number,state,mergedAt,baseRefName"],
+        None => vec!["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
+    };
+    match runner.run_output("gh", &args, checkout_path, &ChannelLabel::Noop).await {
         Ok(output) if output.success => match serde_json::from_str::<serde_json::Value>(&output.stdout) {
-            Ok(serde_json::Value::Array(items)) => match items.first() {
-                Some(item) => {
-                    let number =
-                        item.get("number").and_then(serde_json::Value::as_i64).map(|number| number.to_string()).unwrap_or_default();
-                    let state = item.get("state").and_then(serde_json::Value::as_str).unwrap_or("unknown");
-                    let merged_at = item.get("mergedAt").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
-                    let target_ref = item.get("baseRefName").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
-                    if state.eq_ignore_ascii_case("MERGED") || state.eq_ignore_ascii_case("CLOSED") || merged_at.is_some() {
-                        let outcome = if state.eq_ignore_ascii_case("CLOSED") && merged_at.is_none() { "closed" } else { "merged" };
-                        (
-                            IntegrationCondition::builder()
-                                .value(ConditionValue::True)
-                                .details(vec![format!("PR #{number} {outcome}")])
-                                .observed_at(observed_at.to_string())
-                                .build(),
-                            Some(
-                                LandedEvidence::builder()
-                                    .change_request_id(number)
-                                    .maybe_merged_at(merged_at.map(str::to_string))
-                                    .maybe_target_ref(if outcome == "merged" { target_ref.map(str::to_string) } else { None })
+            Ok(value) => {
+                let item = match value {
+                    serde_json::Value::Array(items) => items.into_iter().next(),
+                    serde_json::Value::Object(_) => Some(value),
+                    _ => None,
+                };
+                match item {
+                    Some(item) => {
+                        let number =
+                            item.get("number").and_then(serde_json::Value::as_i64).map(|number| number.to_string()).unwrap_or_default();
+                        let state = item.get("state").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+                        let merged_at = item.get("mergedAt").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
+                        let target_ref = item.get("baseRefName").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
+                        if state.eq_ignore_ascii_case("MERGED") || state.eq_ignore_ascii_case("CLOSED") || merged_at.is_some() {
+                            let outcome = if state.eq_ignore_ascii_case("CLOSED") && merged_at.is_none() { "closed" } else { "merged" };
+                            (
+                                IntegrationCondition::builder()
+                                    .value(ConditionValue::True)
+                                    .details(vec![format!("PR #{number} {outcome}")])
+                                    .observed_at(observed_at.to_string())
                                     .build(),
-                            ),
-                        )
-                    } else {
-                        (
-                            IntegrationCondition::builder()
-                                .value(ConditionValue::False)
-                                .details(vec![format!("PR #{number} {state}, not merged")])
-                                .observed_at(observed_at.to_string())
-                                .build(),
-                            None,
-                        )
+                                Some(
+                                    LandedEvidence::builder()
+                                        .change_request_id(number)
+                                        .maybe_merged_at(merged_at.map(str::to_string))
+                                        .maybe_target_ref(if outcome == "merged" { target_ref.map(str::to_string) } else { None })
+                                        .build(),
+                                ),
+                            )
+                        } else {
+                            (
+                                IntegrationCondition::builder()
+                                    .value(ConditionValue::False)
+                                    .details(vec![format!("PR #{number} {state}, not merged")])
+                                    .observed_at(observed_at.to_string())
+                                    .build(),
+                                None,
+                            )
+                        }
                     }
+                    None => (landed_without_change_request(&comparison, observed_at), None),
                 }
-                None => (landed_without_change_request(&comparison, observed_at), None),
-            },
-            Ok(_) | Err(_) => (
+            }
+            Err(_) => (
                 IntegrationCondition::builder()
                     .value(ConditionValue::Unknown)
                     .details(vec!["could not parse gh PR lookup output".to_string()])
@@ -394,7 +408,7 @@ mod tests {
 
     async fn landed_with_responses(responses: Vec<Result<String, String>>) -> IntegrationCondition {
         let runner = MockRunner::new(responses);
-        let (landed, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), "2026-07-27T00:00:00Z").await;
+        let (landed, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, "2026-07-27T00:00:00Z").await;
         landed
     }
 
@@ -429,6 +443,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_change_request_landing_is_keyed_by_id_instead_of_branch() {
+        let runner = MockRunner::new(vec![
+            Ok("0".into()),
+            Ok(r#"{"number":1071,"state":"MERGED","mergedAt":"2026-07-27T12:00:00Z","baseRefName":"main"}"#.into()),
+        ]);
+        let (landed, evidence) =
+            inspect_landed(&runner, Path::new("/checkout"), "renamed-head", Some("main"), Some("1071"), "2026-07-27T00:00:00Z").await;
+
+        assert_eq!(landed.value, ConditionValue::True);
+        assert_eq!(evidence.as_ref().map(|evidence| evidence.change_request_id.as_str()), Some("1071"));
+        assert_eq!(evidence.as_ref().and_then(|evidence| evidence.target_ref.as_deref()), Some("main"));
+        assert_eq!(
+            runner.calls()[1],
+            ("gh".to_string(), vec![
+                "pr".to_string(),
+                "view".to_string(),
+                "1071".to_string(),
+                "--json".to_string(),
+                "number,state,mergedAt,baseRefName".to_string(),
+            ],)
+        );
+    }
+
+    #[tokio::test]
     async fn merged_change_request_is_landed() {
         let landed = landed_with_responses(vec![
             Ok("2".into()),
@@ -441,7 +479,7 @@ mod tests {
     #[tokio::test]
     async fn indeterminate_base_without_change_request_is_unknown() {
         let runner = MockRunner::new(vec![Err("fatal: ambiguous argument".into()), Ok("[]".into())]);
-        let (landed, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", None, "2026-07-27T00:00:00Z").await;
+        let (landed, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", None, None, "2026-07-27T00:00:00Z").await;
         assert_eq!(landed.value, ConditionValue::Unknown);
     }
 }

@@ -752,6 +752,7 @@ impl CheckoutManager for FakeCheckoutManager {
 pub struct FakeChangeRequest {
     pub change_requests: Arc<TokioMutex<Vec<(String, ChangeRequest)>>>,
     pub merged_branches: Arc<TokioMutex<Vec<String>>>,
+    pub admission_base_ref: String,
 }
 
 pub struct FakePresentationManager {
@@ -919,7 +920,11 @@ impl Default for FakeChangeRequest {
 
 impl FakeChangeRequest {
     pub fn new() -> Self {
-        Self { change_requests: Arc::new(TokioMutex::new(Vec::new())), merged_branches: Arc::new(TokioMutex::new(Vec::new())) }
+        Self {
+            change_requests: Arc::new(TokioMutex::new(Vec::new())),
+            merged_branches: Arc::new(TokioMutex::new(Vec::new())),
+            admission_base_ref: "main".to_string(),
+        }
     }
 
     pub async fn add_change_requests(&self, crs: Vec<(String, ChangeRequest)>) {
@@ -937,6 +942,15 @@ impl ChangeRequestTracker for FakeChangeRequest {
     async fn get_change_request(&self, _repo_root: &Path, id: &str) -> Result<(String, ChangeRequest), String> {
         let store = self.change_requests.lock().await;
         store.iter().find(|(cr_id, _)| cr_id == id).cloned().ok_or_else(|| format!("change request {id} not found"))
+    }
+
+    async fn get_change_request_for_admission(
+        &self,
+        repo_root: &Path,
+        id: &str,
+    ) -> Result<super::super::change_request::ChangeRequestAdmission, String> {
+        let (id, change_request) = self.get_change_request(repo_root, id).await?;
+        Ok(super::super::change_request::ChangeRequestAdmission { id, change_request, base_ref: Some(self.admission_base_ref.clone()) })
     }
 
     async fn open_in_browser(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {

@@ -17,15 +17,15 @@ use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key,
     controller::{Actuation, Reconciler},
-    ensure_repository, interactive_single_workflow_spec, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec,
-    Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CrewSource,
-    CrewSpec, CrewWorkPhase, CrewWorkState, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy,
-    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec,
-    PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend, ResourceError, Selector, Stance, TerminalBrief, TerminalCrewContext,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase,
-    VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
-    CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    ensure_repository, interactive_single_workflow_spec, BoundChangeRequest, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus,
+    CheckoutWorktreeSpec, Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
+    ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DockerCheckoutStrategy, DockerEnvironmentSpec,
+    DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta, IssueSnapshot, LifecycleAuthority,
+    ObservedCheckoutSpec, PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend, ResourceError, Selector, Stance, TerminalBrief,
+    TerminalCrewContext, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel,
+    VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
+    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use rstest::rstest;
 
@@ -59,6 +59,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
             issues: Vec::new(),
+            change_request: None,
             instruction: None,
         })
         .await
@@ -205,6 +206,15 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
         .update_status("convoy-shared", &convoy.metadata.resource_version, &status)
         .await
         .expect("second vessel should be recorded");
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    let current = convoys.get("convoy-shared").await.expect("convoy after status update");
+    let mut spec = current.spec.clone();
+    spec.change_request = Some(BoundChangeRequest {
+        id: "1071".to_string(),
+        repository_ref: spec.repositories[0].repo_ref.clone(),
+        title: "Existing PR".to_string(),
+    });
+    convoys.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await.expect("bind change request");
     create_host_direct_policy(&backend, NAMESPACE, "policy-shared", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     let clone_name =
@@ -228,6 +238,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
         .expect("first vessel should create the shared checkout");
     assert_eq!(checkout_meta.name, "checkout-convoy-shared");
     assert_eq!(checkout_meta.labels.get(CONVOY_LABEL).map(String::as_str), Some("convoy-shared"));
+    assert_eq!(checkout_meta.labels.get(CHANGE_REQUEST_ID_LABEL).map(String::as_str), Some("1071"));
     assert!(!checkout_meta.labels.contains_key(VESSEL_REF_LABEL));
 
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
@@ -422,6 +433,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                     },
                 },
             ],
+            change_request: None,
             instruction: Some("Keep the public seam stable.".into()),
         })
         .await
@@ -599,6 +611,7 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
             project_ref: Some("flotilla-suite".to_string()),
             adopted_checkout_refs: BTreeMap::new(),
             issues: Vec::new(),
+            change_request: None,
             instruction: None,
         })
         .await
@@ -754,6 +767,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
             project_ref: Some("flotilla-suite".to_string()),
             adopted_checkout_refs: BTreeMap::new(),
             issues: Vec::new(),
+            change_request: None,
             instruction: None,
         })
         .await
@@ -869,6 +883,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
             project_ref: Some("flotilla-suite".to_string()),
             adopted_checkout_refs: BTreeMap::new(),
             issues: Vec::new(),
+            change_request: None,
             instruction: None,
         })
         .await
@@ -1694,6 +1709,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
                     as_of: "2026-07-22T09:30:00Z".parse().expect("timestamp"),
                 },
             }],
+            change_request: None,
             instruction: None,
         })
         .await
@@ -2092,6 +2108,7 @@ async fn create_convoy_with_labeled_processes(
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
             issues: Vec::new(),
+            change_request: None,
             instruction: None,
         })
         .await

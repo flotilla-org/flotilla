@@ -85,6 +85,22 @@ spec:
                   additionalProperties:
                     type: string
                     minLength: 1
+                change_request:
+                  type: object
+                  required: [id, repository_ref, title]
+                  properties:
+                    id:
+                      type: string
+                      minLength: 1
+                    repository_ref:
+                      type: string
+                      minLength: 1
+                    title:
+                      type: string
+                      minLength: 1
+                  x-kubernetes-validations:
+                    - rule: "self == oldSelf"
+                      message: "change_request is immutable after creation"
                 issue:
                   type: object
                   required: [reference, snapshot]

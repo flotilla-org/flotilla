@@ -388,6 +388,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
             project_ref: Some("flotilla-suite".to_string()),
             adopted_checkout_refs: BTreeMap::new(),
             issues: Vec::new(),
+            change_request: None,
             instruction: None,
         })
         .await

@@ -612,6 +612,7 @@ fn builtin_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
         ("implement-review", flotilla_resources::implement_review_workflow_spec()),
         ("interactive-single", flotilla_resources::interactive_single_workflow_spec()),
         ("single-agent-contained", flotilla_resources::single_agent_contained_workflow_spec()),
+        ("single-agent-shepherd", flotilla_resources::single_agent_shepherd_workflow_spec()),
         ("single-agent-trusted", flotilla_resources::single_agent_trusted_workflow_spec()),
     ]
 }
@@ -1866,7 +1867,13 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
     }
 
     async fn inspect_integration(&self, checkout: &ResourceObject<Checkout>) -> Result<CheckoutIntegrationStatus, String> {
-        Ok(inspect_checkout_integration(&*self.local_runner()?, Path::new(self.checkout_path(checkout)?), &checkout.spec).await)
+        Ok(inspect_checkout_integration(
+            &*self.local_runner()?,
+            Path::new(self.checkout_path(checkout)?),
+            &checkout.spec,
+            checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
+        )
+        .await)
     }
 
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
@@ -3634,6 +3641,19 @@ mod tests {
         assert_eq!(unchanged.metadata.resource_version, labelled.metadata.resource_version);
     }
 
+    #[tokio::test]
+    async fn startup_reconciles_owned_single_agent_shepherd_builtin() {
+        let backend = ResourceBackend::InMemory(Default::default());
+
+        reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("builtin reconciliation should succeed");
+
+        let shepherd =
+            backend.using::<WorkflowTemplate>(NAMESPACE).get("single-agent-shepherd").await.expect("shepherd builtin should exist");
+        assert_eq!(shepherd.spec, flotilla_resources::single_agent_shepherd_workflow_spec());
+        assert_eq!(shepherd.spec.vessels[0].stance, Stance::Trusted);
+        assert_eq!(shepherd.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(BUILTIN_MANAGED_BY_VALUE));
+    }
+
     fn manual_profile(host_id: &str, docker_available: bool) -> LocalProvisioningProfile {
         LocalProvisioningProfile {
             host_id: host_id.to_string(),
@@ -3867,6 +3887,7 @@ mod tests {
                 project_ref: None,
                 adopted_checkout_refs: BTreeMap::new(),
                 issues: Vec::new(),
+                change_request: None,
                 instruction: None,
             })
             .await

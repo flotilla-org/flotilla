@@ -21,6 +21,7 @@ pub const DEFAULT_CREW_BRIEF_TEMPLATE: &str = "crew.md";
 const BUILTIN_CREW_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/crew.md");
 const BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/interactive-session.md");
 const BUILTIN_DIFF_REVIEW_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/diff-review.md");
+const BUILTIN_SHEPHERD_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/shepherd.md");
 const BUILTIN_FORK_STANCE_BRIEF_LAYER: &str = include_str!("agent_adapter/templates/fork-stance.md");
 const BRIEF_TEMPLATE_DIR: &str = "brief-templates";
 
@@ -51,6 +52,9 @@ pub enum CrewAssignment<'a> {
     /// The convoy carries issue snapshots appended below the brief; those issues
     /// are the assignment.
     CarriedIssue,
+    /// The convoy carries an explicitly bound change request in its work
+    /// context; that request is the assignment.
+    CarriedChangeRequest,
     /// Nothing was provided.
     Unassigned,
 }
@@ -85,6 +89,7 @@ impl CrewBriefTemplateResolver {
         let override_filename = match template {
             "interactive-session" => "interactive-session.md",
             "diff-review" => "diff-review.md",
+            "shepherd" => "shepherd.md",
             other => other,
         };
         let mut overrides = Vec::new();
@@ -165,6 +170,8 @@ pub fn build_crew_brief_with_options(
         CrewAssignment::Prompt(prompt) => prompt,
         CrewAssignment::CarriedIssue =>
             "Your assignment is the issue snapshot section below. Its body is the contract: work it to completion and deliver as described above.",
+        CrewAssignment::CarriedChangeRequest =>
+            "Your assignment is the bound pull request in the work context below. Work that pull request to the completion standard described above.",
         CrewAssignment::Unassigned =>
             "No assignment was provided with this dispatch. Check `## Human instruction` below if present; otherwise report via `flotilla crew fail` rather than inventing work.",
     };
@@ -191,11 +198,14 @@ fn render_crew_brief_template(options: &CrewBriefRenderOptions, context: &CrewBr
         .map_err(|err| format!("load built-in interactive-session brief template: {err}"))?;
     env.add_template(BUILTIN_DIFF_REVIEW_BRIEF_TEMPLATE_NAME, BUILTIN_DIFF_REVIEW_BRIEF_TEMPLATE)
         .map_err(|err| format!("load built-in diff-review brief template: {err}"))?;
+    env.add_template(BUILTIN_SHEPHERD_BRIEF_TEMPLATE_NAME, BUILTIN_SHEPHERD_BRIEF_TEMPLATE)
+        .map_err(|err| format!("load built-in shepherd brief template: {err}"))?;
     let mut skip_overrides = 0;
     let mut current_template = match options.template.as_str() {
         DEFAULT_CREW_BRIEF_TEMPLATE => BUILTIN_CREW_BRIEF_TEMPLATE_NAME.to_string(),
         "interactive-session" | "interactive-session.md" => BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE_NAME.to_string(),
         "diff-review" | "diff-review.md" => BUILTIN_DIFF_REVIEW_BRIEF_TEMPLATE_NAME.to_string(),
+        "shepherd" | "shepherd.md" => BUILTIN_SHEPHERD_BRIEF_TEMPLATE_NAME.to_string(),
         custom if !options.overrides.is_empty() => {
             let first = &options.overrides[0];
             if is_block_only_override(&first.source) {
@@ -231,6 +241,7 @@ fn render_crew_brief_template(options: &CrewBriefRenderOptions, context: &CrewBr
 const BUILTIN_CREW_BRIEF_TEMPLATE_NAME: &str = "builtin/crew.md";
 const BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE_NAME: &str = "builtin/interactive-session.md";
 const BUILTIN_DIFF_REVIEW_BRIEF_TEMPLATE_NAME: &str = "builtin/diff-review.md";
+const BUILTIN_SHEPHERD_BRIEF_TEMPLATE_NAME: &str = "builtin/shepherd.md";
 
 fn layered_override_source(parent: &str, source: &str) -> String {
     if !is_block_only_override(source) {
@@ -263,6 +274,12 @@ pub fn append_convoy_work_context(
     content.push_str("- Repositories:\n");
     for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
         content.push_str(&format!("  - `{}` — {} (target `{}`)\n", repository.repo_ref, repository.url, repository.target_ref));
+    }
+    if let Some(change_request) = &convoy.spec.change_request {
+        content.push_str(&format!(
+            "- Bound pull request: `#{}` — {} (`{}`)\n",
+            change_request.id, change_request.title, change_request.repository_ref
+        ));
     }
     if !convoy.spec.issues.is_empty() {
         let header = if convoy.spec.issues.len() == 1 { "Issue snapshot" } else { "Issue snapshots" };
@@ -794,6 +811,32 @@ mod tests {
     }
 
     #[test]
+    fn shepherd_template_processes_exactly_one_round_and_yields() {
+        let brief = build_crew_brief_with_options(
+            &TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "adopt-1071".to_string(),
+                vessel_ref: "adopt-1071-work".to_string(),
+            },
+            "work",
+            "shepherd",
+            CrewAssignment::Unassigned,
+            &[CrewBriefMember { role: "shepherd".to_string(), state: "active".to_string(), is_agent: true }],
+            &CrewBriefRenderOptions { template: "shepherd".to_string(), overrides: Vec::new(), fork_stance: false },
+        )
+        .expect("render shepherd brief")
+        .content;
+
+        assert!(brief.contains("exactly one review and CI round"));
+        assert!(brief.contains("Finish, don't redo"));
+        assert!(brief.contains("`pr-shepherd` skill"));
+        assert!(brief.contains("Future events belong to a later engagement"));
+        assert!(brief.contains("flotilla crew complete --message '<PR URL>'"));
+        assert!(!brief.contains("wait-for-checks"));
+        assert!(!brief.contains("No assignment was provided"));
+    }
+
+    #[test]
     fn extensionless_interactive_template_uses_markdown_override_filename() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -889,6 +932,13 @@ mod tests {
     }
 
     #[test]
+    fn carried_change_request_assignment_points_at_the_bound_pr() {
+        let content = brief_for(CrewAssignment::CarriedChangeRequest);
+        assert!(content.contains("Your assignment is the bound pull request in the work context below."));
+        assert!(!content.contains("No assignment was provided"));
+    }
+
+    #[test]
     fn convoy_work_context_separates_multiple_issue_snapshots() {
         let repo_ref = RepositoryKey("repo_widgets".to_string());
         let source = IssueSource { service: "https://github.com".to_string(), scope: "flotilla-org/flotilla".to_string() };
@@ -933,6 +983,11 @@ mod tests {
                 project_ref: None,
                 adopted_checkout_refs: BTreeMap::new(),
                 issues: vec![issue("809", "First issue", "First issue body."), issue("810", "Second issue", "Second issue body.")],
+                change_request: Some(flotilla_resources::BoundChangeRequest {
+                    id: "1071".to_string(),
+                    repository_ref: repo_ref.clone(),
+                    title: "Existing pull request".to_string(),
+                }),
                 instruction: None,
             },
             status: None,
@@ -941,6 +996,7 @@ mod tests {
         append_convoy_work_context(&mut content, &convoy, &[repo_ref]);
 
         assert!(content.contains("- `repo_widgets` — https://github.com/flotilla-org/flotilla (target `main`)"));
+        assert!(content.contains("- Bound pull request: `#1071` — Existing pull request (`repo_widgets`)"));
         assert!(content.contains("First issue body.\n\nSource-qualified reference: `https://github.com` / `flotilla-org/flotilla` / `810`"));
     }
 

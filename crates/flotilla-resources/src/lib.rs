@@ -44,9 +44,9 @@ pub use clock::{Clock, SystemClock};
 pub use clone::{Clone, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use convoy::{
     controller_patches, external_patches, pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending, provisioning_patches,
-    reconcile, Convoy, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
-    ConvoyStatusPatch, ConvoyTeardownRuntime, CrewWorkPhase, CrewWorkState, InputValue, IssueSnapshot, PlacementStatus, ReconcileOutcome,
-    TargetMismatch, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION,
+    reconcile, BoundChangeRequest, Convoy, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec,
+    ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewWorkPhase, CrewWorkState, InputValue, IssueSnapshot, PlacementStatus,
+    ReconcileOutcome, TargetMismatch, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION,
     PREPARED_SNAPSHOT_PENDING_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use credential::{
@@ -68,8 +68,8 @@ pub use host::{
 pub use http::{ensure_crd, ensure_namespace, HttpBackend};
 pub use in_memory::InMemoryBackend;
 pub use labels::{
-    LifecycleAuthority, AUTHORITY_LABEL, CONVOY_LABEL, CREW_ORDINAL_LABEL, MANAGED_BY_LABEL, REPO_KEY_LABEL, REPO_LABEL, RESERVED_PREFIX,
-    ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    LifecycleAuthority, AUTHORITY_LABEL, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREW_ORDINAL_LABEL, MANAGED_BY_LABEL, REPO_KEY_LABEL,
+    REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 pub use placement_policy::{
     DockerCheckoutStrategy, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout,
@@ -141,6 +141,7 @@ macro_rules! for_each_registered_resource {
 }
 pub use workflow_template::{
     implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_contained_workflow_spec,
-    single_agent_trusted_workflow_spec, validate, CrewSource, CrewSpec, InputDefinition, InterpolationField, InterpolationLocation,
-    Selector, Stance, ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    single_agent_shepherd_workflow_spec, single_agent_trusted_workflow_spec, validate, CrewSource, CrewSpec, InputDefinition,
+    InterpolationField, InterpolationLocation, Selector, Stance, ValidationError, VesselRequirement, WorkflowTemplate,
+    WorkflowTemplateSpec,
 };
