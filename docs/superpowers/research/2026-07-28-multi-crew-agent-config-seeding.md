@@ -772,6 +772,16 @@ not preemptively). Per-crew homes remain an available *option* for the rare
 case of two same-CLI crew members needing divergent persistent config, not
 the default.
 
+**What one `$HOME` actually costs, graded (closing the question):** (1) two
+crews needing *different login-file identities on the same provider* — the only
+binding case, dissolved by per-process ambient env keys, and not a case we
+have; (2) deep persistent settings divergence for one CLI — served per-process
+by flags/env overrides; (3) write races on shared state — empirically absent
+at desk-machine scale (dozens of concurrent sessions daily); (4) session
+resume — already per-session-id. Conclusion: for trusted cohabiting crews, one
+`$HOME` has no real cost, and the per-crew-home machinery solved a
+multi-tenant problem this system does not have.
+
 The original per-crew layout is retained below for reference.
 
 ## Recommended container layout
