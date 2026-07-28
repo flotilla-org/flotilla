@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, retention::ResourceStoreDiagnostics, status_patch::StatusPatch, ReplicationClass};
+use crate::{
+    checkout::ConditionValue, resource::define_resource, retention::ResourceStoreDiagnostics, status_patch::StatusPatch, ReplicationClass,
+};
 
 define_resource!(Host, "hosts", HostSpec, HostStatus, HostStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
 
@@ -36,6 +38,9 @@ pub struct HostStatus {
     pub daemon_started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub conditions: Vec<HostCondition>,
 }
 
 impl HostStatus {
@@ -49,10 +54,30 @@ impl HostStatus {
 
     pub fn apply_heartbeat_readiness(&mut self, now: DateTime<Utc>) {
         self.ready = self.ready
+            && !self.is_degraded()
             && self
                 .heartbeat_at
                 .is_some_and(|heartbeat_at| now.signed_duration_since(heartbeat_at) <= chrono::Duration::seconds(HEARTBEAT_READY_TTL_SECS));
     }
+
+    pub fn is_degraded(&self) -> bool {
+        self.conditions.iter().any(|condition| condition.value == ConditionValue::False)
+    }
+}
+
+/// A daemon-owned liveness invariant published on its [`Host`] resource.
+///
+/// `True` means the named subsystem is healthy; `False` makes the host
+/// degraded and unavailable for placement until a later observation clears it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct HostCondition {
+    #[serde(rename = "type")]
+    pub condition_type: String,
+    pub value: ConditionValue,
+    pub reason: String,
+    pub message: String,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,5 +114,33 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 status.disk_free_bytes = *disk_free_bytes;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_host_condition_makes_fresh_heartbeat_not_ready() {
+        let now = Utc::now();
+        let mut status = HostStatus {
+            heartbeat_at: Some(now),
+            ready: true,
+            conditions: vec![HostCondition::builder()
+                .condition_type("Controller/checkout")
+                .value(ConditionValue::False)
+                .reason("RestartBudgetExhausted")
+                .message("checkout controller stopped")
+                .observed_at(now)
+                .build()],
+            ..HostStatus::default()
+        };
+
+        status.apply_heartbeat_readiness(now);
+
+        assert!(!status.ready);
+        let encoded = serde_json::to_value(&status).expect("serialize host status");
+        assert_eq!(encoded["conditions"][0]["type"], "Controller/checkout");
     }
 }

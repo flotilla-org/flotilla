@@ -20,18 +20,18 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer,
-    CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
-    CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment,
-    EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, LifecycleAuthority,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
-    ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus, Selector, Stance, TerminalBrief, TerminalCrewContext,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase,
-    VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL,
-    VESSEL_REF_LABEL,
+    CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
+    CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
+    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase,
+    CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost, HostCondition,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
+    ProjectRepositorySpec, ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus, Selector, Stance,
+    TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
+    Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -1958,6 +1958,13 @@ async fn fleet_health_keeps_link_heartbeat_and_generation_disagreements_visible(
             daemon_version: Some("0.9.0".to_string()),
             daemon_started_at: Some(Utc::now() - ChronoDuration::hours(2)),
             disk_free_bytes: Some(42 * 1024 * 1024 * 1024),
+            conditions: vec![HostCondition::builder()
+                .condition_type("Controller/checkout")
+                .value(ConditionValue::False)
+                .reason("RestartBudgetExhausted")
+                .message("checkout controller stopped after 10 consecutive failures")
+                .observed_at(Utc::now())
+                .build()],
             ..HostStatus::default()
         })
         .await
@@ -2005,6 +2012,7 @@ async fn fleet_health_keeps_link_heartbeat_and_generation_disagreements_visible(
     assert_eq!(feta.convoy_count, 1);
     assert_eq!(feta.staleness, FleetHostStaleness::Stale);
     assert_eq!(feta.observation_agreement, FleetObservationAgreement::Disagree);
+    assert_eq!(feta.degraded_conditions, vec!["Controller/checkout: checkout controller stopped after 10 consecutive failures"]);
 
     let udder = response.hosts.iter().find(|row| row.host == HostName::new("udder")).expect("unreachable configured host row");
     assert_eq!(udder.link, PeerConnectionState::Disconnected);

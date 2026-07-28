@@ -46,8 +46,8 @@ use flotilla_resources::{
     ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, REPO_KEY_LABEL,
-    REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -3395,9 +3395,7 @@ async fn ensure_default_workflows(backend: &ResourceBackend, namespace: &str) ->
 }
 
 fn prepared_snapshot_name(kind: &str, spec: &serde_json::Value) -> Result<String, String> {
-    let encoded = serde_json::to_vec(spec).map_err(|error| error.to_string())?;
-    let digest = Sha256::digest(encoded);
-    let suffix = digest[..6].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let suffix = flotilla_resources::content_hash(spec).map_err(|error| error.to_string())?;
     Ok(format!("{kind}-snapshot-{suffix}"))
 }
 
@@ -3505,6 +3503,48 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
         issue_source: None,
         repositories: vec![ProjectRepositorySpec { repo: repository_key, subpath: None, default_branch: None }],
     })
+}
+
+const WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE: &str = "whole-repository-project";
+
+fn whole_repository_project_meta(name: impl Into<String>) -> InputMeta {
+    InputMeta::builder()
+        .name(name.into())
+        .labels(BTreeMap::from([(MANAGED_BY_LABEL.to_string(), WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE.to_string())]))
+        .build()
+}
+
+/// Converges the fields owned by the whole-repository generator while leaving
+/// user-owned presentation and issue-routing fields intact.
+async fn reconcile_whole_repository_project_definition(
+    projects: &flotilla_resources::DefinitionResolver<Project>,
+    existing: ResourceObject<Project>,
+    generated: &ProjectSpec,
+) -> Result<ResourceObject<Project>, String> {
+    let generator_fields_diverged =
+        existing.spec.default_workflow_ref != generated.default_workflow_ref || existing.spec.repositories != generated.repositories;
+    let managed_by_generator =
+        existing.metadata.labels.get(MANAGED_BY_LABEL).is_some_and(|value| value == WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE);
+    if !generator_fields_diverged && managed_by_generator {
+        return Ok(existing);
+    }
+
+    let mut reconciled_spec = existing.spec.clone();
+    reconciled_spec.default_workflow_ref.clone_from(&generated.default_workflow_ref);
+    reconciled_spec.repositories.clone_from(&generated.repositories);
+    let mut meta = InputMeta::from(&existing.metadata);
+    meta.labels.insert(MANAGED_BY_LABEL.to_string(), WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE.to_string());
+    let reconciled = projects
+        .apply(&meta, &reconciled_spec)
+        .await
+        .map_err(|error| format!("reconcile generated whole-repository Project {}: {error}", existing.metadata.name))?;
+    if generator_fields_diverged {
+        warn!(
+            project = %existing.metadata.name,
+            "stored generator-owned whole-repository Project fields diverged; overwriting"
+        );
+    }
+    Ok(reconciled)
 }
 
 fn is_whole_repository_project(spec: &ProjectSpec, repository_key: &RepositoryKey) -> bool {
@@ -4554,7 +4594,7 @@ impl InProcessDaemon {
 
         ensure_repository_and_default_project_workflow(&self.resource_backend, &namespace, &key, &repository_spec).await?;
         if let Some(checkout) = checkout {
-            self.ensure_project_checkout(&namespace, &key, &repository_spec, checkout).await?;
+            self.reconcile_project_checkouts(&namespace, &key, &repository_spec, checkout).await?;
         }
 
         let default_name = normalize_project_name(&repository_spec.leaf_slug())?;
@@ -4572,6 +4612,8 @@ impl InProcessDaemon {
                         existing.spec.display_name
                     ));
                 }
+                let generated = whole_repository_project_spec(key, existing.spec.display_name.clone())?;
+                reconcile_whole_repository_project_definition(&projects, existing, &generated).await?;
                 return Ok(project_name);
             }
             Err(ResourceError::NotFound { .. }) => {}
@@ -4579,7 +4621,7 @@ impl InProcessDaemon {
         }
 
         let spec = whole_repository_project_spec(key, explicit_display_name.map(str::to_string).unwrap_or(default_name))?;
-        projects.apply(&InputMeta::builder().name(project_name.clone()).build(), &spec).await.map_err(|error| error.to_string())?;
+        projects.apply(&whole_repository_project_meta(project_name.clone()), &spec).await.map_err(|error| error.to_string())?;
         Ok(project_name)
     }
 
@@ -4591,6 +4633,7 @@ impl InProcessDaemon {
         let repository_spec = &inspection.spec;
         let repository_key = repository_spec.key();
         ensure_repository_and_default_project_workflow(&self.resource_backend, &namespace, &repository_key, repository_spec).await?;
+        self.reconcile_project_checkouts(&namespace, &repository_key, repository_spec, inspection.checkout.clone()).await?;
         let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
         let stored = repositories.get(&repository_key.to_string()).await.map_err(|error| error.to_string())?;
         if stored.spec != *repository_spec {
@@ -4692,6 +4735,11 @@ impl InProcessDaemon {
             })
             .map(|project| project.metadata.name.clone());
         if let Some(primary_name) = &primary_name {
+            let primary = project_objects
+                .iter_mut()
+                .find(|project| project.metadata.name == *primary_name)
+                .expect("selected primary Project should remain in the listed objects");
+            *primary = reconcile_whole_repository_project_definition(&projects, primary.clone(), &spec).await?;
             for duplicate in project_objects.iter().filter(|project| {
                 project.metadata.name != *primary_name
                     && generated_names.contains(&project.metadata.name)
@@ -4744,11 +4792,12 @@ impl InProcessDaemon {
         }
 
         for project_name in whole_repository_project_names(repository_spec)? {
-            match projects.create(&InputMeta::builder().name(project_name.clone()).build(), &spec).await {
+            match projects.create(&whole_repository_project_meta(project_name.clone()), &spec).await {
                 Ok(_) => return Ok(identity_change),
                 Err(ResourceError::Conflict { .. }) => {
                     let existing = projects.get(&project_name).await.map_err(|error| error.to_string())?;
                     if is_whole_repository_project(&existing.spec, &repository_key) {
+                        reconcile_whole_repository_project_definition(&projects, existing, &spec).await?;
                         return Ok(identity_change);
                     }
                 }
@@ -4795,59 +4844,40 @@ impl InProcessDaemon {
         Ok(())
     }
 
-    async fn ensure_project_checkout(
+    async fn reconcile_project_checkouts(
         &self,
         namespace: &str,
         repository_key: &RepositoryKey,
         repository_spec: &RepositorySpec,
         checkout: crate::repository_inspection::LocalCheckoutInspection,
     ) -> Result<(), String> {
-        let checkouts = self.observed_resource_backend.clone().using::<ResourceCheckout>(namespace);
-        let checkout_name = format!(
-            "checkout-{}",
-            flotilla_resources::repo_key(&format!("{}\0{}\0{}", repository_key, checkout.host_ref, checkout.path.display()))
-        );
-        let spec = ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-            r#ref: checkout.git_ref,
-            path: checkout.path.to_string_lossy().into_owned(),
-            repo_ref: repository_key.clone(),
-            host_ref: checkout.host_ref,
-            is_main: checkout.is_main,
-        });
-        let meta = InputMeta::builder()
-            .name(checkout_name.clone())
-            .labels(BTreeMap::from([
-                (REPO_KEY_LABEL.to_string(), repository_key.to_string()),
-                (REPO_LABEL.to_string(), repository_spec.catalog_slug()),
-            ]))
-            .build()
-            .with_lifecycle_authority(LifecycleAuthority::Observed);
-        let stored = match checkouts.create(&meta, &spec).await {
-            Ok(created) => created,
-            Err(ResourceError::Conflict { .. }) => {
-                let existing = checkouts.get(&checkout_name).await.map_err(|error| error.to_string())?;
-                if existing.spec != spec {
-                    return Err(format!("checkout {checkout_name} already exists with a different observation"));
-                }
-                existing
-            }
-            Err(error) => return Err(error.to_string()),
-        };
-        checkouts
-            .update_status(&checkout_name, &stored.metadata.resource_version, &ResourceCheckoutStatus {
-                phase: ResourceCheckoutPhase::Ready,
-                path: spec.target_path().map(str::to_string).or_else(|| match &spec {
-                    ResourceCheckoutSpec::Observed(observed) => Some(observed.path.clone()),
-                    _ => None,
-                }),
-                commit: None,
-                branch_provenance: Default::default(),
-                integration: Default::default(),
-                message: None,
-            })
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        let inspection = RepositoryInspection { spec: repository_spec.clone(), checkout, transport_url: None };
+        let inspector = self.repository_inspector().await?;
+        let mut providers = ProviderData::default();
+        for checkout in inspector.inspect_checkouts(&inspection).await? {
+            providers.checkouts.insert(QualifiedPath::host(HostId::new(checkout.host_ref), checkout.path), flotilla_protocol::Checkout {
+                branch: checkout.git_ref,
+                is_main: checkout.is_main,
+                trunk_ahead_behind: None,
+                remote_ahead_behind: None,
+                working_tree: None,
+                last_commit: None,
+                correlation_keys: Vec::new(),
+                association_keys: Vec::new(),
+                host_name: None,
+                environment_id: None,
+            });
+        }
+        crate::observed_resources::reconcile_checkouts(
+            &self.observed_resource_backend,
+            namespace,
+            repository_key,
+            &repository_spec.catalog_slug(),
+            &providers,
+            &inspection.checkout.host_ref,
+        )
+        .await
+        .map_err(|error| error.to_string())
     }
 
     pub async fn refresh(&self, repo: &flotilla_protocol::RepoSelector) -> Result<Option<RepositoryIdentityChange>, String> {
@@ -5364,6 +5394,12 @@ impl InProcessDaemon {
                 is_local,
             );
             let (crew_count, convoys) = counts.remove(&host).unwrap_or_default();
+            let degraded_conditions = status
+                .into_iter()
+                .flat_map(|status| status.conditions.iter())
+                .filter(|condition| condition.value == ConditionValue::False)
+                .map(|condition| format!("{}: {}", condition.condition_type, condition.message))
+                .collect();
 
             rows.push(
                 FleetHostRow::builder()
@@ -5384,6 +5420,7 @@ impl InProcessDaemon {
                     .maybe_disk_free_bytes(status.and_then(|status| status.disk_free_bytes))
                     .staleness(staleness)
                     .observation_agreement(observation_agreement)
+                    .degraded_conditions(degraded_conditions)
                     .build(),
             );
         }
@@ -7546,8 +7583,13 @@ impl InProcessDaemon {
             let result = match validate_project_name(name).and_then(|_| parse_project_yaml(spec_yaml)) {
                 Ok(spec) => match normalize_project_spec(spec) {
                     Ok(spec) => {
-                        let meta = InputMeta::builder().name(name.clone()).build();
-                        let outcome = projects.apply(&meta, &spec).await.map(|_| ());
+                        let outcome = match projects.get(name).await {
+                            Ok(existing) => projects.apply(&InputMeta::from(&existing.metadata), &spec).await.map(|_| ()),
+                            Err(ResourceError::NotFound { .. }) => {
+                                projects.apply(&InputMeta::builder().name(name.clone()).build(), &spec).await.map(|_| ())
+                            }
+                            Err(error) => Err(error),
+                        };
                         match outcome {
                             Ok(()) => flotilla_protocol::CommandValue::ProjectApplied { name: name.clone() },
                             Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },

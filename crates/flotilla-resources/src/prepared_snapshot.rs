@@ -1,5 +1,8 @@
 use std::collections::BTreeSet;
 
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
 use crate::{
     Convoy, InputMeta, PlacementPolicy, ResourceBackend, ResourceError, WorkflowTemplate, PLACEMENT_SNAPSHOT_ANNOTATION,
     PREPARED_SNAPSHOT_PENDING_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
@@ -8,6 +11,14 @@ use crate::{
 pub const PREPARED_SNAPSHOT_LABEL: &str = "flotilla.work/prepared-snapshot";
 pub const WORKFLOW_SNAPSHOT_KIND: &str = "workflow";
 pub const PLACEMENT_SNAPSHOT_KIND: &str = "placement";
+
+/// The short, stable JSON content digest used by prepared snapshots and
+/// last-applied manifest annotations.
+pub fn content_hash(value: &Value) -> Result<String, ResourceError> {
+    let encoded = serde_json::to_vec(value).map_err(|error| ResourceError::decode(format!("encode content for digest: {error}")))?;
+    let digest = Sha256::digest(encoded);
+    Ok(digest[..6].iter().map(|byte| format!("{byte:02x}")).collect())
+}
 
 #[derive(Debug, Clone)]
 pub struct PreparedSnapshotGarbageCollector {

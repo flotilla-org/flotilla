@@ -99,6 +99,27 @@ flotilla logs --host feta --since 2h --level warn --target flotilla_daemon::peer
 
 Output remains JSONL so it can be piped directly to `jq`.
 
+## Resource manifests
+
+A daemon can continuously apply a directory of JSON and YAML resource
+documents as additive desired state:
+
+```toml
+[manifests]
+dir = "/home/alice/dev/project-map/flotilla"
+```
+
+Each file contains one or more full resource envelopes (`apiVersion`, `kind`,
+`metadata`, and `spec`). The daemon labels created objects as managed by the
+manifest reconciler and records the relative source path and last-applied spec
+digest. It fast-forwards a changed manifest only while the live spec still
+matches that digest; live drift and collisions with unmanaged objects are
+reported and left untouched.
+
+This first manifest-reconciliation slice is deliberately additive: removing a
+file does not delete its object, and existing unmanaged objects are never
+adopted. Omit `[manifests]` to disable the loop.
+
 ## Dependencies
 
 Flotilla auto-detects available tools. Nothing is strictly required beyond git, but more tools unlock more features.

@@ -97,6 +97,42 @@ impl Reconciler for RecordingReconciler {
 }
 
 #[derive(Clone)]
+struct FailingObjectReconciler {
+    failed_name: String,
+    reconciled: Arc<Mutex<Vec<String>>>,
+}
+
+impl Reconciler for FailingObjectReconciler {
+    type Resource = PrimaryResource;
+    type Dependencies = ();
+
+    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Dependencies,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
+        ReconcileOutcome::new(None)
+    }
+
+    async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        if obj.metadata.name == self.failed_name {
+            return Err(ResourceError::other("object-specific teardown failure"));
+        }
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        Some("flotilla.work/test-finalizer")
+    }
+}
+
+#[derive(Clone)]
 struct FinalizingReconciler {
     finalized: Arc<Mutex<Vec<String>>>,
 }
@@ -760,6 +796,48 @@ async fn duplicate_secondary_events_for_the_same_primary_are_deduped_per_burst()
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(reconciled.lock().expect("reconciled lock").as_slice(), &["alpha".to_string()]);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn finalizer_failure_does_not_stop_other_objects_from_reconciling() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let failing_meta = resource_meta()
+        .name("alpha-failing")
+        .finalizers(vec!["flotilla.work/test-finalizer".to_string()])
+        .deletion_timestamp(chrono::Utc::now())
+        .call();
+    primaries.create(&failing_meta, &PrimarySpec { value: "one".to_string() }).await.expect("failing primary create should succeed");
+    primaries
+        .create(&primary_meta("beta-healthy"), &PrimarySpec { value: "two".to_string() })
+        .await
+        .expect("healthy primary create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: FailingObjectReconciler { failed_name: "alpha-failing".to_string(), reconciled: Arc::clone(&reconciled) },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").contains(&"beta-healthy".to_string()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("healthy primary should reconcile despite another object's permanent failure");
 
     harness.shutdown().await;
 }

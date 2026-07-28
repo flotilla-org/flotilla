@@ -31,14 +31,14 @@ use flotilla_core::{
         ChannelLabel, CommandRunner,
     },
 };
-use flotilla_protocol::{EnvironmentId, HostSummary, ImageId, TerminalStatus};
+use flotilla_protocol::{EnvironmentId, HostSummary, ImageId, Rows, TerminalStatus};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance,
-    CheckoutIntegrationStatus, Clone, CloneSpec, Convoy, ConvoyReconciler, ConvoyTeardownRuntime, CrewSource, CrewSpec, Demand,
-    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host,
+    CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy, ConvoyReconciler, ConvoyTeardownRuntime, CrewSource, CrewSpec,
+    Demand, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host, HostCondition,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
     InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend, ResourceError,
-    ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
     AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
 };
 use serde_json::json;
@@ -47,8 +47,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     credential::CredentialStore,
+    resource_manifest::ResourceManifestReconciler,
     sleep_inhibitor,
-    supervisor::{supervise, ControllerSupervision},
+    supervisor::{supervise, ControllerSupervision, RestartBudgetExhausted},
     Aggregator, AggregatorResolvers,
 };
 
@@ -56,6 +57,7 @@ use crate::{
 /// enough to be quiet in a healthy log, short enough to bound how much time a
 /// wedge can hide in.
 const LIVENESS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+const MANIFEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 const BUILTIN_MANAGED_BY_VALUE: &str = "builtin";
@@ -166,6 +168,45 @@ struct DaemonHealthIdentity {
     started_at: chrono::DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RuntimeHealth {
+    failures: Arc<StdMutex<BTreeMap<String, HostCondition>>>,
+}
+
+impl RuntimeHealth {
+    fn report_restart_budget_exhausted(&self, exhausted: RestartBudgetExhausted) {
+        let condition_type = format!("Controller/{}", exhausted.controller);
+        let condition = HostCondition::builder()
+            .condition_type(condition_type.clone())
+            .value(ConditionValue::False)
+            .reason("RestartBudgetExhausted")
+            .message(format!(
+                "{} controller stopped after {} consecutive failures: {}",
+                exhausted.controller, exhausted.attempts, exhausted.error
+            ))
+            .observed_at(Utc::now())
+            .build();
+        self.failures.lock().expect("runtime health lock poisoned").insert(condition_type, condition);
+    }
+
+    fn report_projection_parity(&self, condition: Option<HostCondition>) {
+        const CONDITION_TYPE: &str = "ProjectionParity";
+        let mut failures = self.failures.lock().expect("runtime health lock poisoned");
+        match condition {
+            Some(condition) => {
+                failures.insert(CONDITION_TYPE.to_string(), condition);
+            }
+            None => {
+                failures.remove(CONDITION_TYPE);
+            }
+        }
+    }
+
+    fn conditions(&self) -> Vec<HostCondition> {
+        self.failures.lock().expect("runtime health lock poisoned").values().cloned().collect()
+    }
+}
+
 #[cfg(test)]
 fn test_health_identity() -> DaemonHealthIdentity {
     DaemonHealthIdentity {
@@ -195,6 +236,7 @@ impl DaemonRuntime {
         }
         daemon.set_provisioning_namespace(options.namespace.clone()).await;
         let aggregator_projection_state = daemon.aggregator_projection_state().await;
+        let manifests = config.load_daemon_config()?.manifests;
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
@@ -218,12 +260,14 @@ impl DaemonRuntime {
             started_at: Utc::now(),
         };
         daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools).await;
+        let runtime_health = RuntimeHealth::default();
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
         flotilla_resources::PreparedSnapshotGarbageCollector::new(daemon.resource_backend(), &options.namespace)
             .recover_pending_claims()
             .await
             .map_err(|error| format!("recover prepared convoy admissions: {error}"))?;
-        apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health).await?;
+        apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health)
+            .await?;
         if let Err(error) = daemon.reconcile_adopted_checkouts(&options.namespace).await {
             warn!(%error, "failed to restore adopted checkout observations during startup; periodic reconciliation will retry");
         }
@@ -235,18 +279,42 @@ impl DaemonRuntime {
                 profile.clone(),
                 Arc::new(Some(Arc::clone(&credential_store))),
                 health,
+                runtime_health.clone(),
                 options.heartbeat_interval,
             ),
             spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
             spawn_adopted_checkout_reconciliation_task(Arc::clone(&daemon), options.namespace.clone(), options.controller_resync_interval),
-            spawn_sleep_inhibitor_task(daemon.resource_backend(), options.namespace.clone(), options.controller_supervision.clone()),
+            spawn_projection_parity_task(
+                daemon.resource_backend(),
+                options.namespace.clone(),
+                aggregator_projection_state.clone(),
+                runtime_health.clone(),
+                options.heartbeat_interval,
+            ),
+            spawn_sleep_inhibitor_task(
+                daemon.resource_backend(),
+                options.namespace.clone(),
+                options.controller_supervision.clone(),
+                runtime_health.clone(),
+            ),
             spawn_aggregator_task(
                 Arc::clone(&daemon),
                 options.namespace.clone(),
                 aggregator_projection_state,
                 options.controller_supervision.clone(),
+                runtime_health.clone(),
             ),
         ];
+        if let Some(manifests) = manifests {
+            tasks.push(spawn_manifest_reconciler_task(
+                daemon.resource_backend(),
+                options.namespace.clone(),
+                manifests.dir,
+                MANIFEST_RECONCILE_INTERVAL,
+                options.controller_supervision.clone(),
+                runtime_health.clone(),
+            ));
+        }
 
         if options.start_controllers {
             let local_repo_root = daemon.tracked_repo_paths().await.into_iter().next().map(ExecutionEnvironmentPath::new);
@@ -267,6 +335,7 @@ impl DaemonRuntime {
                 &options.namespace,
                 options.controller_resync_interval,
                 options.controller_supervision.clone(),
+                runtime_health,
             ));
         }
 
@@ -277,6 +346,23 @@ impl DaemonRuntime {
 
         Ok(Self { tasks, stop_expected: false })
     }
+}
+
+fn spawn_manifest_reconciler_task(
+    backend: ResourceBackend,
+    namespace: String,
+    root: PathBuf,
+    interval: Duration,
+    supervision: ControllerSupervision,
+    runtime_health: RuntimeHealth,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        supervise_controller("manifest", supervision, runtime_health, move || {
+            let reconciler = ResourceManifestReconciler::new(backend.clone(), namespace.clone(), root.clone());
+            async move { reconciler.run(interval).await }
+        })
+        .await;
+    })
 }
 
 impl DaemonRuntime {
@@ -695,9 +781,24 @@ async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, pro
     Ok(())
 }
 
-fn spawn_sleep_inhibitor_task(backend: ResourceBackend, namespace: String, supervision: ControllerSupervision) -> JoinHandle<()> {
+async fn supervise_controller<F, Fut>(name: &'static str, supervision: ControllerSupervision, runtime_health: RuntimeHealth, make_run: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), ResourceError>>,
+{
+    if let Err(exhausted) = supervise(name, supervision, make_run).await {
+        runtime_health.report_restart_budget_exhausted(exhausted);
+    }
+}
+
+fn spawn_sleep_inhibitor_task(
+    backend: ResourceBackend,
+    namespace: String,
+    supervision: ControllerSupervision,
+    runtime_health: RuntimeHealth,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        supervise("sleep_inhibitor", supervision, move || {
+        supervise_controller("sleep_inhibitor", supervision, runtime_health, move || {
             let convoys = backend.clone().using::<Convoy>(&namespace);
             async move { sleep_inhibitor::run(convoys).await }
         })
@@ -713,7 +814,7 @@ fn spawn_heartbeat_task(
     health: DaemonHealthIdentity,
     interval: Duration,
 ) -> JoinHandle<()> {
-    spawn_heartbeat_task_with_credentials(daemon, namespace, profile, Arc::new(None), health, interval)
+    spawn_heartbeat_task_with_credentials(daemon, namespace, profile, Arc::new(None), health, RuntimeHealth::default(), interval)
 }
 
 fn spawn_heartbeat_task_with_credentials(
@@ -722,6 +823,7 @@ fn spawn_heartbeat_task_with_credentials(
     profile: LocalProvisioningProfile,
     credential_store: Arc<Option<Arc<CredentialStore>>>,
     health: DaemonHealthIdentity,
+    runtime_health: RuntimeHealth,
     interval: Duration,
 ) -> JoinHandle<()> {
     spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
@@ -730,9 +832,11 @@ fn spawn_heartbeat_task_with_credentials(
         let profile = profile.clone();
         let credential_store = Arc::clone(&credential_store);
         let health = health.clone();
+        let runtime_health = runtime_health.clone();
         async move {
             if let Err(err) =
-                apply_host_heartbeat_with_credentials(&daemon, &namespace, &profile, credential_store.as_deref(), &health).await
+                apply_host_heartbeat_with_credentials(&daemon, &namespace, &profile, credential_store.as_deref(), &health, &runtime_health)
+                    .await
             {
                 warn!(%err, "failed to publish host heartbeat");
             }
@@ -747,7 +851,7 @@ async fn apply_host_heartbeat(
     profile: &LocalProvisioningProfile,
     health: &DaemonHealthIdentity,
 ) -> Result<(), String> {
-    apply_host_heartbeat_with_credentials(daemon, namespace, profile, None, health).await
+    apply_host_heartbeat_with_credentials(daemon, namespace, profile, None, health, &RuntimeHealth::default()).await
 }
 
 fn spawn_replica_refresh_task(daemon: Arc<InProcessDaemon>, interval: Duration) -> JoinHandle<()> {
@@ -771,6 +875,70 @@ fn spawn_adopted_checkout_reconciliation_task(daemon: Arc<InProcessDaemon>, name
             }
         }
     })
+}
+
+fn spawn_projection_parity_task(
+    backend: ResourceBackend,
+    namespace: String,
+    projection: AggregatorProjectionState,
+    runtime_health: RuntimeHealth,
+    interval: Duration,
+) -> JoinHandle<()> {
+    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || {
+        let backend = backend.clone();
+        let namespace = namespace.clone();
+        let projection = projection.clone();
+        let runtime_health = runtime_health.clone();
+        async move {
+            match projection_parity_condition(&backend, &namespace, &projection).await {
+                Ok(condition) => runtime_health.report_projection_parity(condition),
+                Err(error) => warn!(%error, "failed to evaluate aggregator projection parity"),
+            }
+        }
+    })
+}
+
+async fn projection_parity_condition(
+    backend: &ResourceBackend,
+    namespace: &str,
+    projection: &AggregatorProjectionState,
+) -> Result<Option<HostCondition>, String> {
+    let stored = backend.using::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?;
+    let expected = stored
+        .items
+        .into_iter()
+        .filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
+        .map(|convoy| convoy.metadata.name)
+        .collect::<BTreeSet<_>>();
+    let projected = match projection.local_result_set().await.rows {
+        Rows::Convoys { rows, .. } => rows.into_iter().map(|row| row.resource.name).collect::<BTreeSet<_>>(),
+        rows => return Err(format!("local convoy projection returned unexpected rows: {rows:?}")),
+    };
+    let missing = expected.difference(&projected).cloned().collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    let message = format!(
+        "durable store has {} live convoys but the local aggregator projection has {}; missing: {}",
+        expected.len(),
+        projected.len(),
+        missing.join(", ")
+    );
+    error!(
+        stored = expected.len(),
+        projected = projected.len(),
+        missing = ?missing,
+        "aggregator projection parity check failed"
+    );
+    Ok(Some(
+        HostCondition::builder()
+            .condition_type("ProjectionParity")
+            .value(ConditionValue::False)
+            .reason("LocalRowsMissing")
+            .message(message)
+            .observed_at(Utc::now())
+            .build(),
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -815,6 +983,7 @@ async fn apply_host_heartbeat_with_credentials(
     profile: &LocalProvisioningProfile,
     credential_store: Option<&CredentialStore>,
     health: &DaemonHealthIdentity,
+    runtime_health: &RuntimeHealth,
 ) -> Result<(), String> {
     ensure_host_exists(&daemon.resource_backend(), namespace, &profile.host_id, &profile.display_name).await?;
     let backend = daemon.resource_backend();
@@ -840,15 +1009,17 @@ async fn apply_host_heartbeat_with_credentials(
     let disk_free_bytes = tokio::task::spawn_blocking(move || measure_available_space(&repo_default_dir))
         .await
         .map_err(|error| format!("measure available disk space: {error}"))?;
+    let conditions = runtime_health.conditions();
     let status = HostStatus {
         capabilities: host_capabilities(&summary, profile, &held_credentials),
         heartbeat_at: Some(Utc::now()),
-        ready: true,
+        ready: conditions.is_empty(),
         resource_store,
         daemon_generation: health.generation.clone(),
         daemon_version: Some(health.version.clone()),
         daemon_started_at: Some(health.started_at),
         disk_free_bytes,
+        conditions,
     };
     hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|err| err.to_string())?;
     daemon.refresh_connected_peer_host_heartbeats().await;
@@ -873,6 +1044,7 @@ fn spawn_controller_loops(
     namespace: &str,
     controller_resync_interval: Duration,
     supervision: ControllerSupervision,
+    runtime_health: RuntimeHealth,
 ) -> Vec<JoinHandle<()>> {
     let backend = state.daemon.resource_backend();
     let observed_backend = state.daemon.observed_resource_backend();
@@ -888,8 +1060,9 @@ fn spawn_controller_loops(
             let namespace_string = namespace_string.clone();
             let forge_default_branch_resolver = forge_default_branch_resolver.clone();
             let supervision = supervision.clone();
+            let runtime_health = runtime_health.clone();
             async move {
-                supervise("repository", supervision, move || {
+                supervise_controller("repository", supervision, runtime_health, move || {
                     let backend = backend.clone();
                     let observed_backend = observed_backend.clone();
                     let namespace_string = namespace_string.clone();
@@ -918,8 +1091,9 @@ fn spawn_controller_loops(
             let namespace_string = namespace_string.clone();
             let state = Arc::clone(&state);
             let supervision = supervision.clone();
+            let runtime_health = runtime_health.clone();
             async move {
-                supervise("environment", supervision, move || {
+                supervise_controller("environment", supervision, runtime_health, move || {
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
                     let state = Arc::clone(&state);
@@ -943,8 +1117,9 @@ fn spawn_controller_loops(
             let namespace_string = namespace_string.clone();
             let state = Arc::clone(&state);
             let supervision = supervision.clone();
+            let runtime_health = runtime_health.clone();
             async move {
-                supervise("clone", supervision, move || {
+                supervise_controller("clone", supervision, runtime_health, move || {
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
                     let runner = state.daemon.local_command_runner().expect("local runner should exist");
@@ -971,8 +1146,9 @@ fn spawn_controller_loops(
             let namespace_string = namespace_string.clone();
             let state = Arc::clone(&state);
             let supervision = supervision.clone();
+            let runtime_health = runtime_health.clone();
             async move {
-                supervise("checkout", supervision, move || {
+                supervise_controller("checkout", supervision, runtime_health, move || {
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
                     let state = Arc::clone(&state);
@@ -1001,8 +1177,9 @@ fn spawn_controller_loops(
             let namespace_string = namespace_string.clone();
             let state = Arc::clone(&state);
             let supervision = supervision.clone();
+            let runtime_health = runtime_health.clone();
             async move {
-                supervise("terminal_session", supervision, move || {
+                supervise_controller("terminal_session", supervision, runtime_health, move || {
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
                     let state = Arc::clone(&state);
@@ -1030,8 +1207,9 @@ fn spawn_controller_loops(
             let namespace_string = namespace_string.clone();
             let config_dir = state.config.base_path().as_path().to_path_buf();
             let supervision = supervision.clone();
+            let runtime_health = runtime_health.clone();
             async move {
-                supervise("vessel", supervision, move || {
+                supervise_controller("vessel", supervision, runtime_health, move || {
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
                     let config_dir = config_dir.clone();
@@ -1055,8 +1233,9 @@ fn spawn_controller_loops(
             let namespace_string = namespace_string.clone();
             let state = Arc::clone(&state);
             let supervision = supervision.clone();
+            let runtime_health = runtime_health.clone();
             async move {
-                supervise("presentation", supervision, move || {
+                supervise_controller("presentation", supervision, runtime_health, move || {
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
                     let state = Arc::clone(&state);
@@ -1103,8 +1282,9 @@ fn spawn_controller_loops(
             let namespace_string = namespace_string.clone();
             let daemon = Arc::clone(&state.daemon);
             let supervision = supervision.clone();
+            let runtime_health = runtime_health.clone();
             async move {
-                supervise("convoy", supervision, move || {
+                supervise_controller("convoy", supervision, runtime_health, move || {
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
                     let daemon = Arc::clone(&daemon);
@@ -1114,6 +1294,7 @@ fn spawn_controller_loops(
                             secondaries: ConvoyReconciler::secondary_watches(),
                             reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
                                 .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
+                                .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
                                 .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
                                 .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
                                 .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
@@ -1139,11 +1320,12 @@ fn spawn_aggregator_task(
     namespace: String,
     state: AggregatorProjectionState,
     supervision: ControllerSupervision,
+    runtime_health: RuntimeHealth,
 ) -> JoinHandle<()> {
     let durable = daemon.resource_backend();
     let observed = daemon.observed_resource_backend();
     tokio::spawn(async move {
-        supervise("aggregator", supervision, move || {
+        supervise_controller("aggregator", supervision, runtime_health, move || {
             let daemon = Arc::clone(&daemon);
             let durable = durable.clone();
             let observed = observed.clone();
@@ -2911,6 +3093,63 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn projection_parity_reports_and_clears_missing_local_convoys() {
+        let backend = ResourceBackend::InMemory(Default::default());
+        backend
+            .using::<Convoy>(NAMESPACE)
+            .create(&empty_meta("convoy-a"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
+            .await
+            .expect("create durable convoy");
+        let projection = AggregatorProjectionState::new();
+
+        let degraded = projection_parity_condition(&backend, NAMESPACE, &projection)
+            .await
+            .expect("evaluate parity")
+            .expect("missing projection should degrade the host");
+        assert_eq!(degraded.condition_type, "ProjectionParity");
+        assert_eq!(degraded.reason, "LocalRowsMissing");
+        assert!(degraded.message.contains("convoy-a"));
+
+        let resource = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", NAMESPACE, "convoy-a");
+        projection.write().await.local_rows.insert(
+            resource.clone(),
+            flotilla_protocol::ConvoyRow::builder()
+                .resource(resource)
+                .name("convoy-a")
+                .workflow_ref("workflow")
+                .phase(flotilla_protocol::ConvoyPhase::Pending)
+                .build(),
+        );
+        assert!(
+            projection_parity_condition(&backend, NAMESPACE, &projection).await.expect("evaluate restored parity").is_none(),
+            "restored parity should clear the degraded condition"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_budget_exhaustion_is_recorded_in_runtime_health() {
+        let runtime_health = RuntimeHealth::default();
+        supervise_controller(
+            "checkout",
+            ControllerSupervision {
+                max_consecutive_failures: 1,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+                success_reset_after: Duration::from_secs(60),
+            },
+            runtime_health.clone(),
+            || async { Err(ResourceError::other("root-owned debris")) },
+        )
+        .await;
+
+        let conditions = runtime_health.conditions();
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].condition_type, "Controller/checkout");
+        assert_eq!(conditions[0].reason, "RestartBudgetExhausted");
+        assert!(conditions[0].message.contains("root-owned debris"));
+    }
+
     async fn daemon_with_backend(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>, backend: ResourceBackend) -> Arc<InProcessDaemon> {
         daemon_with_backend_and_runner(tracked_repos, config, backend, Arc::new(NoPrProcessRunner)).await
     }
@@ -3023,8 +3262,13 @@ mod tests {
             Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
-        let controller_handles =
-            spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(25), ControllerSupervision::default());
+        let controller_handles = spawn_controller_loops(
+            Arc::clone(&state),
+            NAMESPACE,
+            Duration::from_millis(25),
+            ControllerSupervision::default(),
+            RuntimeHealth::default(),
+        );
 
         backend
             .clone()
@@ -3747,8 +3991,13 @@ mod tests {
             Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
-        let controller_handles =
-            spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(20), ControllerSupervision::default());
+        let controller_handles = spawn_controller_loops(
+            Arc::clone(&state),
+            NAMESPACE,
+            Duration::from_millis(20),
+            ControllerSupervision::default(),
+            RuntimeHealth::default(),
+        );
 
         backend
             .clone()
@@ -4001,8 +4250,13 @@ mod tests {
             Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
-        let controller_handles =
-            spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(20), ControllerSupervision::default());
+        let controller_handles = spawn_controller_loops(
+            Arc::clone(&state),
+            NAMESPACE,
+            Duration::from_millis(20),
+            ControllerSupervision::default(),
+            RuntimeHealth::default(),
+        );
         wait_until(|| {
             let terminals = terminals.clone();
             let name = coder.metadata.name.clone();
@@ -4215,8 +4469,13 @@ mod tests {
             Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
-        let controller_handles =
-            spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(25), ControllerSupervision::default());
+        let controller_handles = spawn_controller_loops(
+            Arc::clone(&state),
+            NAMESPACE,
+            Duration::from_millis(25),
+            ControllerSupervision::default(),
+            RuntimeHealth::default(),
+        );
 
         backend
             .clone()

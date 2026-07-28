@@ -163,6 +163,26 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::WorkflowTemplate => $body::<WorkflowTemplate>(),
         }
     };
+    ($resource:expr, $body:ident($($arg:expr),*)) => {
+        match $resource {
+            RegisteredResource::Checkout => $body::<Checkout>($($arg),*),
+            RegisteredResource::Clone => $body::<CloneResource>($($arg),*),
+            RegisteredResource::Convoy => $body::<Convoy>($($arg),*),
+            RegisteredResource::CredentialGrant => $body::<CredentialGrant>($($arg),*),
+            RegisteredResource::CredentialSpec => $body::<CredentialSpec>($($arg),*),
+            RegisteredResource::Demand => $body::<Demand>($($arg),*),
+            RegisteredResource::Environment => $body::<Environment>($($arg),*),
+            RegisteredResource::Host => $body::<Host>($($arg),*),
+            RegisteredResource::PlacementPolicy => $body::<PlacementPolicy>($($arg),*),
+            RegisteredResource::Presentation => $body::<Presentation>($($arg),*),
+            RegisteredResource::Project => $body::<Project>($($arg),*),
+            RegisteredResource::Regard => $body::<Regard>($($arg),*),
+            RegisteredResource::Repository => $body::<Repository>($($arg),*),
+            RegisteredResource::TerminalSession => $body::<TerminalSession>($($arg),*),
+            RegisteredResource::Vessel => $body::<Vessel>($($arg),*),
+            RegisteredResource::WorkflowTemplate => $body::<WorkflowTemplate>($($arg),*),
+        }
+    };
 }
 
 pub async fn list_resource_kind(
@@ -252,6 +272,25 @@ pub async fn apply_resource_document(
         lookup_resource_kind(&document.kind)?.resource,
         apply_typed(backend, &namespace, document.metadata, document.spec).await
     )
+}
+
+/// Hash a resource document's spec after its registered typed representation
+/// has applied Serde defaults.
+pub fn resource_document_spec_hash(document: &Value) -> Result<String, ResourceError> {
+    let kind = document
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ResourceError::decode("decode resource document: missing or non-string kind"))?;
+    let spec = document.get("spec").ok_or_else(|| ResourceError::decode("decode resource document: missing spec"))?;
+    dispatch_resource_kind!(lookup_resource_kind(kind)?.resource, typed_spec_hash(spec))
+}
+
+fn typed_spec_hash<T: Resource>(spec: &Value) -> Result<String, ResourceError> {
+    let typed = serde_json::from_value::<T::Spec>(spec.clone())
+        .map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", T::API_PATHS.kind)))?;
+    let normalized = serde_json::to_value(typed)
+        .map_err(|error| ResourceError::decode(format!("encode normalized {} spec: {error}", T::API_PATHS.kind)))?;
+    crate::content_hash(&normalized)
 }
 
 fn lookup_resource_kind(kind: &str) -> Result<&'static RegisteredResourceKind, ResourceError> {

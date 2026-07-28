@@ -3,10 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
-    controller::{ReconcileOutcome, Reconciler},
-    Environment, EnvironmentPhase, ResourceBackend, ResourceError, ResourceObject, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver,
-    CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, VESSEL_REF_LABEL,
+    controller::{Actuation, ReconcileOutcome, Reconciler},
+    Convoy, Environment, EnvironmentPhase, ResourceBackend, ResourceError, ResourceObject, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag,
+    TypedResolver, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -53,12 +53,13 @@ pub trait TerminalRuntime: Send + Sync {
 
 pub struct TerminalSessionReconciler<R> {
     runtime: Arc<R>,
+    convoys: TypedResolver<Convoy>,
     environments: TypedResolver<Environment>,
 }
 
 impl<R> TerminalSessionReconciler<R> {
     pub fn new(runtime: Arc<R>, backend: ResourceBackend, namespace: &str) -> Self {
-        Self { runtime, environments: backend.using::<Environment>(namespace) }
+        Self { runtime, convoys: backend.clone().using::<Convoy>(namespace), environments: backend.using::<Environment>(namespace) }
     }
 }
 
@@ -70,6 +71,7 @@ pub enum TerminalDeps {
     Stopped,
     Attention(TerminalAttention),
     AttentionStale,
+    OwnerMissing,
     Failed(String),
 }
 
@@ -81,6 +83,18 @@ where
     type Dependencies = TerminalDeps;
 
     async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+        let convoy_ref = match &obj.spec.source {
+            TerminalSessionSource::Agent { context, .. } => Some(context.convoy.as_str()),
+            TerminalSessionSource::Tool { .. } => obj.metadata.labels.get(CONVOY_LABEL).map(String::as_str),
+        };
+        if let Some(convoy_ref) = convoy_ref {
+            match self.convoys.get(convoy_ref).await {
+                Ok(convoy) if convoy.metadata.deletion_timestamp.is_none() => {}
+                Ok(_) | Err(ResourceError::NotFound { .. }) => return Ok(TerminalDeps::OwnerMissing),
+                Err(err) => return Err(err),
+            }
+        }
+
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
         if phase == TerminalSessionPhase::Running {
             let session_id = obj
@@ -147,6 +161,10 @@ where
         deps: &Self::Dependencies,
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
+        if matches!(deps, TerminalDeps::OwnerMissing) {
+            return ReconcileOutcome::with_actuations(None, vec![Actuation::DeleteTerminalSession { name: obj.metadata.name.clone() }]);
+        }
+
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
         let patch = match phase {
             TerminalSessionPhase::Starting => match deps {
@@ -166,7 +184,8 @@ where
                 | TerminalDeps::Stopped
                 | TerminalDeps::MessageDelivered(_)
                 | TerminalDeps::Attention(_)
-                | TerminalDeps::AttentionStale => None,
+                | TerminalDeps::AttentionStale
+                | TerminalDeps::OwnerMissing => None,
             },
             TerminalSessionPhase::Running if matches!(deps, TerminalDeps::Stopped) => Some(TerminalSessionStatusPatch::MarkStopped {
                 stopped_at: now,

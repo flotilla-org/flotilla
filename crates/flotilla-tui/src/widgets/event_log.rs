@@ -387,15 +387,16 @@ fn short_generation(generation: Option<&str>) -> String {
 fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame, area: Rect) {
     let now = Utc::now();
     let rows = hosts.iter().map(|host| {
+        let degraded = !host.degraded_conditions.is_empty();
         let disagreement = host.observation_agreement == FleetObservationAgreement::Disagree;
-        let icon = if disagreement {
+        let icon = if degraded || disagreement {
             "⚠"
         } else if host.staleness == FleetHostStaleness::Current {
             "●"
         } else {
             "○"
         };
-        let style = if disagreement {
+        let style = if degraded || disagreement {
             Style::default().fg(theme.warning)
         } else if host.staleness == FleetHostStaleness::Current {
             Style::default().fg(theme.status_ok)
@@ -419,10 +420,14 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
         let replica = format!("{} {}", fleet_age(host.replica_last_sync, now), short_generation(host.replica_generation.as_deref()));
         let disk =
             host.disk_free_bytes.map_or_else(|| "-".to_string(), |bytes| format!("{:.1}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0)));
-        let stale = match host.staleness {
-            FleetHostStaleness::Current => "current",
-            FleetHostStaleness::Stale => "STALE",
-            FleetHostStaleness::Unknown => "unknown",
+        let stale = if degraded {
+            "DEGRADED"
+        } else {
+            match host.staleness {
+                FleetHostStaleness::Current => "current",
+                FleetHostStaleness::Stale => "STALE",
+                FleetHostStaleness::Unknown => "unknown",
+            }
         };
         Row::new(vec![
             Cell::from(Span::styled(icon, style)),

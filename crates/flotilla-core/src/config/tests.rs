@@ -626,6 +626,7 @@ fn load_daemon_config_missing_file_returns_default() {
     let config = store.load_daemon_config().unwrap();
     assert!(!config.follower);
     assert_eq!(config.host_name, None);
+    assert_eq!(config.manifests, None);
 }
 
 #[test]
@@ -638,6 +639,16 @@ fn load_daemon_config_from_file() {
     assert!(config.follower);
     assert_eq!(config.machine_id, Some("my-machine".into()));
     assert_eq!(config.host_name, Some("my-host".into()));
+}
+
+#[test]
+fn load_daemon_manifest_directory() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("daemon.toml"), "[manifests]\ndir = \"/srv/flotilla/manifests\"\n").unwrap();
+
+    let config = ConfigStore::with_base(dir.path()).load_daemon_config().expect("daemon config");
+
+    assert_eq!(config.manifests.expect("manifest config").dir, std::path::PathBuf::from("/srv/flotilla/manifests"));
 }
 
 #[test]
