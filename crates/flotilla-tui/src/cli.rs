@@ -224,9 +224,8 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
         }
         let diagnosis = if diagnoses.is_empty() {
             match host.observation_agreement {
-                FleetObservationAgreement::Agree => "agree".to_string(),
-                FleetObservationAgreement::Disagree => unreachable!("disagreement should have produced a diagnosis"),
                 FleetObservationAgreement::Unknown => "unknown".to_string(),
+                FleetObservationAgreement::Agree | FleetObservationAgreement::Disagree => "agree".to_string(),
             }
         } else {
             diagnoses.join("; ")
