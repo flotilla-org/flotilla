@@ -3474,6 +3474,14 @@ mod tests {
         )
         .await
         .expect("first generation heartbeat");
+        let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
+        let first_host = hosts.get(&host_id).await.expect("first generation host");
+        let mut legacy_status = first_host.status.expect("first generation status");
+        legacy_status.agent_adapter_baseline = None;
+        hosts
+            .update_status(&host_id, &first_host.metadata.resource_version, &legacy_status)
+            .await
+            .expect("simulate status written before the baseline field existed");
 
         let mut restarted_profile = first_profile.clone();
         restarted_profile.available_agent_adapters.remove("claude-code");
