@@ -838,50 +838,100 @@ async fn discover_local_clones(
 }
 
 async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, profile: &LocalProvisioningProfile) -> Result<(), String> {
-    let policies = backend.clone().using::<PlacementPolicy>(namespace);
-
     let host_direct_name = profile.host_direct_policy_name();
-    if matches!(policies.get(&host_direct_name).await, Err(ResourceError::NotFound { .. })) {
-        policies
-            .create(
-                &empty_meta(&host_direct_name),
-                &PlacementPolicySpec::builder()
-                    .pool(profile.host_direct_pool.clone())
-                    .host_direct(HostDirectPlacementPolicySpec {
-                        host_ref: profile.host_id.clone(),
-                        checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                    })
-                    .build(),
-            )
-            .await
-            .map_err(|err| err.to_string())?;
-    }
+    reconcile_registered_policy(
+        backend,
+        namespace,
+        &host_direct_name,
+        &PlacementPolicySpec::builder()
+            .pool(profile.host_direct_pool.clone())
+            .host_direct(HostDirectPlacementPolicySpec {
+                host_ref: profile.host_id.clone(),
+                checkout: HostDirectPlacementPolicyCheckout::Worktree,
+            })
+            .build(),
+    )
+    .await?;
 
     if profile.docker_available {
         let docker_name = profile.docker_policy_name();
-        if matches!(policies.get(&docker_name).await, Err(ResourceError::NotFound { .. })) {
-            policies
-                .create(
-                    &empty_meta(&docker_name),
-                    &PlacementPolicySpec::builder()
-                        .pool(profile.docker_pool.clone())
-                        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                            host_ref: profile.host_id.clone(),
-                            image: DEFAULT_DOCKER_IMAGE.to_string(),
-                            pull_policy: Default::default(),
-                            agent_adapters: BTreeSet::new(),
-                            default_cwd: Some("/workspace".to_string()),
-                            env: BTreeMap::new(),
-                            checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
-                        })
-                        .build(),
-                )
-                .await
-                .map_err(|err| err.to_string())?;
-        }
+        reconcile_registered_policy(
+            backend,
+            namespace,
+            &docker_name,
+            &PlacementPolicySpec::builder()
+                .pool(profile.docker_pool.clone())
+                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    host_ref: profile.host_id.clone(),
+                    image: DEFAULT_DOCKER_IMAGE.to_string(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::new(),
+                    default_cwd: Some("/workspace".to_string()),
+                    env: BTreeMap::new(),
+                    checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+                })
+                .build(),
+        )
+        .await?;
     }
 
     Ok(())
+}
+
+async fn reconcile_registered_policy(
+    backend: &ResourceBackend,
+    namespace: &str,
+    name: &str,
+    desired: &PlacementPolicySpec,
+) -> Result<(), String> {
+    let policies = backend.clone().using::<PlacementPolicy>(namespace);
+    match policies.get(name).await {
+        Ok(existing) => {
+            if existing.metadata.deletion_timestamp.is_some() {
+                return Ok(());
+            }
+            if let Some(managed_by) = existing.metadata.labels.get(MANAGED_BY_LABEL) {
+                warn!(policy = %name, %managed_by, "leaving managed placement policy untouched during daemon registration");
+                return Ok(());
+            }
+
+            let merged = merge_registered_policy_spec(&existing.spec, desired)?;
+            if merged != existing.spec {
+                policies
+                    .update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &merged)
+                    .await
+                    .map_err(|err| format!("reconcile registered placement policy {name}: {err}"))?;
+            }
+            Ok(())
+        }
+        Err(ResourceError::NotFound { .. }) => {
+            policies.create(&empty_meta(name), desired).await.map(|_| ()).map_err(|err| format!("register placement policy {name}: {err}"))
+        }
+        Err(err) => Err(format!("check registered placement policy {name}: {err}")),
+    }
+}
+
+fn merge_registered_policy_spec(existing: &PlacementPolicySpec, desired: &PlacementPolicySpec) -> Result<PlacementPolicySpec, String> {
+    // Registration owns placement topology, not operator scheduling or runtime
+    // configuration. Starting from the live spec also preserves future fields
+    // until their ownership is explicitly assigned here.
+    let mut merged = existing.clone();
+    merged.pool.clone_from(&desired.pool);
+    match (&desired.host_direct, &desired.docker_per_vessel) {
+        (Some(host_direct), None) => {
+            merged.host_direct = Some(host_direct.clone());
+            merged.docker_per_vessel = None;
+        }
+        (None, Some(desired_docker)) => {
+            let mut docker = existing.docker_per_vessel.clone().unwrap_or_else(|| desired_docker.clone());
+            docker.host_ref.clone_from(&desired_docker.host_ref);
+            docker.checkout.clone_from(&desired_docker.checkout);
+            merged.host_direct = None;
+            merged.docker_per_vessel = Some(docker);
+        }
+        _ => return Err("registered placement policy must define exactly one strategy".to_string()),
+    }
+    Ok(merged)
 }
 
 async fn supervise_controller<F, Fut>(name: &'static str, supervision: ControllerSupervision, runtime_health: RuntimeHealth, make_run: F)
@@ -4450,6 +4500,145 @@ mod tests {
         let clone = clones.get(&clone_name).await.expect("discovered clone should exist");
         assert_eq!(clone.spec.url, "git@github.com:flotilla-org/flotilla.git");
         assert_eq!(clone.metadata.labels.get("flotilla.work/discovered").map(String::as_str), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn policy_registration_preserves_operator_fields_and_corrects_owned_drift() {
+        let temp = TempDir::new().expect("tempdir");
+        let database_path = temp.path().join("resources.sqlite");
+        let profile = manual_profile("host-test", false);
+        {
+            let backend =
+                ResourceBackend::Sqlite(SqliteBackend::open(&database_path).expect("initial sqlite resource backend should open"));
+            ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("initial policy registration should succeed");
+
+            let policies = backend.using::<PlacementPolicy>(NAMESPACE);
+            let registered = policies.get(&profile.host_direct_policy_name()).await.expect("registered host-direct policy");
+            policies
+                .update(
+                    &InputMeta::from(&registered.metadata),
+                    &registered.metadata.resource_version,
+                    &PlacementPolicySpec::builder()
+                        .pool("operator-edited-pool".to_string())
+                        .priority(10)
+                        .host_direct(HostDirectPlacementPolicySpec {
+                            host_ref: "operator-edited-host".to_string(),
+                            checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                        })
+                        .build(),
+                )
+                .await
+                .expect("operator policy apply should succeed");
+        }
+
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&database_path).expect("restarted sqlite resource backend should open"));
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("policy re-registration should succeed");
+
+        let reconciled = backend
+            .using::<PlacementPolicy>(NAMESPACE)
+            .get(&profile.host_direct_policy_name())
+            .await
+            .expect("reconciled host-direct policy");
+        assert_eq!(reconciled.spec.priority, 10, "operator-owned priority must survive re-registration");
+        assert_eq!(reconciled.spec.pool, profile.host_direct_pool, "registration must assert the discovered terminal pool");
+        assert_eq!(
+            reconciled.spec.host_direct,
+            Some(HostDirectPlacementPolicySpec {
+                host_ref: profile.host_id.clone(),
+                checkout: HostDirectPlacementPolicyCheckout::Worktree,
+            }),
+            "registration must assert its host and checkout strategy"
+        );
+        assert!(reconciled.spec.docker_per_vessel.is_none());
+
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("steady-state policy registration should succeed");
+        let steady =
+            backend.using::<PlacementPolicy>(NAMESPACE).get(&profile.host_direct_policy_name()).await.expect("steady host-direct policy");
+        assert_eq!(steady.spec.priority, 10);
+        assert_eq!(
+            steady.metadata.resource_version, reconciled.metadata.resource_version,
+            "steady registration must not rewrite the policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_policy_registration_preserves_runtime_configuration_and_corrects_owned_drift() {
+        let backend = ResourceBackend::InMemory(Default::default());
+        let profile = manual_profile("host-test", true);
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("initial policy registration should succeed");
+
+        let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
+        let registered = policies.get(&profile.docker_policy_name()).await.expect("registered docker policy");
+        policies
+            .update(
+                &InputMeta::from(&registered.metadata),
+                &registered.metadata.resource_version,
+                &PlacementPolicySpec::builder()
+                    .pool("operator-edited-pool".to_string())
+                    .priority(20)
+                    .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                        host_ref: "operator-edited-host".to_string(),
+                        image: "operator/image:latest".to_string(),
+                        pull_policy: flotilla_resources::DockerImagePullPolicy::Never,
+                        agent_adapters: BTreeSet::from(["codex".to_string()]),
+                        default_cwd: Some("/operator-workspace".to_string()),
+                        env: BTreeMap::from([("OPERATOR_CONFIG".to_string(), "true".to_string())]),
+                        checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/operator-clone".to_string() },
+                    })
+                    .build(),
+            )
+            .await
+            .expect("operator policy apply should succeed");
+
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("policy re-registration should succeed");
+
+        let reconciled = policies.get(&profile.docker_policy_name()).await.expect("reconciled docker policy");
+        assert_eq!(reconciled.spec.priority, 20);
+        assert_eq!(reconciled.spec.pool, profile.docker_pool);
+        assert!(reconciled.spec.host_direct.is_none());
+        assert_eq!(
+            reconciled.spec.docker_per_vessel,
+            Some(DockerPerVesselPlacementPolicySpec {
+                host_ref: profile.host_id,
+                image: "operator/image:latest".to_string(),
+                pull_policy: flotilla_resources::DockerImagePullPolicy::Never,
+                agent_adapters: BTreeSet::from(["codex".to_string()]),
+                default_cwd: Some("/operator-workspace".to_string()),
+                env: BTreeMap::from([("OPERATOR_CONFIG".to_string(), "true".to_string())]),
+                checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_registration_leaves_manifest_managed_collision_untouched() {
+        let backend = ResourceBackend::InMemory(Default::default());
+        let profile = manual_profile("host-test", false);
+        let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
+        let manifest_spec = PlacementPolicySpec::builder()
+            .pool("manifest-pool".to_string())
+            .priority(25)
+            .host_direct(HostDirectPlacementPolicySpec {
+                host_ref: "manifest-host".to_string(),
+                checkout: HostDirectPlacementPolicyCheckout::Worktree,
+            })
+            .build();
+        let manifest = policies
+            .create(
+                &empty_meta_with_labels(
+                    &profile.host_direct_policy_name(),
+                    BTreeMap::from([(MANAGED_BY_LABEL.to_string(), "manifest".to_string())]),
+                ),
+                &manifest_spec,
+            )
+            .await
+            .expect("manifest-managed policy should exist");
+
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("registration should tolerate managed collision");
+
+        let unchanged = policies.get(&profile.host_direct_policy_name()).await.expect("manifest-managed policy should remain");
+        assert_eq!(unchanged.spec, manifest_spec);
+        assert_eq!(unchanged.metadata.resource_version, manifest.metadata.resource_version, "registration must not rewrite managed policy");
     }
 
     #[tokio::test]
