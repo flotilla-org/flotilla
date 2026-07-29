@@ -1,7 +1,11 @@
-# 0024 — Declared state machines, static field ownership, and a fold-based property engine
+# Declared state machines, static field ownership, and a fold-based property engine
 
-Date: 2026-07-29
-Status: Accepted
+**Status:** Accepted
+**Date:** 2026-07-29
+**Relates to:** ADR 0003 (generalizes `LifecycleAuthority` into per-field owner
+roles), #1188 (adopts and extends its owner-authored vs actuator-observed
+vocabulary; the write helper is the future enforcement point for its
+single-writer rule), #1176/#1214 (the liveness harness this extends)
 
 ## Context
 
