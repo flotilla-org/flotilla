@@ -38,6 +38,11 @@ impl CodexSlotPool {
         Self { pool_dir, state_path, supported: true, lock: Mutex::new(()) }
     }
 
+    #[cfg(test)]
+    fn unsupported(pool_dir: PathBuf, state_path: PathBuf) -> Self {
+        Self { pool_dir, state_path, supported: false, lock: Mutex::new(()) }
+    }
+
     pub(crate) async fn acquire(&self, environment_ref: &str) -> Result<CodexSlotLease, String> {
         if !self.supported {
             return Err("Codex login slot delivery is supported only on Linux placement hosts".to_string());
@@ -71,6 +76,9 @@ impl CodexSlotPool {
     }
 
     pub(crate) async fn release(&self, environment_ref: &str) -> Result<(), String> {
+        if !self.supported {
+            return Ok(());
+        }
         let _guard = self.lock.lock().await;
         let mut state = self.load_state().await?;
         state.leases.retain(|_, holder| holder != environment_ref);
@@ -78,6 +86,9 @@ impl CodexSlotPool {
     }
 
     pub(crate) async fn recover(&self, active_environment_refs: &BTreeSet<String>) -> Result<(), String> {
+        if !self.supported {
+            return Ok(());
+        }
         let _guard = self.lock.lock().await;
         let mut state = self.load_state().await?;
         state.leases.retain(|_, holder| active_environment_refs.contains(holder));
@@ -211,5 +222,17 @@ mod tests {
         assert_eq!(pool.acquire("env-a").await.expect("wait"), CodexSlotLease::Waiting {
             message: "waiting for codex login slot; 0 in pool, all leased; mint another slot to increase concurrency".to_string(),
         });
+    }
+
+    #[tokio::test]
+    async fn unsupported_hosts_do_not_create_lease_state_during_recovery_or_release() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_path = temp.path().join("leases.json");
+        let pool = CodexSlotPool::unsupported(temp.path().join("pool"), state_path.clone());
+
+        pool.recover(&BTreeSet::from(["env-a".to_string()])).await.expect("skip unsupported recovery");
+        pool.release("env-a").await.expect("skip unsupported release");
+
+        assert!(!state_path.exists());
     }
 }
