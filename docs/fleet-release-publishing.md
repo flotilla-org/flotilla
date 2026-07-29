@@ -1,113 +1,134 @@
 # Fleet release publishing
 
-Each source repository is mirrored into the lab Forgejo under `robert/` and has
-its own `.forgejo/workflows/` publisher. Once a mirror is provisioned, a sync of
-that repository's `main` branch triggers only its publisher. The workflows
-publish to Forgejo's generic package registry; Forgejo run artifacts are not
-release inputs because they expire and are not addressable across runs.
-
-## Package coordinates
-
-| Source repository | Forgejo package | Version |
-|---|---|---|
-| `flotilla-org/flotilla` | `robert/flotilla` | `<commit-sha>-<wire-generation>` |
-| `flotilla-org/cleat` | `robert/cleat` | `<commit-sha>` |
-| `flotilla-org/andamento` | `robert/andamento` | `<commit-sha>` |
-| `flotilla-org/mattpocock-skills` | `robert/mattpocock-skills` | `<commit-sha>` |
-| `rjwittams/rjw-skills` | `robert/rjw-skills` | `<commit-sha>` |
-
-The download shape is:
+Each source repository has its own GitHub Actions publisher. A push to that
+repository's `main` branch builds only its artifacts and creates a GitHub
+Release tagged:
 
 ```text
-https://forgejo.lab.flotilla.work/api/packages/robert/generic/<package>/<version>/<file>
+fleet-<full-commit-sha>
 ```
 
-Every artifact has `<file>.json` beside it. The metadata is the input to a fleet
-pin and includes the full source SHA, platform, file name, SHA-256, size, signing
-state, and (for Flotilla) wire generation. Consumers should verify the metadata
-coordinates and digest before executing or unpacking an artifact.
+The workflows use GitHub self-hosted runners and select them only by operating
+system, architecture, and generic release capabilities. They do not contain
+runner names, private network topology, or private registry coordinates.
 
-## Runner registration
+## Release coordinates
 
-Register Feta with the Forgejo label specification `feta:host` and Comte with
-`comte:host`. In Forgejo runner syntax, those specifications create the
-matching label names `feta` and `comte` with the `host` execution schema; the
-workflows therefore use `runs-on: feta` and `runs-on: comte`. Do not reuse
-either label name on a developer desk: jobs also attest `hostname`, `uname`,
-and architecture, and will fail before checkout if the label is attached to
-the wrong machine.
-
-Both runners need `git`, `curl`, `jq`, current stable Rust, and Zig 0.15.2 for
-Cleat. Feta also needs the `wasm32-wasip1` Rust target for Andamento (the
-workflow installs the target when absent). Cleat's preparation helper verifies
-the pinned Zig and Ghostty revisions. Zig 0.15.2 cannot consume the Xcode 26
-macOS SDK, so Comte must retain
-`/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk`; the Cleat workflow
-uses its scoped `xcrun` shim only for Zig's macOS SDK lookup and passes all
-other Xcode lookups through unchanged. Comte also needs the valid codesigning
-identity:
+An artifact URL has this public shape:
 
 ```text
-Apple Development: Robert Wittams (DYYMCPD885)
+https://github.com/<owner>/<repository>/releases/download/fleet-<commit-sha>/<asset>
 ```
 
-The Comte runner process must have its login keychain unlocked and permission
-to use that identity's private key without an interactive prompt. Both Darwin
-jobs prove this by signing and verifying a disposable system-binary copy before
-checkout; an `errSecInternalComponent` failure means the runner keychain/ACL
-still needs operator provisioning.
+Every artifact has `<asset>.json` beside it. Metadata schema version 2 includes
+the full source SHA, release tag, artifact URL, metadata URL, platform, file
+name, SHA-256, size, signing state, and (for Flotilla) wire generation.
+
+A `project-map` pin should record the metadata asset URL and the artifact
+coordinate/digest it selects. Release tags are repository-local, so every pin
+also names the source repository. Consumers must verify the metadata repository,
+commit, release tag, asset URL, and digest before executing or unpacking a file.
+
+GitHub Actions artifacts are used only as one-day job-to-job transfer storage.
+They are not stable inputs and must never appear in a project-map pin.
+
+## Runner registration and environment
+
+Register the release machines as GitHub self-hosted runners for the repositories
+or an appropriately restricted organization runner group. Keep GitHub's default
+OS and architecture labels enabled:
+
+- Linux publishers require `[self-hosted, Linux, X64, fleet-release]`;
+- Darwin publishers require
+  `[self-hosted, macOS, ARM64, fleet-release-signing]`.
+
+Apply the custom capability labels only to the controlled release runners. Do
+not register a developer desk as an eligible repository or runner-group
+publisher.
+
+Linux runners need `git`, `gh`, `jq`, current stable Rust, and Zig 0.15.2 for
+Cleat. The Andamento workflow installs the `wasm32-wasip1` Rust target when
+absent. Cleat's preparation helper verifies the pinned Zig and Ghostty
+revisions.
+
+The Darwin signing runner needs `git`, `gh`, `jq`, stable Rust, Zig 0.15.2,
+`codesign`, and a compatible SDK for the pinned Zig toolchain. Configure these
+runner-process environment variables outside the repository:
+
+- `FLEET_CODESIGN_IDENTITY`: the signing identity available to `codesign`;
+- `FLEET_MACOS_SDK`: the SDK directory Cleat's scoped Zig `xcrun` shim should
+  expose.
+
+The runner process must have its keychain unlocked and permission to use the
+identity's private key without an interactive prompt. The Darwin jobs fail
+before checkout if the environment, SDK, or disposable signing probe is not
+usable.
 
 The Darwin workflows use `packaging/macos-cli.entitlements`, an intentionally
-empty entitlement set for unsandboxed CLI executables, then run strict
-`codesign` verification before upload.
+empty entitlement set for unsandboxed CLI executables, then run strict signature
+verification before transfer.
 
 ## Repository setup
 
-For each Forgejo mirror:
+For each source repository:
 
-1. create a pull mirror of the GitHub source repository;
-2. enable Actions and repository packages;
-3. add the owner package token as the Actions secret `PACKAGE_TOKEN`;
-4. make the appropriate host runner available to the repository;
-5. synchronize `main`.
+1. enable GitHub Actions;
+2. grant the workflow token permission to create releases (`contents: write`);
+3. make the appropriate self-hosted runner or restricted runner group available;
+4. configure the Darwin runner environment and signing access where applicable;
+5. merge the workflow and push or merge a follow-up commit to `main`.
 
-Public source repositories can be mirrored without GitHub credentials. Private
-source repositories need a dedicated, non-human read credential: grant the
-mirror machine account read access or provision a GitHub App/deploy credential.
-Do not store a developer's personal access token in Forgejo. At rollout time,
-the operator must provision that access for the private Andamento,
-Matt Pocock skills, and RJW skills source repositories before creating their
-mirrors.
-
-The token needs `write:package` and belongs to the `robert` package owner. It
-must live in Forgejo's encrypted Actions secret store, not a workflow file,
-checkout, image, or desk environment.
+No package token, private mirror, private source credential, or private registry
+configuration is required by this slice. Release publication uses the
+repository-scoped GitHub workflow token.
 
 ## Verification after a merge
 
-For a Flotilla SHA, wait for both platform jobs and download all eight files:
-two binaries and two metadata files per platform. Verify:
+For a source SHA, inspect and download the release:
 
 ```bash
-jq -e '.schema_version == 1 and .commit_sha != "" and .wire_generation != ""' flotilla-linux-x86_64.json
-sha256sum -c <(jq -r '"\(.sha256)  \(.artifact)"' flotilla-linux-x86_64.json)
-./flotilla-linux-x86_64 --version
+release_tag="fleet-<full-commit-sha>"
+gh release view "$release_tag" --repo flotilla-org/flotilla
+gh release download "$release_tag" --repo flotilla-org/flotilla --dir dist
+```
+
+For a Flotilla asset, verify the public coordinates and bytes:
+
+```bash
+jq -e \
+  '.schema_version == 2
+   and .commit_sha != ""
+   and .release_tag == ("fleet-" + .commit_sha)
+   and (.artifact_url | startswith("https://github.com/"))' \
+  dist/flotilla-linux-x86_64.json
+(
+  cd dist
+  sha256sum -c <(jq -r '"\(.sha256)  \(.artifact)"' flotilla-linux-x86_64.json)
+)
+dist/flotilla-linux-x86_64 --version
 ```
 
 On Darwin, also verify each binary with:
 
 ```bash
-codesign --verify --strict --verbose=2 flotilla-darwin-arm64
+codesign --verify --strict --verbose=2 dist/flotilla-darwin-arm64
 ```
 
-Cleat's workflow will not publish unless its release binary is built with
-`ghostty-vt`, is self-contained, and passes:
+Cleat's workflow will not transfer or publish unless its release binary is
+self-contained, built with `ghostty-vt`, and passes:
 
 ```bash
 cleat launch --help | grep -q -- --tag
 ```
 
-Andamento publishes exactly the controller, rail, and config WASM modules.
-Each skills publisher uses `git archive` at the triggering SHA, so the bundle is
-an exact, prefix-contained snapshot of tracked source rather than the runner's
+Andamento publishes exactly the controller, rail, and config WASM modules. Each
+skills publisher uses `git archive` at the triggering SHA, so the bundle is an
+exact, prefix-contained snapshot of tracked source rather than the runner's
 working tree.
+
+## Image build boundary
+
+The crew-image top-layer bake belongs to slice 3. A lab-side builder consumes
+the GitHub release assets selected by the project-map pin and publishes the
+result to the private registry. Repository workflows neither build that image
+nor know the registry coordinate.

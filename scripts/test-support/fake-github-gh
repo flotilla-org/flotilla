@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${FAKE_GH_STATE_DIR:?FAKE_GH_STATE_DIR is required}"
+: "${FAKE_GH_LOG:?FAKE_GH_LOG is required}"
+
+if [[ ${1:-} != release || $# -lt 2 ]]; then
+  exit 2
+fi
+
+command=$2
+shift 2
+mkdir -p "$FAKE_GH_STATE_DIR/assets"
+
+case "$command" in
+  view)
+    if [[ ! -f "$FAKE_GH_STATE_DIR/target" ]]; then
+      exit 1
+    fi
+    if [[ " $* " == *" targetCommitish "* ]]; then
+      cat "$FAKE_GH_STATE_DIR/target"
+    elif [[ " $* " == *" assets "* ]]; then
+      find "$FAKE_GH_STATE_DIR/assets" -type f -maxdepth 1 -exec basename {} \; | sort
+    fi
+    ;;
+  create)
+    target=
+    assets=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --target)
+          target=$2
+          shift 2
+          ;;
+        --repo | --title | --notes)
+          shift 2
+          ;;
+        --latest=false)
+          shift
+          ;;
+        *)
+          if [[ -f "$1" ]]; then
+            assets+=("$1")
+          fi
+          shift
+          ;;
+      esac
+    done
+    printf '%s\n' "$target" >"$FAKE_GH_STATE_DIR/target"
+    for asset in "${assets[@]}"; do
+      cp "$asset" "$FAKE_GH_STATE_DIR/assets/$(basename "$asset")"
+      printf 'create:%s\n' "$(basename "$asset")" >>"$FAKE_GH_LOG"
+    done
+    ;;
+  download)
+    pattern=
+    destination=
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --pattern)
+          pattern=$2
+          shift 2
+          ;;
+        --dir)
+          destination=$2
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    mkdir -p "$destination"
+    cp "$FAKE_GH_STATE_DIR/assets/$pattern" "$destination/$pattern"
+    printf 'download:%s\n' "$pattern" >>"$FAKE_GH_LOG"
+    ;;
+  *)
+    exit 2
+    ;;
+esac

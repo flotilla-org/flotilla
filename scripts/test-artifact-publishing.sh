@@ -9,10 +9,11 @@ artifact="$test_dir/artifact"
 metadata="$test_dir/artifact.json"
 printf 'fleet artifact\n' >"$artifact"
 commit_sha=0123456789abcdef0123456789abcdef01234567
+release_tag=fleet-$commit_sha
 
 "$repo_root/scripts/write-artifact-metadata.sh" \
   "$artifact" "$metadata" flotilla-org/flotilla "$commit_sha" \
-  linux-x86_64 0123456789ab false
+  "$release_tag" linux-x86_64 0123456789ab false
 
 if command -v sha256sum >/dev/null 2>&1; then
   expected_sha256=$(sha256sum "$artifact" | awk '{print $1}')
@@ -22,20 +23,26 @@ fi
 
 jq -e \
   --arg commit_sha "$commit_sha" \
+  --arg release_tag "$release_tag" \
   --arg sha256 "$expected_sha256" \
-  '.schema_version == 1
+  '.schema_version == 2
     and .repository == "flotilla-org/flotilla"
     and .commit_sha == $commit_sha
+    and .release_tag == $release_tag
     and .wire_generation == "0123456789ab"
     and .platform == "linux-x86_64"
     and .artifact == "artifact"
+    and .artifact_url == ("https://github.com/flotilla-org/flotilla/releases/download/" + $release_tag + "/artifact")
+    and .metadata_asset == "artifact.json"
+    and .metadata_url == ("https://github.com/flotilla-org/flotilla/releases/download/" + $release_tag + "/artifact.json")
     and .sha256 == $sha256
     and .size_bytes == 15
     and .signed == false' \
   "$metadata" >/dev/null
 
 if "$repo_root/scripts/write-artifact-metadata.sh" \
-  "$artifact" "$metadata" flotilla-org/flotilla not-a-sha linux-x86_64 \
+  "$artifact" "$metadata" flotilla-org/flotilla not-a-sha \
+  fleet-not-a-sha linux-x86_64 \
   >/dev/null 2>&1; then
   echo "metadata helper accepted an invalid commit SHA" >&2
   exit 1
@@ -43,51 +50,49 @@ fi
 
 stub_bin="$test_dir/bin"
 mkdir "$stub_bin"
-ln -s "$repo_root/scripts/test-support/fake-forgejo-curl" "$stub_bin/curl"
-curl_log="$test_dir/curl.log"
-uploaded="$test_dir/uploaded"
+ln -s "$repo_root/scripts/test-support/fake-github-gh" "$stub_bin/gh"
+gh_log="$test_dir/gh.log"
+gh_state="$test_dir/gh-state"
 
 publish() {
   env \
     PATH="$stub_bin:$PATH" \
-    FORGEJO_SERVER_URL=https://forgejo.example \
-    FORGEJO_PACKAGE_OWNER=robert \
-    FORGEJO_PACKAGE_NAME=flotilla \
-    FORGEJO_PACKAGE_VERSION="$commit_sha-0123456789ab" \
-    FORGEJO_PACKAGE_TOKEN=secret \
-    FAKE_CURL_STATUS="$1" \
-    FAKE_CURL_LOG="$curl_log" \
-    FAKE_CURL_REMOTE="${2:-$artifact}" \
-    FAKE_CURL_UPLOADED="$uploaded" \
-    "$repo_root/scripts/publish-forgejo-generic.sh" "$artifact"
+    GH_TOKEN=secret \
+    GITHUB_REPOSITORY=flotilla-org/flotilla \
+    GITHUB_SHA="$commit_sha" \
+    FAKE_GH_STATE_DIR="$gh_state" \
+    FAKE_GH_LOG="$gh_log" \
+    "$repo_root/scripts/publish-github-release.sh" "$artifact"
 }
 
-publish 404 >/dev/null
-cmp -s "$artifact" "$uploaded"
-grep -Fxq upload "$curl_log"
+publish >/dev/null
+cmp -s "$artifact" "$gh_state/assets/artifact"
+grep -Fxq create:artifact "$gh_log"
 
-: >"$curl_log"
-publish 200 "$artifact" >/dev/null
-grep -Fxq get:200 "$curl_log"
-if grep -Fxq upload "$curl_log"; then
-  echo "idempotent publication uploaded an existing artifact" >&2
+: >"$gh_log"
+publish >/dev/null
+grep -Fxq download:artifact "$gh_log"
+if grep -Fq create: "$gh_log"; then
+  echo "idempotent publication recreated an existing release" >&2
   exit 1
 fi
 
-printf 'different bytes\n' >"$test_dir/different"
-if publish 200 "$test_dir/different" >/dev/null 2>&1; then
-  echo "publisher accepted conflicting immutable bytes" >&2
+printf 'different bytes\n' >"$artifact"
+if publish >/dev/null 2>&1; then
+  echo "publisher accepted conflicting release bytes" >&2
   exit 1
 fi
 
 if env \
-  FORGEJO_SERVER_URL=https://forgejo.example \
-  FORGEJO_PACKAGE_OWNER=robert \
-  FORGEJO_PACKAGE_NAME=flotilla \
-  FORGEJO_PACKAGE_VERSION=invalid/version \
-  FORGEJO_PACKAGE_TOKEN=secret \
-  "$repo_root/scripts/publish-forgejo-generic.sh" "$artifact" \
+  PATH="$stub_bin:$PATH" \
+  GH_TOKEN=secret \
+  GITHUB_REPOSITORY=flotilla-org/flotilla \
+  GITHUB_SHA="$commit_sha" \
+  GITHUB_RELEASE_TAG=invalid-tag \
+  FAKE_GH_STATE_DIR="$gh_state" \
+  FAKE_GH_LOG="$gh_log" \
+  "$repo_root/scripts/publish-github-release.sh" "$artifact" \
   >/dev/null 2>&1; then
-  echo "publisher accepted an invalid package version" >&2
+  echo "publisher accepted an invalid release tag" >&2
   exit 1
 fi

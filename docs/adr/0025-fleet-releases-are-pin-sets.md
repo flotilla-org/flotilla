@@ -3,9 +3,10 @@
 **Status:** Accepted
 **Date:** 2026-07-29
 **Relates to:** ADR 0022 (publishing credentials remain runner-local material),
-#917 (fleet release design), #1258 (first publishing slice), #1225 (capability
-regression gates), #1229 (wire-generation handshake), #1243 (store decode
-quarantine), #1257 (replication convergence evidence).
+#917 (fleet release design), #1258 (first publishing slice and amended CI
+ruling), #1225 (capability regression gates), #1229 (wire-generation
+handshake), #1243 (store decode quarantine), #1257 (replication convergence
+evidence).
 
 Fleet deployment was a set of hand rituals: build whichever repositories had
 changed, copy binaries between hosts, remember whether a schema change required
@@ -33,45 +34,50 @@ The initial publishers are:
 - `andamento`: the controller, rail, and config `wasm32-wasip1` plugins;
 - `mattpocock-skills` and `rjw-skills`: exact source bundles.
 
-### Forgejo's generic package registry is the artifact store
+### GitHub Releases are the public artifact boundary
 
-Workflow-run artifacts are temporary and cannot be addressed reliably from a
-later workflow run. The generic registry provides a durable URL whose owner,
-package, version, and file name can all be pinned. Versions are immutable:
-publishing an existing name is accepted only when its bytes are identical.
+GitHub Actions runs each repository's publisher on a push to `main`. Build jobs
+may use short-lived Actions artifacts to transfer files between jobs, but those
+temporary files are never release coordinates. A final job creates a GitHub
+Release tagged `fleet-<full-commit-sha>` and uploads the candidate artifacts and
+their adjacent metadata files.
 
-Every file has an adjacent JSON metadata file. Schema version 1 records:
+Release publication is retry-safe. An existing release is accepted only when it
+targets the expected commit, and an existing asset is accepted only when its
+bytes are identical. Conflicting bytes are never replaced.
+
+Every artifact has an adjacent JSON metadata file. Schema version 2 records:
 
 - source repository and full commit SHA;
+- GitHub release tag, artifact URL, and metadata URL;
 - platform;
 - artifact file name, byte size, and SHA-256;
 - whether the file is signed;
 - wire generation for Flotilla binaries.
 
-Flotilla package versions are `<full-sha>-<wire-generation>`; all other package
-versions are the full source SHA. The current wire generation is Git's
-12-character short form for that commit, matching desk builds of the same
-checkout. The two axes remain explicit so a future wire-generation scheme does
+The project-map pin references these GitHub release assets directly. The current
+Flotilla wire generation is Git's 12-character short form for the commit,
+matching desk builds of the same checkout. Full source identity and wire
+compatibility remain separate fields so a future wire-generation scheme does
 not change the pin vocabulary.
 
-### Builds and signing happen only on named fleet runners
+### Builds and signing happen only on self-hosted release runners
 
-Forgejo Actions host runners labeled `feta` and `comte` are the only publishers.
-Each job also checks the host name, operating system, and architecture before
-checking out or building source, so copying a runner label onto a desk does not
-turn that desk into a publisher.
+Workflows select GitHub self-hosted runners by public capabilities only:
+operating system, architecture, and generic `fleet-release` or
+`fleet-release-signing` labels. They contain no machine names, private network
+topology, private registry coordinates, or runner-specific filesystem values.
 
-Darwin CLI artifacts are signed on Comte with the Change Direction Apple
-Development identity and the repository's standard CLI entitlement set. The set
-is intentionally empty: these are unsandboxed command-line programs, and adding
-sandbox or runtime exceptions would either break them or weaken the signature.
-The workflow verifies each signature before publishing it.
+Darwin CLI artifacts are signed on the signing-capable runner with the identity
+provided by its `FLEET_CODESIGN_IDENTITY` environment. Cleat's compatible macOS
+SDK location is likewise supplied as `FLEET_MACOS_SDK`. These values and signing
+key access are runner-side operator configuration, never repository data. The
+workflows sign a disposable probe before building and strictly verify each
+published Darwin binary.
 
-Publishing uses a Forgejo owner token stored as the repository secret
-`PACKAGE_TOKEN`. It is not committed, baked into an image, or inherited from a
-developer desk. This is the static runner credential case governed by ADR 0022;
-it can later move behind the same credential declaration/lease machinery without
-changing artifact identities.
+The publishing job receives only GitHub's scoped workflow token and declares
+`contents: write`; build jobs retain `contents: read`. No package-registry
+credential or developer credential is stored in the repositories.
 
 ### Deployment is pull convergence over a pin
 
@@ -81,21 +87,24 @@ generation, image presence, and store epoch before switching. It must postflight
 daemon heartbeat, epoch, non-regressed capabilities, and advancing replication
 cursors. Failure leaves the previous pin active and records why.
 
-The crew image is rebuilt as a top layer for a fleet release, with that pin's
-Linux Flotilla CLI and skills bundles baked in. Live host skill directories and
-daemon bind mounts remain development overrides, not the production delivery
-path.
+Building the crew-image top layer is not repository release CI. Slice 3 owns a
+lab-side builder that pulls the GitHub assets pinned by `project-map`, builds the
+image, and publishes it to the private registry. Only the lab-side project-map
+pin knows that registry coordinate.
 
 ## Consequences
 
 - A repository merge produces only that repository's immutable candidate
-  artifacts. Release assembly is cheap and can choose latest-green or explicit
-  older pins without rebuilding.
-- A pin file can name every byte unambiguously and verify it before activation.
-- Sleeping or disconnected hosts catch up when they can reach the pin and
-  registry; deploy does not depend on a one-shot push window.
+  artifacts. Release assembly can choose latest-green or explicit older pins
+  without rebuilding.
+- A pin file can name every public release byte unambiguously and verify it
+  before activation.
+- Private network topology, registry locations, signing identities, and SDK
+  paths do not leak into repository workflows.
+- Sleeping or disconnected hosts catch up from GitHub when they can reach the
+  pin; deploy does not depend on a one-shot push window.
 - Store-breaking changes must bump `store_epoch` in the pin. The updater
   snapshots the old store to a dated `pre-*` directory and starts a fresh epoch;
   quarantine remains a safety net for unmarked breaks, not the upgrade method.
-- Registering and maintaining the two host runners, their signing identity, and
-  repository secrets are explicit operator responsibilities.
+- Registering and maintaining the self-hosted runners, signing access, and
+  runner-side environment are explicit operator responsibilities.
