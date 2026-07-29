@@ -47,7 +47,7 @@ jobs:
           git fetch --force --no-tags --depth=1 origin "$GITHUB_SHA"
           git checkout --force --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          git clean -ffdx
+          git clean -ffdx -e target/
 
       - name: Build debug-profile binaries
         run: |
