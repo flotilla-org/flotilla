@@ -40,14 +40,14 @@ The recommended cut is therefore:
 
 1. retain vessels, stances, repository scope, credential declarations, and
    crew roles as the **actor/placement topology**;
-2. extend the workflow snapshot with a declarative **turn, gate, and
+2. extend the workflow snapshot with a declarative **Leg, gate, and
    subscription program** that can request only transitions already admitted
    by the resource's declared state machine;
 3. add a durable, auditable **event inbox and engagement records** to the convoy
    instance; and
 4. keep reconcilers level-triggered and authoritative for observed conditions,
-   while engagements are imperative, re-entrant turns sent to a selected crew
-   role.
+   while engagements are imperative, re-entrant conversational rounds sent to
+   a selected crew role.
 
 The semantic unit is not “run this agent pod once.” It is:
 
@@ -93,6 +93,16 @@ The existing model is consequently already richer than a generic state
 machine's `Task`. Replacing it would discard placement, authority, isolation,
 and conversational identity exactly where the new workflow substrate needs
 them.
+
+The established name for the control-side script is **Leg**: `CONTEXT.md`
+defines a Leg as a broad workflow phase carrying prompts and information
+routing, materialized by zero or more Vessels; ADR 0008 names it alongside
+Convoy and `VesselRequirement` as a runtime primitive
+(`CONTEXT.md:84-100`; `docs/adr/0008-agentic-first-orchestration.md:16-27`).
+This note uses **engagement** for one concrete, addressed conversational round
+within a Leg. A Leg may create one or more engagements across its materializing
+Vessels, and may be revisited; an engagement record is runtime history, not a
+replacement term for Leg.
 
 There is also an accepted outer safety envelope. ADR 0024 requires every
 lifecycle-bearing resource to declare one transition table as Rust data beside
@@ -310,7 +320,7 @@ level-triggered reconciler ── computes current declared transition/gate
 durable event/inbox record ── selects or creates one crew engagement
         │
         ▼
-stateful imperative crew turn ── conversation, tools, side effects, report
+stateful crew engagement ──────── conversation, tools, side effects, report
         │
         └──────────── claims/results/observations return to resource store
 ```
@@ -353,12 +363,13 @@ The distinction that #1268 must preserve is:
 - **Outer resource lifecycle:** the fixed ADR 0024 transition table over
   `ConvoyPhase`, `WorkPhase`, and `CrewWorkPhase`. This is the safety and field
   ownership boundary. Workflow data cannot extend its edge set.
-- **Inner workflow program:** named turns, subscriptions, gates, and outcome
+- **Inner workflow program:** named Legs, subscriptions, gates, and outcome
   actions. It may loop and re-engage a role many times while the outer convoy
   remains `Landing`, or request a declared `Anchored → Active`-style edge
   through the authorized claim writer.
 
-An inner turn name such as `shepherd-round` is not a new `ConvoyPhase`.
+An inner Leg name such as `shepherding` is not a new `ConvoyPhase`. Each
+matched review episode can create a distinct engagement of that Leg.
 
 ```yaml
 inputs:
@@ -374,13 +385,13 @@ vessels:                         # existing actor/placement topology
       - role: reviewer
         selector: { capability: code-review }
 
-turns:                           # inner logical program, not ConvoyPhase
+legs:                            # control-side script, not ConvoyPhase
   - name: initial
     engage:
       vessel: work
       role: coder
       prompt_template: initial
-  - name: shepherd-round
+  - name: shepherding
     engage:
       vessel: work
       role: coder
@@ -397,7 +408,7 @@ subscriptions:
       key: review-round
       quiet_period: 20s
     request:
-      turn: shepherd-round
+      leg: shepherding
       mode: resume-or-deliver
       # If a phase move is needed, select one edge from the fixed ADR 0024
       # table; do not define `from`/`to` here.
@@ -421,8 +432,9 @@ outcomes:
 ### Why extension is the sound cut
 
 `vessels` answers **who/where/with what isolation and credentials**.
-`turns` answers **which repeatable conversation to engage**.
-`subscriptions` answer **which changing facts can request another turn**.
+`legs` answers **which script and information routing to materialize**.
+`subscriptions` answer **which changing facts can request another engagement
+of a Leg**.
 The ADR 0024 table continues to answer **which resource phase moves are legal
 and who may write them**.
 An instance-side inbox answers **what actually arrived and what happened to
@@ -433,14 +445,14 @@ The runtime shape should include at least:
 ```text
 WorkflowSnapshot
   vessels[]                 existing, pinned at admission
-  turns[]
+  legs[]
   subscriptions[]
   gates[]
   outcomes[]
 
 ConvoyStatus
   phase                     existing outer ConvoyPhase
-  program_position          inner turn/gate position, if one is needed
+  program_position          inner Leg/gate position, if one is needed
   event_cursor(s)
   inbox[event_id]           observed, matched, coalesced, delivered, acked
   engagements[id]          target role, prompt digest, attempt, result
@@ -495,18 +507,19 @@ change request,” independent of whether Flotilla created or adopted the branch
 
 ### G1 — What is the workflow semantic unit?
 
-- Is a vessel strictly an actor/placement boundary referenced by turns, or can
+- Is a vessel strictly an actor/placement boundary referenced by Legs, or can
   it also carry an inner program position distinct from its outer work phase?
-- Is an engagement/turn the disposable execution unit beneath a durable vessel?
+- Is an engagement the runtime materialization of a Leg for one role, or can
+  one engagement span several roles/Vessels?
 - Can two roles on one vessel have concurrent engagements, and who serializes
   writes to the shared checkout?
 
-### G2 — How does the current DAG extend into a turn program?
+### G2 — How does the current DAG extend into a Leg program?
 
-- Does `depends_on` compile into initial turn readiness, remain a separate
+- Does `depends_on` compile into initial Leg readiness, remain a separate
   topology relation, or disappear?
-- Are inner turn positions convoy-wide, per-vessel, or hierarchical?
-- How are turn loops represented without adding edges to the fixed ADR 0024
+- Are inner Leg positions convoy-wide, per-vessel, or hierarchical?
+- How are Leg loops represented without adding edges to the fixed ADR 0024
   machine or making the original DAG validation meaningless?
 
 ### G3 — What is an event?
@@ -540,8 +553,8 @@ change request,” independent of whether Flotilla created or adopted the branch
 - Ordering per source, subject, subscription, vessel, or role?
 - What is the coalescing key and quiet period for review + checks + conflict?
 - What happens to an event arriving while the target role is already working?
-- When is an event acknowledged: persisted, message delivered, crew turn
-  started, or crew turn completed?
+- When is an event acknowledged: persisted, message delivered, engagement
+  started, or engagement completed?
 
 ### G7 — Who gets woken?
 
