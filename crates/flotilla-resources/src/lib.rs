@@ -92,9 +92,9 @@ pub use project::{
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use registry::{
     apply_resource_document, delete_resource_kind, get_resource_kind, list_resource_kind, list_resource_kind_including_replicas,
-    list_resource_kind_replica_sources, resource_document_spec_hash, resource_list_api_version, watch_resource_kind,
-    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceList,
-    DynamicResourceObject, DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
+    list_resource_kind_replica_sources, quarantine_undecodable_stored_objects, resource_document_spec_hash, resource_list_api_version,
+    watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources,
+    DynamicResourceList, DynamicResourceObject, DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
 };
 pub use replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass, ResourceProvenance};
 pub use repository::{
@@ -106,7 +106,7 @@ pub use resource::{
     api_version, ApiPaths, CausalDot, FieldMergeMetadata, InputMeta, K8sListMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject,
     K8sWatchEvent, MergeConflictSibling, MergeMetadata, ObjectMeta, OwnerReference, Resource, ResourceObject,
 };
-pub use retention::{EventRetention, ResourceStoreDiagnostics, ResourceStoreWarning};
+pub use retention::{EventRetention, ResourceDecodeQuarantine, ResourceStoreDiagnostics, ResourceStoreWarning};
 pub use sqlite::SqliteBackend;
 pub use status_patch::{apply_status_patch, apply_status_patch_checked, NoStatusPatch, StatusPatch};
 pub use terminal_session::{

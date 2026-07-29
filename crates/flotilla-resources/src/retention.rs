@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::ResourceError;
@@ -35,6 +36,15 @@ pub enum ResourceStoreWarning {
     ExcessiveEventToObjectRatio,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ResourceDecodeQuarantine {
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub error: String,
+    pub quarantined_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ResourceStoreDiagnostics {
     pub object_count: u64,
@@ -43,6 +53,8 @@ pub struct ResourceStoreDiagnostics {
     pub max_retained_events: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ResourceStoreWarning>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decode_quarantines: Vec<ResourceDecodeQuarantine>,
 }
 
 impl ResourceStoreDiagnostics {
@@ -58,7 +70,7 @@ impl ResourceStoreDiagnostics {
         if event_count > ratio_baseline.saturating_mul(Self::EVENT_TO_OBJECT_WARNING_MULTIPLIER) {
             warnings.push(ResourceStoreWarning::ExcessiveEventToObjectRatio);
         }
-        Self { object_count, event_count, resource_stream_count, max_retained_events, warnings }
+        Self { object_count, event_count, resource_stream_count, max_retained_events, warnings, decode_quarantines: Vec::new() }
     }
 
     pub fn event_log_within_retention(&self) -> bool {
