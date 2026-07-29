@@ -383,9 +383,10 @@ impl DaemonServer {
 
         // Accept loop
         let mut accept_error_backoff = AcceptErrorBackoff::default();
+        let mut accept_retry_at = None;
         loop {
             tokio::select! {
-                accept_result = listener.accept() => {
+                accept_result = listener.accept(), if accept_retry_at.is_none() => {
                     match accept_result {
                         Ok((stream, _addr)) => {
                             accept_error_backoff.reset();
@@ -424,9 +425,17 @@ impl DaemonServer {
                                 fd_exhausted = e.raw_os_error().is_some_and(|code| code == libc::EMFILE || code == libc::ENFILE),
                                 "failed to accept connection; backing off"
                             );
-                            tokio::time::sleep(delay).await;
+                            accept_retry_at = Some(tokio::time::Instant::now() + delay);
                         }
                     }
+                }
+                () = async {
+                    match accept_retry_at {
+                        Some(retry_at) => tokio::time::sleep_until(retry_at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    accept_retry_at = None;
                 }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
