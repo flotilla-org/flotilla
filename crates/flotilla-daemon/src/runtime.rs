@@ -209,6 +209,10 @@ struct RuntimeHealth {
 }
 
 impl RuntimeHealth {
+    fn report_capability_regression(&self, condition: HostCondition) {
+        self.failures.lock().expect("runtime health lock poisoned").insert(condition.condition_type.clone(), condition);
+    }
+
     fn report_restart_budget_exhausted(&self, exhausted: RestartBudgetExhausted) {
         let condition_type = format!("Controller/{}", exhausted.controller);
         let condition = HostCondition::builder()
@@ -240,6 +244,58 @@ impl RuntimeHealth {
     fn conditions(&self) -> Vec<HostCondition> {
         self.failures.lock().expect("runtime health lock poisoned").values().cloned().collect()
     }
+}
+
+struct AgentAdapterCapabilityAssessment {
+    baseline: BTreeSet<String>,
+    regression: Option<HostCondition>,
+}
+
+fn assess_agent_adapter_capabilities(
+    previous: Option<&HostStatus>,
+    current: &BTreeSet<String>,
+    health: &DaemonHealthIdentity,
+) -> AgentAdapterCapabilityAssessment {
+    let Some(previous) = previous else {
+        return AgentAdapterCapabilityAssessment { baseline: current.clone(), regression: None };
+    };
+    let baseline = match &previous.agent_adapter_baseline {
+        Some(baseline) => baseline.clone(),
+        None => match previous.agent_adapters() {
+            Ok(adapters) => adapters,
+            Err(error) => {
+                warn!(%error, "cannot compare agent adapter capabilities with previous daemon generation");
+                return AgentAdapterCapabilityAssessment { baseline: current.clone(), regression: None };
+            }
+        },
+    };
+    let same_daemon = previous.daemon_generation == health.generation && previous.daemon_started_at == Some(health.started_at);
+    if same_daemon {
+        return AgentAdapterCapabilityAssessment { baseline, regression: None };
+    }
+    let missing = baseline.difference(current).cloned().collect::<Vec<_>>();
+    if missing.is_empty() {
+        return AgentAdapterCapabilityAssessment { baseline: current.clone(), regression: None };
+    }
+
+    warn!(
+        previous_generation = ?previous.daemon_generation,
+        current_generation = ?health.generation,
+        baseline_adapters = ?baseline,
+        current_adapters = ?current,
+        missing_adapters = ?missing,
+        "host capabilities regressed across daemon restart"
+    );
+    let regression = Some(
+        HostCondition::builder()
+            .condition_type("CapabilityRegression")
+            .value(ConditionValue::False)
+            .reason("AgentAdaptersMissing")
+            .message(format!("agent adapters from the last non-regressed daemon generation are missing: {}", missing.join(", ")))
+            .observed_at(Utc::now())
+            .build(),
+    );
+    AgentAdapterCapabilityAssessment { baseline, regression }
 }
 
 #[cfg(test)]
@@ -1039,6 +1095,10 @@ async fn apply_host_heartbeat_with_credentials(
     let backend = daemon.resource_backend();
     let hosts = backend.using::<Host>(namespace);
     let host = hosts.get(&profile.host_id).await.map_err(|err| err.to_string())?;
+    let adapter_assessment = assess_agent_adapter_capabilities(host.status.as_ref(), &profile.available_agent_adapters, health);
+    if let Some(condition) = adapter_assessment.regression {
+        runtime_health.report_capability_regression(condition);
+    }
     let summary = daemon.local_host_summary().await;
     let resource_store = backend.diagnostics().await.map_err(|err| err.to_string())?;
     if let Some(diagnostics) = resource_store.as_ref().filter(|diagnostics| !diagnostics.warnings.is_empty()) {
@@ -1062,6 +1122,7 @@ async fn apply_host_heartbeat_with_credentials(
     let conditions = runtime_health.conditions();
     let status = HostStatus {
         capabilities: host_capabilities(&summary, profile, &held_credentials),
+        agent_adapter_baseline: Some(adapter_assessment.baseline),
         heartbeat_at: Some(Utc::now()),
         ready: conditions.is_empty(),
         resource_store,
@@ -3665,6 +3726,148 @@ mod tests {
             available_agent_adapters: BTreeSet::new(),
             docker_available,
         }
+    }
+
+    #[tokio::test]
+    async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let daemon = in_memory_daemon(Vec::new(), config).await;
+        let host_id = daemon.local_host_id().expect("local host id").to_string();
+        let mut first_profile = manual_profile(&host_id, false);
+        first_profile.available_agent_adapters = BTreeSet::from(["claude-code".to_string(), "codex".to_string()]);
+        ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration");
+        apply_host_heartbeat_with_credentials(
+            &daemon,
+            NAMESPACE,
+            &first_profile,
+            None,
+            &DaemonHealthIdentity {
+                generation: Some("generation-1".to_string()),
+                version: "1.0.0".to_string(),
+                started_at: Utc::now() - chrono::Duration::minutes(1),
+            },
+            &RuntimeHealth::default(),
+        )
+        .await
+        .expect("first generation heartbeat");
+        let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
+        let first_host = hosts.get(&host_id).await.expect("first generation host");
+        let mut legacy_status = first_host.status.expect("first generation status");
+        legacy_status.agent_adapter_baseline = None;
+        hosts
+            .update_status(&host_id, &first_host.metadata.resource_version, &legacy_status)
+            .await
+            .expect("simulate status written before the baseline field existed");
+
+        let mut restarted_profile = first_profile.clone();
+        restarted_profile.available_agent_adapters.remove("claude-code");
+        let runtime_health = RuntimeHealth::default();
+        let second_health =
+            DaemonHealthIdentity { generation: Some("generation-2".to_string()), version: "1.0.0".to_string(), started_at: Utc::now() };
+        let log_output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let writer = LogCaptureWriter(Arc::clone(&log_output));
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &restarted_profile, None, &second_health, &runtime_health)
+                .await
+                .expect("restarted generation heartbeat");
+        }
+
+        let status = daemon
+            .resource_backend()
+            .using::<Host>(NAMESPACE)
+            .get(&host_id)
+            .await
+            .expect("host after restart")
+            .status
+            .expect("host status after restart");
+        assert!(!status.ready, "capability regression should degrade the host");
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].condition_type, "CapabilityRegression");
+        assert_eq!(status.conditions[0].reason, "AgentAdaptersMissing");
+        assert!(status.conditions[0].message.contains("claude-code"));
+        assert_eq!(status.agent_adapter_baseline, Some(first_profile.available_agent_adapters.clone()));
+
+        let logs = String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+        assert!(logs.contains("host capabilities regressed across daemon restart"), "missing capability regression warning: {logs}");
+        assert!(logs.contains("claude-code"), "warning should name the missing adapter: {logs}");
+
+        log_output.lock().expect("log output lock should be healthy").clear();
+        {
+            let writer = LogCaptureWriter(Arc::clone(&log_output));
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &restarted_profile, None, &second_health, &runtime_health)
+                .await
+                .expect("same generation heartbeat");
+        }
+        let same_generation_logs =
+            String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+        assert!(
+            !same_generation_logs.contains("host capabilities regressed across daemon restart"),
+            "same generation heartbeat should not repeat the warning: {same_generation_logs}"
+        );
+
+        let third_runtime_health = RuntimeHealth::default();
+        log_output.lock().expect("log output lock should be healthy").clear();
+        {
+            let writer = LogCaptureWriter(Arc::clone(&log_output));
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            apply_host_heartbeat_with_credentials(
+                &daemon,
+                NAMESPACE,
+                &restarted_profile,
+                None,
+                &DaemonHealthIdentity {
+                    generation: Some("generation-3".to_string()),
+                    version: "1.0.0".to_string(),
+                    started_at: Utc::now() + chrono::Duration::minutes(1),
+                },
+                &third_runtime_health,
+            )
+            .await
+            .expect("third generation heartbeat");
+        }
+        let third_status = daemon
+            .resource_backend()
+            .using::<Host>(NAMESPACE)
+            .get(&host_id)
+            .await
+            .expect("host after repeated restart")
+            .status
+            .expect("host status after repeated restart");
+        assert!(!third_status.ready, "a repeated restart must not absorb the capability regression into its baseline");
+        assert_eq!(third_status.conditions.len(), 1);
+        assert_eq!(third_status.conditions[0].reason, "AgentAdaptersMissing");
+        assert!(third_status.conditions[0].message.contains("claude-code"));
+        assert_eq!(third_status.agent_adapter_baseline, Some(first_profile.available_agent_adapters));
+        let third_logs =
+            String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+        assert!(
+            third_logs.contains("host capabilities regressed across daemon restart"),
+            "each regressed daemon generation should warn: {third_logs}"
+        );
     }
 
     #[tokio::test]
