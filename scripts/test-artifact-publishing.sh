@@ -62,7 +62,8 @@ publish() {
     GITHUB_SHA="$commit_sha" \
     FAKE_GH_STATE_DIR="$gh_state" \
     FAKE_GH_LOG="$gh_log" \
-    "$repo_root/scripts/publish-github-release.sh" "$artifact"
+    "$repo_root/scripts/publish-github-release.sh" \
+    --expect artifact -- "$artifact"
 }
 
 publish >/dev/null
@@ -85,12 +86,45 @@ if publish >/dev/null 2>&1; then
   exit 1
 fi
 
+cohort_state="$test_dir/cohort-state"
+printf 'first asset\n' >"$test_dir/first"
+printf 'second asset\n' >"$test_dir/second"
+: >"$gh_log"
+env \
+  PATH="$stub_bin:$PATH" \
+  GH_TOKEN=secret \
+  GITHUB_REPOSITORY=flotilla-org/flotilla \
+  GITHUB_SHA="$commit_sha" \
+  FLEET_RELEASE_WAIT_ATTEMPTS=1 \
+  FAKE_GH_STATE_DIR="$cohort_state" \
+  FAKE_GH_LOG="$gh_log" \
+  "$repo_root/scripts/publish-github-release.sh" \
+  --expect first --expect second -- "$test_dir/first" >/dev/null
+cmp -s "$test_dir/first" "$cohort_state/assets/first"
+grep -Fxq true "$cohort_state/draft"
+if grep -Fxq publish-draft "$gh_log"; then
+  echo "publisher published before every expected cohort arrived" >&2
+  exit 1
+fi
+
+: >"$gh_log"
+env \
+  PATH="$stub_bin:$PATH" \
+  GH_TOKEN=secret \
+  GITHUB_REPOSITORY=flotilla-org/flotilla \
+  GITHUB_SHA="$commit_sha" \
+  FAKE_GH_STATE_DIR="$cohort_state" \
+  FAKE_GH_LOG="$gh_log" \
+  "$repo_root/scripts/publish-github-release.sh" \
+  --expect first --expect second -- "$test_dir/second" >/dev/null
+cmp -s "$test_dir/second" "$cohort_state/assets/second"
+grep -Fxq publish-draft "$gh_log"
+grep -Fxq false "$cohort_state/draft"
+
 draft_state="$test_dir/draft-state"
 mkdir -p "$draft_state/assets"
 printf '%s\n' "$commit_sha" >"$draft_state/target"
 printf 'true\n' >"$draft_state/draft"
-printf 'first asset\n' >"$test_dir/first"
-printf 'second asset\n' >"$test_dir/second"
 cp "$test_dir/first" "$draft_state/assets/first"
 : >"$gh_log"
 env \
@@ -101,6 +135,7 @@ env \
   FAKE_GH_STATE_DIR="$draft_state" \
   FAKE_GH_LOG="$gh_log" \
   "$repo_root/scripts/publish-github-release.sh" \
+  --expect first --expect second -- \
   "$test_dir/first" "$test_dir/second" >/dev/null
 cmp -s "$test_dir/second" "$draft_state/assets/second"
 grep -Fxq upload:second "$gh_log"
@@ -116,6 +151,7 @@ if env \
   FAKE_GH_STATE_DIR="$draft_state" \
   FAKE_GH_LOG="$gh_log" \
   "$repo_root/scripts/publish-github-release.sh" \
+  --expect first --expect second -- \
   "$test_dir/first" "$test_dir/second" >/dev/null 2>&1; then
   echo "publisher repaired an incomplete published release" >&2
   exit 1

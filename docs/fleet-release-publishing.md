@@ -10,7 +10,10 @@ fleet-<full-commit-sha>
 
 The workflows use GitHub self-hosted runners and select them only by operating
 system, architecture, and generic release capabilities. They do not contain
-runner names, private network topology, or private registry coordinates.
+runner names, private network topology, or private registry coordinates. Linux
+and Darwin are separate workflows where both platforms are published. Their
+platform-specific concurrency keys prevent duplicate same-platform work without
+letting an unavailable signing runner block Linux.
 
 ## Release coordinates
 
@@ -29,8 +32,30 @@ coordinate/digest it selects. Release tags are repository-local, so every pin
 also names the source repository. Consumers must verify the metadata repository,
 commit, release tag, asset URL, and digest before executing or unpacking a file.
 
-GitHub Actions artifacts are used only as one-day job-to-job transfer storage.
-They are not stable inputs and must never appear in a project-map pin.
+The workflows do not use GitHub Actions artifacts. Every cohort builds, tests,
+describes, and publishes directly from one runner workspace.
+
+## Portable workflow boundary
+
+Every workflow has portable checkout, build, test, metadata, and signing shell
+steps followed by exactly one provider-specific step:
+
+```yaml
+# Publishing adapter: a Forgejo fork replaces only this step.
+- name: Publish GitHub Release assets
+```
+
+No remote Actions are used. GitHub's remote-action syntax accepts
+`owner/repository@ref`, while Forgejo's fully qualified form is an absolute URL;
+using only shell steps avoids baking either engine's action-resolution rules or
+Actions-artifact implementation into the portable portion. Any future remote
+Action must use that engine's fully qualified immutable reference, never an
+instance-relative shorthand.
+
+The GitHub adapter receives `GH_TOKEN` and calls
+`scripts/publish-github-release.sh`. A future lab-side Forgejo fork replaces
+that one step with its publishing adapter. The artifact manifest and every
+preceding step remain unchanged.
 
 ## Runner registration and environment
 
@@ -66,7 +91,7 @@ usable.
 
 The Darwin workflows use `packaging/macos-cli.entitlements`, an intentionally
 empty entitlement set for unsandboxed CLI executables, then run strict signature
-verification before transfer.
+verification before publication.
 
 ## Repository setup
 
@@ -84,12 +109,15 @@ repository-scoped GitHub workflow token.
 
 ## Retry and recovery
 
-Re-running a failed publishing job is safe. A matching draft release is resumed:
-existing assets must have identical bytes, missing assets are uploaded, and the
-draft is published only after the complete input set has been checked. A
-published release is immutable; if one is missing an expected asset or contains
-different bytes, the job stops for operator investigation instead of modifying
-it.
+Re-running a failed publishing workflow is safe. A matching draft release is
+resumed: existing local assets must have identical bytes and missing local
+assets are uploaded. Each platform supplies the same expected-asset manifest.
+The first cohort leaves the release as a draft while another cohort is missing;
+overlapping cohorts briefly poll the manifest, and the workflow that completes
+it publishes it. Draft creation and finalization tolerate another cohort
+winning the same operation. A published release is immutable; if one is missing
+an expected asset or contains different bytes, the job stops for operator
+investigation instead of modifying it.
 
 ## Verification after a merge
 

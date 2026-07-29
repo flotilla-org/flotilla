@@ -36,17 +36,23 @@ The initial publishers are:
 
 ### GitHub Releases are the public artifact boundary
 
-GitHub Actions runs each repository's publisher on a push to `main`. Build jobs
-may use short-lived Actions artifacts to transfer files between jobs, but those
-temporary files are never release coordinates. A final job creates a GitHub
-Release tagged `fleet-<full-commit-sha>` and uploads the candidate artifacts and
-their adjacent metadata files.
+GitHub Actions runs each repository's publishers on a push to `main`. Each
+workflow builds one local artifact cohort and ends in one provider-specific
+publishing-adapter step. It does not use Actions artifacts or another
+provider-specific transport between jobs. The adapter creates a GitHub Release
+tagged `fleet-<full-commit-sha>` and uploads the local artifacts and their
+adjacent metadata files.
 
 Release publication is retry-safe. An existing release is accepted only when it
 targets the expected commit, and an existing asset is accepted only when its
 bytes are identical. An interrupted draft is completed and published only after
-all expected assets have been checked or uploaded. A published release with a
-missing asset fails closed, and conflicting bytes are never replaced.
+all expected cohorts have uploaded the manifest's complete asset set. Linux and
+Darwin use independent concurrency groups so an unavailable signing runner
+cannot block Linux from building. Draft creation tolerates a competing creator,
+and each cohort briefly polls the shared manifest so overlapping publishers
+converge; an earlier cohort may leave a draft and a later cohort publishes it.
+A published release with a missing asset fails closed, and conflicting bytes
+are never replaced.
 
 Every artifact has an adjacent JSON metadata file. Schema version 2 records:
 
@@ -77,9 +83,25 @@ key access are runner-side operator configuration, never repository data. The
 workflows sign a disposable probe before building and strictly verify each
 published Darwin binary.
 
-The publishing job receives only GitHub's scoped workflow token and declares
-`contents: write`; build jobs retain `contents: read`. No package-registry
-credential or developer credential is stored in the repositories.
+The workflow job declares `contents: write` because GitHub permissions are
+job-scoped, but only the final publishing-adapter step receives the workflow
+token in its environment. Portable checkout, build, test, and signing steps do
+not reference that token. No package-registry credential or developer
+credential is stored in the repositories.
+
+### Publishing is the provider seam
+
+Checkout, build, test, metadata generation, and signing use portable shell steps
+and the GitHub-compatible environment shared by Forgejo Actions. The workflows
+deliberately use no remote Actions, avoiding both Actions-artifact transport and
+the engines' incompatible fully-qualified action locator syntax. If a remote
+Action is introduced later, it must use the engine's fully qualified,
+immutable form rather than an instance-relative shorthand.
+
+A future lab-side Forgejo fork replaces only the final publishing-adapter step
+with its Forgejo release or package implementation. Artifact names, expected
+asset manifests, metadata, build commands, signature gates, runner capability
+labels, and all preceding steps remain unchanged.
 
 ### Deployment is pull convergence over a pin
 
