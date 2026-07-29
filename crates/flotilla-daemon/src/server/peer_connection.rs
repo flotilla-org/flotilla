@@ -13,7 +13,7 @@ use super::{
     peer_runtime::disconnect_peer_and_rebuild, sync_peer_query_state, ConnectionDirection, ConnectionMeta, PeerConnectedNotice,
     PeerConnectionEvent, SocketPeerSender,
 };
-use crate::peer::{ActivationResult, InboundPeerEnvelope, PeerManager};
+use crate::peer::{reverse_peer_resource_socket_path, ActivationResult, InboundPeerEnvelope, PeerManager};
 
 pub(super) const PEER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -117,10 +117,16 @@ impl PeerConnection {
 
         sync_peer_query_state(&self.peer_manager, &self.daemon).await;
         self.daemon.publish_peer_connection_status(&peer_node, PeerConnectionState::Connected).await;
+        let resource_socket_path = match self.daemon.daemon_socket_path().await {
+            Some(daemon_socket_path) => reverse_peer_resource_socket_path(&daemon_socket_path, &node_id)
+                .inspect_err(|error| warn!(peer = %node_id, %error, "cannot derive reverse-forwarded resource socket"))
+                .ok(),
+            None => None,
+        };
         let _ = self.peer_connected_tx.send(PeerConnectionEvent::Connected(PeerConnectedNotice {
             peer: node_id.clone(),
             generation,
-            resource_socket_path: None,
+            resource_socket_path,
         }));
 
         let idle_deadline = tokio::time::sleep(PEER_IDLE_TIMEOUT);

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use flotilla_protocol::NodeId;
 use futures::{stream::BoxStream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -9,15 +10,16 @@ use crate::{
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
     Checkout, Clone as CloneResource, Convoy, CredentialGrant, CredentialSpec, Demand, Environment, Host, InputMeta, MaterialPool,
-    ObjectMeta, OwnerReference, PlacementPolicy, Presentation, Project, ReadResourceList, ReadWatchEvent, Regard, Repository, Resource,
-    ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart,
-    WorkflowTemplate,
+    ObjectMeta, OwnerReference, PlacementPolicy, Presentation, Project, ReadResourceList, ReadWatchEvent, Regard, ReplicaCursor,
+    ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
+    TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegisteredResourceKind {
     pub kind: &'static str,
     pub plural: &'static str,
+    pub replication_class: ReplicationClass,
     aliases: &'static [&'static str],
     resource: RegisteredResource,
 }
@@ -127,7 +129,13 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
 ];
 
 const fn kind<T: Resource>(resource: RegisteredResource, aliases: &'static [&'static str]) -> RegisteredResourceKind {
-    RegisteredResourceKind { kind: T::API_PATHS.kind, plural: T::API_PATHS.plural, aliases, resource }
+    RegisteredResourceKind {
+        kind: T::API_PATHS.kind,
+        plural: T::API_PATHS.plural,
+        replication_class: T::REPLICATION_CLASS,
+        aliases,
+        resource,
+    }
 }
 
 macro_rules! dispatch_resource_kind {
@@ -225,6 +233,23 @@ pub async fn list_resource_kind_including_replicas(
     requested_kind: &str,
 ) -> Result<DynamicResourceList, ResourceError> {
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, list_typed_including_replicas(backend, namespace).await)
+}
+
+pub async fn replica_cursor_for_resource_kind(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    origin_root: &NodeId,
+) -> Result<Option<ReplicaCursor>, ResourceError> {
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, replica_cursor_typed(backend, namespace, origin_root).await)
+}
+
+async fn replica_cursor_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    origin_root: &NodeId,
+) -> Result<Option<ReplicaCursor>, ResourceError> {
+    backend.replica_writer::<T>(origin_root.clone(), namespace).cursor().await
 }
 
 pub async fn get_resource_kind(

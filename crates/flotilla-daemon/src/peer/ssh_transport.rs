@@ -41,6 +41,27 @@ pub(crate) fn peer_resource_socket_path(peer_resource_socket_dir: &Path, config_
     Ok(peer_resource_socket_dir.join(format!("{}.sock", config_label.0)))
 }
 
+/// Path bound on the accepting peer by the reverse half of an SSH resource
+/// tunnel. Both ends derive it from the accepting daemon socket and the
+/// dialing node identity, so no follower-side peer configuration is needed.
+pub(crate) fn reverse_peer_resource_socket_path(daemon_socket: &Path, dialing_node: &NodeId) -> Result<PathBuf, String> {
+    let parent = daemon_socket
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| format!("daemon socket has no parent directory: {}", daemon_socket.display()))?;
+    let node_hash = dialing_node
+        .as_str()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3));
+    Ok(parent.join(format!(".peer-{node_hash:016x}")))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SshTransportPaths<'a> {
+    pub state_dir: &'a Path,
+    pub daemon_socket: &'a Path,
+}
+
 struct ChannelPeerSender {
     tx: tokio::sync::Mutex<Option<mpsc::Sender<PeerWireMessage>>>,
 }
@@ -61,13 +82,15 @@ impl PeerSender for ChannelPeerSender {
     }
 }
 
-/// SSH-based transport that forwards a remote daemon's Unix socket locally
-/// and exchanges peer wire messages over it.
+/// SSH-based transport that forwards both daemons' Unix sockets over one SSH
+/// connection and exchanges peer wire messages over the local forward.
 ///
-/// The transport spawns `ssh -N -L <local>:<remote> [user@]host` as a child
-/// process, then connects to the locally-forwarded socket to read/write
-/// JSON-line `Message` values. Only `Message::Peer` payloads are forwarded;
-/// other message types on the wire are silently discarded.
+/// The transport spawns
+/// `ssh -N -L <local-resource>:<remote-daemon>
+///          -R <remote-resource>:<local-daemon> [user@]host`
+/// as a child process, then connects to the locally-forwarded socket to
+/// read/write JSON-line `Message` values. Only `Message::Peer` payloads are
+/// forwarded; other message types on the wire are silently discarded.
 pub struct SshTransport {
     local_node_id: NodeId,
     local_display_name: String,
@@ -76,6 +99,8 @@ pub struct SshTransport {
     expected_host_name: HostName,
     expected_node_id: Option<NodeId>,
     local_socket_path: PathBuf,
+    local_daemon_socket_path: PathBuf,
+    remote_resource_socket_path: PathBuf,
     ssh_process: Option<tokio::process::Child>,
     status: PeerConnectionStatus,
     /// Receiver for inbound peer data, produced by `connect_socket()` and
@@ -105,9 +130,10 @@ impl SshTransport {
         config: RemoteHostConfig,
         expected_node_id: Option<NodeId>,
         local_session_id: uuid::Uuid,
-        state_dir: &Path,
+        paths: SshTransportPaths<'_>,
     ) -> Result<Self, String> {
-        let local_socket_path = peer_resource_socket_path(&state_dir.join("peers"), &config_label)?;
+        let local_socket_path = peer_resource_socket_path(&paths.state_dir.join("peers"), &config_label)?;
+        let remote_resource_socket_path = reverse_peer_resource_socket_path(Path::new(&config.daemon_socket), &local_node_id)?;
         let expected_host_name = HostName::new(&config.expected_host_name);
 
         Ok(Self {
@@ -118,6 +144,8 @@ impl SshTransport {
             expected_host_name,
             expected_node_id,
             local_socket_path,
+            local_daemon_socket_path: paths.daemon_socket.to_path_buf(),
+            remote_resource_socket_path,
             ssh_process: None,
             status: PeerConnectionStatus::Disconnected,
             inbound_rx: None,
@@ -139,7 +167,7 @@ impl SshTransport {
             std::fs::create_dir_all(parent).map_err(|e| format!("failed to create peers directory: {e}"))?;
         }
 
-        let forward_spec = format!("{}:{}", self.local_socket_path.display(), self.config.daemon_socket);
+        let (forward_spec, reverse_forward_spec) = self.resource_forward_specs();
 
         let destination = match &self.config.user {
             Some(user) => format!("{user}@{}", self.config.hostname),
@@ -150,7 +178,8 @@ impl SshTransport {
             expected_host = %self.expected_host_name,
             label = %self.config_label.0,
             %destination,
-            forward = %forward_spec,
+            local_forward = %forward_spec,
+            reverse_forward = %reverse_forward_spec,
             "spawning SSH tunnel"
         );
 
@@ -158,8 +187,12 @@ impl SshTransport {
             .arg("-N") // no remote command
             .arg("-L")
             .arg(&forward_spec)
+            .arg("-R")
+            .arg(&reverse_forward_spec)
             .arg("-o")
             .arg("ExitOnForwardFailure=yes")
+            .arg("-o")
+            .arg("StreamLocalBindUnlink=yes")
             .arg("-o")
             .arg("ServerAliveInterval=15")
             .arg("-o")
@@ -174,6 +207,13 @@ impl SshTransport {
 
         self.ssh_process = Some(child);
         Ok(())
+    }
+
+    fn resource_forward_specs(&self) -> (String, String) {
+        (
+            format!("{}:{}", self.local_socket_path.display(), self.config.daemon_socket),
+            format!("{}:{}", self.remote_resource_socket_path.display(), self.local_daemon_socket_path.display()),
+        )
     }
 
     /// Wait for the forwarded local socket file to appear on disk.
@@ -513,10 +553,49 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Path::new("/tmp/flotilla-test"),
+            SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
         assert!(transport.local_socket_path.to_string_lossy().ends_with("peers/my-server.sock"));
+    }
+
+    #[test]
+    fn resource_socket_forward_specs_are_bidirectional() {
+        let config = RemoteHostConfig {
+            hostname: "feta.local".to_string(),
+            expected_host_name: "feta".to_string(),
+            expected_node_id: None,
+            user: Some("flotilla".to_string()),
+            daemon_socket: "/home/flotilla/.config/flotilla/flotilla.sock".to_string(),
+            ssh_multiplex: None,
+        };
+        let local_node = NodeId::new("kiwi-root");
+        let transport = SshTransport::new(
+            local_node.clone(),
+            "kiwi".into(),
+            ConfigLabel("feta".to_string()),
+            config,
+            None,
+            uuid::Uuid::nil(),
+            SshTransportPaths {
+                state_dir: Path::new("/home/kiwi/.local/state/flotilla"),
+                daemon_socket: Path::new("/home/kiwi/.config/flotilla/flotilla.sock"),
+            },
+        )
+        .expect("valid transport");
+
+        let (local_forward, reverse_forward) = transport.resource_forward_specs();
+
+        assert_eq!(local_forward, "/home/kiwi/.local/state/flotilla/peers/feta.sock:/home/flotilla/.config/flotilla/flotilla.sock");
+        assert_eq!(
+            reverse_forward,
+            format!(
+                "{}:/home/kiwi/.config/flotilla/flotilla.sock",
+                reverse_peer_resource_socket_path(Path::new("/home/flotilla/.config/flotilla/flotilla.sock"), &local_node)
+                    .expect("reverse path")
+                    .display()
+            )
+        );
     }
 
     #[test]
@@ -536,7 +615,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Path::new("/tmp/flotilla-test"),
+            SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         ) {
             Err(e) => assert!(e.contains("path separators"), "unexpected error: {e}"),
             Ok(_) => panic!("should reject host name with path separators"),
@@ -560,7 +639,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Path::new("/tmp/flotilla-test"),
+            SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
         assert_eq!(transport.status(), PeerConnectionStatus::Disconnected);
@@ -664,7 +743,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Path::new("/tmp/flotilla-test"),
+            SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
         assert!(transport.sender().is_none(), "disconnected transport should not expose a sender");
@@ -687,7 +766,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Path::new("/tmp/flotilla-test"),
+            SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
 
@@ -718,7 +797,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Path::new("/tmp/flotilla-test"),
+            SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
         transport.local_socket_path = socket_path.clone();
@@ -790,7 +869,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Path::new("/tmp/flotilla-test"),
+            SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
 

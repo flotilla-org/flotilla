@@ -2982,13 +2982,15 @@ fn host_seq_for(events: &[DaemonEvent], host_name: &NodeId) -> Option<u64> {
 #[tokio::test]
 async fn handle_client_forwards_peer_data_and_registers_peer() {
     let (_tmp, daemon) = empty_daemon().await;
+    let daemon_socket_path = PathBuf::from("/tmp/flotilla-follower.sock");
+    daemon.set_daemon_socket_path(daemon_socket_path.clone()).await;
     let expected_local_host = daemon.node_id().clone();
     let (peer_data_tx, mut peer_data_rx) = mpsc::channel(16);
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
-    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
+    let (peer_connected_tx, mut peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
 
     let (client_stream, server_stream) = tokio::net::UnixStream::pair().expect("pair");
 
@@ -3038,6 +3040,17 @@ async fn handle_client_forwards_peer_data_and_registers_peer() {
         }
         other => panic!("expected hello response, got {other:?}"),
     }
+    let connected = peer_connected_rx.recv().await.expect("peer connected notice");
+    let PeerConnectionEvent::Connected(notice) = connected else {
+        panic!("expected peer connected notice");
+    };
+    assert_eq!(
+        notice.resource_socket_path,
+        Some(
+            crate::peer::reverse_peer_resource_socket_path(&daemon_socket_path, &NodeId::new("remote-host")).expect("reverse socket path")
+        ),
+        "an inbound peer connection must expose the reverse-forwarded resource socket so follower replication can bootstrap",
+    );
 
     // Send a peer message from the client side
     let peer_msg = test_peer_msg("remote-host");
