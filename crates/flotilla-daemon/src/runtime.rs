@@ -207,11 +207,17 @@ struct DaemonHealthIdentity {
 #[derive(Debug, Clone, Default)]
 struct RuntimeHealth {
     failures: Arc<StdMutex<BTreeMap<String, HostCondition>>>,
+    restart_history_dir: Option<Arc<PathBuf>>,
 }
 
 impl RuntimeHealth {
     fn report_capability_regression(&self, condition: HostCondition) {
         self.failures.lock().expect("runtime health lock poisoned").insert(condition.condition_type.clone(), condition);
+    }
+
+    fn with_restart_history_dir(mut self, path: PathBuf) -> Self {
+        self.restart_history_dir = Some(Arc::new(path));
+        self
     }
 
     fn report_restart_budget_exhausted(&self, exhausted: RestartBudgetExhausted) {
@@ -243,7 +249,36 @@ impl RuntimeHealth {
     }
 
     fn conditions(&self) -> Vec<HostCondition> {
-        self.failures.lock().expect("runtime health lock poisoned").values().cloned().collect()
+        let mut conditions = self.failures.lock().expect("runtime health lock poisoned").values().cloned().collect::<Vec<_>>();
+        if let Some(state_dir) = self.restart_history_dir.as_deref() {
+            let condition = match crate::restart_history::recent_abnormal_restarts(state_dir, Utc::now()) {
+                Ok(frequency) if frequency.count > 0 => Some(
+                    HostCondition::builder()
+                        .condition_type("Daemon/AbnormalRestarts")
+                        .value(ConditionValue::False)
+                        .reason("AbnormalExitFrequency")
+                        .message(format!(
+                            "daemon restarted {}× after abnormal exits in {}m",
+                            frequency.count,
+                            frequency.window.as_secs() / 60
+                        ))
+                        .observed_at(Utc::now())
+                        .build(),
+                ),
+                Ok(_) => None,
+                Err(error) => Some(
+                    HostCondition::builder()
+                        .condition_type("Daemon/RestartTracking")
+                        .value(ConditionValue::False)
+                        .reason("RestartHistoryUnavailable")
+                        .message(error)
+                        .observed_at(Utc::now())
+                        .build(),
+                ),
+            };
+            conditions.extend(condition);
+        }
+        conditions
     }
 }
 
@@ -352,7 +387,10 @@ impl DaemonRuntime {
             started_at: Utc::now(),
         };
         daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools).await;
-        let runtime_health = RuntimeHealth::default();
+        let runtime_health = RuntimeHealth::default().with_restart_history_dir(config.state_dir().as_path().to_path_buf());
+        flotilla_resources::quarantine_undecodable_stored_objects(&daemon.resource_backend(), &options.namespace)
+            .await
+            .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
         flotilla_resources::PreparedSnapshotGarbageCollector::new(daemon.resource_backend(), &options.namespace)
             .recover_pending_claims()
@@ -1172,6 +1210,9 @@ async fn apply_host_heartbeat_with_credentials(
         .map_err(|error| format!("measure available disk space: {error}"))?;
     let mut conditions = runtime_health.conditions();
     conditions.extend(file_descriptor_pressure_condition());
+    if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
+        conditions.push(condition);
+    }
     let status = HostStatus {
         capabilities: host_capabilities(&summary, profile, &held_credentials),
         agent_adapter_baseline: Some(adapter_assessment.baseline),
@@ -1188,6 +1229,32 @@ async fn apply_host_heartbeat_with_credentials(
     hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|err| err.to_string())?;
     daemon.refresh_connected_peer_host_heartbeats().await;
     Ok(())
+}
+
+fn resource_decode_quarantine_condition(diagnostics: Option<&flotilla_resources::ResourceStoreDiagnostics>) -> Option<HostCondition> {
+    let quarantines = &diagnostics?.decode_quarantines;
+    if quarantines.is_empty() {
+        return None;
+    }
+    let identities = quarantines
+        .iter()
+        .map(|quarantine| format!("{}/{}: {}", quarantine.kind, quarantine.name, quarantine.error))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(
+        HostCondition::builder()
+            .condition_type("ResourceStore/DecodeQuarantine")
+            .value(ConditionValue::False)
+            .reason("StoredObjectDecodeFailed")
+            .message(format!(
+                "{} stored resource object{} quarantined after typed decode failure{}: {identities}",
+                quarantines.len(),
+                if quarantines.len() == 1 { "" } else { "s" },
+                if quarantines.len() == 1 { "" } else { "s" },
+            ))
+            .observed_at(Utc::now())
+            .build(),
+    )
 }
 
 fn host_capabilities(
@@ -2491,10 +2558,10 @@ mod tests {
     use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource};
     use flotilla_resources::{
         Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-        CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, LifecycleAuthority,
-        ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec, Selector, SqliteBackend,
-        TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, WorkPhase, WorkflowTemplate,
-        WorkflowTemplateSpec,
+        CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CredentialGrant, CredentialSpec,
+        CrewSource, CrewSpec, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec,
+        Resource, Selector, SqliteBackend, TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, WorkPhase,
+        WorkflowTemplate, WorkflowTemplateSpec,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
@@ -4017,6 +4084,121 @@ mod tests {
         std::fs::create_dir_all(config.state_dir()).expect("state dir");
         let backend = ResourceBackend::Sqlite(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend"));
         daemon_with_backend(tracked_repos, config, backend).await
+    }
+
+    fn insert_undecodable_resource<T: Resource>(connection: &rusqlite::Connection, name: &str) {
+        connection
+            .execute(
+                r#"
+                INSERT INTO resource_objects
+                    (group_name, version, kind, namespace, name, resource_version, body_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, 1, '{}')
+                "#,
+                rusqlite::params![T::API_PATHS.group, T::API_PATHS.version, T::API_PATHS.kind, NAMESPACE, name],
+            )
+            .expect("insert undecodable resource");
+    }
+
+    #[tokio::test]
+    async fn daemon_boot_quarantines_every_undecodable_replicated_kind_and_reports_them() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let sqlite_path = config.state_dir().join("resources.sqlite");
+        drop(SqliteBackend::open(&sqlite_path).expect("initialize sqlite store"));
+        let connection = rusqlite::Connection::open(&sqlite_path).expect("open raw sqlite store");
+        insert_undecodable_resource::<Project>(&connection, "poisoned-project");
+        insert_undecodable_resource::<Convoy>(&connection, "poisoned-convoy");
+        insert_undecodable_resource::<CredentialGrant>(&connection, "poisoned-credential-grant");
+        insert_undecodable_resource::<CredentialSpec>(&connection, "poisoned-credential-spec");
+        insert_undecodable_resource::<Host>(&connection, "poisoned-host");
+        insert_undecodable_resource::<Vessel>(&connection, "poisoned-vessel");
+        insert_undecodable_resource::<TerminalSession>(&connection, "poisoned-terminal-session");
+        drop(connection);
+
+        let log_output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = LogCaptureWriter(Arc::clone(&log_output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let daemon = sqlite_daemon(Vec::new(), Arc::clone(&config)).await;
+        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
+            heartbeat_interval: Duration::from_secs(300),
+            controller_resync_interval: Duration::from_secs(300),
+            start_controllers: false,
+            ..RuntimeOptions::default()
+        })
+        .await
+        .expect("daemon should boot with undecodable stored resources");
+
+        daemon.list_projects_internal().await.expect("daemon should serve project queries");
+        let health = daemon.fleet_health_internal().await.expect("daemon should serve fleet health");
+        let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
+        let diagnosis = local.degraded_conditions.join("; ");
+        for identity in [
+            "Project/poisoned-project",
+            "Convoy/poisoned-convoy",
+            "CredentialGrant/poisoned-credential-grant",
+            "CredentialSpec/poisoned-credential-spec",
+            "Host/poisoned-host",
+            "Vessel/poisoned-vessel",
+            "TerminalSession/poisoned-terminal-session",
+        ] {
+            assert!(diagnosis.contains(identity), "fleet diagnosis should name {identity}: {diagnosis}");
+        }
+
+        let logs = String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+        for field in ["kind", "name", "error"] {
+            assert!(logs.contains(field), "quarantine warning should include {field}: {logs}");
+        }
+        assert!(logs.contains("quarantin"), "quarantine warning should be explicit: {logs}");
+
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn daemon_reports_recent_abnormal_restart_frequency_in_fleet_health() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let now = Utc::now();
+        fs::write(
+            config.state_dir().join("flotillad-abnormal-exits.json"),
+            serde_json::to_vec(&json!({
+                "abnormal_exits": [
+                    now - chrono::Duration::minutes(3),
+                    now - chrono::Duration::minutes(8),
+                    now - chrono::Duration::minutes(21),
+                    now - chrono::Duration::minutes(45),
+                ]
+            }))
+            .expect("serialize restart history"),
+        )
+        .expect("seed restart history");
+
+        let daemon = sqlite_daemon(Vec::new(), Arc::clone(&config)).await;
+        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
+            heartbeat_interval: Duration::from_secs(300),
+            controller_resync_interval: Duration::from_secs(300),
+            start_controllers: false,
+            ..RuntimeOptions::default()
+        })
+        .await
+        .expect("daemon should start");
+
+        let health = daemon.fleet_health_internal().await.expect("fleet health");
+        let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
+        assert!(
+            local.degraded_conditions.iter().any(|condition| condition.contains("daemon restarted 3× after abnormal exits in 30m")),
+            "fleet diagnosis should surface the restart window: {:?}",
+            local.degraded_conditions
+        );
+
+        runtime.shutdown();
     }
 
     async fn crew_daemon(config: Arc<ConfigStore>) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {

@@ -30,6 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 visibility = "0.1.1"
+libc = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
