@@ -1,4 +1,5 @@
 mod aggregator;
+mod codex_slot;
 mod credential;
 mod issue_materializer;
 pub mod resource_manifest;

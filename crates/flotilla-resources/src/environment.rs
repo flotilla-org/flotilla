@@ -27,6 +27,9 @@ pub struct DockerEnvironmentSpec {
     /// Agent adapters the placement policy expects discovery to find in the image.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub declared_agent_adapters: BTreeSet<String>,
+    /// Agent adapters this specific vessel workflow will actually launch.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub required_agent_adapters: BTreeSet<String>,
     #[serde(default)]
     pub pull_policy: DockerImagePullPolicy,
     #[serde(default)]
@@ -76,6 +79,7 @@ pub struct EnvironmentStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentStatusPatch {
     MarkReady { docker_container_id: Option<String>, image_ref: Option<String>, image_digest: Option<String> },
+    MarkWaiting { message: String },
     MarkFailed { message: String },
     MarkTerminating,
 }
@@ -90,6 +94,11 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
                 status.image_ref = image_ref.clone();
                 status.image_digest = image_digest.clone();
                 status.message = None;
+            }
+            Self::MarkWaiting { message } => {
+                status.phase = EnvironmentPhase::Pending;
+                status.ready = false;
+                status.message = Some(message.clone());
             }
             Self::MarkFailed { message } => {
                 status.phase = EnvironmentPhase::Failed;

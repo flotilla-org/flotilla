@@ -17,9 +17,9 @@ use common::{
 };
 use flotilla_controllers::reconcilers::{
     checkout::CheckoutDeps, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
-    DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, HopChainContext, PreparedCheckout, PresentationPolicyRegistry,
-    PresentationReconciler, ProviderPresentationRuntime, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler,
-    VesselReconciler,
+    DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler, HopChainContext, PreparedCheckout,
+    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TerminalRuntime, TerminalRuntimeState,
+    TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
     path_context::DaemonHostPath,
@@ -52,7 +52,11 @@ struct FakeDockerRuntime {
 
 #[async_trait]
 impl DockerEnvironmentRuntime for FakeDockerRuntime {
-    async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+    async fn provision(
+        &self,
+        name: &str,
+        spec: &flotilla_resources::DockerEnvironmentSpec,
+    ) -> Result<DockerProvisioning, DockerProvisioningError> {
         Ok(DockerProvisioning {
             container_id: format!("container-{name}"),
             image_ref: spec.image.clone(),
@@ -60,7 +64,7 @@ impl DockerEnvironmentRuntime for FakeDockerRuntime {
         })
     }
 
-    async fn destroy(&self, container_id: &str) -> Result<(), String> {
+    async fn destroy(&self, _environment_ref: &str, container_id: &str) -> Result<(), String> {
         self.destroyed.lock().expect("destroyed lock").push(container_id.to_string());
         Ok(())
     }
@@ -505,6 +509,7 @@ async fn environment_controller_marks_docker_environment_ready() {
                 host_ref: "01HXYZ".to_string(),
                 image: "ghcr.io/flotilla/dev:latest".to_string(),
                 declared_agent_adapters: Default::default(),
+                required_agent_adapters: Default::default(),
                 pull_policy: Default::default(),
                 mounts: vec![EnvironmentMount {
                     source_path: "/tmp/src".to_string(),

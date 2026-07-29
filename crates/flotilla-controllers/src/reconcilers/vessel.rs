@@ -7,7 +7,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_core::agent_adapter::{
-    append_convoy_work_context, build_crew_brief_with_options, CrewAssignment, CrewBriefMember, CrewBriefTemplateResolver,
+    append_convoy_work_context, build_crew_brief_with_options, CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefTemplateResolver,
 };
 use flotilla_protocol::PlacementDecision;
 use flotilla_resources::{
@@ -209,6 +209,18 @@ impl Reconciler for VesselReconciler {
             Some((vessel_index, requirement)) => (vessel_index, requirement),
             None => return Ok(VesselDeps::failed(format!("vessel {} missing from convoy snapshot", obj.spec.vessel_name))),
         };
+        let capabilities = CapabilityTable::seeded();
+        let mut required_agent_adapters = BTreeSet::new();
+        for process in &requirement.crew {
+            if let CrewSource::Agent { selector, .. } = &process.source {
+                match capabilities.resolve(&selector.capability) {
+                    Ok(agent) => {
+                        required_agent_adapters.insert(agent.adapter.clone());
+                    }
+                    Err(message) => return Ok(VesselDeps::failed(message)),
+                }
+            }
+        }
         let effective_stance = strategy.effective_stance();
         if effective_stance < requirement.stance {
             return Ok(VesselDeps::failed(format!(
@@ -301,12 +313,12 @@ impl Reconciler for VesselReconciler {
                             return Ok(VesselDeps::failed(message));
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                            return Ok(VesselDeps::provisioning(
-                                &placement_policy,
-                                placement_decision.clone(),
-                                format!("environment {env_name} to become ready"),
-                                actuations,
-                            ));
+                            let waiting_for = existing
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.message.clone())
+                                .unwrap_or_else(|| format!("environment {env_name} to become ready"));
+                            return Ok(VesselDeps::provisioning(&placement_policy, placement_decision.clone(), waiting_for, actuations));
                         }
                         match image_stamp(&existing) {
                             Ok(image) => image,
@@ -322,6 +334,7 @@ impl Reconciler for VesselReconciler {
                                     host_ref: host_ref.clone(),
                                     image: image.clone(),
                                     declared_agent_adapters: declared_agent_adapters.clone(),
+                                    required_agent_adapters: required_agent_adapters.clone(),
                                     pull_policy: *pull_policy,
                                     mounts: Vec::new(),
                                     env: environment_with_credentials(env.clone(), &requirement.credential_refs),
@@ -611,12 +624,12 @@ impl Reconciler for VesselReconciler {
                             return Ok(VesselDeps::failed(message));
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                            return Ok(VesselDeps::provisioning(
-                                &placement_policy,
-                                placement_decision.clone(),
-                                format!("environment {env_name} to become ready"),
-                                actuations,
-                            ));
+                            let waiting_for = existing
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.message.clone())
+                                .unwrap_or_else(|| format!("environment {env_name} to become ready"));
+                            return Ok(VesselDeps::provisioning(&placement_policy, placement_decision.clone(), waiting_for, actuations));
                         }
                         match image_stamp(&existing) {
                             Ok(image) => image,
@@ -632,6 +645,7 @@ impl Reconciler for VesselReconciler {
                                     host_ref: host_ref.clone(),
                                     image: image.clone(),
                                     declared_agent_adapters: declared_agent_adapters.clone(),
+                                    required_agent_adapters: required_agent_adapters.clone(),
                                     pull_policy: *pull_policy,
                                     mounts: has_repositories
                                         .then(|| EnvironmentMount {
@@ -977,6 +991,9 @@ fn provisioning_patch(
 }
 
 fn provisioning_stuck_message(obj: &ResourceObject<Vessel>, waiting_for: &str, now: DateTime<Utc>) -> Option<String> {
+    if waiting_for.starts_with("waiting for codex login slot;") {
+        return Some(waiting_for.to_string());
+    }
     let started_at = obj.status.as_ref().filter(|status| status.phase == VesselPhase::Provisioning).and_then(|status| status.started_at)?;
     (now.signed_duration_since(started_at) >= chrono::Duration::seconds(VESSEL_PROVISIONING_STUCK_SECONDS))
         .then(|| format!("provisioning is stalled while waiting for {waiting_for}; reconciliation will continue retrying"))
@@ -993,6 +1010,42 @@ fn legible_waiting_for(mut waiting_for: String, placement_decision: Option<&Plac
         waiting_for = waiting_for.replace(&target_environment, &display_environment);
     }
     waiting_for
+}
+
+#[cfg(test)]
+mod codex_wait_tests {
+    use flotilla_resources::ObjectMeta;
+
+    use super::*;
+
+    #[test]
+    fn codex_slot_wait_is_visible_immediately_in_vessel_status() {
+        let now = Utc::now();
+        let vessel = ResourceObject::<Vessel> {
+            metadata: ObjectMeta {
+                name: "vessel-a".to_string(),
+                namespace: "flotilla".to_string(),
+                resource_version: "1".to_string(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: now,
+                merge: None,
+            },
+            spec: flotilla_resources::VesselSpec {
+                convoy_ref: "convoy-a".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "docker-a".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+            status: None,
+        };
+        let message = "waiting for codex login slot; 2 in pool, all leased; mint another slot to increase concurrency";
+
+        assert_eq!(provisioning_stuck_message(&vessel, message, now).as_deref(), Some(message));
+    }
 }
 
 fn environment_name(vessel_name: &str) -> String {
