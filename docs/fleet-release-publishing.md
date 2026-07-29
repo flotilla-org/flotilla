@@ -48,6 +48,12 @@ identity:
 Apple Development: Robert Wittams (DYYMCPD885)
 ```
 
+The Comte runner process must have its login keychain unlocked and permission
+to use that identity's private key without an interactive prompt. Both Darwin
+jobs prove this by signing and verifying a disposable system-binary copy before
+checkout; an `errSecInternalComponent` failure means the runner keychain/ACL
+still needs operator provisioning.
+
 The Darwin workflows use `packaging/macos-cli.entitlements`, an intentionally
 empty entitlement set for unsandboxed CLI executables, then run strict
 `codesign` verification before upload.
