@@ -29,6 +29,7 @@ jobs:
         run: |
           scripts/test-prune-target.sh
           scripts/test-cargo-sweep-mtime.sh
+          scripts/test-artifact-publishing.sh
       - name: Check Rust formatting
         run: cargo +nightly-2026-03-12 fmt --check
 

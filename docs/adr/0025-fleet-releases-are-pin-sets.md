@@ -49,9 +49,10 @@ Every file has an adjacent JSON metadata file. Schema version 1 records:
 - wire generation for Flotilla binaries.
 
 Flotilla package versions are `<full-sha>-<wire-generation>`; all other package
-versions are the full source SHA. This deliberately repeats the SHA when the
-current wire generation is itself the build SHA: the two axes remain explicit,
-so a future wire-generation scheme does not change the pin vocabulary.
+versions are the full source SHA. The current wire generation is Git's
+12-character short form for that commit, matching desk builds of the same
+checkout. The two axes remain explicit so a future wire-generation scheme does
+not change the pin vocabulary.
 
 ### Builds and signing happen only on named fleet runners
 
