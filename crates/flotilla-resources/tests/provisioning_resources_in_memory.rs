@@ -111,6 +111,7 @@ async fn environment_and_checkout_specs_serialize_through_in_memory_backend() {
             host_ref: "01HXYZ".to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),
             declared_agent_adapters: Default::default(),
+            required_agent_adapters: Default::default(),
             pull_policy: Default::default(),
             mounts: vec![EnvironmentMount {
                 source_path: "/Users/alice/dev/flotilla.fix-bug-123".to_string(),

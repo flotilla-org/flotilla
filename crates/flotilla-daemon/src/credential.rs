@@ -48,6 +48,14 @@ impl CredentialStore {
         }
     }
 
+    pub(crate) async fn consumer_adapters(&self, credential_refs: &BTreeSet<String>) -> Result<BTreeSet<String>, String> {
+        let mut adapters = BTreeSet::new();
+        for name in credential_refs {
+            adapters.insert(self.spec(name).await?.consumer.adapter_name().to_string());
+        }
+        Ok(adapters)
+    }
+
     pub(crate) async fn held_credentials(&self) -> Result<BTreeSet<String>, String> {
         let specs = self
             .backend

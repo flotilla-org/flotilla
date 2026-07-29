@@ -12,6 +12,7 @@ mod host;
 mod http;
 mod in_memory;
 mod labels;
+mod material_pool;
 mod placement_policy;
 mod prepared_snapshot;
 mod presentation;
@@ -58,10 +59,10 @@ pub use credential::{
 pub use definition::DefinitionResolver;
 pub use environment::{
     DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus,
-    EnvironmentStatusPatch, HostDirectEnvironmentSpec,
+    EnvironmentStatusPatch, EnvironmentWaitReason, HostDirectEnvironmentSpec,
 };
 pub use error::ResourceError;
-pub use flotilla_protocol::PrincipalRef;
+pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use host::{
     Host, HostCondition, HostSpec, HostStatus, HostStatusPatch, AGENT_ADAPTERS_CAPABILITY, HEARTBEAT_READY_TTL_SECS,
     HELD_CREDENTIALS_CAPABILITY, TERMINAL_POOLS_CAPABILITY,
@@ -71,6 +72,9 @@ pub use in_memory::InMemoryBackend;
 pub use labels::{
     LifecycleAuthority, AUTHORITY_LABEL, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREW_ORDINAL_LABEL, MANAGED_BY_LABEL, REPO_KEY_LABEL,
     REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+};
+pub use material_pool::{
+    MaterialPool, MaterialPoolLease, MaterialPoolSpec, MaterialPoolStatus, MaterialPoolStatusPatch, MaterialPoolUnitSpec,
 };
 pub use placement_policy::{
     DockerCheckoutStrategy, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout,
@@ -130,6 +134,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Demand>($($argument),*);
         $callback::<$crate::Environment>($($argument),*);
         $callback::<$crate::Host>($($argument),*);
+        $callback::<$crate::MaterialPool>($($argument),*);
         $callback::<$crate::PlacementPolicy>($($argument),*);
         $callback::<$crate::Presentation>($($argument),*);
         $callback::<$crate::Project>($($argument),*);

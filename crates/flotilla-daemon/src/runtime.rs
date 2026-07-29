@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
-    DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout,
-    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalRuntime,
-    TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
+    DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler, ForgeDefaultBranchResolver,
+    HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
+    RepositoryReconciler, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
@@ -35,17 +35,19 @@ use flotilla_protocol::{EnvironmentId, HostSummary, ImageId, Rows, TerminalStatu
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance,
     CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy, ConvoyReconciler, ConvoyTeardownRuntime, CrewSource, CrewSpec,
-    Demand, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host, HostCondition,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
-    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend, ResourceError,
-    ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
+    Demand, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, EnvironmentWaitReason, ForgeIdentity,
+    Host, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
+    InputDefinition, InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend,
+    ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate,
+    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
+    MANAGED_BY_LABEL,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    agent_material::{AgentMaterialPrepareError, AgentMaterialRegistry},
     credential::CredentialStore,
     resource_limits::file_descriptor_pressure_condition,
     resource_manifest::ResourceManifestReconciler,
@@ -380,6 +382,11 @@ impl DaemonRuntime {
             daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?,
             config.state_dir().as_path().to_path_buf(),
         ));
+        let agent_material = Arc::new(AgentMaterialRegistry::new(
+            daemon.resource_backend(),
+            &options.namespace,
+            Arc::clone(&daemon.discovery_runtime().env),
+        ));
         let health = DaemonHealthIdentity {
             generation: daemon
                 .observed_resource_backend()
@@ -401,6 +408,16 @@ impl DaemonRuntime {
             .recover_pending_claims()
             .await
             .map_err(|error| format!("recover prepared convoy admissions: {error}"))?;
+        let active_environments = daemon
+            .resource_backend()
+            .using::<Environment>(&options.namespace)
+            .list()
+            .await
+            .map_err(|error| format!("list environments for material lease recovery: {error}"))?
+            .items
+            .into_iter()
+            .map(|environment| environment.metadata.name);
+        agent_material.recover(active_environments).await?;
         apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health)
             .await?;
         if let Err(error) = daemon.reconcile_adopted_checkouts(&options.namespace).await {
@@ -464,7 +481,8 @@ impl DaemonRuntime {
                     local_repo_root,
                     profile.host_direct_environment_name(),
                 )
-                .with_credential_store(credential_store),
+                .with_credential_store(credential_store)
+                .with_agent_material(agent_material),
             );
             tasks.extend(spawn_controller_loops(
                 state,
@@ -571,6 +589,7 @@ struct ControllerRuntimeState {
     host_direct_environment_name: String,
     flotilla_binary_path: Result<DaemonHostPath, String>,
     credential_store: Option<Arc<CredentialStore>>,
+    agent_material: Option<Arc<AgentMaterialRegistry>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     clone_flights: Arc<CloneFlights>,
 }
@@ -612,6 +631,7 @@ impl ControllerRuntimeState {
             host_direct_environment_name,
             flotilla_binary_path: running_daemon_flotilla_binary(),
             credential_store: None,
+            agent_material: None,
             provisioned_environments: Mutex::new(HashMap::new()),
             clone_flights: Arc::new(CloneFlights::default()),
         }
@@ -619,6 +639,11 @@ impl ControllerRuntimeState {
 
     fn with_credential_store(mut self, credential_store: Arc<CredentialStore>) -> Self {
         self.credential_store = Some(credential_store);
+        self
+    }
+
+    fn with_agent_material(mut self, agent_material: Arc<AgentMaterialRegistry>) -> Self {
+        self.agent_material = Some(agent_material);
         self
     }
 
@@ -630,7 +655,6 @@ impl ControllerRuntimeState {
 }
 
 struct ActiveProvisionedEnvironment {
-    env_id: EnvironmentId,
     handle: EnvironmentHandle,
 }
 
@@ -1605,9 +1629,15 @@ struct DockerControllerRuntime {
 
 #[async_trait]
 impl DockerEnvironmentRuntime for DockerControllerRuntime {
-    async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+    async fn provision(
+        &self,
+        name: &str,
+        spec: &flotilla_resources::DockerEnvironmentSpec,
+    ) -> Result<DockerProvisioning, DockerProvisioningError> {
         if spec.mounts.iter().any(|mount| Path::new(&mount.target_path) == Path::new(CONTAINER_FLOTILLA_PATH)) {
-            return Err(format!("mount target {CONTAINER_FLOTILLA_PATH} is reserved for the flotilla CLI"));
+            return Err(DockerProvisioningError::Failed(format!(
+                "mount target {CONTAINER_FLOTILLA_PATH} is reserved for the flotilla CLI"
+            )));
         }
         let credential_refs = credential_refs_from_environment(spec)?;
         let daemon_socket_path = self
@@ -1628,23 +1658,91 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .or_else(|| self.state.local_registry.environment_providers.preferred_with_desc())
             .ok_or_else(|| "docker environment provider unavailable".to_string())?;
 
-        let docker_config_dir = match &self.state.credential_store {
-            Some(store) => store.prepare_registry_pull(name, &credential_refs, &spec.image).await?.map(DaemonHostPath::new),
-            None if credential_refs.is_empty() => None,
-            None => return Err("host-local credential store unavailable".to_string()),
-        };
         let image = ImageId::new(spec.image.clone());
         let env_id = EnvironmentId::new(name.to_string());
-        let mut provisioned_mounts = Vec::with_capacity(spec.mounts.len() + 1);
+        let mut environment_variables = spec
+            .env
+            .iter()
+            .filter(|(name, _)| name.as_str() != CREDENTIAL_REFS_ENV)
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let credential_adapters = match &self.state.credential_store {
+            Some(store) => match store.consumer_adapters(&credential_refs).await {
+                Ok(adapters) => adapters,
+                Err(error) => {
+                    return Err(discard_uncreated_environment(
+                        self.state.credential_store.as_deref(),
+                        self.state.agent_material.as_deref(),
+                        name,
+                        error,
+                    )
+                    .await
+                    .into())
+                }
+            },
+            None if credential_refs.is_empty() => BTreeSet::new(),
+            None => return Err("host-local credential store unavailable".to_string().into()),
+        };
+        let material_deliveries = match &self.state.agent_material {
+            Some(registry) => match registry.prepare(name, &spec.required_agent_adapters, &spec.env, &credential_adapters).await {
+                Ok(deliveries) => deliveries,
+                Err(AgentMaterialPrepareError::Waiting { pool_ref, message }) => {
+                    let message = discard_uncreated_environment(
+                        self.state.credential_store.as_deref(),
+                        self.state.agent_material.as_deref(),
+                        name,
+                        message,
+                    )
+                    .await;
+                    return Err(DockerProvisioningError::Waiting {
+                        message,
+                        reason: EnvironmentWaitReason::MaterialPoolExhausted { pool_ref },
+                    });
+                }
+                Err(AgentMaterialPrepareError::Failed(error)) => {
+                    return Err(discard_uncreated_environment(
+                        self.state.credential_store.as_deref(),
+                        self.state.agent_material.as_deref(),
+                        name,
+                        error,
+                    )
+                    .await
+                    .into())
+                }
+            },
+            None => Vec::new(),
+        };
+        let docker_config_dir = match &self.state.credential_store {
+            Some(store) => match store.prepare_registry_pull(name, &credential_refs, &spec.image).await {
+                Ok(config) => config.map(DaemonHostPath::new),
+                Err(error) => {
+                    return Err(discard_uncreated_environment(
+                        self.state.credential_store.as_deref(),
+                        self.state.agent_material.as_deref(),
+                        name,
+                        error,
+                    )
+                    .await
+                    .into())
+                }
+            },
+            None if credential_refs.is_empty() => None,
+            None => return Err("host-local credential store unavailable".to_string().into()),
+        };
+        let mut provisioned_mounts = Vec::with_capacity(spec.mounts.len() + 2);
         provisioned_mounts.push(ProvisionedMount::new(
             flotilla_binary_path.as_path().to_path_buf(),
             CONTAINER_FLOTILLA_PATH,
             ProvisionedMountMode::Ro,
         ));
         provisioned_mounts.extend(spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount));
+        for delivery in &material_deliveries {
+            provisioned_mounts.push(delivery.mount.clone());
+            environment_variables.extend(delivery.environment.clone());
+        }
         let handle = match provider
             .create(env_id.clone(), &image, CreateOpts {
-                tokens: Vec::new(),
+                tokens: environment_variables,
                 daemon_socket_path,
                 working_directory: None,
                 image_pull_policy: spec.pull_policy.into(),
@@ -1655,12 +1753,12 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         {
             Ok(handle) => handle,
             Err(error) => {
-                if let Some(store) = &self.state.credential_store {
-                    if let Err(cleanup_error) = store.forget_environment(name).await {
-                        return Err(format!("{error}; additionally failed to remove credential cache: {cleanup_error}"));
-                    }
+                let cleanup_errors =
+                    forget_environment_state(self.state.credential_store.as_deref(), self.state.agent_material.as_deref(), name).await;
+                if !cleanup_errors.is_empty() {
+                    return Err(format!("{error}; additionally failed to {}", cleanup_errors.join("; ")).into());
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
         let image_ref = handle.image().as_str().to_string();
@@ -1670,29 +1768,72 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 return Err(discard_failed_environment(
                     &handle,
                     self.state.credential_store.as_deref(),
+                    self.state.agent_material.as_deref(),
                     name,
                     format!("docker environment provider did not report an image digest for {name}"),
                 )
-                .await)
+                .await
+                .into())
             }
         };
 
         let container_id = handle.container_name().map(ToString::to_string).unwrap_or_else(|| format!("flotilla-env-{}", env_id));
         if let Some(store) = &self.state.credential_store {
             if let Err(error) = store.prepare(name, &credential_refs, handle.runner()).await {
-                return Err(discard_failed_environment(&handle, Some(store), name, error).await);
+                return Err(discard_failed_environment(&handle, Some(store), self.state.agent_material.as_deref(), name, error)
+                    .await
+                    .into());
             }
         } else if !credential_refs.is_empty() {
-            return Err(discard_failed_environment(&handle, None, name, "host-local credential store unavailable".to_string()).await);
+            return Err(discard_failed_environment(
+                &handle,
+                None,
+                self.state.agent_material.as_deref(),
+                name,
+                "host-local credential store unavailable".to_string(),
+            )
+            .await
+            .into());
+        }
+        for delivery in &material_deliveries {
+            let args = delivery.preflight.args.iter().map(String::as_str).collect::<Vec<_>>();
+            if let Err(error) = handle.runner().run(&delivery.preflight.command, &args, Path::new("/"), &ChannelLabel::Noop).await {
+                return Err(DockerProvisioningError::Failed(
+                    discard_failed_environment(
+                        &handle,
+                        self.state.credential_store.as_deref(),
+                        self.state.agent_material.as_deref(),
+                        name,
+                        format!("{}: {error}", delivery.preflight.failure_context),
+                    )
+                    .await,
+                ));
+            }
         }
         let (bag, registry) = match probe_provisioned_environment(&self.state, &env_id, &handle).await {
             Ok(probed) => probed,
             Err(error) => {
-                return Err(discard_failed_environment(&handle, self.state.credential_store.as_deref(), name, error).await);
+                return Err(discard_failed_environment(
+                    &handle,
+                    self.state.credential_store.as_deref(),
+                    self.state.agent_material.as_deref(),
+                    name,
+                    error,
+                )
+                .await
+                .into());
             }
         };
         if let Err(error) = verify_declared_agent_adapters(spec, &registry) {
-            return Err(discard_failed_environment(&handle, self.state.credential_store.as_deref(), name, error).await);
+            return Err(discard_failed_environment(
+                &handle,
+                self.state.credential_store.as_deref(),
+                self.state.agent_material.as_deref(),
+                name,
+                error,
+            )
+            .await
+            .into());
         }
         if let Err(error) = self
             .state
@@ -1700,21 +1841,43 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .register_provisioned_environment(env_id.clone(), Arc::clone(&handle), bag, Some(registry))
             .map_err(|err| format!("failed to register provisioned environment {env_id}: {err}"))
         {
-            return Err(discard_failed_environment(&handle, self.state.credential_store.as_deref(), name, error).await);
+            return Err(discard_failed_environment(
+                &handle,
+                self.state.credential_store.as_deref(),
+                self.state.agent_material.as_deref(),
+                name,
+                error,
+            )
+            .await
+            .into());
         }
-        self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { env_id, handle });
+        self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { handle });
         Ok(DockerProvisioning { container_id, image_ref, image_digest })
     }
 
-    async fn destroy(&self, container_id: &str) -> Result<(), String> {
+    async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String> {
         let active = self.state.provisioned_environments.lock().await.remove(container_id);
-        let Some(active) = active else {
-            return Ok(());
+        let handle = match active {
+            Some(active) => Some(active.handle),
+            None => {
+                let (_, provider) = self
+                    .state
+                    .local_registry
+                    .environment_providers
+                    .get("docker")
+                    .or_else(|| self.state.local_registry.environment_providers.preferred_with_desc())
+                    .ok_or_else(|| "docker environment provider unavailable during teardown".to_string())?;
+                provider.list().await?.into_iter().find(|handle| handle.container_name() == Some(container_id))
+            }
         };
-        active.handle.destroy().await?;
-        let _ = self.state.daemon.remove_provisioned_environment(&active.env_id);
-        if let Some(store) = &self.state.credential_store {
-            store.forget_environment(active.env_id.as_str()).await?;
+        if let Some(handle) = handle {
+            handle.destroy().await?;
+        }
+        let _ = self.state.daemon.remove_provisioned_environment(&EnvironmentId::new(environment_ref));
+        let cleanup_errors =
+            forget_environment_state(self.state.credential_store.as_deref(), self.state.agent_material.as_deref(), environment_ref).await;
+        if !cleanup_errors.is_empty() {
+            return Err(cleanup_errors.join("; "));
         }
         Ok(())
     }
@@ -1747,6 +1910,7 @@ fn credential_refs_from_environment(spec: &flotilla_resources::DockerEnvironment
 async fn discard_failed_environment(
     handle: &EnvironmentHandle,
     credential_store: Option<&CredentialStore>,
+    agent_material: Option<&AgentMaterialRegistry>,
     environment_ref: &str,
     error: String,
 ) -> String {
@@ -1754,16 +1918,45 @@ async fn discard_failed_environment(
     if let Err(cleanup_error) = handle.destroy().await {
         cleanup_errors.push(format!("destroy rejected environment: {cleanup_error}"));
     }
-    if let Some(store) = credential_store {
-        if let Err(cleanup_error) = store.forget_environment(environment_ref).await {
-            cleanup_errors.push(format!("remove credential cache: {cleanup_error}"));
-        }
-    }
+    cleanup_errors.extend(forget_environment_state(credential_store, agent_material, environment_ref).await);
     if cleanup_errors.is_empty() {
         error
     } else {
         format!("{error}; additionally failed to {}", cleanup_errors.join("; "))
     }
+}
+
+async fn discard_uncreated_environment(
+    credential_store: Option<&CredentialStore>,
+    agent_material: Option<&AgentMaterialRegistry>,
+    environment_ref: &str,
+    error: String,
+) -> String {
+    let cleanup_errors = forget_environment_state(credential_store, agent_material, environment_ref).await;
+    if cleanup_errors.is_empty() {
+        error
+    } else {
+        format!("{error}; additionally failed to {}", cleanup_errors.join("; "))
+    }
+}
+
+async fn forget_environment_state(
+    credential_store: Option<&CredentialStore>,
+    agent_material: Option<&AgentMaterialRegistry>,
+    environment_ref: &str,
+) -> Vec<String> {
+    let mut cleanup_errors = Vec::new();
+    if let Some(store) = credential_store {
+        if let Err(cleanup_error) = store.forget_environment(environment_ref).await {
+            cleanup_errors.push(format!("remove credential cache: {cleanup_error}"));
+        }
+    }
+    if let Some(registry) = agent_material {
+        if let Err(cleanup_error) = registry.release(environment_ref).await {
+            cleanup_errors.push(format!("release material lease: {cleanup_error}"));
+        }
+    }
+    cleanup_errors
 }
 
 async fn probe_provisioned_environment(
@@ -2552,7 +2745,7 @@ mod tests {
             discovery::{
                 test_support::{
                     fake_discovery_with_provider_set, git_process_discovery, DiscoveryMockRunner, FakeDiscoveryProviders, FakeTerminalPool,
-                    MergedPrProcessRunner,
+                    MergedPrProcessRunner, TestEnvVars,
                 },
                 EnvironmentAssertion, EnvironmentBag,
             },
@@ -2560,19 +2753,24 @@ mod tests {
             ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
         },
     };
-    use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource};
+    use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource, ResourceRef};
     use flotilla_resources::{
-        Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-        CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CredentialGrant, CredentialSpec,
-        CrewSource, CrewSpec, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec,
-        Resource, Selector, SqliteBackend, TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, WorkPhase,
-        WorkflowTemplate, WorkflowTemplateSpec,
+        api_version, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+        CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CredentialConsumer, CredentialGrant,
+        CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
+        LifecycleAuthority, MaterialPoolSpec, MaterialPoolUnitSpec, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
+        RepositorySpec, Resource, Selector, SqliteBackend, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
+        VesselRequirement, WorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
     use tokio::sync::Notify;
 
     use super::{test_git_repo::TestGitRepo, *};
+    use crate::{
+        agent_material::CONTAINER_CODEX_HOME,
+        material_pool::{MaterialLeaseOutcome, MaterialPoolManager},
+    };
 
     #[test]
     fn resolves_flotilla_binary_adjacent_to_daemon() {
@@ -2891,6 +3089,59 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RejectingRegistryRunner {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CommandRunner for RejectingRegistryRunner {
+        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err("registry preflight must not run while waiting for agent material".to_string())
+        }
+
+        async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err("registry preflight must not run while waiting for agent material".to_string())
+        }
+
+        async fn run_with_input(
+            &self,
+            _cmd: &str,
+            _args: &[&str],
+            _cwd: &Path,
+            _label: &ChannelLabel,
+            _input: &[u8],
+        ) -> Result<String, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err("registry preflight must not run while waiting for agent material".to_string())
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+    }
+
+    struct ListingEnvironmentProvider {
+        handle: EnvironmentHandle,
+    }
+
+    #[async_trait]
+    impl EnvironmentProvider for ListingEnvironmentProvider {
+        async fn ensure_image(&self, _spec: &flotilla_protocol::EnvironmentSpec, _repo_root: &Path) -> Result<ImageId, String> {
+            Err("not used".to_string())
+        }
+
+        async fn create(&self, _id: EnvironmentId, _image: &ImageId, _opts: CreateOpts) -> Result<EnvironmentHandle, String> {
+            Err("not used".to_string())
+        }
+
+        async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
+            Ok(vec![Arc::clone(&self.handle)])
+        }
+    }
+
     #[tokio::test]
     async fn docker_provisioning_mounts_daemon_adjacent_cli_read_only() {
         let temp = TempDir::new().expect("tempdir");
@@ -2926,21 +3177,251 @@ mod tests {
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::new(),
+            required_agent_adapters: BTreeSet::new(),
             pull_policy: Default::default(),
             mounts: Vec::new(),
             env: BTreeMap::new(),
         };
 
-        let error =
-            DockerControllerRuntime { state }.provision("contained-work", &spec).await.expect_err("capture provider should stop provision");
+        let error = DockerControllerRuntime { state: Arc::clone(&state) }
+            .provision("contained-work", &spec)
+            .await
+            .expect_err("capture provider should stop provision");
 
-        assert_eq!(error, "stop after capturing create options");
+        assert_eq!(error.to_string(), "stop after capturing create options");
         let opts = provider.create_opts.lock().await.take().expect("captured create options");
         assert_eq!(opts.provisioned_mounts, vec![ProvisionedMount::new(
             "/opt/flotilla/bin/flotilla",
             "/usr/local/bin/flotilla",
             ProvisionedMountMode::Ro,
         )],);
+    }
+
+    #[tokio::test]
+    async fn codex_adapter_delivers_leased_material_as_a_writable_codex_home() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"codex-material-test\"\n").expect("daemon config");
+        let home = temp.path().join("home");
+        let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
+        fs::create_dir_all(&slot).expect("slot directory");
+        let auth = slot.join("auth.json");
+        fs::write(&auth, "{\"tokens\":\"test\"}").expect("slot auth");
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("protect slot auth");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None) });
+        let mut local_registry = ProviderRegistry::new();
+        local_registry.environment_providers.insert(
+            "docker",
+            flotilla_core::providers::discovery::ProviderDescriptor::named(
+                flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+                "docker",
+            ),
+            Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
+        );
+        let credential_store = Arc::new(CredentialStore::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("HOME", home.display().to_string())])),
+            EnvironmentBag::new(),
+            Arc::new(ProcessCommandRunner),
+            config.state_dir().as_path().to_path_buf(),
+        ));
+        let agent_material = Arc::new(AgentMaterialRegistry::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("HOME", home.display().to_string())])),
+        ));
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                daemon,
+                config,
+                Arc::new(local_registry),
+                Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+                "host-test".to_string(),
+                None,
+                "host-direct-host-test".to_string(),
+            )
+            .with_flotilla_binary_path(DaemonHostPath::new("/opt/flotilla/bin/flotilla"))
+            .with_credential_store(credential_store)
+            .with_agent_material(agent_material),
+        );
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host-test".to_string(),
+            image: "contained-image".to_string(),
+            declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
+            required_agent_adapters: BTreeSet::from(["codex".to_string()]),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: BTreeMap::new(),
+        };
+
+        let error = DockerControllerRuntime { state: Arc::clone(&state) }
+            .provision("contained-work", &spec)
+            .await
+            .expect_err("capture provider should stop provision");
+
+        assert_eq!(error.to_string(), "stop after capturing create options");
+        let opts = provider.create_opts.lock().await.take().expect("captured create options");
+        assert!(opts.provisioned_mounts.contains(&ProvisionedMount::new(slot, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw,)));
+        assert_eq!(opts.tokens, vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())]);
+
+        let mut preconfigured = spec;
+        preconfigured.env.insert("CODEX_HOME".to_string(), "/image/codex".to_string());
+        DockerControllerRuntime { state }
+            .provision("contained-preconfigured", &preconfigured)
+            .await
+            .expect_err("capture provider should stop provision");
+        let opts = provider.create_opts.lock().await.take().expect("captured preconfigured create options");
+        assert_eq!(opts.tokens, vec![("CODEX_HOME".to_string(), "/image/codex".to_string())]);
+        assert!(
+            opts.provisioned_mounts.iter().all(|mount| mount.environment_path.as_path() != Path::new(CONTAINER_CODEX_HOME)),
+            "a placement-provided CODEX_HOME must not be overwritten with a leased slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn material_pool_wait_skips_registry_preflight_and_leaves_no_credential_cache() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"material-pool-registry-wait-test\"\n").expect("daemon config");
+        let home = temp.path().join("home");
+        let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
+        fs::create_dir_all(&slot).expect("slot directory");
+        let auth = slot.join("auth.json");
+        fs::write(&auth, "{\"tokens\":\"test\"}").expect("slot auth");
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("protect slot auth");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        daemon
+            .resource_backend()
+            .definitions::<CredentialSpec>(NAMESPACE)
+            .create(&InputMeta::builder().name("private-registry".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".to_string(), username: "crew".to_string() },
+                source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create registry credential");
+        let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None) });
+        let mut local_registry = ProviderRegistry::new();
+        local_registry.environment_providers.insert(
+            "docker",
+            flotilla_core::providers::discovery::ProviderDescriptor::named(
+                flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+                "docker",
+            ),
+            Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
+        );
+        let registry_runner = Arc::new(RejectingRegistryRunner::default());
+        let credential_store = Arc::new(CredentialStore::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("HOME", home.display().to_string()), ("TEST_REGISTRY_TOKEN", "registry-secret".to_string())])),
+            EnvironmentBag::new(),
+            registry_runner.clone(),
+            config.state_dir().as_path().to_path_buf(),
+        ));
+        let agent_material = Arc::new(AgentMaterialRegistry::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("HOME", home.display().to_string())])),
+        ));
+        agent_material
+            .prepare("slot-holder", &BTreeSet::from(["codex".to_string()]), &BTreeMap::new(), &BTreeSet::new())
+            .await
+            .expect("occupy only material unit");
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                daemon,
+                Arc::clone(&config),
+                Arc::new(local_registry),
+                Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+                "host-test".to_string(),
+                None,
+                "host-direct-host-test".to_string(),
+            )
+            .with_flotilla_binary_path(DaemonHostPath::new("/opt/flotilla/bin/flotilla"))
+            .with_credential_store(credential_store)
+            .with_agent_material(agent_material),
+        );
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host-test".to_string(),
+            image: "registry.example/crew:latest".to_string(),
+            declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
+            required_agent_adapters: BTreeSet::from(["codex".to_string()]),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: BTreeMap::from([(
+                CREDENTIAL_REFS_ENV.to_string(),
+                serde_json::to_string(&BTreeSet::from(["private-registry".to_string()])).expect("encode credential refs"),
+            )]),
+        };
+
+        let error =
+            DockerControllerRuntime { state }.provision("waiting-environment", &spec).await.expect_err("exhausted Codex pool should wait");
+
+        assert_eq!(error, DockerProvisioningError::Waiting {
+            message: "waiting for codex login material; 1 in pool, all leased; mint another unit to increase concurrency".to_string(),
+            reason: EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: "codex-login".to_string() },
+        });
+        assert_eq!(registry_runner.calls.load(Ordering::SeqCst), 0, "registry login and pull must not run before material is available");
+        assert!(provider.create_opts.lock().await.is_none(), "provider create must not run while waiting");
+        assert!(!config.state_dir().as_path().join("credential-runtime").exists(), "waiting must not leave a credential cache on disk");
+    }
+
+    #[tokio::test]
+    async fn docker_teardown_after_restart_destroys_the_container_before_releasing_runtime_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"material-restart-teardown-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+            id: EnvironmentId::new("contained-restarted"),
+            image: ImageId::new("contained-image"),
+            runner: Arc::new(DiscoveryMockRunner::builder().build()),
+            env_vars: HashMap::new(),
+            destroyed: Arc::clone(&destroyed),
+        });
+        let mut local_registry = ProviderRegistry::new();
+        local_registry.environment_providers.insert(
+            "docker",
+            flotilla_core::providers::discovery::ProviderDescriptor::named(
+                flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+                "docker",
+            ),
+            Arc::new(ListingEnvironmentProvider { handle }),
+        );
+        let state = Arc::new(ControllerRuntimeState::new(
+            daemon,
+            config,
+            Arc::new(local_registry),
+            Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+            "host-test".to_string(),
+            None,
+            "host-direct-host-test".to_string(),
+        ));
+
+        DockerControllerRuntime { state }
+            .destroy("contained-restarted", "test-interior")
+            .await
+            .expect("restart teardown should rediscover and destroy the container");
+
+        assert!(destroyed.load(Ordering::SeqCst), "the restarted daemon must destroy the still-running lease holder");
     }
 
     #[tokio::test]
@@ -2965,6 +3446,7 @@ mod tests {
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::new(),
+            required_agent_adapters: BTreeSet::new(),
             pull_policy: Default::default(),
             mounts: Vec::new(),
             env: BTreeMap::new(),
@@ -2974,7 +3456,7 @@ mod tests {
             DockerControllerRuntime { state }.provision("contained-work", &spec).await.expect_err("missing CLI should fail provision");
 
         assert!(
-            error.starts_with("flotilla CLI unavailable for docker environment provisioning: "),
+            error.to_string().starts_with("flotilla CLI unavailable for docker environment provisioning: "),
             "unavailable CLI resolution should retain its clear provisioning context: {error}",
         );
     }
@@ -3014,6 +3496,7 @@ mod tests {
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::new(),
+            required_agent_adapters: BTreeSet::new(),
             pull_policy: Default::default(),
             mounts: vec![flotilla_resources::EnvironmentMount {
                 source_path: "/host/replacement-flotilla".to_string(),
@@ -3028,7 +3511,7 @@ mod tests {
             .await
             .expect_err("reserved CLI mount should fail provision");
 
-        assert_eq!(error, "mount target /usr/local/bin/flotilla is reserved for the flotilla CLI");
+        assert_eq!(error.to_string(), "mount target /usr/local/bin/flotilla is reserved for the flotilla CLI");
         assert!(provider.create_opts.lock().await.is_none(), "reserved mount collisions should fail before invoking the provider");
     }
 
@@ -3673,6 +4156,7 @@ mod tests {
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::from(["codex".to_string(), "missing-adapter".to_string()]),
+            required_agent_adapters: BTreeSet::new(),
             pull_policy: Default::default(),
             mounts: Vec::new(),
             env: BTreeMap::new(),
@@ -3724,6 +4208,7 @@ mod tests {
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
+            required_agent_adapters: BTreeSet::new(),
             pull_policy: Default::default(),
             mounts: Vec::new(),
             env: BTreeMap::new(),
@@ -3734,7 +4219,7 @@ mod tests {
             .await
             .expect_err("missing declared adapter should reject the environment");
 
-        assert_eq!(error, "image `contained-image` declares agent adapter `codex`, but interior discovery did not find it");
+        assert_eq!(error.to_string(), "image `contained-image` declares agent adapter `codex`, but interior discovery did not find it");
         assert!(destroyed.load(Ordering::SeqCst), "rejected environment should be destroyed");
     }
 
@@ -4089,6 +4574,66 @@ mod tests {
         std::fs::create_dir_all(config.state_dir()).expect("state dir");
         let backend = ResourceBackend::Sqlite(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend"));
         daemon_with_backend(tracked_repos, config, backend).await
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_retains_material_lease_for_environment_pending_finalization() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+        let backend = daemon.resource_backend();
+        let environments = backend.clone().using::<Environment>(NAMESPACE);
+        environments
+            .create(
+                &InputMeta::builder()
+                    .name("deleting-environment".to_string())
+                    .finalizers(vec!["flotilla.work/test-environment-finalizer".to_string()])
+                    .build(),
+                &EnvironmentSpec {
+                    host_direct: Some(HostDirectEnvironmentSpec {
+                        host_ref: "host-test".to_string(),
+                        repo_default_dir: "/tmp/worktrees".to_string(),
+                    }),
+                    docker: None,
+                },
+            )
+            .await
+            .expect("create environment with pending finalizer");
+        environments.delete("deleting-environment").await.expect("mark environment for deletion");
+        let deleting = environments.get("deleting-environment").await.expect("pending finalizer should retain environment");
+        assert!(deleting.metadata.deletion_timestamp.is_some(), "environment should be pending finalization");
+
+        let pools = MaterialPoolManager::new(backend, NAMESPACE);
+        pools
+            .reconcile_pool("codex-login", &MaterialPoolSpec {
+                units: BTreeMap::from([("unit-0".to_string(), MaterialPoolUnitSpec {
+                    directory: "/var/lib/flotilla/material/unit-0".to_string(),
+                })]),
+            })
+            .await
+            .expect("create material pool");
+        let deleting_holder =
+            ResourceRef::new(api_version(Environment::API_PATHS), Environment::API_PATHS.kind, NAMESPACE, "deleting-environment");
+        pools.acquire("codex-login", &deleting_holder).await.expect("lease material to deleting environment");
+
+        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
+            heartbeat_interval: Duration::from_secs(300),
+            controller_resync_interval: Duration::from_secs(300),
+            start_controllers: false,
+            ..RuntimeOptions::default()
+        })
+        .await
+        .expect("daemon should start");
+
+        let second_holder =
+            ResourceRef::new(api_version(Environment::API_PATHS), Environment::API_PATHS.kind, NAMESPACE, "second-environment");
+        assert_eq!(
+            pools.acquire("codex-login", &second_holder).await.expect("second holder should wait"),
+            MaterialLeaseOutcome::Waiting { unit_count: 1 },
+            "startup recovery must retain leases until an environment's finalizer removes it from the store"
+        );
+
+        runtime.shutdown();
     }
 
     fn insert_undecodable_resource<T: Resource>(connection: &rusqlite::Connection, name: &str) {

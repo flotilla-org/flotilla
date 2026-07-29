@@ -27,6 +27,9 @@ pub struct DockerEnvironmentSpec {
     /// Agent adapters the placement policy expects discovery to find in the image.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub declared_agent_adapters: BTreeSet<String>,
+    /// Agent adapters this specific vessel workflow will actually launch.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub required_agent_adapters: BTreeSet<String>,
     #[serde(default)]
     pub pull_policy: DockerImagePullPolicy,
     #[serde(default)]
@@ -71,11 +74,20 @@ pub struct EnvironmentStatus {
     pub image_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<EnvironmentWaitReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum EnvironmentWaitReason {
+    MaterialPoolExhausted { pool_ref: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentStatusPatch {
     MarkReady { docker_container_id: Option<String>, image_ref: Option<String>, image_digest: Option<String> },
+    MarkWaiting { message: String, reason: EnvironmentWaitReason },
     MarkFailed { message: String },
     MarkTerminating,
 }
@@ -90,15 +102,24 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
                 status.image_ref = image_ref.clone();
                 status.image_digest = image_digest.clone();
                 status.message = None;
+                status.wait_reason = None;
+            }
+            Self::MarkWaiting { message, reason } => {
+                status.phase = EnvironmentPhase::Pending;
+                status.ready = false;
+                status.message = Some(message.clone());
+                status.wait_reason = Some(reason.clone());
             }
             Self::MarkFailed { message } => {
                 status.phase = EnvironmentPhase::Failed;
                 status.ready = false;
                 status.message = Some(message.clone());
+                status.wait_reason = None;
             }
             Self::MarkTerminating => {
                 status.phase = EnvironmentPhase::Terminating;
                 status.ready = false;
+                status.wait_reason = None;
             }
         }
     }
