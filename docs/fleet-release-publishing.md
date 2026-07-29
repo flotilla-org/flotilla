@@ -76,6 +76,11 @@ Cleat. The Andamento workflow installs the `wasm32-wasip1` Rust target when
 absent. Cleat's preparation helper verifies the pinned Zig and Ghostty
 revisions.
 
+Release workflows preserve runner-local `target/` directories (and Cleat's
+`.tools/` directory) as portable build caches. Enrol these long-lived runners in
+the same daily `cargo-sweep --time 3` maintenance and `scripts/prune-target.sh`
+size-cap backstop documented in `docs/development.md`.
+
 The Darwin signing runner needs `git`, `gh`, `jq`, stable Rust, Zig 0.15.2,
 `codesign`, and a compatible SDK for the pinned Zig toolchain. Configure these
 runner-process environment variables outside the repository:
