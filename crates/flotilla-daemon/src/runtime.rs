@@ -4359,6 +4359,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn docker_policy_registration_preserves_runtime_configuration_and_corrects_owned_drift() {
+        let backend = ResourceBackend::InMemory(Default::default());
+        let profile = manual_profile("host-test", true);
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("initial policy registration should succeed");
+
+        let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
+        let registered = policies.get(&profile.docker_policy_name()).await.expect("registered docker policy");
+        policies
+            .update(
+                &InputMeta::from(&registered.metadata),
+                &registered.metadata.resource_version,
+                &PlacementPolicySpec::builder()
+                    .pool("operator-edited-pool".to_string())
+                    .priority(20)
+                    .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                        host_ref: "operator-edited-host".to_string(),
+                        image: "operator/image:latest".to_string(),
+                        pull_policy: flotilla_resources::DockerImagePullPolicy::Never,
+                        agent_adapters: BTreeSet::from(["codex".to_string()]),
+                        default_cwd: Some("/operator-workspace".to_string()),
+                        env: BTreeMap::from([("OPERATOR_CONFIG".to_string(), "true".to_string())]),
+                        checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/operator-clone".to_string() },
+                    })
+                    .build(),
+            )
+            .await
+            .expect("operator policy apply should succeed");
+
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("policy re-registration should succeed");
+
+        let reconciled = policies.get(&profile.docker_policy_name()).await.expect("reconciled docker policy");
+        assert_eq!(reconciled.spec.priority, 20);
+        assert_eq!(reconciled.spec.pool, profile.docker_pool);
+        assert!(reconciled.spec.host_direct.is_none());
+        assert_eq!(
+            reconciled.spec.docker_per_vessel,
+            Some(DockerPerVesselPlacementPolicySpec {
+                host_ref: profile.host_id,
+                image: "operator/image:latest".to_string(),
+                pull_policy: flotilla_resources::DockerImagePullPolicy::Never,
+                agent_adapters: BTreeSet::from(["codex".to_string()]),
+                default_cwd: Some("/operator-workspace".to_string()),
+                env: BTreeMap::from([("OPERATOR_CONFIG".to_string(), "true".to_string())]),
+                checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn policy_registration_leaves_manifest_managed_collision_untouched() {
         let backend = ResourceBackend::InMemory(Default::default());
         let profile = manual_profile("host-test", false);
