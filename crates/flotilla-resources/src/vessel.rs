@@ -8,6 +8,9 @@ use crate::{resource::define_resource, status_patch::StatusPatch, ReplicationCla
 
 define_resource!(Vessel, "vessels", VesselSpec, VesselStatus, VesselStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
 
+pub const ACTUATOR_HOST_REF_ANNOTATION: &str = "flotilla.work/actuator-host-ref";
+pub const ACTUATOR_SOURCE_ROOT_ANNOTATION: &str = "flotilla.work/actuator-source-root";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VesselSpec {
     pub convoy_ref: String,

@@ -15,6 +15,7 @@ bon = { workspace = true }
 tracing = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 dirs = "6"
+futures = "0.3"
 sha2 = "0.10"
 serde_json = { workspace = true }
 
@@ -23,3 +24,4 @@ flotilla-resources = { path = "../flotilla-resources", features = ["test-support
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 rstest = { workspace = true }
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

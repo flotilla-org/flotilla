@@ -2,9 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::NoStatusPatch};
+use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass};
 
-define_resource!(PlacementPolicy, "placementpolicies", PlacementPolicySpec, (), NoStatusPatch);
+define_resource!(
+    PlacementPolicy,
+    "placementpolicies",
+    PlacementPolicySpec,
+    (),
+    NoStatusPatch,
+    replication = ReplicationClass::HomeBoundRuntime
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct PlacementPolicySpec {

@@ -19,11 +19,13 @@ use flotilla_resources::{
     CrewSource, CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentMount,
     EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, EnvironmentWaitReason, FreshCloneCheckoutSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
-    PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
-    ResourceObject, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel,
-    VesselPhase, VesselStatusPatch, WorkPhase, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
+    PlacementPolicySpec, ReplicaReadResolver, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend,
+    ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
+    TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
     VESSEL_REF_LABEL,
 };
+use tracing::warn;
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
 const REPO_LABEL: &str = "flotilla.work/repo";
@@ -41,6 +43,9 @@ pub struct VesselReconciler {
     clones: TypedResolver<Clone>,
     checkouts: TypedResolver<Checkout>,
     terminal_sessions: TypedResolver<TerminalSession>,
+    federated_convoys: Option<ReplicaReadResolver<Convoy>>,
+    federated_placement_policies: Option<ReplicaReadResolver<PlacementPolicy>>,
+    local_host_ref: Option<String>,
     namespace: String,
     brief_templates: CrewBriefTemplateResolver,
 }
@@ -55,6 +60,9 @@ impl VesselReconciler {
             clones: backend.clone().using::<Clone>(namespace),
             checkouts: backend.clone().using::<Checkout>(namespace),
             terminal_sessions: backend.using::<TerminalSession>(namespace),
+            federated_convoys: None,
+            federated_placement_policies: None,
+            local_host_ref: None,
             namespace: namespace.to_string(),
             brief_templates: CrewBriefTemplateResolver::default(),
         }
@@ -64,6 +72,13 @@ impl VesselReconciler {
         Self { brief_templates: CrewBriefTemplateResolver::with_config_dir(config_dir), ..Self::new(backend, namespace) }
     }
 
+    pub fn with_federated_dependencies(mut self, backend: &ResourceBackend, local_host_ref: impl Into<String>) -> Self {
+        self.federated_convoys = Some(backend.including_replicas::<Convoy>(&self.namespace));
+        self.federated_placement_policies = Some(backend.including_replicas::<PlacementPolicy>(&self.namespace));
+        self.local_host_ref = Some(local_host_ref.into());
+        self
+    }
+
     pub fn secondary_watches() -> Vec<Box<dyn SecondaryWatch<Primary = Vessel>>> {
         vec![
             Box::new(LabelMappedWatch::<Environment, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
@@ -71,6 +86,48 @@ impl VesselReconciler {
             Box::new(LabelJoinWatch::<Checkout, Vessel> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<TerminalSession, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
         ]
+    }
+
+    async fn dependency<T: Resource>(
+        local: &TypedResolver<T>,
+        federated: Option<&ReplicaReadResolver<T>>,
+        vessel: &ResourceObject<Vessel>,
+        name: &str,
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        let Some(origin) = vessel.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION) else {
+            return local.get(name).await;
+        };
+        let Some(federated) = federated else {
+            return Err(ResourceError::not_found(name));
+        };
+        federated
+            .list()
+            .await?
+            .items
+            .into_iter()
+            .find(|source| {
+                source.object.metadata.name == name
+                    && matches!(
+                        &source.provenance,
+                        ResourceProvenance::Replica { origin_root, .. } if origin_root.as_str() == origin
+                    )
+            })
+            .map(|source| source.object)
+            .ok_or_else(|| ResourceError::not_found(name))
+    }
+
+    fn missing_host_local_environment(&self, environment_ref: &str, placement_host_ref: &str) -> String {
+        let reconciler_host_ref = self.local_host_ref.as_deref().unwrap_or("unknown");
+        let message = format!(
+            "host-local Environment {environment_ref} for placement host {placement_host_ref} was not found in the resource store for reconciler host {reconciler_host_ref}"
+        );
+        warn!(
+            %environment_ref,
+            %placement_host_ref,
+            %reconciler_host_ref,
+            "host-local Environment lookup failed in Vessel reconciliation"
+        );
+        message
     }
 }
 
@@ -199,19 +256,34 @@ impl Reconciler for VesselReconciler {
             return Ok(VesselDeps::none());
         }
 
-        let convoy = match self.convoys.get(&obj.spec.convoy_ref).await {
+        let convoy = match Self::dependency(&self.convoys, self.federated_convoys.as_ref(), obj, &obj.spec.convoy_ref).await {
             Ok(convoy) => convoy,
             Err(ResourceError::NotFound { .. }) => return Ok(VesselDeps::failed(format!("convoy {} not found", obj.spec.convoy_ref))),
             Err(err) => return Err(err),
         };
-        let placement_policy = match self.placement_policies.get(&obj.spec.placement_policy_ref).await {
+        let placement_decision = convoy.status.as_ref().and_then(|status| status.placement_decision.clone());
+        if self
+            .local_host_ref
+            .as_ref()
+            .zip(placement_decision.as_ref())
+            .is_some_and(|(local_host_ref, decision)| decision.target_host.reference != *local_host_ref)
+        {
+            return Ok(VesselDeps::none());
+        }
+        let placement_policy = match Self::dependency(
+            &self.placement_policies,
+            self.federated_placement_policies.as_ref(),
+            obj,
+            &obj.spec.placement_policy_ref,
+        )
+        .await
+        {
             Ok(policy) => policy,
             Err(ResourceError::NotFound { .. }) => {
                 return Ok(VesselDeps::failed(format!("placement policy {} not found", obj.spec.placement_policy_ref)))
             }
             Err(err) => return Err(err),
         };
-        let placement_decision = convoy.status.as_ref().and_then(|status| status.placement_decision.clone());
         let strategy = match placement_strategy(&placement_policy.spec) {
             Ok(strategy) => strategy,
             Err(message) => return Ok(VesselDeps::failed(message)),
@@ -297,7 +369,7 @@ impl Reconciler for VesselReconciler {
             let clone_env = match self.environments.get(&clone_env_ref).await {
                 Ok(environment) => environment,
                 Err(ResourceError::NotFound { .. }) => {
-                    return Ok(VesselDeps::failed(format!("host-direct environment {clone_env_ref} not found")))
+                    return Ok(VesselDeps::failed(self.missing_host_local_environment(&clone_env_ref, strategy.host_ref())))
                 }
                 Err(err) => return Err(err),
             };
@@ -585,7 +657,7 @@ impl Reconciler for VesselReconciler {
                     }
                     let meta = match &strategy {
                         PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
-                            convoy_owned_child_meta(&checkout_name, &convoy, labels)
+                            convoy_owned_child_meta(&checkout_name, &convoy, obj, labels)
                         }
                         PlacementStrategy::DockerFreshCloneInContainer { .. } => owned_child_meta(&checkout_name, obj, labels),
                     };
@@ -619,7 +691,7 @@ impl Reconciler for VesselReconciler {
                 let environment = match self.environments.get(&env_name).await {
                     Ok(environment) => environment,
                     Err(ResourceError::NotFound { .. }) => {
-                        return Ok(VesselDeps::failed(format!("host-direct environment {env_name} not found")))
+                        return Ok(VesselDeps::failed(self.missing_host_local_environment(&env_name, host_ref)))
                     }
                     Err(err) => return Err(err),
                 };
@@ -844,6 +916,7 @@ impl Reconciler for VesselReconciler {
                         }
                     };
                     let mut terminal_meta = identity.input_meta();
+                    terminal_meta.annotations.extend(actuator_annotations(obj));
                     if !requirement.credential_refs.is_empty() {
                         terminal_meta.annotations.insert(
                             CREDENTIAL_REFS_ANNOTATION.to_string(),
@@ -1121,6 +1194,7 @@ fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_la
     InputMeta::builder()
         .name(name.to_string())
         .labels(extra_labels)
+        .annotations(actuator_annotations(workspace))
         .owner_references(vec![OwnerReference {
             api_version: format!("{}/{}", Vessel::API_PATHS.group, Vessel::API_PATHS.version),
             kind: Vessel::API_PATHS.kind.to_string(),
@@ -1130,11 +1204,24 @@ fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_la
         .build()
 }
 
-fn convoy_owned_child_meta(name: &str, convoy: &ResourceObject<Convoy>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {
+fn actuator_annotations(workspace: &ResourceObject<Vessel>) -> BTreeMap<String, String> {
+    [ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION]
+        .into_iter()
+        .filter_map(|key| workspace.metadata.annotations.get(key).map(|value| (key.to_string(), value.clone())))
+        .collect()
+}
+
+fn convoy_owned_child_meta(
+    name: &str,
+    convoy: &ResourceObject<Convoy>,
+    workspace: &ResourceObject<Vessel>,
+    mut extra_labels: BTreeMap<String, String>,
+) -> InputMeta {
     extra_labels.insert(CONVOY_LABEL.to_string(), convoy.metadata.name.clone());
     InputMeta::builder()
         .name(name.to_string())
         .labels(extra_labels)
+        .annotations(actuator_annotations(workspace))
         .owner_references(vec![OwnerReference {
             api_version: format!("{}/{}", Convoy::API_PATHS.group, Convoy::API_PATHS.version),
             kind: Convoy::API_PATHS.kind.to_string(),
@@ -1207,9 +1294,26 @@ impl PlacementStrategy {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
+    use std::sync::{Arc, Mutex};
 
-    use super::legible_waiting_for;
+    use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
+    use flotilla_resources::ResourceBackend;
+
+    use super::{legible_waiting_for, VesselReconciler};
+
+    #[derive(Clone)]
+    struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log output lock should be healthy").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn waiting_message_replaces_the_structured_host_direct_environment_name() {
@@ -1229,5 +1333,33 @@ mod tests {
             "checkout checkout-01HXYZ to become ready",
             "unrelated names containing the host ref must not be rewritten"
         );
+    }
+
+    #[test]
+    fn missing_host_local_environment_warns_with_store_and_host_context() {
+        let backend = ResourceBackend::InMemory(Default::default());
+        let reconciler = VesselReconciler::new(backend.clone(), "flotilla").with_federated_dependencies(&backend, "feta-host");
+        let log_output = Arc::new(Mutex::new(Vec::new()));
+        let message;
+        {
+            let writer = LogCaptureWriter(Arc::clone(&log_output));
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            message = reconciler.missing_host_local_environment("host-direct-kiwi", "kiwi-host");
+        }
+
+        let logs =
+            String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be valid UTF-8");
+        assert!(logs.contains(" WARN "), "missing warning level: {logs}");
+        assert!(logs.contains("environment_ref=host-direct-kiwi"), "missing Environment context: {logs}");
+        assert!(logs.contains("placement_host_ref=kiwi-host"), "missing placement-host context: {logs}");
+        assert!(logs.contains("reconciler_host_ref=feta-host"), "missing store-host context: {logs}");
+        assert!(message.contains("resource store for reconciler host feta-host"));
     }
 }

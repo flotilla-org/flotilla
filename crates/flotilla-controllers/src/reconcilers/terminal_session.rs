@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
     controller::{Actuation, ReconcileOutcome, Reconciler},
-    Convoy, Environment, EnvironmentPhase, ResourceBackend, ResourceError, ResourceObject, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag,
-    TypedResolver, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, VESSEL_REF_LABEL,
+    Convoy, Environment, EnvironmentPhase, ReplicaReadResolver, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
+    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -54,12 +55,50 @@ pub trait TerminalRuntime: Send + Sync {
 pub struct TerminalSessionReconciler<R> {
     runtime: Arc<R>,
     convoys: TypedResolver<Convoy>,
+    federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     environments: TypedResolver<Environment>,
 }
 
 impl<R> TerminalSessionReconciler<R> {
     pub fn new(runtime: Arc<R>, backend: ResourceBackend, namespace: &str) -> Self {
-        Self { runtime, convoys: backend.clone().using::<Convoy>(namespace), environments: backend.using::<Environment>(namespace) }
+        Self {
+            runtime,
+            convoys: backend.clone().using::<Convoy>(namespace),
+            federated_convoys: None,
+            environments: backend.using::<Environment>(namespace),
+        }
+    }
+
+    pub fn with_federated_convoys(mut self, backend: &ResourceBackend, namespace: &str) -> Self {
+        self.federated_convoys = Some(backend.including_replicas::<Convoy>(namespace));
+        self
+    }
+
+    async fn convoy_for_session(
+        &self,
+        session: &ResourceObject<TerminalSession>,
+        convoy_ref: &str,
+    ) -> Result<ResourceObject<Convoy>, ResourceError> {
+        let Some(origin) = session.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION) else {
+            return self.convoys.get(convoy_ref).await;
+        };
+        let Some(federated) = self.federated_convoys.as_ref() else {
+            return Err(ResourceError::not_found(convoy_ref));
+        };
+        federated
+            .list()
+            .await?
+            .items
+            .into_iter()
+            .find(|source| {
+                source.object.metadata.name == convoy_ref
+                    && matches!(
+                        &source.provenance,
+                        ResourceProvenance::Replica { origin_root, .. } if origin_root.as_str() == origin
+                    )
+            })
+            .map(|source| source.object)
+            .ok_or_else(|| ResourceError::not_found(convoy_ref))
     }
 }
 
@@ -88,7 +127,7 @@ where
             TerminalSessionSource::Tool { .. } => obj.metadata.labels.get(CONVOY_LABEL).map(String::as_str),
         };
         if let Some(convoy_ref) = convoy_ref {
-            match self.convoys.get(convoy_ref).await {
+            match self.convoy_for_session(obj, convoy_ref).await {
                 Ok(convoy) if convoy.metadata.deletion_timestamp.is_none() => {}
                 Ok(_) | Err(ResourceError::NotFound { .. }) => return Ok(TerminalDeps::OwnerMissing),
                 Err(err) => return Err(err),

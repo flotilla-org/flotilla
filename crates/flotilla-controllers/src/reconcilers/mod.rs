@@ -5,6 +5,7 @@ pub mod presentation;
 pub mod repository;
 pub mod terminal_session;
 pub mod vessel;
+pub mod vessel_placement;
 
 pub use checkout::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
@@ -19,3 +20,4 @@ pub use presentation::{
 pub use repository::{ForgeDefaultBranchResolver, RepositoryReconciler};
 pub use terminal_session::{TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
 pub use vessel::{VesselDeps, VesselReconciler};
+pub use vessel_placement::{VesselPlacementProjector, VesselPlacementSync};
