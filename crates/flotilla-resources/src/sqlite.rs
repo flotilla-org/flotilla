@@ -1074,6 +1074,7 @@ impl SqliteBackend {
                 params![key.0, key.1, key.2, key.3, meta.name, version, body_json],
             )
             .map_err(|err| Self::map_sqlite(err, "insert sqlite resource object"))?;
+            Self::clear_decode_quarantine(&tx, &key, &meta.name)?;
             Self::insert_event(&tx, &key, version, StoredEventKind::Added, &body_json, event_retention)?;
             tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource create"))?;
             Self::notify_watchers(&watchers, &key, StoredEvent { kind: StoredEventKind::Added, object: encoded });
@@ -1325,6 +1326,19 @@ impl SqliteBackend {
             params![key.0, key.1, key.2, key.3, name, resource_version, body_json],
         )
         .map_err(|err| Self::map_sqlite(err, "upsert sqlite resource object"))?;
+        Self::clear_decode_quarantine(tx, key, name)?;
+        Ok(())
+    }
+
+    fn clear_decode_quarantine(tx: &rusqlite::Transaction<'_>, key: &StoreKey, name: &str) -> Result<(), ResourceError> {
+        tx.execute(
+            r#"
+            DELETE FROM resource_decode_quarantine
+            WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
+            "#,
+            params![key.0, key.1, key.2, key.3, name],
+        )
+        .map_err(|err| Self::map_sqlite(err, "clear sqlite resource decode quarantine"))?;
         Ok(())
     }
 

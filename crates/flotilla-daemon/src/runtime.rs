@@ -248,10 +248,15 @@ impl RuntimeHealth {
         }
     }
 
-    fn conditions(&self) -> Vec<HostCondition> {
+    async fn conditions(&self) -> Vec<HostCondition> {
         let mut conditions = self.failures.lock().expect("runtime health lock poisoned").values().cloned().collect::<Vec<_>>();
-        if let Some(state_dir) = self.restart_history_dir.as_deref() {
-            let condition = match crate::restart_history::recent_abnormal_restarts(state_dir, Utc::now()) {
+        if let Some(state_dir) = self.restart_history_dir.clone() {
+            let frequency =
+                tokio::task::spawn_blocking(move || crate::restart_history::recent_abnormal_restarts(state_dir.as_path(), Utc::now()))
+                    .await
+                    .map_err(|error| format!("restart history task failed: {error}"))
+                    .and_then(|result| result);
+            let condition = match frequency {
                 Ok(frequency) if frequency.count > 0 => Some(
                     HostCondition::builder()
                         .condition_type("Daemon/AbnormalRestarts")
@@ -1208,7 +1213,7 @@ async fn apply_host_heartbeat_with_credentials(
     let disk_free_bytes = tokio::task::spawn_blocking(move || measure_available_space(&repo_default_dir))
         .await
         .map_err(|error| format!("measure available disk space: {error}"))?;
-    let mut conditions = runtime_health.conditions();
+    let mut conditions = runtime_health.conditions().await;
     conditions.extend(file_descriptor_pressure_condition());
     if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
         conditions.push(condition);
@@ -4039,7 +4044,7 @@ mod tests {
         )
         .await;
 
-        let conditions = runtime_health.conditions();
+        let conditions = runtime_health.conditions().await;
         assert_eq!(conditions.len(), 1);
         assert_eq!(conditions[0].condition_type, "Controller/checkout");
         assert_eq!(conditions[0].reason, "RestartBudgetExhausted");
