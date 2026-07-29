@@ -5046,8 +5046,42 @@ async fn repeated_identical_reclaim_refusal_does_not_rewrite_checkout_status() {
     );
 }
 
-#[test]
-fn teardown_latch_normalization_preserves_terminal_change_request_for_dedup() {
+#[tokio::test]
+async fn teardown_gate_does_not_rewrite_a_latched_terminal_change_request() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/merged\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/merged\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/merged..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/merged..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("0\n".into()))
+        .build();
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(&config_base)),
+        fake_discovery_with_runner(false, Arc::new(runner)),
+        HostName::local(),
+    )
+    .await;
+    daemon
+        .resource_backend()
+        .using::<Convoy>("flotilla")
+        .create(&empty_input_meta("merged-convoy"), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
+        .await
+        .expect("convoy create should succeed");
+    create_ready_observed_checkout_for_convoy(&daemon, "flotilla", "merged-convoy", "checkout-merged", "/repo", "feature/merged").await;
+
     let condition = |value, observed_at: &str| IntegrationCondition::builder().value(value).observed_at(observed_at.to_string()).build();
     let evidence = flotilla_resources::LandedEvidence::builder().change_request_id("1162".to_string()).build();
     let change_request = flotilla_resources::ChangeRequestObservation::builder()
@@ -5056,26 +5090,25 @@ fn teardown_latch_normalization_preserves_terminal_change_request_for_dedup() {
         .mergeability(flotilla_resources::ChangeRequestMergeability::Unknown)
         .observed_at("2026-07-28T00:00:00Z".to_string())
         .build();
-    let existing = CheckoutIntegrationStatus {
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let checkout = checkouts.get("checkout-merged").await.expect("ready checkout");
+    let mut status = checkout.status.expect("ready checkout status");
+    status.integration = CheckoutIntegrationStatus {
         clean: condition(ConditionValue::True, "2026-07-28T00:00:00Z"),
         pushed: condition(ConditionValue::True, "2026-07-28T00:00:00Z"),
         landed: condition(ConditionValue::True, "2026-07-28T00:00:00Z"),
         landed_evidence: Some(evidence),
         change_request: Some(change_request),
     };
-    let mut observed = CheckoutIntegrationStatus {
-        clean: condition(ConditionValue::True, "2026-07-28T00:01:00Z"),
-        pushed: condition(ConditionValue::True, "2026-07-28T00:01:00Z"),
-        landed: condition(ConditionValue::True, "2026-07-28T00:01:00Z"),
-        landed_evidence: None,
-        change_request: None,
-    };
+    checkouts.update_status("checkout-merged", &checkout.metadata.resource_version, &status).await.expect("persist landed checkout");
 
-    latch_evidence_backed_integration(&existing, &mut observed);
-
-    assert!(
-        integration_observation_matches(&existing, &observed),
-        "a timestamp-only refresh must not rewrite a latched terminal change request"
+    daemon.verify_convoy_teardown_gate("flotilla", "merged-convoy", false).await.expect("landed checkout should pass teardown");
+    let first = checkouts.get("checkout-merged").await.expect("checkout after first teardown gate");
+    daemon.verify_convoy_teardown_gate("flotilla", "merged-convoy", false).await.expect("landed checkout should still pass teardown");
+    let second = checkouts.get("checkout-merged").await.expect("checkout after second teardown gate");
+    assert_eq!(
+        second.metadata.resource_version, first.metadata.resource_version,
+        "a repeated timestamp-only teardown probe must not rewrite a latched terminal change request"
     );
 }
 

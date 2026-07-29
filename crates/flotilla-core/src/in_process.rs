@@ -6058,15 +6058,8 @@ impl InProcessDaemon {
                 checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
             )
             .await;
-            if let Some(existing) = checkout
-                .status
-                .as_ref()
-                .filter(|status| status.integration.landed.value == ConditionValue::True && status.integration.landed_evidence.is_some())
-            {
-                integration.landed.value = ConditionValue::True;
-                if integration.landed_evidence.is_none() {
-                    integration.landed_evidence = existing.integration.landed_evidence.clone();
-                }
+            if let Some(existing) = checkout.status.as_ref() {
+                latch_evidence_backed_integration(&existing.integration, &mut integration);
             }
             if !checkout.status.as_ref().is_some_and(|status| integration_observation_matches(&status.integration, &integration)) {
                 if let Err(error) = apply_resource_status_patch(
