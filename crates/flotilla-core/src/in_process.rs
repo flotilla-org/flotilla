@@ -1624,6 +1624,20 @@ fn integration_observation_matches(left: &CheckoutIntegrationStatus, right: &Che
         }
 }
 
+fn latch_evidence_backed_integration(existing: &CheckoutIntegrationStatus, observed: &mut CheckoutIntegrationStatus) {
+    if existing.landed.value != ConditionValue::True || existing.landed_evidence.is_none() {
+        return;
+    }
+    observed.landed.value = ConditionValue::True;
+    if observed.landed_evidence.is_none() {
+        observed.landed_evidence = existing.landed_evidence.clone();
+    }
+    if observed.change_request.is_none() {
+        observed.change_request =
+            existing.change_request.clone().filter(|change_request| change_request.state != flotilla_resources::ChangeRequestState::Open);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExistingConvoyTarget {
     pub home: HostName,
@@ -2272,15 +2286,8 @@ impl InProcessDaemon {
                 checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
             )
             .await;
-            if let Some(existing) = checkout
-                .status
-                .as_ref()
-                .filter(|status| status.integration.landed.value == ConditionValue::True && status.integration.landed_evidence.is_some())
-            {
-                integration.landed.value = ConditionValue::True;
-                if integration.landed_evidence.is_none() {
-                    integration.landed_evidence = existing.integration.landed_evidence.clone();
-                }
+            if let Some(existing) = checkout.status.as_ref() {
+                latch_evidence_backed_integration(&existing.integration, &mut integration);
             }
             apply_resource_status_patch(&checkouts, &checkout.metadata.name, &flotilla_resources::CheckoutStatusPatch::UpdateIntegration {
                 integration: Box::new(integration),

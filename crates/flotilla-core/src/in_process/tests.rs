@@ -5046,6 +5046,39 @@ async fn repeated_identical_reclaim_refusal_does_not_rewrite_checkout_status() {
     );
 }
 
+#[test]
+fn teardown_latch_normalization_preserves_terminal_change_request_for_dedup() {
+    let condition = |value, observed_at: &str| IntegrationCondition::builder().value(value).observed_at(observed_at.to_string()).build();
+    let evidence = flotilla_resources::LandedEvidence::builder().change_request_id("1162".to_string()).build();
+    let change_request = flotilla_resources::ChangeRequestObservation::builder()
+        .id("1162".to_string())
+        .state(flotilla_resources::ChangeRequestState::Merged)
+        .mergeability(flotilla_resources::ChangeRequestMergeability::Unknown)
+        .observed_at("2026-07-28T00:00:00Z".to_string())
+        .build();
+    let existing = CheckoutIntegrationStatus {
+        clean: condition(ConditionValue::True, "2026-07-28T00:00:00Z"),
+        pushed: condition(ConditionValue::True, "2026-07-28T00:00:00Z"),
+        landed: condition(ConditionValue::True, "2026-07-28T00:00:00Z"),
+        landed_evidence: Some(evidence),
+        change_request: Some(change_request),
+    };
+    let mut observed = CheckoutIntegrationStatus {
+        clean: condition(ConditionValue::True, "2026-07-28T00:01:00Z"),
+        pushed: condition(ConditionValue::True, "2026-07-28T00:01:00Z"),
+        landed: condition(ConditionValue::True, "2026-07-28T00:01:00Z"),
+        landed_evidence: None,
+        change_request: None,
+    };
+
+    latch_evidence_backed_integration(&existing, &mut observed);
+
+    assert!(
+        integration_observation_matches(&existing, &observed),
+        "a timestamp-only refresh must not rewrite a latched terminal change request"
+    );
+}
+
 #[tokio::test]
 async fn convoy_reclaim_allows_managed_checkout_whose_path_is_already_gone() {
     let temp = tempfile::tempdir().expect("create tempdir");
