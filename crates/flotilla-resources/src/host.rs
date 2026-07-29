@@ -25,6 +25,11 @@ pub struct HostSpec {
 pub struct HostStatus {
     #[serde(default)]
     pub capabilities: BTreeMap<String, serde_json::Value>,
+    /// Last adapter inventory that did not regress from the preceding
+    /// generation. A regressed generation retains this baseline so another
+    /// restart cannot silently absorb the loss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_adapter_baseline: Option<BTreeSet<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat_at: Option<DateTime<Utc>>,
     #[serde(default)]

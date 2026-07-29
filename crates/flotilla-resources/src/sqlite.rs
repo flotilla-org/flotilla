@@ -17,7 +17,7 @@ use crate::{
     error::ResourceError,
     replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, K8sResourceObject, MergeMetadata, ObjectMeta, Resource, ResourceObject},
-    retention::{EventRetention, ResourceStoreDiagnostics},
+    retention::{EventRetention, ResourceDecodeQuarantine, ResourceStoreDiagnostics},
     watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
 };
 
@@ -172,6 +172,18 @@ impl SqliteBackend {
                     PRIMARY KEY (group_name, version, kind, namespace, event_version)
                 );
 
+                CREATE TABLE IF NOT EXISTS resource_decode_quarantine (
+                    group_name TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    body_json TEXT NOT NULL,
+                    error TEXT NOT NULL,
+                    quarantined_at TEXT NOT NULL,
+                    PRIMARY KEY (group_name, version, kind, namespace, name)
+                );
+
                 CREATE TABLE IF NOT EXISTS resource_event_compaction (
                     group_name TEXT NOT NULL,
                     version TEXT NOT NULL,
@@ -306,7 +318,39 @@ impl SqliteBackend {
         let resource_stream_count = connection
             .query_row("SELECT COUNT(*) FROM resource_sequences", [], |row| row.get::<_, u64>(0))
             .map_err(|err| Self::map_sqlite(err, "count sqlite resource streams"))?;
-        Ok(ResourceStoreDiagnostics::new(object_count, event_count, resource_stream_count, event_retention))
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT kind, namespace, name, error, quarantined_at
+                FROM resource_decode_quarantine
+                ORDER BY kind, namespace, name
+                "#,
+            )
+            .map_err(|err| Self::map_sqlite(err, "prepare sqlite resource decode quarantine diagnostics"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|err| Self::map_sqlite(err, "query sqlite resource decode quarantine diagnostics"))?;
+        let decode_quarantines = rows
+            .map(|row| {
+                let (kind, namespace, name, error, quarantined_at) =
+                    row.map_err(|err| Self::map_sqlite(err, "read sqlite resource decode quarantine diagnostic"))?;
+                let quarantined_at = DateTime::parse_from_rfc3339(&quarantined_at)
+                    .map_err(|err| ResourceError::decode(format!("decode resource quarantine timestamp: {err}")))?
+                    .with_timezone(&Utc);
+                Ok(ResourceDecodeQuarantine { kind, namespace, name, error, quarantined_at })
+            })
+            .collect::<Result<Vec<_>, ResourceError>>()?;
+        let mut diagnostics = ResourceStoreDiagnostics::new(object_count, event_count, resource_stream_count, event_retention);
+        diagnostics.decode_quarantines = decode_quarantines;
+        Ok(diagnostics)
     }
 
     fn clone_through_serde<T>(value: &T) -> Result<T, ResourceError>
@@ -860,29 +904,79 @@ impl SqliteBackend {
 
     pub(crate) async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
-        self.call(move |connection| {
-            let mut statement = connection
-                .prepare(
-                    r#"
-                    SELECT body_json FROM resource_objects
-                    WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4
-                    ORDER BY name
-                    "#,
-                )
-                .map_err(|err| Self::map_sqlite(err, "prepare sqlite resource list"))?;
-            let rows = statement
-                .query_map(params![key.0, key.1, key.2, key.3], |row| row.get::<_, String>(0))
-                .map_err(|err| Self::map_sqlite(err, "query sqlite resource list"))?;
-            let mut items = Vec::new();
-            for row in rows {
-                let body = row.map_err(|err| Self::map_sqlite(err, "read sqlite resource list row"))?;
-                let value =
-                    serde_json::from_str(&body).map_err(|err| ResourceError::decode(format!("decode stored object JSON: {err}")))?;
-                items.push(Self::decode_object::<T>(value)?);
-            }
-            Ok(ResourceList { items, resource_version: Self::current_version(connection, &key)?.to_string(), generation: None })
-        })
-        .await
+        let namespace = namespace.to_string();
+        let (listed, failures) = self
+            .call(move |connection| {
+                let mut statement = connection
+                    .prepare(
+                        r#"
+                        SELECT name, body_json FROM resource_objects
+                        WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4
+                        ORDER BY name
+                        "#,
+                    )
+                    .map_err(|err| Self::map_sqlite(err, "prepare sqlite resource list"))?;
+                let rows = statement
+                    .query_map(params![key.0, key.1, key.2, key.3], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                    .map_err(|err| Self::map_sqlite(err, "query sqlite resource list"))?;
+                let rows = rows.collect::<Result<Vec<_>, _>>().map_err(|err| Self::map_sqlite(err, "read sqlite resource list row"))?;
+                drop(statement);
+                let mut items = Vec::new();
+                let mut failures = Vec::new();
+                for (name, body) in rows {
+                    let decoded = serde_json::from_str(&body)
+                        .map_err(|err| ResourceError::decode(format!("decode stored object JSON: {err}")))
+                        .and_then(Self::decode_object::<T>);
+                    match decoded {
+                        Ok(object) => items.push(object),
+                        Err(error) => failures.push((name, body, error.to_string())),
+                    }
+                }
+                if !failures.is_empty() {
+                    let quarantined_at = Utc::now();
+                    let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource decode quarantine"))?;
+                    for (name, body, error) in &failures {
+                        tx.execute(
+                            r#"
+                            INSERT INTO resource_decode_quarantine
+                                (group_name, version, kind, namespace, name, body_json, error, quarantined_at)
+                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                            ON CONFLICT(group_name, version, kind, namespace, name)
+                            DO UPDATE SET body_json = excluded.body_json,
+                                          error = excluded.error,
+                                          quarantined_at = excluded.quarantined_at
+                            "#,
+                            params![key.0, key.1, key.2, key.3, name, body, error, quarantined_at.to_rfc3339()],
+                        )
+                        .map_err(|err| Self::map_sqlite(err, "persist sqlite resource decode quarantine"))?;
+                        tx.execute(
+                            r#"
+                            DELETE FROM resource_objects
+                            WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
+                            "#,
+                            params![key.0, key.1, key.2, key.3, name],
+                        )
+                        .map_err(|err| Self::map_sqlite(err, "remove quarantined sqlite resource object"))?;
+                    }
+                    tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource decode quarantine"))?;
+                }
+                let warnings: Vec<_> = failures.iter().map(|(name, _, error)| (name.clone(), error.clone())).collect();
+                Ok((
+                    ResourceList { items, resource_version: Self::current_version(connection, &key)?.to_string(), generation: None },
+                    warnings,
+                ))
+            })
+            .await?;
+        for (name, error) in failures {
+            tracing::warn!(
+                kind = T::API_PATHS.kind,
+                namespace = %namespace,
+                %name,
+                %error,
+                "quarantined undecodable stored resource object"
+            );
+        }
+        Ok(listed)
     }
 
     pub(crate) async fn list_typed_matching_labels<T: Resource>(
@@ -980,6 +1074,7 @@ impl SqliteBackend {
                 params![key.0, key.1, key.2, key.3, meta.name, version, body_json],
             )
             .map_err(|err| Self::map_sqlite(err, "insert sqlite resource object"))?;
+            Self::clear_decode_quarantine(&tx, &key, &meta.name)?;
             Self::insert_event(&tx, &key, version, StoredEventKind::Added, &body_json, event_retention)?;
             tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource create"))?;
             Self::notify_watchers(&watchers, &key, StoredEvent { kind: StoredEventKind::Added, object: encoded });
@@ -1231,6 +1326,19 @@ impl SqliteBackend {
             params![key.0, key.1, key.2, key.3, name, resource_version, body_json],
         )
         .map_err(|err| Self::map_sqlite(err, "upsert sqlite resource object"))?;
+        Self::clear_decode_quarantine(tx, key, name)?;
+        Ok(())
+    }
+
+    fn clear_decode_quarantine(tx: &rusqlite::Transaction<'_>, key: &StoreKey, name: &str) -> Result<(), ResourceError> {
+        tx.execute(
+            r#"
+            DELETE FROM resource_decode_quarantine
+            WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
+            "#,
+            params![key.0, key.1, key.2, key.3, name],
+        )
+        .map_err(|err| Self::map_sqlite(err, "clear sqlite resource decode quarantine"))?;
         Ok(())
     }
 

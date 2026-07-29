@@ -85,6 +85,16 @@ fn attention_crds_parse_with_expected_names() {
 }
 
 #[test]
+fn material_pool_crd_parses_with_expected_name() {
+    let pool: serde_json::Value =
+        serde_yml::from_str(include_str!("../src/crds/material_pool.crd.yaml")).expect("MaterialPool CRD should parse");
+
+    assert_eq!(pool["metadata"]["name"], "materialpools.flotilla.work");
+    assert_eq!(pool["spec"]["names"]["kind"], "MaterialPool");
+    assert_eq!(pool["spec"]["versions"][0]["subresources"]["status"], serde_json::json!({}));
+}
+
+#[test]
 fn k8s_object_projection_rejects_wrong_resource_identity() {
     let object = convoy_object("alpha", convoy_spec("review"), None);
     let mut projected = object.to_k8s_object();

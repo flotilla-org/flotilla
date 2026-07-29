@@ -6805,6 +6805,7 @@ async fn convoy_landing_reprobes_after_injected_clock_crosses_evidence_ttl() {
                 pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
                 landed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at).build(),
                 landed_evidence: None,
+                change_request: None,
             },
             message: None,
         })

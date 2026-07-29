@@ -7,7 +7,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_core::agent_adapter::{
-    append_convoy_work_context, build_crew_brief_with_options, CrewAssignment, CrewBriefMember, CrewBriefTemplateResolver,
+    append_convoy_work_context, build_crew_brief_with_options, CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefTemplateResolver,
 };
 use flotilla_protocol::PlacementDecision;
 use flotilla_resources::{
@@ -17,11 +17,12 @@ use flotilla_resources::{
     },
     repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
     CrewSource, CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentMount,
-    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository,
-    RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase,
-    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, VESSEL_REF_LABEL,
+    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, EnvironmentWaitReason, FreshCloneCheckoutSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
+    PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
+    ResourceObject, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel,
+    VesselPhase, VesselStatusPatch, WorkPhase, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
+    VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -107,6 +108,7 @@ enum PlannedPatch {
         observed_policy_version: String,
         placement_decision: Option<PlacementDecision>,
         waiting_for: String,
+        wait_reason: Option<EnvironmentWaitReason>,
     },
     Ready {
         placement_decision: Option<PlacementDecision>,
@@ -150,7 +152,24 @@ impl VesselDeps {
         actuations: Vec<Actuation>,
     ) -> Self {
         let waiting_for = legible_waiting_for(waiting_for.into(), placement_decision.as_ref());
-        Self { patch: provisioning_patch(placement_policy, placement_decision, waiting_for), actuations }
+        Self { patch: provisioning_patch(placement_policy, placement_decision, waiting_for, None), actuations }
+    }
+
+    fn provisioning_for_environment(
+        placement_policy: &ResourceObject<PlacementPolicy>,
+        placement_decision: Option<PlacementDecision>,
+        environment: &ResourceObject<Environment>,
+        fallback: impl Into<String>,
+        actuations: Vec<Actuation>,
+    ) -> Self {
+        let fallback = fallback.into();
+        let (waiting_for, wait_reason) = environment
+            .status
+            .as_ref()
+            .map(|status| (status.message.clone().unwrap_or_else(|| fallback.clone()), status.wait_reason.clone()))
+            .unwrap_or((fallback, None));
+        let waiting_for = legible_waiting_for(waiting_for, placement_decision.as_ref());
+        Self { patch: provisioning_patch(placement_policy, placement_decision, waiting_for, wait_reason), actuations }
     }
 
     fn failed(message: impl Into<String>) -> Self {
@@ -209,6 +228,18 @@ impl Reconciler for VesselReconciler {
             Some((vessel_index, requirement)) => (vessel_index, requirement),
             None => return Ok(VesselDeps::failed(format!("vessel {} missing from convoy snapshot", obj.spec.vessel_name))),
         };
+        let capabilities = CapabilityTable::seeded();
+        let mut required_agent_adapters = BTreeSet::new();
+        for process in &requirement.crew {
+            if let CrewSource::Agent { selector, .. } = &process.source {
+                match capabilities.resolve(&selector.capability) {
+                    Ok(agent) => {
+                        required_agent_adapters.insert(agent.adapter.clone());
+                    }
+                    Err(message) => return Ok(VesselDeps::failed(message)),
+                }
+            }
+        }
         let effective_stance = strategy.effective_stance();
         if effective_stance < requirement.stance {
             return Ok(VesselDeps::failed(format!(
@@ -301,10 +332,16 @@ impl Reconciler for VesselReconciler {
                             return Ok(VesselDeps::failed(message));
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                            return Ok(VesselDeps::provisioning(
+                            let waiting_for = existing
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.message.clone())
+                                .unwrap_or_else(|| format!("environment {env_name} to become ready"));
+                            return Ok(VesselDeps::provisioning_for_environment(
                                 &placement_policy,
                                 placement_decision.clone(),
-                                format!("environment {env_name} to become ready"),
+                                &existing,
+                                waiting_for,
                                 actuations,
                             ));
                         }
@@ -322,6 +359,7 @@ impl Reconciler for VesselReconciler {
                                     host_ref: host_ref.clone(),
                                     image: image.clone(),
                                     declared_agent_adapters: declared_agent_adapters.clone(),
+                                    required_agent_adapters: required_agent_adapters.clone(),
                                     pull_policy: *pull_policy,
                                     mounts: Vec::new(),
                                     env: environment_with_credentials(env.clone(), &requirement.credential_refs),
@@ -611,10 +649,16 @@ impl Reconciler for VesselReconciler {
                             return Ok(VesselDeps::failed(message));
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                            return Ok(VesselDeps::provisioning(
+                            let waiting_for = existing
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.message.clone())
+                                .unwrap_or_else(|| format!("environment {env_name} to become ready"));
+                            return Ok(VesselDeps::provisioning_for_environment(
                                 &placement_policy,
                                 placement_decision.clone(),
-                                format!("environment {env_name} to become ready"),
+                                &existing,
+                                waiting_for,
                                 actuations,
                             ));
                         }
@@ -632,6 +676,7 @@ impl Reconciler for VesselReconciler {
                                     host_ref: host_ref.clone(),
                                     image: image.clone(),
                                     declared_agent_adapters: declared_agent_adapters.clone(),
+                                    required_agent_adapters: required_agent_adapters.clone(),
                                     pull_policy: *pull_policy,
                                     mounts: has_repositories
                                         .then(|| EnvironmentMount {
@@ -848,13 +893,13 @@ impl Reconciler for VesselReconciler {
     ) -> ReconcileOutcome<Self::Resource> {
         let patch = match &deps.patch {
             PlannedPatch::None => None,
-            PlannedPatch::Provisioning { observed_policy_ref, observed_policy_version, placement_decision, waiting_for } => {
+            PlannedPatch::Provisioning { observed_policy_ref, observed_policy_version, placement_decision, waiting_for, wait_reason } => {
                 Some(VesselStatusPatch::MarkProvisioning {
                     observed_policy_ref: observed_policy_ref.clone(),
                     observed_policy_version: observed_policy_version.clone(),
                     placement_decision: placement_decision.clone(),
                     started_at: now,
-                    message: provisioning_stuck_message(obj, waiting_for, now),
+                    message: provisioning_stuck_message(obj, waiting_for, wait_reason.as_ref(), now),
                 })
             }
             PlannedPatch::Ready {
@@ -967,16 +1012,26 @@ fn provisioning_patch(
     placement_policy: &ResourceObject<PlacementPolicy>,
     placement_decision: Option<PlacementDecision>,
     waiting_for: String,
+    wait_reason: Option<EnvironmentWaitReason>,
 ) -> PlannedPatch {
     PlannedPatch::Provisioning {
         observed_policy_ref: placement_policy.metadata.name.clone(),
         observed_policy_version: placement_policy.metadata.resource_version.clone(),
         placement_decision,
         waiting_for,
+        wait_reason,
     }
 }
 
-fn provisioning_stuck_message(obj: &ResourceObject<Vessel>, waiting_for: &str, now: DateTime<Utc>) -> Option<String> {
+fn provisioning_stuck_message(
+    obj: &ResourceObject<Vessel>,
+    waiting_for: &str,
+    wait_reason: Option<&EnvironmentWaitReason>,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    if matches!(wait_reason, Some(EnvironmentWaitReason::MaterialPoolExhausted { .. })) {
+        return Some(waiting_for.to_string());
+    }
     let started_at = obj.status.as_ref().filter(|status| status.phase == VesselPhase::Provisioning).and_then(|status| status.started_at)?;
     (now.signed_duration_since(started_at) >= chrono::Duration::seconds(VESSEL_PROVISIONING_STUCK_SECONDS))
         .then(|| format!("provisioning is stalled while waiting for {waiting_for}; reconciliation will continue retrying"))
@@ -993,6 +1048,43 @@ fn legible_waiting_for(mut waiting_for: String, placement_decision: Option<&Plac
         waiting_for = waiting_for.replace(&target_environment, &display_environment);
     }
     waiting_for
+}
+
+#[cfg(test)]
+mod material_pool_wait_tests {
+    use flotilla_resources::ObjectMeta;
+
+    use super::*;
+
+    #[test]
+    fn material_pool_wait_is_visible_immediately_in_vessel_status() {
+        let now = Utc::now();
+        let vessel = ResourceObject::<Vessel> {
+            metadata: ObjectMeta {
+                name: "vessel-a".to_string(),
+                namespace: "flotilla".to_string(),
+                resource_version: "1".to_string(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: now,
+                merge: None,
+            },
+            spec: flotilla_resources::VesselSpec {
+                convoy_ref: "convoy-a".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "docker-a".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+            status: None,
+        };
+        let message = "waiting for agent login material; 2 in pool, all leased";
+        let reason = EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: "agent-login".to_string() };
+
+        assert_eq!(provisioning_stuck_message(&vessel, message, Some(&reason), now).as_deref(), Some(message));
+    }
 }
 
 fn environment_name(vessel_name: &str) -> String {

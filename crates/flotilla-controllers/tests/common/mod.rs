@@ -217,6 +217,7 @@ pub async fn create_ready_host_direct_environment(
             image_ref: None,
             image_digest: None,
             message: None,
+            wait_reason: None,
         })
         .await
         .expect("environment status update should succeed");
@@ -243,6 +244,7 @@ pub async fn create_ready_docker_environment(
             image_ref: Some(image_ref),
             image_digest: Some("sha256:test-image".to_string()),
             message: None,
+            wait_reason: None,
         })
         .await
         .expect("docker env status update should succeed");

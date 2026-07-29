@@ -8,8 +8,8 @@ use crate::{
     api_version,
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
-    Checkout, Clone as CloneResource, Convoy, CredentialGrant, CredentialSpec, Demand, Environment, Host, InputMeta, ObjectMeta,
-    OwnerReference, PlacementPolicy, Presentation, Project, ReadResourceList, ReadWatchEvent, Regard, Repository, Resource,
+    Checkout, Clone as CloneResource, Convoy, CredentialGrant, CredentialSpec, Demand, Environment, Host, InputMeta, MaterialPool,
+    ObjectMeta, OwnerReference, PlacementPolicy, Presentation, Project, ReadResourceList, ReadWatchEvent, Regard, Repository, Resource,
     ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart,
     WorkflowTemplate,
 };
@@ -32,6 +32,7 @@ enum RegisteredResource {
     Demand,
     Environment,
     Host,
+    MaterialPool,
     PlacementPolicy,
     Presentation,
     Project,
@@ -90,6 +91,13 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<Demand>(RegisteredResource::Demand, &[]),
     kind::<Environment>(RegisteredResource::Environment, &[]),
     kind::<Host>(RegisteredResource::Host, &[]),
+    kind::<MaterialPool>(RegisteredResource::MaterialPool, &[
+        "materialpool",
+        "material_pool",
+        "material_pools",
+        "material-pool",
+        "material-pools",
+    ]),
     kind::<PlacementPolicy>(RegisteredResource::PlacementPolicy, &[
         "placementpolicy",
         "placement_policy",
@@ -133,6 +141,7 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::Demand => $body::<Demand>($($arg),*).await,
             RegisteredResource::Environment => $body::<Environment>($($arg),*).await,
             RegisteredResource::Host => $body::<Host>($($arg),*).await,
+            RegisteredResource::MaterialPool => $body::<MaterialPool>($($arg),*).await,
             RegisteredResource::PlacementPolicy => $body::<PlacementPolicy>($($arg),*).await,
             RegisteredResource::Presentation => $body::<Presentation>($($arg),*).await,
             RegisteredResource::Project => $body::<Project>($($arg),*).await,
@@ -153,6 +162,7 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::Demand => $body::<Demand>(),
             RegisteredResource::Environment => $body::<Environment>(),
             RegisteredResource::Host => $body::<Host>(),
+            RegisteredResource::MaterialPool => $body::<MaterialPool>(),
             RegisteredResource::PlacementPolicy => $body::<PlacementPolicy>(),
             RegisteredResource::Presentation => $body::<Presentation>(),
             RegisteredResource::Project => $body::<Project>(),
@@ -173,6 +183,7 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::Demand => $body::<Demand>($($arg),*),
             RegisteredResource::Environment => $body::<Environment>($($arg),*),
             RegisteredResource::Host => $body::<Host>($($arg),*),
+            RegisteredResource::MaterialPool => $body::<MaterialPool>($($arg),*),
             RegisteredResource::PlacementPolicy => $body::<PlacementPolicy>($($arg),*),
             RegisteredResource::Presentation => $body::<Presentation>($($arg),*),
             RegisteredResource::Project => $body::<Project>($($arg),*),
@@ -183,6 +194,21 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::WorkflowTemplate => $body::<WorkflowTemplate>($($arg),*),
         }
     };
+}
+
+/// Drives a typed read of every kind in the embedded durable store.
+///
+/// Embedded stores use this startup pass to isolate rows whose persisted
+/// representation no longer decodes under the running schema. Other backends
+/// cannot contain an untyped local row and need no scan.
+pub async fn quarantine_undecodable_stored_objects(backend: &ResourceBackend, namespace: &str) -> Result<(), ResourceError> {
+    if !matches!(backend, ResourceBackend::Sqlite(_)) {
+        return Ok(());
+    }
+    for registered in REGISTERED_RESOURCE_KINDS {
+        list_resource_kind(backend, namespace, registered.kind).await?;
+    }
+    Ok(())
 }
 
 pub async fn list_resource_kind(
