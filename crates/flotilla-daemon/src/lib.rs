@@ -1,6 +1,7 @@
 mod aggregator;
 mod credential;
 mod issue_materializer;
+mod resource_limits;
 pub mod resource_manifest;
 mod sleep_inhibitor;
 pub use aggregator::{Aggregator, AggregatorResolvers};
