@@ -31,8 +31,8 @@ use flotilla_resources::{
     TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
     Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
-    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL,
-    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, MANAGED_BY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -557,7 +557,7 @@ async fn default_placement_no_viable_candidate_error_names_the_adapter_and_candi
 }
 
 #[tokio::test]
-async fn peer_summary_materializes_an_admissible_host_direct_placement_target() {
+async fn peer_summary_registration_preserves_operator_fields_and_corrects_owned_drift() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -602,6 +602,24 @@ async fn peer_summary_materializes_an_admissible_host_direct_placement_target() 
         Some(ConvoyStartTarget { policy_name: "host-direct-feta-host".to_string(), host_id: HostId::new("feta-host") })
     );
 
+    let policies = daemon.resource_backend().using::<PlacementPolicy>("flotilla");
+    let registered = policies.get("host-direct-feta-host").await.expect("peer placement policy");
+    policies
+        .update(
+            &InputMeta::from(&registered.metadata),
+            &registered.metadata.resource_version,
+            &PlacementPolicySpec::builder()
+                .pool("operator-edited-pool".to_string())
+                .priority(10)
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: "operator-edited-host".to_string(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("operator placement policy apply");
+
     daemon
         .publish_peer_summary(
             HostSummary::builder()
@@ -622,7 +640,13 @@ async fn peer_summary_materializes_an_admissible_host_direct_placement_target() 
         .get("host-direct-feta-host")
         .await
         .expect("peer placement policy should update");
+    assert_eq!(refreshed.spec.priority, 10, "peer refresh must preserve operator-owned priority");
     assert_eq!(refreshed.spec.pool, "zellij");
+    assert_eq!(
+        refreshed.spec.host_direct,
+        Some(HostDirectPlacementPolicySpec { host_ref: "feta-host".to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree }),
+        "peer refresh must assert its host and checkout strategy"
+    );
 
     daemon
         .resource_backend()
@@ -635,6 +659,51 @@ async fn peer_summary_materializes_an_admissible_host_direct_placement_target() 
         .expect("local placement policy create");
     let local_intent = ConvoyStartIntent::builder().project_ref("flotilla".to_string()).placement_policy("local-pool".to_string()).build();
     assert_eq!(daemon.resolve_convoy_start_target(&local_intent).await.expect("non-host-direct placement should remain local"), None);
+}
+
+#[tokio::test]
+async fn peer_summary_leaves_manifest_managed_placement_policy_untouched() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"kiwi-host\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::new("kiwi")).await;
+    let policies = daemon.resource_backend().using::<PlacementPolicy>("flotilla");
+    let manifest_spec = PlacementPolicySpec::builder()
+        .pool("manifest-pool".to_string())
+        .priority(25)
+        .host_direct(HostDirectPlacementPolicySpec {
+            host_ref: "manifest-host".to_string(),
+            checkout: HostDirectPlacementPolicyCheckout::Worktree,
+        })
+        .build();
+    let manifest = policies
+        .create(
+            &InputMeta::builder()
+                .name("host-direct-feta-host".to_string())
+                .labels(BTreeMap::from([(MANAGED_BY_LABEL.to_string(), "manifest".to_string())]))
+                .build(),
+            &manifest_spec,
+        )
+        .await
+        .expect("manifest-managed policy");
+
+    daemon
+        .publish_peer_summary(
+            HostSummary::builder()
+                .environment_id(EnvironmentId::host(HostId::new("feta-host")))
+                .host_name(HostName::new("feta"))
+                .node(flotilla_protocol::NodeInfo::new(flotilla_protocol::NodeId::new("feta-node"), "feta"))
+                .system(SystemInfo::default())
+                .providers(vec![HostProviderStatus::available(TERMINAL_POOL_PROVIDER_CATEGORY, "cleat")])
+                .build(),
+        )
+        .await;
+
+    let unchanged = policies.get("host-direct-feta-host").await.expect("manifest-managed policy should remain");
+    assert_eq!(unchanged.spec, manifest_spec);
+    assert_eq!(unchanged.metadata.resource_version, manifest.metadata.resource_version, "peer refresh must not rewrite managed policy");
 }
 
 #[test]

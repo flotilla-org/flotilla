@@ -81,6 +81,7 @@ use crate::{
     host_registry::HostCounts,
     model::{provider_names_from_registry, repo_name, RepoModel},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
+    placement_policy::reconcile_registered_policy,
     providers::{
         ai_utility::{AiUtility, ConvoyNames},
         discovery::{
@@ -2493,7 +2494,6 @@ impl InProcessDaemon {
             .map_err(|error| error.to_string())?;
 
         let policy_name = format!("host-direct-{host_name}");
-        let policies = self.resource_backend.clone().using::<PlacementPolicy>(&namespace);
         let pool = terminal_pools.into_iter().next().unwrap_or_else(|| "passthrough".to_string());
         let desired = PlacementPolicySpec::builder()
             .pool(pool)
@@ -2502,20 +2502,7 @@ impl InProcessDaemon {
                 checkout: HostDirectPlacementPolicyCheckout::Worktree,
             })
             .build();
-        match policies.get(&policy_name).await {
-            Ok(existing) if existing.spec == desired => Ok(()),
-            Ok(existing) => policies
-                .update(&InputMeta::builder().name(policy_name).build(), &existing.metadata.resource_version, &desired)
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-            Err(ResourceError::NotFound { .. }) => policies
-                .create(&InputMeta::builder().name(policy_name).build(), &desired)
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-            Err(error) => Err(error.to_string()),
-        }
+        reconcile_registered_policy(&self.resource_backend, &namespace, &policy_name, &desired).await
     }
 
     pub async fn resolve_convoy_start_target(
