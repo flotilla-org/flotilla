@@ -5142,7 +5142,7 @@ mod tests {
         flotilla_resources::apply_status_patch(
             &checkouts,
             &checkout.metadata.name,
-            &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration },
+            &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration) },
         )
         .await
         .expect("record observed absence of a change request");

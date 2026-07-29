@@ -94,14 +94,15 @@ fn checkout_integration_patch_updates_conditions_and_latches_landed() {
     let mut status = CheckoutStatus::default();
 
     CheckoutStatusPatch::UpdateIntegration {
-        integration: CheckoutIntegrationStatus {
+        integration: Box::new(CheckoutIntegrationStatus {
             clean: IntegrationCondition::builder().value(ConditionValue::True).build(),
             pushed: IntegrationCondition::builder().value(ConditionValue::False).details(vec!["2 unpushed commits".to_string()]).build(),
             landed: IntegrationCondition::builder().value(ConditionValue::True).build(),
             landed_evidence: Some(
                 LandedEvidence::builder().change_request_id("815".to_string()).merged_at("2026-07-21T23:15:00Z".to_string()).build(),
             ),
-        },
+            change_request: None,
+        }),
     }
     .apply(&mut status);
 
@@ -111,12 +112,13 @@ fn checkout_integration_patch_updates_conditions_and_latches_landed() {
     assert_eq!(status.integration.landed_evidence.as_ref().map(|evidence| evidence.change_request_id.as_str()), Some("815"));
 
     CheckoutStatusPatch::UpdateIntegration {
-        integration: CheckoutIntegrationStatus {
+        integration: Box::new(CheckoutIntegrationStatus {
             clean: IntegrationCondition::builder().value(ConditionValue::True).build(),
             pushed: IntegrationCondition::builder().value(ConditionValue::True).build(),
             landed: IntegrationCondition::builder().value(ConditionValue::False).details(vec!["no PR found".to_string()]).build(),
             landed_evidence: None,
-        },
+            change_request: None,
+        }),
     }
     .apply(&mut status);
 

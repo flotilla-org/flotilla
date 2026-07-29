@@ -4835,7 +4835,7 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
                 "--state",
                 "all",
                 "--json",
-                "number,state,mergedAt,baseRefName",
+                "number,state,mergedAt,baseRefName,mergeable",
                 "--limit",
                 "1",
             ],
@@ -4932,7 +4932,18 @@ async fn convoy_delete_refuses_diverged_checkout_without_a_change_request() {
         .on_run("git", &["rev-list", "--count", "origin/feature/diverged..HEAD"], Ok("0\n".into()))
         .on_run(
             "gh",
-            &["pr", "list", "--head", "feature/diverged", "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/diverged",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName,mergeable",
+                "--limit",
+                "1",
+            ],
             Ok("[]".into()),
         )
         .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
@@ -4973,12 +4984,34 @@ async fn repeated_identical_reclaim_refusal_does_not_rewrite_checkout_status() {
         .on_run("git", &["rev-list", "--count", "origin/feature/diverged..HEAD"], Ok("0\n".into()))
         .on_run(
             "gh",
-            &["pr", "list", "--head", "feature/diverged", "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/diverged",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName,mergeable",
+                "--limit",
+                "1",
+            ],
             Ok("[]".into()),
         )
         .on_run(
             "gh",
-            &["pr", "list", "--head", "feature/diverged", "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/diverged",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName,mergeable",
+                "--limit",
+                "1",
+            ],
             Ok("[]".into()),
         )
         .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
@@ -5010,6 +5043,144 @@ async fn repeated_identical_reclaim_refusal_does_not_rewrite_checkout_status() {
     assert_eq!(
         second.metadata.resource_version, first.metadata.resource_version,
         "an identical refusal must not emit a status write that immediately requeues the convoy"
+    );
+}
+
+#[tokio::test]
+async fn teardown_gate_does_not_rewrite_a_latched_terminal_change_request() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/merged\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/merged\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/merged..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/merged..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("0\n".into()))
+        .build();
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(&config_base)),
+        fake_discovery_with_runner(false, Arc::new(runner)),
+        HostName::local(),
+    )
+    .await;
+    daemon
+        .resource_backend()
+        .using::<Convoy>("flotilla")
+        .create(&empty_input_meta("merged-convoy"), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
+        .await
+        .expect("convoy create should succeed");
+    create_ready_observed_checkout_for_convoy(&daemon, "flotilla", "merged-convoy", "checkout-merged", "/repo", "feature/merged").await;
+
+    let condition = |value, observed_at: &str| IntegrationCondition::builder().value(value).observed_at(observed_at.to_string()).build();
+    let evidence = flotilla_resources::LandedEvidence::builder().change_request_id("1162".to_string()).build();
+    let change_request = flotilla_resources::ChangeRequestObservation::builder()
+        .id("1162".to_string())
+        .state(flotilla_resources::ChangeRequestState::Merged)
+        .mergeability(flotilla_resources::ChangeRequestMergeability::Unknown)
+        .observed_at("2026-07-28T00:00:00Z".to_string())
+        .build();
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let checkout = checkouts.get("checkout-merged").await.expect("ready checkout");
+    let mut status = checkout.status.expect("ready checkout status");
+    status.integration = CheckoutIntegrationStatus {
+        clean: condition(ConditionValue::True, "2026-07-28T00:00:00Z"),
+        pushed: condition(ConditionValue::True, "2026-07-28T00:00:00Z"),
+        landed: condition(ConditionValue::True, "2026-07-28T00:00:00Z"),
+        landed_evidence: Some(evidence),
+        change_request: Some(change_request),
+    };
+    checkouts.update_status("checkout-merged", &checkout.metadata.resource_version, &status).await.expect("persist landed checkout");
+
+    daemon.verify_convoy_teardown_gate("flotilla", "merged-convoy", false).await.expect("landed checkout should pass teardown");
+    let first = checkouts.get("checkout-merged").await.expect("checkout after first teardown gate");
+    daemon.verify_convoy_teardown_gate("flotilla", "merged-convoy", false).await.expect("landed checkout should still pass teardown");
+    let second = checkouts.get("checkout-merged").await.expect("checkout after second teardown gate");
+    assert_eq!(
+        second.metadata.resource_version, first.metadata.resource_version,
+        "a repeated timestamp-only teardown probe must not rewrite a latched terminal change request"
+    );
+}
+
+#[tokio::test]
+async fn landing_settlement_uses_latched_terminal_change_request_after_stale_reprobe() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/merged\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/merged..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("1\n".into()))
+        .on_run(
+            "gh",
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/merged",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName,mergeable",
+                "--limit",
+                "1",
+            ],
+            Ok("[]".into()),
+        )
+        .build();
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(&config_base)),
+        fake_discovery_with_runner(false, Arc::new(runner)),
+        HostName::local(),
+    )
+    .await;
+    create_ready_observed_checkout_for_convoy(&daemon, "flotilla", "merged-convoy", "checkout-merged", "/repo", "feature/merged").await;
+
+    let observed_at = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+    let condition = || IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build();
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let checkout = checkouts.get("checkout-merged").await.expect("ready checkout");
+    let mut status = checkout.status.expect("ready checkout status");
+    status.integration = CheckoutIntegrationStatus {
+        clean: condition(),
+        pushed: condition(),
+        landed: condition(),
+        landed_evidence: Some(flotilla_resources::LandedEvidence::builder().change_request_id("1162".to_string()).build()),
+        change_request: Some(
+            flotilla_resources::ChangeRequestObservation::builder()
+                .id("1162".to_string())
+                .state(flotilla_resources::ChangeRequestState::Merged)
+                .mergeability(flotilla_resources::ChangeRequestMergeability::Unknown)
+                .observed_at(observed_at)
+                .build(),
+        ),
+    };
+    checkouts.update_status("checkout-merged", &checkout.metadata.resource_version, &status).await.expect("persist landed checkout");
+
+    assert!(
+        daemon.convoy_change_requests_settled("flotilla", "merged-convoy").await.expect("landing evaluation"),
+        "evidence-backed landed status must survive a stale reprobe that can no longer discover the merged PR"
+    );
+    let stored = checkouts.get("checkout-merged").await.expect("checkout after landing evaluation");
+    assert_eq!(
+        stored.status.expect("checkout status").integration.change_request.unwrap().state,
+        flotilla_resources::ChangeRequestState::Merged
     );
 }
 
@@ -5070,7 +5241,7 @@ async fn convoy_delete_allows_multi_repo_convoy_with_work_on_only_one_side() {
                 "--state",
                 "all",
                 "--json",
-                "number,state,mergedAt,baseRefName",
+                "number,state,mergedAt,baseRefName,mergeable",
                 "--limit",
                 "1",
             ],
@@ -5934,7 +6105,18 @@ async fn landing_holds_when_fresh_probe_contradicts_stale_vacuous_landed() {
         .on_run("git", &["rev-list", "--count", "main..HEAD"], Ok("2".into()))
         .on_run(
             "gh",
-            &["pr", "list", "--head", "feature/split", "--state", "all", "--json", "number,state,mergedAt,baseRefName", "--limit", "1"],
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/split",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName,mergeable",
+                "--limit",
+                "1",
+            ],
             Ok(r#"[{"number": 1162, "state": "OPEN", "mergedAt": null, "baseRefName": "main"}]"#.into()),
         )
         .on_run("git", &["status", "--porcelain"], Ok(String::new()))
@@ -5982,6 +6164,7 @@ async fn landing_holds_when_fresh_probe_contradicts_stale_vacuous_landed() {
                 pushed: stale_vacuous.clone(),
                 landed: stale_vacuous,
                 landed_evidence: None,
+                change_request: None,
             },
             message: None,
         })
