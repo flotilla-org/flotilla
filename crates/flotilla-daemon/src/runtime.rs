@@ -416,7 +416,6 @@ impl DaemonRuntime {
             .map_err(|error| format!("list environments for material lease recovery: {error}"))?
             .items
             .into_iter()
-            .filter(|environment| environment.metadata.deletion_timestamp.is_none())
             .map(|environment| environment.metadata.name);
         agent_material.recover(active_environments).await?;
         apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health)
@@ -2754,21 +2753,24 @@ mod tests {
             ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
         },
     };
-    use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource};
+    use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource, ResourceRef};
     use flotilla_resources::{
-        Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+        api_version, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
         CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CredentialConsumer, CredentialGrant,
         CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
-        LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec, Resource, Selector,
-        SqliteBackend, TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, WorkPhase, WorkflowTemplate,
-        WorkflowTemplateSpec,
+        LifecycleAuthority, MaterialPoolSpec, MaterialPoolUnitSpec, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
+        RepositorySpec, Resource, Selector, SqliteBackend, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
+        VesselRequirement, WorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
     use tokio::sync::Notify;
 
     use super::{test_git_repo::TestGitRepo, *};
-    use crate::agent_material::CONTAINER_CODEX_HOME;
+    use crate::{
+        agent_material::CONTAINER_CODEX_HOME,
+        material_pool::{MaterialLeaseOutcome, MaterialPoolManager},
+    };
 
     #[test]
     fn resolves_flotilla_binary_adjacent_to_daemon() {
@@ -4572,6 +4574,66 @@ mod tests {
         std::fs::create_dir_all(config.state_dir()).expect("state dir");
         let backend = ResourceBackend::Sqlite(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend"));
         daemon_with_backend(tracked_repos, config, backend).await
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_retains_material_lease_for_environment_pending_finalization() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+        let backend = daemon.resource_backend();
+        let environments = backend.clone().using::<Environment>(NAMESPACE);
+        environments
+            .create(
+                &InputMeta::builder()
+                    .name("deleting-environment".to_string())
+                    .finalizers(vec!["flotilla.work/test-environment-finalizer".to_string()])
+                    .build(),
+                &EnvironmentSpec {
+                    host_direct: Some(HostDirectEnvironmentSpec {
+                        host_ref: "host-test".to_string(),
+                        repo_default_dir: "/tmp/worktrees".to_string(),
+                    }),
+                    docker: None,
+                },
+            )
+            .await
+            .expect("create environment with pending finalizer");
+        environments.delete("deleting-environment").await.expect("mark environment for deletion");
+        let deleting = environments.get("deleting-environment").await.expect("pending finalizer should retain environment");
+        assert!(deleting.metadata.deletion_timestamp.is_some(), "environment should be pending finalization");
+
+        let pools = MaterialPoolManager::new(backend, NAMESPACE);
+        pools
+            .reconcile_pool("codex-login", &MaterialPoolSpec {
+                units: BTreeMap::from([("unit-0".to_string(), MaterialPoolUnitSpec {
+                    directory: "/var/lib/flotilla/material/unit-0".to_string(),
+                })]),
+            })
+            .await
+            .expect("create material pool");
+        let deleting_holder =
+            ResourceRef::new(api_version(Environment::API_PATHS), Environment::API_PATHS.kind, NAMESPACE, "deleting-environment");
+        pools.acquire("codex-login", &deleting_holder).await.expect("lease material to deleting environment");
+
+        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
+            heartbeat_interval: Duration::from_secs(300),
+            controller_resync_interval: Duration::from_secs(300),
+            start_controllers: false,
+            ..RuntimeOptions::default()
+        })
+        .await
+        .expect("daemon should start");
+
+        let second_holder =
+            ResourceRef::new(api_version(Environment::API_PATHS), Environment::API_PATHS.kind, NAMESPACE, "second-environment");
+        assert_eq!(
+            pools.acquire("codex-login", &second_holder).await.expect("second holder should wait"),
+            MaterialLeaseOutcome::Waiting { unit_count: 1 },
+            "startup recovery must retain leases until an environment's finalizer removes it from the store"
+        );
+
+        runtime.shutdown();
     }
 
     fn insert_undecodable_resource<T: Resource>(connection: &rusqlite::Connection, name: &str) {
