@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::OnceLock};
 
 use clap::Parser;
 use flotilla_core::path_policy::PathPolicy;
 
 /// Flotilla daemon
 #[derive(Parser)]
-#[command(version)]
+#[command(version, long_version = binary_version())]
 struct Cli {
     /// Config directory
     #[arg(long)]
@@ -18,6 +18,11 @@ struct Cli {
     /// Idle timeout in seconds (0 = no timeout)
     #[arg(long, default_value = "300")]
     timeout: u64,
+}
+
+fn binary_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| format!("{} (wire={})", env!("CARGO_PKG_VERSION"), flotilla_tui::socket::BUILD_ID))
 }
 
 impl Cli {

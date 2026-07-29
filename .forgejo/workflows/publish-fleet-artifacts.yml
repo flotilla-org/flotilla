@@ -1,0 +1,105 @@
+name: Publish fleet artifacts
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_INCREMENTAL: "0"
+  FORGEJO_SERVER_URL: ${{ forgejo.server_url }}
+  FORGEJO_PACKAGE_OWNER: robert
+  FORGEJO_PACKAGE_NAME: flotilla
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: feta
+    steps:
+      - name: Verify fleet runner
+        run: |
+          test "$(hostname -s)" = feta
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+
+      - name: Check out source
+        uses: https://data.forgejo.org/actions/checkout@v6
+
+      - name: Build debug-profile binaries
+        env:
+          FLOTILLA_BUILD_ID: ${{ forgejo.sha }}
+        run: cargo +stable build --locked --bin flotilla --bin flotillad
+
+      - name: Stage and describe artifacts
+        env:
+          COMMIT_SHA: ${{ forgejo.sha }}
+        run: |
+          mkdir -p dist
+          install -m 0755 target/debug/flotilla dist/flotilla-linux-x86_64
+          install -m 0755 target/debug/flotillad dist/flotillad-linux-x86_64
+          dist/flotilla-linux-x86_64 --version | grep -F "wire=${COMMIT_SHA}"
+          dist/flotillad-linux-x86_64 --version | grep -F "wire=${COMMIT_SHA}"
+          scripts/write-artifact-metadata.sh \
+            dist/flotilla-linux-x86_64 \
+            dist/flotilla-linux-x86_64.json \
+            flotilla-org/flotilla "$COMMIT_SHA" linux-x86_64 "$COMMIT_SHA" false
+          scripts/write-artifact-metadata.sh \
+            dist/flotillad-linux-x86_64 \
+            dist/flotillad-linux-x86_64.json \
+            flotilla-org/flotilla "$COMMIT_SHA" linux-x86_64 "$COMMIT_SHA" false
+
+      - name: Publish immutable package version
+        env:
+          FORGEJO_PACKAGE_VERSION: ${{ forgejo.sha }}-${{ forgejo.sha }}
+          FORGEJO_PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+        run: scripts/publish-forgejo-generic.sh dist/*
+
+  darwin:
+    name: Darwin arm64
+    runs-on: comte
+    steps:
+      - name: Verify fleet runner
+        run: |
+          test "$(hostname -s)" = comte
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+
+      - name: Check out source
+        uses: https://data.forgejo.org/actions/checkout@v6
+
+      - name: Build debug-profile binaries
+        env:
+          FLOTILLA_BUILD_ID: ${{ forgejo.sha }}
+        run: cargo +stable build --locked --bin flotilla --bin flotillad
+
+      - name: Sign, verify, and describe artifacts
+        env:
+          COMMIT_SHA: ${{ forgejo.sha }}
+          CODESIGN_IDENTITY: "Apple Development: Robert Wittams (DYYMCPD885)"
+        run: |
+          mkdir -p dist
+          install -m 0755 target/debug/flotilla dist/flotilla-darwin-arm64
+          install -m 0755 target/debug/flotillad dist/flotillad-darwin-arm64
+          for artifact in dist/flotilla-darwin-arm64 dist/flotillad-darwin-arm64; do
+            codesign --force --options runtime \
+              --entitlements packaging/macos-cli.entitlements \
+              --sign "$CODESIGN_IDENTITY" \
+              "$artifact"
+            codesign --verify --strict --verbose=2 "$artifact"
+          done
+          dist/flotilla-darwin-arm64 --version | grep -F "wire=${COMMIT_SHA}"
+          dist/flotillad-darwin-arm64 --version | grep -F "wire=${COMMIT_SHA}"
+          scripts/write-artifact-metadata.sh \
+            dist/flotilla-darwin-arm64 \
+            dist/flotilla-darwin-arm64.json \
+            flotilla-org/flotilla "$COMMIT_SHA" darwin-arm64 "$COMMIT_SHA" true
+          scripts/write-artifact-metadata.sh \
+            dist/flotillad-darwin-arm64 \
+            dist/flotillad-darwin-arm64.json \
+            flotilla-org/flotilla "$COMMIT_SHA" darwin-arm64 "$COMMIT_SHA" true
+
+      - name: Publish immutable package version
+        env:
+          FORGEJO_PACKAGE_VERSION: ${{ forgejo.sha }}-${{ forgejo.sha }}
+          FORGEJO_PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+        run: scripts/publish-forgejo-generic.sh dist/*
