@@ -23,6 +23,7 @@ pub mod model;
 pub(crate) mod observed_resources;
 pub mod path_context;
 pub mod path_policy;
+pub mod placement_policy;
 pub mod provider_data;
 pub mod providers;
 pub mod query_registry;
