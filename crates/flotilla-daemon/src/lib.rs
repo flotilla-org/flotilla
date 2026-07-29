@@ -1,7 +1,8 @@
+mod agent_material;
 mod aggregator;
-mod codex_slot;
 mod credential;
 mod issue_materializer;
+mod material_pool;
 pub mod resource_manifest;
 mod sleep_inhibitor;
 pub use aggregator::{Aggregator, AggregatorResolvers};

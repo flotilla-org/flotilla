@@ -5103,6 +5103,7 @@ async fn convoy_delete_allows_multi_repo_convoy_with_work_on_only_one_side() {
             image_ref: None,
             image_digest: None,
             message: None,
+            wait_reason: None,
         })
         .await
         .expect("environment status should update");

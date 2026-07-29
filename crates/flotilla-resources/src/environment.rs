@@ -74,12 +74,20 @@ pub struct EnvironmentStatus {
     pub image_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<EnvironmentWaitReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum EnvironmentWaitReason {
+    MaterialPoolExhausted { pool_ref: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentStatusPatch {
     MarkReady { docker_container_id: Option<String>, image_ref: Option<String>, image_digest: Option<String> },
-    MarkWaiting { message: String },
+    MarkWaiting { message: String, reason: EnvironmentWaitReason },
     MarkFailed { message: String },
     MarkTerminating,
 }
@@ -94,20 +102,24 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
                 status.image_ref = image_ref.clone();
                 status.image_digest = image_digest.clone();
                 status.message = None;
+                status.wait_reason = None;
             }
-            Self::MarkWaiting { message } => {
+            Self::MarkWaiting { message, reason } => {
                 status.phase = EnvironmentPhase::Pending;
                 status.ready = false;
                 status.message = Some(message.clone());
+                status.wait_reason = Some(reason.clone());
             }
             Self::MarkFailed { message } => {
                 status.phase = EnvironmentPhase::Failed;
                 status.ready = false;
                 status.message = Some(message.clone());
+                status.wait_reason = None;
             }
             Self::MarkTerminating => {
                 status.phase = EnvironmentPhase::Terminating;
                 status.ready = false;
+                status.wait_reason = None;
             }
         }
     }

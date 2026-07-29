@@ -3,7 +3,8 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler};
 use flotilla_resources::{
-    controller::Reconciler, DockerEnvironmentSpec, Environment, EnvironmentSpec, EnvironmentStatusPatch, InputMeta, ResourceBackend,
+    controller::Reconciler, DockerEnvironmentSpec, Environment, EnvironmentSpec, EnvironmentStatusPatch, EnvironmentWaitReason, InputMeta,
+    ResourceBackend,
 };
 
 struct WaitingDockerRuntime;
@@ -11,9 +12,10 @@ struct WaitingDockerRuntime;
 #[async_trait]
 impl DockerEnvironmentRuntime for WaitingDockerRuntime {
     async fn provision(&self, _name: &str, _spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, DockerProvisioningError> {
-        Err(DockerProvisioningError::Waiting(
-            "waiting for codex login slot; 2 in pool, all leased; mint another slot to increase concurrency".to_string(),
-        ))
+        Err(DockerProvisioningError::Waiting {
+            message: "waiting for agent login material; 2 in pool, all leased".to_string(),
+            reason: EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: "agent-login".to_string() },
+        })
     }
 
     async fn destroy(&self, _environment_ref: &str, _container_id: &str) -> Result<(), String> {
@@ -48,7 +50,9 @@ async fn pool_exhaustion_stays_pending_with_a_legible_requeued_wait() {
     assert_eq!(outcome.requeue_after, Some(Duration::from_secs(5)));
     assert!(matches!(
         outcome.patch,
-        Some(EnvironmentStatusPatch::MarkWaiting { message })
-            if message == "waiting for codex login slot; 2 in pool, all leased; mint another slot to increase concurrency"
+        Some(EnvironmentStatusPatch::MarkWaiting {
+            message,
+            reason: EnvironmentWaitReason::MaterialPoolExhausted { pool_ref },
+        }) if message == "waiting for agent login material; 2 in pool, all leased" && pool_ref == "agent-login"
     ));
 }

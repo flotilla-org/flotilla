@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use flotilla_resources::{
     controller::{ReconcileOutcome, Reconciler},
-    DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentStatusPatch, ResourceError, ResourceObject,
+    DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentStatusPatch, EnvironmentWaitReason, ResourceError, ResourceObject,
 };
 
 #[async_trait]
@@ -14,14 +14,14 @@ pub trait DockerEnvironmentRuntime: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DockerProvisioningError {
-    Waiting(String),
+    Waiting { message: String, reason: EnvironmentWaitReason },
     Failed(String),
 }
 
 impl fmt::Display for DockerProvisioningError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Waiting(message) | Self::Failed(message) => formatter.write_str(message),
+            Self::Waiting { message, .. } | Self::Failed(message) => formatter.write_str(message),
         }
     }
 }
@@ -52,7 +52,7 @@ impl<R> EnvironmentReconciler<R> {
 pub enum EnvironmentDeps {
     None,
     Ready(DockerProvisioning),
-    Waiting(String),
+    Waiting { message: String, reason: EnvironmentWaitReason },
     Failed(String),
 }
 
@@ -69,7 +69,7 @@ where
                 if let Some(spec) = &obj.spec.docker {
                     match self.docker.provision(&obj.metadata.name, spec).await {
                         Ok(provisioning) => Ok(EnvironmentDeps::Ready(provisioning)),
-                        Err(DockerProvisioningError::Waiting(message)) => Ok(EnvironmentDeps::Waiting(message)),
+                        Err(DockerProvisioningError::Waiting { message, reason }) => Ok(EnvironmentDeps::Waiting { message, reason }),
                         Err(DockerProvisioningError::Failed(message)) => Ok(EnvironmentDeps::Failed(message)),
                     }
                 } else {
@@ -96,7 +96,9 @@ where
                     image_ref: Some(provisioning.image_ref.clone()),
                     image_digest: Some(provisioning.image_digest.clone()),
                 }),
-                EnvironmentDeps::Waiting(message) => Some(EnvironmentStatusPatch::MarkWaiting { message: message.clone() }),
+                EnvironmentDeps::Waiting { message, reason } => {
+                    Some(EnvironmentStatusPatch::MarkWaiting { message: message.clone(), reason: reason.clone() })
+                }
                 EnvironmentDeps::Failed(message) => Some(EnvironmentStatusPatch::MarkFailed { message: message.clone() }),
                 EnvironmentDeps::None => None,
             },
@@ -104,7 +106,7 @@ where
         };
 
         let mut outcome = ReconcileOutcome::new(patch);
-        if matches!(deps, EnvironmentDeps::Waiting(_)) {
+        if matches!(deps, EnvironmentDeps::Waiting { .. }) {
             outcome.requeue_after = Some(Duration::from_secs(5));
         }
         outcome

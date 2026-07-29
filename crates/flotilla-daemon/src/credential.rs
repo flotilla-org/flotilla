@@ -10,12 +10,9 @@ use flotilla_core::providers::{
     ChannelLabel, CommandRunner,
 };
 use flotilla_resources::{
-    CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Environment, ResourceBackend,
-    ResourceError,
+    CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, ResourceBackend, ResourceError,
 };
 use tokio::sync::Mutex;
-
-use crate::codex_slot::{CodexSlotLease, CodexSlotPool};
 
 pub(crate) struct CredentialStore {
     backend: ResourceBackend,
@@ -24,7 +21,6 @@ pub(crate) struct CredentialStore {
     host_bag: EnvironmentBag,
     host_runner: Arc<dyn CommandRunner>,
     state_dir: PathBuf,
-    codex_slots: CodexSlotPool,
     prepared: Mutex<BTreeSet<(String, String)>>,
     materials: Mutex<BTreeMap<(String, String), String>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
@@ -39,9 +35,6 @@ impl CredentialStore {
         host_runner: Arc<dyn CommandRunner>,
         state_dir: PathBuf,
     ) -> Self {
-        let codex_pool_dir =
-            env.get("HOME").map(PathBuf::from).unwrap_or_else(|| state_dir.clone()).join(".config/flotilla/credentials/codex-pool");
-        let codex_lease_state = state_dir.join("codex-slot-leases.json");
         Self {
             backend,
             namespace: namespace.to_string(),
@@ -49,41 +42,18 @@ impl CredentialStore {
             host_bag,
             host_runner,
             state_dir,
-            codex_slots: CodexSlotPool::new(codex_pool_dir, codex_lease_state),
             prepared: Mutex::new(BTreeSet::new()),
             materials: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
         }
     }
 
-    pub(crate) async fn lease_codex_slot(&self, environment_ref: &str) -> Result<CodexSlotLease, String> {
-        self.codex_slots.acquire(environment_ref).await
-    }
-
-    pub(crate) async fn includes_codex_credential(&self, credential_refs: &BTreeSet<String>) -> Result<bool, String> {
+    pub(crate) async fn consumer_adapters(&self, credential_refs: &BTreeSet<String>) -> Result<BTreeSet<String>, String> {
+        let mut adapters = BTreeSet::new();
         for name in credential_refs {
-            if matches!(self.spec(name).await?.consumer, CredentialConsumer::Codex) {
-                return Ok(true);
-            }
+            adapters.insert(self.spec(name).await?.consumer.adapter_name().to_string());
         }
-        Ok(false)
-    }
-
-    pub(crate) async fn recover_codex_slots(&self) -> Result<(), String> {
-        let environments = self
-            .backend
-            .clone()
-            .using::<Environment>(&self.namespace)
-            .list()
-            .await
-            .map_err(|error| format!("list environments for Codex login lease recovery: {error}"))?;
-        let active = environments
-            .items
-            .into_iter()
-            .filter(|environment| environment.metadata.deletion_timestamp.is_none())
-            .map(|environment| environment.metadata.name)
-            .collect();
-        self.codex_slots.recover(&active).await
+        Ok(adapters)
     }
 
     pub(crate) async fn held_credentials(&self) -> Result<BTreeSet<String>, String> {
@@ -229,7 +199,6 @@ impl CredentialStore {
         if let Some(config_dir) = config_dir {
             remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
         }
-        self.codex_slots.release(environment_ref).await?;
         Ok(())
     }
 
