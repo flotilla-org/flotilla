@@ -233,11 +233,11 @@ impl<W: Resource, P: Resource> SecondaryWatch for ReplicaLabelMappedWatch<W, P> 
         sender: mpsc::Sender<String>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
+            let mut watch = self.resolver.watch().await?;
             let listed = self.resolver.list().await?;
             for source in &listed.items {
                 LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, &source.object).await?;
             }
-            let mut watch = self.resolver.watch().await?;
             while let Some(event) = watch.next().await {
                 let source = match event? {
                     crate::ReadWatchEvent::Added(source)
