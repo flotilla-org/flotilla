@@ -16,7 +16,7 @@ fn binaries_report_their_wire_generation() {
         assert!(output.status.success(), "{} --version should succeed", binary);
         let stdout = String::from_utf8(output.stdout).expect("version output should be UTF-8");
         assert!(
-            stdout.contains(&format!("wire={}", flotilla_tui::socket::BUILD_ID)),
+            stdout.contains(&format!("wire={}", flotilla_client::BUILD_ID)),
             "{} should report its wire generation, got {stdout:?}",
             binary
         );

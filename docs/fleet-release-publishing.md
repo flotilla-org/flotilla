@@ -29,10 +29,13 @@ coordinates and digest before executing or unpacking an artifact.
 
 ## Runner registration
 
-Register Feta as a host runner with the `feta:host` label and Comte with the
-`comte:host` label. Do not reuse either label on a developer desk: jobs also
-attest `hostname`, `uname`, and architecture, and will fail before checkout if
-the label is attached to the wrong machine.
+Register Feta with the Forgejo label specification `feta:host` and Comte with
+`comte:host`. In Forgejo runner syntax, those specifications create the
+matching label names `feta` and `comte` with the `host` execution schema; the
+workflows therefore use `runs-on: feta` and `runs-on: comte`. Do not reuse
+either label name on a developer desk: jobs also attest `hostname`, `uname`,
+and architecture, and will fail before checkout if the label is attached to
+the wrong machine.
 
 Both runners need `git`, `curl`, `jq`, current stable Rust, and Zig 0.15.2 for
 Cleat. Feta also needs the `wasm32-wasip1` Rust target for Andamento (the
