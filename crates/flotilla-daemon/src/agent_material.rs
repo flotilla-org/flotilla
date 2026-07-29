@@ -13,6 +13,7 @@ use flotilla_core::providers::{
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{api_version, Environment, MaterialPoolSpec, MaterialPoolUnitSpec, Resource, ResourceBackend};
 use tokio::fs;
+use tracing::warn;
 
 use crate::material_pool::{MaterialLeaseOutcome, MaterialPoolManager};
 
@@ -136,7 +137,7 @@ impl CodexMaterialAdapter {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
             Err(error) => return Err(format!("read Codex login pool {}: {error}", self.pool_dir.display())),
         };
-        let mut numbered = Vec::new();
+        let mut numbered: BTreeMap<u64, PathBuf> = BTreeMap::new();
         while let Some(entry) =
             entries.next_entry().await.map_err(|error| format!("read Codex login pool {}: {error}", self.pool_dir.display()))?
         {
@@ -150,10 +151,18 @@ impl CodexMaterialAdapter {
                 continue;
             };
             if metadata.is_file() && metadata.len() > 0 && metadata.permissions().mode() & 0o777 == 0o600 {
-                numbered.push((number, path));
+                if let Some(kept_path) = numbered.get(&number) {
+                    warn!(
+                        slot_number = number,
+                        kept_path = %kept_path.display(),
+                        skipped_path = %path.display(),
+                        "duplicate numeric Codex login slot; skipping directory"
+                    );
+                    continue;
+                }
+                numbered.insert(number, path);
             }
         }
-        numbered.sort_by_key(|(number, _)| *number);
         Ok(numbered
             .into_iter()
             .map(|(number, path)| (format!("slot-{number:020}"), MaterialPoolUnitSpec { directory: path.to_string_lossy().into_owned() }))
@@ -208,7 +217,7 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{io, path::Path, sync::Mutex};
 
     use flotilla_core::providers::discovery::test_support::TestEnvVars;
     use flotilla_protocol::NodeId;
@@ -216,13 +225,31 @@ mod tests {
 
     use super::*;
 
-    fn write_slot(root: &Path, number: u64) -> PathBuf {
-        let slot = root.join(format!("slot-{number}"));
+    #[derive(Clone)]
+    struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for LogCaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log capture lock should be healthy").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn write_named_slot(root: &Path, name: &str, number: u64) -> PathBuf {
+        let slot = root.join(name);
         std::fs::create_dir_all(&slot).expect("create slot");
         let auth = slot.join("auth.json");
         std::fs::write(&auth, format!("{{\"slot\":{number}}}")).expect("write auth");
         std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).expect("protect auth");
         slot
+    }
+
+    fn write_slot(root: &Path, number: u64) -> PathBuf {
+        write_named_slot(root, &format!("slot-{number}"), number)
     }
 
     fn registry(home: &Path) -> AgentMaterialRegistry {
@@ -244,6 +271,37 @@ mod tests {
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].mount, ProvisionedMount::new(slot, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw));
         assert_eq!(deliveries[0].environment, vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())]);
+    }
+
+    #[tokio::test]
+    async fn duplicate_numeric_codex_slots_keep_one_unit_and_warn_with_both_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pool_dir = temp.path().join("codex-pool");
+        let slot_zero = write_named_slot(&pool_dir, "slot-0", 0);
+        let slot_zero_padded = write_named_slot(&pool_dir, "slot-00", 0);
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let adapter = CodexMaterialAdapter::new(Arc::new(MaterialPoolManager::new(backend, "flotilla")), pool_dir, true);
+        let log_output = Arc::new(Mutex::new(Vec::new()));
+
+        let units = {
+            let writer = LogCaptureWriter(Arc::clone(&log_output));
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            adapter.usable_units().await.expect("discover usable units")
+        };
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(units.keys().map(String::as_str).collect::<Vec<_>>(), ["slot-00000000000000000000"]);
+        let logs = String::from_utf8(log_output.lock().expect("log capture lock should be healthy").clone()).expect("logs should be utf-8");
+        assert!(logs.contains("duplicate numeric Codex login slot; skipping directory"), "missing duplicate warning: {logs}");
+        assert!(logs.contains(&slot_zero.to_string_lossy().into_owned()), "warning should name slot-0: {logs}");
+        assert!(logs.contains(&slot_zero_padded.to_string_lossy().into_owned()), "warning should name slot-00: {logs}");
     }
 
     #[tokio::test]
