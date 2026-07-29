@@ -5954,13 +5954,16 @@ impl InProcessDaemon {
                 Ok(runner) => runner,
                 Err(_) => return Ok(false),
             };
-            let integration = inspect_checkout_integration(
+            let mut integration = inspect_checkout_integration(
                 &*runner,
                 &path,
                 &checkout.spec,
                 checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
             )
             .await;
+            if let Some(existing) = checkout.status.as_ref() {
+                latch_evidence_backed_integration(&existing.integration, &mut integration);
+            }
             if let Err(error) = apply_resource_status_patch(
                 &checkouts,
                 &checkout.metadata.name,
