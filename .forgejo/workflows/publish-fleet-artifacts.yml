@@ -5,6 +5,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 env:
   CARGO_INCREMENTAL: "0"
   FORGEJO_SERVER_URL: ${{ forgejo.server_url }}
