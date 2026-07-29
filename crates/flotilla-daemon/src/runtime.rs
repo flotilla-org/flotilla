@@ -47,6 +47,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     credential::CredentialStore,
+    resource_limits::file_descriptor_pressure_condition,
     resource_manifest::ResourceManifestReconciler,
     sleep_inhibitor,
     supervisor::{supervise, ControllerSupervision, RestartBudgetExhausted},
@@ -1059,7 +1060,8 @@ async fn apply_host_heartbeat_with_credentials(
     let disk_free_bytes = tokio::task::spawn_blocking(move || measure_available_space(&repo_default_dir))
         .await
         .map_err(|error| format!("measure available disk space: {error}"))?;
-    let conditions = runtime_health.conditions();
+    let mut conditions = runtime_health.conditions();
+    conditions.extend(file_descriptor_pressure_condition());
     let status = HostStatus {
         capabilities: host_capabilities(&summary, profile, &held_credentials),
         heartbeat_at: Some(Utc::now()),

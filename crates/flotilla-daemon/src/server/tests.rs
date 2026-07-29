@@ -35,10 +35,11 @@ use flotilla_resources::{
     ResourceProvenance, Stance, StatusPatch, TerminalAttentionState, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
     TerminalSessionStatus, TerminalSessionStatusPatch, WatchEvent, WatchStart, WorkflowTemplate,
 };
+use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use indexmap::IndexMap;
 use tokio::{
-    io::{AsyncBufReadExt, BufReader, BufWriter},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     sync::{mpsc, oneshot, watch, Mutex, Notify},
     time::Duration,
 };
@@ -47,6 +48,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     client_connection::QuerySubscriptions,
     handle_client, handle_client_session,
+    peer_connection::PEER_IDLE_TIMEOUT,
     peer_runtime::{
         disconnect_peer_and_rebuild, forward_with_keepalive_for_test, handle_remote_restart_if_needed, relay_peer_data, send_local_to_peer,
         should_send_local_version, ForwardResult,
@@ -60,7 +62,8 @@ use super::{
     resource_http::serve_resource_http,
     shared::{sync_peer_query_state, write_message, SocketPeerSender},
     test_support::{apply_convoy_replica_feed, seed_trusted_remote_convoy_project},
-    DaemonServer, PeerConnectionEvent,
+    AcceptErrorBackoff, DaemonServer, PeerConnectionEvent, ACCEPT_ERROR_INITIAL_BACKOFF, ACCEPT_ERROR_MAX_BACKOFF,
+    CONNECTION_PREFACE_TIMEOUT, HELLO_HANDSHAKE_TIMEOUT,
 };
 
 #[tokio::test]
@@ -448,6 +451,40 @@ async fn complete_client_hello(session: &MessageSession) {
 
 async fn empty_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     empty_daemon_named("local").await
+}
+
+async fn spawn_test_client_handler(
+) -> (tempfile::TempDir, tokio::net::UnixStream, tokio::task::JoinHandle<()>, Arc<AtomicUsize>, watch::Sender<bool>) {
+    let (tmp, daemon) = empty_daemon().await;
+    let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let client_count = Arc::new(AtomicUsize::new(0));
+    let client_notify = Arc::new(Notify::new());
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
+    let (client_stream, server_stream) = tokio::net::UnixStream::pair().expect("pair");
+
+    let daemon_for_task = Arc::clone(&daemon);
+    let pm = Arc::clone(&peer_manager);
+    let count_ref = Arc::clone(&client_count);
+    let handle = tokio::spawn(async move {
+        let remote_command_router = empty_remote_command_router(&daemon_for_task, &pm);
+        handle_client(
+            server_stream,
+            daemon_for_task,
+            shutdown_rx,
+            peer_data_tx,
+            pm,
+            remote_command_router,
+            count_ref,
+            client_notify,
+            peer_connected_tx,
+            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
+        )
+        .await;
+    });
+    (tmp, client_stream, handle, client_count, shutdown_tx)
 }
 
 async fn empty_daemon_named(host_name: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
@@ -3037,6 +3074,36 @@ async fn handle_client_forwards_peer_data_and_registers_peer() {
 }
 
 #[tokio::test]
+async fn silent_peer_session_is_reaped_at_idle_deadline() {
+    let (_tmp, client, handle, client_count, _shutdown_tx) = spawn_test_client_handler().await;
+    let (read_half, write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half).lines();
+    let mut writer = BufWriter::new(write_half);
+    let hello = Message::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        node_id: NodeId::new("silent-peer"),
+        display_name: "silent-peer".into(),
+        session_id: uuid::Uuid::nil(),
+        connection_role: None,
+        surface: None,
+    };
+    flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write peer hello");
+    assert!(matches!(
+        serde_json::from_str::<Message>(&reader.next_line().await.expect("read hello").expect("hello line")).expect("parse hello"),
+        Message::Hello { .. }
+    ));
+    assert_eq!(client_count.load(Ordering::SeqCst), 1);
+
+    tokio::time::pause();
+    tokio::time::advance(PEER_IDLE_TIMEOUT).await;
+    tokio::task::yield_now().await;
+
+    assert!(reader.next_line().await.expect("read peer EOF").is_none());
+    handle.await.expect("join idle peer handler");
+    assert_eq!(client_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn handle_client_does_not_advance_host_cursor_for_duplicate_host_summary() {
     let (_tmp, daemon) = empty_daemon().await;
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -3348,7 +3415,10 @@ async fn assert_client_hello_rejected(protocol_version: u32, display_name: Strin
         .expect("server should close the mismatched connection promptly")
         .expect("read after hello");
     assert!(eof.is_none(), "expected EOF after {mismatch}-mismatch hello, got {eof:?}");
-    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("rejected connection handler should exit")
+        .expect("join rejected connection handler");
 }
 
 #[tokio::test]
@@ -3364,6 +3434,95 @@ async fn handle_client_rejects_client_hello_with_wire_generation_mismatch() {
         "wire generation",
     )
     .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn connection_without_preface_is_closed_at_handshake_deadline() {
+    let (_tmp, mut client, handle, client_count, _shutdown_tx) = spawn_test_client_handler().await;
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(CONNECTION_PREFACE_TIMEOUT).await;
+    tokio::task::yield_now().await;
+
+    let mut byte = [0_u8; 1];
+    assert_eq!(client.read(&mut byte).await.expect("read closed connection"), 0);
+    handle.await.expect("join timed-out connection handler");
+    assert_eq!(client_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn partial_hello_is_closed_at_handshake_deadline() {
+    let (_tmp, mut client, handle, client_count, _shutdown_tx) = spawn_test_client_handler().await;
+    client.write_all(b"{").await.expect("write partial hello");
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(HELLO_HANDSHAKE_TIMEOUT).await;
+    tokio::task::yield_now().await;
+
+    let mut byte = [0_u8; 1];
+    assert_eq!(client.read(&mut byte).await.expect("read closed connection"), 0);
+    handle.await.expect("join timed-out connection handler");
+    assert_eq!(client_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn live_daemon_reaps_partial_peer_dial_churn() {
+    const DIAL_COUNT: u64 = 32;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket_dir = TestSocketDir::new();
+    let socket_path = socket_dir.socket_path("churn.sock");
+    let config = test_config_store(tmp.path().join("config"));
+    let server = DaemonServer::new(Vec::new(), config, fake_discovery(false), socket_path.clone(), StdDuration::from_secs(60))
+        .await
+        .expect("create daemon server");
+    let shutdown_tx = server.shutdown_tx.clone();
+    let server_task = tokio::spawn(server.run());
+    while !socket_path.exists() {
+        tokio::task::yield_now().await;
+    }
+    let baseline = crate::resource_limits::open_file_descriptor_count().expect("count process file descriptors");
+
+    let mut stalled_dials = Vec::new();
+    for _ in 0..DIAL_COUNT {
+        let mut stream = tokio::net::UnixStream::connect(&socket_path).await.expect("dial live daemon");
+        stream.write_all(b"{").await.expect("write partial peer hello");
+        stalled_dials.push(stream);
+    }
+    tokio::task::yield_now().await;
+    let during_churn = crate::resource_limits::open_file_descriptor_count().expect("count descriptors during churn");
+    assert!(during_churn >= baseline + DIAL_COUNT * 2, "each stalled dial should initially hold both ends of a socket");
+
+    tokio::time::pause();
+    tokio::time::advance(HELLO_HANDSHAKE_TIMEOUT).await;
+    tokio::task::yield_now().await;
+    for stream in &mut stalled_dials {
+        let mut byte = [0_u8; 1];
+        assert_eq!(stream.read(&mut byte).await.expect("read closed stalled dial"), 0);
+    }
+    let after_deadline = crate::resource_limits::open_file_descriptor_count().expect("count descriptors after handshake deadlines");
+    assert!(
+        after_deadline <= baseline + DIAL_COUNT + 2,
+        "daemon-side descriptors should be reaped while dialer descriptors remain: baseline={baseline}, after={after_deadline}"
+    );
+
+    drop(stalled_dials);
+    shutdown_tx.send(true).expect("request daemon shutdown");
+    server_task.await.expect("join daemon server").expect("daemon server should stop cleanly");
+}
+
+#[test]
+fn accept_errors_back_off_exponentially_and_reset_after_success() {
+    let mut backoff = AcceptErrorBackoff::default();
+    assert_eq!(backoff.next_delay(), ACCEPT_ERROR_INITIAL_BACKOFF);
+    assert_eq!(backoff.next_delay(), ACCEPT_ERROR_INITIAL_BACKOFF * 2);
+    for _ in 0..10 {
+        backoff.next_delay();
+    }
+    assert_eq!(backoff.next_delay(), ACCEPT_ERROR_MAX_BACKOFF);
+
+    backoff.reset();
+    assert_eq!(backoff.next_delay(), ACCEPT_ERROR_INITIAL_BACKOFF);
 }
 
 #[tokio::test]

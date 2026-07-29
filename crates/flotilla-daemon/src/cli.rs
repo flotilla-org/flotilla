@@ -9,7 +9,7 @@ use flotilla_core::{
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{runtime::DaemonRuntime, server::DaemonServer};
+use crate::{resource_limits::raise_file_descriptor_limit, runtime::DaemonRuntime, server::DaemonServer};
 
 pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeout_secs: u64) -> Result<(), String> {
     let config = Arc::new(ConfigStore::new(DaemonHostPath::new(config_dir), DaemonHostPath::new(state_dir)));
@@ -35,6 +35,7 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
     let stderr_layer = std::io::stderr().is_terminal().then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     let file_layer = tracing_subscriber::fmt::layer().json().with_ansi(false).with_writer(file_appender);
     tracing_subscriber::registry().with(filter).with(stderr_layer).with(file_layer).try_init().ok();
+    raise_file_descriptor_limit();
 
     let timeout = if timeout_secs == 0 { Duration::from_secs(u64::MAX) } else { Duration::from_secs(timeout_secs) };
 

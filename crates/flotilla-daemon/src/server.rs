@@ -42,6 +42,34 @@ use self::{
 };
 use crate::peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, SshTransport};
 
+const CONNECTION_PREFACE_TIMEOUT: Duration = Duration::from_secs(10);
+const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const ACCEPT_ERROR_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+struct AcceptErrorBackoff {
+    next: Duration,
+}
+
+impl Default for AcceptErrorBackoff {
+    fn default() -> Self {
+        Self { next: ACCEPT_ERROR_INITIAL_BACKOFF }
+    }
+}
+
+impl AcceptErrorBackoff {
+    fn reset(&mut self) {
+        self.next = ACCEPT_ERROR_INITIAL_BACKOFF;
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self.next.saturating_mul(2).min(ACCEPT_ERROR_MAX_BACKOFF);
+        delay
+    }
+}
+
 /// Notification sent from connection sites to the outbound task when a
 /// peer connects or reconnects. The outbound task responds by sending
 /// current local state for all repos to the specific peer.
@@ -354,11 +382,13 @@ impl DaemonServer {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("failed to register SIGTERM handler");
 
         // Accept loop
+        let mut accept_error_backoff = AcceptErrorBackoff::default();
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, _addr)) => {
+                            accept_error_backoff.reset();
                             let daemon = Arc::clone(&daemon);
                             let client_count = Arc::clone(&client_count);
                             let client_notify = Arc::clone(&client_notify);
@@ -387,7 +417,14 @@ impl DaemonServer {
                             });
                         }
                         Err(e) => {
-                            error!(err = %e, "failed to accept connection");
+                            let delay = accept_error_backoff.next_delay();
+                            error!(
+                                err = %e,
+                                delay_ms = delay.as_millis() as u64,
+                                fd_exhausted = e.raw_os_error().is_some_and(|code| code == libc::EMFILE || code == libc::ENFILE),
+                                "failed to accept connection; backing off"
+                            );
+                            tokio::time::sleep(delay).await;
                         }
                     }
                 }
@@ -450,15 +487,19 @@ async fn handle_client(
     environment_context: Option<EnvironmentId>,
 ) {
     let mut first_byte = [0_u8; 1];
-    match tokio::io::AsyncReadExt::read_exact(&mut stream, &mut first_byte).await {
-        Ok(_) if first_byte[0].is_ascii_uppercase() => {
+    match tokio::time::timeout(CONNECTION_PREFACE_TIMEOUT, tokio::io::AsyncReadExt::read_exact(&mut stream, &mut first_byte)).await {
+        Err(_) => {
+            warn!(timeout_secs = CONNECTION_PREFACE_TIMEOUT.as_secs(), "connection timed out before sending a preface");
+            return;
+        }
+        Ok(Ok(_)) if first_byte[0].is_ascii_uppercase() => {
             if let Err(error) = resource_http::serve_resource_http(stream, first_byte[0], daemon.resource_backend().clone()).await {
                 warn!(%error, "resource HTTP connection failed");
             }
             return;
         }
-        Ok(_) => {}
-        Err(error) => {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
             warn!(%error, "failed to read connection preface");
             return;
         }
@@ -495,16 +536,20 @@ async fn handle_client_session(
 ) {
     let session = Arc::new(session);
     let first_msg = tokio::select! {
-            message_result = session.read() => {
-                match message_result {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        error!(err = %e, "error reading first message from client");
-                        None
-                    }
+        message_result = tokio::time::timeout(HELLO_HANDSHAKE_TIMEOUT, session.read()) => {
+            match message_result {
+                Ok(Ok(msg)) => msg,
+                Ok(Err(e)) => {
+                    error!(err = %e, "error reading first message from client");
+                    None
+                }
+                Err(_) => {
+                    warn!(timeout_secs = HELLO_HANDSHAKE_TIMEOUT.as_secs(), "connection timed out before completing Hello handshake");
+                    None
                 }
             }
-            _ = shutdown_rx.changed() => None,
+        }
+        _ = shutdown_rx.changed() => None,
     };
 
     const BUILD_ID: &str = env!("FLOTILLA_BUILD_ID");
