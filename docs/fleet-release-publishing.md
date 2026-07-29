@@ -37,7 +37,11 @@ the label is attached to the wrong machine.
 Both runners need `git`, `curl`, `jq`, current stable Rust, and Zig 0.15.2 for
 Cleat. Feta also needs the `wasm32-wasip1` Rust target for Andamento (the
 workflow installs the target when absent). Cleat's preparation helper verifies
-the pinned Zig and Ghostty revisions. Comte needs the valid codesigning
+the pinned Zig and Ghostty revisions. Zig 0.15.2 cannot consume the Xcode 26
+macOS SDK, so Comte must retain
+`/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk`; the Cleat workflow
+uses its scoped `xcrun` shim only for Zig's macOS SDK lookup and passes all
+other Xcode lookups through unchanged. Comte also needs the valid codesigning
 identity:
 
 ```text
