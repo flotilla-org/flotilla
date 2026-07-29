@@ -12,7 +12,7 @@ use flotilla_controllers::reconcilers::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
     DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler, ForgeDefaultBranchResolver,
     HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
-    RepositoryReconciler, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
+    RepositoryReconciler, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
@@ -61,6 +61,7 @@ use crate::{
 /// wedge can hide in.
 const LIVENESS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 const MANIFEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+const VESSEL_PLACEMENT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 const BUILTIN_MANAGED_BY_VALUE: &str = "builtin";
@@ -1316,6 +1317,26 @@ fn spawn_controller_loops(
     vec![
         tokio::spawn({
             let backend = backend.clone();
+            let namespace_string = namespace_string.clone();
+            let local_host_ref = state.local_host_ref.clone();
+            let supervision = supervision.clone();
+            let runtime_health = runtime_health.clone();
+            async move {
+                supervise_controller("vessel_placement", supervision, runtime_health, move || {
+                    let projector = VesselPlacementProjector::new(backend.clone(), namespace_string.clone(), local_host_ref.clone());
+                    async move {
+                        let mut interval = tokio::time::interval(VESSEL_PLACEMENT_SYNC_INTERVAL);
+                        loop {
+                            interval.tick().await;
+                            projector.sync_once().await?;
+                        }
+                    }
+                })
+                .await;
+            }
+        }),
+        tokio::spawn({
+            let backend = backend.clone();
             let observed_backend = observed_backend.clone();
             let namespace_string = namespace_string.clone();
             let forge_default_branch_resolver = forge_default_branch_resolver.clone();
@@ -1452,7 +1473,8 @@ fn spawn_controller_loops(
                                 Arc::new(TerminalControllerRuntime { state }),
                                 backend.clone(),
                                 &namespace_string,
-                            ),
+                            )
+                            .with_federated_convoys(&backend, &namespace_string),
                             resync_interval: controller_resync_interval,
                             backend,
                         }
@@ -1467,6 +1489,7 @@ fn spawn_controller_loops(
             let backend = backend.clone();
             let namespace_string = namespace_string.clone();
             let config_dir = state.config.base_path().as_path().to_path_buf();
+            let local_host_ref = state.local_host_ref.clone();
             let supervision = supervision.clone();
             let runtime_health = runtime_health.clone();
             async move {
@@ -1474,11 +1497,13 @@ fn spawn_controller_loops(
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
                     let config_dir = config_dir.clone();
+                    let local_host_ref = local_host_ref.clone();
                     async move {
                         ControllerLoop {
                             primary: backend.clone().using::<Vessel>(&namespace_string),
                             secondaries: VesselReconciler::secondary_watches(),
-                            reconciler: VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir),
+                            reconciler: VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
+                                .with_federated_dependencies(&backend, local_host_ref),
                             resync_interval: controller_resync_interval,
                             backend,
                         }
@@ -1552,12 +1577,14 @@ fn spawn_controller_loops(
                     async move {
                         ControllerLoop {
                             primary: backend.clone().using::<Convoy>(&namespace_string),
-                            secondaries: ConvoyReconciler::secondary_watches(),
+                            secondaries: ConvoyReconciler::federated_secondary_watches(&backend, &namespace_string),
                             reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
                                 .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
+                                .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))
                                 .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
                                 .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
                                 .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
+                                .with_federated_checkouts(backend.including_replicas::<Checkout>(&namespace_string))
                                 .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
                                 .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
                                     backend.clone(),
@@ -2753,14 +2780,18 @@ mod tests {
             ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
         },
     };
-    use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource, ResourceRef};
+    use flotilla_protocol::{
+        Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource, PlacementDecision,
+        PlacementTargetHost, ResourceRef,
+    };
     use flotilla_resources::{
         api_version, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-        CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CredentialConsumer, CredentialGrant,
-        CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
-        LifecycleAuthority, MaterialPoolSpec, MaterialPoolUnitSpec, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
-        RepositorySpec, Resource, Selector, SqliteBackend, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
-        VesselRequirement, WorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
+        CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer,
+        CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
+        CrewSource, CrewSpec, LifecycleAuthority, MaterialPoolSpec, MaterialPoolUnitSpec,
+        ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec, Resource, Selector, SqliteBackend,
+        TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, VesselStatus, WorkPhase, WorkflowTemplate,
+        WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
@@ -4101,6 +4132,300 @@ mod tests {
             Arc::new(PassthroughTerminalPool),
         );
         Arc::new(registry)
+    }
+
+    fn passthrough_registry_with_environment(handle: EnvironmentHandle) -> Arc<ProviderRegistry> {
+        use flotilla_core::providers::{
+            discovery::{ProviderCategory, ProviderDescriptor},
+            registry::ProviderRegistry,
+            terminal::passthrough::PassthroughTerminalPool,
+        };
+
+        let mut registry = ProviderRegistry::new();
+        registry.terminal_pools.insert(
+            "passthrough",
+            ProviderDescriptor::named(ProviderCategory::TerminalPool, "passthrough"),
+            Arc::new(PassthroughTerminalPool),
+        );
+        registry.environment_providers.insert(
+            "docker",
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
+            Arc::new(TestInteriorEnvironmentProvider { handle: Mutex::new(Some(handle)) }),
+        );
+        Arc::new(registry)
+    }
+
+    async fn replicate_local_kind<T: Resource>(source: &InProcessDaemon, target: &InProcessDaemon) {
+        let listed = source
+            .resource_backend()
+            .using::<T>(NAMESPACE)
+            .list()
+            .await
+            .unwrap_or_else(|error| panic!("list {} for test replication: {error}", T::API_PATHS.kind));
+        target
+            .resource_backend()
+            .replica_writer::<T>(source.node_id().clone(), NAMESPACE)
+            .replace(&listed, Utc::now())
+            .await
+            .unwrap_or_else(|error| panic!("replicate {} in test: {error}", T::API_PATHS.kind));
+    }
+
+    async fn bridge_runtime_resource_stores(first: &InProcessDaemon, second: &InProcessDaemon) {
+        replicate_local_kind::<Convoy>(first, second).await;
+        replicate_local_kind::<Vessel>(first, second).await;
+        replicate_local_kind::<PlacementPolicy>(first, second).await;
+        replicate_local_kind::<ResourceCheckout>(first, second).await;
+        replicate_local_kind::<TerminalSession>(first, second).await;
+
+        replicate_local_kind::<Convoy>(second, first).await;
+        replicate_local_kind::<Vessel>(second, first).await;
+        replicate_local_kind::<PlacementPolicy>(second, first).await;
+        replicate_local_kind::<ResourceCheckout>(second, first).await;
+        replicate_local_kind::<TerminalSession>(second, first).await;
+    }
+
+    async fn remote_shared_clone_placement_reaches_running(docker: bool) {
+        let temp = TempDir::new().expect("tempdir");
+        let kiwi_config_path = temp.path().join("kiwi-config");
+        let feta_config_path = temp.path().join("feta-config");
+        fs::create_dir_all(&kiwi_config_path).expect("kiwi config");
+        fs::create_dir_all(&feta_config_path).expect("feta config");
+        fs::write(kiwi_config_path.join("daemon.toml"), "machine_id = \"kiwi-root\"\n").expect("kiwi daemon config");
+        fs::write(feta_config_path.join("daemon.toml"), "machine_id = \"feta-root\"\n").expect("feta daemon config");
+        let kiwi_config = Arc::new(ConfigStore::with_base(kiwi_config_path));
+        let feta_config = Arc::new(ConfigStore::with_base(feta_config_path));
+        let kiwi = in_memory_daemon(Vec::new(), Arc::clone(&kiwi_config)).await;
+        let feta = in_memory_daemon(Vec::new(), Arc::clone(&feta_config)).await;
+        let kiwi_host_ref = kiwi.local_host_id().expect("kiwi Host identity").to_string();
+        let feta_host_ref = feta.local_host_id().expect("feta Host identity").to_string();
+        assert_ne!(kiwi_host_ref, feta_host_ref);
+
+        let kiwi_profile = LocalProvisioningProfile {
+            repo_default_dir: temp.path().join("kiwi-repos").display().to_string(),
+            ..manual_profile(&kiwi_host_ref, false)
+        };
+        let feta_profile = LocalProvisioningProfile {
+            repo_default_dir: temp.path().join("feta-repos").display().to_string(),
+            ..manual_profile(&feta_host_ref, docker)
+        };
+        fs::create_dir_all(&kiwi_profile.repo_default_dir).expect("kiwi repo root");
+        fs::create_dir_all(&feta_profile.repo_default_dir).expect("feta repo root");
+        register_startup_resources(&kiwi, NAMESPACE, &kiwi_profile).await.expect("register kiwi resources");
+        register_startup_resources(&feta, NAMESPACE, &feta_profile).await.expect("register feta resources");
+
+        let kiwi_state = Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&kiwi),
+            Arc::clone(&kiwi_config),
+            passthrough_registry(),
+            None,
+            kiwi_host_ref.clone(),
+            None,
+            kiwi_profile.host_direct_environment_name(),
+        ));
+        let feta_registry = if docker {
+            let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+                id: EnvironmentId::new("env-remote-placement-work"),
+                image: ImageId::new("test-image"),
+                runner: Arc::new(ProcessCommandRunner),
+                env_vars: HashMap::from([("HOME".to_string(), temp.path().join("container-home").display().to_string())]),
+                destroyed: Arc::new(AtomicBool::new(false)),
+            });
+            passthrough_registry_with_environment(handle)
+        } else {
+            passthrough_registry()
+        };
+        let feta_state = Arc::new(
+            ControllerRuntimeState::new(
+                Arc::clone(&feta),
+                Arc::clone(&feta_config),
+                feta_registry,
+                docker.then(|| DaemonHostPath::new(temp.path().join("flotilla.sock"))),
+                feta_host_ref.clone(),
+                None,
+                feta_profile.host_direct_environment_name(),
+            )
+            .with_flotilla_binary_path(DaemonHostPath::new("/usr/local/bin/flotilla")),
+        );
+        let mut controller_handles = spawn_controller_loops(
+            kiwi_state,
+            NAMESPACE,
+            Duration::from_millis(25),
+            ControllerSupervision::default(),
+            RuntimeHealth::default(),
+        );
+        controller_handles.extend(spawn_controller_loops(
+            feta_state,
+            NAMESPACE,
+            Duration::from_millis(25),
+            ControllerSupervision::default(),
+            RuntimeHealth::default(),
+        ));
+        let bridge = tokio::spawn({
+            let kiwi = Arc::clone(&kiwi);
+            let feta = Arc::clone(&feta);
+            async move {
+                loop {
+                    bridge_runtime_resource_stores(&kiwi, &feta).await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        });
+
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let repo_url = format!("file://{}", source.path().display());
+        let repository_spec = RepositorySpec::remote(&repo_url).expect("test repository spec");
+        let repository_key = repository_spec.key();
+        let workflow_name = if docker { "remote-docker" } else { "remote-host-direct" };
+        kiwi.resource_backend()
+            .using::<WorkflowTemplate>(NAMESPACE)
+            .create(
+                &empty_meta(workflow_name),
+                &WorkflowTemplateSpec::builder()
+                    .inputs(Vec::new())
+                    .vessels(vec![VesselRequirement::builder()
+                        .name("work".to_string())
+                        .stance(if docker { Stance::Contained } else { Stance::Trusted })
+                        .crew(vec![CrewSpec::builder()
+                            .role("coder".to_string())
+                            .source(CrewSource::Tool { command: "true".to_string() })
+                            .build()])
+                        .build()])
+                    .build(),
+            )
+            .await
+            .expect("create workflow");
+        let policy_name = if docker { "remote-docker-feta" } else { "remote-host-direct-feta" };
+        let policy = if docker {
+            PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    host_ref: feta_host_ref.clone(),
+                    image: "test-image".to_string(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::new(),
+                    default_cwd: Some("/workspace".to_string()),
+                    env: BTreeMap::new(),
+                    checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+                })
+                .build()
+        } else {
+            PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: feta_host_ref.clone(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build()
+        };
+        kiwi.resource_backend()
+            .using::<PlacementPolicy>(NAMESPACE)
+            .create(&empty_meta(policy_name), &policy)
+            .await
+            .expect("create remote placement policy");
+        let convoys = kiwi.resource_backend().using::<Convoy>(NAMESPACE);
+        let convoy = convoys
+            .create(&empty_meta("remote-placement"), &ConvoySpec {
+                workflow_ref: workflow_name.to_string(),
+                dispatching_principal_ref: Default::default(),
+                inputs: BTreeMap::new(),
+                placement_policy: Some(policy_name.to_string()),
+                repositories: vec![ConvoyRepositorySpec {
+                    url: repo_url,
+                    repo_ref: repository_key,
+                    source_ref: "main".to_string(),
+                    target_ref: "main".to_string(),
+                    workspace_slug: repository_spec.leaf_slug(),
+                    subpaths: Vec::new(),
+                }],
+                r#ref: Some("remote-placement".to_string()),
+                project_ref: None,
+                adopted_checkout_refs: BTreeMap::new(),
+                issues: Vec::new(),
+                change_request: None,
+                instruction: None,
+            })
+            .await
+            .expect("create admitting Convoy");
+        convoys
+            .update_status("remote-placement", &convoy.metadata.resource_version, &ConvoyStatus {
+                placement_decision: Some(PlacementDecision {
+                    policy_name: policy_name.to_string(),
+                    target_host: PlacementTargetHost { reference: feta_host_ref.clone(), display_name: "feta".to_string() },
+                    refused_candidates: Vec::new(),
+                    viable_not_selected: Vec::new(),
+                }),
+                ..ConvoyStatus::default()
+            })
+            .await
+            .expect("record remote placement");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let running = convoys.get("remote-placement").await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
+                status.phase == ConvoyPhase::Active && status.work.get("work").is_some_and(|work| work.phase == WorkPhase::Running)
+            });
+            if running {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let kiwi_convoy = convoys.get("remote-placement").await.expect("kiwi Convoy");
+                let kiwi_vessels = kiwi.resource_backend().using::<Vessel>(NAMESPACE).list().await.expect("kiwi Vessels");
+                let feta_vessels = feta.resource_backend().using::<Vessel>(NAMESPACE).list().await.expect("feta Vessels");
+                let feta_clones = feta.resource_backend().using::<Clone>(NAMESPACE).list().await.expect("feta Clones");
+                let feta_checkouts = feta.resource_backend().using::<ResourceCheckout>(NAMESPACE).list().await.expect("feta Checkouts");
+                let feta_terminals =
+                    feta.resource_backend().using::<TerminalSession>(NAMESPACE).list().await.expect("feta TerminalSessions");
+                let feta_environments = feta.resource_backend().using::<Environment>(NAMESPACE).list().await.expect("feta Environments");
+                panic!(
+                    "remote placement did not reach Running: convoy={kiwi_convoy:?} kiwi_vessels={kiwi_vessels:?} \
+                     feta_vessels={feta_vessels:?} feta_clones={feta_clones:?} feta_checkouts={feta_checkouts:?} \
+                     feta_terminals={feta_terminals:?} feta_environments={feta_environments:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let actuator = feta.resource_backend().using::<Vessel>(NAMESPACE).get("remote-placement-work").await.expect("feta actuator Vessel");
+        assert_eq!(actuator.status.as_ref().map(|status| status.phase), Some(flotilla_resources::VesselPhase::Ready));
+        assert_eq!(actuator.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).map(String::as_str), Some(feta_host_ref.as_str()));
+        let owner = kiwi.resource_backend().using::<Vessel>(NAMESPACE).get("remote-placement-work").await.expect("kiwi owner Vessel");
+        assert!(
+            owner.status.as_ref().is_none_or(|status: &VesselStatus| status.phase != flotilla_resources::VesselPhase::Failed),
+            "the admitting-side Vessel must not attempt remote actuation"
+        );
+        assert!(
+            matches!(
+                kiwi.resource_backend().using::<Environment>(NAMESPACE).get(&feta_profile.host_direct_environment_name()).await,
+                Err(ResourceError::NotFound { .. })
+            ),
+            "the placement host's Environment must remain host-local"
+        );
+        let ready_checkouts = feta
+            .resource_backend()
+            .using::<ResourceCheckout>(NAMESPACE)
+            .list()
+            .await
+            .expect("feta Checkouts")
+            .items
+            .into_iter()
+            .filter(|checkout| checkout.status.as_ref().map(|status| status.phase) == Some(ResourceCheckoutPhase::Ready))
+            .count();
+        assert_eq!(ready_checkouts, 1);
+
+        bridge.abort();
+        for handle in controller_handles {
+            handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn remotely_placed_host_direct_shared_clone_provisions_across_two_stores() {
+        remote_shared_clone_placement_reaches_running(false).await;
+    }
+
+    #[tokio::test]
+    async fn remotely_placed_docker_shared_clone_provisions_across_two_stores() {
+        remote_shared_clone_placement_reaches_running(true).await;
     }
 
     #[tokio::test]

@@ -119,7 +119,9 @@ pub use terminal_session::{
     TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
     TerminalSessionStatusPatch, TerminalSessionTag,
 };
-pub use vessel::{Vessel, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch};
+pub use vessel::{
+    Vessel, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+};
 pub use watch::{ResourceList, WatchEvent, WatchStart, WatchStream};
 
 #[doc(hidden)]

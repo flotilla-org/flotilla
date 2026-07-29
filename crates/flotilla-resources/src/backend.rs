@@ -79,11 +79,17 @@ impl ResourceBackend {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ReplicaReadResolver<T: Resource> {
     backend: ResourceBackend,
     namespace: String,
     _marker: PhantomData<T>,
+}
+
+impl<T: Resource> Clone for ReplicaReadResolver<T> {
+    fn clone(&self) -> Self {
+        Self { backend: self.backend.clone(), namespace: self.namespace.clone(), _marker: PhantomData }
+    }
 }
 
 impl<T: Resource> ReplicaReadResolver<T> {

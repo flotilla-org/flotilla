@@ -17,7 +17,7 @@ use tracing::warn;
 
 use crate::{
     apply_status_patch,
-    backend::{ResourceBackend, TypedResolver},
+    backend::{ReplicaReadResolver, ResourceBackend, TypedResolver},
     checkout::CheckoutSpec,
     clone::CloneSpec,
     environment::EnvironmentSpec,
@@ -206,6 +206,45 @@ impl<W: Resource, P: Resource> SecondaryWatch for ResolverLabelMappedWatch<W, P>
                         LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, &object).await?;
                     }
                 }
+            }
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct ReplicaLabelMappedWatch<W: Resource, P: Resource> {
+    pub label_key: &'static str,
+    pub resolver: ReplicaReadResolver<W>,
+    pub _marker: PhantomData<P>,
+}
+
+impl<W: Resource, P: Resource> SecondaryWatch for ReplicaLabelMappedWatch<W, P> {
+    type Primary = P;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(Self { label_key: self.label_key, resolver: self.resolver.clone(), _marker: PhantomData })
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        sender: mpsc::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            let listed = self.resolver.list().await?;
+            for source in &listed.items {
+                LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, &source.object).await?;
+            }
+            let mut watch = self.resolver.watch().await?;
+            while let Some(event) = watch.next().await {
+                let source = match event? {
+                    crate::ReadWatchEvent::Added(source)
+                    | crate::ReadWatchEvent::Modified(source)
+                    | crate::ReadWatchEvent::Deleted(source) => source,
+                };
+                LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, &source.object).await?;
             }
             Ok(())
         })

@@ -16,7 +16,7 @@ use crate::{
     checkout::Checkout,
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler,
-        SecondaryWatch,
+        ReplicaLabelMappedWatch, SecondaryWatch,
     },
     labels::{LifecycleAuthority, CONVOY_LABEL, VESSEL_LABEL},
     pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending,
@@ -24,9 +24,10 @@ use crate::{
     resource::ResourceObject,
     status_patch::StatusPatch,
     terminal_session::TerminalSession,
-    vessel::{Vessel, VesselPhase},
+    vessel::{Vessel, VesselPhase, ACTUATOR_HOST_REF_ANNOTATION},
     workflow_template::{validate, visit_template_tokens, CrewSource, CrewSpec, ValidationError, WorkflowTemplate},
-    InputMeta, InputValue, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, Resource, ResourceError, TypedResolver,
+    InputMeta, InputValue, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError,
+    ResourceProvenance, TypedResolver,
 };
 
 #[async_trait]
@@ -81,9 +82,11 @@ pub enum ConvoyEvent {
 pub struct ConvoyReconciler {
     templates: TypedResolver<WorkflowTemplate>,
     vessels: Option<TypedResolver<Vessel>>,
+    federated_vessels: Option<ReplicaReadResolver<Vessel>>,
     terminal_sessions: Option<TypedResolver<TerminalSession>>,
     presentations: Option<TypedResolver<Presentation>>,
     checkouts: Option<TypedResolver<Checkout>>,
+    federated_checkouts: Option<ReplicaReadResolver<Checkout>>,
     prepared_snapshot_gc: Option<PreparedSnapshotGarbageCollector>,
     teardown_runtime: Option<Arc<dyn ConvoyTeardownRuntime>>,
 }
@@ -103,9 +106,11 @@ impl ConvoyReconciler {
         Self {
             templates,
             vessels: None,
+            federated_vessels: None,
             terminal_sessions: None,
             presentations: None,
             checkouts: None,
+            federated_checkouts: None,
             prepared_snapshot_gc: None,
             teardown_runtime: None,
         }
@@ -113,6 +118,11 @@ impl ConvoyReconciler {
 
     pub fn with_vessels(mut self, vessels: TypedResolver<Vessel>) -> Self {
         self.vessels = Some(vessels);
+        self
+    }
+
+    pub fn with_federated_vessels(mut self, vessels: ReplicaReadResolver<Vessel>) -> Self {
+        self.federated_vessels = Some(vessels);
         self
     }
 
@@ -128,6 +138,11 @@ impl ConvoyReconciler {
 
     pub fn with_checkouts(mut self, checkouts: TypedResolver<Checkout>) -> Self {
         self.checkouts = Some(checkouts);
+        self
+    }
+
+    pub fn with_federated_checkouts(mut self, checkouts: ReplicaReadResolver<Checkout>) -> Self {
+        self.federated_checkouts = Some(checkouts);
         self
     }
 
@@ -148,6 +163,56 @@ impl ConvoyReconciler {
             Box::new(LabelMappedWatch::<Checkout, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
         ]
     }
+
+    pub fn federated_secondary_watches(
+        backend: &crate::ResourceBackend,
+        namespace: &str,
+    ) -> Vec<Box<dyn SecondaryWatch<Primary = Convoy>>> {
+        vec![
+            Box::new(ReplicaLabelMappedWatch::<Vessel, Convoy> {
+                label_key: CONVOY_LABEL,
+                resolver: backend.including_replicas::<Vessel>(namespace),
+                _marker: PhantomData,
+            }),
+            Box::new(LabelMappedWatch::<Presentation, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
+            Box::new(ReplicaLabelMappedWatch::<Checkout, Convoy> {
+                label_key: CONVOY_LABEL,
+                resolver: backend.including_replicas::<Checkout>(namespace),
+                _marker: PhantomData,
+            }),
+        ]
+    }
+}
+
+async fn federated_children<T: Resource>(
+    resolver: &ReplicaReadResolver<T>,
+    convoy: &ResourceObject<Convoy>,
+) -> Result<BTreeMap<String, ResourceObject<T>>, ResourceError> {
+    let target_host_ref = convoy
+        .status
+        .as_ref()
+        .and_then(|status| status.placement_decision.as_ref())
+        .map(|decision| decision.target_host.reference.as_str());
+    let mut selected = BTreeMap::<String, (u8, ResourceObject<T>)>::new();
+    for source in resolver.list().await?.items {
+        if source.object.metadata.labels.get(CONVOY_LABEL) != Some(&convoy.metadata.name) {
+            continue;
+        }
+        let actuator_matches = target_host_ref
+            .is_some_and(|target| source.object.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).is_some_and(|host| host == target));
+        let priority = if actuator_matches {
+            2
+        } else if matches!(source.provenance, ResourceProvenance::Local) {
+            1
+        } else {
+            0
+        };
+        let name = source.object.metadata.name.clone();
+        if selected.get(&name).is_none_or(|(current_priority, _)| priority > *current_priority) {
+            selected.insert(name, (priority, source.object));
+        }
+    }
+    Ok(selected.into_iter().map(|(name, (_, object))| (name, object)).collect())
 }
 
 impl Reconciler for ConvoyReconciler {
@@ -164,8 +229,11 @@ impl Reconciler for ConvoyReconciler {
                 Err(err) => return Err(err),
             }
         };
-        let vessels = match &self.vessels {
-            Some(vessels) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => vessels
+        let vessels = match (&self.federated_vessels, &self.vessels) {
+            (Some(vessels), _) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => {
+                federated_children(vessels, obj).await?
+            }
+            (None, Some(vessels)) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => vessels
                 .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]))
                 .await?
                 .items
@@ -184,8 +252,11 @@ impl Reconciler for ConvoyReconciler {
                 .collect(),
             _ => BTreeMap::new(),
         };
-        let checkouts = match &self.checkouts {
-            Some(checkouts) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => checkouts
+        let checkouts = match (&self.federated_checkouts, &self.checkouts) {
+            (Some(checkouts), _) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => {
+                federated_children(checkouts, obj).await?
+            }
+            (None, Some(checkouts)) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => checkouts
                 .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]))
                 .await?
                 .items

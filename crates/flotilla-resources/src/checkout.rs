@@ -1,8 +1,15 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, RepositoryCheckoutKind, RepositoryKey};
+use crate::{resource::define_resource, status_patch::StatusPatch, ReplicationClass, RepositoryCheckoutKind, RepositoryKey};
 
-define_resource!(Checkout, "checkouts", CheckoutSpec, CheckoutStatus, CheckoutStatusPatch);
+define_resource!(
+    Checkout,
+    "checkouts",
+    CheckoutSpec,
+    CheckoutStatus,
+    CheckoutStatusPatch,
+    replication = ReplicationClass::HomeBoundRuntime
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
