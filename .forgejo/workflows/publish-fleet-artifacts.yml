@@ -23,7 +23,7 @@ jobs:
           test "$(uname -m)" = x86_64
 
       - name: Check out source
-        uses: https://data.forgejo.org/actions/checkout@v6
+        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Build debug-profile binaries
         env:
@@ -65,7 +65,7 @@ jobs:
           test "$(uname -m)" = arm64
 
       - name: Check out source
-        uses: https://data.forgejo.org/actions/checkout@v6
+        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Build debug-profile binaries
         env:

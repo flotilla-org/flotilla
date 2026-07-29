@@ -12,7 +12,7 @@ if [[ $# -eq 0 ]]; then
   exit 2
 fi
 
-for value in "$FORGEJO_PACKAGE_OWNER" "$FORGEJO_PACKAGE_NAME"; do
+for value in "$FORGEJO_PACKAGE_OWNER" "$FORGEJO_PACKAGE_NAME" "$FORGEJO_PACKAGE_VERSION"; do
   if [[ ! "$value" =~ ^[A-Za-z0-9._+-]+$ ]]; then
     echo "invalid Forgejo package path component: $value" >&2
     exit 1
