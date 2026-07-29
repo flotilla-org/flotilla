@@ -1,9 +1,10 @@
 use std::collections::{btree_map::Entry, BTreeMap, HashMap};
 
 use flotilla_resources::{
-    Convoy, InputMeta, LifecycleAuthority, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, Vessel,
-    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    Convoy, InputMeta, LifecycleAuthority, ReadWatchEvent, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
+    Vessel, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
+use futures::StreamExt;
 use tracing::{debug, warn};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -27,6 +28,22 @@ pub struct VesselPlacementProjector {
 impl VesselPlacementProjector {
     pub fn new(backend: ResourceBackend, namespace: impl Into<String>, local_host_ref: impl Into<String>) -> Self {
         Self { backend, namespace: namespace.into(), local_host_ref: local_host_ref.into() }
+    }
+
+    pub async fn run(&self) -> Result<(), ResourceError> {
+        let mut convoy_watch = self.backend.including_replicas::<Convoy>(&self.namespace).watch().await?;
+        let mut vessel_watch = self.backend.including_replicas::<Vessel>(&self.namespace).watch().await?;
+        self.sync_once().await?;
+
+        loop {
+            let replica_changed = tokio::select! {
+                event = convoy_watch.next() => replica_changed(event, Convoy::API_PATHS.kind)?,
+                event = vessel_watch.next() => replica_changed(event, Vessel::API_PATHS.kind)?,
+            };
+            if replica_changed {
+                self.sync_once().await?;
+            }
+        }
     }
 
     pub async fn sync_once(&self) -> Result<VesselPlacementSync, ResourceError> {
@@ -160,4 +177,12 @@ impl VesselPlacementProjector {
         );
         Ok(result)
     }
+}
+
+fn replica_changed<T: Resource>(event: Option<Result<ReadWatchEvent<T>, ResourceError>>, kind: &str) -> Result<bool, ResourceError> {
+    let event = event.ok_or_else(|| ResourceError::invalid(format!("{kind} replica watch ended")))?;
+    let source = match event? {
+        ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => source,
+    };
+    Ok(matches!(source.provenance, ResourceProvenance::Replica { .. }))
 }

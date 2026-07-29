@@ -1065,6 +1065,7 @@ dependencies = [
  "flotilla-manifest",
  "flotilla-protocol",
  "flotilla-resources",
+ "futures",
  "rstest",
  "serde_json",
  "sha2",

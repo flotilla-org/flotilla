@@ -61,7 +61,6 @@ use crate::{
 /// wedge can hide in.
 const LIVENESS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 const MANIFEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
-const VESSEL_PLACEMENT_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 const BUILTIN_MANAGED_BY_VALUE: &str = "builtin";
@@ -1324,13 +1323,7 @@ fn spawn_controller_loops(
             async move {
                 supervise_controller("vessel_placement", supervision, runtime_health, move || {
                     let projector = VesselPlacementProjector::new(backend.clone(), namespace_string.clone(), local_host_ref.clone());
-                    async move {
-                        let mut interval = tokio::time::interval(VESSEL_PLACEMENT_SYNC_INTERVAL);
-                        loop {
-                            interval.tick().await;
-                            projector.sync_once().await?;
-                        }
-                    }
+                    async move { projector.run().await }
                 })
                 .await;
             }
