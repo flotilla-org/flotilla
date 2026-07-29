@@ -38,6 +38,7 @@ pub(crate) struct AbnormalRestartFrequency {
 pub(crate) struct DaemonLifecycle {
     marker_path: PathBuf,
     lock: File,
+    lock_released: bool,
 }
 
 impl DaemonLifecycle {
@@ -95,19 +96,35 @@ impl DaemonLifecycle {
         atomic_write_json(&history_path, &history)?;
         atomic_write_json(&marker_path, &ActiveRun { pid: std::process::id(), started_at: now })?;
 
-        Ok(Self { marker_path, lock })
+        Ok(Self { marker_path, lock, lock_released: false })
     }
 
-    pub(crate) fn finish(self) -> Result<(), String> {
+    pub(crate) fn finish(mut self) -> Result<(), String> {
         fs::remove_file(&self.marker_path)
             .map_err(|error| format!("remove daemon active-run marker {}: {error}", self.marker_path.display()))?;
+        self.release_lock()
+    }
+
+    fn release_lock(&mut self) -> Result<(), String> {
+        if self.lock_released {
+            return Ok(());
+        }
         // SAFETY: `self.lock` owns a valid descriptor and this explicit unlock
         // defines the clean handoff boundary before the descriptor is dropped.
         let unlock_result = unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
         if unlock_result != 0 {
             return Err(format!("release daemon lifecycle lock after clean stop: {}", std::io::Error::last_os_error()));
         }
+        self.lock_released = true;
         Ok(())
+    }
+}
+
+impl Drop for DaemonLifecycle {
+    fn drop(&mut self) {
+        // An abnormal exit deliberately leaves the marker behind, but explicitly
+        // release the advisory lock so another launcher can observe that marker.
+        let _ = self.release_lock();
     }
 }
 

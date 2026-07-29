@@ -9,9 +9,7 @@ use flotilla_core::{
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{
-    resource_limits::raise_file_descriptor_limit, restart_history::DaemonLifecycle, runtime::DaemonRuntime, server::DaemonServer,
-};
+use crate::{resource_limits::raise_file_descriptor_limit, restart_history::DaemonLifecycle, runtime::DaemonRuntime, server::DaemonServer};
 
 pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeout_secs: u64) -> Result<(), String> {
     let lifecycle = DaemonLifecycle::begin(state_dir)?;
