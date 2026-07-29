@@ -1450,11 +1450,6 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .or_else(|| self.state.local_registry.environment_providers.preferred_with_desc())
             .ok_or_else(|| "docker environment provider unavailable".to_string())?;
 
-        let docker_config_dir = match &self.state.credential_store {
-            Some(store) => store.prepare_registry_pull(name, &credential_refs, &spec.image).await?.map(DaemonHostPath::new),
-            None if credential_refs.is_empty() => None,
-            None => return Err("host-local credential store unavailable".to_string().into()),
-        };
         let image = ImageId::new(spec.image.clone());
         let env_id = EnvironmentId::new(name.to_string());
         let mut environment_variables = spec
@@ -1464,7 +1459,10 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
         let has_explicit_codex_credential = match &self.state.credential_store {
-            Some(store) => store.includes_codex_credential(&credential_refs).await?,
+            Some(store) => match store.includes_codex_credential(&credential_refs).await {
+                Ok(includes) => includes,
+                Err(error) => return Err(discard_uncreated_environment(store, name, error).await.into()),
+            },
             None => false,
         };
         let codex_slot =
@@ -1474,13 +1472,29 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                     .credential_store
                     .as_ref()
                     .ok_or_else(|| DockerProvisioningError::Failed("host-local credential store unavailable".to_string()))?;
-                match store.lease_codex_slot(name).await? {
-                    CodexSlotLease::Leased { host_path } => Some(host_path),
-                    CodexSlotLease::Waiting { message } => return Err(DockerProvisioningError::Waiting(message)),
+                match store.lease_codex_slot(name).await {
+                    Ok(CodexSlotLease::Leased { host_path }) => Some(host_path),
+                    Ok(CodexSlotLease::Waiting { message }) => {
+                        if let Err(cleanup_error) = store.forget_environment(name).await {
+                            return Err(DockerProvisioningError::Failed(format!(
+                                "{message}; additionally failed to remove credential cache: {cleanup_error}"
+                            )));
+                        }
+                        return Err(DockerProvisioningError::Waiting(message));
+                    }
+                    Err(error) => return Err(discard_uncreated_environment(store, name, error).await.into()),
                 }
             } else {
                 None
             };
+        let docker_config_dir = match &self.state.credential_store {
+            Some(store) => match store.prepare_registry_pull(name, &credential_refs, &spec.image).await {
+                Ok(config) => config.map(DaemonHostPath::new),
+                Err(error) => return Err(discard_uncreated_environment(store, name, error).await.into()),
+            },
+            None if credential_refs.is_empty() => None,
+            None => return Err("host-local credential store unavailable".to_string().into()),
+        };
         let mut provisioned_mounts = Vec::with_capacity(spec.mounts.len() + 2);
         provisioned_mounts.push(ProvisionedMount::new(
             flotilla_binary_path.as_path().to_path_buf(),
@@ -1641,6 +1655,13 @@ async fn discard_failed_environment(
         error
     } else {
         format!("{error}; additionally failed to {}", cleanup_errors.join("; "))
+    }
+}
+
+async fn discard_uncreated_environment(credential_store: &CredentialStore, environment_ref: &str, error: String) -> String {
+    match credential_store.forget_environment(environment_ref).await {
+        Ok(()) => error,
+        Err(cleanup_error) => format!("{error}; additionally failed to remove credential cache: {cleanup_error}"),
     }
 }
 
@@ -2441,7 +2462,8 @@ mod tests {
     use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource};
     use flotilla_resources::{
         Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-        CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, LifecycleAuthority,
+        CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CredentialConsumer, CredentialLifecycle,
+        CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, LifecycleAuthority,
         ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec, Selector, SqliteBackend,
         TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, WorkPhase, WorkflowTemplate,
         WorkflowTemplateSpec,
@@ -2769,6 +2791,40 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RejectingRegistryRunner {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CommandRunner for RejectingRegistryRunner {
+        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err("registry preflight must not run while waiting for a Codex slot".to_string())
+        }
+
+        async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err("registry preflight must not run while waiting for a Codex slot".to_string())
+        }
+
+        async fn run_with_input(
+            &self,
+            _cmd: &str,
+            _args: &[&str],
+            _cwd: &Path,
+            _label: &ChannelLabel,
+            _input: &[u8],
+        ) -> Result<String, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err("registry preflight must not run while waiting for a Codex slot".to_string())
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+    }
+
     struct ListingEnvironmentProvider {
         handle: EnvironmentHandle,
     }
@@ -2923,6 +2979,94 @@ mod tests {
             opts.provisioned_mounts.iter().all(|mount| mount.environment_path.as_path() != Path::new(CONTAINER_CODEX_HOME)),
             "a placement-provided CODEX_HOME must not be overwritten with a leased slot"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_slot_wait_skips_registry_preflight_and_leaves_no_credential_cache() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"codex-slot-registry-wait-test\"\n").expect("daemon config");
+        let home = temp.path().join("home");
+        let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
+        fs::create_dir_all(&slot).expect("slot directory");
+        let auth = slot.join("auth.json");
+        fs::write(&auth, "{\"tokens\":\"test\"}").expect("slot auth");
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("protect slot auth");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        daemon
+            .resource_backend()
+            .definitions::<CredentialSpec>(NAMESPACE)
+            .create(&InputMeta::builder().name("private-registry".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".to_string(), username: "crew".to_string() },
+                source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create registry credential");
+        let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None) });
+        let mut local_registry = ProviderRegistry::new();
+        local_registry.environment_providers.insert(
+            "docker",
+            flotilla_core::providers::discovery::ProviderDescriptor::named(
+                flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+                "docker",
+            ),
+            Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
+        );
+        let registry_runner = Arc::new(RejectingRegistryRunner::default());
+        let credential_store = Arc::new(CredentialStore::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("HOME", home.display().to_string()), ("TEST_REGISTRY_TOKEN", "registry-secret".to_string())])),
+            EnvironmentBag::new(),
+            registry_runner.clone(),
+            config.state_dir().as_path().to_path_buf(),
+        ));
+        assert!(matches!(credential_store.lease_codex_slot("slot-holder").await.expect("occupy only slot"), CodexSlotLease::Leased { .. }));
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                daemon,
+                Arc::clone(&config),
+                Arc::new(local_registry),
+                Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+                "host-test".to_string(),
+                None,
+                "host-direct-host-test".to_string(),
+            )
+            .with_flotilla_binary_path(DaemonHostPath::new("/opt/flotilla/bin/flotilla"))
+            .with_credential_store(credential_store),
+        );
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host-test".to_string(),
+            image: "registry.example/crew:latest".to_string(),
+            declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
+            required_agent_adapters: BTreeSet::from(["codex".to_string()]),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: BTreeMap::from([(
+                CREDENTIAL_REFS_ENV.to_string(),
+                serde_json::to_string(&BTreeSet::from(["private-registry".to_string()])).expect("encode credential refs"),
+            )]),
+        };
+
+        let error =
+            DockerControllerRuntime { state }.provision("waiting-environment", &spec).await.expect_err("exhausted Codex pool should wait");
+
+        assert_eq!(
+            error,
+            DockerProvisioningError::Waiting(
+                "waiting for codex login slot; 1 in pool, all leased; mint another slot to increase concurrency".to_string()
+            )
+        );
+        assert_eq!(registry_runner.calls.load(Ordering::SeqCst), 0, "registry login and pull must not run before a slot is available");
+        assert!(provider.create_opts.lock().await.is_none(), "provider create must not run while waiting");
+        assert!(!config.state_dir().as_path().join("credential-runtime").exists(), "waiting must not leave a credential cache on disk");
     }
 
     #[tokio::test]
