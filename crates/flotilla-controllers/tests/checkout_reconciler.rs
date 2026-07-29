@@ -65,6 +65,7 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
                 .details(vec!["no change request provider".to_string()])
                 .build(),
             landed_evidence: None,
+            change_request: None,
         })
     }
 
@@ -312,6 +313,7 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
                 pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
                 landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at).build(),
                 landed_evidence: None,
+                change_request: None,
             },
             message: None,
         })

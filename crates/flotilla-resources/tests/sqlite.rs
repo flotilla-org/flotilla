@@ -373,6 +373,42 @@ async fn objects_and_resource_versions_survive_restart() {
     assert_eq!(updated.metadata.resource_version, "2");
 }
 
+#[tokio::test]
+async fn recreating_a_quarantined_object_clears_its_decode_diagnosis() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("resources.sqlite");
+
+    {
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should open"));
+        backend
+            .using::<Convoy>("flotilla")
+            .create(&convoy_meta("poisoned"), &convoy_spec("template-a"))
+            .await
+            .expect("create object to corrupt");
+    }
+    let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
+    let changed = connection
+        .execute("UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = ?2", rusqlite::params![
+            Convoy::API_PATHS.kind,
+            "poisoned"
+        ])
+        .expect("corrupt stored object");
+    assert_eq!(changed, 1);
+    drop(connection);
+
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should reopen"));
+    let convoys = backend.using::<Convoy>("flotilla");
+    assert!(convoys.list().await.expect("quarantine corrupt object").items.is_empty());
+    assert_eq!(backend.diagnostics().await.expect("read quarantine diagnostics").expect("sqlite diagnostics").decode_quarantines.len(), 1);
+
+    convoys.create(&convoy_meta("poisoned"), &convoy_spec("template-b")).await.expect("recreate quarantined object");
+
+    assert!(
+        backend.diagnostics().await.expect("read repaired diagnostics").expect("sqlite diagnostics").decode_quarantines.is_empty(),
+        "a valid same-identity recreation should resolve the active quarantine diagnosis"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn delayed_sqlite_open_does_not_stall_tokio_executor() {
     let dir = tempdir().expect("tempdir");

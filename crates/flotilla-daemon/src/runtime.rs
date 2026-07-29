@@ -49,6 +49,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     agent_material::{AgentMaterialPrepareError, AgentMaterialRegistry},
     credential::CredentialStore,
+    resource_limits::file_descriptor_pressure_condition,
     resource_manifest::ResourceManifestReconciler,
     sleep_inhibitor,
     supervisor::{supervise, ControllerSupervision, RestartBudgetExhausted},
@@ -208,9 +209,19 @@ struct DaemonHealthIdentity {
 #[derive(Debug, Clone, Default)]
 struct RuntimeHealth {
     failures: Arc<StdMutex<BTreeMap<String, HostCondition>>>,
+    restart_history_dir: Option<Arc<PathBuf>>,
 }
 
 impl RuntimeHealth {
+    fn report_capability_regression(&self, condition: HostCondition) {
+        self.failures.lock().expect("runtime health lock poisoned").insert(condition.condition_type.clone(), condition);
+    }
+
+    fn with_restart_history_dir(mut self, path: PathBuf) -> Self {
+        self.restart_history_dir = Some(Arc::new(path));
+        self
+    }
+
     fn report_restart_budget_exhausted(&self, exhausted: RestartBudgetExhausted) {
         let condition_type = format!("Controller/{}", exhausted.controller);
         let condition = HostCondition::builder()
@@ -239,9 +250,95 @@ impl RuntimeHealth {
         }
     }
 
-    fn conditions(&self) -> Vec<HostCondition> {
-        self.failures.lock().expect("runtime health lock poisoned").values().cloned().collect()
+    async fn conditions(&self) -> Vec<HostCondition> {
+        let mut conditions = self.failures.lock().expect("runtime health lock poisoned").values().cloned().collect::<Vec<_>>();
+        if let Some(state_dir) = self.restart_history_dir.clone() {
+            let frequency =
+                tokio::task::spawn_blocking(move || crate::restart_history::recent_abnormal_restarts(state_dir.as_path(), Utc::now()))
+                    .await
+                    .map_err(|error| format!("restart history task failed: {error}"))
+                    .and_then(|result| result);
+            let condition = match frequency {
+                Ok(frequency) if frequency.count > 0 => Some(
+                    HostCondition::builder()
+                        .condition_type("Daemon/AbnormalRestarts")
+                        .value(ConditionValue::False)
+                        .reason("AbnormalExitFrequency")
+                        .message(format!(
+                            "daemon restarted {}× after abnormal exits in {}m",
+                            frequency.count,
+                            frequency.window.as_secs() / 60
+                        ))
+                        .observed_at(Utc::now())
+                        .build(),
+                ),
+                Ok(_) => None,
+                Err(error) => Some(
+                    HostCondition::builder()
+                        .condition_type("Daemon/RestartTracking")
+                        .value(ConditionValue::False)
+                        .reason("RestartHistoryUnavailable")
+                        .message(error)
+                        .observed_at(Utc::now())
+                        .build(),
+                ),
+            };
+            conditions.extend(condition);
+        }
+        conditions
     }
+}
+
+struct AgentAdapterCapabilityAssessment {
+    baseline: BTreeSet<String>,
+    regression: Option<HostCondition>,
+}
+
+fn assess_agent_adapter_capabilities(
+    previous: Option<&HostStatus>,
+    current: &BTreeSet<String>,
+    health: &DaemonHealthIdentity,
+) -> AgentAdapterCapabilityAssessment {
+    let Some(previous) = previous else {
+        return AgentAdapterCapabilityAssessment { baseline: current.clone(), regression: None };
+    };
+    let baseline = match &previous.agent_adapter_baseline {
+        Some(baseline) => baseline.clone(),
+        None => match previous.agent_adapters() {
+            Ok(adapters) => adapters,
+            Err(error) => {
+                warn!(%error, "cannot compare agent adapter capabilities with previous daemon generation");
+                return AgentAdapterCapabilityAssessment { baseline: current.clone(), regression: None };
+            }
+        },
+    };
+    let same_daemon = previous.daemon_generation == health.generation && previous.daemon_started_at == Some(health.started_at);
+    if same_daemon {
+        return AgentAdapterCapabilityAssessment { baseline, regression: None };
+    }
+    let missing = baseline.difference(current).cloned().collect::<Vec<_>>();
+    if missing.is_empty() {
+        return AgentAdapterCapabilityAssessment { baseline: current.clone(), regression: None };
+    }
+
+    warn!(
+        previous_generation = ?previous.daemon_generation,
+        current_generation = ?health.generation,
+        baseline_adapters = ?baseline,
+        current_adapters = ?current,
+        missing_adapters = ?missing,
+        "host capabilities regressed across daemon restart"
+    );
+    let regression = Some(
+        HostCondition::builder()
+            .condition_type("CapabilityRegression")
+            .value(ConditionValue::False)
+            .reason("AgentAdaptersMissing")
+            .message(format!("agent adapters from the last non-regressed daemon generation are missing: {}", missing.join(", ")))
+            .observed_at(Utc::now())
+            .build(),
+    );
+    AgentAdapterCapabilityAssessment { baseline, regression }
 }
 
 #[cfg(test)]
@@ -302,7 +399,10 @@ impl DaemonRuntime {
             started_at: Utc::now(),
         };
         daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools).await;
-        let runtime_health = RuntimeHealth::default();
+        let runtime_health = RuntimeHealth::default().with_restart_history_dir(config.state_dir().as_path().to_path_buf());
+        flotilla_resources::quarantine_undecodable_stored_objects(&daemon.resource_backend(), &options.namespace)
+            .await
+            .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
         flotilla_resources::PreparedSnapshotGarbageCollector::new(daemon.resource_backend(), &options.namespace)
             .recover_pending_claims()
@@ -807,50 +907,100 @@ async fn discover_local_clones(
 }
 
 async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, profile: &LocalProvisioningProfile) -> Result<(), String> {
-    let policies = backend.clone().using::<PlacementPolicy>(namespace);
-
     let host_direct_name = profile.host_direct_policy_name();
-    if matches!(policies.get(&host_direct_name).await, Err(ResourceError::NotFound { .. })) {
-        policies
-            .create(
-                &empty_meta(&host_direct_name),
-                &PlacementPolicySpec::builder()
-                    .pool(profile.host_direct_pool.clone())
-                    .host_direct(HostDirectPlacementPolicySpec {
-                        host_ref: profile.host_id.clone(),
-                        checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                    })
-                    .build(),
-            )
-            .await
-            .map_err(|err| err.to_string())?;
-    }
+    reconcile_registered_policy(
+        backend,
+        namespace,
+        &host_direct_name,
+        &PlacementPolicySpec::builder()
+            .pool(profile.host_direct_pool.clone())
+            .host_direct(HostDirectPlacementPolicySpec {
+                host_ref: profile.host_id.clone(),
+                checkout: HostDirectPlacementPolicyCheckout::Worktree,
+            })
+            .build(),
+    )
+    .await?;
 
     if profile.docker_available {
         let docker_name = profile.docker_policy_name();
-        if matches!(policies.get(&docker_name).await, Err(ResourceError::NotFound { .. })) {
-            policies
-                .create(
-                    &empty_meta(&docker_name),
-                    &PlacementPolicySpec::builder()
-                        .pool(profile.docker_pool.clone())
-                        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                            host_ref: profile.host_id.clone(),
-                            image: DEFAULT_DOCKER_IMAGE.to_string(),
-                            pull_policy: Default::default(),
-                            agent_adapters: BTreeSet::new(),
-                            default_cwd: Some("/workspace".to_string()),
-                            env: BTreeMap::new(),
-                            checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
-                        })
-                        .build(),
-                )
-                .await
-                .map_err(|err| err.to_string())?;
-        }
+        reconcile_registered_policy(
+            backend,
+            namespace,
+            &docker_name,
+            &PlacementPolicySpec::builder()
+                .pool(profile.docker_pool.clone())
+                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    host_ref: profile.host_id.clone(),
+                    image: DEFAULT_DOCKER_IMAGE.to_string(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::new(),
+                    default_cwd: Some("/workspace".to_string()),
+                    env: BTreeMap::new(),
+                    checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+                })
+                .build(),
+        )
+        .await?;
     }
 
     Ok(())
+}
+
+async fn reconcile_registered_policy(
+    backend: &ResourceBackend,
+    namespace: &str,
+    name: &str,
+    desired: &PlacementPolicySpec,
+) -> Result<(), String> {
+    let policies = backend.clone().using::<PlacementPolicy>(namespace);
+    match policies.get(name).await {
+        Ok(existing) => {
+            if existing.metadata.deletion_timestamp.is_some() {
+                return Ok(());
+            }
+            if let Some(managed_by) = existing.metadata.labels.get(MANAGED_BY_LABEL) {
+                warn!(policy = %name, %managed_by, "leaving managed placement policy untouched during daemon registration");
+                return Ok(());
+            }
+
+            let merged = merge_registered_policy_spec(&existing.spec, desired)?;
+            if merged != existing.spec {
+                policies
+                    .update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &merged)
+                    .await
+                    .map_err(|err| format!("reconcile registered placement policy {name}: {err}"))?;
+            }
+            Ok(())
+        }
+        Err(ResourceError::NotFound { .. }) => {
+            policies.create(&empty_meta(name), desired).await.map(|_| ()).map_err(|err| format!("register placement policy {name}: {err}"))
+        }
+        Err(err) => Err(format!("check registered placement policy {name}: {err}")),
+    }
+}
+
+fn merge_registered_policy_spec(existing: &PlacementPolicySpec, desired: &PlacementPolicySpec) -> Result<PlacementPolicySpec, String> {
+    // Registration owns placement topology, not operator scheduling or runtime
+    // configuration. Starting from the live spec also preserves future fields
+    // until their ownership is explicitly assigned here.
+    let mut merged = existing.clone();
+    merged.pool.clone_from(&desired.pool);
+    match (&desired.host_direct, &desired.docker_per_vessel) {
+        (Some(host_direct), None) => {
+            merged.host_direct = Some(host_direct.clone());
+            merged.docker_per_vessel = None;
+        }
+        (None, Some(desired_docker)) => {
+            let mut docker = existing.docker_per_vessel.clone().unwrap_or_else(|| desired_docker.clone());
+            docker.host_ref.clone_from(&desired_docker.host_ref);
+            docker.checkout.clone_from(&desired_docker.checkout);
+            merged.host_direct = None;
+            merged.docker_per_vessel = Some(docker);
+        }
+        _ => return Err("registered placement policy must define exactly one strategy".to_string()),
+    }
+    Ok(merged)
 }
 
 async fn supervise_controller<F, Fut>(name: &'static str, supervision: ControllerSupervision, runtime_health: RuntimeHealth, make_run: F)
@@ -1064,6 +1214,10 @@ async fn apply_host_heartbeat_with_credentials(
     let backend = daemon.resource_backend();
     let hosts = backend.using::<Host>(namespace);
     let host = hosts.get(&profile.host_id).await.map_err(|err| err.to_string())?;
+    let adapter_assessment = assess_agent_adapter_capabilities(host.status.as_ref(), &profile.available_agent_adapters, health);
+    if let Some(condition) = adapter_assessment.regression {
+        runtime_health.report_capability_regression(condition);
+    }
     let summary = daemon.local_host_summary().await;
     let resource_store = backend.diagnostics().await.map_err(|err| err.to_string())?;
     if let Some(diagnostics) = resource_store.as_ref().filter(|diagnostics| !diagnostics.warnings.is_empty()) {
@@ -1084,9 +1238,14 @@ async fn apply_host_heartbeat_with_credentials(
     let disk_free_bytes = tokio::task::spawn_blocking(move || measure_available_space(&repo_default_dir))
         .await
         .map_err(|error| format!("measure available disk space: {error}"))?;
-    let conditions = runtime_health.conditions();
+    let mut conditions = runtime_health.conditions().await;
+    conditions.extend(file_descriptor_pressure_condition());
+    if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
+        conditions.push(condition);
+    }
     let status = HostStatus {
         capabilities: host_capabilities(&summary, profile, &held_credentials),
+        agent_adapter_baseline: Some(adapter_assessment.baseline),
         heartbeat_at: Some(Utc::now()),
         ready: conditions.is_empty(),
         resource_store,
@@ -1100,6 +1259,32 @@ async fn apply_host_heartbeat_with_credentials(
     hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|err| err.to_string())?;
     daemon.refresh_connected_peer_host_heartbeats().await;
     Ok(())
+}
+
+fn resource_decode_quarantine_condition(diagnostics: Option<&flotilla_resources::ResourceStoreDiagnostics>) -> Option<HostCondition> {
+    let quarantines = &diagnostics?.decode_quarantines;
+    if quarantines.is_empty() {
+        return None;
+    }
+    let identities = quarantines
+        .iter()
+        .map(|quarantine| format!("{}/{}: {}", quarantine.kind, quarantine.name, quarantine.error))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(
+        HostCondition::builder()
+            .condition_type("ResourceStore/DecodeQuarantine")
+            .value(ConditionValue::False)
+            .reason("StoredObjectDecodeFailed")
+            .message(format!(
+                "{} stored resource object{} quarantined after typed decode failure{}: {identities}",
+                quarantines.len(),
+                if quarantines.len() == 1 { "" } else { "s" },
+                if quarantines.len() == 1 { "" } else { "s" },
+            ))
+            .observed_at(Utc::now())
+            .build(),
+    )
 }
 
 fn host_capabilities(
@@ -2572,10 +2757,10 @@ mod tests {
     use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource};
     use flotilla_resources::{
         Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-        CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CredentialConsumer, CredentialLifecycle,
-        CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, LifecycleAuthority,
-        ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec, Selector, SqliteBackend,
-        TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, WorkPhase, WorkflowTemplate,
+        CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CredentialConsumer, CredentialGrant,
+        CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
+        LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec, Resource, Selector,
+        SqliteBackend, TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, WorkPhase, WorkflowTemplate,
         WorkflowTemplateSpec,
     };
     use futures::StreamExt;
@@ -4151,6 +4336,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let daemon = in_memory_daemon(Vec::new(), config).await;
+        let host_id = daemon.local_host_id().expect("local host id").to_string();
+        let mut first_profile = manual_profile(&host_id, false);
+        first_profile.available_agent_adapters = BTreeSet::from(["claude-code".to_string(), "codex".to_string()]);
+        ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration");
+        apply_host_heartbeat_with_credentials(
+            &daemon,
+            NAMESPACE,
+            &first_profile,
+            None,
+            &DaemonHealthIdentity {
+                generation: Some("generation-1".to_string()),
+                version: "1.0.0".to_string(),
+                started_at: Utc::now() - chrono::Duration::minutes(1),
+            },
+            &RuntimeHealth::default(),
+        )
+        .await
+        .expect("first generation heartbeat");
+        let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
+        let first_host = hosts.get(&host_id).await.expect("first generation host");
+        let mut legacy_status = first_host.status.expect("first generation status");
+        legacy_status.agent_adapter_baseline = None;
+        hosts
+            .update_status(&host_id, &first_host.metadata.resource_version, &legacy_status)
+            .await
+            .expect("simulate status written before the baseline field existed");
+
+        let mut restarted_profile = first_profile.clone();
+        restarted_profile.available_agent_adapters.remove("claude-code");
+        let runtime_health = RuntimeHealth::default();
+        let second_health =
+            DaemonHealthIdentity { generation: Some("generation-2".to_string()), version: "1.0.0".to_string(), started_at: Utc::now() };
+        let log_output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let writer = LogCaptureWriter(Arc::clone(&log_output));
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &restarted_profile, None, &second_health, &runtime_health)
+                .await
+                .expect("restarted generation heartbeat");
+        }
+
+        let status = daemon
+            .resource_backend()
+            .using::<Host>(NAMESPACE)
+            .get(&host_id)
+            .await
+            .expect("host after restart")
+            .status
+            .expect("host status after restart");
+        assert!(!status.ready, "capability regression should degrade the host");
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].condition_type, "CapabilityRegression");
+        assert_eq!(status.conditions[0].reason, "AgentAdaptersMissing");
+        assert!(status.conditions[0].message.contains("claude-code"));
+        assert_eq!(status.agent_adapter_baseline, Some(first_profile.available_agent_adapters.clone()));
+
+        let logs = String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+        assert!(logs.contains("host capabilities regressed across daemon restart"), "missing capability regression warning: {logs}");
+        assert!(logs.contains("claude-code"), "warning should name the missing adapter: {logs}");
+
+        log_output.lock().expect("log output lock should be healthy").clear();
+        {
+            let writer = LogCaptureWriter(Arc::clone(&log_output));
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &restarted_profile, None, &second_health, &runtime_health)
+                .await
+                .expect("same generation heartbeat");
+        }
+        let same_generation_logs =
+            String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+        assert!(
+            !same_generation_logs.contains("host capabilities regressed across daemon restart"),
+            "same generation heartbeat should not repeat the warning: {same_generation_logs}"
+        );
+
+        let third_runtime_health = RuntimeHealth::default();
+        log_output.lock().expect("log output lock should be healthy").clear();
+        {
+            let writer = LogCaptureWriter(Arc::clone(&log_output));
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            apply_host_heartbeat_with_credentials(
+                &daemon,
+                NAMESPACE,
+                &restarted_profile,
+                None,
+                &DaemonHealthIdentity {
+                    generation: Some("generation-3".to_string()),
+                    version: "1.0.0".to_string(),
+                    started_at: Utc::now() + chrono::Duration::minutes(1),
+                },
+                &third_runtime_health,
+            )
+            .await
+            .expect("third generation heartbeat");
+        }
+        let third_status = daemon
+            .resource_backend()
+            .using::<Host>(NAMESPACE)
+            .get(&host_id)
+            .await
+            .expect("host after repeated restart")
+            .status
+            .expect("host status after repeated restart");
+        assert!(!third_status.ready, "a repeated restart must not absorb the capability regression into its baseline");
+        assert_eq!(third_status.conditions.len(), 1);
+        assert_eq!(third_status.conditions[0].reason, "AgentAdaptersMissing");
+        assert!(third_status.conditions[0].message.contains("claude-code"));
+        assert_eq!(third_status.agent_adapter_baseline, Some(first_profile.available_agent_adapters));
+        let third_logs =
+            String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+        assert!(
+            third_logs.contains("host capabilities regressed across daemon restart"),
+            "each regressed daemon generation should warn: {third_logs}"
+        );
+    }
+
+    #[tokio::test]
     async fn projection_parity_reports_and_clears_missing_local_convoys() {
         let backend = ResourceBackend::InMemory(Default::default());
         backend
@@ -4200,7 +4527,7 @@ mod tests {
         )
         .await;
 
-        let conditions = runtime_health.conditions();
+        let conditions = runtime_health.conditions().await;
         assert_eq!(conditions.len(), 1);
         assert_eq!(conditions[0].condition_type, "Controller/checkout");
         assert_eq!(conditions[0].reason, "RestartBudgetExhausted");
@@ -4245,6 +4572,121 @@ mod tests {
         std::fs::create_dir_all(config.state_dir()).expect("state dir");
         let backend = ResourceBackend::Sqlite(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend"));
         daemon_with_backend(tracked_repos, config, backend).await
+    }
+
+    fn insert_undecodable_resource<T: Resource>(connection: &rusqlite::Connection, name: &str) {
+        connection
+            .execute(
+                r#"
+                INSERT INTO resource_objects
+                    (group_name, version, kind, namespace, name, resource_version, body_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, 1, '{}')
+                "#,
+                rusqlite::params![T::API_PATHS.group, T::API_PATHS.version, T::API_PATHS.kind, NAMESPACE, name],
+            )
+            .expect("insert undecodable resource");
+    }
+
+    #[tokio::test]
+    async fn daemon_boot_quarantines_every_undecodable_replicated_kind_and_reports_them() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let sqlite_path = config.state_dir().join("resources.sqlite");
+        drop(SqliteBackend::open(&sqlite_path).expect("initialize sqlite store"));
+        let connection = rusqlite::Connection::open(&sqlite_path).expect("open raw sqlite store");
+        insert_undecodable_resource::<Project>(&connection, "poisoned-project");
+        insert_undecodable_resource::<Convoy>(&connection, "poisoned-convoy");
+        insert_undecodable_resource::<CredentialGrant>(&connection, "poisoned-credential-grant");
+        insert_undecodable_resource::<CredentialSpec>(&connection, "poisoned-credential-spec");
+        insert_undecodable_resource::<Host>(&connection, "poisoned-host");
+        insert_undecodable_resource::<Vessel>(&connection, "poisoned-vessel");
+        insert_undecodable_resource::<TerminalSession>(&connection, "poisoned-terminal-session");
+        drop(connection);
+
+        let log_output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = LogCaptureWriter(Arc::clone(&log_output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let daemon = sqlite_daemon(Vec::new(), Arc::clone(&config)).await;
+        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
+            heartbeat_interval: Duration::from_secs(300),
+            controller_resync_interval: Duration::from_secs(300),
+            start_controllers: false,
+            ..RuntimeOptions::default()
+        })
+        .await
+        .expect("daemon should boot with undecodable stored resources");
+
+        daemon.list_projects_internal().await.expect("daemon should serve project queries");
+        let health = daemon.fleet_health_internal().await.expect("daemon should serve fleet health");
+        let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
+        let diagnosis = local.degraded_conditions.join("; ");
+        for identity in [
+            "Project/poisoned-project",
+            "Convoy/poisoned-convoy",
+            "CredentialGrant/poisoned-credential-grant",
+            "CredentialSpec/poisoned-credential-spec",
+            "Host/poisoned-host",
+            "Vessel/poisoned-vessel",
+            "TerminalSession/poisoned-terminal-session",
+        ] {
+            assert!(diagnosis.contains(identity), "fleet diagnosis should name {identity}: {diagnosis}");
+        }
+
+        let logs = String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+        for field in ["kind", "name", "error"] {
+            assert!(logs.contains(field), "quarantine warning should include {field}: {logs}");
+        }
+        assert!(logs.contains("quarantin"), "quarantine warning should be explicit: {logs}");
+
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn daemon_reports_recent_abnormal_restart_frequency_in_fleet_health() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let now = Utc::now();
+        fs::write(
+            config.state_dir().join("flotillad-abnormal-exits.json"),
+            serde_json::to_vec(&json!({
+                "abnormal_exits": [
+                    now - chrono::Duration::minutes(3),
+                    now - chrono::Duration::minutes(8),
+                    now - chrono::Duration::minutes(21),
+                    now - chrono::Duration::minutes(45),
+                ]
+            }))
+            .expect("serialize restart history"),
+        )
+        .expect("seed restart history");
+
+        let daemon = sqlite_daemon(Vec::new(), Arc::clone(&config)).await;
+        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
+            heartbeat_interval: Duration::from_secs(300),
+            controller_resync_interval: Duration::from_secs(300),
+            start_controllers: false,
+            ..RuntimeOptions::default()
+        })
+        .await
+        .expect("daemon should start");
+
+        let health = daemon.fleet_health_internal().await.expect("fleet health");
+        let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
+        assert!(
+            local.degraded_conditions.iter().any(|condition| condition.contains("daemon restarted 3× after abnormal exits in 30m")),
+            "fleet diagnosis should surface the restart window: {:?}",
+            local.degraded_conditions
+        );
+
+        runtime.shutdown();
     }
 
     async fn crew_daemon(config: Arc<ConfigStore>) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
@@ -4730,6 +5172,145 @@ mod tests {
         let clone = clones.get(&clone_name).await.expect("discovered clone should exist");
         assert_eq!(clone.spec.url, "git@github.com:flotilla-org/flotilla.git");
         assert_eq!(clone.metadata.labels.get("flotilla.work/discovered").map(String::as_str), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn policy_registration_preserves_operator_fields_and_corrects_owned_drift() {
+        let temp = TempDir::new().expect("tempdir");
+        let database_path = temp.path().join("resources.sqlite");
+        let profile = manual_profile("host-test", false);
+        {
+            let backend =
+                ResourceBackend::Sqlite(SqliteBackend::open(&database_path).expect("initial sqlite resource backend should open"));
+            ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("initial policy registration should succeed");
+
+            let policies = backend.using::<PlacementPolicy>(NAMESPACE);
+            let registered = policies.get(&profile.host_direct_policy_name()).await.expect("registered host-direct policy");
+            policies
+                .update(
+                    &InputMeta::from(&registered.metadata),
+                    &registered.metadata.resource_version,
+                    &PlacementPolicySpec::builder()
+                        .pool("operator-edited-pool".to_string())
+                        .priority(10)
+                        .host_direct(HostDirectPlacementPolicySpec {
+                            host_ref: "operator-edited-host".to_string(),
+                            checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                        })
+                        .build(),
+                )
+                .await
+                .expect("operator policy apply should succeed");
+        }
+
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&database_path).expect("restarted sqlite resource backend should open"));
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("policy re-registration should succeed");
+
+        let reconciled = backend
+            .using::<PlacementPolicy>(NAMESPACE)
+            .get(&profile.host_direct_policy_name())
+            .await
+            .expect("reconciled host-direct policy");
+        assert_eq!(reconciled.spec.priority, 10, "operator-owned priority must survive re-registration");
+        assert_eq!(reconciled.spec.pool, profile.host_direct_pool, "registration must assert the discovered terminal pool");
+        assert_eq!(
+            reconciled.spec.host_direct,
+            Some(HostDirectPlacementPolicySpec {
+                host_ref: profile.host_id.clone(),
+                checkout: HostDirectPlacementPolicyCheckout::Worktree,
+            }),
+            "registration must assert its host and checkout strategy"
+        );
+        assert!(reconciled.spec.docker_per_vessel.is_none());
+
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("steady-state policy registration should succeed");
+        let steady =
+            backend.using::<PlacementPolicy>(NAMESPACE).get(&profile.host_direct_policy_name()).await.expect("steady host-direct policy");
+        assert_eq!(steady.spec.priority, 10);
+        assert_eq!(
+            steady.metadata.resource_version, reconciled.metadata.resource_version,
+            "steady registration must not rewrite the policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_policy_registration_preserves_runtime_configuration_and_corrects_owned_drift() {
+        let backend = ResourceBackend::InMemory(Default::default());
+        let profile = manual_profile("host-test", true);
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("initial policy registration should succeed");
+
+        let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
+        let registered = policies.get(&profile.docker_policy_name()).await.expect("registered docker policy");
+        policies
+            .update(
+                &InputMeta::from(&registered.metadata),
+                &registered.metadata.resource_version,
+                &PlacementPolicySpec::builder()
+                    .pool("operator-edited-pool".to_string())
+                    .priority(20)
+                    .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                        host_ref: "operator-edited-host".to_string(),
+                        image: "operator/image:latest".to_string(),
+                        pull_policy: flotilla_resources::DockerImagePullPolicy::Never,
+                        agent_adapters: BTreeSet::from(["codex".to_string()]),
+                        default_cwd: Some("/operator-workspace".to_string()),
+                        env: BTreeMap::from([("OPERATOR_CONFIG".to_string(), "true".to_string())]),
+                        checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/operator-clone".to_string() },
+                    })
+                    .build(),
+            )
+            .await
+            .expect("operator policy apply should succeed");
+
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("policy re-registration should succeed");
+
+        let reconciled = policies.get(&profile.docker_policy_name()).await.expect("reconciled docker policy");
+        assert_eq!(reconciled.spec.priority, 20);
+        assert_eq!(reconciled.spec.pool, profile.docker_pool);
+        assert!(reconciled.spec.host_direct.is_none());
+        assert_eq!(
+            reconciled.spec.docker_per_vessel,
+            Some(DockerPerVesselPlacementPolicySpec {
+                host_ref: profile.host_id,
+                image: "operator/image:latest".to_string(),
+                pull_policy: flotilla_resources::DockerImagePullPolicy::Never,
+                agent_adapters: BTreeSet::from(["codex".to_string()]),
+                default_cwd: Some("/operator-workspace".to_string()),
+                env: BTreeMap::from([("OPERATOR_CONFIG".to_string(), "true".to_string())]),
+                checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_registration_leaves_manifest_managed_collision_untouched() {
+        let backend = ResourceBackend::InMemory(Default::default());
+        let profile = manual_profile("host-test", false);
+        let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
+        let manifest_spec = PlacementPolicySpec::builder()
+            .pool("manifest-pool".to_string())
+            .priority(25)
+            .host_direct(HostDirectPlacementPolicySpec {
+                host_ref: "manifest-host".to_string(),
+                checkout: HostDirectPlacementPolicyCheckout::Worktree,
+            })
+            .build();
+        let manifest = policies
+            .create(
+                &empty_meta_with_labels(
+                    &profile.host_direct_policy_name(),
+                    BTreeMap::from([(MANAGED_BY_LABEL.to_string(), "manifest".to_string())]),
+                ),
+                &manifest_spec,
+            )
+            .await
+            .expect("manifest-managed policy should exist");
+
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("registration should tolerate managed collision");
+
+        let unchanged = policies.get(&profile.host_direct_policy_name()).await.expect("manifest-managed policy should remain");
+        assert_eq!(unchanged.spec, manifest_spec);
+        assert_eq!(unchanged.metadata.resource_version, manifest.metadata.resource_version, "registration must not rewrite managed policy");
     }
 
     #[tokio::test]
@@ -5422,7 +6003,7 @@ mod tests {
         flotilla_resources::apply_status_patch(
             &checkouts,
             &checkout.metadata.name,
-            &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration },
+            &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration) },
         )
         .await
         .expect("record observed absence of a change request");

@@ -15,6 +15,8 @@ use super::{
 };
 use crate::peer::{ActivationResult, InboundPeerEnvelope, PeerManager};
 
+pub(super) const PEER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub(super) struct PeerConnection {
     daemon: Arc<InProcessDaemon>,
     shutdown_rx: watch::Receiver<bool>,
@@ -121,11 +123,14 @@ impl PeerConnection {
             resource_socket_path: None,
         }));
 
+        let idle_deadline = tokio::time::sleep(PEER_IDLE_TIMEOUT);
+        tokio::pin!(idle_deadline);
         loop {
             tokio::select! {
                 message_result = session.read() => {
                     match message_result {
                         Ok(Some(msg)) => {
+                            idle_deadline.as_mut().reset(tokio::time::Instant::now() + PEER_IDLE_TIMEOUT);
                             match msg {
                                 Message::Peer(peer_msg) => {
                                     if let Err(e) = self.peer_data_tx.send(InboundPeerEnvelope {
@@ -149,6 +154,10 @@ impl PeerConnection {
                         }
                         Ok(None) => break,
                     }
+                }
+                () = &mut idle_deadline => {
+                    warn!(peer = %node_id, timeout_secs = PEER_IDLE_TIMEOUT.as_secs(), "peer connection idle timeout");
+                    break;
                 }
                 _ = self.shutdown_rx.changed() => {
                     if *self.shutdown_rx.borrow() {

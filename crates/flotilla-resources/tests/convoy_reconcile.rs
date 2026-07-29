@@ -156,6 +156,7 @@ async fn reconcile_landing_with_observed_change_request(
                     landed_evidence: observed_target_ref.map(|target_ref| {
                         LandedEvidence::builder().change_request_id("42".to_string()).target_ref(target_ref.to_string()).build()
                     }),
+                    change_request: None,
                 },
                 message: None,
             })

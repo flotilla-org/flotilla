@@ -169,10 +169,10 @@ where
         } else if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) {
             match deps {
                 CheckoutDeps::Integration { status } => {
-                    Some(CheckoutStatusPatch::UpdateIntegration { integration: status.as_ref().clone() })
+                    Some(CheckoutStatusPatch::UpdateIntegration { integration: Box::new(status.as_ref().clone()) })
                 }
                 CheckoutDeps::Failed(message) => Some(CheckoutStatusPatch::UpdateIntegration {
-                    integration: CheckoutIntegrationStatus {
+                    integration: Box::new(CheckoutIntegrationStatus {
                         clean: flotilla_resources::IntegrationCondition::builder()
                             .value(flotilla_resources::ConditionValue::Unknown)
                             .details(vec![message.clone()])
@@ -189,7 +189,8 @@ where
                             .observed_at(now.to_rfc3339())
                             .build(),
                         landed_evidence: None,
-                    },
+                        change_request: None,
+                    }),
                 }),
                 CheckoutDeps::None | CheckoutDeps::Ready { .. } | CheckoutDeps::Waiting => None,
             }

@@ -9,9 +9,10 @@ use flotilla_core::{
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{runtime::DaemonRuntime, server::DaemonServer};
+use crate::{resource_limits::raise_file_descriptor_limit, restart_history::DaemonLifecycle, runtime::DaemonRuntime, server::DaemonServer};
 
 pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeout_secs: u64) -> Result<(), String> {
+    let lifecycle = DaemonLifecycle::begin(state_dir)?;
     let config = Arc::new(ConfigStore::new(DaemonHostPath::new(config_dir), DaemonHostPath::new(state_dir)));
     let daemon_config = config.load_daemon_config()?;
 
@@ -35,6 +36,7 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
     let stderr_layer = std::io::stderr().is_terminal().then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     let file_layer = tracing_subscriber::fmt::layer().json().with_ansi(false).with_writer(file_appender);
     tracing_subscriber::registry().with(filter).with(stderr_layer).with(file_layer).try_init().ok();
+    raise_file_descriptor_limit();
 
     let timeout = if timeout_secs == 0 { Duration::from_secs(u64::MAX) } else { Duration::from_secs(timeout_secs) };
 
@@ -48,9 +50,12 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
     let runtime = DaemonRuntime::start(daemon, Arc::clone(&config), Some(socket_path.to_path_buf())).await?;
 
     let result = server.run().await;
-    // Every path out of `run` here is an intended stop (SIGTERM, SIGINT, idle
-    // timeout, explicit shutdown); say so, so the runtime's Drop ERROR keeps
-    // meaning "this went away when it should not have".
+    // Stop background tasks after the accept loop ends. SIGTERM, SIGINT, idle
+    // timeout, and explicit shutdown return Ok and clear the lifecycle marker;
+    // a server error deliberately leaves it behind as an abnormal exit.
     runtime.shutdown();
+    if result.is_ok() {
+        lifecycle.finish()?;
+    }
     result
 }

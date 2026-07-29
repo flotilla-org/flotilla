@@ -1612,6 +1612,30 @@ fn integration_observation_matches(left: &CheckoutIntegrationStatus, right: &Che
         .into_iter()
         .all(|(left, right)| left.value == right.value && left.details == right.details)
         && left.landed_evidence == right.landed_evidence
+        && match (&left.change_request, &right.change_request) {
+            (Some(left), Some(right)) => {
+                left.id == right.id
+                    && left.state == right.state
+                    && left.mergeability == right.mergeability
+                    && left.target_ref == right.target_ref
+            }
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+fn latch_evidence_backed_integration(existing: &CheckoutIntegrationStatus, observed: &mut CheckoutIntegrationStatus) {
+    if existing.landed.value != ConditionValue::True || existing.landed_evidence.is_none() {
+        return;
+    }
+    observed.landed.value = ConditionValue::True;
+    if observed.landed_evidence.is_none() {
+        observed.landed_evidence = existing.landed_evidence.clone();
+    }
+    if observed.change_request.is_none() {
+        observed.change_request =
+            existing.change_request.clone().filter(|change_request| change_request.state != flotilla_resources::ChangeRequestState::Open);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2262,18 +2286,11 @@ impl InProcessDaemon {
                 checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
             )
             .await;
-            if let Some(existing) = checkout
-                .status
-                .as_ref()
-                .filter(|status| status.integration.landed.value == ConditionValue::True && status.integration.landed_evidence.is_some())
-            {
-                integration.landed.value = ConditionValue::True;
-                if integration.landed_evidence.is_none() {
-                    integration.landed_evidence = existing.integration.landed_evidence.clone();
-                }
+            if let Some(existing) = checkout.status.as_ref() {
+                latch_evidence_backed_integration(&existing.integration, &mut integration);
             }
             apply_resource_status_patch(&checkouts, &checkout.metadata.name, &flotilla_resources::CheckoutStatusPatch::UpdateIntegration {
-                integration,
+                integration: Box::new(integration),
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -5937,17 +5954,20 @@ impl InProcessDaemon {
                 Ok(runner) => runner,
                 Err(_) => return Ok(false),
             };
-            let integration = inspect_checkout_integration(
+            let mut integration = inspect_checkout_integration(
                 &*runner,
                 &path,
                 &checkout.spec,
                 checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
             )
             .await;
+            if let Some(existing) = checkout.status.as_ref() {
+                latch_evidence_backed_integration(&existing.integration, &mut integration);
+            }
             if let Err(error) = apply_resource_status_patch(
                 &checkouts,
                 &checkout.metadata.name,
-                &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: integration.clone() },
+                &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration.clone()) },
             )
             .await
             {
@@ -6041,21 +6061,14 @@ impl InProcessDaemon {
                 checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
             )
             .await;
-            if let Some(existing) = checkout
-                .status
-                .as_ref()
-                .filter(|status| status.integration.landed.value == ConditionValue::True && status.integration.landed_evidence.is_some())
-            {
-                integration.landed.value = ConditionValue::True;
-                if integration.landed_evidence.is_none() {
-                    integration.landed_evidence = existing.integration.landed_evidence.clone();
-                }
+            if let Some(existing) = checkout.status.as_ref() {
+                latch_evidence_backed_integration(&existing.integration, &mut integration);
             }
             if !checkout.status.as_ref().is_some_and(|status| integration_observation_matches(&status.integration, &integration)) {
                 if let Err(error) = apply_resource_status_patch(
                     &checkouts,
                     &checkout.metadata.name,
-                    &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: integration.clone() },
+                    &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration.clone()) },
                 )
                 .await
                 {

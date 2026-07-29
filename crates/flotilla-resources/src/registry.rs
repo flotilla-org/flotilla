@@ -196,6 +196,21 @@ macro_rules! dispatch_resource_kind {
     };
 }
 
+/// Drives a typed read of every kind in the embedded durable store.
+///
+/// Embedded stores use this startup pass to isolate rows whose persisted
+/// representation no longer decodes under the running schema. Other backends
+/// cannot contain an untyped local row and need no scan.
+pub async fn quarantine_undecodable_stored_objects(backend: &ResourceBackend, namespace: &str) -> Result<(), ResourceError> {
+    if !matches!(backend, ResourceBackend::Sqlite(_)) {
+        return Ok(());
+    }
+    for registered in REGISTERED_RESOURCE_KINDS {
+        list_resource_kind(backend, namespace, registered.kind).await?;
+    }
+    Ok(())
+}
+
 pub async fn list_resource_kind(
     backend: &ResourceBackend,
     namespace: &str,
