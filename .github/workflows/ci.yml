@@ -25,7 +25,7 @@ jobs:
         with:
           toolchain: nightly-2026-03-12
           components: rustfmt
-      - name: Test target cache policies
+      - name: Test repository shell policies
         run: |
           scripts/test-prune-target.sh
           scripts/test-cargo-sweep-mtime.sh

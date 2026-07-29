@@ -44,7 +44,9 @@ their adjacent metadata files.
 
 Release publication is retry-safe. An existing release is accepted only when it
 targets the expected commit, and an existing asset is accepted only when its
-bytes are identical. Conflicting bytes are never replaced.
+bytes are identical. An interrupted draft is completed and published only after
+all expected assets have been checked or uploaded. A published release with a
+missing asset fails closed, and conflicting bytes are never replaced.
 
 Every artifact has an adjacent JSON metadata file. Schema version 2 records:
 

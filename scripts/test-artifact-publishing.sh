@@ -67,12 +67,14 @@ publish() {
 
 publish >/dev/null
 cmp -s "$artifact" "$gh_state/assets/artifact"
-grep -Fxq create:artifact "$gh_log"
+grep -Fxq create-release "$gh_log"
+grep -Fxq upload:artifact "$gh_log"
+grep -Fxq publish-draft "$gh_log"
 
 : >"$gh_log"
 publish >/dev/null
 grep -Fxq download:artifact "$gh_log"
-if grep -Fq create: "$gh_log"; then
+if grep -Fq create-release "$gh_log"; then
   echo "idempotent publication recreated an existing release" >&2
   exit 1
 fi
@@ -83,16 +85,38 @@ if publish >/dev/null 2>&1; then
   exit 1
 fi
 
+draft_state="$test_dir/draft-state"
+mkdir -p "$draft_state/assets"
+printf '%s\n' "$commit_sha" >"$draft_state/target"
+printf 'true\n' >"$draft_state/draft"
+printf 'first asset\n' >"$test_dir/first"
+printf 'second asset\n' >"$test_dir/second"
+cp "$test_dir/first" "$draft_state/assets/first"
+: >"$gh_log"
+env \
+  PATH="$stub_bin:$PATH" \
+  GH_TOKEN=secret \
+  GITHUB_REPOSITORY=flotilla-org/flotilla \
+  GITHUB_SHA="$commit_sha" \
+  FAKE_GH_STATE_DIR="$draft_state" \
+  FAKE_GH_LOG="$gh_log" \
+  "$repo_root/scripts/publish-github-release.sh" \
+  "$test_dir/first" "$test_dir/second" >/dev/null
+cmp -s "$test_dir/second" "$draft_state/assets/second"
+grep -Fxq upload:second "$gh_log"
+grep -Fxq publish-draft "$gh_log"
+grep -Fxq false "$draft_state/draft"
+
+rm "$draft_state/assets/second"
 if env \
   PATH="$stub_bin:$PATH" \
   GH_TOKEN=secret \
   GITHUB_REPOSITORY=flotilla-org/flotilla \
   GITHUB_SHA="$commit_sha" \
-  GITHUB_RELEASE_TAG=invalid-tag \
-  FAKE_GH_STATE_DIR="$gh_state" \
+  FAKE_GH_STATE_DIR="$draft_state" \
   FAKE_GH_LOG="$gh_log" \
-  "$repo_root/scripts/publish-github-release.sh" "$artifact" \
-  >/dev/null 2>&1; then
-  echo "publisher accepted an invalid release tag" >&2
+  "$repo_root/scripts/publish-github-release.sh" \
+  "$test_dir/first" "$test_dir/second" >/dev/null 2>&1; then
+  echo "publisher repaired an incomplete published release" >&2
   exit 1
 fi

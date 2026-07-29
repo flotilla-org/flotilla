@@ -82,6 +82,15 @@ No package token, private mirror, private source credential, or private registry
 configuration is required by this slice. Release publication uses the
 repository-scoped GitHub workflow token.
 
+## Retry and recovery
+
+Re-running a failed publishing job is safe. A matching draft release is resumed:
+existing assets must have identical bytes, missing assets are uploaded, and the
+draft is published only after the complete input set has been checked. A
+published release is immutable; if one is missing an expected asset or contains
+different bytes, the job stops for operator investigation instead of modifying
+it.
+
 ## Verification after a merge
 
 For a source SHA, inspect and download the release:

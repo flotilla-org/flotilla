@@ -19,13 +19,15 @@ case "$command" in
     fi
     if [[ " $* " == *" targetCommitish "* ]]; then
       cat "$FAKE_GH_STATE_DIR/target"
+    elif [[ " $* " == *" isDraft "* ]]; then
+      cat "$FAKE_GH_STATE_DIR/draft"
     elif [[ " $* " == *" assets "* ]]; then
       find "$FAKE_GH_STATE_DIR/assets" -type f -maxdepth 1 -exec basename {} \; | sort
     fi
     ;;
   create)
     target=
-    assets=()
+    is_draft=false
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --target)
@@ -38,19 +40,28 @@ case "$command" in
         --latest=false)
           shift
           ;;
+        --draft)
+          is_draft=true
+          shift
+          ;;
         *)
-          if [[ -f "$1" ]]; then
-            assets+=("$1")
-          fi
           shift
           ;;
       esac
     done
     printf '%s\n' "$target" >"$FAKE_GH_STATE_DIR/target"
-    for asset in "${assets[@]}"; do
-      cp "$asset" "$FAKE_GH_STATE_DIR/assets/$(basename "$asset")"
-      printf 'create:%s\n' "$(basename "$asset")" >>"$FAKE_GH_LOG"
-    done
+    printf '%s\n' "$is_draft" >"$FAKE_GH_STATE_DIR/draft"
+    printf 'create-release\n' >>"$FAKE_GH_LOG"
+    ;;
+  upload)
+    shift
+    asset=$1
+    cp "$asset" "$FAKE_GH_STATE_DIR/assets/$(basename "$asset")"
+    printf 'upload:%s\n' "$(basename "$asset")" >>"$FAKE_GH_LOG"
+    ;;
+  edit)
+    printf 'false\n' >"$FAKE_GH_STATE_DIR/draft"
+    printf 'publish-draft\n' >>"$FAKE_GH_LOG"
     ;;
   download)
     pattern=
