@@ -2,7 +2,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     process::ExitStatus,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -28,7 +28,7 @@ use tracing::info;
 
 /// Flotilla: TUI dashboard for managing development workspaces
 #[derive(Parser)]
-#[command(version)]
+#[command(version, long_version = binary_version())]
 struct Cli {
     /// Git repo roots (repeatable; auto-detected from cwd if omitted)
     #[arg(long)]
@@ -56,6 +56,11 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<SubCommand>,
+}
+
+fn binary_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| format!("{} (wire={})", env!("CARGO_PKG_VERSION"), flotilla_client::BUILD_ID))
 }
 
 #[derive(clap::Subcommand)]

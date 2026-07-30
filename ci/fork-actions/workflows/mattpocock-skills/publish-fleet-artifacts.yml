@@ -1,0 +1,62 @@
+name: Publish fleet artifacts
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: fleet-release-${{ forgejo.repository }}-${{ forgejo.sha }}
+  cancel-in-progress: false
+
+env:
+  FLEET_REPOSITORY: ${{ forgejo.repository }}
+  FLEET_COMMIT_SHA: ${{ forgejo.sha }}
+  FLEET_SERVER_URL: ${{ forgejo.server_url }}
+  FLEET_API_URL: ${{ forgejo.api_url }}
+
+jobs:
+  bundle:
+    name: Versioned skills bundle
+    runs-on: fleet-release-linux-x64
+    timeout-minutes: 10
+    steps:
+      - name: Verify release runner capability
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+
+      - name: Check out exact source revision
+        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ forgejo.sha }}
+
+      - name: Verify source revision
+        run: test "$(git rev-parse HEAD)" = "$FLEET_COMMIT_SHA"
+
+      - name: Archive and describe tracked source
+        run: |
+          RELEASE_TAG="fleet-$FLEET_COMMIT_SHA"
+          mkdir -p dist
+          git archive \
+            --format=tar.gz \
+            --prefix=mattpocock-skills/ \
+            --output=dist/mattpocock-skills.tar.gz \
+            "$FLEET_COMMIT_SHA"
+          ci/fork-actions/runtime/write-artifact-metadata.sh \
+            dist/mattpocock-skills.tar.gz \
+            dist/mattpocock-skills.tar.gz.json \
+            "$FLEET_REPOSITORY" "$FLEET_COMMIT_SHA" "$RELEASE_TAG" \
+            any "" false
+
+      # Publishing adapter: all Forgejo release creation and asset upload is isolated here.
+      - name: Publish Forgejo Release assets
+        env:
+          FORGEJO_TOKEN: ${{ forgejo.token }}
+        run: |
+          ci/fork-actions/runtime/publish-forgejo-release.sh \
+            --expect mattpocock-skills.tar.gz \
+            --expect mattpocock-skills.tar.gz.json \
+            -- dist/*

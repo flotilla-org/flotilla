@@ -1009,6 +1009,7 @@ dependencies = [
  "bon",
  "clap",
  "color-eyre",
+ "flotilla-client",
  "flotilla-commands",
  "flotilla-core",
  "flotilla-daemon",

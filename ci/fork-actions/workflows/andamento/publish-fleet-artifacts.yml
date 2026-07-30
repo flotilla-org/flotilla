@@ -1,0 +1,92 @@
+name: Publish fleet artifacts
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: fleet-release-${{ forgejo.repository }}-${{ forgejo.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  FLEET_REPOSITORY: ${{ forgejo.repository }}
+  FLEET_COMMIT_SHA: ${{ forgejo.sha }}
+  FLEET_SERVER_URL: ${{ forgejo.server_url }}
+  FLEET_API_URL: ${{ forgejo.api_url }}
+  ZELLIJ_REVISION: d262df58ebdea2549666a5060663d017545bb5cb
+
+jobs:
+  wasm:
+    name: WASM plugin trio
+    runs-on: fleet-release-linux-x64
+    timeout-minutes: 45
+    steps:
+      - name: Verify release runner capability
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+
+      - name: Check out exact source revision
+        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          clean: false
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ forgejo.sha }}
+
+      - name: Verify and clean source revision
+        run: |
+          test "$(git rev-parse HEAD)" = "$FLEET_COMMIT_SHA"
+          git clean -ffdx -e target/
+
+      - name: Prepare pinned Zellij dependency
+        run: |
+          git init zellij
+          git -C zellij remote add origin https://github.com/rjwittams/zellij.git
+          git -C zellij fetch --depth 1 origin "$ZELLIJ_REVISION"
+          git -C zellij checkout --detach FETCH_HEAD
+          sibling_zellij="$PWD/../zellij"
+          if test -L "$sibling_zellij"; then
+            rm "$sibling_zellij"
+          elif test -e "$sibling_zellij"; then
+            echo "refusing to replace non-symlink sibling: $sibling_zellij" >&2
+            exit 1
+          fi
+          ln -s "$PWD/zellij" "$sibling_zellij"
+
+      - name: Build release plugins
+        run: |
+          rustup target add wasm32-wasip1 --toolchain stable
+          cargo +stable build --workspace --target wasm32-wasip1 --release --locked -j1
+
+      - name: Stage and describe artifacts
+        run: |
+          RELEASE_TAG="fleet-$FLEET_COMMIT_SHA"
+          mkdir -p dist
+          for plugin in andamento-controller andamento-rail andamento-config; do
+            install -m 0644 \
+              "target/wasm32-wasip1/release/${plugin}.wasm" \
+              "dist/${plugin}-wasm32-wasip1.wasm"
+            test -s "dist/${plugin}-wasm32-wasip1.wasm"
+            ci/fork-actions/runtime/write-artifact-metadata.sh \
+              "dist/${plugin}-wasm32-wasip1.wasm" \
+              "dist/${plugin}-wasm32-wasip1.wasm.json" \
+              "$FLEET_REPOSITORY" "$FLEET_COMMIT_SHA" "$RELEASE_TAG" \
+              wasm32-wasip1 "" false
+          done
+
+      # Publishing adapter: all Forgejo release creation and asset upload is isolated here.
+      - name: Publish Forgejo Release assets
+        env:
+          FORGEJO_TOKEN: ${{ forgejo.token }}
+        run: |
+          ci/fork-actions/runtime/publish-forgejo-release.sh \
+            --expect andamento-controller-wasm32-wasip1.wasm \
+            --expect andamento-controller-wasm32-wasip1.wasm.json \
+            --expect andamento-rail-wasm32-wasip1.wasm \
+            --expect andamento-rail-wasm32-wasip1.wasm.json \
+            --expect andamento-config-wasm32-wasip1.wasm \
+            --expect andamento-config-wasm32-wasip1.wasm.json \
+            -- dist/*

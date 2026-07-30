@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${FLEET_MACOS_SDK:?FLEET_MACOS_SDK is required}"
+
+original_args=("$@")
+show_sdk_path=false
+sdk=
+passthrough=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --show-sdk-path)
+      show_sdk_path=true
+      shift
+      ;;
+    --sdk)
+      if [[ $# -lt 2 ]]; then
+        passthrough=true
+        break
+      fi
+      sdk=$2
+      shift 2
+      ;;
+    *)
+      passthrough=true
+      break
+      ;;
+  esac
+done
+
+if [[ "$passthrough" == false && "$show_sdk_path" == true && ( -z "$sdk" || "$sdk" == macosx ) ]]; then
+  test -d "$FLEET_MACOS_SDK"
+  printf '%s\n' "$FLEET_MACOS_SDK"
+  exit 0
+fi
+
+exec /usr/bin/xcrun "${original_args[@]}"
