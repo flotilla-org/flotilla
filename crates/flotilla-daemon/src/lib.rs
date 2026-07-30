@@ -1,6 +1,7 @@
 mod agent_material;
 mod aggregator;
 mod credential;
+mod environment_tools;
 mod issue_materializer;
 mod material_pool;
 mod resource_limits;

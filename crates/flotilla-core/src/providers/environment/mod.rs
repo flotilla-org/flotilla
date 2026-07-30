@@ -22,11 +22,103 @@ use super::CommandRunner;
 #[derive(Debug, Clone)]
 pub struct CreateOpts {
     pub tokens: Vec<(String, String)>,
-    pub daemon_socket_path: DaemonHostPath,
     pub working_directory: Option<ExecutionEnvironmentPath>,
     pub provisioned_mounts: Vec<ProvisionedMount>,
+    /// Tools that must be made available inside the environment.
+    ///
+    /// Providers choose how to deliver these assets. Docker currently lowers
+    /// them to bind mounts; remote sandbox providers may upload files or expose
+    /// sockets through their own transport.
+    pub tools: Vec<EnvironmentTool>,
     pub image_pull_policy: ImagePullPolicy,
     pub docker_config_dir: Option<DaemonHostPath>,
+}
+
+/// A host-side tool that an environment provider must make invokable inside a
+/// provisioned environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentTool {
+    pub name: String,
+    pub executable: ExecutionEnvironmentPath,
+    pub assets: Vec<EnvironmentToolAsset>,
+    pub environment: Vec<EnvironmentVariableUpdate>,
+}
+
+impl EnvironmentTool {
+    pub fn new(name: impl Into<String>, executable: impl Into<PathBuf>) -> Self {
+        Self { name: name.into(), executable: ExecutionEnvironmentPath::new(executable), assets: Vec::new(), environment: Vec::new() }
+    }
+
+    pub fn with_asset(mut self, asset: EnvironmentToolAsset) -> Self {
+        self.assets.push(asset);
+        self
+    }
+
+    pub fn with_environment(mut self, update: EnvironmentVariableUpdate) -> Self {
+        self.environment.push(update);
+        self
+    }
+}
+
+/// An asset needed by a tool inside an environment.
+///
+/// The source is deliberately described as a host path rather than as a bind
+/// mount. Bind mounting is one provider's delivery strategy, not the contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentToolAsset {
+    pub host_path: DaemonHostPath,
+    pub environment_path: ExecutionEnvironmentPath,
+    pub kind: EnvironmentToolAssetKind,
+    pub access: EnvironmentToolAssetAccess,
+    pub purpose: String,
+}
+
+impl EnvironmentToolAsset {
+    pub fn new(
+        host_path: impl Into<PathBuf>,
+        environment_path: impl Into<PathBuf>,
+        kind: EnvironmentToolAssetKind,
+        access: EnvironmentToolAssetAccess,
+        purpose: impl Into<String>,
+    ) -> Self {
+        Self {
+            host_path: DaemonHostPath::new(host_path),
+            environment_path: ExecutionEnvironmentPath::new(environment_path),
+            kind,
+            access,
+            purpose: purpose.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvironmentToolAssetKind {
+    File,
+    Directory,
+    UnixSocket,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvironmentToolAssetAccess {
+    ReadOnly,
+    SharedWritable,
+}
+
+/// A tool's requested mutation to the environment it runs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentVariableUpdate {
+    Set { name: String, value: String, purpose: String },
+    PrependPath { name: String, value: String },
+}
+
+impl EnvironmentVariableUpdate {
+    pub fn set(name: impl Into<String>, value: impl Into<String>, purpose: impl Into<String>) -> Self {
+        Self::Set { name: name.into(), value: value.into(), purpose: purpose.into() }
+    }
+
+    pub fn prepend_path(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::PrependPath { name: name.into(), value: value.into() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

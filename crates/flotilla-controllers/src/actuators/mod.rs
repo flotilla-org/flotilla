@@ -3,7 +3,10 @@ use std::{path::PathBuf, sync::Arc};
 use flotilla_core::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
-        environment::{CreateOpts, EnvironmentProvider, ProvisionedMount, ProvisionedMountMode},
+        environment::{
+            CreateOpts, EnvironmentProvider, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind,
+            EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode,
+        },
         terminal::TerminalPool,
         vcs::{CloneInspection, CloneProvisioner},
     },
@@ -45,11 +48,19 @@ impl DockerEnvironmentActuator {
     pub fn build_create_opts(&self, spec: &DockerEnvironmentSpec) -> CreateOpts {
         CreateOpts {
             tokens: self.tokens.clone(),
-            daemon_socket_path: self.daemon_socket_path.clone(),
             working_directory: None,
             image_pull_policy: spec.pull_policy.into(),
             docker_config_dir: None,
             provisioned_mounts: spec.mounts.iter().map(provisioned_mount).collect(),
+            tools: vec![EnvironmentTool::new("flotilla-daemon-access", "/usr/local/bin/flotilla")
+                .with_asset(EnvironmentToolAsset::new(
+                    self.daemon_socket_path.as_path().to_path_buf(),
+                    "/run/flotilla.sock",
+                    EnvironmentToolAssetKind::UnixSocket,
+                    EnvironmentToolAssetAccess::SharedWritable,
+                    "the daemon socket",
+                ))
+                .with_environment(EnvironmentVariableUpdate::set("FLOTILLA_DAEMON_SOCKET", "/run/flotilla.sock", "the daemon socket"))],
         }
     }
 }

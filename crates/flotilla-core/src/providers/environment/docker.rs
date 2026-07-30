@@ -10,13 +10,11 @@ use flotilla_protocol::{EnvironmentId, EnvironmentSpec, EnvironmentStatus, Image
 use sha2::{Digest, Sha256};
 
 use super::{
-    runner::DockerEnvironmentRunner, CreateOpts, EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount,
-    ProvisionedMountMode,
+    runner::DockerEnvironmentRunner, CreateOpts, EnvironmentHandle, EnvironmentProvider, EnvironmentToolAssetAccess,
+    EnvironmentVariableUpdate, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode,
 };
 use crate::providers::{ChannelLabel, CommandRunner};
 
-/// Fixed path inside the container where the daemon socket is mounted.
-const CONTAINER_SOCKET_PATH: &str = "/run/flotilla.sock";
 /// Bump this when the short-term Dockerfile image fingerprint inputs change.
 const DOCKERFILE_IMAGE_TAG_VERSION: &str = "v1";
 
@@ -72,23 +70,48 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
     async fn create(&self, id: EnvironmentId, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String> {
         let container_name = format!("flotilla-env-{}", id);
 
-        if opts.provisioned_mounts.iter().any(|mount| mount.environment_path.as_path() == Path::new(CONTAINER_SOCKET_PATH)) {
-            return Err(format!("mount target {CONTAINER_SOCKET_PATH} is reserved for the daemon socket"));
+        let requested_mounts = opts.provisioned_mounts;
+        let mut provisioned_mounts = Vec::new();
+        let mut tokens = opts.tokens;
+        for tool in &opts.tools {
+            for asset in &tool.assets {
+                if requested_mounts.iter().chain(&provisioned_mounts).any(|mount| mount.environment_path == asset.environment_path) {
+                    return Err(format!("mount target {} is reserved for {}", asset.environment_path, asset.purpose));
+                }
+                let mode = match asset.access {
+                    EnvironmentToolAssetAccess::ReadOnly => ProvisionedMountMode::Ro,
+                    EnvironmentToolAssetAccess::SharedWritable => ProvisionedMountMode::Rw,
+                };
+                provisioned_mounts.push(ProvisionedMount::new(
+                    asset.host_path.as_path().to_path_buf(),
+                    asset.environment_path.as_path().to_path_buf(),
+                    mode,
+                ));
+            }
+            for update in &tool.environment {
+                match update {
+                    EnvironmentVariableUpdate::Set { name, value, purpose } => {
+                        if tokens.iter().any(|(existing, _)| existing == name) {
+                            return Err(format!("environment variable {name} is reserved for {purpose}"));
+                        }
+                        tokens.push((name.clone(), value.clone()));
+                    }
+                    EnvironmentVariableUpdate::PrependPath { name, value } => {
+                        match tokens.iter_mut().find(|(existing, _)| existing == name) {
+                            Some((_, existing)) => *existing = format!("{value}:{existing}"),
+                            None => tokens.push((name.clone(), value.clone())),
+                        }
+                    }
+                }
+            }
         }
-        let mut provisioned_mounts = Vec::with_capacity(opts.provisioned_mounts.len() + 1);
-        provisioned_mounts.push(ProvisionedMount::new(
-            opts.daemon_socket_path.as_path().to_path_buf(),
-            CONTAINER_SOCKET_PATH,
-            ProvisionedMountMode::Rw,
-        ));
-        provisioned_mounts.extend(opts.provisioned_mounts);
+        provisioned_mounts.extend(requested_mounts);
         let env_id_str = id.to_string();
         let image_str = image.as_str().to_string();
         let label_val = format!("flotilla.environment={}", id);
         let mounts_label_val =
             format!("flotilla.provisioned_mounts={}", serde_json::to_string(&provisioned_mounts).map_err(|err| err.to_string())?);
         let env_id_env = format!("FLOTILLA_ENVIRONMENT_ID={}", env_id_str);
-        let socket_env = format!("FLOTILLA_DAEMON_SOCKET={CONTAINER_SOCKET_PATH}");
         #[cfg(unix)]
         let user = host_user();
 
@@ -108,8 +131,6 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             &label_val,
             "--label",
             &mounts_label_val,
-            "-e",
-            &socket_env,
             "-e",
             &env_id_env,
         ]);
@@ -132,7 +153,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         }
 
         // Token env vars
-        let token_env_strs: Vec<String> = opts.tokens.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        let token_env_strs: Vec<String> = tokens.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
         for token_env in &token_env_strs {
             args.push("-e");
             args.push(token_env);

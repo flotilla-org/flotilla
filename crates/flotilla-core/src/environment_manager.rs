@@ -17,7 +17,10 @@ use crate::{
             detectors::default_host_detectors, run_host_detectors, run_provisioned_host_detectors, DiscoveryRuntime, EnvironmentBag,
             FactoryRegistry,
         },
-        environment::{CreateOpts, EnvironmentHandle, ProvisionedMount, ProvisionedMountMode},
+        environment::{
+            CreateOpts, EnvironmentHandle, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind,
+            EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode,
+        },
         registry::ProviderRegistry,
         CommandRunner,
     },
@@ -272,9 +275,17 @@ impl EnvironmentManager {
             .unwrap_or_default();
         let opts = CreateOpts {
             tokens,
-            daemon_socket_path: daemon_socket_path.clone(),
             working_directory: None,
             provisioned_mounts,
+            tools: vec![EnvironmentTool::new("flotilla-daemon-access", "/usr/local/bin/flotilla")
+                .with_asset(EnvironmentToolAsset::new(
+                    daemon_socket_path.as_path().to_path_buf(),
+                    "/run/flotilla.sock",
+                    EnvironmentToolAssetKind::UnixSocket,
+                    EnvironmentToolAssetAccess::SharedWritable,
+                    "the daemon socket",
+                ))
+                .with_environment(EnvironmentVariableUpdate::set("FLOTILLA_DAEMON_SOCKET", "/run/flotilla.sock", "the daemon socket"))],
             image_pull_policy: Default::default(),
             docker_config_dir: None,
         };
