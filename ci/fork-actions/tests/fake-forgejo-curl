@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${FAKE_FORGEJO_STATE_DIR:?FAKE_FORGEJO_STATE_DIR is required}"
+: "${FAKE_FORGEJO_LOG:?FAKE_FORGEJO_LOG is required}"
+
+method=GET
+output=/dev/stdout
+write_out=
+data_file=
+form_file=
+url=
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --silent | --show-error | --location)
+      shift
+      ;;
+    --config | --header)
+      shift 2
+      ;;
+    --request)
+      method=$2
+      shift 2
+      ;;
+    --output)
+      output=$2
+      shift 2
+      ;;
+    --write-out)
+      write_out=$2
+      shift 2
+      ;;
+    --data-binary)
+      data_file=${2#@}
+      shift 2
+      ;;
+    --form)
+      form_file=${2#attachment=@}
+      form_file=${form_file%%;filename=*}
+      shift 2
+      ;;
+    http://* | https://*)
+      url=$1
+      shift
+      ;;
+    *)
+      echo "unsupported fake curl argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$url" ]]; then
+  echo "fake curl did not receive a URL" >&2
+  exit 2
+fi
+
+mkdir -p "$FAKE_FORGEJO_STATE_DIR/assets"
+
+respond() {
+  local response_status=$1
+  local response_source=$2
+  if [[ "$response_source" == - ]]; then
+    : >"$output"
+  else
+    cp "$response_source" "$output"
+  fi
+  if [[ -n "$write_out" ]]; then
+    printf '%s' "$response_status"
+  fi
+}
+
+make_release_response() {
+  local destination=$1
+  jq -n \
+    --argjson id 1 \
+    --arg target_commitish "$(cat "$FAKE_FORGEJO_STATE_DIR/target")" \
+    --argjson draft "$(cat "$FAKE_FORGEJO_STATE_DIR/draft")" \
+    '{
+      id: $id,
+      tag_name: ("fleet-" + $target_commitish),
+      target_commitish: $target_commitish,
+      draft: $draft
+    }' >"$destination"
+}
+
+make_assets_response() {
+  local destination=$1
+  local first=true
+  printf '[' >"$destination"
+  for asset in "$FAKE_FORGEJO_STATE_DIR"/assets/*; do
+    [[ -f "$asset" ]] || continue
+    if [[ "$first" == false ]]; then
+      printf ',' >>"$destination"
+    fi
+    first=false
+    jq -n \
+      --arg name "$(basename "$asset")" \
+      --arg browser_download_url "https://download.invalid/assets/$(basename "$asset")" \
+      --argjson size "$(wc -c <"$asset" | tr -d '[:space:]')" \
+      '{
+        id: 1,
+        name: $name,
+        browser_download_url: $browser_download_url,
+        size: $size,
+        type: "attachment"
+      }' >>"$destination"
+  done
+  printf ']\n' >>"$destination"
+}
+
+response_file=$(mktemp)
+trap 'rm -f "$response_file"' EXIT
+
+case "$method $url" in
+  "GET https://download.invalid/assets/"*)
+    asset_name=${url##*/}
+    printf 'download:%s\n' "$asset_name" >>"$FAKE_FORGEJO_LOG"
+    if [[ -f "$FAKE_FORGEJO_STATE_DIR/assets/$asset_name" ]]; then
+      respond 200 "$FAKE_FORGEJO_STATE_DIR/assets/$asset_name"
+    else
+      respond 404 -
+    fi
+    ;;
+  "GET "*"releases/tags/fleet-"*)
+    printf 'get-release\n' >>"$FAKE_FORGEJO_LOG"
+    if [[ -f "$FAKE_FORGEJO_STATE_DIR/target" ]]; then
+      make_release_response "$response_file"
+      respond 200 "$response_file"
+    else
+      respond 404 -
+    fi
+    ;;
+  "POST "*"releases")
+    printf 'create-release\n' >>"$FAKE_FORGEJO_LOG"
+    if [[ -f "$FAKE_FORGEJO_STATE_DIR/target" ]]; then
+      respond 409 -
+    else
+      jq -er '.target_commitish' "$data_file" >"$FAKE_FORGEJO_STATE_DIR/target"
+      printf 'true\n' >"$FAKE_FORGEJO_STATE_DIR/draft"
+      make_release_response "$response_file"
+      respond 201 "$response_file"
+    fi
+    ;;
+  "GET "*"releases/1/assets")
+    printf 'list-assets\n' >>"$FAKE_FORGEJO_LOG"
+    make_assets_response "$response_file"
+    respond 200 "$response_file"
+    ;;
+  "POST "*"releases/1/assets?name="*)
+    asset_name=${url##*?name=}
+    printf 'upload:%s\n' "$asset_name" >>"$FAKE_FORGEJO_LOG"
+    if [[ -f "$FAKE_FORGEJO_STATE_DIR/assets/$asset_name" ]]; then
+      respond 409 -
+    else
+      cp "$form_file" "$FAKE_FORGEJO_STATE_DIR/assets/$asset_name"
+      jq -n \
+        --arg name "$asset_name" \
+        --arg browser_download_url "https://download.invalid/assets/$asset_name" \
+        '{id: 1, name: $name, browser_download_url: $browser_download_url, type: "attachment"}' \
+        >"$response_file"
+      respond 201 "$response_file"
+    fi
+    ;;
+  "PATCH "*"releases/1")
+    printf 'publish-draft\n' >>"$FAKE_FORGEJO_LOG"
+    printf 'false\n' >"$FAKE_FORGEJO_STATE_DIR/draft"
+    make_release_response "$response_file"
+    respond 200 "$response_file"
+    ;;
+  *)
+    echo "unsupported fake Forgejo request: $method $url" >&2
+    exit 2
+    ;;
+esac

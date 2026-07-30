@@ -5,23 +5,22 @@ on:
     branches:
       - main
 
-permissions:
-  contents: read
-
 concurrency:
-  group: fleet-release-${{ github.repository }}-${{ github.sha }}-darwin
+  group: fleet-release-${{ forgejo.repository }}-${{ forgejo.sha }}-darwin
   cancel-in-progress: false
 
 env:
   CARGO_INCREMENTAL: "0"
+  FLEET_REPOSITORY: ${{ forgejo.repository }}
+  FLEET_COMMIT_SHA: ${{ forgejo.sha }}
+  FLEET_SERVER_URL: ${{ forgejo.server_url }}
+  FLEET_API_URL: ${{ forgejo.api_url }}
 
 jobs:
   darwin:
     name: Darwin arm64
-    runs-on: [self-hosted, macOS, ARM64, fleet-release-signing]
+    runs-on: fleet-release-darwin-arm64-signing
     timeout-minutes: 30
-    permissions:
-      contents: write
     steps:
       - name: Verify release runner capability
         run: |
@@ -35,60 +34,58 @@ jobs:
           codesign --verify --strict "$signing_probe"
 
       - name: Check out exact source revision
-        env:
-          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          clean: false
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ forgejo.sha }}
+
+      - name: Verify and clean source revision
         run: |
-          git init .
-          if git remote get-url origin >/dev/null 2>&1; then
-            git remote set-url origin "$SOURCE_URL"
-          else
-            git remote add origin "$SOURCE_URL"
-          fi
-          git fetch --force --no-tags --depth=1 origin "$GITHUB_SHA"
-          git checkout --force --detach FETCH_HEAD
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$FLEET_COMMIT_SHA"
           git clean -ffdx -e target/
 
       - name: Build debug-profile binaries
         run: |
-          FLOTILLA_BUILD_ID=$(git rev-parse --short=12 "$GITHUB_SHA")
+          FLOTILLA_BUILD_ID=$(git rev-parse --short=12 "$FLEET_COMMIT_SHA")
           export FLOTILLA_BUILD_ID
           cargo +stable build --locked --bin flotilla --bin flotillad
 
       - name: Test, sign, and describe artifacts
         run: |
           : "${FLEET_CODESIGN_IDENTITY:?runner environment must provide FLEET_CODESIGN_IDENTITY}"
-          RELEASE_TAG="fleet-$GITHUB_SHA"
-          WIRE_GENERATION=$(git rev-parse --short=12 "$GITHUB_SHA")
+          RELEASE_TAG="fleet-$FLEET_COMMIT_SHA"
+          WIRE_GENERATION=$(git rev-parse --short=12 "$FLEET_COMMIT_SHA")
           mkdir -p dist
           install -m 0755 target/debug/flotilla dist/flotilla-darwin-arm64
           install -m 0755 target/debug/flotillad dist/flotillad-darwin-arm64
           for artifact in dist/flotilla-darwin-arm64 dist/flotillad-darwin-arm64; do
             codesign --force --options runtime \
-              --entitlements packaging/macos-cli.entitlements \
+              --entitlements ci/fork-actions/runtime/macos-cli.entitlements \
               --sign "$FLEET_CODESIGN_IDENTITY" \
               "$artifact"
             codesign --verify --strict --verbose=2 "$artifact"
           done
           dist/flotilla-darwin-arm64 --version | grep -F "wire=${WIRE_GENERATION}"
           dist/flotillad-darwin-arm64 --version | grep -F "wire=${WIRE_GENERATION}"
-          scripts/write-artifact-metadata.sh \
+          ci/fork-actions/runtime/write-artifact-metadata.sh \
             dist/flotilla-darwin-arm64 \
             dist/flotilla-darwin-arm64.json \
-            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$RELEASE_TAG" \
+            "$FLEET_REPOSITORY" "$FLEET_COMMIT_SHA" "$RELEASE_TAG" \
             darwin-arm64 "$WIRE_GENERATION" true
-          scripts/write-artifact-metadata.sh \
+          ci/fork-actions/runtime/write-artifact-metadata.sh \
             dist/flotillad-darwin-arm64 \
             dist/flotillad-darwin-arm64.json \
-            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$RELEASE_TAG" \
+            "$FLEET_REPOSITORY" "$FLEET_COMMIT_SHA" "$RELEASE_TAG" \
             darwin-arm64 "$WIRE_GENERATION" true
 
-      # Publishing adapter: a Forgejo fork replaces only this step.
-      - name: Publish GitHub Release assets
+      # Publishing adapter: all Forgejo release creation and asset upload is isolated here.
+      - name: Publish Forgejo Release assets
         env:
-          GH_TOKEN: ${{ github.token }}
+          FORGEJO_TOKEN: ${{ forgejo.token }}
         run: |
-          scripts/publish-github-release.sh \
+          ci/fork-actions/runtime/publish-forgejo-release.sh \
             --expect flotilla-linux-x86_64 \
             --expect flotilla-linux-x86_64.json \
             --expect flotillad-linux-x86_64 \

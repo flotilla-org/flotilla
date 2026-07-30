@@ -5,23 +5,22 @@ on:
     branches:
       - main
 
-permissions:
-  contents: read
-
 concurrency:
-  group: fleet-release-${{ github.repository }}-${{ github.sha }}-linux
+  group: fleet-release-${{ forgejo.repository }}-${{ forgejo.sha }}-linux
   cancel-in-progress: false
 
 env:
   CARGO_INCREMENTAL: "0"
+  FLEET_REPOSITORY: ${{ forgejo.repository }}
+  FLEET_COMMIT_SHA: ${{ forgejo.sha }}
+  FLEET_SERVER_URL: ${{ forgejo.server_url }}
+  FLEET_API_URL: ${{ forgejo.api_url }}
 
 jobs:
   linux:
     name: Linux x86_64
-    runs-on: [self-hosted, Linux, X64, fleet-release]
+    runs-on: fleet-release-linux-x64
     timeout-minutes: 30
-    permissions:
-      contents: write
     steps:
       - name: Verify release runner capability
         run: |
@@ -29,52 +28,50 @@ jobs:
           test "$(uname -m)" = x86_64
 
       - name: Check out exact source revision
-        env:
-          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          clean: false
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ forgejo.sha }}
+
+      - name: Verify and clean source revision
         run: |
-          git init .
-          if git remote get-url origin >/dev/null 2>&1; then
-            git remote set-url origin "$SOURCE_URL"
-          else
-            git remote add origin "$SOURCE_URL"
-          fi
-          git fetch --force --no-tags --depth=1 origin "$GITHUB_SHA"
-          git checkout --force --detach FETCH_HEAD
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$FLEET_COMMIT_SHA"
           git clean -ffdx -e target/
 
       - name: Build debug-profile binaries
         run: |
-          FLOTILLA_BUILD_ID=$(git rev-parse --short=12 "$GITHUB_SHA")
+          FLOTILLA_BUILD_ID=$(git rev-parse --short=12 "$FLEET_COMMIT_SHA")
           export FLOTILLA_BUILD_ID
           cargo +stable build --locked --bin flotilla --bin flotillad
 
       - name: Test and describe artifacts
         run: |
-          RELEASE_TAG="fleet-$GITHUB_SHA"
-          WIRE_GENERATION=$(git rev-parse --short=12 "$GITHUB_SHA")
+          RELEASE_TAG="fleet-$FLEET_COMMIT_SHA"
+          WIRE_GENERATION=$(git rev-parse --short=12 "$FLEET_COMMIT_SHA")
           mkdir -p dist
           install -m 0755 target/debug/flotilla dist/flotilla-linux-x86_64
           install -m 0755 target/debug/flotillad dist/flotillad-linux-x86_64
           dist/flotilla-linux-x86_64 --version | grep -F "wire=${WIRE_GENERATION}"
           dist/flotillad-linux-x86_64 --version | grep -F "wire=${WIRE_GENERATION}"
-          scripts/write-artifact-metadata.sh \
+          ci/fork-actions/runtime/write-artifact-metadata.sh \
             dist/flotilla-linux-x86_64 \
             dist/flotilla-linux-x86_64.json \
-            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$RELEASE_TAG" \
+            "$FLEET_REPOSITORY" "$FLEET_COMMIT_SHA" "$RELEASE_TAG" \
             linux-x86_64 "$WIRE_GENERATION" false
-          scripts/write-artifact-metadata.sh \
+          ci/fork-actions/runtime/write-artifact-metadata.sh \
             dist/flotillad-linux-x86_64 \
             dist/flotillad-linux-x86_64.json \
-            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$RELEASE_TAG" \
+            "$FLEET_REPOSITORY" "$FLEET_COMMIT_SHA" "$RELEASE_TAG" \
             linux-x86_64 "$WIRE_GENERATION" false
 
-      # Publishing adapter: a Forgejo fork replaces only this step.
-      - name: Publish GitHub Release assets
+      # Publishing adapter: all Forgejo release creation and asset upload is isolated here.
+      - name: Publish Forgejo Release assets
         env:
-          GH_TOKEN: ${{ github.token }}
+          FORGEJO_TOKEN: ${{ forgejo.token }}
         run: |
-          scripts/publish-github-release.sh \
+          ci/fork-actions/runtime/publish-forgejo-release.sh \
             --expect flotilla-linux-x86_64 \
             --expect flotilla-linux-x86_64.json \
             --expect flotillad-linux-x86_64 \

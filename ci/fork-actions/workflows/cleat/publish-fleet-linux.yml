@@ -1,0 +1,76 @@
+name: Publish fleet artifacts (Linux)
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: fleet-release-${{ forgejo.repository }}-${{ forgejo.sha }}-linux
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  FLEET_REPOSITORY: ${{ forgejo.repository }}
+  FLEET_COMMIT_SHA: ${{ forgejo.sha }}
+  FLEET_SERVER_URL: ${{ forgejo.server_url }}
+  FLEET_API_URL: ${{ forgejo.api_url }}
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: fleet-release-linux-x64
+    timeout-minutes: 30
+    steps:
+      - name: Verify release runner capability
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          test "$(zig version)" = 0.15.2
+
+      - name: Check out exact source revision
+        uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          clean: false
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ forgejo.sha }}
+
+      - name: Verify and clean source revision
+        run: |
+          test "$(git rev-parse HEAD)" = "$FLEET_COMMIT_SHA"
+          git clean -ffdx -e target/ -e .tools/
+
+      - name: Prepare Ghostty VT
+        run: ci/fork-actions/runtime/cleat/prepare-ghostty-vt.sh
+
+      - name: Build functional release binary
+        run: cargo +stable build -p cleat --locked --features ghostty-vt --release
+
+      - name: Test and describe artifact
+        run: |
+          RELEASE_TAG="fleet-$FLEET_COMMIT_SHA"
+          mkdir -p dist
+          install -m 0755 target/release/cleat dist/cleat-linux-x86_64
+          dist/cleat-linux-x86_64 launch --help | grep -q -- --tag
+          if ldd dist/cleat-linux-x86_64 | grep -q ghostty-vt; then
+            echo "cleat must be self-contained; found a dynamic ghostty-vt dependency" >&2
+            exit 1
+          fi
+          ci/fork-actions/runtime/write-artifact-metadata.sh \
+            dist/cleat-linux-x86_64 \
+            dist/cleat-linux-x86_64.json \
+            "$FLEET_REPOSITORY" "$FLEET_COMMIT_SHA" "$RELEASE_TAG" \
+            linux-x86_64 "" false
+
+      # Publishing adapter: all Forgejo release creation and asset upload is isolated here.
+      - name: Publish Forgejo Release assets
+        env:
+          FORGEJO_TOKEN: ${{ forgejo.token }}
+        run: |
+          ci/fork-actions/runtime/publish-forgejo-release.sh \
+            --expect cleat-linux-x86_64 \
+            --expect cleat-linux-x86_64.json \
+            --expect cleat-darwin-arm64 \
+            --expect cleat-darwin-arm64.json \
+            -- dist/*
