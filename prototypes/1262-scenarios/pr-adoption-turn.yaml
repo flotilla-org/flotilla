@@ -1,0 +1,41 @@
+# Candidate WorkflowTemplate extension for the PR-first adoption turn from
+# flotilla-org/flotilla#1071. This is reaction data for #1269, not a document
+# accepted by today's schema.
+apiVersion: flotilla.work/v1
+kind: WorkflowTemplate
+metadata:
+  name: pr-adoption-turn
+  namespace: flotilla
+spec:
+  vessels:
+    - name: work
+      stance: trusted
+      credential_refs:
+        - forge
+      crew:
+        - role: shepherd
+          selector:
+            capability: code
+          brief_template: shepherd
+
+  # PR adoption remains a Convoy admission operation: it writes the explicit
+  # change-request binding and provisions or adopts the PR branch. The workflow
+  # reacts to the ordinary declared Active phase edge, guarded by that binding;
+  # it does not require an imperative "adopted" event.
+  engagement_rules:
+    - name: first-shepherd-round
+      when:
+        transition: convoy.entered-active
+        guards:
+          - fact: convoy.change-request
+            operator: present
+      engage:
+        vessel: work
+        role: shepherd
+        brief_template: shepherd
+      expecting:
+        fact: crew-work.phase
+        subject:
+          vessel: work
+          role: shepherd
+        equals: Done
