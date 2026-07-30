@@ -2811,13 +2811,18 @@ mod tests {
         PlacementDecision, PlacementTargetHost, ResourceRef,
     };
     use flotilla_resources::{
-        api_version, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+        api_version,
+        test_support::{
+            run_transition_sequence, FixpointPredicate, LivenessEnrollment, LivenessScenario, LivenessStep, ReconcileStep, Transition,
+            TransitionDriver, TransitionSequence, WorldBuilder,
+        },
+        Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
         CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer,
         CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
         CrewSource, CrewSpec, LifecycleAuthority, MaterialPoolSpec, MaterialPoolUnitSpec,
         ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec, Resource, Selector, SqliteBackend,
-        TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, VesselStatus, WorkPhase, WorkflowTemplate,
-        WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION,
+        TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, VesselStatus, VirtualClock, WorkPhase,
+        WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
@@ -5045,64 +5050,168 @@ mod tests {
         daemon_with_backend(tracked_repos, config, backend).await
     }
 
+    struct LeaseRecoveryWorld {
+        _temp: TempDir,
+        config: Arc<ConfigStore>,
+        daemon: Arc<InProcessDaemon>,
+        backend: ResourceBackend,
+        pools: MaterialPoolManager,
+        second_holder: ResourceRef,
+        runtime: Option<DaemonRuntime>,
+        pending_finalization: bool,
+        second_outcome: Option<MaterialLeaseOutcome>,
+    }
+
+    struct LeaseRecoveryWorldBuilder;
+
+    #[async_trait]
+    impl WorldBuilder for LeaseRecoveryWorldBuilder {
+        type World = LeaseRecoveryWorld;
+
+        async fn build(&self, _scenario: LivenessScenario) -> Result<Self::World, String> {
+            let temp = TempDir::new().map_err(|error| error.to_string())?;
+            let config = Arc::new(ConfigStore::with_base(temp.path()));
+            let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+            let backend = daemon.resource_backend();
+            backend
+                .clone()
+                .using::<Environment>(NAMESPACE)
+                .create(
+                    &InputMeta::builder()
+                        .name("deleting-environment".to_string())
+                        .finalizers(vec!["flotilla.work/test-environment-finalizer".to_string()])
+                        .build(),
+                    &EnvironmentSpec {
+                        host_direct: Some(HostDirectEnvironmentSpec {
+                            host_ref: "host-test".to_string(),
+                            repo_default_dir: "/tmp/worktrees".to_string(),
+                        }),
+                        docker: None,
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+
+            let pools = MaterialPoolManager::new(backend.clone(), NAMESPACE);
+            pools
+                .reconcile_pool("codex-login", &MaterialPoolSpec {
+                    units: BTreeMap::from([("unit-0".to_string(), MaterialPoolUnitSpec {
+                        directory: "/var/lib/flotilla/material/unit-0".to_string(),
+                    })]),
+                })
+                .await?;
+            let deleting_holder =
+                ResourceRef::new(api_version(Environment::API_PATHS), Environment::API_PATHS.kind, NAMESPACE, "deleting-environment");
+            pools.acquire("codex-login", &deleting_holder).await?;
+            let second_holder =
+                ResourceRef::new(api_version(Environment::API_PATHS), Environment::API_PATHS.kind, NAMESPACE, "second-environment");
+
+            Ok(LeaseRecoveryWorld {
+                _temp: temp,
+                config,
+                daemon,
+                backend,
+                pools,
+                second_holder,
+                runtime: None,
+                pending_finalization: false,
+                second_outcome: None,
+            })
+        }
+    }
+
+    struct LeaseRecoveryStep;
+
+    #[async_trait]
+    impl ReconcileStep<LeaseRecoveryWorld> for LeaseRecoveryStep {
+        type Patch = ();
+        type Actuation = ();
+
+        async fn reconcile_step(&self, world: &mut LeaseRecoveryWorld) -> Result<LivenessStep<Self::Patch, Self::Actuation>, String> {
+            world.second_outcome = Some(world.pools.acquire("codex-login", &world.second_holder).await?);
+            Ok(LivenessStep::new(None, Vec::new()))
+        }
+
+        async fn apply_patch(&self, _world: &mut LeaseRecoveryWorld, _patch: Self::Patch) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn apply_actuation(&self, _world: &mut LeaseRecoveryWorld, _actuation: Self::Actuation) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl TransitionDriver<LeaseRecoveryWorld> for LeaseRecoveryStep {
+        type Field = ();
+        type Value = ();
+        type OriginRoot = String;
+
+        async fn external_spec_write(
+            &self,
+            _world: &mut LeaseRecoveryWorld,
+            _field: &Self::Field,
+            _value: &Self::Value,
+        ) -> Result<(), String> {
+            Err("external spec writes are not part of the lease recovery property".to_string())
+        }
+
+        async fn delete(&self, world: &mut LeaseRecoveryWorld) -> Result<(), String> {
+            let environments = world.backend.clone().using::<Environment>(NAMESPACE);
+            environments.delete("deleting-environment").await.map_err(|error| error.to_string())?;
+            world.pending_finalization =
+                environments.get("deleting-environment").await.map_err(|error| error.to_string())?.metadata.deletion_timestamp.is_some();
+            Ok(())
+        }
+
+        async fn restart_controller(&self, world: &mut LeaseRecoveryWorld) -> Result<(), String> {
+            let runtime = DaemonRuntime::start_with_options(Arc::clone(&world.daemon), Arc::clone(&world.config), None, RuntimeOptions {
+                heartbeat_interval: Duration::from_secs(300),
+                controller_resync_interval: Duration::from_secs(300),
+                start_controllers: false,
+                ..RuntimeOptions::default()
+            })
+            .await?;
+            world.runtime = Some(runtime);
+            Ok(())
+        }
+
+        async fn partition_store(&self, _world: &mut LeaseRecoveryWorld, _origin_root: &Self::OriginRoot) -> Result<(), String> {
+            Err("store partition is not part of the lease recovery property".to_string())
+        }
+    }
+
+    struct LeaseRecoveryFixpoint;
+
+    impl FixpointPredicate<LeaseRecoveryWorld> for LeaseRecoveryFixpoint {
+        fn at_fixpoint(&self, _world: &LeaseRecoveryWorld) -> bool {
+            false
+        }
+    }
+
+    /// Regression property from the #1242 review: deletion only timestamps a
+    /// holder while its finalizer is pending, so restart recovery must retain
+    /// its lease and refuse a second holder.
     #[tokio::test]
     async fn startup_recovery_retains_material_lease_for_environment_pending_finalization() {
-        let temp = TempDir::new().expect("tempdir");
-        let config = Arc::new(ConfigStore::with_base(temp.path()));
-        let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
-        let backend = daemon.resource_backend();
-        let environments = backend.clone().using::<Environment>(NAMESPACE);
-        environments
-            .create(
-                &InputMeta::builder()
-                    .name("deleting-environment".to_string())
-                    .finalizers(vec!["flotilla.work/test-environment-finalizer".to_string()])
-                    .build(),
-                &EnvironmentSpec {
-                    host_direct: Some(HostDirectEnvironmentSpec {
-                        host_ref: "host-test".to_string(),
-                        repo_default_dir: "/tmp/worktrees".to_string(),
-                    }),
-                    docker: None,
-                },
-            )
+        let clock = Arc::new(VirtualClock::new(Utc::now()));
+        let enrollment = LivenessEnrollment::new(LeaseRecoveryWorldBuilder, LeaseRecoveryStep, LeaseRecoveryFixpoint, clock);
+        let sequence: TransitionSequence<LeaseRecoveryWorld, (), (), String> =
+            TransitionSequence::new([Transition::Delete, Transition::RestartController, Transition::Reconcile])
+                .sometimes("holder reached pending finalization before restart", |world: &LeaseRecoveryWorld| world.pending_finalization)
+                .sometimes("second holder was refused after restart", |world: &LeaseRecoveryWorld| {
+                    world.runtime.is_some() && matches!(world.second_outcome, Some(MaterialLeaseOutcome::Waiting { unit_count: 1 }))
+                });
+
+        let mut world = run_transition_sequence(&enrollment, LivenessScenario::Normal, &sequence)
             .await
-            .expect("create environment with pending finalizer");
-        environments.delete("deleting-environment").await.expect("mark environment for deletion");
-        let deleting = environments.get("deleting-environment").await.expect("pending finalizer should retain environment");
-        assert!(deleting.metadata.deletion_timestamp.is_some(), "environment should be pending finalization");
-
-        let pools = MaterialPoolManager::new(backend, NAMESPACE);
-        pools
-            .reconcile_pool("codex-login", &MaterialPoolSpec {
-                units: BTreeMap::from([("unit-0".to_string(), MaterialPoolUnitSpec {
-                    directory: "/var/lib/flotilla/material/unit-0".to_string(),
-                })]),
-            })
-            .await
-            .expect("create material pool");
-        let deleting_holder =
-            ResourceRef::new(api_version(Environment::API_PATHS), Environment::API_PATHS.kind, NAMESPACE, "deleting-environment");
-        pools.acquire("codex-login", &deleting_holder).await.expect("lease material to deleting environment");
-
-        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
-            heartbeat_interval: Duration::from_secs(300),
-            controller_resync_interval: Duration::from_secs(300),
-            start_controllers: false,
-            ..RuntimeOptions::default()
-        })
-        .await
-        .expect("daemon should start");
-
-        let second_holder =
-            ResourceRef::new(api_version(Environment::API_PATHS), Environment::API_PATHS.kind, NAMESPACE, "second-environment");
+            .expect("deleting-holder lease recovery sequence");
         assert_eq!(
-            pools.acquire("codex-login", &second_holder).await.expect("second holder should wait"),
-            MaterialLeaseOutcome::Waiting { unit_count: 1 },
+            world.second_outcome,
+            Some(MaterialLeaseOutcome::Waiting { unit_count: 1 }),
             "startup recovery must retain leases until an environment's finalizer removes it from the store"
         );
-
-        runtime.shutdown();
+        world.runtime.take().expect("sequence restarted daemon runtime").shutdown();
     }
 
     fn insert_undecodable_resource<T: Resource>(connection: &rusqlite::Connection, name: &str) {

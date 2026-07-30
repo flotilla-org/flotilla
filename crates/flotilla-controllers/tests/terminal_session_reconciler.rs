@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use async_trait::async_trait;
@@ -8,9 +11,13 @@ use chrono::Utc;
 use flotilla_controllers::reconcilers::{TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
 use flotilla_resources::{
     controller::{Actuation, Reconciler},
-    EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta, ResourceBackend, StatusPatch,
-    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSessionPhase, TerminalSessionSpec, CONVOY_LABEL,
-    VESSEL_REF_LABEL,
+    test_support::{
+        run_transition_sequence, FixpointPredicate, LivenessEnrollment, LivenessScenario, LivenessStep, ReconcileStep, Transition,
+        TransitionDriver, TransitionSequence, WorldBuilder,
+    },
+    EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta, ResourceBackend, ResourceError,
+    ResourceObject, StatusPatch, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSpec, TerminalSessionStatusPatch, VirtualClock, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 
 mod common;
@@ -80,47 +87,205 @@ impl TerminalRuntime for FailingTerminalRuntime {
     }
 }
 
-#[tokio::test]
-async fn orphaned_convoy_session_is_deleted_without_relaunching() {
-    let backend = ResourceBackend::InMemory(Default::default());
-    let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &InputMeta::builder()
-                .name("terminal-deleted-convoy-work-coder".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "deleted-convoy".to_string())]))
-                .build(),
-            &TerminalSessionSpec {
-                env_ref: "host-direct-feta".to_string(),
-                role: "coder".to_string(),
-                source: flotilla_resources::TerminalSessionSource::Agent {
-                    selector: flotilla_resources::Selector { capability: "coding".to_string() },
-                    brief: flotilla_resources::TerminalBrief {
-                        path: ".flotilla/briefs/coder.md".to_string(),
-                        content: "brief".to_string(),
-                        copies: Vec::new(),
+const GHOST_SESSION_NAME: &str = "terminal-deleted-convoy-work-coder";
+
+struct GhostRecoveryWorld {
+    backend: ResourceBackend,
+    stale_session: ResourceObject<TerminalSession>,
+    runtime: Arc<GhostRecoveryRuntime>,
+    reconciler: TerminalSessionReconciler<GhostRecoveryRuntime>,
+    durable_record_deleted: bool,
+    ownerless_recovery_rejected: bool,
+}
+
+struct GhostRecoveryWorldBuilder;
+
+#[async_trait]
+impl WorldBuilder for GhostRecoveryWorldBuilder {
+    type World = GhostRecoveryWorld;
+
+    async fn build(&self, _scenario: LivenessScenario) -> Result<Self::World, String> {
+        let backend = ResourceBackend::InMemory(Default::default());
+        let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
+        let env = environments
+            .create(&meta("host-direct-feta"), &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "feta".to_string(), repo_default_dir: "/worktrees".to_string() }),
+                docker: None,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut env_status = EnvironmentStatus::default();
+        EnvironmentStatusPatch::MarkReady { docker_container_id: None, image_ref: None, image_digest: None }.apply(&mut env_status);
+        environments
+            .update_status("host-direct-feta", &env.metadata.resource_version, &env_status)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let stale_session = backend
+            .clone()
+            .using::<TerminalSession>("flotilla")
+            .create(
+                &InputMeta::builder()
+                    .name(GHOST_SESSION_NAME.to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "deleted-convoy".to_string())]))
+                    .build(),
+                &TerminalSessionSpec {
+                    env_ref: "host-direct-feta".to_string(),
+                    role: "coder".to_string(),
+                    source: flotilla_resources::TerminalSessionSource::Agent {
+                        selector: flotilla_resources::Selector { capability: "coding".to_string() },
+                        brief: flotilla_resources::TerminalBrief {
+                            path: ".flotilla/briefs/coder.md".to_string(),
+                            content: "brief".to_string(),
+                            copies: Vec::new(),
+                        },
+                        context: flotilla_resources::TerminalCrewContext {
+                            namespace: "flotilla".to_string(),
+                            convoy: "deleted-convoy".to_string(),
+                            vessel_ref: "deleted-convoy-work".to_string(),
+                        },
+                        message: None,
                     },
-                    context: flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".to_string(),
-                        convoy: "deleted-convoy".to_string(),
-                        vessel_ref: "deleted-convoy-work".to_string(),
-                    },
-                    message: None,
+                    cwd: "/workspace".to_string(),
+                    pool: "cleat".to_string(),
                 },
-                cwd: "/workspace".to_string(),
-                pool: "cleat".to_string(),
-            },
-        )
-        .await
-        .expect("session create should succeed");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(MissingTerminalRuntime), backend, "flotilla");
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let runtime = Arc::new(GhostRecoveryRuntime::default());
+        let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla");
+        Ok(GhostRecoveryWorld {
+            backend,
+            stale_session,
+            runtime,
+            reconciler,
+            durable_record_deleted: false,
+            ownerless_recovery_rejected: false,
+        })
+    }
+}
 
-    let deps = reconciler.fetch_dependencies(&session).await.expect("orphan dependencies should load");
-    let outcome = reconciler.reconcile(&session, &deps, Utc::now());
+#[derive(Default)]
+struct GhostRecoveryRuntime {
+    ensure_calls: AtomicUsize,
+}
 
+#[async_trait]
+impl TerminalRuntime for GhostRecoveryRuntime {
+    async fn ensure_session(
+        &self,
+        name: &str,
+        _spec: &TerminalSessionSpec,
+        _tags: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
+        self.ensure_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(TerminalRuntimeState {
+            session_id: name.to_string(),
+            pid: None,
+            started_at: Utc::now(),
+            crew: None,
+            launch_command: "codex".to_string(),
+            delivered_message_id: None,
+        })
+    }
+
+    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct GhostRecoveryStep;
+
+#[async_trait]
+impl ReconcileStep<GhostRecoveryWorld> for GhostRecoveryStep {
+    type Patch = TerminalSessionStatusPatch;
+    type Actuation = Actuation;
+
+    async fn reconcile_step(&self, world: &mut GhostRecoveryWorld) -> Result<LivenessStep<Self::Patch, Self::Actuation>, String> {
+        let deps = world.reconciler.fetch_dependencies(&world.stale_session).await.map_err(|error| error.to_string())?;
+        let outcome = world.reconciler.reconcile(&world.stale_session, &deps, Utc::now());
+        world.ownerless_recovery_rejected = outcome.patch.is_none()
+            && matches!(
+                outcome.actuations.as_slice(),
+                [Actuation::DeleteTerminalSession { name }] if name == GHOST_SESSION_NAME
+            );
+        Ok(LivenessStep::new(outcome.patch, outcome.actuations))
+    }
+
+    async fn apply_patch(&self, world: &mut GhostRecoveryWorld, patch: Self::Patch) -> Result<(), String> {
+        flotilla_resources::apply_status_patch(&world.backend.clone().using::<TerminalSession>("flotilla"), GHOST_SESSION_NAME, &patch)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn apply_actuation(&self, world: &mut GhostRecoveryWorld, actuation: Self::Actuation) -> Result<(), String> {
+        match actuation {
+            Actuation::DeleteTerminalSession { name } => {
+                match world.backend.clone().using::<TerminalSession>("flotilla").delete(&name).await {
+                    Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            other => Err(format!("ghost recovery unexpectedly emitted {other:?}")),
+        }
+    }
+}
+
+#[async_trait]
+impl TransitionDriver<GhostRecoveryWorld> for GhostRecoveryStep {
+    type Field = ();
+    type Value = ();
+    type OriginRoot = String;
+
+    async fn external_spec_write(&self, _world: &mut GhostRecoveryWorld, _field: &Self::Field, _value: &Self::Value) -> Result<(), String> {
+        Err("external spec writes are not part of the ghost recovery property".to_string())
+    }
+
+    async fn delete(&self, world: &mut GhostRecoveryWorld) -> Result<(), String> {
+        let sessions = world.backend.clone().using::<TerminalSession>("flotilla");
+        sessions.delete(GHOST_SESSION_NAME).await.map_err(|error| error.to_string())?;
+        world.durable_record_deleted = matches!(sessions.get(GHOST_SESSION_NAME).await, Err(ResourceError::NotFound { .. }));
+        Ok(())
+    }
+
+    async fn restart_controller(&self, world: &mut GhostRecoveryWorld) -> Result<(), String> {
+        world.reconciler = TerminalSessionReconciler::new(Arc::clone(&world.runtime), world.backend.clone(), "flotilla");
+        Ok(())
+    }
+
+    async fn partition_store(&self, _world: &mut GhostRecoveryWorld, _origin_root: &Self::OriginRoot) -> Result<(), String> {
+        Err("store partition is not part of the ghost recovery property".to_string())
+    }
+}
+
+struct GhostRecoveryFixpoint;
+
+impl FixpointPredicate<GhostRecoveryWorld> for GhostRecoveryFixpoint {
+    fn at_fixpoint(&self, _world: &GhostRecoveryWorld) -> bool {
+        false
+    }
+}
+
+/// Regression property for #1202: a stale TerminalSession snapshot surviving
+/// teardown and controller restart must not recreate the external session once
+/// its owning convoy and durable record are gone.
+#[tokio::test]
+async fn deleted_terminal_session_is_not_resurrected_from_stale_state_after_restart() {
+    let clock = Arc::new(VirtualClock::new(Utc::now()));
+    let enrollment = LivenessEnrollment::new(GhostRecoveryWorldBuilder, GhostRecoveryStep, GhostRecoveryFixpoint, clock);
+    let sequence: TransitionSequence<GhostRecoveryWorld, (), (), String> =
+        TransitionSequence::new([Transition::Delete, Transition::RestartController, Transition::Reconcile, Transition::DeliverActuation])
+            .sometimes("terminal record was absent before recovery", |world: &GhostRecoveryWorld| world.durable_record_deleted)
+            .sometimes("ownerless stale recovery was rejected", |world: &GhostRecoveryWorld| world.ownerless_recovery_rejected);
+
+    let world =
+        run_transition_sequence(&enrollment, LivenessScenario::Normal, &sequence).await.expect("terminal-session ghost recovery sequence");
+
+    assert_eq!(world.runtime.ensure_calls.load(Ordering::SeqCst), 0, "recovery resurrected an ownerless external terminal session");
     assert!(matches!(
-        outcome.actuations.as_slice(),
-        [Actuation::DeleteTerminalSession { name }] if name == "terminal-deleted-convoy-work-coder"
+        world.backend.clone().using::<TerminalSession>("flotilla").get(GHOST_SESSION_NAME).await,
+        Err(ResourceError::NotFound { .. })
     ));
 }
 
