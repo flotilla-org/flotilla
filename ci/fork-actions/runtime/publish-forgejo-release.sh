@@ -81,11 +81,11 @@ for asset in "${publish_assets[@]}"; do
 done
 
 work_dir=$(mktemp -d)
+trap 'rm -rf "$work_dir"' EXIT
 auth_config="$work_dir/curl-auth"
 chmod 700 "$work_dir"
 printf 'header = "Authorization: token %s"\n' "$FORGEJO_TOKEN" >"$auth_config"
 chmod 600 "$auth_config"
-trap 'rm -rf "$work_dir"' EXIT
 
 api_url=${FLEET_API_URL%/}
 if [[ "$api_url" =~ ^(https://[^/]+) ]]; then
