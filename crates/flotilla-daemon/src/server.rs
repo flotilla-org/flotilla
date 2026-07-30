@@ -12,7 +12,7 @@ pub mod test_support;
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -40,7 +40,7 @@ use self::{
     remote_commands::{ForwardedCommandMap, PendingRemoteCancelMap, PendingRemoteCommandMap, RemoteCommandRouter},
     shared::{sync_peer_query_state, SocketPeerSender},
 };
-use crate::peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, SshTransport};
+use crate::peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, SshTransport, SshTransportPaths};
 
 const CONNECTION_PREFACE_TIMEOUT: Duration = Duration::from_secs(10);
 const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -114,7 +114,11 @@ fn build_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc
     )
 }
 
-fn build_peer_manager(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Result<Arc<Mutex<PeerManager>>, String> {
+fn build_peer_manager(
+    daemon: &Arc<InProcessDaemon>,
+    config: &ConfigStore,
+    local_daemon_socket_path: &Path,
+) -> Result<Arc<Mutex<PeerManager>>, String> {
     let host_name = daemon.host_name().clone();
     let local_node_id = daemon.node_id().clone();
     let hosts_config = config.load_hosts()?;
@@ -131,7 +135,7 @@ fn build_peer_manager(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Re
             host_config,
             expected_node_id.clone(),
             daemon.session_id(),
-            config.state_dir().as_path(),
+            SshTransportPaths { state_dir: config.state_dir().as_path(), daemon_socket: local_daemon_socket_path },
         ) {
             Ok(transport) => {
                 peer_manager.add_configured_target(ConfigLabel(name), expected_host_name, expected_node_id, Box::new(transport));
@@ -161,7 +165,8 @@ async fn build_embedded_resource_backend(config: &ConfigStore) -> Result<Resourc
 }
 
 pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &ConfigStore) -> Result<tokio::task::JoinHandle<()>, String> {
-    let peer_manager = build_peer_manager(&daemon, config)?;
+    let local_daemon_socket_path = config.base_path().join("flotilla.sock");
+    let peer_manager = build_peer_manager(&daemon, config, local_daemon_socket_path.as_path())?;
     {
         let daemon = Arc::clone(&daemon);
         let peer_manager = Arc::clone(&peer_manager);
@@ -254,7 +259,7 @@ impl DaemonServer {
         let daemon =
             InProcessDaemon::new_with_resource_backend(repo_paths, Arc::clone(&config), discovery, host_name.clone(), resource_backend)
                 .await;
-        let peer_manager = build_peer_manager(&daemon, &config)?;
+        let peer_manager = build_peer_manager(&daemon, &config, &socket_path)?;
         sync_peer_query_state(&peer_manager, &daemon).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (peer_data_tx, peer_data_rx) = mpsc::channel(256);

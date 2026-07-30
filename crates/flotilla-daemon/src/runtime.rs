@@ -32,15 +32,16 @@ use flotilla_core::{
         ChannelLabel, CommandRunner,
     },
 };
-use flotilla_protocol::{EnvironmentId, HostSummary, ImageId, Rows, TerminalStatus};
+use flotilla_protocol::{EnvironmentId, HostSummary, ImageId, NodeId, Rows, TerminalStatus};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance,
     CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy, ConvoyReconciler, ConvoyTeardownRuntime, CrewSource, CrewSpec,
     Demand, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, EnvironmentWaitReason, ForgeIdentity,
     Host, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
-    InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, Repository, ResourceBackend, ResourceError,
-    ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
+    InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicationClass, Repository, ResourceBackend,
+    ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate,
+    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
+    MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -1186,6 +1187,9 @@ async fn apply_host_heartbeat_with_credentials(
     if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
         conditions.push(condition);
     }
+    if let Some(condition) = resource_replication_content_condition(daemon, namespace).await? {
+        conditions.push(condition);
+    }
     let status = HostStatus {
         capabilities: host_capabilities(&summary, profile, &held_credentials),
         agent_adapter_baseline: Some(adapter_assessment.baseline),
@@ -1202,6 +1206,52 @@ async fn apply_host_heartbeat_with_credentials(
     hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|err| err.to_string())?;
     daemon.refresh_connected_peer_host_heartbeats().await;
     Ok(())
+}
+
+async fn resource_replication_content_condition(daemon: &Arc<InProcessDaemon>, namespace: &str) -> Result<Option<HostCondition>, String> {
+    let connected_peers = daemon.connected_peer_node_ids().await;
+    if connected_peers.is_empty() {
+        return Ok(None);
+    }
+
+    let backend = daemon.resource_backend();
+    let mut peers_without_cursors = Vec::new();
+    for peer in connected_peers {
+        let mut cursor_count = 0;
+        for kind in REGISTERED_RESOURCE_KINDS {
+            if kind.replication_class == ReplicationClass::None {
+                continue;
+            }
+            if flotilla_resources::replica_cursor_for_resource_kind(&backend, namespace, kind.kind, &peer)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                cursor_count += 1;
+            }
+        }
+        if cursor_count == 0 {
+            peers_without_cursors.push(peer);
+        }
+    }
+    if peers_without_cursors.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        HostCondition::builder()
+            .condition_type("ResourceReplication")
+            .value(ConditionValue::False)
+            .reason("ReplicaCursorsMissing")
+            .message(format!(
+                "connected peer{} {} {} zero replica cursors; resource replication has not bootstrapped",
+                if peers_without_cursors.len() == 1 { "" } else { "s" },
+                peers_without_cursors.iter().map(NodeId::as_str).collect::<Vec<_>>().join(", "),
+                if peers_without_cursors.len() == 1 { "has" } else { "have" },
+            ))
+            .observed_at(Utc::now())
+            .build(),
+    ))
 }
 
 fn resource_decode_quarantine_condition(diagnostics: Option<&flotilla_resources::ResourceStoreDiagnostics>) -> Option<HostCondition> {
@@ -2718,8 +2768,8 @@ mod tests {
         },
     };
     use flotilla_protocol::{
-        Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource, PlacementDecision,
-        PlacementTargetHost, ResourceRef,
+        Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource, NodeInfo, PeerConnectionState,
+        PlacementDecision, PlacementTargetHost, ResourceRef,
     };
     use flotilla_resources::{
         api_version, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
@@ -2759,6 +2809,73 @@ mod tests {
         }
 
         assert_eq!(adjacent_flotilla_binary(&daemon_binary).expect("adjacent flotilla binary"), DaemonHostPath::new(flotilla_binary),);
+    }
+
+    #[tokio::test]
+    async fn connected_peer_with_replicable_resources_and_zero_cursors_is_degraded() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("feta")));
+        let feta = in_memory_daemon(Vec::new(), config).await;
+        let kiwi_node = NodeId::new("kiwi-root");
+        let kiwi = NodeInfo::new(kiwi_node.clone(), "kiwi");
+        feta.set_configured_peers(vec![kiwi.clone()]).await;
+        feta.publish_peer_summary(
+            HostSummary::builder()
+                .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("kiwi-host")))
+                .host_name(flotilla_protocol::HostName::new("kiwi"))
+                .node(kiwi.clone())
+                .system(flotilla_protocol::SystemInfo::default())
+                .providers(Vec::new())
+                .build(),
+        )
+        .await;
+        feta.publish_peer_connection_status(&kiwi, PeerConnectionState::Connected).await;
+
+        let kiwi_store = ResourceBackend::InMemory(Default::default());
+        let kiwi_hosts = kiwi_store.using::<Host>(NAMESPACE);
+        kiwi_hosts
+            .create(&empty_meta("kiwi-host"), &HostSpec { display_name: "kiwi".to_string() })
+            .await
+            .expect("kiwi holds a replicable Host");
+
+        let degraded = resource_replication_content_condition(&feta, NAMESPACE)
+            .await
+            .expect("diagnose empty follower replica store")
+            .expect("zero cursors must be degraded");
+        assert_eq!(degraded.condition_type, "ResourceReplication");
+        assert_eq!(degraded.reason, "ReplicaCursorsMissing");
+        assert!(degraded.message.contains("zero replica cursors"));
+
+        let feta_host_id = feta.local_host_id().expect("feta Host identity").to_string();
+        let profile = manual_profile(&feta_host_id, false);
+        ensure_host_exists(&feta.resource_backend(), NAMESPACE, &feta_host_id, "feta").await.expect("register feta Host");
+        apply_host_heartbeat(&feta, NAMESPACE, &profile, &test_health_identity()).await.expect("publish degraded heartbeat");
+        let fleet = feta.fleet_health_internal().await.expect("feta fleet health");
+        let feta_row = fleet.hosts.iter().find(|host| host.is_local).expect("local feta fleet row");
+        assert!(
+            feta_row.degraded_conditions.iter().any(|condition| condition.contains("zero replica cursors")),
+            "fleet diagnosis must expose the empty replica store: {:?}",
+            feta_row.degraded_conditions
+        );
+
+        feta.resource_backend()
+            .replica_writer::<Host>(kiwi_node, NAMESPACE)
+            .replace(&kiwi_hosts.list().await.expect("list kiwi Hosts"), Utc::now())
+            .await
+            .expect("bootstrap one replica cursor");
+
+        assert!(
+            resource_replication_content_condition(&feta, NAMESPACE).await.expect("diagnose bootstrapped follower").is_none(),
+            "the zero-cursor diagnosis must clear once resource replication bootstraps"
+        );
+        apply_host_heartbeat(&feta, NAMESPACE, &profile, &test_health_identity()).await.expect("publish healthy heartbeat");
+        let fleet = feta.fleet_health_internal().await.expect("healthy feta fleet");
+        let feta_row = fleet.hosts.iter().find(|host| host.is_local).expect("local feta fleet row");
+        assert!(
+            feta_row.degraded_conditions.iter().all(|condition| !condition.contains("replica cursors")),
+            "fleet diagnosis must clear after bootstrap: {:?}",
+            feta_row.degraded_conditions
+        );
     }
 
     #[cfg(unix)]
@@ -4149,6 +4266,24 @@ mod tests {
         fs::create_dir_all(&feta_profile.repo_default_dir).expect("feta repo root");
         register_startup_resources(&kiwi, NAMESPACE, &kiwi_profile).await.expect("register kiwi resources");
         register_startup_resources(&feta, NAMESPACE, &feta_profile).await.expect("register feta resources");
+        assert!(
+            feta.resource_backend()
+                .replica_writer::<Convoy>(kiwi.node_id().clone(), NAMESPACE)
+                .cursor()
+                .await
+                .expect("read initial Convoy replica cursor")
+                .is_none(),
+            "the placement host must begin with an empty replica store"
+        );
+        assert!(
+            feta.resource_backend()
+                .replica_writer::<Vessel>(kiwi.node_id().clone(), NAMESPACE)
+                .cursor()
+                .await
+                .expect("read initial Vessel replica cursor")
+                .is_none(),
+            "the placement host must begin with an empty replica store"
+        );
 
         let kiwi_state = Arc::new(ControllerRuntimeState::new(
             Arc::clone(&kiwi),

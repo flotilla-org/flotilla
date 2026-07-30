@@ -2374,6 +2374,14 @@ impl InProcessDaemon {
         self.host_registry.peer_connection_status(node_id).await
     }
 
+    pub async fn connected_peer_node_ids(&self) -> Vec<NodeId> {
+        let mut peers =
+            self.host_registry.connected_peer_summaries().await.into_iter().map(|summary| summary.node.node_id).collect::<Vec<_>>();
+        peers.sort();
+        peers.dedup();
+        peers
+    }
+
     pub async fn set_configured_peers(&self, peers: Vec<NodeInfo>) {
         let remote_counts = self.remote_host_counts().await;
         self.host_registry
