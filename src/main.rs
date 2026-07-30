@@ -1496,10 +1496,7 @@ async fn run_hook(cli: &Cli, harness: &str, event_type: &str) -> Result<()> {
 
     // 6. Send to daemon via socket. The daemon owns agent state as a single
     // actor — no file-level races between concurrent hook processes.
-    // Priority: FLOTILLA_DAEMON_SOCKET env > --socket CLI flag > global default.
-    let socket_path = std::env::var("FLOTILLA_DAEMON_SOCKET").map(std::path::PathBuf::from).unwrap_or_else(|_| cli.socket_path());
-
-    send_hook_event(&socket_path, event).await
+    send_hook_event(&cli.socket_path(), event).await
 }
 
 /// One-shot client: connect to daemon, send an AgentHook request, read one response, exit.

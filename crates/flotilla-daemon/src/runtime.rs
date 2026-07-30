@@ -45,7 +45,10 @@ use flotilla_resources::{
     MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS,
 };
 use serde_json::json;
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, OnceCell},
+    task::JoinHandle,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -622,7 +625,7 @@ struct ControllerRuntimeState {
     host_direct_environment_name: String,
     flotilla_binary_path: Result<DaemonHostPath, String>,
     cleat_binary_path: Result<DaemonHostPath, String>,
-    cleat_ghostty_library_path: Option<DaemonHostPath>,
+    cleat_ghostty_library_path: OnceCell<DaemonHostPath>,
     credential_store: Option<Arc<CredentialStore>>,
     agent_material: Option<Arc<AgentMaterialRegistry>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
@@ -672,7 +675,7 @@ impl ControllerRuntimeState {
             host_direct_environment_name,
             flotilla_binary_path: running_daemon_flotilla_binary(),
             cleat_binary_path,
-            cleat_ghostty_library_path: None,
+            cleat_ghostty_library_path: OnceCell::new(),
             credential_store: None,
             agent_material: None,
             provisioned_environments: Mutex::new(HashMap::new()),
@@ -704,7 +707,7 @@ impl ControllerRuntimeState {
 
     #[cfg(test)]
     fn with_cleat_ghostty_library_path(mut self, cleat_ghostty_library_path: DaemonHostPath) -> Self {
-        self.cleat_ghostty_library_path = Some(cleat_ghostty_library_path);
+        self.cleat_ghostty_library_path = OnceCell::new_with(Some(cleat_ghostty_library_path));
         self
     }
 }
@@ -740,6 +743,8 @@ fn build_local_profile(daemon: &Arc<InProcessDaemon>, local_registry: &ProviderR
 
     let host_direct_pool = local_registry.terminal_pools.preferred_name().unwrap_or("passthrough").to_string();
     let docker_pool = "cleat".to_string();
+    let docker_available =
+        local_registry.environment_providers.contains_key("docker") && local_registry.terminal_pools.contains_key(&docker_pool);
     let available_agent_adapters = local_registry.agent_adapters.ids().map(ToString::to_string).collect();
 
     Ok(LocalProvisioningProfile {
@@ -750,7 +755,7 @@ fn build_local_profile(daemon: &Arc<InProcessDaemon>, local_registry: &ProviderR
         docker_pool,
         available_pools,
         available_agent_adapters,
-        docker_available: local_registry.environment_providers.contains_key("docker"),
+        docker_available,
     })
 }
 
@@ -1833,44 +1838,48 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             CONTAINER_FLOTILLA_PATH,
             ProvisionedMountMode::Ro,
         ));
-        if let Ok(cleat_binary_path) = &self.state.cleat_binary_path {
-            let cleat_ghostty_library_path = match &self.state.cleat_ghostty_library_path {
-                Some(path) => path.clone(),
-                None => {
-                    let runner = self
-                        .state
-                        .daemon
-                        .local_command_runner()
-                        .ok_or_else(|| "local command runner unavailable for cleat asset discovery".to_string())?;
-                    resolve_cleat_ghostty_library(&*runner, cleat_binary_path)
-                        .await
-                        .map_err(|error| format!("cleat unavailable for docker environment provisioning: {error}"))?
-                }
-            };
-            let cleat_state = self.state.config.state_dir().join(format!("contained-cleat/{name}"));
-            tokio::fs::create_dir_all(cleat_state.as_path())
-                .await
-                .map_err(|error| format!("create durable cleat state directory {}: {error}", cleat_state.as_path().display()))?;
-            provisioned_mounts.push(ProvisionedMount::new(
-                cleat_binary_path.as_path().to_path_buf(),
-                CONTAINER_CLEAT_PATH,
-                ProvisionedMountMode::Ro,
-            ));
-            provisioned_mounts.push(ProvisionedMount::new(
-                cleat_ghostty_library_path.as_path().to_path_buf(),
-                CONTAINER_CLEAT_GHOSTTY_LIBRARY_PATH,
-                ProvisionedMountMode::Ro,
-            ));
-            provisioned_mounts.push(ProvisionedMount::new(
-                cleat_state.as_path().to_path_buf(),
-                CONTAINER_CLEAT_RUNTIME_DIR,
-                ProvisionedMountMode::Rw,
-            ));
-            environment_variables.push((CLEAT_RUNTIME_DIR_ENV.to_string(), CONTAINER_CLEAT_RUNTIME_DIR.to_string()));
-            match environment_variables.iter_mut().find(|(name, _)| name == "LD_LIBRARY_PATH") {
-                Some((_, value)) => *value = format!("{CONTAINER_CLEAT_LIBRARY_DIR}:{value}"),
-                None => environment_variables.push(("LD_LIBRARY_PATH".to_string(), CONTAINER_CLEAT_LIBRARY_DIR.to_string())),
-            }
+        let cleat_binary_path = self
+            .state
+            .cleat_binary_path
+            .as_ref()
+            .map_err(|error| format!("cleat unavailable for docker environment provisioning: {error}"))?;
+        let cleat_ghostty_library_path = self
+            .state
+            .cleat_ghostty_library_path
+            .get_or_try_init(|| async {
+                let runner = self
+                    .state
+                    .daemon
+                    .local_command_runner()
+                    .ok_or_else(|| "local command runner unavailable for cleat asset discovery".to_string())?;
+                resolve_cleat_ghostty_library(&*runner, cleat_binary_path)
+                    .await
+                    .map_err(|error| format!("cleat unavailable for docker environment provisioning: {error}"))
+            })
+            .await?;
+        let cleat_state = self.state.config.state_dir().join(format!("contained-cleat/{name}"));
+        tokio::fs::create_dir_all(cleat_state.as_path())
+            .await
+            .map_err(|error| format!("create durable cleat state directory {}: {error}", cleat_state.as_path().display()))?;
+        provisioned_mounts.push(ProvisionedMount::new(
+            cleat_binary_path.as_path().to_path_buf(),
+            CONTAINER_CLEAT_PATH,
+            ProvisionedMountMode::Ro,
+        ));
+        provisioned_mounts.push(ProvisionedMount::new(
+            cleat_ghostty_library_path.as_path().to_path_buf(),
+            CONTAINER_CLEAT_GHOSTTY_LIBRARY_PATH,
+            ProvisionedMountMode::Ro,
+        ));
+        provisioned_mounts.push(ProvisionedMount::new(
+            cleat_state.as_path().to_path_buf(),
+            CONTAINER_CLEAT_RUNTIME_DIR,
+            ProvisionedMountMode::Rw,
+        ));
+        environment_variables.push((CLEAT_RUNTIME_DIR_ENV.to_string(), CONTAINER_CLEAT_RUNTIME_DIR.to_string()));
+        match environment_variables.iter_mut().find(|(name, _)| name == "LD_LIBRARY_PATH") {
+            Some((_, value)) => *value = format!("{CONTAINER_CLEAT_LIBRARY_DIR}:{value}"),
+            None => environment_variables.push(("LD_LIBRARY_PATH".to_string(), CONTAINER_CLEAT_LIBRARY_DIR.to_string())),
         }
         provisioned_mounts.extend(spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount));
         for delivery in &material_deliveries {
@@ -2963,6 +2972,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_profile_does_not_advertise_docker_without_interior_cleat() {
+        use flotilla_core::providers::discovery::{ProviderCategory, ProviderDescriptor};
+
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        let daemon = InProcessDaemon::new(Vec::new(), config, discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let mut registry = ProviderRegistry::new();
+        registry.environment_providers.insert(
+            "docker",
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
+            Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None) }),
+        );
+        registry.terminal_pools.insert(
+            "passthrough",
+            ProviderDescriptor::named(ProviderCategory::TerminalPool, "passthrough"),
+            Arc::new(flotilla_core::providers::terminal::passthrough::PassthroughTerminalPool),
+        );
+
+        let profile = build_local_profile(&daemon, &registry).expect("local profile");
+
+        assert_eq!(profile.docker_pool, "cleat");
+        assert!(!profile.docker_available, "a host must not advertise contained placement until it can deliver interior cleat");
+    }
+
+    #[tokio::test]
     async fn connected_peer_with_replicable_resources_and_zero_cursors_is_degraded() {
         let temp = TempDir::new().expect("tempdir");
         let config = Arc::new(ConfigStore::with_base(temp.path().join("feta")));
@@ -3447,6 +3482,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn docker_provisioning_fails_loudly_without_interior_cleat_assets() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"missing-cleat-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None) });
+        let mut local_registry = ProviderRegistry::new();
+        local_registry.environment_providers.insert(
+            "docker",
+            flotilla_core::providers::discovery::ProviderDescriptor::named(
+                flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+                "docker",
+            ),
+            Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
+        );
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                daemon,
+                config,
+                Arc::new(local_registry),
+                Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+                "host-test".to_string(),
+                None,
+                "host-direct-host-test".to_string(),
+            )
+            .with_flotilla_binary_path(DaemonHostPath::new("/opt/flotilla/bin/flotilla")),
+        );
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host-test".to_string(),
+            image: "contained-image".to_string(),
+            declared_agent_adapters: BTreeSet::new(),
+            required_agent_adapters: BTreeSet::new(),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: BTreeMap::new(),
+        };
+
+        let error = DockerControllerRuntime { state }
+            .provision("contained-work", &spec)
+            .await
+            .expect_err("provisioning without cleat must fail before creating a container");
+
+        assert_eq!(
+            error.to_string(),
+            "cleat unavailable for docker environment provisioning: cleat binary unavailable for contained environment injection"
+        );
+        assert!(provider.create_opts.lock().await.is_none(), "the incomplete container must not be created");
+    }
+
+    #[tokio::test]
     async fn codex_adapter_delivers_leased_material_as_a_writable_codex_home() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3497,6 +3585,8 @@ mod tests {
                 "host-direct-host-test".to_string(),
             )
             .with_flotilla_binary_path(DaemonHostPath::new("/opt/flotilla/bin/flotilla"))
+            .with_cleat_binary_path(DaemonHostPath::new("/opt/flotilla/bin/cleat"))
+            .with_cleat_ghostty_library_path(DaemonHostPath::new("/opt/flotilla/lib/libghostty-vt.so.0"))
             .with_credential_store(credential_store)
             .with_agent_material(agent_material),
         );
@@ -3518,7 +3608,11 @@ mod tests {
         assert_eq!(error.to_string(), "stop after capturing create options");
         let opts = provider.create_opts.lock().await.take().expect("captured create options");
         assert!(opts.provisioned_mounts.contains(&ProvisionedMount::new(slot, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw,)));
-        assert_eq!(opts.tokens, vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())]);
+        assert_eq!(opts.tokens, vec![
+            ("CLEAT_RUNTIME_DIR".to_string(), CONTAINER_CLEAT_RUNTIME_DIR.to_string()),
+            ("LD_LIBRARY_PATH".to_string(), CONTAINER_CLEAT_LIBRARY_DIR.to_string()),
+            ("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string()),
+        ]);
 
         let mut preconfigured = spec;
         preconfigured.env.insert("CODEX_HOME".to_string(), "/image/codex".to_string());
@@ -3527,7 +3621,11 @@ mod tests {
             .await
             .expect_err("capture provider should stop provision");
         let opts = provider.create_opts.lock().await.take().expect("captured preconfigured create options");
-        assert_eq!(opts.tokens, vec![("CODEX_HOME".to_string(), "/image/codex".to_string())]);
+        assert_eq!(opts.tokens, vec![
+            ("CODEX_HOME".to_string(), "/image/codex".to_string()),
+            ("CLEAT_RUNTIME_DIR".to_string(), CONTAINER_CLEAT_RUNTIME_DIR.to_string()),
+            ("LD_LIBRARY_PATH".to_string(), CONTAINER_CLEAT_LIBRARY_DIR.to_string()),
+        ]);
         assert!(
             opts.provisioned_mounts.iter().all(|mount| mount.environment_path.as_path() != Path::new(CONTAINER_CODEX_HOME)),
             "a placement-provided CODEX_HOME must not be overwritten with a leased slot"
@@ -4480,7 +4578,9 @@ mod tests {
                 None,
                 feta_profile.host_direct_environment_name(),
             )
-            .with_flotilla_binary_path(DaemonHostPath::new("/usr/local/bin/flotilla")),
+            .with_flotilla_binary_path(DaemonHostPath::new("/usr/local/bin/flotilla"))
+            .with_cleat_binary_path(DaemonHostPath::new("/usr/local/bin/cleat"))
+            .with_cleat_ghostty_library_path(DaemonHostPath::new("/usr/local/lib/libghostty-vt.so.0")),
         );
         let mut controller_handles = spawn_controller_loops(
             kiwi_state,
@@ -4807,7 +4907,9 @@ mod tests {
                 None,
                 "host-direct-host-test".to_string(),
             )
-            .with_flotilla_binary_path(DaemonHostPath::new("/usr/local/bin/flotilla")),
+            .with_flotilla_binary_path(DaemonHostPath::new("/usr/local/bin/flotilla"))
+            .with_cleat_binary_path(DaemonHostPath::new("/usr/local/bin/cleat"))
+            .with_cleat_ghostty_library_path(DaemonHostPath::new("/usr/local/lib/libghostty-vt.so.0")),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
             host_ref: "host-test".to_string(),
