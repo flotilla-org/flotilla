@@ -22,23 +22,36 @@ names are not yet decided.
 
 ## What the model cannot express yet
 
-1. **An engagement round has no runtime shape.** No resource or status records
-   its identity, target, attempt, admitted brief, report, or result. A rule
-   cannot distinguish "this round completed" from the existing
-   `CrewWorkPhase::Done`, which contributes to completing a vessel and moving a
-   convoy to `Landing`. Re-engaging a warm, completed crew needs an inner-round
-   contract that does not accidentally claim an outer lifecycle edge.
+1. **Outcome-carrying engagement completion has no runtime shape yet.**
+   `builtin-implement-review.yaml` adopts the refined candidate contract:
+   completion is `Done` plus a typed outcome, and pure interpreters derive
+   transitions such as `review.requested-changes` and `review.approved` from
+   that stored fact. No resource or status yet records the engagement identity,
+   attempt, admitted brief, typed outcome schema, report, or result. The
+   producer authority and validation rules for each outcome kind also remain
+   undefined.
 
-2. **Agent-directed handoff has no declaration or typed outcome.** Today's
-   `implement-review` coder chooses when to run `flotilla crew reviewer
+   This exposes a sharper lifecycle gap. Today's bare
+   `CrewWorkPhase::Done` unconditionally contributes to completing the vessel
+   and moving the convoy to `Landing`. In the refined model,
+   Done-with-requested-changes completes the review engagement but is not a
+   settlement claim: the workflow remains active and re-engages the coder.
+   Only Done-with-approved admits the existing `Work → Complete` and
+   `Convoy → Landing` progression. The roll-up must therefore consume the
+   pinned rule's accepted verdict, associate it with the current engagement
+   attempt, and supersede it safely when a rule re-arms.
+
+2. **Agent-directed early handoff still has no declaration.** The typed
+   implementation/review outcomes now express the full normal loop: ready for
+   review, requested changes, revised implementation, re-review, and approval.
+   Today's `implement-review` coder chooses when to run `flotilla crew reviewer
    handoff`, may overlap implementation and review, and supplies a free-form
    message. The `diff-review` brief can hand findings back and re-review. The
    ruled model reserves adaptive engagements that write workflow data, but it
    does not define the declaration an agent writes for "engage reviewer now
-   with this result," nor how a typed review outcome requests the next coder or
-   reviewer round. `builtin-implement-review.yaml` can express the deterministic
-   serial path; it cannot preserve today's discretionary timing and payload
-   exactly without that missing shape.
+   with this partial result." The file preserves the workflow's full settled
+   behavior, but cannot preserve today's optional early/overlapping timing and
+   free-form payload exactly without that declaration shape.
 
 3. **Wake admission, coalescing, and re-arming are unspecified.**
    `rebase-on-conflict.yaml` states the desired cause and outcome but cannot
@@ -100,12 +113,15 @@ These are deliberate translations, not missing expressive power:
    `shepherd` on `engage`, allowing later engagements of one role to use a
    different brief without cloning the role.
 
-3. **The normal implement-review sequence is declared rather than prompted.**
-   Today the coder learns about the latent reviewer from generated brief text
-   and invokes a handoff command. The ruled normal path makes coder completion
-   engage the reviewer with `diff-review`. This removes lifecycle sequencing
-   from prose. Preserving the optional early/overlapping handoff is the true
-   gap described above, not a reason to keep the normal path implicit.
+3. **The full implement-review loop is declared rather than prompted.** Today
+   the coder learns about the latent reviewer from generated brief text and
+   agents drive the loop with handoff commands. The ruled path stores typed
+   Done-with-verdict outcomes: ready-for-review engages the reviewer,
+   requested-changes re-arms review and engages the coder, and approved settles
+   the loop into the declared work-completion and convoy-Landing progression.
+   This removes lifecycle sequencing and settlement from prose. Preserving the
+   optional early/overlapping handoff is the true gap described above, not a
+   reason to keep the normal loop implicit.
 
 4. **Follow-up shepherding becomes event-driven.** Today
    `single-agent-shepherd` runs one eager round, then a human or governor

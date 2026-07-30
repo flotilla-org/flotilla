@@ -32,36 +32,61 @@ spec:
         role: coder
         brief_template: crew
       expecting:
-        fact: crew-work.phase
-        subject:
-          vessel: work
-          role: coder
-        equals: Done
+        completion:
+          phase: Done
+          outcome:
+            kind: implementation
+            verdict: ready-for-review
 
-    # This is the ruled model's deterministic normal path: completed
-    # implementation engages the latent reviewer. Today's coder may instead
-    # choose an earlier, overlapping handoff with a free-form message; GAPS.md
-    # records the missing declaration/outcome shape needed to preserve that
-    # choice exactly.
-    - name: review-completed-implementation
+    # An implementation outcome is a stored fact. Its derived transition opens
+    # a review engagement. A requested-changes verdict re-arms this rule while
+    # the next coder round runs; approval leaves it closed.
+    - name: review-ready-implementation
       when:
-        transition: crew-work.entered-done
-        subject:
-          vessel: work
-          role: coder
+        transition: implementation.ready-for-review
         guards:
-          - fact: crew-work.phase
-            subject:
-              vessel: work
-              role: reviewer
-            equals: Pending
+          - fact: convoy.phase
+            equals: Active
       engage:
         vessel: work
         role: reviewer
         brief_template: diff-review
       expecting:
-        fact: crew-work.phase
-        subject:
-          vessel: work
-          role: reviewer
-        equals: Done
+        completion:
+          phase: Done
+          outcome:
+            kind: review
+            verdict:
+              one_of:
+                - requested-changes
+                - approved
+      rearm:
+        on_transition: review.requested-changes
+      settles:
+        on_transition: review.approved
+        through_declared_transitions:
+          - work.entered-complete
+          - convoy.entered-landing
+
+    # Done-with-requested-changes completes only the review engagement; it does
+    # not settle the work. The derived transition requests a fresh coder
+    # engagement. Its ready-for-review outcome both completes this round and
+    # supplies the fact the re-armed reviewer rule consumes.
+    - name: address-requested-changes
+      when:
+        transition: review.requested-changes
+        guards:
+          - fact: convoy.phase
+            equals: Active
+      engage:
+        vessel: work
+        role: coder
+        brief_template: crew
+      expecting:
+        completion:
+          phase: Done
+          outcome:
+            kind: implementation
+            verdict: ready-for-review
+      rearm:
+        on_transition: implementation.ready-for-review
