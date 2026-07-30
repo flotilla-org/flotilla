@@ -14,7 +14,7 @@ use crate::{
     field_ownership::FieldOwnershipViolation,
     replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, K8sResourceObject, MergeMetadata, ObjectMeta, Resource, ResourceObject},
-    retention::{EventRetention, ResourceStoreDiagnostics},
+    retention::{EventRetention, ResourceStoreDiagnostics, MAX_FIELD_OWNERSHIP_VIOLATIONS},
     watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
 };
 
@@ -155,7 +155,12 @@ impl InMemoryBackend {
     }
 
     pub(crate) async fn record_field_ownership_violation(&self, violation: FieldOwnershipViolation) {
-        self.ownership_violations.lock().await.push(violation);
+        let mut violations = self.ownership_violations.lock().await;
+        violations.push(violation);
+        let excess = violations.len().saturating_sub(MAX_FIELD_OWNERSHIP_VIOLATIONS);
+        if excess > 0 {
+            violations.drain(..excess);
+        }
     }
 
     fn store_key<T: Resource>(namespace: &str) -> StoreKey {

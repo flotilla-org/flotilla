@@ -1,7 +1,9 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use flotilla_resources::{
-    ApiPaths, FieldOwnedResource, FieldOwnership, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend,
-    InputMeta, NoStatusPatch, OwnershipEnforcement, PlacementPolicy, PlacementPolicySpec, ReplicationClass, Resource, ResourceBackend,
-    ResourceError, WriterIdentity, WriterRole,
+    ApiPaths, DockerCheckoutStrategy, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, FieldOwnedResource, FieldOwnership,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend, InputMeta, NoStatusPatch, OwnershipEnforcement,
+    PlacementPolicy, PlacementPolicySpec, ReplicationClass, Resource, ResourceBackend, ResourceError, WriterIdentity, WriterRole,
 };
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +12,22 @@ fn host_direct(pool: &str, priority: i32, host: &str) -> PlacementPolicySpec {
         .pool(pool.to_string())
         .priority(priority)
         .host_direct(HostDirectPlacementPolicySpec { host_ref: host.to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
+        .build()
+}
+
+fn docker(pool: &str, priority: i32, host: &str, image: &str) -> PlacementPolicySpec {
+    PlacementPolicySpec::builder()
+        .pool(pool.to_string())
+        .priority(priority)
+        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+            host_ref: host.to_string(),
+            image: image.to_string(),
+            pull_policy: DockerImagePullPolicy::IfNotPresent,
+            agent_adapters: BTreeSet::from(["codex".to_string()]),
+            default_cwd: Some("/workspace".to_string()),
+            env: BTreeMap::new(),
+            checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+        })
         .build()
 }
 
@@ -23,6 +41,7 @@ fn placement_policy_declares_every_spec_leaf_and_no_status_fields() {
         ("spec.pool", WriterRole::ReconcileLoop),
         ("spec.priority", WriterRole::Operator),
         ("spec.host_direct", WriterRole::ReconcileLoop),
+        ("spec.docker_per_vessel", WriterRole::ReconcileLoop),
         ("spec.docker_per_vessel.host_ref", WriterRole::ReconcileLoop),
         ("spec.docker_per_vessel.image", WriterRole::Operator),
         ("spec.docker_per_vessel.pull_policy", WriterRole::Operator),
@@ -88,6 +107,59 @@ async fn operator_apply_preserves_loop_fields_while_updating_priority() {
     assert_eq!(updated.spec.priority, 99);
     assert_eq!(updated.spec.pool, "owned-pool");
     assert_eq!(updated.spec.host_direct.expect("host-direct").host_ref, "owned-host");
+}
+
+#[tokio::test]
+async fn operator_cannot_clear_loop_owned_docker_strategy_and_violation_remains_visible() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let policies = backend.using::<PlacementPolicy>("flotilla");
+    let created = policies
+        .create(&InputMeta::builder().name("docker-local".to_string()).build(), &docker("docker", 4, "local", "operator/image:latest"))
+        .await
+        .expect("create docker policy");
+
+    let updated = policies
+        .write_spec(
+            &WriterIdentity::operator(),
+            &InputMeta::from(&created.metadata),
+            &created.metadata.resource_version,
+            &host_direct("docker", 9, "local"),
+        )
+        .await
+        .expect("observe-mode structural violation must not become Invalid");
+
+    assert_eq!(updated.spec.priority, 9);
+    assert!(updated.spec.host_direct.is_none());
+    assert_eq!(updated.spec.docker_per_vessel.expect("preserved docker strategy").image, "operator/image:latest");
+    let diagnostics = backend.diagnostics().await.expect("diagnostics").expect("embedded diagnostics");
+    assert!(
+        diagnostics.field_ownership_violations.iter().any(|violation| violation.field == "spec.docker_per_vessel"),
+        "the structural violation must be recorded"
+    );
+}
+
+#[tokio::test]
+async fn loop_can_switch_from_docker_to_host_direct_without_descendant_ownership_conflicts() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let policies = backend.using::<PlacementPolicy>("flotilla");
+    let created = policies
+        .create(&InputMeta::builder().name("switching".to_string()).build(), &docker("docker", 44, "local", "operator/image:latest"))
+        .await
+        .expect("create docker policy");
+
+    let updated = policies
+        .write_spec(
+            &WriterIdentity::reconcile_loop(),
+            &InputMeta::from(&created.metadata),
+            &created.metadata.resource_version,
+            &host_direct("direct", 0, "local"),
+        )
+        .await
+        .expect("loop-owned strategy switch");
+
+    assert_eq!(updated.spec.priority, 44);
+    assert!(updated.spec.docker_per_vessel.is_none());
+    assert_eq!(updated.spec.host_direct.expect("host-direct strategy").host_ref, "local");
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

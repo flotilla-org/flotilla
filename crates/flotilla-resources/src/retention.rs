@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{FieldOwnershipViolation, ResourceError};
 
+pub(crate) const MAX_FIELD_OWNERSHIP_VIOLATIONS: usize = 1_024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventRetention {
     max_events_per_resource_stream: usize,

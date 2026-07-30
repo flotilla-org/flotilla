@@ -87,6 +87,8 @@ impl ResourceBackend {
                 Ok(())
             }
             Self::Sqlite(backend) => backend.record_field_ownership_violation(violation).await,
+            // HTTP clients cannot publish authoritative host diagnostics. The
+            // enrolled write paths currently execute against embedded stores.
             Self::Http(_) => Ok(()),
         }
     }

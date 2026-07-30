@@ -52,7 +52,9 @@ pub enum OwnershipEnforcement {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldOwnership {
-    /// Dot-separated path rooted at `spec` or `status`.
+    /// Dot-separated path rooted at `spec`.
+    ///
+    /// Status ownership joins this format when the status write path enrolls.
     pub field: &'static str,
     pub owner: WriterRole,
 }
@@ -79,6 +81,13 @@ pub trait FieldOwnedResource: Resource {
     {
         serialized_spec_field_value::<Self>(spec, field)
     }
+
+    fn spec_field_restore_value(spec: &Self::Spec, field: &str) -> Result<Value, ResourceError>
+    where
+        Self: Sized,
+    {
+        Ok(serialized_spec_field_value::<Self>(spec, field)?.unwrap_or(Value::Null))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -103,19 +112,22 @@ pub(crate) fn merge_owned_spec<T: FieldOwnedResource>(
     let mut merged =
         serde_json::to_value(requested).map_err(|error| ResourceError::decode(format!("serialize requested spec: {error}")))?;
     let mut violations = Vec::new();
+    let mut resolved_subtrees = Vec::<&str>::new();
 
     for ownership in T::FIELD_OWNERSHIP {
+        if resolved_subtrees.iter().any(|parent| ownership.field.strip_prefix(parent).is_some_and(|suffix| suffix.starts_with('.'))) {
+            continue;
+        }
         let relative = ownership.field.strip_prefix("spec.").ok_or_else(|| {
             ResourceError::invalid(format!("{} ownership table field '{}' is not rooted at spec", T::API_PATHS.kind, ownership.field))
         })?;
         let current_field = T::spec_field_value(current, ownership.field)?;
         let requested_field = T::spec_field_value(requested, ownership.field)?;
-        if current_field == requested_field || ownership.owner == writer.role {
+        if current_field == requested_field {
             continue;
         }
-        // A role which creates a newly-applicable strategy must initialize its
-        // complete shape. Ownership protects stored values, not absent values.
-        if current_field.as_ref().is_none_or(Value::is_null) {
+        if ownership.owner == writer.role {
+            resolved_subtrees.push(ownership.field);
             continue;
         }
         let attempted_value = requested_field.unwrap_or(Value::Null);
@@ -131,7 +143,8 @@ pub(crate) fn merge_owned_spec<T: FieldOwnedResource>(
                 .observed_at(Utc::now())
                 .build(),
         );
-        set_value_at_path(&mut merged, relative, current_field.unwrap_or(Value::Null))?;
+        set_value_at_path(&mut merged, relative, T::spec_field_restore_value(current, ownership.field)?)?;
+        resolved_subtrees.push(ownership.field);
     }
 
     let merged = serde_json::from_value(merged).map_err(|error| ResourceError::decode(format!("decode ownership-merged spec: {error}")))?;

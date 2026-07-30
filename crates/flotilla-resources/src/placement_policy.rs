@@ -26,6 +26,7 @@ impl FieldOwnedResource for PlacementPolicy {
         FieldOwnership::new("spec.pool", WriterRole::ReconcileLoop),
         FieldOwnership::new("spec.priority", WriterRole::Operator),
         FieldOwnership::new("spec.host_direct", WriterRole::ReconcileLoop),
+        FieldOwnership::new("spec.docker_per_vessel", WriterRole::ReconcileLoop),
         FieldOwnership::new("spec.docker_per_vessel.host_ref", WriterRole::ReconcileLoop),
         FieldOwnership::new("spec.docker_per_vessel.image", WriterRole::Operator),
         FieldOwnership::new("spec.docker_per_vessel.pull_policy", WriterRole::Operator),
@@ -39,7 +40,16 @@ impl FieldOwnedResource for PlacementPolicy {
     fn spec_field_value(spec: &Self::Spec, field: &str) -> Result<Option<serde_json::Value>, ResourceError> {
         match field {
             "spec.priority" => Ok(Some(serde_json::json!(spec.priority))),
+            "spec.docker_per_vessel" => Ok(Some(serde_json::json!(spec.docker_per_vessel.is_some()))),
             _ => serialized_spec_field_value::<Self>(spec, field),
+        }
+    }
+
+    fn spec_field_restore_value(spec: &Self::Spec, field: &str) -> Result<serde_json::Value, ResourceError> {
+        match field {
+            "spec.docker_per_vessel" => Ok(serde_json::to_value(&spec.docker_per_vessel)
+                .map_err(|error| ResourceError::decode(format!("serialize docker_per_vessel: {error}")))?),
+            _ => Ok(serialized_spec_field_value::<Self>(spec, field)?.unwrap_or(serde_json::Value::Null)),
         }
     }
 }

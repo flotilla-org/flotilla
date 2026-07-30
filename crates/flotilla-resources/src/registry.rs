@@ -9,10 +9,10 @@ use crate::{
     api_version,
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
-    Checkout, Clone as CloneResource, Convoy, CredentialGrant, CredentialSpec, Demand, Environment, Host, InputMeta, MaterialPool,
-    ObjectMeta, OwnerReference, PlacementPolicy, Presentation, Project, ReadResourceList, ReadWatchEvent, Regard, ReplicaCursor,
-    ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
-    TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
+    Checkout, Clone as CloneResource, Convoy, CredentialGrant, CredentialSpec, Demand, Environment, FieldOwnedResource, Host, InputMeta,
+    MaterialPool, ObjectMeta, OwnerReference, PlacementPolicy, Presentation, Project, ReadResourceList, ReadWatchEvent, Regard,
+    ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
+    ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +204,18 @@ macro_rules! dispatch_resource_kind {
     };
 }
 
+/// Dynamic apply uses the ownership-aware path for enrolled kinds. Enrolling
+/// another resource changes one dispatch arm rather than adding a one-off
+/// apply function or branch.
+macro_rules! dispatch_apply_resource_kind {
+    ($resource:expr, $backend:expr, $namespace:expr, $metadata:expr, $spec:expr) => {
+        match $resource {
+            RegisteredResource::PlacementPolicy => apply_owned_typed::<PlacementPolicy>($backend, $namespace, $metadata, $spec).await,
+            resource => dispatch_resource_kind!(resource, apply_typed($backend, $namespace, $metadata, $spec).await),
+        }
+    };
+}
+
 /// Drives a typed read of every kind in the embedded durable store.
 ///
 /// Embedded stores use this startup pass to isolate rows whose persisted
@@ -319,11 +331,7 @@ pub async fn apply_resource_document(
     let document: DynamicApplyDocument =
         serde_json::from_value(document).map_err(|error| ResourceError::decode(format!("decode resource document: {error}")))?;
     let namespace = document.metadata.namespace.clone().unwrap_or_else(|| default_namespace.to_string());
-    let registered = lookup_resource_kind(&document.kind)?.resource;
-    if registered == RegisteredResource::PlacementPolicy {
-        return apply_placement_policy(backend, &namespace, document.metadata, document.spec).await;
-    }
-    dispatch_resource_kind!(registered, apply_typed(backend, &namespace, document.metadata, document.spec).await)
+    dispatch_apply_resource_kind!(lookup_resource_kind(&document.kind)?.resource, backend, &namespace, document.metadata, document.spec)
 }
 
 /// Hash a resource document's spec after its registered typed representation
@@ -609,15 +617,15 @@ async fn apply_typed<T: Resource>(
     })
 }
 
-async fn apply_placement_policy(
+async fn apply_owned_typed<T: FieldOwnedResource>(
     backend: &ResourceBackend,
     namespace: &str,
     metadata: DynamicApplyMetadata,
     spec: Value,
 ) -> Result<DynamicResourceObject, ResourceError> {
-    let spec = serde_json::from_value(spec)
-        .map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", PlacementPolicy::API_PATHS.kind)))?;
-    let resolver = backend.using::<PlacementPolicy>(namespace);
+    let spec =
+        serde_json::from_value(spec).map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", T::API_PATHS.kind)))?;
+    let resolver = backend.using::<T>(namespace);
     let object = match resolver.get(&metadata.name).await {
         Ok(existing) => {
             let meta = metadata.input_meta_for_update(&existing.metadata);
@@ -627,8 +635,8 @@ async fn apply_placement_policy(
         Err(error) => return Err(error),
     };
     Ok(DynamicResourceObject {
-        kind: PlacementPolicy::API_PATHS.kind.to_string(),
-        plural: PlacementPolicy::API_PATHS.plural.to_string(),
+        kind: T::API_PATHS.kind.to_string(),
+        plural: T::API_PATHS.plural.to_string(),
         namespace: namespace.to_string(),
         value: object_value(&object)?,
     })

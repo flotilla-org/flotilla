@@ -17,7 +17,7 @@ use crate::{
     error::ResourceError,
     replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, K8sResourceObject, MergeMetadata, ObjectMeta, Resource, ResourceObject},
-    retention::{EventRetention, ResourceDecodeQuarantine, ResourceStoreDiagnostics},
+    retention::{EventRetention, ResourceDecodeQuarantine, ResourceStoreDiagnostics, MAX_FIELD_OWNERSHIP_VIOLATIONS},
     watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
     FieldOwnershipViolation,
 };
@@ -383,6 +383,15 @@ impl SqliteBackend {
                     observed_at
                 ])
                 .map_err(|error| Self::map_sqlite(error, "record field ownership violation"))?;
+            connection
+                .execute(
+                    "DELETE FROM field_ownership_violations
+                     WHERE id NOT IN (
+                         SELECT id FROM field_ownership_violations ORDER BY id DESC LIMIT ?1
+                     )",
+                    rusqlite::params![MAX_FIELD_OWNERSHIP_VIOLATIONS],
+                )
+                .map_err(|error| Self::map_sqlite(error, "compact field ownership violations"))?;
             Ok(())
         })
         .await
