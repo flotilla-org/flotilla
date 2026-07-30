@@ -320,8 +320,12 @@ impl Cli {
     }
 
     fn socket_path(&self) -> PathBuf {
-        self.socket.clone().unwrap_or_else(|| self.config_dir().join("flotilla.sock"))
+        socket_path_from(self.socket.as_deref(), &self.config_dir(), std::env::var_os("FLOTILLA_DAEMON_SOCKET").as_deref())
     }
+}
+
+fn socket_path_from(explicit: Option<&Path>, config_dir: &Path, environment: Option<&std::ffi::OsStr>) -> PathBuf {
+    environment.map(PathBuf::from).or_else(|| explicit.map(PathBuf::from)).unwrap_or_else(|| config_dir.join("flotilla.sock"))
 }
 
 #[tokio::main]
@@ -1497,10 +1501,7 @@ async fn run_hook(cli: &Cli, harness: &str, event_type: &str) -> Result<()> {
 
     // 6. Send to daemon via socket. The daemon owns agent state as a single
     // actor — no file-level races between concurrent hook processes.
-    // Priority: FLOTILLA_DAEMON_SOCKET env > --socket CLI flag > global default.
-    let socket_path = std::env::var("FLOTILLA_DAEMON_SOCKET").map(std::path::PathBuf::from).unwrap_or_else(|_| cli.socket_path());
-
-    send_hook_event(&socket_path, event).await
+    send_hook_event(&cli.socket_path(), event).await
 }
 
 /// One-shot client: connect to daemon, send an AgentHook request, read one response, exit.
@@ -1718,8 +1719,8 @@ mod tests {
     use super::{
         attach_exit_disposition, confirm_command, default_project_landing, format_human_resource_value,
         provisioning_target_for_environment, replace_host_ids, run_replica_snapshot, select_host_target, select_startup_repo_roots,
-        should_reexec_for_incompatible_daemon, show_startup_splash, AttachExitDisposition, Cli, CommandValue, ResourceApplyArgs,
-        ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, SubCommand,
+        should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, AttachExitDisposition, Cli, CommandValue,
+        ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, SubCommand,
     };
 
     fn landing_repo(path: &str, name: &str, key: Option<&str>) -> RepoInfo {
@@ -2027,6 +2028,18 @@ mod tests {
             cli.command,
             Some(SubCommand::Attach { reference, transient: false, host: None }) if reference == "convoy-a/implement/coder"
         ));
+    }
+
+    #[test]
+    fn contained_cli_socket_environment_takes_precedence() {
+        assert_eq!(
+            socket_path_from(
+                Some(Path::new("/explicit/flotilla.sock")),
+                Path::new("/config"),
+                Some(std::ffi::OsStr::new("/run/flotilla.sock")),
+            ),
+            PathBuf::from("/run/flotilla.sock"),
+        );
     }
 
     #[test]

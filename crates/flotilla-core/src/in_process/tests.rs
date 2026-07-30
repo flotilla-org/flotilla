@@ -1501,6 +1501,35 @@ async fn convoy_resume_delivers_follow_up_to_unique_completed_crew_session() {
 }
 
 #[tokio::test]
+async fn convoy_resume_does_not_fall_back_from_the_sessions_named_pool() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let (daemon, terminal_pool) = new_attach_test_daemon_with_pool(temp.path()).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_two_agent_crew(&daemon, &env_ref).await;
+    daemon
+        .crew_complete_internal(&CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() }, Some("ready".into()))
+        .await
+        .expect("complete coder work");
+    let sessions = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
+    let session = sessions.get("terminal-demo-implement-coder").await.expect("coder session");
+    let mut spec = session.spec.clone();
+    spec.pool = "missing-interior-pool".to_string();
+    sessions
+        .update(&InputMeta::from(&session.metadata), &session.metadata.resource_version, &spec)
+        .await
+        .expect("simulate a named interior pool that is no longer available");
+
+    let error = daemon
+        .convoy_resume_internal("flotilla", "demo", "Continue", Some("implement"), Some("coder"))
+        .await
+        .expect_err("message delivery must not use the preferred fallback pool");
+
+    assert_eq!(error, format!("terminal pool missing-interior-pool unavailable for environment {env_ref}"));
+    assert!(terminal_pool.delivered.lock().await.is_empty());
+}
+
+#[tokio::test]
 async fn convoy_resume_requires_a_selector_when_completed_crew_is_ambiguous() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");

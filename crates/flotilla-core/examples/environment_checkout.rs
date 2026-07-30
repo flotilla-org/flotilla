@@ -52,19 +52,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Creating environment ---");
     let env_id = EnvironmentId::new("smoke-test");
 
-    // We need git inside the container — install it after creation
-    // Use a temp socket path (we don't need a real daemon socket for this test)
-    let temp = tempfile::tempdir()?;
-    let socket_path = DaemonHostPath::new(temp.path().join("fake.sock"));
-    // Create a dummy socket file so the mount doesn't fail
-    std::fs::write(socket_path.as_path(), "")?;
-
     let opts = CreateOpts {
         tokens: vec![],
-        daemon_socket_path: socket_path,
         working_directory: None,
         image_pull_policy: Default::default(),
         docker_config_dir: None,
+        tools: Vec::new(),
         provisioned_mounts: vec![flotilla_core::providers::environment::ProvisionedMount::new(
             reference_repo.as_path().to_path_buf(),
             "/ref/repo",

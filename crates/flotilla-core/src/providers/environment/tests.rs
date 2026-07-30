@@ -8,10 +8,23 @@ use async_trait::async_trait;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, EnvironmentStatus, HostName, ImageSource};
 
 use super::{
-    docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner, CreateOpts, EnvironmentProvider, ImagePullPolicy, ProvisionedMount,
-    ProvisionedMountMode,
+    docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner, CreateOpts, EnvironmentProvider, EnvironmentTool,
+    EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate, ImagePullPolicy,
+    ProvisionedMount, ProvisionedMountMode,
 };
 use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
+
+fn test_daemon_tool(socket_path: impl Into<PathBuf>) -> EnvironmentTool {
+    EnvironmentTool::new("flotilla", "/usr/local/bin/flotilla")
+        .with_asset(EnvironmentToolAsset::new(
+            socket_path,
+            "/run/flotilla.sock",
+            EnvironmentToolAssetKind::UnixSocket,
+            EnvironmentToolAssetAccess::SharedWritable,
+            "the daemon socket",
+        ))
+        .with_environment(EnvironmentVariableUpdate::set("FLOTILLA_DAEMON_SOCKET", "/run/flotilla.sock", "the daemon socket"))
+}
 
 /// A mock CommandRunner that records all (cmd, args, cwd) tuples passed to run/run_output.
 struct RecordingRunner {
@@ -255,7 +268,7 @@ async fn create_returns_handle() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![("GITHUB_TOKEN".into(), "ghp_secret".into())],
-        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        tools: vec![test_daemon_tool("/run/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
@@ -308,7 +321,7 @@ async fn create_runs_container_as_the_host_user() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: Vec::new(),
-        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        tools: vec![test_daemon_tool("/run/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: Vec::new(),
         image_pull_policy: ImagePullPolicy::IfNotPresent,
@@ -336,7 +349,7 @@ async fn create_removes_container_when_image_digest_cannot_be_resolved() {
     let image = ImageId::new("registry.example/crew:latest");
     let opts = CreateOpts {
         tokens: Vec::new(),
-        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        tools: vec![test_daemon_tool("/run/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: Vec::new(),
         image_pull_policy: ImagePullPolicy::Always,
@@ -367,7 +380,7 @@ async fn create_translates_image_pull_policy_to_docker_run() {
         let image = ImageId::new("flotilla-dev-env:latest");
         let opts = CreateOpts {
             tokens: Vec::new(),
-            daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+            tools: vec![test_daemon_tool("/run/flotilla.sock")],
             working_directory: None,
             provisioned_mounts: Vec::new(),
             image_pull_policy: policy,
@@ -393,7 +406,7 @@ async fn create_uses_the_credential_scoped_docker_config_for_pull_on_run() {
     let image = ImageId::new("registry.example/crew:latest");
     let opts = CreateOpts {
         tokens: Vec::new(),
-        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        tools: vec![test_daemon_tool("/run/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: Vec::new(),
         image_pull_policy: ImagePullPolicy::Always,
@@ -419,7 +432,7 @@ async fn create_reports_infrastructure_and_requested_mount_metadata() {
     let reference_repo = DaemonHostPath::new("/host/reference-repo");
     let opts = CreateOpts {
         tokens: vec![],
-        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        tools: vec![test_daemon_tool("/run/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new(reference_repo.as_path().to_path_buf(), "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
@@ -454,7 +467,7 @@ async fn create_rejects_a_mount_targeting_the_reserved_daemon_socket_path() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
-        daemon_socket_path: DaemonHostPath::new("/host/flotilla.sock"),
+        tools: vec![test_daemon_tool("/host/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new("/host/replacement.sock", "/run/flotilla.sock", ProvisionedMountMode::Rw)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
@@ -472,6 +485,48 @@ async fn create_rejects_a_mount_targeting_the_reserved_daemon_socket_path() {
 }
 
 #[tokio::test]
+async fn create_delivers_tool_assets_and_applies_tool_environment() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let image = ImageId::new("ubuntu:22.04");
+    let tool = EnvironmentTool::new("terminal", "/usr/local/bin/terminal")
+        .with_asset(EnvironmentToolAsset::new(
+            "/host/bin/terminal",
+            "/usr/local/bin/terminal",
+            EnvironmentToolAssetKind::File,
+            EnvironmentToolAssetAccess::ReadOnly,
+            "the terminal executable",
+        ))
+        .with_asset(EnvironmentToolAsset::new(
+            "/host/state/terminal",
+            "/var/lib/terminal",
+            EnvironmentToolAssetKind::Directory,
+            EnvironmentToolAssetAccess::SharedWritable,
+            "terminal state",
+        ))
+        .with_environment(EnvironmentVariableUpdate::set("TERMINAL_STATE", "/var/lib/terminal", "terminal state"))
+        .with_environment(EnvironmentVariableUpdate::prepend_path("LD_LIBRARY_PATH", "/usr/local/lib/terminal"));
+    let opts = CreateOpts {
+        tokens: vec![("LD_LIBRARY_PATH".to_string(), "/image/lib".to_string())],
+        working_directory: None,
+        provisioned_mounts: Vec::new(),
+        tools: vec![tool],
+        image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
+    };
+
+    provider.create(EnvironmentId::new("tool-delivery"), &image, opts).await.expect("Docker should lower provider-neutral tool assets");
+
+    let args = &runner.calls()[0].1;
+    assert!(args.contains(&"/host/bin/terminal:/usr/local/bin/terminal:ro".to_string()));
+    assert!(args.contains(&"/host/state/terminal:/var/lib/terminal:rw".to_string()));
+    assert!(args.contains(&"TERMINAL_STATE=/var/lib/terminal".to_string()));
+    assert!(args.contains(&"LD_LIBRARY_PATH=/usr/local/lib/terminal:/image/lib".to_string()));
+}
+
+#[tokio::test]
 async fn create_uses_requested_mount_modes_in_docker_arguments() {
     use flotilla_protocol::ImageId;
 
@@ -480,7 +535,7 @@ async fn create_uses_requested_mount_modes_in_docker_arguments() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
-        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        tools: vec![test_daemon_tool("/run/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: vec![
             ProvisionedMount::new("/host/workspace", "/workspace", ProvisionedMountMode::Rw),
@@ -524,7 +579,7 @@ async fn list_preserves_provisioned_mount_metadata() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
-        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        tools: vec![test_daemon_tool("/run/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
@@ -558,7 +613,7 @@ async fn list_fails_on_malformed_reference_repo_mount_metadata() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
-        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        tools: vec![test_daemon_tool("/run/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
@@ -584,7 +639,7 @@ async fn list_rejects_missing_reference_repo_mount_metadata() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
-        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        tools: vec![test_daemon_tool("/run/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
@@ -606,7 +661,7 @@ async fn provisioned_handle_returns_its_initialized_runner() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
-        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        tools: vec![test_daemon_tool("/run/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
@@ -632,7 +687,7 @@ async fn status_returns_running() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
-        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        tools: vec![test_daemon_tool("/run/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
@@ -664,7 +719,7 @@ async fn env_vars_parses_output() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
-        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        tools: vec![test_daemon_tool("/run/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
@@ -698,7 +753,7 @@ async fn destroy_calls_docker_rm() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
-        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        tools: vec![test_daemon_tool("/run/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,

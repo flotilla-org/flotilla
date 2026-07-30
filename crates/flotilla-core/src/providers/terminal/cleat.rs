@@ -109,7 +109,7 @@ impl TerminalPool for CleatTerminalPool {
             parts.join(" ")
         };
         let cwd = cwd.as_path().display().to_string();
-        let mut args = vec!["create", "--json", session_name, "--cwd", &cwd, "--cmd", &effective_cmd];
+        let mut args = vec!["launch", "--json", "--record", session_name, "--cwd", &cwd, "--cmd", &effective_cmd];
         let encoded_tags = tags.iter().map(|tag| format!("{}={}", tag.key, tag.value)).collect::<Vec<_>>();
         for tag in &encoded_tags {
             args.push("--tag");
@@ -123,16 +123,15 @@ impl TerminalPool for CleatTerminalPool {
         &self,
         session_name: &str,
         _command: &str,
-        cwd: &ExecutionEnvironmentPath,
+        _cwd: &ExecutionEnvironmentPath,
         _env_vars: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String> {
         Ok(vec![
             Arg::Literal(self.binary.clone()),
             Arg::Literal("attach".into()),
+            Arg::Literal("--no-create".into()),
             // Session names are UUIDs (attachable IDs) — always shell-safe, no quoting needed.
             Arg::Literal(session_name.into()),
-            Arg::Literal("--cwd".into()),
-            Arg::Quoted(cwd.as_path().display().to_string()),
         ])
     }
 
@@ -201,11 +200,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_creates_session() {
+    async fn ensure_launches_recorded_session() {
         let create_json = r#"{"id":"my-session","cwd":"/repo","cmd":"bash","status":"Detached"}"#;
         let runner = Arc::new(MockRunner::new(vec![
             Ok("[]".into()),        // list_sessions: empty (session doesn't exist)
-            Ok(create_json.into()), // create response
+            Ok(create_json.into()), // launch response
         ]));
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
 
@@ -214,7 +213,7 @@ mod tests {
         let calls = runner.calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].0, "cleat");
-        assert_eq!(calls[1].1, vec!["create", "--json", "my-session", "--cwd", "/repo", "--cmd", "bash"]);
+        assert_eq!(calls[1].1, vec!["launch", "--json", "--record", "my-session", "--cwd", "/repo", "--cmd", "bash"]);
     }
 
     #[tokio::test]
@@ -222,7 +221,7 @@ mod tests {
         let create_json = r#"{"id":"my-session","cwd":"/repo","cmd":"env FOO='bar' claude","status":"Detached"}"#;
         let runner = Arc::new(MockRunner::new(vec![
             Ok("[]".into()),        // list_sessions: empty
-            Ok(create_json.into()), // create response
+            Ok(create_json.into()), // launch response
         ]));
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
         let env = vec![("FOO".to_string(), "bar".to_string())];
@@ -252,8 +251,9 @@ mod tests {
         .expect("ensure tagged session");
 
         assert_eq!(runner.calls()[1].1, vec![
-            "create",
+            "launch",
             "--json",
+            "--record",
             "terminal-demo-coder",
             "--cwd",
             "/repo",
@@ -278,7 +278,7 @@ mod tests {
         pool.ensure_session("my-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env, &[]).await.expect("ensure session");
 
         let calls = runner.calls();
-        assert_eq!(calls.len(), 1, "should only call list, not create: {calls:?}");
+        assert_eq!(calls.len(), 1, "should only call list, not launch: {calls:?}");
         assert!(calls[0].1.contains(&"list".to_string()), "should be a list call: {:?}", calls[0].1);
     }
 
@@ -289,8 +289,7 @@ mod tests {
         let cmd =
             pool.attach_command("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).await.expect("attach command");
 
-        assert!(cmd.contains("cleat attach my-session"));
-        assert!(cmd.contains("--cwd '/repo'"));
+        assert_eq!(cmd, "cleat attach --no-create my-session");
         assert!(!cmd.contains("--cmd"), "should NOT have --cmd");
     }
 
@@ -329,9 +328,8 @@ mod tests {
         assert_eq!(args, vec![
             Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
+            Arg::Literal("--no-create".into()),
             Arg::Literal("my-session".into()),
-            Arg::Literal("--cwd".into()),
-            Arg::Quoted("/repo".into()),
         ]);
     }
 
@@ -341,7 +339,7 @@ mod tests {
         let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
-        assert_eq!(flat, "cleat attach my-session --cwd '/repo'");
+        assert_eq!(flat, "cleat attach --no-create my-session");
     }
 
     #[test]
@@ -353,9 +351,8 @@ mod tests {
         assert_eq!(args, vec![
             Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
+            Arg::Literal("--no-create".into()),
             Arg::Literal("sess-1".into()),
-            Arg::Literal("--cwd".into()),
-            Arg::Quoted("/home/dev".into()),
         ]);
     }
 
@@ -365,13 +362,12 @@ mod tests {
         let env = vec![("FOO".to_string(), "bar".to_string()), ("BAZ".to_string(), "qu'x".to_string())];
         let args = pool.attach_args("sess", "cmd", &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
 
-        // Env vars are baked in at ensure_session/create time — not in attach_args
+        // Env vars are baked in at ensure_session/launch time — not in attach_args
         assert_eq!(args, vec![
             Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
+            Arg::Literal("--no-create".into()),
             Arg::Literal("sess".into()),
-            Arg::Literal("--cwd".into()),
-            Arg::Quoted("/wd".into()),
         ]);
     }
 
@@ -384,9 +380,8 @@ mod tests {
         assert_eq!(args, vec![
             Arg::Literal("cleat".into()),
             Arg::Literal("attach".into()),
+            Arg::Literal("--no-create".into()),
             Arg::Literal("sess".into()),
-            Arg::Literal("--cwd".into()),
-            Arg::Quoted("/wd".into()),
         ]);
     }
 
@@ -398,7 +393,7 @@ mod tests {
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
         // No --cmd, no NestedCommand
-        assert_eq!(flat, "cleat attach sess --cwd '/wd'");
+        assert_eq!(flat, "cleat attach --no-create sess");
     }
 
     #[tokio::test]
