@@ -16,7 +16,6 @@ spec:
         - role: shepherd
           selector:
             capability: code
-          brief_template: shepherd
 
   # PR adoption remains a Convoy admission operation: it writes the explicit
   # change-request binding and provisions or adopts the PR branch. The workflow

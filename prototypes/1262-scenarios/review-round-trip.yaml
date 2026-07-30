@@ -15,7 +15,6 @@ spec:
         - role: shepherd
           selector:
             capability: code
-          brief_template: shepherd
 
   # One rule deliberately groups every kind of actionable PR material. The
   # subscription is implicitly limited to this convoy's bound change request.
