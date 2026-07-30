@@ -162,6 +162,29 @@ assets_body="$work_dir/assets.json"
 download_dir="$work_dir/downloads"
 mkdir "$download_dir"
 
+verify_existing_asset() {
+  local existing_url=$1
+  local local_asset=$2
+  local asset_name=$3
+  local downloaded_asset="$download_dir/$asset_name"
+  local download_status
+
+  if [[ "$existing_url" != "$forge_origin/"* ]]; then
+    echo "refusing to send Forgejo credentials to another origin: $existing_url" >&2
+    exit 1
+  fi
+  download_status=$(request GET "$existing_url" "$downloaded_asset")
+  if [[ "$download_status" != 200 ]]; then
+    echo "Forgejo release asset download returned HTTP $download_status: $asset_name" >&2
+    exit 1
+  fi
+  if ! cmp -s "$local_asset" "$downloaded_asset"; then
+    echo "refusing to replace immutable release asset: $asset_name" >&2
+    exit 1
+  fi
+  echo "release asset already exists with identical bytes: $asset_name"
+}
+
 refresh_assets() {
   local assets_status
   assets_status=$(request GET "$assets_url" "$assets_body")
@@ -194,26 +217,13 @@ for asset in "${publish_assets[@]}"; do
         cat "$upload_body" >&2
         exit 1
       fi
+      verify_existing_asset "$existing_url" "$asset" "$asset_name"
     fi
     refresh_assets
     continue
   fi
 
-  downloaded_asset="$download_dir/$asset_name"
-  if [[ "$existing_url" != "$forge_origin/"* ]]; then
-    echo "refusing to send Forgejo credentials to another origin: $existing_url" >&2
-    exit 1
-  fi
-  download_status=$(request GET "$existing_url" "$downloaded_asset")
-  if [[ "$download_status" != 200 ]]; then
-    echo "Forgejo release asset download returned HTTP $download_status: $asset_name" >&2
-    exit 1
-  fi
-  if ! cmp -s "$asset" "$downloaded_asset"; then
-    echo "refusing to replace immutable release asset: $asset_name" >&2
-    exit 1
-  fi
-  echo "release asset already exists with identical bytes: $asset_name"
+  verify_existing_asset "$existing_url" "$asset" "$asset_name"
 done
 
 missing_assets=()

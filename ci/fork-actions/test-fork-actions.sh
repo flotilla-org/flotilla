@@ -157,11 +157,51 @@ if env \
   exit 1
 fi
 
+printf 'race candidate\n' >"$test_dir/race"
+conflict_race_state="$test_dir/conflict-race-state"
+if env \
+  PATH="$stub_bin:$PATH" \
+  FORGEJO_TOKEN=secret \
+  FLEET_API_URL=https://download.invalid/api/v1 \
+  FLEET_REPOSITORY=lab/flotilla \
+  FLEET_COMMIT_SHA="$commit_sha" \
+  FAKE_FORGEJO_STATE_DIR="$conflict_race_state" \
+  FAKE_FORGEJO_LOG="$api_log" \
+  FAKE_FORGEJO_UPLOAD_RACE_MODE=conflict \
+  "$publisher" \
+  --expect race -- "$test_dir/race" >/dev/null 2>&1; then
+  echo "publisher accepted conflicting bytes from a racing uploader" >&2
+  exit 1
+fi
+
+identical_race_state="$test_dir/identical-race-state"
+env \
+  PATH="$stub_bin:$PATH" \
+  FORGEJO_TOKEN=secret \
+  FLEET_API_URL=https://download.invalid/api/v1 \
+  FLEET_REPOSITORY=lab/flotilla \
+  FLEET_COMMIT_SHA="$commit_sha" \
+  FAKE_FORGEJO_STATE_DIR="$identical_race_state" \
+  FAKE_FORGEJO_LOG="$api_log" \
+  FAKE_FORGEJO_UPLOAD_RACE_MODE=identical \
+  "$publisher" \
+  --expect race -- "$test_dir/race" >/dev/null
+grep -Fxq false "$identical_race_state/draft"
+
 workflow_count=$(find "$bundle_root/workflows" -type f -name '*.yml' | wc -l | tr -d '[:space:]')
 if [[ "$workflow_count" != 7 ]]; then
   echo "expected seven inert workflow templates, found $workflow_count" >&2
   exit 1
 fi
+
+forbidden_workflow_pattern='forgejo\.lab|udder|comte|feta|GH_TOKEN|github\.token|upload-artifact|download-artifact|publish-github'
+# shellcheck disable=SC2016 # Intentional literal workflow expression fixture.
+for forbidden_fixture in 'https://forgejo.lab.example/repo' '${{ github.token }}'; do
+  if ! grep -Eqi "$forbidden_workflow_pattern" <<<"$forbidden_fixture"; then
+    echo "forbidden workflow pattern did not catch: $forbidden_fixture" >&2
+    exit 1
+  fi
+done
 
 while IFS= read -r workflow; do
   if [[ "$(grep -c 'Publishing adapter:' "$workflow")" != 1 ]]; then
@@ -186,7 +226,7 @@ while IFS= read -r workflow; do
       exit 1
     fi
   done < <(sed -n 's/^[[:space:]]*uses:[[:space:]]*//p' "$workflow")
-  if grep -Eqi 'forgejo\\.lab|udder|comte|feta|GH_TOKEN|github\\.token|upload-artifact|download-artifact|publish-github' "$workflow"; then
+  if grep -Eqi "$forbidden_workflow_pattern" "$workflow"; then
     echo "workflow contains a forbidden provider/private value: $workflow" >&2
     exit 1
   fi

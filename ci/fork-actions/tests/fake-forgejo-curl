@@ -151,7 +151,24 @@ case "$method $url" in
   "POST "*"releases/1/assets?name="*)
     asset_name=${url##*?name=}
     printf 'upload:%s\n' "$asset_name" >>"$FAKE_FORGEJO_LOG"
-    if [[ -f "$FAKE_FORGEJO_STATE_DIR/assets/$asset_name" ]]; then
+    race_mode=${FAKE_FORGEJO_UPLOAD_RACE_MODE:-}
+    race_marker="$FAKE_FORGEJO_STATE_DIR/upload-race-$asset_name"
+    if [[ -n "$race_mode" && ! -f "$race_marker" ]]; then
+      case "$race_mode" in
+        conflict)
+          printf 'competing bytes\n' >"$FAKE_FORGEJO_STATE_DIR/assets/$asset_name"
+          ;;
+        identical)
+          cp "$form_file" "$FAKE_FORGEJO_STATE_DIR/assets/$asset_name"
+          ;;
+        *)
+          echo "unsupported upload race mode: $race_mode" >&2
+          exit 2
+          ;;
+      esac
+      touch "$race_marker"
+      respond 409 -
+    elif [[ -f "$FAKE_FORGEJO_STATE_DIR/assets/$asset_name" ]]; then
       respond 409 -
     else
       cp "$form_file" "$FAKE_FORGEJO_STATE_DIR/assets/$asset_name"
