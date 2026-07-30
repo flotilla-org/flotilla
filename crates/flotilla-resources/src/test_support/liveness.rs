@@ -216,12 +216,15 @@ where
     for (index, transition) in sequence.transitions.iter().enumerate() {
         let result = match transition {
             Transition::Reconcile => {
-                let outcome = enrollment.reconciler_step.reconcile_step(&mut world).await?;
-                if let Some(patch) = outcome.patch {
-                    enrollment.reconciler_step.apply_patch(&mut world, patch).await?;
+                async {
+                    let outcome = enrollment.reconciler_step.reconcile_step(&mut world).await?;
+                    if let Some(patch) = outcome.patch {
+                        enrollment.reconciler_step.apply_patch(&mut world, patch).await?;
+                    }
+                    pending_actuations.extend(outcome.actuations);
+                    Ok(())
                 }
-                pending_actuations.extend(outcome.actuations);
-                Ok(())
+                .await
             }
             Transition::ExternalSpecWrite(field, value) => enrollment.reconciler_step.external_spec_write(&mut world, field, value).await,
             Transition::Delete => enrollment.reconciler_step.delete(&mut world).await,
@@ -239,10 +242,13 @@ where
                 }
             }
             Transition::DeliverActuation => {
-                for actuation in pending_actuations.drain(..) {
-                    enrollment.reconciler_step.apply_actuation(&mut world, actuation).await?;
+                async {
+                    for actuation in pending_actuations.drain(..) {
+                        enrollment.reconciler_step.apply_actuation(&mut world, actuation).await?;
+                    }
+                    Ok(())
                 }
-                Ok(())
+                .await
             }
             Transition::PartitionStore(origin_root) => enrollment.reconciler_step.partition_store(&mut world, origin_root).await,
         };
@@ -349,7 +355,7 @@ mod tests {
     use super::*;
     use crate::Clock;
 
-    #[derive(Default)]
+    #[derive(Debug, Default)]
     struct TestWorld {
         interesting: bool,
         events: Vec<&'static str>,
@@ -423,10 +429,65 @@ mod tests {
         }
     }
 
+    enum FailurePoint {
+        Reconcile,
+        DeliverActuation,
+    }
+
+    struct FailingStep(FailurePoint);
+
+    #[async_trait]
+    impl ReconcileStep<TestWorld> for FailingStep {
+        type Patch = ();
+        type Actuation = ();
+
+        async fn reconcile_step(&self, _world: &mut TestWorld) -> Result<LivenessStep<Self::Patch, Self::Actuation>, String> {
+            match self.0 {
+                FailurePoint::Reconcile => Err("reconcile failed".to_string()),
+                FailurePoint::DeliverActuation => Ok(LivenessStep::new(None, vec![()])),
+            }
+        }
+
+        async fn apply_patch(&self, _world: &mut TestWorld, _patch: Self::Patch) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn apply_actuation(&self, _world: &mut TestWorld, _actuation: Self::Actuation) -> Result<(), String> {
+            Err("actuation failed".to_string())
+        }
+    }
+
+    #[async_trait]
+    impl TransitionDriver<TestWorld> for FailingStep {
+        type Field = ();
+        type Value = ();
+        type OriginRoot = ();
+
+        async fn external_spec_write(&self, _world: &mut TestWorld, _field: &Self::Field, _value: &Self::Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn delete(&self, _world: &mut TestWorld) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn restart_controller(&self, _world: &mut TestWorld) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn partition_store(&self, _world: &mut TestWorld, _origin_root: &Self::OriginRoot) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn test_clock() -> Arc<VirtualClock> {
+        Arc::new(VirtualClock::new(Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).single().expect("valid test timestamp")))
+    }
+
     #[tokio::test]
     #[should_panic(expected = "coverage assertion `interesting state` was never observed")]
     async fn transition_sequence_rejects_vacuous_coverage() {
-        let clock = Arc::new(VirtualClock::new(Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).single().expect("valid test timestamp")));
+        let clock = test_clock();
         let enrollment = LivenessEnrollment::new(TestWorldBuilder, TestStep, TestFixpoint, clock);
         let sequence = TransitionSequence::new([Transition::AdvanceClock(Duration::seconds(1))])
             .sometimes("interesting state", |world: &TestWorld| world.interesting);
@@ -436,7 +497,7 @@ mod tests {
 
     #[tokio::test]
     async fn transition_sequence_drives_the_complete_vocabulary_and_controls_actuation_delivery() {
-        let clock = Arc::new(VirtualClock::new(Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).single().expect("valid test timestamp")));
+        let clock = test_clock();
         let enrollment = LivenessEnrollment::new(TestWorldBuilder, TestStep, TestFixpoint, Arc::clone(&clock));
         let sequence = TransitionSequence::new([
             Transition::Reconcile,
@@ -460,5 +521,27 @@ mod tests {
             "the first actuation must be dropped and the second delivered"
         );
         assert_eq!(clock.now(), Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 5).single().expect("valid advanced timestamp"));
+    }
+
+    #[tokio::test]
+    async fn transition_sequence_errors_name_the_failing_transition() {
+        let reconcile_enrollment =
+            LivenessEnrollment::new(TestWorldBuilder, FailingStep(FailurePoint::Reconcile), TestFixpoint, test_clock());
+        let reconcile_error =
+            run_transition_sequence(&reconcile_enrollment, LivenessScenario::Normal, &TransitionSequence::new([Transition::Reconcile]))
+                .await
+                .expect_err("reconcile failure");
+        assert_eq!(reconcile_error, "transition 0 (Reconcile) failed: reconcile failed");
+
+        let actuation_enrollment =
+            LivenessEnrollment::new(TestWorldBuilder, FailingStep(FailurePoint::DeliverActuation), TestFixpoint, test_clock());
+        let actuation_error = run_transition_sequence(
+            &actuation_enrollment,
+            LivenessScenario::Normal,
+            &TransitionSequence::new([Transition::Reconcile, Transition::DeliverActuation]),
+        )
+        .await
+        .expect_err("actuation failure");
+        assert_eq!(actuation_error, "transition 1 (DeliverActuation) failed: actuation failed");
     }
 }
