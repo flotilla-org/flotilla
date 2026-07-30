@@ -103,8 +103,9 @@ strictly verify every Darwin binary.
 ### Publishing is the provider seam
 
 Build, test, metadata generation, and signing remain ordinary shell steps.
-Checkout uses the fully qualified official Forgejo action reference and
-discards persisted credentials immediately. All release creation and asset
+Checkout uses the fully qualified official Forgejo action reference pinned to
+the commit behind the reviewed release and discards persisted credentials
+immediately. All release creation and asset
 upload is confined to the final publishing-adapter step; changing release
 providers means replacing that step and its helper, not rewriting the build.
 

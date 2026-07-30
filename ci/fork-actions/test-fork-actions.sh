@@ -225,6 +225,10 @@ while IFS= read -r workflow; do
       echo "action reference is not fully qualified in $workflow: $action_reference" >&2
       exit 1
     fi
+    if [[ ! "$action_reference" =~ @[0-9a-f]{40}$ ]]; then
+      echo "action reference is not pinned to a full commit SHA in $workflow: $action_reference" >&2
+      exit 1
+    fi
   done < <(sed -n 's/^[[:space:]]*uses:[[:space:]]*//p' "$workflow")
   if grep -Eqi "$forbidden_workflow_pattern" "$workflow"; then
     echo "workflow contains a forbidden provider/private value: $workflow" >&2

@@ -64,9 +64,9 @@ through a draft release and publishes only when the full expected asset
 manifest exists.
 
 The workflows do not use Actions artifacts. Remote Actions must always use a
-fully qualified HTTPS reference. The current templates use only
-`https://data.forgejo.org/actions/checkout@v6`; the structural test rejects
-instance-relative shorthand such as `actions/checkout@v6`.
+fully qualified HTTPS reference pinned to the commit behind the reviewed
+release. The structural test rejects floating tags and instance-relative
+shorthand such as `actions/checkout@v6`.
 
 ## Metadata and pins
 
