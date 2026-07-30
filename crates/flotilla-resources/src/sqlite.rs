@@ -17,8 +17,9 @@ use crate::{
     error::ResourceError,
     replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, K8sResourceObject, MergeMetadata, ObjectMeta, Resource, ResourceObject},
-    retention::{EventRetention, ResourceDecodeQuarantine, ResourceStoreDiagnostics},
+    retention::{EventRetention, ResourceDecodeQuarantine, ResourceStoreDiagnostics, MAX_FIELD_OWNERSHIP_VIOLATIONS},
     watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
+    FieldOwnershipViolation,
 };
 
 type StoreKey = (String, String, String, String);
@@ -193,6 +194,12 @@ impl SqliteBackend {
                     PRIMARY KEY (group_name, version, kind, namespace)
                 );
 
+                CREATE TABLE IF NOT EXISTS field_ownership_violations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    body_json TEXT NOT NULL,
+                    observed_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS replica_objects (
                     origin_root TEXT NOT NULL,
                     group_name TEXT NOT NULL,
@@ -350,7 +357,44 @@ impl SqliteBackend {
             .collect::<Result<Vec<_>, ResourceError>>()?;
         let mut diagnostics = ResourceStoreDiagnostics::new(object_count, event_count, resource_stream_count, event_retention);
         diagnostics.decode_quarantines = decode_quarantines;
+        let mut statement = connection
+            .prepare("SELECT body_json FROM field_ownership_violations ORDER BY id")
+            .map_err(|err| Self::map_sqlite(err, "prepare field ownership violation diagnostics"))?;
+        diagnostics.field_ownership_violations = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| Self::map_sqlite(err, "query field ownership violation diagnostics"))?
+            .map(|row| {
+                let body = row.map_err(|err| Self::map_sqlite(err, "read field ownership violation diagnostic"))?;
+                serde_json::from_str(&body)
+                    .map_err(|err| ResourceError::decode(format!("decode field ownership violation diagnostic: {err}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(diagnostics)
+    }
+
+    pub(crate) async fn record_field_ownership_violation(&self, violation: FieldOwnershipViolation) -> Result<(), ResourceError> {
+        let body = serde_json::to_string(&violation)
+            .map_err(|error| ResourceError::decode(format!("encode field ownership violation: {error}")))?;
+        let observed_at = violation.observed_at.to_rfc3339();
+        self.call(move |connection| {
+            connection
+                .execute("INSERT INTO field_ownership_violations (body_json, observed_at) VALUES (?1, ?2)", rusqlite::params![
+                    body,
+                    observed_at
+                ])
+                .map_err(|error| Self::map_sqlite(error, "record field ownership violation"))?;
+            connection
+                .execute(
+                    "DELETE FROM field_ownership_violations
+                     WHERE id NOT IN (
+                         SELECT id FROM field_ownership_violations ORDER BY id DESC LIMIT ?1
+                     )",
+                    rusqlite::params![MAX_FIELD_OWNERSHIP_VIOLATIONS],
+                )
+                .map_err(|error| Self::map_sqlite(error, "compact field ownership violations"))?;
+            Ok(())
+        })
+        .await
     }
 
     fn clone_through_serde<T>(value: &T) -> Result<T, ResourceError>

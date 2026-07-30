@@ -46,6 +46,7 @@ default = []
 aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-daemon/aws-lc-provider"]
 
 [dependencies]
+flotilla-client = { path = "crates/flotilla-client" }
 flotilla-commands = { path = "crates/flotilla-commands" }
 flotilla-core = { path = "crates/flotilla-core" }
 flotilla-daemon = { path = "crates/flotilla-daemon" }

@@ -1,0 +1,97 @@
+name: Publish fleet artifacts (Darwin)
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: fleet-release-${{ forgejo.repository }}-${{ forgejo.sha }}-darwin
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  FLEET_REPOSITORY: ${{ forgejo.repository }}
+  FLEET_COMMIT_SHA: ${{ forgejo.sha }}
+  FLEET_SERVER_URL: ${{ forgejo.server_url }}
+  FLEET_API_URL: ${{ forgejo.api_url }}
+
+jobs:
+  darwin:
+    name: Darwin arm64
+    runs-on: fleet-release-darwin-arm64-signing
+    timeout-minutes: 30
+    steps:
+      - name: Verify release runner capability
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          : "${FLEET_CODESIGN_IDENTITY:?runner environment must provide FLEET_CODESIGN_IDENTITY}"
+          signing_probe=$(mktemp)
+          trap 'rm -f "$signing_probe"' EXIT
+          cp /usr/bin/true "$signing_probe"
+          codesign --force --sign "$FLEET_CODESIGN_IDENTITY" "$signing_probe"
+          codesign --verify --strict "$signing_probe"
+
+      - name: Check out exact source revision
+        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          clean: false
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ forgejo.sha }}
+
+      - name: Verify and clean source revision
+        run: |
+          test "$(git rev-parse HEAD)" = "$FLEET_COMMIT_SHA"
+          git clean -ffdx -e target/
+
+      - name: Build debug-profile binaries
+        run: |
+          FLOTILLA_BUILD_ID=$(git rev-parse --short=12 "$FLEET_COMMIT_SHA")
+          export FLOTILLA_BUILD_ID
+          cargo +stable build --locked --bin flotilla --bin flotillad
+
+      - name: Test, sign, and describe artifacts
+        run: |
+          : "${FLEET_CODESIGN_IDENTITY:?runner environment must provide FLEET_CODESIGN_IDENTITY}"
+          RELEASE_TAG="fleet-$FLEET_COMMIT_SHA"
+          WIRE_GENERATION=$(git rev-parse --short=12 "$FLEET_COMMIT_SHA")
+          mkdir -p dist
+          install -m 0755 target/debug/flotilla dist/flotilla-darwin-arm64
+          install -m 0755 target/debug/flotillad dist/flotillad-darwin-arm64
+          for artifact in dist/flotilla-darwin-arm64 dist/flotillad-darwin-arm64; do
+            codesign --force --options runtime \
+              --entitlements ci/fork-actions/runtime/macos-cli.entitlements \
+              --sign "$FLEET_CODESIGN_IDENTITY" \
+              "$artifact"
+            codesign --verify --strict --verbose=2 "$artifact"
+          done
+          dist/flotilla-darwin-arm64 --version | grep -F "wire=${WIRE_GENERATION}"
+          dist/flotillad-darwin-arm64 --version | grep -F "wire=${WIRE_GENERATION}"
+          ci/fork-actions/runtime/write-artifact-metadata.sh \
+            dist/flotilla-darwin-arm64 \
+            dist/flotilla-darwin-arm64.json \
+            "$FLEET_REPOSITORY" "$FLEET_COMMIT_SHA" "$RELEASE_TAG" \
+            darwin-arm64 "$WIRE_GENERATION" true
+          ci/fork-actions/runtime/write-artifact-metadata.sh \
+            dist/flotillad-darwin-arm64 \
+            dist/flotillad-darwin-arm64.json \
+            "$FLEET_REPOSITORY" "$FLEET_COMMIT_SHA" "$RELEASE_TAG" \
+            darwin-arm64 "$WIRE_GENERATION" true
+
+      # Publishing adapter: all Forgejo release creation and asset upload is isolated here.
+      - name: Publish Forgejo Release assets
+        env:
+          FORGEJO_TOKEN: ${{ forgejo.token }}
+        run: |
+          ci/fork-actions/runtime/publish-forgejo-release.sh \
+            --expect flotilla-linux-x86_64 \
+            --expect flotilla-linux-x86_64.json \
+            --expect flotillad-linux-x86_64 \
+            --expect flotillad-linux-x86_64.json \
+            --expect flotilla-darwin-arm64 \
+            --expect flotilla-darwin-arm64.json \
+            --expect flotillad-darwin-arm64 \
+            --expect flotillad-darwin-arm64.json \
+            -- dist/*

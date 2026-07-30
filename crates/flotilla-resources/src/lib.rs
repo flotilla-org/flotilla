@@ -8,6 +8,7 @@ mod credential;
 mod definition;
 mod environment;
 mod error;
+mod field_ownership;
 mod host;
 mod http;
 mod in_memory;
@@ -62,6 +63,7 @@ pub use environment::{
     EnvironmentStatusPatch, EnvironmentWaitReason, HostDirectEnvironmentSpec,
 };
 pub use error::ResourceError;
+pub use field_ownership::{FieldOwnedResource, FieldOwnership, FieldOwnershipViolation, OwnershipEnforcement, WriterIdentity, WriterRole};
 pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use host::{
     Host, HostCondition, HostSpec, HostStatus, HostStatusPatch, AGENT_ADAPTERS_CAPABILITY, HEARTBEAT_READY_TTL_SECS,
@@ -95,11 +97,11 @@ pub use project::{
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use registry::{
-    apply_resource_document, delete_resource_kind, get_resource_kind, list_resource_kind, list_resource_kind_including_replicas,
-    list_resource_kind_replica_sources, quarantine_undecodable_stored_objects, replica_cursor_for_resource_kind,
-    resource_document_spec_hash, resource_list_api_version, watch_resource_kind, watch_resource_kind_from,
-    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceList, DynamicResourceObject,
-    DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
+    apply_manifest_resource_document, apply_resource_document, delete_resource_kind, get_resource_kind, list_resource_kind,
+    list_resource_kind_including_replicas, list_resource_kind_replica_sources, quarantine_undecodable_stored_objects,
+    replica_cursor_for_resource_kind, resource_document_spec_hash, resource_list_api_version, watch_resource_kind,
+    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceList,
+    DynamicResourceObject, DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
 };
 pub use replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass, ResourceProvenance};
 pub use repository::{

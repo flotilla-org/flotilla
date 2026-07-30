@@ -1,5 +1,7 @@
 use std::{error::Error, fmt};
 
+use crate::FieldOwnershipViolation;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceError {
     NotFound { name: String },
@@ -7,6 +9,7 @@ pub enum ResourceError {
     Invalid { message: String },
     WatchExpired { requested_version: String, compacted_through: Option<String> },
     Unauthorized { message: String },
+    FieldOwnership { violations: Vec<FieldOwnershipViolation> },
     Other { message: String },
 }
 
@@ -34,6 +37,12 @@ impl ResourceError {
     pub fn decode(message: impl Into<String>) -> Self {
         Self::other(message)
     }
+
+    /// Reconcilers requeue both optimistic concurrency conflicts and ownership
+    /// enforcement failures from a fresh read.
+    pub fn is_stale_view(&self) -> bool {
+        matches!(self, Self::Conflict { .. } | Self::FieldOwnership { .. })
+    }
 }
 
 impl fmt::Display for ResourceError {
@@ -49,6 +58,9 @@ impl fmt::Display for ResourceError {
                 write!(f, "watch resourceVersion {requested_version} expired")
             }
             Self::Unauthorized { message } => write!(f, "unauthorized: {message}"),
+            Self::FieldOwnership { violations } => {
+                write!(f, "field ownership refused {} violation(s)", violations.len())
+            }
             Self::Other { message } => f.write_str(message),
         }
     }

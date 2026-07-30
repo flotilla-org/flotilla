@@ -11,7 +11,7 @@ use std::{
 };
 
 use flotilla_resources::{
-    apply_resource_document, get_resource_kind, resource_document_spec_hash, ResourceBackend, ResourceError, MANAGED_BY_LABEL,
+    apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, ResourceBackend, ResourceError, MANAGED_BY_LABEL,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -151,9 +151,7 @@ impl ResourceManifestReconciler {
             Err(error) => return Err(format!("{identity}: {error}")),
         };
         let Some(existing) = existing else {
-            apply_resource_document(&self.backend, &self.default_namespace, document)
-                .await
-                .map_err(|error| format!("{identity}: {error}"))?;
+            self.apply_manifest_document(document).await.map_err(|error| format!("{identity}: {error}"))?;
             report.created += 1;
             return Ok(());
         };
@@ -192,9 +190,30 @@ impl ResourceManifestReconciler {
         }
 
         preserve_external_metadata(&mut document, &existing)?;
-        apply_resource_document(&self.backend, &self.default_namespace, document).await.map_err(|error| format!("{identity}: {error}"))?;
+        self.apply_manifest_document(document).await.map_err(|error| format!("{identity}: {error}"))?;
         self.warned_drift.retain(|(warned, _, _)| warned != &identity);
         report.updated += 1;
+        Ok(())
+    }
+
+    async fn apply_manifest_document(&self, document: Value) -> Result<(), String> {
+        let applied =
+            apply_manifest_resource_document(&self.backend, &self.default_namespace, document).await.map_err(|error| error.to_string())?;
+        let persisted_hash = resource_document_spec_hash(&applied.value).map_err(|error| error.to_string())?;
+        let recorded_hash = string_map(&applied.value, "annotations")?.get(LAST_APPLIED_HASH_ANNOTATION).cloned();
+        if recorded_hash.as_deref() == Some(persisted_hash.as_str()) {
+            return Ok(());
+        }
+
+        // Ownership enforcement can preserve protected fields, so the stored
+        // spec may differ from the requested manifest. Record the hash of what
+        // was actually persisted or the next pass will misclassify that
+        // preservation as external drift.
+        let mut persisted = applied.value;
+        let metadata =
+            persisted.get_mut("metadata").and_then(Value::as_object_mut).ok_or_else(|| "stored object has invalid metadata".to_string())?;
+        insert_metadata_value(metadata, "annotations", LAST_APPLIED_HASH_ANNOTATION, &persisted_hash)?;
+        apply_manifest_resource_document(&self.backend, &self.default_namespace, persisted).await.map_err(|error| error.to_string())?;
         Ok(())
     }
 }
@@ -324,6 +343,12 @@ mod tests {
         format!("apiVersion: flotilla.work/v1\nkind: PlacementPolicy\nmetadata:\n  name: {name}\nspec:\n  pool: {pool}\n")
     }
 
+    fn manifest_with_priority(name: &str, pool: &str, priority: i32) -> String {
+        format!(
+            "apiVersion: flotilla.work/v1\nkind: PlacementPolicy\nmetadata:\n  name: {name}\nspec:\n  pool: {pool}\n  priority: {priority}\n"
+        )
+    }
+
     #[tokio::test]
     async fn fresh_directory_applies_all_documents_with_ownership_and_source() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -399,7 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_forwards_only_when_live_spec_matches_last_applied_hash() {
+    async fn manifest_updates_all_declared_fields_and_then_settles() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("moving", "one"));
@@ -412,13 +437,33 @@ mod tests {
         live_meta.labels.insert("another-controller/observation".to_string(), "kept".to_string());
         resolver.update(&live_meta, &applied.metadata.resource_version, &applied.spec).await.expect("add external metadata");
 
-        write(&path, &manifest("moving", "two"));
+        write(&path, &manifest_with_priority("moving", "two", 100));
         let report = reconciler.reconcile_once().await.expect("fast-forward pass");
         let object = resolver.get("moving").await.expect("policy");
 
         assert_eq!(report.updated, 1);
         assert_eq!(object.spec.pool, "two");
+        assert_eq!(object.spec.priority, 100);
         assert_eq!(object.metadata.labels.get("another-controller/observation").map(String::as_str), Some("kept"));
+        assert_eq!(
+            object.metadata.annotations.get(LAST_APPLIED_HASH_ANNOTATION),
+            Some(
+                &resource_document_spec_hash(&serde_json::to_value(object.to_k8s_object()).expect("resource document"))
+                    .expect("persisted spec digest")
+            ),
+            "last-applied must describe the ownership-filtered spec"
+        );
+
+        let settled_version = object.metadata.resource_version;
+        let settled = reconciler.reconcile_once().await.expect("settled pass");
+        let object = resolver.get("moving").await.expect("settled policy");
+
+        assert_eq!(settled.unchanged, 1);
+        assert_eq!(settled.updated, 0);
+        assert_eq!(settled.drifted, 0);
+        assert_eq!(object.metadata.resource_version, settled_version, "settled manifests must not keep writing");
+        let diagnostics = backend.diagnostics().await.expect("diagnostics").expect("embedded diagnostics");
+        assert!(diagnostics.field_ownership_violations.is_empty(), "manifest projection must not synthesize ownership violations");
     }
 
     #[tokio::test]

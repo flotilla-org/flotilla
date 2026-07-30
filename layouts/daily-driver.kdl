@@ -19,8 +19,8 @@ plugins {
         rail_sizing "active-large"
         rail_grouping "directory"
         rail_segment_between_color "#282c34"
-        template_config_path "file:$ANDAMENTO_ROOT/templates/andamento-git.kdl"
-        grouping_config_path "file:$ANDAMENTO_ROOT/templates/andamento-git.kdl"
+        template_config_path "file:$ANDAMENTO_ROOT/templates/flotilla-default.kdl"
+        grouping_config_path "file:$ANDAMENTO_ROOT/templates/flotilla-default.kdl"
     }
     andamento-rail location="native:andamento-rail" {
         controller_plugin_url "andamento-controller"

@@ -1,0 +1,93 @@
+name: Publish fleet artifacts (Darwin)
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: fleet-release-${{ forgejo.repository }}-${{ forgejo.sha }}-darwin
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  FLEET_REPOSITORY: ${{ forgejo.repository }}
+  FLEET_COMMIT_SHA: ${{ forgejo.sha }}
+  FLEET_SERVER_URL: ${{ forgejo.server_url }}
+  FLEET_API_URL: ${{ forgejo.api_url }}
+
+jobs:
+  darwin:
+    name: Darwin arm64
+    runs-on: fleet-release-darwin-arm64-signing
+    timeout-minutes: 30
+    steps:
+      - name: Verify release runner capability
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          test "$(zig version)" = 0.15.2
+          : "${FLEET_CODESIGN_IDENTITY:?runner environment must provide FLEET_CODESIGN_IDENTITY}"
+          : "${FLEET_MACOS_SDK:?runner environment must provide FLEET_MACOS_SDK}"
+          test -d "$FLEET_MACOS_SDK"
+          signing_probe=$(mktemp)
+          trap 'rm -f "$signing_probe"' EXIT
+          cp /usr/bin/true "$signing_probe"
+          codesign --force --sign "$FLEET_CODESIGN_IDENTITY" "$signing_probe"
+          codesign --verify --strict "$signing_probe"
+
+      - name: Check out exact source revision
+        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          clean: false
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ forgejo.sha }}
+
+      - name: Verify and clean source revision
+        run: |
+          test "$(git rev-parse HEAD)" = "$FLEET_COMMIT_SHA"
+          git clean -ffdx -e target/ -e .tools/
+
+      - name: Prepare Ghostty VT
+        run: |
+          export PATH="$PWD/ci/fork-actions/runtime/cleat/macos-zig-sdk-shim:$PATH"
+          test "$(xcrun --show-sdk-path)" = "$FLEET_MACOS_SDK"
+          ci/fork-actions/runtime/cleat/prepare-ghostty-vt.sh
+
+      - name: Build functional release binary
+        run: cargo +stable build -p cleat --locked --features ghostty-vt --release
+
+      - name: Test, sign, and describe artifact
+        run: |
+          : "${FLEET_CODESIGN_IDENTITY:?runner environment must provide FLEET_CODESIGN_IDENTITY}"
+          RELEASE_TAG="fleet-$FLEET_COMMIT_SHA"
+          mkdir -p dist
+          install -m 0755 target/release/cleat dist/cleat-darwin-arm64
+          dist/cleat-darwin-arm64 launch --help | grep -q -- --tag
+          if otool -L dist/cleat-darwin-arm64 | grep -q ghostty-vt; then
+            echo "cleat must be self-contained; found a dynamic ghostty-vt dependency" >&2
+            exit 1
+          fi
+          codesign --force --options runtime \
+            --entitlements ci/fork-actions/runtime/macos-cli.entitlements \
+            --sign "$FLEET_CODESIGN_IDENTITY" \
+            dist/cleat-darwin-arm64
+          codesign --verify --strict --verbose=2 dist/cleat-darwin-arm64
+          ci/fork-actions/runtime/write-artifact-metadata.sh \
+            dist/cleat-darwin-arm64 \
+            dist/cleat-darwin-arm64.json \
+            "$FLEET_REPOSITORY" "$FLEET_COMMIT_SHA" "$RELEASE_TAG" \
+            darwin-arm64 "" true
+
+      # Publishing adapter: all Forgejo release creation and asset upload is isolated here.
+      - name: Publish Forgejo Release assets
+        env:
+          FORGEJO_TOKEN: ${{ forgejo.token }}
+        run: |
+          ci/fork-actions/runtime/publish-forgejo-release.sh \
+            --expect cleat-linux-x86_64 \
+            --expect cleat-linux-x86_64.json \
+            --expect cleat-darwin-arm64 \
+            --expect cleat-darwin-arm64.json \
+            -- dist/*
