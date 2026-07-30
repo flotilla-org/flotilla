@@ -1187,6 +1187,9 @@ async fn apply_host_heartbeat_with_credentials(
     if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
         conditions.push(condition);
     }
+    if let Some(condition) = resource_field_ownership_condition(resource_store.as_ref()) {
+        conditions.push(condition);
+    }
     if let Some(condition) = resource_replication_content_condition(daemon, namespace).await? {
         conditions.push(condition);
     }
@@ -1274,6 +1277,42 @@ fn resource_decode_quarantine_condition(diagnostics: Option<&flotilla_resources:
                 quarantines.len(),
                 if quarantines.len() == 1 { "" } else { "s" },
                 if quarantines.len() == 1 { "" } else { "s" },
+            ))
+            .observed_at(Utc::now())
+            .build(),
+    )
+}
+
+fn resource_field_ownership_condition(diagnostics: Option<&flotilla_resources::ResourceStoreDiagnostics>) -> Option<HostCondition> {
+    let violations = &diagnostics?.field_ownership_violations;
+    if violations.is_empty() {
+        return None;
+    }
+    let details = violations
+        .iter()
+        .map(|violation| {
+            format!(
+                "{}/{}/{} {:?} attempted {}={} ({})",
+                violation.kind,
+                violation.namespace,
+                violation.name,
+                violation.writer.role,
+                violation.field,
+                violation.attempted_value,
+                violation.rule
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(
+        HostCondition::builder()
+            .condition_type("ResourceStore/FieldOwnership")
+            .value(ConditionValue::False)
+            .reason("FieldOwnershipViolation")
+            .message(format!(
+                "{} field ownership violation{} recorded: {details}",
+                violations.len(),
+                if violations.len() == 1 { "" } else { "s" }
             ))
             .observed_at(Utc::now())
             .build(),
@@ -2876,6 +2915,39 @@ mod tests {
             "fleet diagnosis must clear after bootstrap: {:?}",
             feta_row.degraded_conditions
         );
+    }
+
+    #[tokio::test]
+    async fn field_ownership_violation_is_exposed_in_fleet_diagnosis() {
+        let temp = TempDir::new().expect("tempdir");
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        let host_id = daemon.local_host_id().expect("local host id").to_string();
+        let profile = manual_profile(&host_id, false);
+        register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("register resources");
+
+        let policies = daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE);
+        let policy = policies.get(&profile.host_direct_policy_name()).await.expect("registered policy");
+        policies
+            .write_spec(
+                &flotilla_resources::WriterIdentity::operator(),
+                &InputMeta::from(&policy.metadata),
+                &policy.metadata.resource_version,
+                &PlacementPolicySpec::builder()
+                    .pool("operator-attempt".to_string())
+                    .priority(8)
+                    .host_direct(policy.spec.host_direct.clone().expect("host-direct policy"))
+                    .build(),
+            )
+            .await
+            .expect("observe-mode operator write");
+
+        apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("publish heartbeat");
+        let fleet = daemon.fleet_health_internal().await.expect("fleet diagnosis");
+        let local = fleet.hosts.iter().find(|host| host.is_local).expect("local host");
+        let diagnosis = local.degraded_conditions.join("; ");
+        assert!(diagnosis.contains("ResourceStore/FieldOwnership"), "{diagnosis}");
+        assert!(diagnosis.contains("spec.pool"), "{diagnosis}");
+        assert!(diagnosis.contains("Operator"), "{diagnosis}");
     }
 
     #[cfg(unix)]

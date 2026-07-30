@@ -141,6 +141,7 @@ async fn write_resource_error(stream: &mut UnixStream, error: ResourceError) -> 
         ResourceError::Invalid { .. } => 400,
         ResourceError::NotFound { .. } => 404,
         ResourceError::Conflict { .. } => 409,
+        ResourceError::FieldOwnership { .. } => 409,
         ResourceError::Unauthorized { .. } => 403,
         ResourceError::Other { .. } => 500,
     };
