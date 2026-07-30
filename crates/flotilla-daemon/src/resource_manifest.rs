@@ -11,7 +11,7 @@ use std::{
 };
 
 use flotilla_resources::{
-    apply_resource_document, get_resource_kind, resource_document_spec_hash, ResourceBackend, ResourceError, MANAGED_BY_LABEL,
+    apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, ResourceBackend, ResourceError, MANAGED_BY_LABEL,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -197,7 +197,8 @@ impl ResourceManifestReconciler {
     }
 
     async fn apply_manifest_document(&self, document: Value) -> Result<(), String> {
-        let applied = apply_resource_document(&self.backend, &self.default_namespace, document).await.map_err(|error| error.to_string())?;
+        let applied =
+            apply_manifest_resource_document(&self.backend, &self.default_namespace, document).await.map_err(|error| error.to_string())?;
         let persisted_hash = resource_document_spec_hash(&applied.value).map_err(|error| error.to_string())?;
         let recorded_hash = string_map(&applied.value, "annotations")?.get(LAST_APPLIED_HASH_ANNOTATION).cloned();
         if recorded_hash.as_deref() == Some(persisted_hash.as_str()) {
@@ -212,7 +213,7 @@ impl ResourceManifestReconciler {
         let metadata =
             persisted.get_mut("metadata").and_then(Value::as_object_mut).ok_or_else(|| "stored object has invalid metadata".to_string())?;
         insert_metadata_value(metadata, "annotations", LAST_APPLIED_HASH_ANNOTATION, &persisted_hash)?;
-        apply_resource_document(&self.backend, &self.default_namespace, persisted).await.map_err(|error| error.to_string())?;
+        apply_manifest_resource_document(&self.backend, &self.default_namespace, persisted).await.map_err(|error| error.to_string())?;
         Ok(())
     }
 }
@@ -423,7 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manifest_change_to_loop_owned_field_is_preserved_and_diagnosed() {
+    async fn manifest_updates_all_declared_fields_and_then_settles() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("moving", "one"));
@@ -436,12 +437,13 @@ mod tests {
         live_meta.labels.insert("another-controller/observation".to_string(), "kept".to_string());
         resolver.update(&live_meta, &applied.metadata.resource_version, &applied.spec).await.expect("add external metadata");
 
-        write(&path, &manifest("moving", "two"));
+        write(&path, &manifest_with_priority("moving", "two", 100));
         let report = reconciler.reconcile_once().await.expect("fast-forward pass");
         let object = resolver.get("moving").await.expect("policy");
 
         assert_eq!(report.updated, 1);
-        assert_eq!(object.spec.pool, "one", "operator manifest must not replace a loop-owned field");
+        assert_eq!(object.spec.pool, "two");
+        assert_eq!(object.spec.priority, 100);
         assert_eq!(object.metadata.labels.get("another-controller/observation").map(String::as_str), Some("kept"));
         assert_eq!(
             object.metadata.annotations.get(LAST_APPLIED_HASH_ANNOTATION),
@@ -452,22 +454,16 @@ mod tests {
             "last-applied must describe the ownership-filtered spec"
         );
 
-        write(&path, &manifest_with_priority("moving", "two", 100));
-        let follow_up = reconciler.reconcile_once().await.expect("follow-up pass");
-        let object = resolver.get("moving").await.expect("updated policy");
+        let settled_version = object.metadata.resource_version;
+        let settled = reconciler.reconcile_once().await.expect("settled pass");
+        let object = resolver.get("moving").await.expect("settled policy");
 
-        assert_eq!(follow_up.drifted, 0, "ownership preservation must not be mistaken for external drift");
-        assert_eq!(follow_up.updated, 1);
-        assert_eq!(object.spec.pool, "one");
-        assert_eq!(object.spec.priority, 100, "later operator-owned changes must still apply");
+        assert_eq!(settled.unchanged, 1);
+        assert_eq!(settled.updated, 0);
+        assert_eq!(settled.drifted, 0);
+        assert_eq!(object.metadata.resource_version, settled_version, "settled manifests must not keep writing");
         let diagnostics = backend.diagnostics().await.expect("diagnostics").expect("embedded diagnostics");
-        assert!(
-            diagnostics
-                .field_ownership_violations
-                .iter()
-                .any(|violation| violation.field == "spec.pool" && violation.writer.role == flotilla_resources::WriterRole::Operator),
-            "the rejected manifest field must remain fleet-visible"
-        );
+        assert!(diagnostics.field_ownership_violations.is_empty(), "manifest projection must not synthesize ownership violations");
     }
 
     #[tokio::test]

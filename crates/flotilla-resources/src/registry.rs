@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use crate::{
     api_version,
+    field_ownership::merge_owned_spec,
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
     Checkout, Clone as CloneResource, Convoy, CredentialGrant, CredentialSpec, Demand, Environment, FieldOwnedResource, Host, InputMeta,
@@ -216,6 +217,20 @@ macro_rules! dispatch_apply_resource_kind {
     };
 }
 
+/// Manifest reconciliation is authoritative for both operator-authored input
+/// and loop-derived topology. Enrolled resources project the same desired spec
+/// through each role instead of bypassing the single ownership-aware write path.
+macro_rules! dispatch_manifest_apply_resource_kind {
+    ($resource:expr, $backend:expr, $namespace:expr, $metadata:expr, $spec:expr) => {
+        match $resource {
+            RegisteredResource::PlacementPolicy => {
+                apply_manifest_owned_typed::<PlacementPolicy>($backend, $namespace, $metadata, $spec).await
+            }
+            resource => dispatch_resource_kind!(resource, apply_typed($backend, $namespace, $metadata, $spec).await),
+        }
+    };
+}
+
 /// Drives a typed read of every kind in the embedded durable store.
 ///
 /// Embedded stores use this startup pass to isolate rows whose persisted
@@ -332,6 +347,23 @@ pub async fn apply_resource_document(
         serde_json::from_value(document).map_err(|error| ResourceError::decode(format!("decode resource document: {error}")))?;
     let namespace = document.metadata.namespace.clone().unwrap_or_else(|| default_namespace.to_string());
     dispatch_apply_resource_kind!(lookup_resource_kind(&document.kind)?.resource, backend, &namespace, document.metadata, document.spec)
+}
+
+pub async fn apply_manifest_resource_document(
+    backend: &ResourceBackend,
+    default_namespace: &str,
+    document: Value,
+) -> Result<DynamicResourceObject, ResourceError> {
+    let document: DynamicApplyDocument =
+        serde_json::from_value(document).map_err(|error| ResourceError::decode(format!("decode resource document: {error}")))?;
+    let namespace = document.metadata.namespace.clone().unwrap_or_else(|| default_namespace.to_string());
+    dispatch_manifest_apply_resource_kind!(
+        lookup_resource_kind(&document.kind)?.resource,
+        backend,
+        &namespace,
+        document.metadata,
+        document.spec
+    )
 }
 
 /// Hash a resource document's spec after its registered typed representation
@@ -632,6 +664,46 @@ async fn apply_owned_typed<T: FieldOwnedResource>(
             resolver.write_spec(&WriterIdentity::operator(), &meta, &existing.metadata.resource_version, &spec).await?
         }
         Err(ResourceError::NotFound { .. }) => resolver.create(&metadata.input_meta_for_create(), &spec).await?,
+        Err(error) => return Err(error),
+    };
+    Ok(DynamicResourceObject {
+        kind: T::API_PATHS.kind.to_string(),
+        plural: T::API_PATHS.plural.to_string(),
+        namespace: namespace.to_string(),
+        value: object_value(&object)?,
+    })
+}
+
+async fn apply_manifest_owned_typed<T: FieldOwnedResource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    metadata: DynamicApplyMetadata,
+    spec: Value,
+) -> Result<DynamicResourceObject, ResourceError> {
+    let desired =
+        serde_json::from_value(spec).map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", T::API_PATHS.kind)))?;
+    let resolver = backend.using::<T>(namespace);
+    let object = match resolver.get(&metadata.name).await {
+        Ok(existing) => {
+            let operator = WriterIdentity::operator();
+            let (operator_spec, _) = merge_owned_spec::<T>(&existing.spec, &desired, &operator, namespace, &metadata.name)?;
+            let meta = metadata.input_meta_for_update(&existing.metadata);
+            let operator_written = resolver.write_spec(&operator, &meta, &existing.metadata.resource_version, &operator_spec).await?;
+
+            let reconcile_loop = WriterIdentity::reconcile_loop();
+            let (loop_spec, _) = merge_owned_spec::<T>(&operator_written.spec, &desired, &reconcile_loop, namespace, &metadata.name)?;
+            let current_value = serde_json::to_value(&operator_written.spec)
+                .map_err(|error| ResourceError::decode(format!("encode current {} spec: {error}", T::API_PATHS.kind)))?;
+            let loop_value = serde_json::to_value(&loop_spec)
+                .map_err(|error| ResourceError::decode(format!("encode projected {} spec: {error}", T::API_PATHS.kind)))?;
+            if current_value == loop_value {
+                operator_written
+            } else {
+                let meta = metadata.input_meta_for_update(&operator_written.metadata);
+                resolver.write_spec(&reconcile_loop, &meta, &operator_written.metadata.resource_version, &loop_spec).await?
+            }
+        }
+        Err(ResourceError::NotFound { .. }) => resolver.create(&metadata.input_meta_for_create(), &desired).await?,
         Err(error) => return Err(error),
     };
     Ok(DynamicResourceObject {
