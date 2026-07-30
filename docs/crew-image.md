@@ -9,6 +9,24 @@ forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-07-26.1
 The explicit release tag is the deployment contract. Do not point placement
 policies at `latest`.
 
+Contained crew terminal sessions run inside the environment. A Docker
+placement therefore names `pool: cleat`, meaning the cleat discovered inside
+that container; it does not name a host-side session that wraps `docker exec`.
+Launch, liveness observation, and attach all resolve that same interior pool.
+
+The current Linux-host interim delivers the cleat executable and its
+`libghostty-vt` runtime library with the same read-only bind-mount mechanism
+used for the Flotilla CLI. Its runtime root is a writable bind mount from
+`<flotilla-state>/contained-cleat/<environment>` to
+`/var/lib/flotilla/cleat`, with `CLEAT_RUNTIME_DIR` set to the latter. Cleat
+records sessions by default, so recordings remain on the host after container
+teardown. A future image release should bake cleat into the image; the mounted
+runtime root remains the durability boundary either way.
+
+The mounted Flotilla CLI connects back to the host daemon through the mounted
+socket named by `FLOTILLA_DAEMON_SOCKET`; normal CLI commands honor that
+variable, not only agent-hook delivery.
+
 This document is curation advice for the Flotilla project. It is not a schema
 or a contract that Flotilla validates. Flotilla's contract stays deliberately
 narrow: a placement names an image and declares the adapters it promises,
@@ -58,7 +76,8 @@ fastest-changing:
 1. Ubuntu, certificates, Git, and curl;
 2. Rust stable, the repository's pinned `nightly-2026-03-12`, and Node.js;
 3. `gh` and general development utilities;
-4. Claude Code and Codex.
+4. the cleat terminal runtime;
+5. Claude Code and Codex.
 
 From the repository root, a builder with amd64 and arm64 workers can publish
 the release with:
@@ -94,8 +113,9 @@ docker run --rm "$IMAGE" claude --version
 docker run --rm "$IMAGE" codex --version
 ```
 
-The Dockerfile also runs these checks while building. A build cannot publish
-successfully if either declared adapter is missing or not executable.
+Until the image bakes cleat, run its version check against a provisioned
+environment, where Flotilla supplies the interim bind mount. The Dockerfile
+currently checks both declared agent adapters while building.
 
 ## Placement policy
 

@@ -252,7 +252,6 @@ impl<R> PresentationReconciler<R> {
             .terminal_pools
             .get(&session.spec.pool)
             .map(|(_, pool)| Arc::clone(pool))
-            .or_else(|| registry.terminal_pools.preferred().cloned())
             .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
 
         let session_cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
