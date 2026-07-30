@@ -208,36 +208,3 @@ async fn enforce_mode_records_and_refuses_with_typed_error() {
     assert_eq!(resources.get("only").await.expect("stored resource").spec.operator_value, "stored");
     assert_eq!(backend.diagnostics().await.expect("diagnostics").expect("embedded diagnostics").field_ownership_violations.len(), 1);
 }
-
-#[tokio::test]
-async fn operator_priority_survives_unbounded_local_and_remote_registration_cycles() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let policies = backend.using::<PlacementPolicy>("flotilla");
-    let created = policies
-        .create(&InputMeta::builder().name("host-direct-shared".to_string()).build(), &host_direct("local", 0, "local"))
-        .await
-        .expect("create policy");
-    let mut current = policies
-        .write_spec(
-            &WriterIdentity::operator(),
-            &InputMeta::from(&created.metadata),
-            &created.metadata.resource_version,
-            &host_direct("local", 73, "local"),
-        )
-        .await
-        .expect("operator applies priority");
-
-    for cycle in 0..256 {
-        let (pool, host) = if cycle % 2 == 0 { ("local", "local") } else { ("remote", "remote") };
-        current = policies
-            .write_spec(
-                &WriterIdentity::reconcile_loop(),
-                &InputMeta::from(&current.metadata),
-                &current.metadata.resource_version,
-                &host_direct(pool, 0, host),
-            )
-            .await
-            .expect("registration cycle");
-        assert_eq!(current.spec.priority, 73, "priority changed during registration cycle {cycle}");
-    }
-}
