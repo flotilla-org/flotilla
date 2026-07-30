@@ -70,11 +70,20 @@ fn merge_registered_policy_spec(existing: &PlacementPolicySpec, desired: &Placem
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
 
+    use async_trait::async_trait;
+    use chrono::{TimeZone, Utc};
     use flotilla_resources::{
+        test_support::{
+            run_transition_sequence, FixpointPredicate, LivenessEnrollment, LivenessScenario, LivenessStep, ReconcileStep, Transition,
+            TransitionDriver, TransitionSequence, WorldBuilder,
+        },
         DockerCheckoutStrategy, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout,
-        HostDirectPlacementPolicySpec, InMemoryBackend,
+        HostDirectPlacementPolicySpec, InMemoryBackend, ResourceObject, VirtualClock,
     };
 
     use super::*;
@@ -177,5 +186,173 @@ mod tests {
         assert_eq!(runtime.env, BTreeMap::from([("OPERATOR".to_string(), "true".to_string())]));
         let diagnostics = backend.diagnostics().await.expect("diagnostics").expect("embedded diagnostics");
         assert!(diagnostics.field_ownership_violations.is_empty(), "registration must not synthesize runtime write attempts");
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum RegistrationRole {
+        Local,
+        Remote,
+    }
+
+    impl RegistrationRole {
+        fn policy_name(self) -> &'static str {
+            match self {
+                Self::Local => "host-direct-local",
+                Self::Remote => "host-direct-remote",
+            }
+        }
+
+        fn host_ref(self) -> &'static str {
+            match self {
+                Self::Local => "local",
+                Self::Remote => "remote",
+            }
+        }
+
+        fn pool(self) -> &'static str {
+            match self {
+                Self::Local => "passthrough",
+                Self::Remote => "zellij",
+            }
+        }
+    }
+
+    struct PolicyWorld {
+        backend: ResourceBackend,
+        role: RegistrationRole,
+        desired: PlacementPolicySpec,
+        current: Option<ResourceObject<PlacementPolicy>>,
+        external_write_observed: bool,
+        reconciles_after_external_write: usize,
+    }
+
+    struct PolicyWorldBuilder {
+        role: RegistrationRole,
+    }
+
+    #[async_trait]
+    impl WorldBuilder for PolicyWorldBuilder {
+        type World = PolicyWorld;
+
+        async fn build(&self, _scenario: LivenessScenario) -> Result<Self::World, String> {
+            Ok(PolicyWorld {
+                backend: ResourceBackend::InMemory(InMemoryBackend::default()),
+                role: self.role,
+                desired: host_direct(self.role.pool(), self.role.host_ref()),
+                current: None,
+                external_write_observed: false,
+                reconciles_after_external_write: 0,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    enum PolicyField {
+        Priority,
+    }
+
+    struct PolicyStep;
+
+    #[async_trait]
+    impl ReconcileStep<PolicyWorld> for PolicyStep {
+        type Patch = ();
+        type Actuation = ();
+
+        async fn reconcile_step(&self, world: &mut PolicyWorld) -> Result<LivenessStep<Self::Patch, Self::Actuation>, String> {
+            reconcile_registered_policy(&world.backend, NAMESPACE, world.role.policy_name(), &world.desired).await?;
+            world.current = Some(
+                world
+                    .backend
+                    .clone()
+                    .using::<PlacementPolicy>(NAMESPACE)
+                    .get(world.role.policy_name())
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+            if world.external_write_observed {
+                world.reconciles_after_external_write += 1;
+            }
+            Ok(LivenessStep::new(None, Vec::new()))
+        }
+
+        async fn apply_patch(&self, _world: &mut PolicyWorld, _patch: Self::Patch) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn apply_actuation(&self, _world: &mut PolicyWorld, _actuation: Self::Actuation) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl TransitionDriver<PolicyWorld> for PolicyStep {
+        type Field = PolicyField;
+        type Value = i32;
+        type OriginRoot = String;
+
+        async fn external_spec_write(&self, world: &mut PolicyWorld, field: &Self::Field, value: &Self::Value) -> Result<(), String> {
+            let current = world.current.as_ref().ok_or_else(|| "registration has not created the policy".to_string())?;
+            let mut spec = current.spec.clone();
+            match field {
+                PolicyField::Priority => spec.priority = *value,
+            }
+            let updated = world
+                .backend
+                .clone()
+                .using::<PlacementPolicy>(NAMESPACE)
+                .write_spec(&WriterIdentity::operator(), &InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec)
+                .await
+                .map_err(|error| error.to_string())?;
+            world.current = Some(updated);
+            world.external_write_observed = true;
+            Ok(())
+        }
+
+        async fn delete(&self, _world: &mut PolicyWorld) -> Result<(), String> {
+            Err("delete is not part of the placement registration property".to_string())
+        }
+
+        async fn restart_controller(&self, _world: &mut PolicyWorld) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn partition_store(&self, _world: &mut PolicyWorld, _origin_root: &Self::OriginRoot) -> Result<(), String> {
+            Err("store partition is not part of the placement registration property".to_string())
+        }
+    }
+
+    struct PolicyFixpoint;
+
+    impl FixpointPredicate<PolicyWorld> for PolicyFixpoint {
+        fn at_fixpoint(&self, _world: &PolicyWorld) -> bool {
+            false
+        }
+    }
+
+    /// Regression property for #1236/#1248: registration owns topology, while
+    /// an operator's priority write must survive subsequent local and remote
+    /// registration reconciles.
+    #[tokio::test]
+    async fn operator_priority_survives_local_and_remote_registration_sequences() {
+        for role in [RegistrationRole::Local, RegistrationRole::Remote] {
+            let clock = Arc::new(VirtualClock::new(Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).single().expect("valid test timestamp")));
+            let enrollment = LivenessEnrollment::new(PolicyWorldBuilder { role }, PolicyStep, PolicyFixpoint, clock);
+            let sequence: TransitionSequence<PolicyWorld, PolicyField, i32, String> = TransitionSequence::new([
+                Transition::Reconcile,
+                Transition::ExternalSpecWrite(PolicyField::Priority, 17),
+                Transition::Reconcile,
+                Transition::Reconcile,
+            ])
+            .sometimes("operator priority survived a registration reconcile", |world: &PolicyWorld| {
+                world.reconciles_after_external_write > 0 && world.current.as_ref().is_some_and(|policy| policy.spec.priority == 17)
+            });
+
+            let world = run_transition_sequence(&enrollment, LivenessScenario::Normal, &sequence)
+                .await
+                .unwrap_or_else(|error| panic!("{role:?} registration sequence failed: {error}"));
+            assert_eq!(world.current.expect("registered policy").spec.priority, 17, "{role:?} registration stomped operator priority");
+            let diagnostics = world.backend.diagnostics().await.expect("diagnostics").expect("embedded diagnostics");
+            assert!(diagnostics.field_ownership_violations.is_empty(), "{role:?} sequence recorded false ownership violations");
+        }
     }
 }

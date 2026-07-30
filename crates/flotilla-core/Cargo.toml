@@ -46,6 +46,7 @@ libc = "0.2"
 
 [dev-dependencies]
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
+flotilla-resources = { path = "../flotilla-resources", features = ["test-support"] }
 tempfile = "3"
 insta = "1"
 
