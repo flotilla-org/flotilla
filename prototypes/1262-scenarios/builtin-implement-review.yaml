@@ -1,0 +1,67 @@
+# Ruled-model translation of implement_review_workflow_spec().
+# This is reaction data for #1269, not a document accepted by today's schema.
+apiVersion: flotilla.work/v1
+kind: WorkflowTemplate
+metadata:
+  name: implement-review
+  namespace: flotilla
+  labels:
+    flotilla.work/managed-by: builtin
+spec:
+  vessels:
+    - name: work
+      stance: contained
+      crew:
+        - role: coder
+          selector:
+            capability: code
+        - role: reviewer
+          selector:
+            capability: code-review
+
+  engagement_rules:
+    # Today the first agent starts eagerly with the vessel. This rule states
+    # that initial engagement explicitly.
+    - name: initial-coding-turn
+      when:
+        transition: work.entered-running
+        subject:
+          vessel: work
+      engage:
+        vessel: work
+        role: coder
+        brief_template: crew
+      expecting:
+        fact: crew-work.phase
+        subject:
+          vessel: work
+          role: coder
+        equals: Done
+
+    # This is the ruled model's deterministic normal path: completed
+    # implementation engages the latent reviewer. Today's coder may instead
+    # choose an earlier, overlapping handoff with a free-form message; GAPS.md
+    # records the missing declaration/outcome shape needed to preserve that
+    # choice exactly.
+    - name: review-completed-implementation
+      when:
+        transition: crew-work.entered-done
+        subject:
+          vessel: work
+          role: coder
+        guards:
+          - fact: crew-work.phase
+            subject:
+              vessel: work
+              role: reviewer
+            equals: Pending
+      engage:
+        vessel: work
+        role: reviewer
+        brief_template: diff-review
+      expecting:
+        fact: crew-work.phase
+        subject:
+          vessel: work
+          role: reviewer
+        equals: Done

@@ -1,0 +1,37 @@
+# Ruled-model translation of single_agent_trusted_workflow_spec().
+# This is reaction data for #1269, not a document accepted by today's schema.
+apiVersion: flotilla.work/v1
+kind: WorkflowTemplate
+metadata:
+  name: single-agent-trusted
+  namespace: flotilla
+  labels:
+    flotilla.work/managed-by: builtin
+spec:
+  vessels:
+    - name: work
+      stance: trusted
+      crew:
+        - role: coder
+          selector:
+            capability: code
+
+  # Today the first agent starts eagerly with the vessel and an absent
+  # brief_template resolves to the default crew brief. The ruled model makes
+  # both choices explicit on the engagement.
+  engagement_rules:
+    - name: initial-coding-turn
+      when:
+        transition: work.entered-running
+        subject:
+          vessel: work
+      engage:
+        vessel: work
+        role: coder
+        brief_template: crew
+      expecting:
+        fact: crew-work.phase
+        subject:
+          vessel: work
+          role: coder
+        equals: Done

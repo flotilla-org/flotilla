@@ -1,8 +1,11 @@
 # Gaps exposed by the #1262 workflow scenarios
 
 These files are candidate `WorkflowTemplate` resources for human reaction, not
-documents accepted by the current `flotilla.work/v1` schema. They preserve the
-resolved model from the workflow-core and subscription grills:
+documents accepted by the current `flotilla.work/v1` schema. The three proving
+scenarios are joined by ruled-model translations of three code-owned builtins:
+`single-agent-trusted`, `implement-review`, and `single-agent-shepherd`.
+
+All six preserve the workflow-core and subscription-grill decisions:
 
 - A workflow extends today's vessel, stance, credential, and crew topology with
   declared engagement rules.
@@ -13,79 +16,124 @@ resolved model from the workflow-core and subscription grills:
 - Rules reference declared convoy phases and derived semantic transitions. They
   do not add phases, add edges, emit events, or encode an imperative script.
 
-The three fixtures intentionally use one small candidate serialization:
+The fixtures intentionally use one small candidate serialization:
 `engagement_rules`, `when`, `engage`, and `expecting`. Exact Rust/YAML field
 names are not yet decided.
 
-## What the model could not express
+## What the model cannot express yet
 
-1. **An engagement round has no runtime shape.** The model names an engagement
-   as the idempotent unit of crew work, but no resource or status records its
-   identity, target, attempt, admitted brief, report, or result. In particular,
-   `review-round-trip.yaml` cannot distinguish "this round completed" from the
-   existing `CrewWorkPhase::Done`, which currently contributes to completing
-   the vessel and moving the convoy to `Landing`. Re-engaging a warm, completed
-   crew needs a contract that does not confuse an inner round with an outer
-   lifecycle edge.
+1. **An engagement round has no runtime shape.** No resource or status records
+   its identity, target, attempt, admitted brief, report, or result. A rule
+   cannot distinguish "this round completed" from the existing
+   `CrewWorkPhase::Done`, which contributes to completing a vessel and moving a
+   convoy to `Landing`. Re-engaging a warm, completed crew needs an inner-round
+   contract that does not accidentally claim an outer lifecycle edge.
 
-2. **Wake admission, coalescing, and re-arming are unspecified.**
+2. **Agent-directed handoff has no declaration or typed outcome.** Today's
+   `implement-review` coder chooses when to run `flotilla crew reviewer
+   handoff`, may overlap implementation and review, and supplies a free-form
+   message. The `diff-review` brief can hand findings back and re-review. The
+   ruled model reserves adaptive engagements that write workflow data, but it
+   does not define the declaration an agent writes for "engage reviewer now
+   with this result," nor how a typed review outcome requests the next coder or
+   reviewer round. `builtin-implement-review.yaml` can express the deterministic
+   serial path; it cannot preserve today's discretionary timing and payload
+   exactly without that missing shape.
+
+3. **Wake admission, coalescing, and re-arming are unspecified.**
    `rebase-on-conflict.yaml` states the desired cause and outcome but cannot
    express one wake per conflict episode, idempotent retry under one wake ID,
    suppression while a round is active, or a successor wake when relevant
    material arrives during that round. It also cannot say that a later
-   mergeable-to-conflicting transition opens a new episode. These are the open
-   questions in the wake-semantics grill, not rebase-specific fields to add to
-   the workflow.
+   mergeable-to-conflicting transition opens a new episode. These are general
+   wake-semantics questions, not rebase-specific fields to add to the workflow.
 
-3. **Target policy is absent.** `engage vessel: work, role: coder|shepherd`
+4. **Target policy is absent.** `engage vessel: work, role: coder|shepherd`
    names the logical target but not what to do when its session is warm, cold,
    reaped, failed, or gone. Resume, re-provision, hold, escalate, and cancel
    policies need one general routing contract. Delivery acknowledgement must
    mean durable admission of the wake, not successful completion of the work.
 
-4. **The review budget and loud hold do not fit.** #1216 requires a maximum
+5. **The review budget and loud hold do not fit.** #1216 requires a maximum
    number of rounds and a visible held condition when the budget is exhausted.
-   The ruled engagement-rule shape has no counter scope, reset rule, or
-   `Demand`/hold action. Adding `max_turns` directly to this one fixture would
-   hide the larger policy question: whether budgets govern a rule, a workflow,
-   a change request, or a convoy lifecycle interval.
+   The rule shape has no counter scope, reset rule, or `Demand`/hold action.
+   Adding `max_turns` directly to one fixture would hide the larger policy
+   question: whether budgets govern a rule, a workflow, a change request, or a
+   convoy lifecycle interval.
 
-5. **Stable review state is not an engagement.** "Checks green and no
-   unaddressed feedback" should surface merge readiness without waking a crew.
-   Rules-only subscriptions deliberately have one effect—request an
-   engagement—so the model needs a separate derived condition or presentation
-   projection for readiness. It must not smuggle a second workflow-subscription
-   surface into the template.
-
-6. **PR adoption crosses the admission boundary.**
-   `pr-adoption-turn.yaml` can guard on the already-bound change request, but it
-   cannot declare the `--pr` resolver, derive the branch/base/title, adopt or
-   provision the checkout, or atomically write `ConvoySpec.change_request`.
-   Those operations belong to admission rather than the inner workflow. What is
-   missing is the explicit hand-off: whether `convoy.entered-active` creates the
-   first engagement, claims an eagerly started crew turn, or would double-wake
-   the session that vessel bootstrap already launched.
-
-7. **The closed semantic vocabulary is only partly named.**
+6. **The closed semantic vocabulary is only partly named.**
    `change-request.went-conflicting` and phase-edge transitions are ruled.
    `change-request.review-arrived` and
    `change-request.checks-failed` are candidate dotted, past-tense names for the
    required review/check interpreters. Their typed payloads still need to
    define review identity, unresolved-thread state, check roll-up, observation
-   freshness, and the comparison needed for "feedback newer than the last crew
-   activity." The definitions must live beside the ADR 0024 tables and carry
-   the vocabulary generation stamp.
+   freshness, and "feedback newer than the last crew activity." Definitions
+   must live beside the ADR 0024 tables and carry the vocabulary generation.
 
-8. **Brief and digest inputs are not declared.** The existing `shepherd`
-   template covers one round, but the rebase brief named here does not yet
-   exist. The workflow model also does not say which typed transition digest,
-   current resource facts, target/base refs, pinned CI gates, and wake identity
-   a brief template may consume. Canonical wake state should remain typed data;
-   rendered prompt prose must not become the event payload.
+7. **Brief and digest inputs are not declared.** The existing `crew`,
+   `diff-review`, and `shepherd` templates cover the builtin turns, but the
+   rebase brief named here does not yet exist. The model also does not say which
+   typed transition digest, current resource facts, target/base refs, pinned CI
+   gates, handoff result, and wake identity a template may consume. Canonical
+   wake state should remain typed data; prompt prose must not become the event
+   payload.
 
-9. **Pinned definitions currently snapshot only vessels.** The core grill says
+8. **Pinned definitions currently snapshot only vessels.** The core grill says
    the resolved builtin/fleet/project/repo source is recorded and definitions
    are pinned at admission, but `WorkflowSnapshot` currently contains only
    vessels. Engagement rules, their resolved source, the transition-vocabulary
-   generation, and brief-template identity all need to be part of the pinned,
-   legible definition seen by a running convoy.
+   generation, and brief-template identity all need to be pinned and legible.
+
+## What the model expresses differently from today's code
+
+These are deliberate translations, not missing expressive power:
+
+1. **Initial agent start becomes an engagement rule.** Today
+   `VesselRequirement::starts_eagerly` starts the first agent when the vessel
+   launches. The three builtin fixtures instead state
+   `work.entered-running → engage role`. The topology still says who can run;
+   the rule says why this turn exists.
+
+2. **Brief selection moves from crew topology to each engagement.** Today
+   `CrewSource::Agent.brief_template` is fixed per role, with `None` resolving
+   to the default crew brief. The ruled files name `crew`, `diff-review`, or
+   `shepherd` on `engage`, allowing later engagements of one role to use a
+   different brief without cloning the role.
+
+3. **The normal implement-review sequence is declared rather than prompted.**
+   Today the coder learns about the latent reviewer from generated brief text
+   and invokes a handoff command. The ruled normal path makes coder completion
+   engage the reviewer with `diff-review`. This removes lifecycle sequencing
+   from prose. Preserving the optional early/overlapping handoff is the true
+   gap described above, not a reason to keep the normal path implicit.
+
+4. **Follow-up shepherding becomes event-driven.** Today
+   `single-agent-shepherd` runs one eager round, then a human or governor
+   manually resumes it. `review-round-trip.yaml` and
+   `rebase-on-conflict.yaml` make later rounds consequences of semantic
+   transitions while retaining the real one-round `shepherd` brief.
+
+5. **Builtins become ordinary layered data.** Today
+   `builtin_workflow_templates()` constructs specs in Rust and the daemon
+   reconciles them into resources labelled `flotilla.work/managed-by: builtin`.
+   The ruled model treats builtin as the least-specific data source beneath
+   fleet, project, and repo definitions. The three files retain the current
+   names, labels, stances, roles, and capabilities while showing that future
+   home.
+
+## Behavior intentionally outside workflow data
+
+- **PR adoption is admission.** `pr-adoption-turn.yaml` can guard on an
+  already-bound change request, but `--pr` resolution, branch/base/title
+  derivation, checkout adoption, and the atomic `ConvoySpec.change_request`
+  write remain admission responsibilities. The missing contract is only the
+  hand-off between eager bootstrap and the first declared engagement, so the
+  same session is not engaged twice.
+- **Stable review state is a derived condition or projection.** "Checks green
+  and no unaddressed feedback" should surface merge readiness without waking a
+  crew. Rules-only subscriptions deliberately have one effect—request an
+  engagement—so readiness belongs in the condition/presentation substrate, not
+  a second workflow subscription surface.
+- **Transition interpretation stays substrate code.** Workflow data consumes
+  stable dotted names; it does not define the pure `(old, new)` interpreters or
+  alter ADR 0024 phase tables.
