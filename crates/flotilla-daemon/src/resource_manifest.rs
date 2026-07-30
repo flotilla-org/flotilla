@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_forwards_only_when_live_spec_matches_last_applied_hash() {
+    async fn manifest_change_to_loop_owned_field_is_preserved_and_diagnosed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("moving", "one"));
@@ -417,8 +417,16 @@ mod tests {
         let object = resolver.get("moving").await.expect("policy");
 
         assert_eq!(report.updated, 1);
-        assert_eq!(object.spec.pool, "two");
+        assert_eq!(object.spec.pool, "one", "operator manifest must not replace a loop-owned field");
         assert_eq!(object.metadata.labels.get("another-controller/observation").map(String::as_str), Some("kept"));
+        let diagnostics = backend.diagnostics().await.expect("diagnostics").expect("embedded diagnostics");
+        assert!(
+            diagnostics
+                .field_ownership_violations
+                .iter()
+                .any(|violation| violation.field == "spec.pool" && violation.writer.role == flotilla_resources::WriterRole::Operator),
+            "the rejected manifest field must remain fleet-visible"
+        );
     }
 
     #[tokio::test]

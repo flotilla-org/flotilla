@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::ResourceError;
+use crate::{FieldOwnershipViolation, ResourceError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventRetention {
@@ -55,6 +55,8 @@ pub struct ResourceStoreDiagnostics {
     pub warnings: Vec<ResourceStoreWarning>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decode_quarantines: Vec<ResourceDecodeQuarantine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_ownership_violations: Vec<FieldOwnershipViolation>,
 }
 
 impl ResourceStoreDiagnostics {
@@ -70,7 +72,15 @@ impl ResourceStoreDiagnostics {
         if event_count > ratio_baseline.saturating_mul(Self::EVENT_TO_OBJECT_WARNING_MULTIPLIER) {
             warnings.push(ResourceStoreWarning::ExcessiveEventToObjectRatio);
         }
-        Self { object_count, event_count, resource_stream_count, max_retained_events, warnings, decode_quarantines: Vec::new() }
+        Self {
+            object_count,
+            event_count,
+            resource_stream_count,
+            max_retained_events,
+            warnings,
+            decode_quarantines: Vec::new(),
+            field_ownership_violations: Vec::new(),
+        }
     }
 
     pub fn event_log_within_retention(&self) -> bool {

@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass};
+use crate::{
+    field_ownership::serialized_spec_field_value, resource::define_resource, status_patch::NoStatusPatch, FieldOwnedResource,
+    FieldOwnership, OwnershipEnforcement, ReplicationClass, ResourceError, WriterRole,
+};
 
 define_resource!(
     PlacementPolicy,
@@ -12,6 +15,34 @@ define_resource!(
     NoStatusPatch,
     replication = ReplicationClass::HomeBoundRuntime
 );
+
+/// Complete PlacementPolicy ownership declaration.
+///
+/// Strategy topology discovered by registration loops is loop-derived.
+/// Scheduling priority and runtime/container configuration are operator-authored.
+/// PlacementPolicy has no status fields.
+impl FieldOwnedResource for PlacementPolicy {
+    const FIELD_OWNERSHIP: &'static [FieldOwnership] = &[
+        FieldOwnership::new("spec.pool", WriterRole::ReconcileLoop),
+        FieldOwnership::new("spec.priority", WriterRole::Operator),
+        FieldOwnership::new("spec.host_direct", WriterRole::ReconcileLoop),
+        FieldOwnership::new("spec.docker_per_vessel.host_ref", WriterRole::ReconcileLoop),
+        FieldOwnership::new("spec.docker_per_vessel.image", WriterRole::Operator),
+        FieldOwnership::new("spec.docker_per_vessel.pull_policy", WriterRole::Operator),
+        FieldOwnership::new("spec.docker_per_vessel.agent_adapters", WriterRole::Operator),
+        FieldOwnership::new("spec.docker_per_vessel.default_cwd", WriterRole::Operator),
+        FieldOwnership::new("spec.docker_per_vessel.env", WriterRole::Operator),
+        FieldOwnership::new("spec.docker_per_vessel.checkout", WriterRole::ReconcileLoop),
+    ];
+    const OWNERSHIP_ENFORCEMENT: OwnershipEnforcement = OwnershipEnforcement::Observe;
+
+    fn spec_field_value(spec: &Self::Spec, field: &str) -> Result<Option<serde_json::Value>, ResourceError> {
+        match field {
+            "spec.priority" => Ok(Some(serde_json::json!(spec.priority))),
+            _ => serialized_spec_field_value::<Self>(spec, field),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct PlacementPolicySpec {

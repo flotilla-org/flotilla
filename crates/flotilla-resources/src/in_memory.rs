@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::{
     error::ResourceError,
+    field_ownership::FieldOwnershipViolation,
     replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, K8sResourceObject, MergeMetadata, ObjectMeta, Resource, ResourceObject},
     retention::{EventRetention, ResourceStoreDiagnostics},
@@ -27,6 +28,7 @@ pub struct InMemoryBackend {
     generation: Option<String>,
     event_retention: EventRetention,
     local_root: Option<NodeId>,
+    ownership_violations: Arc<Mutex<Vec<FieldOwnershipViolation>>>,
 }
 
 type ReplicaKey = (NodeId, StoreKey);
@@ -107,11 +109,19 @@ impl InMemoryBackend {
             generation: Some(uuid::Uuid::new_v4().to_string()),
             event_retention: EventRetention::default(),
             local_root: None,
+            ownership_violations: Arc::default(),
         }
     }
 
     pub fn with_event_retention(event_retention: EventRetention) -> Self {
-        Self { stores: Arc::default(), replicas: Arc::default(), generation: None, event_retention, local_root: None }
+        Self {
+            stores: Arc::default(),
+            replicas: Arc::default(),
+            generation: None,
+            event_retention,
+            local_root: None,
+            ownership_violations: Arc::default(),
+        }
     }
 
     pub fn observed_with_event_retention(event_retention: EventRetention) -> Self {
@@ -121,6 +131,7 @@ impl InMemoryBackend {
             generation: Some(uuid::Uuid::new_v4().to_string()),
             event_retention,
             local_root: None,
+            ownership_violations: Arc::default(),
         }
     }
 
@@ -138,7 +149,13 @@ impl InMemoryBackend {
         let object_count = stores.values().map(|store| store.objects.len() as u64).sum();
         let event_count = stores.values().map(|store| store.event_log.len() as u64).sum();
         let resource_stream_count = stores.values().filter(|store| store.current_version() > 0).count() as u64;
-        Ok(ResourceStoreDiagnostics::new(object_count, event_count, resource_stream_count, self.event_retention))
+        let mut diagnostics = ResourceStoreDiagnostics::new(object_count, event_count, resource_stream_count, self.event_retention);
+        diagnostics.field_ownership_violations = self.ownership_violations.lock().await.clone();
+        Ok(diagnostics)
+    }
+
+    pub(crate) async fn record_field_ownership_violation(&self, violation: FieldOwnershipViolation) {
+        self.ownership_violations.lock().await.push(violation);
     }
 
     fn store_key<T: Resource>(namespace: &str) -> StoreKey {

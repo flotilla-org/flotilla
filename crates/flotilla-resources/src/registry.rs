@@ -12,7 +12,7 @@ use crate::{
     Checkout, Clone as CloneResource, Convoy, CredentialGrant, CredentialSpec, Demand, Environment, Host, InputMeta, MaterialPool,
     ObjectMeta, OwnerReference, PlacementPolicy, Presentation, Project, ReadResourceList, ReadWatchEvent, Regard, ReplicaCursor,
     ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
-    TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
+    TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,10 +319,11 @@ pub async fn apply_resource_document(
     let document: DynamicApplyDocument =
         serde_json::from_value(document).map_err(|error| ResourceError::decode(format!("decode resource document: {error}")))?;
     let namespace = document.metadata.namespace.clone().unwrap_or_else(|| default_namespace.to_string());
-    dispatch_resource_kind!(
-        lookup_resource_kind(&document.kind)?.resource,
-        apply_typed(backend, &namespace, document.metadata, document.spec).await
-    )
+    let registered = lookup_resource_kind(&document.kind)?.resource;
+    if registered == RegisteredResource::PlacementPolicy {
+        return apply_placement_policy(backend, &namespace, document.metadata, document.spec).await;
+    }
+    dispatch_resource_kind!(registered, apply_typed(backend, &namespace, document.metadata, document.spec).await)
 }
 
 /// Hash a resource document's spec after its registered typed representation
@@ -603,6 +604,31 @@ async fn apply_typed<T: Resource>(
     Ok(DynamicResourceObject {
         kind: T::API_PATHS.kind.to_string(),
         plural: T::API_PATHS.plural.to_string(),
+        namespace: namespace.to_string(),
+        value: object_value(&object)?,
+    })
+}
+
+async fn apply_placement_policy(
+    backend: &ResourceBackend,
+    namespace: &str,
+    metadata: DynamicApplyMetadata,
+    spec: Value,
+) -> Result<DynamicResourceObject, ResourceError> {
+    let spec = serde_json::from_value(spec)
+        .map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", PlacementPolicy::API_PATHS.kind)))?;
+    let resolver = backend.using::<PlacementPolicy>(namespace);
+    let object = match resolver.get(&metadata.name).await {
+        Ok(existing) => {
+            let meta = metadata.input_meta_for_update(&existing.metadata);
+            resolver.write_spec(&WriterIdentity::operator(), &meta, &existing.metadata.resource_version, &spec).await?
+        }
+        Err(ResourceError::NotFound { .. }) => resolver.create(&metadata.input_meta_for_create(), &spec).await?,
+        Err(error) => return Err(error),
+    };
+    Ok(DynamicResourceObject {
+        kind: PlacementPolicy::API_PATHS.kind.to_string(),
+        plural: PlacementPolicy::API_PATHS.plural.to_string(),
         namespace: namespace.to_string(),
         value: object_value(&object)?,
     })

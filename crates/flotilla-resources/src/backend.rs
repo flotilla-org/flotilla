@@ -7,6 +7,7 @@ use futures::{stream, StreamExt};
 use crate::{
     definition::DefinitionResolver,
     error::ResourceError,
+    field_ownership::merge_owned_spec,
     http::HttpBackend,
     in_memory::InMemoryBackend,
     replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEventKind},
@@ -14,6 +15,7 @@ use crate::{
     retention::ResourceStoreDiagnostics,
     sqlite::SqliteBackend,
     watch::{ResourceList, WatchStart, WatchStream},
+    FieldOwnedResource, FieldOwnershipViolation, OwnershipEnforcement, WriterIdentity,
 };
 
 macro_rules! dispatch_backend {
@@ -75,6 +77,17 @@ impl ResourceBackend {
             Self::InMemory(backend) => backend.diagnostics().await.map(Some),
             Self::Http(_) => Ok(None),
             Self::Sqlite(backend) => backend.diagnostics().await.map(Some),
+        }
+    }
+
+    async fn record_field_ownership_violation(&self, violation: FieldOwnershipViolation) -> Result<(), ResourceError> {
+        match self {
+            Self::InMemory(backend) => {
+                backend.record_field_ownership_violation(violation).await;
+                Ok(())
+            }
+            Self::Sqlite(backend) => backend.record_field_ownership_violation(violation).await,
+            Self::Http(_) => Ok(()),
         }
     }
 }
@@ -304,5 +317,40 @@ impl<T: Resource> TypedResolver<T> {
 
     pub async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
         dispatch_backend!(self, watch_typed, start)
+    }
+}
+
+impl<T: FieldOwnedResource> TypedResolver<T> {
+    /// The only update path for an enrolled resource kind.
+    ///
+    /// Observe mode records attempted ownership violations and applies the
+    /// writer's owned fields while preserving protected stored values. Enforce
+    /// mode records the same event and refuses the complete write.
+    pub async fn write_spec(
+        &self,
+        writer: &WriterIdentity,
+        meta: &InputMeta,
+        resource_version: &str,
+        requested: &T::Spec,
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        let current = self.get(&meta.name).await?;
+        let (merged, violations) = merge_owned_spec::<T>(&current.spec, requested, writer, &self.namespace, &meta.name)?;
+        for violation in &violations {
+            tracing::warn!(
+                kind = %violation.kind,
+                namespace = %violation.namespace,
+                name = %violation.name,
+                writer_role = ?violation.writer.role,
+                field = %violation.field,
+                attempted_value = %violation.attempted_value,
+                rule = %violation.rule,
+                "resource field ownership violation"
+            );
+            self.backend.record_field_ownership_violation(violation.clone()).await?;
+        }
+        if !violations.is_empty() && T::OWNERSHIP_ENFORCEMENT == OwnershipEnforcement::Enforce {
+            return Err(ResourceError::FieldOwnership { violations });
+        }
+        self.update(meta, resource_version, &merged).await
     }
 }

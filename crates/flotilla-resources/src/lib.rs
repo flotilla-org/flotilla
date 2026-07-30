@@ -8,6 +8,7 @@ mod credential;
 mod definition;
 mod environment;
 mod error;
+mod field_ownership;
 mod host;
 mod http;
 mod in_memory;
@@ -62,6 +63,7 @@ pub use environment::{
     EnvironmentStatusPatch, EnvironmentWaitReason, HostDirectEnvironmentSpec,
 };
 pub use error::ResourceError;
+pub use field_ownership::{FieldOwnedResource, FieldOwnership, FieldOwnershipViolation, OwnershipEnforcement, WriterIdentity, WriterRole};
 pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use host::{
     Host, HostCondition, HostSpec, HostStatus, HostStatusPatch, AGENT_ADAPTERS_CAPABILITY, HEARTBEAT_READY_TTL_SECS,
