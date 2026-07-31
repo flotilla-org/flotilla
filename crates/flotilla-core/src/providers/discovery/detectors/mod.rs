@@ -11,6 +11,7 @@ use super::{HostDetector, RepoDetector};
 pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
     vec![
         Box::new(CommandDetector::new("git", &["--version"], parse_first_dotted_version)),
+        Box::new(CommandDetector::new("curl", &["--version"], parse_first_dotted_version)),
         Box::new(CommandDetector::new("gh", &["--version"], parse_first_dotted_version)),
         Box::new(claude::ClaudeDetector),
         Box::new(codex::CodexAuthDetector),
@@ -83,6 +84,7 @@ mod tests {
     async fn simple_command_detectors_are_table_driven() {
         let cases: Vec<(&str, &str, &[&str], &str, Option<&str>)> = vec![
             ("git-binary", "git", &["--version"], "git version 2.43.0\n", Some("2.43.0")),
+            ("curl-binary", "curl", &["--version"], "curl 8.7.1 (arm64-apple-darwin)\n", Some("8.7.1")),
             ("gh-cli", "gh", &["--version"], "gh version 2.49.0\n", Some("2.49.0")),
             ("cursor-agent", "agent", &["--version"], "0.1.0\n", Some("0.1.0")),
             ("zellij-binary", "zellij", &["--version"], "zellij 0.40.1\n", Some("0.40.1")),

@@ -689,9 +689,14 @@ mod tests {
             &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
         );
 
-        assert!(brief.content.contains(
-            "For assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue (ready for review, never a draft), and shepherd the pull request until all checks pass; if it is a draft for any reason, mark it ready once checks are green. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`."
-        ));
+        assert!(brief.content.contains("The pull-request destination is the repository URL and target ref named in `## Work context`"));
+        assert!(brief.content.contains("the issue source may be a different forge"));
+        assert!(brief.content.contains("Inspect the existing remotes and push to the one whose URL matches that destination"));
+        assert!(brief.content.contains("never add or repoint a remote"));
+        assert!(brief.content.contains("For a Forgejo destination, use the injected `FORGEJO_SERVER_URL`"));
+        assert!(brief.content.contains("Do not use `gh`, a GitHub-only shepherding helper, or ambient human credentials"));
+        assert!(brief.content.contains("only when it explicitly supports the destination forge"));
+        assert!(brief.content.contains("Do not merge it"));
         assert!(brief.content.contains("Clone scratch repositories outside the vessel checkout"));
     }
 
@@ -731,7 +736,7 @@ mod tests {
 
         assert_eq!(
             content,
-            "# Flotilla crew brief\n\nYou are `coder` in convoy `fix-delivery`, aboard vessel `work` (`vessel-fix-delivery-work`).\n\n## Crew\n\n- `coder`: active\n- `reviewer`: latent\n- `watcher`: active\n\nRun `flotilla crew list` for current crew state.\nClone scratch repositories outside the vessel checkout (for example under a `mktemp -d` directory); embedded repositories make teardown refuse by default.\nHand off to reviewer with `flotilla crew reviewer handoff --message '...'`.\nFor assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue (ready for review, never a draft), and shepherd the pull request until all checks pass; if it is a draft for any reason, mark it ready once checks are green. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`. For other assignments, complete with `flotilla crew complete --message '...'`. If the assignment cannot be completed, report the failure with `flotilla crew fail --message '...'`. Run the applicable `flotilla crew complete` command as your final act so the convoy can enter landing.\n\n## Assignment\n\nFix the flux capacitor.\n"
+            "# Flotilla crew brief\n\nYou are `coder` in convoy `fix-delivery`, aboard vessel `work` (`vessel-fix-delivery-work`).\n\n## Crew\n\n- `coder`: active\n- `reviewer`: latent\n- `watcher`: active\n\nRun `flotilla crew list` for current crew state.\nClone scratch repositories outside the vessel checkout (for example under a `mktemp -d` directory); embedded repositories make teardown refuse by default.\nHand off to reviewer with `flotilla crew reviewer handoff --message '...'`.\nFor assignments that change a repository, delivery is part of the assignment. The pull-request destination is the repository URL and target ref named in `## Work context`; the issue source may be a different forge. Inspect the existing remotes and push to the one whose URL matches that destination; never add or repoint a remote. Open a pull request that closes the issue (ready for review, never a draft), and shepherd it until all checks pass; if it is a draft for any reason, mark it ready once checks are green. For a Forgejo destination, use the injected `FORGEJO_SERVER_URL`, `FORGEJO_API_URL`, `FORGEJO_USERNAME`, and `FORGEJO_TOKEN_FILE` values for API operations; Git is configured with a destination-scoped credential helper. Do not use `gh`, a GitHub-only shepherding helper, or ambient human credentials for Forgejo delivery. Use a shepherding tool only when it explicitly supports the destination forge; otherwise inspect the Forgejo PR, reviews, and checks through its API. If those credentials are unavailable or rejected, fail the assignment instead of delivering to another forge. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`. For other assignments, complete with `flotilla crew complete --message '...'`. If the assignment cannot be completed, report the failure with `flotilla crew fail --message '...'`. Run the applicable `flotilla crew complete` command as your final act so the convoy can enter landing.\n\n## Assignment\n\nFix the flux capacitor.\n"
         );
     }
 
@@ -805,9 +810,10 @@ mod tests {
 
         assert!(brief.contains("flotilla crew coder handoff --message"));
         assert!(brief.contains("sign off on the fork PR"));
-        assert!(brief.contains("Never add a git remote"));
+        assert!(brief.contains("Never add or repoint a git remote"));
         assert!(brief.contains("Never open issues, pull requests, or comments against the upstream repository"));
-        assert!(brief.contains("base set to the repository target named in the work context"));
+        assert!(brief.contains("exact repository URL and target ref named in `## Work context`"));
+        assert!(!brief.contains("only the fork remote (`origin`)"));
     }
 
     #[test]
@@ -830,6 +836,7 @@ mod tests {
         assert!(brief.contains("exactly one review and CI round"));
         assert!(brief.contains("Finish, don't redo"));
         assert!(brief.contains("`pr-shepherd` skill"));
+        assert!(brief.contains("For a Forgejo destination, do not use that GitHub-only helper"));
         assert!(brief.contains("Future events belong to a later engagement"));
         assert!(brief.contains("flotilla crew complete --message '<PR URL>'"));
         assert!(!brief.contains("wait-for-checks"));

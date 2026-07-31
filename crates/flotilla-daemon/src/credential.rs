@@ -13,6 +13,7 @@ use flotilla_resources::{
     CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, ResourceBackend, ResourceError,
 };
 use tokio::sync::Mutex;
+use url::Url;
 
 pub(crate) struct CredentialStore {
     backend: ResourceBackend,
@@ -281,15 +282,38 @@ impl CredentialStore {
                 }
                 env.insert("GH_TOKEN".to_string(), material.to_string());
             }
-            CredentialConsumer::Forgejo { api_url } => {
+            CredentialConsumer::Forgejo { api_url, username } => {
+                let server_url = api_url.trim_end_matches('/');
+                let parsed_url = Url::parse(server_url).map_err(|error| format!("invalid Forgejo server URL: {error}"))?;
+                if parsed_url.scheme() != "https" {
+                    return Err("Forgejo server URL must use HTTPS".to_string());
+                }
+                let host = parsed_url.host_str().ok_or_else(|| "Forgejo server URL has no host".to_string())?;
+                let credential_url = match parsed_url.port() {
+                    Some(port) => format!("https://{host}:{port}"),
+                    None => format!("https://{host}"),
+                };
                 let path = format!("/run/flotilla/credentials/{}/token", safe_component(name));
+                let helper_path = format!("/run/flotilla/credentials/{}/git-credential-forgejo", safe_component(name));
                 if !already_prepared {
                     runner.write_file(Path::new(&path), material).await.map_err(|error| format!("write token file: {error}"))?;
                     runner
                         .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Noop)
                         .await
                         .map_err(|error| format!("protect token file: {error}"))?;
-                    let url = format!("{}/api/v1/user", api_url.trim_end_matches('/'));
+                    let helper = format!(
+                        "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nprotocol=\nhost=\nwhile IFS='=' read -r key value; do\n  case \"$key\" in\n    protocol) protocol=$value ;;\n    host) host=$value ;;\n  esac\ndone\n[ \"$protocol\" = https ] || exit 0\n[ \"$host\" = {host}{} ] || exit 0\nprintf 'username=%s\\n' \"$FORGEJO_USERNAME\"\nprintf 'password='\ncat \"$FORGEJO_TOKEN_FILE\"\nprintf '\\n'\n",
+                        parsed_url.port().map(|port| format!(":{port}")).unwrap_or_default()
+                    );
+                    runner
+                        .write_file(Path::new(&helper_path), &helper)
+                        .await
+                        .map_err(|error| format!("write Git credential helper: {error}"))?;
+                    runner
+                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Noop)
+                        .await
+                        .map_err(|error| format!("protect Git credential helper: {error}"))?;
+                    let url = format!("{server_url}/api/v1/user");
                     let curl_config = format!(
                         "silent\nshow-error\nfail\nheader = \"Authorization: token {}\"\nurl = \"{}\"\n",
                         sanitize_curl_config(material),
@@ -301,6 +325,13 @@ impl CredentialStore {
                         .map_err(|error| format!("authentication preflight failed: {error}"))?;
                 }
                 env.insert("FORGEJO_TOKEN_FILE".to_string(), path);
+                env.insert("FORGEJO_SERVER_URL".to_string(), server_url.to_string());
+                env.insert("FORGEJO_API_URL".to_string(), format!("{server_url}/api/v1"));
+                env.insert("FORGEJO_USERNAME".to_string(), username.to_string());
+                env.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
+                env.insert("GIT_CONFIG_KEY_0".to_string(), format!("credential.{credential_url}.helper"));
+                env.insert("GIT_CONFIG_VALUE_0".to_string(), format!("!{helper_path}"));
+                env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
             }
             CredentialConsumer::Claude => {
                 if !runner.exists("claude", &["--version"]).await {
@@ -581,7 +612,7 @@ mod tests {
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("lab-forgejo".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Forgejo { api_url: "https://forgejo.lab".to_string() },
+                consumer: CredentialConsumer::Forgejo { api_url: "https://forgejo.lab".to_string(), username: "flotilla-crew".to_string() },
                 source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
@@ -597,13 +628,28 @@ mod tests {
         let delivered =
             store.prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone()).await.expect("prepare Forgejo credential");
 
-        assert_eq!(delivered, vec![("FORGEJO_TOKEN_FILE".to_string(), "/run/flotilla/credentials/lab-forgejo/token".to_string(),)]);
-        assert_eq!(runner.writes.lock().expect("writes lock").as_slice(), &[(
-            PathBuf::from("/run/flotilla/credentials/lab-forgejo/token"),
-            secret.to_string()
-        )]);
+        assert_eq!(delivered, vec![
+            ("FORGEJO_API_URL".to_string(), "https://forgejo.lab/api/v1".to_string()),
+            ("FORGEJO_SERVER_URL".to_string(), "https://forgejo.lab".to_string()),
+            ("FORGEJO_TOKEN_FILE".to_string(), "/run/flotilla/credentials/lab-forgejo/token".to_string()),
+            ("FORGEJO_USERNAME".to_string(), "flotilla-crew".to_string()),
+            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+            ("GIT_CONFIG_KEY_0".to_string(), "credential.https://forgejo.lab.helper".to_string()),
+            ("GIT_CONFIG_VALUE_0".to_string(), "!/run/flotilla/credentials/lab-forgejo/git-credential-forgejo".to_string(),),
+            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        ]);
+        let writes = runner.writes.lock().expect("writes lock");
+        assert_eq!(writes[0], (PathBuf::from("/run/flotilla/credentials/lab-forgejo/token"), secret.to_string()));
+        assert_eq!(writes[1].0, PathBuf::from("/run/flotilla/credentials/lab-forgejo/git-credential-forgejo"));
+        assert!(writes[1].1.contains("[ \"$protocol\" = https ]"));
+        assert!(writes[1].1.contains("[ \"$host\" = forgejo.lab ]"));
+        assert!(writes[1].1.contains("$FORGEJO_USERNAME"));
+        assert!(!writes[1].1.contains(secret));
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, _)| cmd == "chmod" && args == &["0600", "/run/flotilla/credentials/lab-forgejo/token"]));
+        assert!(calls
+            .iter()
+            .any(|(cmd, args, _)| { cmd == "chmod" && args == &["0700", "/run/flotilla/credentials/lab-forgejo/git-credential-forgejo"] }));
         assert!(calls.iter().any(|(cmd, args, input)| {
             cmd == "curl"
                 && args == &["--config", "-"]
