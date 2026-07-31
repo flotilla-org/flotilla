@@ -2815,7 +2815,10 @@ mod tests {
         use flotilla_core::providers::discovery::{ProviderCategory, ProviderDescriptor};
 
         let temp = TempDir::new().expect("tempdir");
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"local-profile-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
         let daemon = InProcessDaemon::new(Vec::new(), config, discovery, flotilla_protocol::HostName::new("dinghy")).await;
         let mut registry = ProviderRegistry::new();
@@ -4673,7 +4676,10 @@ mod tests {
     #[tokio::test]
     async fn contained_terminal_session_never_falls_back_from_the_requested_interior_pool() {
         let temp = TempDir::new().expect("tempdir");
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"interior-pool-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
         let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
         let env_id = EnvironmentId::new("contained-work");
