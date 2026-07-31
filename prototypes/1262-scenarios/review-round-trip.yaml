@@ -1,0 +1,42 @@
+# Candidate WorkflowTemplate extension for flotilla-org/flotilla#1216.
+# This is reaction data for #1269, not a document accepted by today's schema.
+apiVersion: flotilla.work/v1
+kind: WorkflowTemplate
+metadata:
+  name: review-round-trip
+  namespace: flotilla
+spec:
+  vessels:
+    - name: work
+      stance: trusted
+      credential_refs:
+        - forge
+      crew:
+        - role: shepherd
+          selector:
+            capability: code
+
+  # One rule deliberately groups every kind of actionable PR material. The
+  # subscription is implicitly limited to this convoy's bound change request.
+  # Each match requests one engagement round; it does not create a workflow
+  # phase or an edge outside the ADR 0024 convoy machine.
+  engagement_rules:
+    - name: process-review-round
+      when:
+        any_transition:
+          - change-request.review-arrived
+          - change-request.checks-failed
+          - change-request.went-conflicting
+        guards:
+          - fact: convoy.phase
+            equals: Landing
+      engage:
+        vessel: work
+        role: shepherd
+        brief_template: shepherd
+      expecting:
+        fact: crew-work.phase
+        subject:
+          vessel: work
+          role: shepherd
+        equals: Done

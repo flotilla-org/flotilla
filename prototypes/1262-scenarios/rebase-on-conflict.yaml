@@ -1,0 +1,35 @@
+# Candidate WorkflowTemplate extension for flotilla-org/flotilla#1150.
+# This is reaction data for #1269, not a document accepted by today's schema.
+apiVersion: flotilla.work/v1
+kind: WorkflowTemplate
+metadata:
+  name: rebase-on-conflict
+  namespace: flotilla
+spec:
+  vessels:
+    - name: work
+      stance: contained
+      credential_refs:
+        - forge
+      crew:
+        - role: coder
+          selector:
+            capability: code
+
+  # Engagement rules are the sole subscription surface. Because this rule does
+  # not declare a wider scope, the transition subject is implicitly restricted
+  # to change requests bound to this convoy.
+  engagement_rules:
+    - name: rebase-on-conflict
+      when:
+        transition: change-request.went-conflicting
+        guards:
+          - fact: convoy.phase
+            equals: Landing
+      engage:
+        vessel: work
+        role: coder
+        brief_template: rebase-on-conflict
+      expecting:
+        fact: change-request.mergeability
+        equals: mergeable
