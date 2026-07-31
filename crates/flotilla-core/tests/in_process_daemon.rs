@@ -786,6 +786,13 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
         )
         .await
         .expect("create convoy");
+    let ignored = convoys
+        .create(
+            &InputMeta::builder().name("ignored-convoy".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("ignored-wf".to_string()).build(),
+        )
+        .await
+        .expect("create ignored convoy");
 
     let mut rx = daemon.subscribe();
     let command_id = daemon
@@ -834,6 +841,14 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
     };
 
     let updated_spec = flotilla_resources::ConvoySpec::builder().workflow_ref("wf-v2".to_string()).build();
+    convoys
+        .update(
+            &InputMeta::from(&ignored.metadata),
+            &ignored.metadata.resource_version,
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("ignored-wf-v2".to_string()).build(),
+        )
+        .await
+        .expect("update ignored convoy");
     convoys
         .update(&InputMeta::from(&created.metadata), &created.metadata.resource_version, &updated_spec)
         .await
