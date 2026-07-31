@@ -7,7 +7,7 @@ the definitions class), ADR 0010 (Hull/Crew boundary — credential state is
 crew/vessel state), the fork-stance rulings (#978, #1047/#1049), #954
 (attribution), issue #1050 (the grill that fixed this contract) and the
 credential-pattern research
-(`docs/superpowers/research/2026-07-27-agent-harness-credential-patterns.md`),
+(`docs/research/2026-07-27-agent-harness-credential-patterns.md`),
 map #1046.
 
 Today every crew inherits the ambient identity of the human whose machine it
@@ -101,7 +101,7 @@ is a bounded provisioning failure, never a silently retrying crew.
 ## Amendment (2026-07-28): subscriptions primary, lease-located material, forge/model split
 
 Ruled during the #1140 seeding design (rulings and evidence in that issue;
-mechanics in `docs/superpowers/research/2026-07-28-multi-crew-agent-config-seeding.md`).
+mechanics in `docs/research/2026-07-28-multi-crew-agent-config-seeding.md`).
 
 ### Forge identity and model identity are different categories
 

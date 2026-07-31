@@ -32,7 +32,7 @@ reconcilers, so there is nothing to check a property against, and every writer o
 resource is a peer of every other.
 
 Prior-art research (see
-`docs/superpowers/research/2026-07-29-state-transition-verification-prior-art.md`)
+`docs/research/2026-07-29-state-transition-verification-prior-art.md`)
 established: class 1 has **no reliable detector in the literature** — Anvil formally
 assumes competing writers stop; Kubernetes server-side-apply made field ownership
 advisory with a `force` escape and degraded to universal forcing. Class 2 is the
