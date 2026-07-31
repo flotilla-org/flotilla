@@ -8343,16 +8343,14 @@ impl DaemonHandle for InProcessDaemon {
                 // Take the collection cursor before reading the object. A
                 // concurrent mutation can then be replayed (at worst as a
                 // duplicate) instead of being hidden behind a newer cursor.
-                let listed = list_resource_kind(&self.resource_backend, namespace, kind).await;
+                let listed = match list_resource_kind(&self.resource_backend, namespace, kind).await {
+                    Ok(listed) => listed,
+                    Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
+                };
                 match get_resource_kind(&self.resource_backend, namespace, kind, name).await {
                     Ok(v) => {
-                        let (resource_version, generation) = match listed {
-                            Ok(listed) => (
-                                listed.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string(),
-                                listed.value["metadata"]["generation"].as_str().map(ToOwned::to_owned),
-                            ),
-                            Err(_) => (v.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string(), None),
-                        };
+                        let resource_version = listed.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string();
+                        let generation = listed.value["metadata"]["generation"].as_str().map(ToOwned::to_owned);
                         let record = resource_record(ResourceRecordType::Current, v.value, &self.node_id);
                         Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
                             v.kind,
