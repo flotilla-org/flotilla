@@ -104,7 +104,8 @@ script's only blocking point against flotilla state for evict to be sound.
 - **Episode identity**: one open turn per (rule/wait, convoy, vessel, role);
   a predicate that holds again after a completed, freshly-judged turn opens a
   new episode and climbs the machinery-owned escalation ladder.
-- **Pinning at admission** (already ruled) is what defuses
+- **Pinning at admission** (ruled by the #1268 workflow-core grill:
+  definitions are pinned when the convoy is admitted) is what defuses
   replay/versioning: a driver only ever replays a log it wrote.
 
 ## Build order
@@ -175,7 +176,7 @@ where it is tractable.
 
 ## Effect on standing material
 
-### GAPS disposition (from prototypes/1262-scenarios/GAPS.md)
+### GAPS disposition (from GAPS.md in #1282, `prototypes/1262-scenarios/`)
 
 | GAPS item | Disposition under the proposal |
 |-----------|-------------------------------|
@@ -186,7 +187,7 @@ where it is tractable.
 | 5 — review budget & loud hold | **Dissolved**: a loop bound and `convoy hold` in the caller's language |
 | 6 — semantic vocabulary | **Shrunk** to defining condition leaves (and named definitions as layered data) |
 | 7 — brief/digest inputs | **Dissolved** into function arguments / the which-condition payload |
-| 8 — pinned definitions | **Unchanged and load-bearing**: pinning at admission is what makes driver replay sound |
+| 8 — pinned definitions | **Unchanged and load-bearing**: pinning at admission (#1268 grill ruling) is what makes driver replay sound |
 
 ### ADR-carry candidates (each needs its own ruling)
 
