@@ -1164,6 +1164,7 @@ dependencies = [
 name = "flotilla-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bon",
  "chrono",
  "gethostname",

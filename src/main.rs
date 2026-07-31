@@ -21,7 +21,7 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     commands::CommandValue, output::OutputFormat, AgentHookEvent, AttachableId, Command, CommandAction, EnvironmentId, HostName,
-    ProjectListResponse, RepoIdentity, RepoInfo, RepoSelector, StepStatus, ViewAddress,
+    ProjectListResponse, RepoIdentity, RepoInfo, RepoSelector, ViewAddress,
 };
 use flotilla_tui::{app, event_log, theme};
 use tracing::info;
@@ -258,7 +258,7 @@ enum ResourceSubCommand {
     /// Delete exactly one raw resource object, bypassing lifecycle gates
     Delete(ResourceDeleteArgs),
     /// Watch resources of a kind
-    Watch(ResourceListArgs),
+    Watch(ResourceWatchArgs),
 }
 
 #[derive(clap::Args, bon::Builder)]
@@ -288,6 +288,26 @@ struct ResourceGetArgs {
     /// Route the query to a peer host
     #[arg(long)]
     host: Option<String>,
+}
+
+#[derive(clap::Args, bon::Builder)]
+struct ResourceWatchArgs {
+    /// Resource kind or plural name, e.g. convoys or WorkflowTemplate
+    kind: String,
+    /// Restrict the stream to one resource name
+    name: Option<String>,
+    /// Resource namespace
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
+    /// Route the watch to a peer host
+    #[arg(long)]
+    host: Option<String>,
+    /// Include read-only replicas from peer roots
+    #[arg(long)]
+    include_replicas: bool,
+    /// Resume strictly after a cursor emitted by an earlier read or watch
+    #[arg(long)]
+    from_cursor: Option<flotilla_protocol::ResourceCursor>,
 }
 
 #[derive(clap::Args)]
@@ -913,40 +933,34 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
         ResourceSubCommand::List(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
             let daemon = connect_daemon(cli).await?;
-            let result = daemon
-                .execute_query(
-                    Command {
-                        node_id: node_id.clone(),
-                        provisioning_target: None,
-                        context_repo: None,
-                        action: CommandAction::QueryResourceList {
-                            namespace: args.namespace,
-                            kind: args.kind,
-                            include_replicas: args.include_replicas,
-                        },
-                    },
-                    uuid::Uuid::new_v4(),
+            let response = flotilla_client::resource::ResourceClient::new(Arc::clone(&daemon))
+                .list(
+                    flotilla_client::resource::ResourceListRequest::builder()
+                        .kind(args.kind)
+                        .namespace(args.namespace)
+                        .maybe_node_id(node_id.clone())
+                        .include_replicas(args.include_replicas)
+                        .build(),
                 )
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!(e))?;
-            print_resource_query_result(daemon.as_ref(), node_id, result, format).await
+            print_resource_read(daemon.as_ref(), node_id, response, format).await
         }
         ResourceSubCommand::Get(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
             let daemon = connect_daemon(cli).await?;
-            let result = daemon
-                .execute_query(
-                    Command {
-                        node_id: node_id.clone(),
-                        provisioning_target: None,
-                        context_repo: None,
-                        action: CommandAction::QueryResourceGet { namespace: args.namespace, kind: args.kind, name: args.name },
-                    },
-                    uuid::Uuid::new_v4(),
+            let response = flotilla_client::resource::ResourceClient::new(Arc::clone(&daemon))
+                .get(
+                    flotilla_client::resource::ResourceGetRequest::builder()
+                        .kind(args.kind)
+                        .name(args.name)
+                        .namespace(args.namespace)
+                        .maybe_node_id(node_id.clone())
+                        .build(),
                 )
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!(e))?;
-            print_resource_query_result(daemon.as_ref(), node_id, result, format).await
+            print_resource_read(daemon.as_ref(), node_id, response, format).await
         }
         ResourceSubCommand::Apply(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
@@ -993,30 +1007,15 @@ async fn resolve_optional_host_node(cli: &Cli, host: Option<&str>) -> Result<Opt
     }
 }
 
-async fn print_resource_query_result(
+async fn print_resource_read(
     daemon: &dyn DaemonHandle,
     node_id: Option<flotilla_protocol::NodeId>,
-    result: CommandValue,
+    response: flotilla_protocol::ResourceReadEnvelope,
     format: OutputFormat,
 ) -> Result<()> {
-    match result {
-        CommandValue::ResourceList(response) => {
-            println!("{}", format_resource_value(daemon, node_id, response.value, format).await?);
-            Ok(())
-        }
-        CommandValue::ResourceObject(response) => {
-            println!("{}", format_resource_value(daemon, node_id, response.value, format).await?);
-            Ok(())
-        }
-        CommandValue::Error { message } => match format {
-            OutputFormat::Json => {
-                println!("{}", flotilla_protocol::output::json_pretty(&CommandValue::Error { message: message.clone() }));
-                Err(color_eyre::eyre::eyre!(message))
-            }
-            OutputFormat::Human => Err(color_eyre::eyre::eyre!(message)),
-        },
-        other => Err(color_eyre::eyre::eyre!("unexpected resource response: {other:?}")),
-    }
+    let value = serde_json::to_value(response).map_err(|error| color_eyre::eyre::eyre!("encode resource read: {error}"))?;
+    println!("{}", format_resource_value(daemon, node_id, value, format).await?);
+    Ok(())
 }
 
 async fn format_resource_value(
@@ -1075,62 +1074,46 @@ fn replace_host_ids(value: &mut serde_json::Value, names: &std::collections::Has
     }
 }
 
-async fn run_resource_watch(cli: &Cli, args: ResourceListArgs, format: OutputFormat) -> Result<()> {
+async fn run_resource_watch(cli: &Cli, args: ResourceWatchArgs, format: OutputFormat) -> Result<()> {
+    reset_sigpipe();
     let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
     let daemon = connect_daemon(cli).await?;
-    let mut rx = daemon.subscribe();
-    let command_id = daemon
-        .execute(Command {
-            node_id,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceWatch {
-                namespace: args.namespace,
-                kind: args.kind,
-                include_replicas: args.include_replicas,
-                replica_sources: false,
-                cursor: None,
-            },
-        })
+    let client = flotilla_client::resource::ResourceClient::new(daemon);
+    let mut watch = client
+        .watch(
+            flotilla_client::resource::ResourceWatchRequest::builder()
+                .kind(args.kind)
+                .namespace(args.namespace)
+                .maybe_name(args.name)
+                .maybe_node_id(node_id)
+                .include_replicas(args.include_replicas)
+                .maybe_cursor(args.from_cursor)
+                .build(),
+        )
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e))?;
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                let _ = daemon.cancel(command_id).await;
+                watch.cancel().await.map_err(|e| color_eyre::eyre::eyre!(e))?;
                 return Ok(());
             }
-            event = rx.recv() => {
-                match event {
-                    Ok(flotilla_protocol::DaemonEvent::CommandStepUpdate { command_id: id, status, .. }) if id == command_id => {
-                        if let StepStatus::Produced { value } = status {
-                            if let CommandValue::ResourceWatchEvent(response) = *value {
-                                print_resource_watch_event(&response, format);
-                            }
-                        }
-                    }
-                    Ok(flotilla_protocol::DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => {
-                        return match result {
-                            CommandValue::Ok | CommandValue::Cancelled => Ok(()),
-                            CommandValue::Error { message } => Err(color_eyre::eyre::eyre!(message)),
-                            other => Err(color_eyre::eyre::eyre!("unexpected resource watch result: {other:?}")),
-                        };
-                    }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => eprintln!("warning: skipped {n} events"),
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err(color_eyre::eyre::eyre!("daemon disconnected")),
+            event = watch.next() => {
+                match event.map_err(|e| color_eyre::eyre::eyre!(e))? {
+                    Some(response) => print_resource_watch_event(&response, format),
+                    None => return Ok(()),
                 }
             }
         }
     }
 }
 
-fn print_resource_watch_event(response: &flotilla_protocol::ResourceWatchResponse, format: OutputFormat) {
+fn print_resource_watch_event(response: &flotilla_protocol::ResourceReadEnvelope, format: OutputFormat) {
     match format {
-        OutputFormat::Json => println!("{}", flotilla_protocol::output::json_line(&response.event)),
+        OutputFormat::Json => println!("{}", flotilla_protocol::output::json_line(response)),
         OutputFormat::Human => {
-            println!("{}", flotilla_protocol::output::json_pretty(&response.event));
+            println!("{}", flotilla_protocol::output::json_pretty(response));
         }
     }
 }
@@ -1720,7 +1703,7 @@ mod tests {
         attach_exit_disposition, confirm_command, default_project_landing, format_human_resource_value,
         provisioning_target_for_environment, replace_host_ids, run_replica_snapshot, select_host_target, select_startup_repo_roots,
         should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, AttachExitDisposition, Cli, CommandValue,
-        ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, SubCommand,
+        ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
 
     fn landing_repo(path: &str, name: &str, key: Option<&str>) -> RepoInfo {
@@ -1959,14 +1942,30 @@ mod tests {
             }) if file.as_path() == Path::new("demand.yaml") && namespace == "ops"
         ));
 
-        let watch =
-            Cli::try_parse_from(["flotilla", "--json", "resource", "watch", "terminalsessions"]).expect("resource watch should parse");
+        let watch = Cli::try_parse_from([
+            "flotilla",
+            "resource",
+            "watch",
+            "terminalsessions",
+            "session-a",
+            "--from-cursor",
+            &flotilla_protocol::ResourceCursor::from_position("7", None).to_string(),
+            "--json",
+        ])
+        .expect("resource watch should parse");
         assert!(watch.json);
         assert!(matches!(
             watch.command,
             Some(SubCommand::Resource {
-                command: ResourceSubCommand::Watch(ResourceListArgs { kind, namespace, host: None, include_replicas: false })
-            }) if kind == "terminalsessions" && namespace == "flotilla"
+                command: ResourceSubCommand::Watch(ResourceWatchArgs {
+                    kind,
+                    name: Some(name),
+                    namespace,
+                    host: None,
+                    include_replicas: false,
+                    from_cursor: Some(_),
+                })
+            }) if kind == "terminalsessions" && name == "session-a" && namespace == "flotilla"
         ));
     }
 

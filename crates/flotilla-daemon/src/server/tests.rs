@@ -25,9 +25,9 @@ use flotilla_protocol::{
     AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachBinding, AttachableId, Checkout, CheckoutTarget, Command,
     CommandAction, CommandPeerEvent, CommandValue, ConfigLabel, ConvoyStartIntent, DaemonEvent, EnvironmentId, HostName, HostPath,
     HostProviderStatus, HostSummary, Message, NodeId, NodeInfo, PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage,
-    PreparedWorkspace, ProviderData, QueryCursor, RepoIdentity, RepoSelector, Request, Response, ResponseResult, RoutedPeerMessage,
-    StepAction, StepExecutionContext, StepOutcome, StepStatus, StreamKey, VectorClock, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION,
-    TERMINAL_POOL_PROVIDER_CATEGORY,
+    PreparedWorkspace, ProviderData, QueryCursor, RepoIdentity, RepoSelector, Request, ResourceCursor, Response, ResponseResult,
+    RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome, StepStatus, StreamKey, VectorClock, AGENT_ADAPTER_PROVIDER_CATEGORY,
+    PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, HttpBackend,
@@ -1193,6 +1193,7 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
         &pending_remote_cancels,
         &next_remote_command_id,
     );
+    let cursor = ResourceCursor::from_position("42", Some("generation-a".to_string()));
 
     let command_id = remote_command_router
         .dispatch_execute(Command {
@@ -1202,9 +1203,10 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
             action: CommandAction::ResourceWatch {
                 namespace: "flotilla".into(),
                 kind: "convoys".into(),
+                name: Some("demo".into()),
                 include_replicas: false,
                 replica_sources: false,
-                cursor: None,
+                cursor: Some(cursor.clone()),
             },
         })
         .await
@@ -1226,9 +1228,10 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
                 action: CommandAction::ResourceWatch {
                     namespace: "flotilla".into(),
                     kind: "convoys".into(),
+                    name: Some("demo".into()),
                     include_replicas: false,
                     replica_sources: false,
-                    cursor: None,
+                    cursor: Some(cursor),
                 }
             });
         }

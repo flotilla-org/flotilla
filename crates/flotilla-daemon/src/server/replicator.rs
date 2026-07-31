@@ -1,12 +1,19 @@
 use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use chrono::Utc;
-use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, NodeId, ResourceWatchCursor, ResourceWatchResponse};
-use flotilla_resources::{
-    HttpBackend, K8sWatchEvent, ReadWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceList, ResourceObject,
-    ResourceProvenance, WatchEvent, WatchStart,
+#[cfg(feature = "test-support")]
+use flotilla_core::daemon::DaemonHandle;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_protocol::NodeId;
+#[cfg(feature = "test-support")]
+use flotilla_protocol::{
+    Command, CommandAction, CommandValue, DaemonEvent, ResourceCursor, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordType,
 };
+use flotilla_resources::{
+    HttpBackend, ReadWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceProvenance, WatchEvent, WatchStart,
+};
+#[cfg(feature = "test-support")]
+use flotilla_resources::{K8sWatchEvent, ResourceList, ResourceObject};
 use futures::StreamExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -74,7 +81,7 @@ impl SocketPathSource {
 impl PeerReplicatorSupervisors {
     pub(super) async fn peer_connected(
         &mut self,
-        router: RemoteCommandRouter,
+        _router: RemoteCommandRouter,
         daemon: Arc<InProcessDaemon>,
         peer: NodeId,
         generation: u64,
@@ -87,7 +94,7 @@ impl PeerReplicatorSupervisors {
         let transport = match resource_socket_path {
             Some(_) => ReplicationTransport::Http(socket_path_source),
             #[cfg(feature = "test-support")]
-            None => ReplicationTransport::Routed(router),
+            None => ReplicationTransport::Routed(_router),
             #[cfg(not(feature = "test-support"))]
             None => {
                 debug!(%peer, generation, "peer has no forwarded resource socket; replication waits for an outbound SSH connection");
@@ -459,8 +466,7 @@ async fn run_routed_watch<T: Resource>(
     cursor: Option<flotilla_resources::ReplicaCursor>,
 ) -> Result<(), String> {
     let resuming = cursor.is_some();
-    let protocol_cursor =
-        cursor.map(|cursor| ResourceWatchCursor { resource_version: cursor.resource_version, generation: cursor.generation });
+    let protocol_cursor = cursor.map(|cursor| ResourceCursor::from_position(cursor.resource_version, cursor.generation));
     let mut events = daemon.subscribe();
     let command_id = router
         .dispatch_execute_for_principal(
@@ -471,6 +477,7 @@ async fn run_routed_watch<T: Resource>(
                 action: CommandAction::ResourceWatch {
                     namespace: REPLICATION_NAMESPACE.to_string(),
                     kind: T::API_PATHS.plural.to_string(),
+                    name: None,
                     include_replicas: false,
                     replica_sources: false,
                     cursor: protocol_cursor,
@@ -494,7 +501,7 @@ async fn run_routed_watch<T: Resource>(
                 let CommandValue::ResourceWatchEvent(response) = *value else {
                     continue;
                 };
-                if response.kind != T::API_PATHS.kind {
+                if response.resource_kind != T::API_PATHS.kind {
                     continue;
                 }
                 apply_response(&writer, &mut initial, &mut initializing, *response).await?;
@@ -532,6 +539,7 @@ async fn replicate_relay_over_routed_watch<T: Resource>(
                 action: CommandAction::ResourceWatch {
                     namespace: REPLICATION_NAMESPACE.to_string(),
                     kind: T::API_PATHS.plural.to_string(),
+                    name: None,
                     include_replicas: false,
                     replica_sources: true,
                     cursor: None,
@@ -550,7 +558,7 @@ async fn replicate_relay_over_routed_watch<T: Resource>(
                 let CommandValue::ResourceWatchEvent(response) = *value else {
                     continue;
                 };
-                if response.kind == T::API_PATHS.kind && response.event["type"] != "BOOKMARK" {
+                if response.resource_kind == T::API_PATHS.kind {
                     apply_relay_response::<T>(daemon, peer, *response).await?;
                 }
             }
@@ -575,47 +583,50 @@ async fn replicate_relay_over_routed_watch<T: Resource>(
 async fn apply_relay_response<T: Resource>(
     daemon: &Arc<InProcessDaemon>,
     peer: &NodeId,
-    response: ResourceWatchResponse,
+    response: ResourceReadEnvelope,
 ) -> Result<(), String> {
-    let event: K8sWatchEvent<T> =
-        serde_json::from_value(response.event).map_err(|error| format!("decode relayed {} event: {error}", T::API_PATHS.kind))?;
-    let event = event.into_watch_event().map_err(|error| error.to_string())?;
-    let object = match &event {
-        WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => object,
-    };
-    let Some(origin) = object.metadata.annotations.get("flotilla.work/origin-root") else {
-        return Ok(());
-    };
-    let origin = NodeId::new(origin.clone());
-    if &origin == daemon.node_id() || &origin == peer {
-        return Ok(());
+    for record in response.records {
+        let Some(event) = record_watch_event::<T>(record)? else {
+            continue;
+        };
+        let object = match &event {
+            WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => object,
+        };
+        let Some(origin) = object.metadata.annotations.get("flotilla.work/origin-root") else {
+            continue;
+        };
+        let origin = NodeId::new(origin.clone());
+        if &origin == daemon.node_id() || &origin == peer {
+            continue;
+        }
+        let synced_at = object
+            .metadata
+            .annotations
+            .get("flotilla.work/last-synced-at")
+            .ok_or_else(|| "relayed resource is missing last-synced-at".to_string())
+            .and_then(|value| {
+                chrono::DateTime::parse_from_rfc3339(value)
+                    .map(|value| value.with_timezone(&Utc))
+                    .map_err(|error| format!("decode relayed sync timestamp: {error}"))
+            })?;
+        let strip = |mut object: ResourceObject<T>| {
+            object.metadata.annotations.remove("flotilla.work/origin-root");
+            object.metadata.annotations.remove("flotilla.work/last-synced-at");
+            object
+        };
+        let event = match event {
+            WatchEvent::Added(object) => WatchEvent::Added(strip(object)),
+            WatchEvent::Modified(object) => WatchEvent::Modified(strip(object)),
+            WatchEvent::Deleted(object) => WatchEvent::Deleted(strip(object)),
+        };
+        daemon
+            .resource_backend()
+            .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
+            .apply(event, synced_at)
+            .await
+            .map_err(|error| error.to_string())?;
     }
-    let synced_at = object
-        .metadata
-        .annotations
-        .get("flotilla.work/last-synced-at")
-        .ok_or_else(|| "relayed resource is missing last-synced-at".to_string())
-        .and_then(|value| {
-            chrono::DateTime::parse_from_rfc3339(value)
-                .map(|value| value.with_timezone(&Utc))
-                .map_err(|error| format!("decode relayed sync timestamp: {error}"))
-        })?;
-    let strip = |mut object: ResourceObject<T>| {
-        object.metadata.annotations.remove("flotilla.work/origin-root");
-        object.metadata.annotations.remove("flotilla.work/last-synced-at");
-        object
-    };
-    let event = match event {
-        WatchEvent::Added(object) => WatchEvent::Added(strip(object)),
-        WatchEvent::Modified(object) => WatchEvent::Modified(strip(object)),
-        WatchEvent::Deleted(object) => WatchEvent::Deleted(strip(object)),
-    };
-    daemon
-        .resource_backend()
-        .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
-        .apply(event, synced_at)
-        .await
-        .map_err(|error| error.to_string())
+    Ok(())
 }
 
 #[cfg(feature = "test-support")]
@@ -623,38 +634,52 @@ async fn apply_response<T: Resource>(
     writer: &flotilla_resources::ReplicaWriter<T>,
     initial: &mut Vec<ResourceObject<T>>,
     initializing: &mut bool,
-    response: ResourceWatchResponse,
+    response: ResourceReadEnvelope,
 ) -> Result<(), String> {
-    if response.event["type"] == "BOOKMARK" {
-        if *initializing {
-            writer
-                .replace(
-                    &ResourceList {
-                        items: std::mem::take(initial),
-                        resource_version: response.resource_version,
-                        generation: response.generation,
-                    },
-                    Utc::now(),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            *initializing = false;
+    let (resource_version, generation) = response.cursor.position()?;
+    for record in response.records {
+        if record.record_type == ResourceRecordType::Bookmark {
+            if *initializing {
+                writer
+                    .replace(
+                        &ResourceList {
+                            items: std::mem::take(initial),
+                            resource_version: resource_version.clone(),
+                            generation: generation.clone(),
+                        },
+                        Utc::now(),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                *initializing = false;
+            }
+            continue;
         }
-        return Ok(());
-    }
-
-    let event: K8sWatchEvent<T> =
-        serde_json::from_value(response.event).map_err(|error| format!("decode replicated {} event: {error}", T::API_PATHS.kind))?;
-    let event = event.into_watch_event().map_err(|error| error.to_string())?;
-    if *initializing && matches!(event, flotilla_resources::WatchEvent::Added(_)) {
-        let object = match event {
-            flotilla_resources::WatchEvent::Added(object) => object,
-            _ => unreachable!("matched added event"),
+        let Some(event) = record_watch_event::<T>(record)? else {
+            continue;
         };
-        initial.push(object);
-        return Ok(());
+        if *initializing && matches!(event, WatchEvent::Added(_)) {
+            let WatchEvent::Added(object) = event else { unreachable!("matched added event") };
+            initial.push(object);
+        } else {
+            writer.apply(event, Utc::now()).await.map_err(|error| error.to_string())?;
+        }
     }
-    writer.apply(event, Utc::now()).await.map_err(|error| error.to_string())
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn record_watch_event<T: Resource>(record: ResourceReadRecord) -> Result<Option<WatchEvent<T>>, String> {
+    let event_type = match record.record_type {
+        ResourceRecordType::Current | ResourceRecordType::Added => "ADDED",
+        ResourceRecordType::Modified => "MODIFIED",
+        ResourceRecordType::Deleted => "DELETED",
+        ResourceRecordType::Bookmark => return Ok(None),
+    };
+    let object = record.object.ok_or_else(|| format!("{event_type} resource record is missing object"))?;
+    let event: K8sWatchEvent<T> = serde_json::from_value(serde_json::json!({ "type": event_type, "object": object }))
+        .map_err(|error| format!("decode replicated {} event: {error}", T::API_PATHS.kind))?;
+    event.into_watch_event().map(Some).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

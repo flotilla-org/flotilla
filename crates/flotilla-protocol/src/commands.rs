@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -53,23 +54,101 @@ pub struct ResourceJsonResponse {
     pub value: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-pub struct ResourceWatchResponse {
-    #[serde(rename = "resourceKind")]
-    pub kind: String,
-    pub plural: String,
-    pub namespace: String,
-    pub resource_version: String,
+/// Opaque position in one resource kind's ordered mutation stream.
+///
+/// The encoded form is stable for scripts but deliberately hides backend
+/// resource versions and generations from the client surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ResourceCursor(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ResourceCursorPayload {
+    version: u8,
+    resource_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<String>,
-    pub event: serde_json::Value,
+    generation: Option<String>,
+}
+
+impl ResourceCursor {
+    pub fn from_position(resource_version: impl Into<String>, generation: Option<String>) -> Self {
+        let payload = ResourceCursorPayload { version: 1, resource_version: resource_version.into(), generation };
+        let encoded = serde_json::to_vec(&payload).expect("resource cursor payload is serializable");
+        Self(URL_SAFE_NO_PAD.encode(encoded))
+    }
+
+    pub fn position(&self) -> Result<(String, Option<String>), String> {
+        let decoded = URL_SAFE_NO_PAD.decode(&self.0).map_err(|error| format!("invalid resource cursor encoding: {error}"))?;
+        let payload: ResourceCursorPayload =
+            serde_json::from_slice(&decoded).map_err(|error| format!("invalid resource cursor payload: {error}"))?;
+        if payload.version != 1 {
+            return Err(format!("unsupported resource cursor version {}", payload.version));
+        }
+        Ok((payload.resource_version, payload.generation))
+    }
+}
+
+impl std::fmt::Display for ResourceCursor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for ResourceCursor {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let cursor = Self(value.to_string());
+        cursor.position()?;
+        Ok(cursor)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ResourceRecordType {
+    Current,
+    Added,
+    Modified,
+    Deleted,
+    Bookmark,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceWatchCursor {
-    pub resource_version: String,
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ResourceRecordProvenance {
+    Local {
+        #[serde(rename = "nodeId")]
+        node_id: crate::NodeId,
+    },
+    Replica {
+        #[serde(rename = "originRoot")]
+        origin_root: crate::NodeId,
+        #[serde(rename = "lastSyncedAt")]
+        last_synced_at: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceReadRecord {
+    #[serde(rename = "type")]
+    pub record_type: ResourceRecordType,
+    pub provenance: ResourceRecordProvenance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<String>,
+    pub object: Option<serde_json::Value>,
+}
+
+/// Stable envelope returned by resource get/list/watch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ResourceReadEnvelope {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    #[serde(rename = "resourceKind")]
+    pub resource_kind: String,
+    pub plural: String,
+    pub namespace: String,
+    pub cursor: ResourceCursor,
+    pub records: Vec<ResourceReadRecord>,
 }
 
 /// Filters for reading a daemon's host-local structured log.
@@ -476,12 +555,14 @@ pub enum CommandAction {
     ResourceWatch {
         namespace: String,
         kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         include_replicas: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         replica_sources: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        cursor: Option<ResourceWatchCursor>,
+        cursor: Option<ResourceCursor>,
     },
 }
 
@@ -683,10 +764,10 @@ pub enum CommandValue {
         /// Complete JSON-lines records, oldest first.
         lines: Vec<String>,
     },
-    ResourceList(Box<ResourceJsonResponse>),
+    ResourceRead(Box<ResourceReadEnvelope>),
     ResourceObject(Box<ResourceJsonResponse>),
     ResourceDeleted(Box<ResourceJsonResponse>),
-    ResourceWatchEvent(Box<ResourceWatchResponse>),
+    ResourceWatchEvent(Box<ResourceReadEnvelope>),
     EnvironmentSpecRead {
         spec: crate::EnvironmentSpec,
     },
@@ -1068,6 +1149,7 @@ mod tests {
                 action: CommandAction::ResourceWatch {
                     namespace: "flotilla".into(),
                     kind: "convoys".into(),
+                    name: None,
                     include_replicas: false,
                     replica_sources: false,
                     cursor: None,
@@ -1318,14 +1400,22 @@ mod tests {
                     .build()],
                 result_sets: vec![],
             })),
-            CommandValue::ResourceList(Box::new(ResourceJsonResponse {
-                kind: "Convoy".into(),
+            CommandValue::ResourceRead(Box::new(ResourceReadEnvelope {
+                api_version: "flotilla.work/v1".into(),
+                resource_kind: "Convoy".into(),
                 plural: "convoys".into(),
                 namespace: "flotilla".into(),
-                value: serde_json::json!({
-                    "metadata": { "resourceVersion": "1" },
-                    "items": [{ "apiVersion": "flotilla.work/v1", "kind": "Convoy", "metadata": { "name": "demo" }, "spec": {} }]
-                }),
+                cursor: ResourceCursor::from_position("1", None),
+                records: vec![ResourceReadRecord {
+                    record_type: ResourceRecordType::Current,
+                    provenance: ResourceRecordProvenance::Local { node_id: crate::NodeId::new("desktop") },
+                    object: Some(serde_json::json!({
+                        "apiVersion": "flotilla.work/v1",
+                        "kind": "Convoy",
+                        "metadata": { "name": "demo" },
+                        "spec": {}
+                    })),
+                }],
             })),
             CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
                 kind: "Convoy".into(),
@@ -1338,16 +1428,22 @@ mod tests {
                     "spec": {}
                 }),
             })),
-            CommandValue::ResourceWatchEvent(Box::new(ResourceWatchResponse {
-                kind: "Convoy".into(),
+            CommandValue::ResourceWatchEvent(Box::new(ResourceReadEnvelope {
+                api_version: "flotilla.work/v1".into(),
+                resource_kind: "Convoy".into(),
                 plural: "convoys".into(),
                 namespace: "flotilla".into(),
-                resource_version: "7".into(),
-                generation: None,
-                event: serde_json::json!({
-                    "type": "ADDED",
-                    "object": { "apiVersion": "flotilla.work/v1", "kind": "Convoy", "metadata": { "name": "demo" }, "spec": {} }
-                }),
+                cursor: ResourceCursor::from_position("7", None),
+                records: vec![ResourceReadRecord {
+                    record_type: ResourceRecordType::Added,
+                    provenance: ResourceRecordProvenance::Local { node_id: crate::NodeId::new("desktop") },
+                    object: Some(serde_json::json!({
+                        "apiVersion": "flotilla.work/v1",
+                        "kind": "Convoy",
+                        "metadata": { "name": "demo" },
+                        "spec": {}
+                    })),
+                }],
             })),
             CommandValue::EnvironmentSpecRead {
                 spec: crate::EnvironmentSpec {
@@ -1664,6 +1760,39 @@ mod tests {
     fn issue_page_value_roundtrip() {
         let val = CommandValue::IssuePage(crate::issue_query::IssueResultPage { items: vec![], total: Some(10), has_more: true });
         assert_json_roundtrip(&val);
+    }
+
+    #[test]
+    fn resource_cursor_is_opaque_and_roundtrips_its_position() {
+        let cursor = ResourceCursor::from_position("42", Some("observed-generation".to_string()));
+
+        assert!(!cursor.to_string().contains("42"));
+        assert_eq!(cursor.position().expect("decode cursor"), ("42".to_string(), Some("observed-generation".to_string())));
+        assert_eq!(cursor.to_string().parse::<ResourceCursor>().expect("parse cursor"), cursor);
+    }
+
+    #[test]
+    fn resource_read_envelope_uses_the_stable_script_shape() {
+        let envelope = ResourceReadEnvelope {
+            api_version: "flotilla.work/v1".into(),
+            resource_kind: "Convoy".into(),
+            plural: "convoys".into(),
+            namespace: "flotilla".into(),
+            cursor: ResourceCursor::from_position("1", None),
+            records: vec![ResourceReadRecord {
+                record_type: ResourceRecordType::Current,
+                provenance: ResourceRecordProvenance::Local { node_id: crate::NodeId::new("feta") },
+                object: Some(serde_json::json!({"metadata": {"name": "demo"}})),
+            }],
+        };
+
+        let value = serde_json::to_value(&envelope).expect("serialize resource envelope");
+        assert_eq!(value["apiVersion"], "flotilla.work/v1");
+        assert_eq!(value["resourceKind"], "Convoy");
+        assert!(value["cursor"].is_string());
+        assert_eq!(value["records"][0]["type"], "CURRENT");
+        assert_eq!(value["records"][0]["provenance"]["source"], "local");
+        assert_json_roundtrip(&envelope);
     }
 
     #[test]

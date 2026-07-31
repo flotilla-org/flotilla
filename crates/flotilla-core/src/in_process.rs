@@ -28,9 +28,10 @@ use flotilla_protocol::{
     HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
     PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
     ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo,
-    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedAttachAction, ResolvedAttachPlan, ResourceJsonResponse,
-    ResourceRef, ResourceWatchResponse, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo, ToolInventory,
-    TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor,
+    ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef,
+    StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress,
+    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -152,9 +153,10 @@ struct ResourceWatchCommandContext {
     backend: ResourceBackend,
     namespace: String,
     kind: String,
+    name: Option<String>,
     include_replicas: bool,
     replica_sources: bool,
-    cursor: Option<flotilla_protocol::ResourceWatchCursor>,
+    cursor: Option<ResourceCursor>,
     command_id: u64,
     node_id: NodeId,
     repo_identity: RepoIdentity,
@@ -163,14 +165,18 @@ struct ResourceWatchCommandContext {
 }
 
 async fn run_resource_watch_command(context: ResourceWatchCommandContext) -> CommandValue {
-    let start = context.cursor.map(|cursor| match cursor.generation {
-        Some(generation) => WatchStart::FromVersionInGeneration { generation, resource_version: cursor.resource_version },
-        None => WatchStart::FromVersion(cursor.resource_version),
-    });
+    let resuming = context.cursor.is_some();
+    let start = match context.cursor.as_ref().map(ResourceCursor::position).transpose() {
+        Ok(position) => position.map(|(resource_version, generation)| match generation {
+            Some(generation) => WatchStart::FromVersionInGeneration { generation, resource_version },
+            None => WatchStart::FromVersion(resource_version),
+        }),
+        Err(message) => return CommandValue::Error { message },
+    };
     let result = match (context.replica_sources, context.include_replicas, start) {
-        (true, _, Some(_)) => Err(ResourceError::invalid("replica-source watches cannot resume from an origin resourceVersion")),
+        (true, _, Some(_)) => Err(ResourceError::invalid("replica-source watches do not support cursor resume")),
         (true, _, None) => watch_resource_kind_replica_sources(&context.backend, &context.namespace, &context.kind).await,
-        (false, true, Some(_)) => Err(ResourceError::invalid("include-replicas watches cannot resume from an origin resourceVersion")),
+        (false, true, Some(_)) => Err(ResourceError::invalid("include-replicas watches do not support cursor resume")),
         (false, true, None) => watch_resource_kind_including_replicas(&context.backend, &context.namespace, &context.kind).await,
         (false, false, Some(start)) => watch_resource_kind_from(&context.backend, &context.namespace, &context.kind, start).await,
         (false, false, None) => watch_resource_kind(&context.backend, &context.namespace, &context.kind).await,
@@ -180,32 +186,44 @@ async fn run_resource_watch_command(context: ResourceWatchCommandContext) -> Com
         Err(error) => return CommandValue::Error { message: error.to_string() },
     };
 
-    let kind = watch.kind;
+    let resource_kind = watch.kind;
     let plural = watch.plural;
     let namespace = watch.namespace;
     let initial_resource_version = watch.resource_version;
     let generation = watch.generation;
-    for event in watch.initial {
+    let initial_cursor = ResourceCursor::from_position(initial_resource_version.clone(), generation.clone());
+    if !resuming {
+        let initial = watch
+            .initial
+            .into_iter()
+            .filter_map(|event| resource_watch_record(event, &context.node_id).transpose())
+            .collect::<Result<Vec<_>, _>>();
+        let initial = match initial {
+            Ok(initial) => initial.into_iter().filter(|record| resource_record_matches_name(record, context.name.as_deref())).collect(),
+            Err(message) => return CommandValue::Error { message },
+        };
         if context.token.is_cancelled() {
             return CommandValue::Cancelled;
         }
-        send_resource_watch_event(&context.event_tx, context.command_id, &context.node_id, &context.repo_identity, ResourceWatchResponse {
-            kind: kind.clone(),
-            plural: plural.clone(),
-            namespace: namespace.clone(),
-            resource_version: initial_resource_version.clone(),
-            generation: generation.clone(),
-            event,
-        });
+        send_resource_watch_event(
+            &context.event_tx,
+            context.command_id,
+            &context.node_id,
+            &context.repo_identity,
+            resource_read_envelope(resource_kind.clone(), plural.clone(), namespace.clone(), initial_cursor.clone(), initial),
+        );
     }
-    send_resource_watch_event(&context.event_tx, context.command_id, &context.node_id, &context.repo_identity, ResourceWatchResponse {
-        kind: kind.clone(),
-        plural: plural.clone(),
-        namespace: namespace.clone(),
-        resource_version: initial_resource_version.clone(),
-        generation: generation.clone(),
-        event: serde_json::json!({"type": "BOOKMARK"}),
-    });
+    send_resource_watch_event(
+        &context.event_tx,
+        context.command_id,
+        &context.node_id,
+        &context.repo_identity,
+        resource_read_envelope(resource_kind.clone(), plural.clone(), namespace.clone(), initial_cursor, vec![ResourceReadRecord {
+            record_type: ResourceRecordType::Bookmark,
+            provenance: ResourceRecordProvenance::Local { node_id: context.node_id.clone() },
+            object: None,
+        }]),
+    );
 
     let mut stream = watch.stream;
     loop {
@@ -218,20 +236,26 @@ async fn run_resource_watch_command(context: ResourceWatchCommandContext) -> Com
                             .as_str()
                             .unwrap_or(&initial_resource_version)
                             .to_string();
-                        send_resource_watch_event(
-                            &context.event_tx,
-                            context.command_id,
-                            &context.node_id,
-                            &context.repo_identity,
-                            ResourceWatchResponse {
-                                kind: kind.clone(),
-                                plural: plural.clone(),
-                                namespace: namespace.clone(),
-                                resource_version,
-                                generation: generation.clone(),
-                                event,
-                            },
-                        );
+                        let record = match resource_watch_record(event, &context.node_id) {
+                            Ok(Some(record)) => record,
+                            Ok(None) => continue,
+                            Err(message) => return CommandValue::Error { message },
+                        };
+                        if resource_record_matches_name(&record, context.name.as_deref()) {
+                            send_resource_watch_event(
+                                &context.event_tx,
+                                context.command_id,
+                                &context.node_id,
+                                &context.repo_identity,
+                                resource_read_envelope(
+                                    resource_kind.clone(),
+                                    plural.clone(),
+                                    namespace.clone(),
+                                    ResourceCursor::from_position(resource_version, generation.clone()),
+                                    vec![record],
+                                ),
+                            );
+                        }
                     }
                     Some(Err(error)) => return CommandValue::Error { message: error.to_string() },
                     None => return CommandValue::Ok,
@@ -246,9 +270,13 @@ fn send_resource_watch_event(
     command_id: u64,
     node_id: &NodeId,
     repo_identity: &RepoIdentity,
-    response: ResourceWatchResponse,
+    response: ResourceReadEnvelope,
 ) {
-    let description = format!("{} {}", response.event["type"].as_str().unwrap_or("EVENT"), response.kind);
+    let description = format!(
+        "{} {}",
+        response.records.first().map(|record| format!("{:?}", record.record_type)).unwrap_or_else(|| "CURRENT".to_string()),
+        response.resource_kind
+    );
     let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
         command_id,
         node_id: node_id.clone(),
@@ -259,6 +287,59 @@ fn send_resource_watch_event(
         description,
         status: StepStatus::Produced { value: Box::new(CommandValue::ResourceWatchEvent(Box::new(response))) },
     });
+}
+
+fn resource_read_envelope(
+    resource_kind: String,
+    plural: String,
+    namespace: String,
+    cursor: ResourceCursor,
+    records: Vec<ResourceReadRecord>,
+) -> ResourceReadEnvelope {
+    ResourceReadEnvelope { api_version: "flotilla.work/v1".to_string(), resource_kind, plural, namespace, cursor, records }
+}
+
+fn resource_record(record_type: ResourceRecordType, object: serde_json::Value, local_node_id: &NodeId) -> ResourceReadRecord {
+    let annotations = object.get("metadata").and_then(|metadata| metadata.get("annotations"));
+    let origin_root = annotations.and_then(|annotations| annotations.get("flotilla.work/origin-root")).and_then(|value| value.as_str());
+    let last_synced_at =
+        annotations.and_then(|annotations| annotations.get("flotilla.work/last-synced-at")).and_then(|value| value.as_str());
+    let provenance = match (origin_root, last_synced_at) {
+        (Some(origin_root), Some(last_synced_at)) => {
+            ResourceRecordProvenance::Replica { origin_root: NodeId::new(origin_root), last_synced_at: last_synced_at.to_string() }
+        }
+        _ => ResourceRecordProvenance::Local { node_id: local_node_id.clone() },
+    };
+    ResourceReadRecord { record_type, provenance, object: Some(object) }
+}
+
+fn resource_watch_record(event: serde_json::Value, local_node_id: &NodeId) -> Result<Option<ResourceReadRecord>, String> {
+    let Some(event_type) = event.get("type").and_then(|value| value.as_str()) else {
+        return Err("resource watch event is missing type".to_string());
+    };
+    if event_type == "BOOKMARK" {
+        return Ok(None);
+    }
+    let record_type = match event_type {
+        "ADDED" => ResourceRecordType::Added,
+        "MODIFIED" => ResourceRecordType::Modified,
+        "DELETED" => ResourceRecordType::Deleted,
+        other => return Err(format!("unknown resource watch event type '{other}'")),
+    };
+    let object = event.get("object").cloned().ok_or_else(|| "resource watch event is missing object".to_string())?;
+    Ok(Some(resource_record(record_type, object, local_node_id)))
+}
+
+fn resource_record_matches_name(record: &ResourceReadRecord, name: Option<&str>) -> bool {
+    name.is_none_or(|name| {
+        record
+            .object
+            .as_ref()
+            .and_then(|object| object.get("metadata"))
+            .and_then(|metadata| metadata.get("name"))
+            .and_then(|value| value.as_str())
+            == Some(name)
+    })
 }
 
 #[derive(Default)]
@@ -7133,7 +7214,7 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::ResourceWatch { namespace, kind, include_replicas, replica_sources, cursor } =
+        if let flotilla_protocol::CommandAction::ResourceWatch { namespace, kind, name, include_replicas, replica_sources, cursor } =
             command.action
         {
             let repo_identity = empty_repo_identity();
@@ -7160,6 +7241,7 @@ impl InProcessDaemon {
                         .backend(backend)
                         .namespace(namespace)
                         .kind(kind)
+                        .maybe_name(name)
                         .include_replicas(include_replicas)
                         .replica_sources(replica_sources)
                         .maybe_cursor(cursor)
@@ -8229,27 +8311,57 @@ impl DaemonHandle for InProcessDaemon {
                     Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
                 }
             }
-            CommandAction::QueryResourceList { namespace, kind, include_replicas } => match if *include_replicas {
-                list_resource_kind_including_replicas(&self.resource_backend, namespace, kind).await
-            } else {
-                list_resource_kind(&self.resource_backend, namespace, kind).await
-            } {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::ResourceList(Box::new(ResourceJsonResponse {
-                    kind: v.kind,
-                    plural: v.plural,
-                    namespace: v.namespace,
-                    value: v.value,
-                }))),
-                Err(error) => Ok(flotilla_protocol::CommandValue::Error { message: error.to_string() }),
-            },
+            CommandAction::QueryResourceList { namespace, kind, include_replicas } => {
+                let listed = if *include_replicas {
+                    list_resource_kind_including_replicas(&self.resource_backend, namespace, kind).await
+                } else {
+                    list_resource_kind(&self.resource_backend, namespace, kind).await
+                };
+                match listed {
+                    Ok(v) => {
+                        let resource_version = v.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string();
+                        let generation = v.value["metadata"]["generation"].as_str().map(ToOwned::to_owned);
+                        let records = v.value["items"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .cloned()
+                            .map(|object| resource_record(ResourceRecordType::Current, object, &self.node_id))
+                            .collect();
+                        Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
+                            v.kind,
+                            v.plural,
+                            v.namespace,
+                            ResourceCursor::from_position(resource_version, generation),
+                            records,
+                        ))))
+                    }
+                    Err(error) => Ok(CommandValue::Error { message: error.to_string() }),
+                }
+            }
             CommandAction::QueryResourceGet { namespace, kind, name } => {
+                // Take the collection cursor before reading the object. A
+                // concurrent mutation can then be replayed (at worst as a
+                // duplicate) instead of being hidden behind a newer cursor.
+                let listed = list_resource_kind(&self.resource_backend, namespace, kind).await;
                 match get_resource_kind(&self.resource_backend, namespace, kind, name).await {
-                    Ok(v) => Ok(flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
-                        kind: v.kind,
-                        plural: v.plural,
-                        namespace: v.namespace,
-                        value: v.value,
-                    }))),
+                    Ok(v) => {
+                        let (resource_version, generation) = match listed {
+                            Ok(listed) => (
+                                listed.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string(),
+                                listed.value["metadata"]["generation"].as_str().map(ToOwned::to_owned),
+                            ),
+                            Err(_) => (v.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string(), None),
+                        };
+                        let record = resource_record(ResourceRecordType::Current, v.value, &self.node_id);
+                        Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
+                            v.kind,
+                            v.plural,
+                            v.namespace,
+                            ResourceCursor::from_position(resource_version, generation),
+                            vec![record],
+                        ))))
+                    }
                     Err(error) => Ok(flotilla_protocol::CommandValue::Error { message: error.to_string() }),
                 }
             }

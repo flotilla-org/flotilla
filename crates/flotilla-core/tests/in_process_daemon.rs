@@ -742,10 +742,13 @@ async fn resource_list_and_get_queries_return_wire_json() {
         )
         .await
         .expect("list query");
-    let CommandValue::ResourceList(listed) = listed else { panic!("expected resource list") };
-    assert_eq!(listed.value["items"][0]["apiVersion"], "flotilla.work/v1");
-    assert_eq!(listed.value["items"][0]["kind"], "Convoy");
-    assert_eq!(listed.value["items"][0]["metadata"]["name"], "resource-demo");
+    let CommandValue::ResourceRead(listed) = listed else { panic!("expected resource read") };
+    assert_eq!(listed.resource_kind, "Convoy");
+    assert_eq!(listed.records[0].record_type, flotilla_protocol::ResourceRecordType::Current);
+    let listed_object = listed.records[0].object.as_ref().expect("listed object");
+    assert_eq!(listed_object["apiVersion"], "flotilla.work/v1");
+    assert_eq!(listed_object["kind"], "Convoy");
+    assert_eq!(listed_object["metadata"]["name"], "resource-demo");
 
     let fetched = daemon
         .execute_query(
@@ -763,19 +766,20 @@ async fn resource_list_and_get_queries_return_wire_json() {
         )
         .await
         .expect("get query");
-    let CommandValue::ResourceObject(fetched) = fetched else { panic!("expected resource object") };
-    assert_eq!(fetched.value["metadata"]["name"], "resource-demo");
-    assert_eq!(fetched.value["spec"]["workflow_ref"], "wf");
+    let CommandValue::ResourceRead(fetched) = fetched else { panic!("expected resource read") };
+    let fetched_object = fetched.records[0].object.as_ref().expect("fetched object");
+    assert_eq!(fetched_object["metadata"]["name"], "resource-demo");
+    assert_eq!(fetched_object["spec"]["workflow_ref"], "wf");
+    assert_eq!(fetched.cursor.position().expect("decode cursor").0, listed.cursor.position().expect("decode cursor").0);
 }
 
 #[tokio::test]
-async fn resource_watch_emits_initial_resources_as_wire_events() {
+async fn resource_watch_streams_current_update_and_resumed_delete_without_loss() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon =
         InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
-    daemon
-        .resource_backend()
-        .using::<ResourceConvoy>("flotilla")
+    let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
+    let created = convoys
         .create(
             &InputMeta::builder().name("watched-convoy".to_string()).build(),
             &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
@@ -792,6 +796,7 @@ async fn resource_watch_emits_initial_resources_as_wire_events() {
             action: CommandAction::ResourceWatch {
                 namespace: "flotilla".to_string(),
                 kind: "convoys".to_string(),
+                name: Some("watched-convoy".to_string()),
                 include_replicas: false,
                 replica_sources: false,
                 cursor: None,
@@ -810,30 +815,50 @@ async fn resource_watch_emits_initial_resources_as_wire_events() {
             _ => {}
         }
     };
-    assert_eq!(watched.event["type"], "ADDED");
-    assert_eq!(watched.event["object"]["metadata"]["name"], "watched-convoy");
+    assert_eq!(watched.records.len(), 1);
+    assert_eq!(watched.records[0].record_type, flotilla_protocol::ResourceRecordType::Added);
+    assert_eq!(watched.records[0].object.as_ref().expect("current object")["metadata"]["name"], "watched-convoy");
+    assert!(matches!(watched.records[0].provenance, flotilla_protocol::ResourceRecordProvenance::Local { .. }));
 
-    daemon.cancel(command_id).await.expect("cancel watch");
-    assert!(matches!(recv_command_finished(&mut rx, command_id).await, CommandValue::Cancelled));
-}
+    let _bookmark = loop {
+        match recv_event(&mut rx).await {
+            DaemonEvent::CommandStepUpdate { command_id: id, status, .. } if id == command_id => {
+                let StepStatus::Produced { value } = status else { continue };
+                let CommandValue::ResourceWatchEvent(event) = *value else { continue };
+                if event.records[0].record_type == flotilla_protocol::ResourceRecordType::Bookmark {
+                    break event;
+                }
+            }
+            _ => {}
+        }
+    };
 
-#[tokio::test]
-async fn resource_watch_resumes_after_a_stored_cursor_without_relisting() {
-    let temp = tempfile::tempdir().expect("create tempdir");
-    let daemon =
-        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
-    let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
+    let updated_spec = flotilla_resources::ConvoySpec::builder().workflow_ref("wf-v2".to_string()).build();
     convoys
-        .create(
-            &InputMeta::builder().name("before-cursor".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
-        )
+        .update(&InputMeta::from(&created.metadata), &created.metadata.resource_version, &updated_spec)
         .await
-        .expect("create initial convoy");
-    let cursor = convoys.list().await.expect("list cursor").resource_version;
+        .expect("update watched convoy");
+    let modified = loop {
+        match recv_event(&mut rx).await {
+            DaemonEvent::CommandStepUpdate { command_id: id, status, .. } if id == command_id => {
+                let StepStatus::Produced { value } = status else { continue };
+                let CommandValue::ResourceWatchEvent(event) = *value else { continue };
+                if event.records[0].record_type == flotilla_protocol::ResourceRecordType::Modified {
+                    break event;
+                }
+            }
+            _ => {}
+        }
+    };
+    let resume_cursor = modified.cursor.clone();
+    assert_eq!(modified.records[0].object.as_ref().expect("modified object")["spec"]["workflow_ref"], "wf-v2");
 
-    let mut rx = daemon.subscribe();
-    let command_id = daemon
+    daemon.cancel(command_id).await.expect("cancel initial watch");
+    assert!(matches!(recv_command_finished(&mut rx, command_id).await, CommandValue::Cancelled));
+    convoys.delete("watched-convoy").await.expect("delete watched convoy");
+
+    let mut resumed_events = daemon.subscribe();
+    let resumed_command_id = daemon
         .execute(Command {
             node_id: None,
             provisioning_target: None,
@@ -841,47 +866,28 @@ async fn resource_watch_resumes_after_a_stored_cursor_without_relisting() {
             action: CommandAction::ResourceWatch {
                 namespace: "flotilla".to_string(),
                 kind: "convoys".to_string(),
+                name: Some("watched-convoy".to_string()),
                 include_replicas: false,
                 replica_sources: false,
-                cursor: Some(flotilla_protocol::ResourceWatchCursor { resource_version: cursor, generation: None }),
+                cursor: Some(resume_cursor),
             },
         })
         .await
         .expect("resume watch command");
-
-    let bookmark = loop {
-        match recv_event(&mut rx).await {
-            DaemonEvent::CommandStepUpdate { command_id: id, status, .. } if id == command_id => {
+    let deleted = loop {
+        match recv_event(&mut resumed_events).await {
+            DaemonEvent::CommandStepUpdate { command_id: id, status, .. } if id == resumed_command_id => {
                 let StepStatus::Produced { value } = status else { continue };
                 let CommandValue::ResourceWatchEvent(event) = *value else { continue };
-                break event;
-            }
-            _ => {}
-        }
-    };
-    assert_eq!(bookmark.event["type"], "BOOKMARK");
-
-    convoys
-        .create(
-            &InputMeta::builder().name("after-cursor".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
-        )
-        .await
-        .expect("create convoy after cursor");
-    let added = loop {
-        match recv_event(&mut rx).await {
-            DaemonEvent::CommandStepUpdate { command_id: id, status, .. } if id == command_id => {
-                let StepStatus::Produced { value } = status else { continue };
-                let CommandValue::ResourceWatchEvent(event) = *value else { continue };
-                if event.event["type"] == "ADDED" {
+                if event.records[0].record_type == flotilla_protocol::ResourceRecordType::Deleted {
                     break event;
                 }
             }
             _ => {}
         }
     };
-    assert_eq!(added.event["object"]["metadata"]["name"], "after-cursor");
-    daemon.cancel(command_id).await.expect("cancel resumed watch");
+    assert_eq!(deleted.records[0].object.as_ref().expect("deleted object")["metadata"]["name"], "watched-convoy");
+    daemon.cancel(resumed_command_id).await.expect("cancel resumed watch");
 }
 
 async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBackend, image: &str, agent_adapters: BTreeSet<String>) {
