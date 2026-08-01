@@ -166,12 +166,14 @@ impl From<flotilla_resources::DockerImagePullPolicy> for ImagePullPolicy {
 pub struct ProvisionedMount {
     pub host_path: DaemonHostPath,
     pub environment_path: ExecutionEnvironmentPath,
+    #[serde(default)]
     pub mode: ProvisionedMountMode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProvisionedMountMode {
+    #[default]
     Ro,
     Rw,
 }
@@ -191,6 +193,11 @@ pub trait EnvironmentProvider: Send + Sync {
     async fn ensure_image(&self, spec: &EnvironmentSpec, repo_root: &Path) -> Result<ImageId, String>;
     async fn create(&self, id: EnvironmentId, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String>;
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String>;
+    /// Destroy an environment using only its stable provider identity.
+    ///
+    /// Teardown must not depend on parsing mutable actuated-object metadata:
+    /// that metadata can outlive the daemon version which wrote it.
+    async fn destroy(&self, container_id: &str) -> Result<(), String>;
 }
 
 /// A handle to a single provisioned sandbox environment instance.

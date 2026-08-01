@@ -644,6 +644,22 @@ async fn list_preserves_provisioned_mount_metadata() {
 }
 
 #[tokio::test]
+async fn list_defaults_mount_mode_from_pre_mode_metadata() {
+    let runner = Arc::new(RecordingRunner::new_ok(
+        "container-1\ttest-env-list\tubuntu:22.04\t[{\"host_path\":\"/host/reference-repo\",\"environment_path\":\"/ref/repo\"}]\n",
+    ));
+    let provider = DockerEnvironmentProvider::new(runner);
+
+    let handles = provider.list().await.expect("pre-mode mount metadata should remain readable");
+
+    assert_eq!(
+        handles[0].provisioned_mounts(),
+        vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
+        "mounts written before mode existed were mounted read-only",
+    );
+}
+
+#[tokio::test]
 async fn list_fails_on_malformed_reference_repo_mount_metadata() {
     use flotilla_protocol::ImageId;
 

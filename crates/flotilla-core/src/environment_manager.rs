@@ -587,6 +587,10 @@ mod tests {
         async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
             Ok(vec![])
         }
+
+        async fn destroy(&self, _container_id: &str) -> Result<(), String> {
+            Err("unused in test".to_string())
+        }
     }
 
     fn mock_handle(
