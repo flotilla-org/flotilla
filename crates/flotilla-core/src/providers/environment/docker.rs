@@ -75,9 +75,6 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         let mut tokens = opts.tokens;
         for tool in &opts.tools {
             for asset in &tool.assets {
-                if requested_mounts.iter().chain(&provisioned_mounts).any(|mount| mount.environment_path == asset.environment_path) {
-                    return Err(format!("mount target {} is reserved for {}", asset.environment_path, asset.purpose));
-                }
                 let mode = match asset.access {
                     EnvironmentToolAssetAccess::ReadOnly => ProvisionedMountMode::Ro,
                     EnvironmentToolAssetAccess::SharedWritable => ProvisionedMountMode::Rw,
@@ -99,6 +96,9 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
                         (asset.host_path.as_path().to_path_buf(), asset.environment_path.as_path().to_path_buf())
                     }
                 };
+                if requested_mounts.iter().chain(&provisioned_mounts).any(|mount| mount.environment_path.as_path() == environment_path) {
+                    return Err(format!("mount target {} is reserved for {}", environment_path.display(), asset.purpose));
+                }
                 provisioned_mounts.push(ProvisionedMount::new(host_path, environment_path, mode));
             }
             for update in &tool.environment {
