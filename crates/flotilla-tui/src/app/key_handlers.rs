@@ -426,7 +426,11 @@ impl App {
                 (self.repo_command_for_identity(repo_identity, CommandAction::SelectWorkspace { ws_ref: workspace_ref }), host)
             }
             TableIntent::AttachPane { reference, host } => {
-                self.proto_commands.push(self.command(CommandAction::AttachTransient { reference, host: Some(host), watch: false }));
+                self.proto_commands.push(self.command(CommandAction::AttachTransient {
+                    reference,
+                    host: Some(host),
+                    mode: flotilla_protocol::commands::AttachMode::Default,
+                }));
                 return;
             }
             TableIntent::DeleteConvoy { row_id, namespace, name, host } => {

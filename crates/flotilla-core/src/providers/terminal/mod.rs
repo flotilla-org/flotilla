@@ -3,7 +3,7 @@ pub mod passthrough;
 pub mod shpool;
 
 use async_trait::async_trait;
-use flotilla_protocol::{arg::Arg, AttachableId, AttachableSetId, TerminalStatus};
+use flotilla_protocol::{arg::Arg, commands::AttachMode, AttachableId, AttachableSetId, TerminalStatus};
 pub use flotilla_resources::TerminalSessionTag;
 
 use crate::path_context::ExecutionEnvironmentPath;
@@ -26,12 +26,6 @@ pub struct TerminalSession {
 pub enum ScreenActivity {
     Active,
     Stable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttachSeat {
-    Control,
-    Watch,
 }
 
 pub(crate) const MANAGED_SESSION_PREFIX: &str = "flotilla-v2:";
@@ -116,19 +110,26 @@ pub trait TerminalPool: Send + Sync {
         env_vars: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String>;
 
-    /// Returns attach arguments for the requested seat. Pools without watcher
-    /// support reject read-only attaches explicitly.
-    fn attach_args_for_seat(
+    /// Verify that the resolved pool supports the requested seat semantics.
+    async fn preflight_attach(&self, mode: AttachMode) -> Result<(), String> {
+        match mode {
+            AttachMode::Default => Ok(()),
+            AttachMode::Strict | AttachMode::Take => Err("terminal pool does not support controller-seat attach options".to_string()),
+        }
+    }
+
+    /// Returns attach arguments for the requested controller-seat behavior.
+    fn attach_args_for_mode(
         &self,
         session_name: &str,
         command: &str,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
-        seat: AttachSeat,
+        mode: AttachMode,
     ) -> Result<Vec<Arg>, String> {
-        match seat {
-            AttachSeat::Control => self.attach_args(session_name, command, cwd, env_vars),
-            AttachSeat::Watch => Err("terminal pool does not support read-only watcher attachments".to_string()),
+        match mode {
+            AttachMode::Default => self.attach_args(session_name, command, cwd, env_vars),
+            AttachMode::Strict | AttachMode::Take => Err("terminal pool does not support controller-seat attach options".to_string()),
         }
     }
 

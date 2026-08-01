@@ -243,6 +243,18 @@ pub enum ConvoyAutoAttach {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AttachMode {
+    /// Request control, degrading to a read-only watcher when control is held.
+    #[default]
+    Default,
+    /// Refuse when another attachment holds control.
+    Strict,
+    /// Take control and demote the current controller to watcher.
+    Take,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConvoyDispatchRegard {
     #[default]
     Emit,
@@ -339,9 +351,8 @@ pub enum CommandAction {
         /// Restrict resolution to the host that advertised the recipe.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<crate::HostName>,
-        /// Request a read-only watcher seat instead of foreground control.
-        #[serde(default, skip_serializing_if = "is_false")]
-        watch: bool,
+        #[serde(default)]
+        mode: AttachMode,
     },
     /// Resolve an attach for a temporary foreground excursion. Unlike the
     /// human-facing CLI attach, recursive hops must not stamp PM metadata.
@@ -349,9 +360,8 @@ pub enum CommandAction {
         reference: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<crate::HostName>,
-        /// Preserve watcher mode while traversing a transport boundary.
-        #[serde(default, skip_serializing_if = "is_false")]
-        watch: bool,
+        #[serde(default)]
+        mode: AttachMode,
     },
     PrepareTerminalForCheckout {
         checkout_path: PathBuf,
@@ -933,7 +943,7 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a".into(), host: None, watch: false },
+                action: CommandAction::Attach { reference: "convoy-a".into(), host: None, mode: AttachMode::Default },
             },
             Command {
                 node_id: None,
@@ -942,7 +952,7 @@ mod tests {
                 action: CommandAction::AttachTransient {
                     reference: "terminal-scratch".into(),
                     host: Some(crate::HostName::new("feta")),
-                    watch: false,
+                    mode: AttachMode::Default,
                 },
             },
             Command {

@@ -896,16 +896,24 @@ impl TerminalPool for FakeTerminalPool {
         Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach {session_name}"))])
     }
 
-    fn attach_args_for_seat(
+    async fn preflight_attach(&self, _mode: flotilla_protocol::commands::AttachMode) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn attach_args_for_mode(
         &self,
         session_name: &str,
         _command: &str,
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &super::super::terminal::TerminalEnvVars,
-        seat: super::super::terminal::AttachSeat,
+        mode: flotilla_protocol::commands::AttachMode,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
-        let watch = if seat == super::super::terminal::AttachSeat::Watch { " --watch" } else { "" };
-        Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach{watch} {session_name}"))])
+        let flag = match mode {
+            flotilla_protocol::commands::AttachMode::Default => "",
+            flotilla_protocol::commands::AttachMode::Strict => " --strict",
+            flotilla_protocol::commands::AttachMode::Take => " --take",
+        };
+        Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach{flag} {session_name}"))])
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {

@@ -167,15 +167,6 @@ fn execute_attach_plan(plan: &ResolvedAttachPlan, runner: &mut dyn AttachCommand
 
 fn replay_attach_stderr(captured: &[u8], mut writer: impl Write) -> Result<(), String> {
     writer.write_all(captured).map_err(|error| format!("could not replay attach error: {error}"))?;
-    let message = String::from_utf8_lossy(captured);
-    if message.contains("foreground client") && !message.contains("--watch") {
-        if !captured.ends_with(b"\n") {
-            writer.write_all(b"\n").map_err(|error| format!("could not replay attach error: {error}"))?;
-        }
-        writer
-            .write_all(b"hint: use `flotilla attach --watch <ref>` for a read-only view\n")
-            .map_err(|error| format!("could not replay attach error: {error}"))?;
-    }
     writer.flush().map_err(|error| format!("could not replay attach error: {error}"))
 }
 
@@ -213,9 +204,6 @@ pub fn run_temporary_attach(plan: &ResolvedAttachPlan) -> (ratatui::DefaultTermi
             if !captured.trim().is_empty() {
                 message.push_str(": ");
                 message.push_str(captured.trim());
-            }
-            if captured.contains("foreground client") && !captured.contains("--watch") {
-                message.push_str("; use `flotilla attach --watch <ref>` for a read-only view");
             }
             Err(message)
         }
@@ -359,15 +347,14 @@ mod tests {
     }
 
     #[test]
-    fn foreground_refusal_replay_preserves_holder_and_suggests_watch() {
+    fn attach_failure_replay_preserves_the_original_error() {
         let mut replayed = Vec::new();
 
         replay_attach_stderr(b"session held by host feta pid 4242: already has a foreground client\n", &mut replayed)
             .expect("refusal should replay");
 
         let replayed = String::from_utf8(replayed).expect("replayed stderr should be UTF-8");
-        assert!(replayed.contains("host feta pid 4242"), "{replayed}");
-        assert!(replayed.contains("flotilla attach --watch <ref>"), "{replayed}");
+        assert_eq!(replayed, "session held by host feta pid 4242: already has a foreground client\n");
     }
 
     #[test]
