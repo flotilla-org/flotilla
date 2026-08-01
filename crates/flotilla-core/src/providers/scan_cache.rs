@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_protocol::commands::AttachMode;
 use tokio::{sync::Mutex as AsyncMutex, time::Instant};
 
 use crate::{
@@ -172,6 +173,21 @@ impl TerminalPool for SharedTerminalPool {
         env_vars: &TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         self.inner.attach_args(session_name, command, cwd, env_vars)
+    }
+
+    async fn preflight_attach(&self, mode: AttachMode) -> Result<(), String> {
+        self.inner.preflight_attach(mode).await
+    }
+
+    fn attach_args_for_mode(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        mode: AttachMode,
+    ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+        self.inner.attach_args_for_mode(session_name, command, cwd, env_vars, mode)
     }
 
     async fn attach_command(

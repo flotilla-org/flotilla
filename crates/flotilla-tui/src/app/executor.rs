@@ -608,6 +608,7 @@ mod tests {
         let command = app.command(CommandAction::AttachTransient {
             reference: "terminal-scratch".to_string(),
             host: Some(flotilla_protocol::HostName::new("kiwi")),
+            mode: flotilla_protocol::commands::AttachMode::Default,
         });
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 

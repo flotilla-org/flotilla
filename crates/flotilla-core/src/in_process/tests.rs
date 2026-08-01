@@ -1438,6 +1438,16 @@ async fn crew_complete_uses_ambient_identity_to_complete_callers_work() {
     let env_ref = create_local_attach_environment(&daemon).await;
     create_two_agent_crew(&daemon, &env_ref).await;
 
+    daemon
+        .mark_crew_completion_pending("flotilla", "terminal-demo-implement-coder", CrewCompletionPending {
+            message: Some("ready for review".into()),
+            attempted_at: chrono::Utc::now(),
+            authority: "remote-before-failover".into(),
+            last_error: "authority unreachable".into(),
+        })
+        .await
+        .expect("mark completion pending before authority failover");
+
     let mut events = daemon.subscribe();
     let command_id = daemon
         .execute(Command {
@@ -1457,6 +1467,19 @@ async fn crew_complete_uses_ambient_identity_to_complete_callers_work() {
     let coder = &convoy.status.expect("convoy status").crew_work["implement"]["coder"];
     assert_eq!(coder.phase, CrewWorkPhase::Done);
     assert_eq!(coder.message.as_deref(), Some("ready for review"));
+    assert!(
+        daemon
+            .resource_backend()
+            .using::<ResourceTerminalSession>("flotilla")
+            .get("terminal-demo-implement-coder")
+            .await
+            .expect("coder terminal")
+            .status
+            .expect("coder terminal status")
+            .completion_pending
+            .is_none(),
+        "successful local completion should acknowledge the durable intent"
+    );
 }
 
 #[tokio::test]
@@ -2606,7 +2629,7 @@ async fn attach_query_resolves_running_terminal_session_by_convoy_task_role() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -2630,6 +2653,45 @@ async fn attach_query_resolves_running_terminal_session_by_convoy_task_role() {
         regards.items[0].spec.target,
         ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-a").subresource("vessels/implement")
     );
+}
+
+#[tokio::test]
+async fn strict_attach_query_passes_through_controller_seat_policy() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_running_attach_session(
+        &daemon,
+        &env_ref,
+        "terminal-convoy-a-implement-coder",
+        "cleat-session-1",
+        "convoy-a",
+        "implement",
+        "coder",
+    )
+    .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None, mode: AttachMode::Strict },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("strict attach query should execute");
+
+    let CommandValue::AttachCommandResolved { plan, .. } = result else {
+        panic!("expected attach command, got {result:?}");
+    };
+    assert_eq!(single_attach_command(&plan), "attach --strict cleat-session-1");
 }
 
 #[tokio::test]
@@ -2687,7 +2749,7 @@ async fn attach_query_rejects_a_running_agent_without_a_recorded_launch_command(
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -2728,7 +2790,7 @@ async fn attach_query_resolves_remote_session_as_one_recursive_hop() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -2971,7 +3033,7 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -3000,7 +3062,7 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "coder".to_string(), host: None },
+                action: CommandAction::Attach { reference: "coder".to_string(), host: None, mode: AttachMode::Strict },
             },
             uuid::Uuid::new_v4(),
         )
@@ -3013,6 +3075,7 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
     let command = attach_plan_text(&plan);
     assert!(command.contains(&format!("ssh -t 'alice@{remote_hostname}'")), "bare role should resolve through the replica host: {command}");
     assert!(command.contains("flotilla attach"), "bare role should recursively invoke flotilla attach: {command}");
+    assert!(command.contains("--strict"), "strict mode should survive the recursive hop: {command}");
     assert!(command.contains("coder"), "command should preserve the original bare role reference: {command}");
 
     let result = daemon
@@ -3021,7 +3084,7 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "terminal-remote-coder".to_string(), host: None },
+                action: CommandAction::Attach { reference: "terminal-remote-coder".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -3095,6 +3158,7 @@ async fn transient_attach_selects_the_displayed_host_for_result_set_only_indepen
                 action: CommandAction::AttachTransient {
                     reference: "terminal-scratch".to_string(),
                     host: Some(HostName::new(selected_host)),
+                    mode: AttachMode::Default,
                 },
             },
             uuid::Uuid::new_v4(),
@@ -3151,6 +3215,7 @@ async fn transient_attach_resolves_standing_checkout_paths_locally_and_determini
                     action: CommandAction::AttachTransient {
                         reference: checkout_path.display().to_string(),
                         host: Some(HostName::new(TEST_LOCAL_ATTACH_HOST)),
+                        mode: AttachMode::Default,
                     },
                 },
                 uuid::Uuid::new_v4(),
@@ -3168,6 +3233,51 @@ async fn transient_attach_resolves_standing_checkout_paths_locally_and_determini
     assert_eq!(ensured.len(), 1, "re-opening a checkout reuses its terminal-pool session");
     assert_eq!(ensured[0].cwd.as_path(), checkout_path);
     assert_eq!(ensured[0].command, "${SHELL:-/bin/sh}");
+}
+
+#[tokio::test]
+async fn transient_checkout_attach_preflights_before_creating_a_session() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let checkout_path = temp.path().join("standing-checkout");
+    std::fs::create_dir_all(&checkout_path).expect("create checkout");
+    let (daemon, terminal_pool) = new_attach_test_daemon_with_pool(&config_base).await;
+    terminal_pool.set_attach_preflight_error("stale pool cleat").await;
+    let row = CheckoutRow::builder()
+        .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "dev", "standing").on_host(HostName::new(TEST_LOCAL_ATTACH_HOST)))
+        .repo(RepositoryKey("repo-standing".to_owned()))
+        .repo_label("standing")
+        .path(checkout_path.display().to_string())
+        .branch("main")
+        .host(HostName::new(TEST_LOCAL_ATTACH_HOST))
+        .authority(LifecycleAuthority::Observed)
+        .build();
+    daemon.aggregator_projection_state().await.replace_local_checkout_rows(vec![row]).await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::AttachTransient {
+                    reference: checkout_path.display().to_string(),
+                    host: Some(HostName::new(TEST_LOCAL_ATTACH_HOST)),
+                    mode: AttachMode::Default,
+                },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should return its preflight error");
+
+    let CommandValue::Error { message } = result else {
+        panic!("expected preflight error, got {result:?}");
+    };
+    assert!(message.contains("stale pool cleat"), "{message}");
+    assert!(terminal_pool.ensured.lock().await.is_empty(), "preflight failure must not create a terminal session");
 }
 
 #[tokio::test]
@@ -3201,7 +3311,11 @@ async fn transient_attach_routes_standing_checkout_paths_to_the_displayed_remote
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::AttachTransient { reference: "/work/standing".to_owned(), host: Some(HostName::new(remote_host)) },
+                action: CommandAction::AttachTransient {
+                    reference: "/work/standing".to_owned(),
+                    host: Some(HostName::new(remote_host)),
+                    mode: AttachMode::Default,
+                },
             },
             uuid::Uuid::new_v4(),
         )
@@ -3250,7 +3364,7 @@ async fn attach_query_ignores_fleet_replica_hosts_that_are_not_configured() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "removed-env".to_string(), host: None },
+                action: CommandAction::Attach { reference: "removed-env".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -3307,7 +3421,7 @@ async fn attach_query_uses_topology_next_hop_for_multi_hop_route_shape() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -3361,7 +3475,7 @@ async fn attach_query_prefers_exact_reference_over_prefix_matches() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a".to_string(), host: None },
+                action: CommandAction::Attach { reference: "convoy-a".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -3437,7 +3551,7 @@ async fn attach_query_rejects_ambiguous_prefix() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a".to_string(), host: None },
+                action: CommandAction::Attach { reference: "convoy-a".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -3470,7 +3584,7 @@ async fn attach_query_reports_no_matching_reference() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "missing".to_string(), host: None },
+                action: CommandAction::Attach { reference: "missing".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -3498,7 +3612,7 @@ async fn attach_query_reports_unreachable_next_hop_for_remote_session_without_ho
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -3546,7 +3660,7 @@ async fn attach_query_reports_route_that_points_back_to_local_host() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -3580,7 +3694,7 @@ async fn attach_query_reports_ambiguous_routed_host_name() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -3604,7 +3718,7 @@ async fn attach_query_rejects_empty_reference() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "".to_string(), host: None },
+                action: CommandAction::Attach { reference: "".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )
@@ -3641,7 +3755,7 @@ async fn attach_query_errors_when_recorded_terminal_pool_is_unavailable() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None, mode: AttachMode::Default },
             },
             uuid::Uuid::new_v4(),
         )

@@ -172,6 +172,31 @@ pub struct TerminalSessionStatus {
     /// This deliberately does not participate in the session lifecycle phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<TerminalAttention>,
+    /// A crew completion accepted by this host but not yet acknowledged by
+    /// the convoy authority. The local terminal session owns this durable
+    /// intent so a daemon restart or mesh partition cannot lose the final act.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_pending: Option<CrewCompletionPending>,
+    /// Set when the controller exhausts its budget for one repeated reconcile
+    /// error. The session remains parked until an explicit restart clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<TerminalSessionDegradedCondition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrewCompletionPending {
+    pub message: Option<String>,
+    pub attempted_at: DateTime<Utc>,
+    pub authority: String,
+    pub last_error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSessionDegradedCondition {
+    pub reason: String,
+    pub message: String,
+    pub consecutive_failures: u32,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,16 +296,26 @@ pub enum TerminalSessionStatusPatch {
         message: String,
         stopped_at: Option<DateTime<Utc>>,
     },
+    MarkReconcileDegraded {
+        message: String,
+        consecutive_failures: u32,
+        observed_at: DateTime<Utc>,
+    },
     ObserveAttention {
         attention: TerminalAttention,
     },
+    MarkCompletionPending {
+        pending: CrewCompletionPending,
+    },
+    ClearCompletionPending,
 }
 
 impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
     fn apply(&self, status: &mut TerminalSessionStatus) {
         match self {
             Self::MarkStarting => {
-                *status = TerminalSessionStatus::default();
+                let completion_pending = status.completion_pending.take();
+                *status = TerminalSessionStatus { completion_pending, ..Default::default() };
             }
             Self::MarkRunning { session_id, pid, started_at, crew, launch_command, delivered_message_id } => {
                 status.phase = TerminalSessionPhase::Running;
@@ -318,12 +353,28 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     }
                 }
             }
+            Self::MarkReconcileDegraded { message, consecutive_failures, observed_at } => {
+                status.phase = TerminalSessionPhase::Failed;
+                status.message = Some(format!("reconcile stopped after {consecutive_failures} consecutive failures: {message}"));
+                status.degraded = Some(TerminalSessionDegradedCondition {
+                    reason: "ReconcileErrorBudgetExhausted".to_string(),
+                    message: message.clone(),
+                    consecutive_failures: *consecutive_failures,
+                    observed_at: *observed_at,
+                });
+                if let Some(attention) = &mut status.attention {
+                    attention.state = TerminalAttentionState::Unobservable;
+                    attention.as_of = *observed_at;
+                }
+            }
             Self::ObserveAttention { attention } => {
                 let replace = status.attention.as_ref().is_none_or(|previous| previous.should_replace_with(attention));
                 if replace {
                     status.attention = Some(attention.clone());
                 }
             }
+            Self::MarkCompletionPending { pending } => status.completion_pending = Some(pending.clone()),
+            Self::ClearCompletionPending => status.completion_pending = None,
         }
     }
 }
@@ -401,5 +452,23 @@ mod tests {
             .apply(&mut status);
 
         assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Unobservable);
+    }
+
+    #[test]
+    fn pending_completion_survives_terminal_restart_until_acknowledged() {
+        let pending = CrewCompletionPending {
+            message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
+            attempted_at: Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).single().expect("valid timestamp"),
+            authority: "kiwi".into(),
+            last_error: "authority unreachable for convoy-a".into(),
+        };
+        let mut status =
+            TerminalSessionStatus { phase: TerminalSessionPhase::Running, completion_pending: Some(pending.clone()), ..Default::default() };
+
+        TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
+        assert_eq!(status.completion_pending, Some(pending));
+
+        TerminalSessionStatusPatch::ClearCompletionPending.apply(&mut status);
+        assert_eq!(status.completion_pending, None);
     }
 }

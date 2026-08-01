@@ -1,12 +1,12 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
-    controller::{Actuation, ReconcileOutcome, Reconciler},
-    Convoy, Environment, EnvironmentPhase, ReplicaReadResolver, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
-    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    controller::{Actuation, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
+    Convoy, ConvoyPhase, Environment, EnvironmentPhase, ReplicaReadResolver, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
     CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, VESSEL_REF_LABEL,
 };
 
@@ -100,6 +100,22 @@ impl<R> TerminalSessionReconciler<R> {
             .map(|source| source.object)
             .ok_or_else(|| ResourceError::not_found(convoy_ref))
     }
+
+    async fn session_owner_missing(&self, session: &ResourceObject<TerminalSession>) -> Result<bool, ResourceError> {
+        let convoy_ref = match &session.spec.source {
+            TerminalSessionSource::Agent { context, .. } => Some(context.convoy.as_str()),
+            TerminalSessionSource::Tool { .. } => session.metadata.labels.get(CONVOY_LABEL).map(String::as_str),
+        };
+        let Some(convoy_ref) = convoy_ref else {
+            return Ok(false);
+        };
+        match self.convoy_for_session(session, convoy_ref).await {
+            Ok(convoy) => Ok(convoy.metadata.deletion_timestamp.is_some()
+                || convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned)),
+            Err(ResourceError::NotFound { .. }) => Ok(true),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 pub enum TerminalDeps {
@@ -122,16 +138,8 @@ where
     type Dependencies = TerminalDeps;
 
     async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
-        let convoy_ref = match &obj.spec.source {
-            TerminalSessionSource::Agent { context, .. } => Some(context.convoy.as_str()),
-            TerminalSessionSource::Tool { .. } => obj.metadata.labels.get(CONVOY_LABEL).map(String::as_str),
-        };
-        if let Some(convoy_ref) = convoy_ref {
-            match self.convoy_for_session(obj, convoy_ref).await {
-                Ok(convoy) if convoy.metadata.deletion_timestamp.is_none() => {}
-                Ok(_) | Err(ResourceError::NotFound { .. }) => return Ok(TerminalDeps::OwnerMissing),
-                Err(err) => return Err(err),
-            }
+        if self.session_owner_missing(obj).await? {
+            return Ok(TerminalDeps::OwnerMissing);
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
@@ -284,5 +292,33 @@ where
 
     fn finalizer_name(&self) -> Option<&'static str> {
         Some("flotilla.work/terminal-teardown")
+    }
+
+    fn reconcile_error_policy(&self) -> Option<ReconcileErrorPolicy> {
+        Some(ReconcileErrorPolicy {
+            max_consecutive_failures: 5,
+            initial_backoff: Duration::from_secs(60),
+            max_backoff: Duration::from_secs(15 * 60),
+        })
+    }
+
+    fn reconcile_degraded_patch(
+        &self,
+        _obj: &ResourceObject<Self::Resource>,
+        failure: &ReconcileFailure,
+    ) -> Option<TerminalSessionStatusPatch> {
+        Some(TerminalSessionStatusPatch::MarkReconcileDegraded {
+            message: failure.message.clone(),
+            consecutive_failures: failure.consecutive_failures,
+            observed_at: Utc::now(),
+        })
+    }
+
+    fn is_reconcile_degraded(&self, obj: &ResourceObject<Self::Resource>) -> bool {
+        obj.status.as_ref().is_some_and(|status| status.degraded.is_some())
+    }
+
+    async fn degraded_object_needs_reconcile(&self, obj: &ResourceObject<Self::Resource>) -> Result<bool, ResourceError> {
+        self.session_owner_missing(obj).await
     }
 }

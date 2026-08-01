@@ -10,7 +10,10 @@ use std::{
 
 use common::{resource_meta, TestLoopHarness};
 use flotilla_resources::{
-    controller::{Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, ResolverLabelMappedWatch},
+    controller::{
+        Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler,
+        ResolverLabelMappedWatch,
+    },
     ApiPaths, InMemoryBackend, InputMeta, LifecycleAuthority, NoStatusPatch, Presentation, PresentationSpec, Resource, ResourceBackend,
     ResourceError, ResourceObject, StatusPatch, TypedResolver, Vessel, VesselSpec,
 };
@@ -50,6 +53,84 @@ impl Resource for SecondaryResource {
     type StatusPatch = NoStatusPatch;
 
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "test-secondaries", kind: "TestSecondary" };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FailureResource;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct FailureStatus {
+    degraded: bool,
+    message: Option<String>,
+    consecutive_failures: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkDegraded(ReconcileFailure);
+
+impl StatusPatch<FailureStatus> for MarkDegraded {
+    fn apply(&self, status: &mut FailureStatus) {
+        status.degraded = true;
+        status.message = Some(self.0.message.clone());
+        status.consecutive_failures = self.0.consecutive_failures;
+    }
+}
+
+impl Resource for FailureResource {
+    type Spec = PrimarySpec;
+    type Status = FailureStatus;
+    type StatusPatch = MarkDegraded;
+
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "test-failures", kind: "TestFailure" };
+}
+
+#[derive(Clone)]
+struct BudgetedFailureReconciler {
+    attempts: Arc<AtomicUsize>,
+    persist_degraded: bool,
+}
+
+impl Reconciler for BudgetedFailureReconciler {
+    type Resource = FailureResource;
+    type Dependencies = ();
+
+    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Err(ResourceError::other("provider registry unavailable"))
+    }
+
+    fn reconcile(
+        &self,
+        _obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Dependencies,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        unreachable!("dependency failure should prevent reconcile")
+    }
+
+    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn reconcile_error_policy(&self) -> Option<ReconcileErrorPolicy> {
+        Some(ReconcileErrorPolicy {
+            max_consecutive_failures: 3,
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(40),
+        })
+    }
+
+    fn reconcile_degraded_patch(&self, _obj: &ResourceObject<Self::Resource>, failure: &ReconcileFailure) -> Option<MarkDegraded> {
+        self.persist_degraded.then(|| MarkDegraded(failure.clone()))
+    }
+
+    fn is_reconcile_degraded(&self, obj: &ResourceObject<Self::Resource>) -> bool {
+        obj.status.as_ref().is_some_and(|status| status.degraded)
+    }
 }
 
 #[derive(Clone)]
@@ -1187,6 +1268,123 @@ async fn controller_loop_removes_existing_adopted_finalizer_without_running_tear
     .expect("adopted primary should be unblocked without teardown");
 
     assert!(finalized.lock().expect("finalized lock").is_empty());
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_identical_reconcile_errors_back_off_and_park_as_degraded() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let failures = backend.clone().using::<FailureResource>("flotilla");
+    failures
+        .create(&primary_meta("terminal-a"), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("failure resource should be created");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: failures.clone(),
+            secondaries: Vec::new(),
+            reconciler: BudgetedFailureReconciler { attempts: Arc::clone(&attempts), persist_degraded: true },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        if attempts.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    tokio::time::advance(Duration::from_millis(9)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "first retry must respect its backoff");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        if attempts.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    tokio::time::advance(Duration::from_millis(19)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "second retry must use an increased backoff");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        if failures.get("terminal-a").await.expect("failure resource should remain").status.as_ref().is_some_and(|status| status.degraded) {
+            break;
+        }
+    }
+
+    let status = failures.get("terminal-a").await.expect("failure resource should remain").status.expect("degraded status");
+    assert!(status.degraded);
+    assert_eq!(status.consecutive_failures, 3);
+    assert_eq!(status.message.as_deref(), Some("provider registry unavailable"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+    tokio::time::advance(Duration::from_secs(120)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 3, "degraded object must remain parked across resyncs");
+
+    failures.delete("terminal-a").await.expect("degraded resource should be deleted");
+    failures
+        .create(&primary_meta("terminal-a"), &PrimarySpec { value: "replacement".to_string() })
+        .await
+        .expect("same-name replacement should be created");
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        if attempts.load(Ordering::SeqCst) == 4 {
+            break;
+        }
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 4, "same-name replacement must not inherit the deleted object's failure budget");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn exhausted_budget_keeps_retrying_until_degraded_status_is_persistable() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let failures = backend.clone().using::<FailureResource>("flotilla");
+    failures
+        .create(&primary_meta("terminal-a"), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("failure resource should be created");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: failures.clone(),
+            secondaries: Vec::new(),
+            reconciler: BudgetedFailureReconciler { attempts: Arc::clone(&attempts), persist_degraded: false },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    for delay in [10, 20, 40] {
+        tokio::time::advance(Duration::from_millis(delay)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 4, "missing degraded persistence must not silently park the object");
+    assert!(failures.get("terminal-a").await.expect("failure resource should remain").status.is_none());
 
     harness.shutdown().await;
 }
