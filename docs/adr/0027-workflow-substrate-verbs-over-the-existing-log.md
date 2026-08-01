@@ -78,9 +78,11 @@ future *artifact* concept hanging off completions — out of scope here.
   delete/abandon.
 - **Synchronization** (the missing keystone): `flotilla wait --for <leaf>
   [--for <leaf>]… [--fresher-than <ref>] [--timeout] --json` —
-  level-triggered (evaluates current state before blocking), returns *which*
-  condition fired plus a snapshot, Kleene-honest (Unknown never triggers),
-  postdating via `--fresher-than`.
+  level-triggered (it evaluates current state before blocking, so a condition
+  that already holds returns immediately), returns *which* condition fired
+  plus a snapshot, honest about ignorance (an Unknown observation never
+  triggers), and refuses stale evidence via `--fresher-than` (see
+  *postdating* below).
 
 Restraint lives in this surface, not in a restricted grammar: arbitrary
 caller logic is harmless because the verbs bound authority. Verb scope
@@ -92,7 +94,8 @@ land with the Bosun contract.
 ### Conditions: leaves only
 
 The condition language is deliberately tiny: field comparison, latest
-completion disposition/phase, before/after freshness. It stays leaf-level.
+completion disposition/phase, before/after freshness. It stays leaf-level —
+a *leaf* is one atomic predicate, a single comparison with no connectives.
 OR is built into `wait` (multiple `--for`); AND-chains, counters, loops,
 budgets, and variables live in the caller's real language — a review budget
 is `for round in 1 2 3` in bash, and exhaustion is a loud `convoy hold`, not
@@ -120,15 +123,17 @@ parked script *is* an engagement-rule row — visible, coalescible, migratable.
 
 ### Machinery obligations
 
-- **Postdating**: continuation and escalation decisions are judged only
-  against observations newer than the work they would judge; the evaluator
-  tracks read sets and triggers targeted re-observation at completion.
+- **Postdating** (plainly: never judge work by evidence older than the
+  work): continuation and escalation decisions are evaluated only against
+  observations newer than the completion they would judge; the evaluator
+  tracks what it read and triggers targeted re-observation at completion.
 - **Three-valued honesty**: Unknown triggers nothing and closes nothing;
   episodes hold.
-- **Episode identity**: one open engagement per (condition source, convoy,
-  vessel, role); a predicate that holds again after a completed,
-  freshly-judged engagement opens a new episode and climbs a
-  machinery-owned escalation ladder.
+- **Episode identity** (plainly: one firing, one engagement — and a
+  re-fire is a new, escalated round, not a re-trigger): one open engagement
+  per (condition source, convoy, vessel, role); a predicate that holds again
+  after a completed, freshly-judged engagement opens a new episode and
+  climbs a machinery-owned escalation ladder.
 - **Pinning at admission** (unchanged from the #1268 grill; load-bearing):
   definitions are pinned when the convoy is admitted, so a driver only ever
   replays a log it wrote.

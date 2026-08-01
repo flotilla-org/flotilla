@@ -477,6 +477,34 @@ code — stewardship (Governor), convoy-driving (Bosun), allocation
 **PersistentAgent** resources; Governor and Bosun arrive first.
 _Avoid_: Bot, assistant.
 
+**Brief**:
+The concrete prompt (normally text) delivered into a crew session to start
+one round of the agent's loop. The brief is the question; it may declare the
+valid **Dispositions** as its answers. Not a new object — the mechanism
+crews already run on (ADR 0027).
+_Avoid_: Task, ticket (a brief is one round, not the whole assignment).
+
+**Disposition**:
+The one-word answer a crew completion gives, chosen from the list its
+**Brief** declared (e.g. `merged | changes-pushed | blocked`). Recorded
+beside the free-text message so drivers branch on the word instead of
+parsing prose; a completion is always a *claim*, never a world-fact.
+_Avoid_: Outcome, result kind (the overturned objectified forms — ADR 0027).
+
+**Observation**:
+A projection of an external system's state (PR state, checks, a container),
+carrying `observed-at` and permitted to be Unknown. Unknown triggers nothing
+and closes nothing. Exit conditions of workflows should be observations, not
+claims.
+_Avoid_: Fact (histories are evidence — ADR 0023), event.
+
+**Condition Leaf**:
+One atomic predicate over the machine, completions, or **Observations** — a
+single comparison, no connectives. `wait` ORs leaves; all other composition
+(AND, loops, budgets) lives in the caller's own language. Named definitions
+are layered data, not new objects.
+_Avoid_: Rule (that is a leaf bound to an engagement), expression language.
+
 ## External Collaborators
 
 These are sibling products in separate repositories, reached over
