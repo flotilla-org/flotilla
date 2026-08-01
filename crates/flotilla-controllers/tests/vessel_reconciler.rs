@@ -1265,6 +1265,105 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
     }));
 }
 
+#[tokio::test]
+async fn docker_worktree_rejects_an_adopted_checkout_without_shared_clone_metadata() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-adopted-docker", "implement", REPO_URL, GIT_REF).await;
+    let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
+    create_docker_worktree_policy(
+        &backend,
+        NAMESPACE,
+        DockerWorktreePolicyFixture::builder()
+            .name("policy-adopted-docker".to_string())
+            .host_ref(HOST_REF.to_string())
+            .pool("cleat".to_string())
+            .image("ghcr.io/flotilla/dev:latest".to_string())
+            .mount_path("/workspace".to_string())
+            .build(),
+    )
+    .await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-convoy-adopted-docker", "/Users/alice/dev/flotilla-existing")
+        .await;
+    let workspace = backend
+        .clone()
+        .using::<Vessel>(NAMESPACE)
+        .create(&vessel_meta("workspace-adopted-docker", REPO_URL), &VesselSpec {
+            convoy_ref: "convoy-adopted-docker".to_string(),
+            vessel_name: "implement".to_string(),
+            placement_policy_ref: "policy-adopted-docker".to_string(),
+            adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-checkout-convoy-adopted-docker".to_string())]),
+        })
+        .await
+        .expect("workspace should create");
+
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("dependencies should resolve to a vessel failure");
+    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::VesselStatusPatch::MarkFailed { ref message })
+            if message.contains("requires checkout adopted-checkout-convoy-adopted-docker to be a managed worktree")
+    ));
+}
+
+#[tokio::test]
+async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failure() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-missing-clone", "implement", REPO_URL, GIT_REF).await;
+    create_docker_worktree_policy(
+        &backend,
+        NAMESPACE,
+        DockerWorktreePolicyFixture::builder()
+            .name("policy-missing-clone".to_string())
+            .host_ref(HOST_REF.to_string())
+            .pool("cleat".to_string())
+            .image("ghcr.io/flotilla/dev:latest".to_string())
+            .mount_path("/workspace".to_string())
+            .build(),
+    )
+    .await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_checkout(
+        &backend,
+        NAMESPACE,
+        ReadyCheckoutFixture::builder()
+            .name("checkout-convoy-missing-clone".to_string())
+            .env_ref(host_direct_env_name())
+            .git_ref(GIT_REF.to_string())
+            .path("/Users/alice/dev/flotilla-repos/convoy-missing-clone/flotilla.feat-task-provisioning".to_string())
+            .maybe_worktree(Some(worktree_checkout_spec(
+                &host_direct_env_name(),
+                GIT_REF,
+                "/Users/alice/dev/flotilla-repos/convoy-missing-clone/flotilla.feat-task-provisioning",
+                "clone-missing",
+            )))
+            .build(),
+    )
+    .await;
+    let workspace = create_workspace(
+        &backend,
+        NAMESPACE,
+        "workspace-missing-clone",
+        "convoy-missing-clone",
+        "implement",
+        "policy-missing-clone",
+        REPO_URL,
+    )
+    .await;
+
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("dependencies should resolve to a vessel failure");
+    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::VesselStatusPatch::MarkFailed { ref message })
+            if message.contains("checkout-convoy-missing-clone refers to missing clone clone-missing")
+    ));
+}
+
 #[rstest]
 #[case::host_direct(
     "workspace-host",

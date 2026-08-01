@@ -469,6 +469,7 @@ impl Reconciler for VesselReconciler {
         };
         let mut checkout_refs = BTreeMap::new();
         let mut checkout_paths = BTreeMap::new();
+        let mut contained_worktree_checkouts = Vec::new();
         let mut waiting_for_checkouts = Vec::new();
         let mut fork_stance = false;
         for convoy_repository in convoy_repositories {
@@ -615,6 +616,12 @@ impl Reconciler for VesselReconciler {
                         else {
                             return Ok(VesselDeps::failed(format!("checkout {checkout_name} is ready but has no target path")));
                         };
+                        if matches!(&strategy, PlacementStrategy::DockerWorktreeOnHostAndMount { .. }) {
+                            contained_worktree_checkouts.push((checkout_name.clone(), match &existing.spec {
+                                CheckoutSpec::Worktree(spec) => Some(spec.clone_ref.clone()),
+                                CheckoutSpec::FreshClone(_) | CheckoutSpec::Observed(_) => None,
+                            }));
+                        }
                         checkout_refs.insert(repository_key.clone(), checkout_name);
                         checkout_paths.insert(repository_key, path);
                     } else {
@@ -684,42 +691,6 @@ impl Reconciler for VesselReconciler {
         } else {
             shared_clone_root.clone().unwrap_or_default()
         };
-        let mut worktree_git_common_dir_mounts = Vec::new();
-        if matches!(&strategy, PlacementStrategy::DockerWorktreeOnHostAndMount { .. }) {
-            // A linked worktree's `.git` file names its administrative directory
-            // beneath the shared clone with an absolute host path. Expose the
-            // clone metadata at that same path so Git can follow the pointer from
-            // the differently-mounted workspace inside the container. Keeping the
-            // shared clone authoritative also preserves its remote configuration
-            // and the host's worktree registrations.
-            let mut mounted_common_dirs = BTreeSet::new();
-            for checkout_name in checkout_refs.values() {
-                let checkout = self.checkouts.get(checkout_name).await?;
-                let CheckoutSpec::Worktree(checkout_spec) = &checkout.spec else {
-                    return Ok(VesselDeps::failed(format!(
-                        "contained worktree placement requires checkout {checkout_name} to be a managed worktree"
-                    )));
-                };
-                let clone = match self.clones.get(&checkout_spec.clone_ref).await {
-                    Ok(clone) => clone,
-                    Err(ResourceError::NotFound { .. }) => {
-                        return Ok(VesselDeps::failed(format!(
-                            "contained worktree checkout {checkout_name} refers to missing clone {}",
-                            checkout_spec.clone_ref
-                        )))
-                    }
-                    Err(error) => return Err(error),
-                };
-                let git_common_dir = format!("{}/.git", clone.spec.path.trim_end_matches('/'));
-                mounted_common_dirs.insert(git_common_dir);
-            }
-            worktree_git_common_dir_mounts.extend(mounted_common_dirs.into_iter().map(|git_common_dir| EnvironmentMount {
-                source_path: git_common_dir.clone(),
-                target_path: git_common_dir,
-                mode: EnvironmentMountMode::Rw,
-            }));
-        }
-
         let (resolved_environment_ref, image) = match &strategy {
             PlacementStrategy::HostDirect { host_ref, .. } => {
                 let env_name = host_direct_environment_name(host_ref);
@@ -783,7 +754,35 @@ impl Reconciler for VesselReconciler {
                             })
                             .into_iter()
                             .collect::<Vec<_>>();
-                        mounts.extend(worktree_git_common_dir_mounts);
+                        // A linked worktree's `.git` file names its administrative
+                        // directory beneath the shared clone with an absolute host
+                        // path. Expose the clone metadata at that same path so Git
+                        // can follow the pointer from the differently-mounted
+                        // workspace. Keeping the shared clone authoritative also
+                        // preserves its remotes and host worktree registrations.
+                        let mut mounted_common_dirs = BTreeSet::new();
+                        for (checkout_name, clone_ref) in &contained_worktree_checkouts {
+                            let Some(clone_ref) = clone_ref else {
+                                return Ok(VesselDeps::failed(format!(
+                                    "contained worktree placement requires checkout {checkout_name} to be a managed worktree"
+                                )));
+                            };
+                            let clone = match self.clones.get(clone_ref).await {
+                                Ok(clone) => clone,
+                                Err(ResourceError::NotFound { .. }) => {
+                                    return Ok(VesselDeps::failed(format!(
+                                        "contained worktree checkout {checkout_name} refers to missing clone {clone_ref}"
+                                    )))
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            mounted_common_dirs.insert(format!("{}/.git", clone.spec.path.trim_end_matches('/')));
+                        }
+                        mounts.extend(mounted_common_dirs.into_iter().map(|git_common_dir| EnvironmentMount {
+                            source_path: git_common_dir.clone(),
+                            target_path: git_common_dir,
+                            mode: EnvironmentMountMode::Rw,
+                        }));
                         actuations.push(Actuation::CreateEnvironment {
                             meta: owned_child_meta(&env_name, obj, BTreeMap::new()),
                             spec: EnvironmentSpec {
