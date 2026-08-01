@@ -404,7 +404,7 @@ async fn connect_required_host_daemon_with_optional_surface(
 ) -> Result<Arc<SocketDaemon>, String> {
     connect_existing_stateful(socket_path, surface.as_ref()).await?.ok_or_else(|| {
         format!(
-            "host daemon socket stale or unreachable at {}; FLOTILLA_DAEMON_SOCKET is set, so a local daemon will not be spawned",
+            "host daemon socket stale or unreachable at {}; this contained environment requires the host daemon, so a local daemon will not be spawned",
             socket_path.display()
         )
     })
