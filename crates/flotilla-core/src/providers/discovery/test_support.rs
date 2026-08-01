@@ -809,6 +809,7 @@ pub struct FakeTerminalPool {
     pub delivered: Arc<TokioMutex<Vec<(String, String, bool)>>>,
     pub ensured: Arc<TokioMutex<Vec<EnsuredTerminalSession>>>,
     pub captured_screens: Arc<TokioMutex<HashMap<String, String>>>,
+    attach_preflight_error: Arc<TokioMutex<Option<String>>>,
 }
 
 pub struct EnsuredTerminalSession {
@@ -832,6 +833,7 @@ impl FakeTerminalPool {
             delivered: Arc::new(TokioMutex::new(Vec::new())),
             ensured: Arc::new(TokioMutex::new(Vec::new())),
             captured_screens: Arc::new(TokioMutex::new(HashMap::new())),
+            attach_preflight_error: Arc::new(TokioMutex::new(None)),
         }
     }
 
@@ -845,6 +847,10 @@ impl FakeTerminalPool {
 
     pub async fn set_captured_screen(&self, session_name: &str, screen: &str) {
         self.captured_screens.lock().await.insert(session_name.to_string(), screen.to_string());
+    }
+
+    pub async fn set_attach_preflight_error(&self, error: impl Into<String>) {
+        *self.attach_preflight_error.lock().await = Some(error.into());
     }
 }
 
@@ -897,7 +903,10 @@ impl TerminalPool for FakeTerminalPool {
     }
 
     async fn preflight_attach(&self, _mode: flotilla_protocol::commands::AttachMode) -> Result<(), String> {
-        Ok(())
+        match self.attach_preflight_error.lock().await.clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn attach_args_for_mode(

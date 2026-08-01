@@ -3212,6 +3212,51 @@ async fn transient_attach_resolves_standing_checkout_paths_locally_and_determini
 }
 
 #[tokio::test]
+async fn transient_checkout_attach_preflights_before_creating_a_session() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let checkout_path = temp.path().join("standing-checkout");
+    std::fs::create_dir_all(&checkout_path).expect("create checkout");
+    let (daemon, terminal_pool) = new_attach_test_daemon_with_pool(&config_base).await;
+    terminal_pool.set_attach_preflight_error("stale pool cleat").await;
+    let row = CheckoutRow::builder()
+        .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "dev", "standing").on_host(HostName::new(TEST_LOCAL_ATTACH_HOST)))
+        .repo(RepositoryKey("repo-standing".to_owned()))
+        .repo_label("standing")
+        .path(checkout_path.display().to_string())
+        .branch("main")
+        .host(HostName::new(TEST_LOCAL_ATTACH_HOST))
+        .authority(LifecycleAuthority::Observed)
+        .build();
+    daemon.aggregator_projection_state().await.replace_local_checkout_rows(vec![row]).await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::AttachTransient {
+                    reference: checkout_path.display().to_string(),
+                    host: Some(HostName::new(TEST_LOCAL_ATTACH_HOST)),
+                    mode: AttachMode::Default,
+                },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should return its preflight error");
+
+    let CommandValue::Error { message } = result else {
+        panic!("expected preflight error, got {result:?}");
+    };
+    assert!(message.contains("stale pool cleat"), "{message}");
+    assert!(terminal_pool.ensured.lock().await.is_empty(), "preflight failure must not create a terminal session");
+}
+
+#[tokio::test]
 async fn transient_attach_routes_standing_checkout_paths_to_the_displayed_remote_host() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");

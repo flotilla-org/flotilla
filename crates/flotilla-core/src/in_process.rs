@@ -6897,8 +6897,8 @@ impl InProcessDaemon {
             .ok_or_else(|| format!("no terminal pool available for checkout {}", checkout.path))?;
         let session_name = transient_checkout_session_name(checkout);
         let command = "${SHELL:-/bin/sh}";
-        pool.ensure_session(&session_name, command, &cwd, &Vec::new(), &[]).await?;
         pool.preflight_attach(seat).await?;
+        pool.ensure_session(&session_name, command, &cwd, &Vec::new(), &[]).await?;
         let args = pool.attach_args_for_mode(&session_name, command, &cwd, &Vec::new(), seat)?;
         Ok(ResolvedAttachPlan(vec![ResolvedAttachAction::Command(args)]))
     }
