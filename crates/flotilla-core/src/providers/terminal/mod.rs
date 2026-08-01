@@ -28,6 +28,12 @@ pub enum ScreenActivity {
     Stable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachSeat {
+    Control,
+    Watch,
+}
+
 pub(crate) const MANAGED_SESSION_PREFIX: &str = "flotilla-v2:";
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -109,6 +115,22 @@ pub trait TerminalPool: Send + Sync {
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String>;
+
+    /// Returns attach arguments for the requested seat. Pools without watcher
+    /// support reject read-only attaches explicitly.
+    fn attach_args_for_seat(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        seat: AttachSeat,
+    ) -> Result<Vec<Arg>, String> {
+        match seat {
+            AttachSeat::Control => self.attach_args(session_name, command, cwd, env_vars),
+            AttachSeat::Watch => Err("terminal pool does not support read-only watcher attachments".to_string()),
+        }
+    }
 
     /// Returns the attach command as a flat shell string.
     /// Default implementation calls `attach_args()` + `flatten()`.

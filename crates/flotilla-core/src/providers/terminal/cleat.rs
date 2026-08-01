@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use flotilla_protocol::arg::Arg;
 use serde::Deserialize;
 
-use super::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag};
+use super::{AttachSeat, ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag};
 use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{run, CommandRunner},
@@ -133,6 +133,21 @@ impl TerminalPool for CleatTerminalPool {
             // Session names are UUIDs (attachable IDs) — always shell-safe, no quoting needed.
             Arg::Literal(session_name.into()),
         ])
+    }
+
+    fn attach_args_for_seat(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        seat: AttachSeat,
+    ) -> Result<Vec<Arg>, String> {
+        let mut args = self.attach_args(session_name, command, cwd, env_vars)?;
+        if seat == AttachSeat::Watch {
+            args.insert(3, Arg::Literal("--watch".into()));
+        }
+        Ok(args)
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
@@ -340,6 +355,16 @@ mod tests {
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
         assert_eq!(flat, "cleat attach --no-create my-session");
+    }
+
+    #[test]
+    fn watch_attach_args_request_a_read_only_seat() {
+        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let args = pool
+            .attach_args_for_seat("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachSeat::Watch)
+            .expect("watch attach args");
+
+        assert_eq!(flotilla_protocol::arg::flatten(&args, 0), "cleat attach --no-create --watch my-session");
     }
 
     #[test]

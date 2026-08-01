@@ -108,6 +108,9 @@ enum SubCommand {
     Ls,
     /// Attach to a running convoy crew session
     Attach {
+        /// Attach read-only without taking the controller seat
+        #[arg(long)]
+        watch: bool,
         /// Convoy, vessel, role, terminal session, or unique prefix
         reference: String,
         /// Internal attach mode used by temporary TUI excursions.
@@ -376,7 +379,9 @@ async fn main() -> Result<()> {
         Some(SubCommand::Logs { host, since, level, target }) => run_logs(&cli, host.as_deref(), since, level, target).await,
         Some(SubCommand::Fleet) => run_fleet_health(&cli, format).await,
         Some(SubCommand::Ls) => run_fleet_list(&cli, format).await,
-        Some(SubCommand::Attach { reference, transient, host }) => run_attach(&cli, &reference, transient, host.as_deref(), format).await,
+        Some(SubCommand::Attach { reference, watch, transient, host }) => {
+            run_attach(&cli, &reference, watch, transient, host.as_deref(), format).await
+        }
         Some(SubCommand::ReplicaSnapshot) => run_replica_snapshot(&cli).await,
         Some(SubCommand::Hook { harness, event_type }) => run_hook(&cli, &harness, &event_type).await,
         Some(SubCommand::Hooks { command }) => run_hooks_command(&command).await,
@@ -822,7 +827,7 @@ fn exit_command_error(message: String, format: OutputFormat) -> ! {
     std::process::exit(1);
 }
 
-async fn run_attach(cli: &Cli, reference: &str, transient: bool, host: Option<&str>, format: OutputFormat) -> Result<()> {
+async fn run_attach(cli: &Cli, reference: &str, watch: bool, transient: bool, host: Option<&str>, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     let daemon = connect_daemon(cli).await?;
     let result = daemon
@@ -832,9 +837,13 @@ async fn run_attach(cli: &Cli, reference: &str, transient: bool, host: Option<&s
                 provisioning_target: None,
                 context_repo: None,
                 action: if transient {
-                    CommandAction::AttachTransient { reference: reference.to_string(), host: host.map(flotilla_protocol::HostName::new) }
+                    CommandAction::AttachTransient {
+                        reference: reference.to_string(),
+                        host: host.map(flotilla_protocol::HostName::new),
+                        watch,
+                    }
                 } else {
-                    CommandAction::Attach { reference: reference.to_string(), host: host.map(flotilla_protocol::HostName::new) }
+                    CommandAction::Attach { reference: reference.to_string(), host: host.map(flotilla_protocol::HostName::new), watch }
                 },
             },
             uuid::Uuid::new_v4(),
@@ -2025,7 +2034,19 @@ mod tests {
         let cli = Cli::try_parse_from(["flotilla", "attach", "convoy-a/implement/coder"]).expect("attach cli should parse");
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Attach { reference, transient: false, host: None }) if reference == "convoy-a/implement/coder"
+            Some(SubCommand::Attach { reference, watch: false, transient: false, host: None })
+                if reference == "convoy-a/implement/coder"
+        ));
+    }
+
+    #[test]
+    fn cli_parses_watch_attach_subcommand() {
+        let cli =
+            Cli::try_parse_from(["flotilla", "attach", "--watch", "convoy-a/implement/coder"]).expect("watch attach cli should parse");
+        assert!(matches!(
+            cli.command,
+            Some(SubCommand::Attach { reference, watch: true, transient: false, host: None })
+                if reference == "convoy-a/implement/coder"
         ));
     }
 
@@ -2047,7 +2068,7 @@ mod tests {
             .expect("transient attach cli should parse");
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Attach { reference, transient: true, host: Some(host) })
+            Some(SubCommand::Attach { reference, watch: false, transient: true, host: Some(host) })
                 if reference == "terminal-scratch" && host == "feta"
         ));
     }
@@ -2058,7 +2079,7 @@ mod tests {
             .expect("host-qualified attach cli should parse");
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Attach { reference, transient: false, host: Some(host) })
+            Some(SubCommand::Attach { reference, watch: false, transient: false, host: Some(host) })
                 if reference == "terminal-scratch" && host == "feta"
         ));
     }

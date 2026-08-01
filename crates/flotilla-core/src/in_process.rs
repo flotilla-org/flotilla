@@ -91,6 +91,7 @@ use crate::{
         },
         issue_tracker::{forge_issue_source, IssueProvider},
         ssh_runner::SshCommandRunner,
+        terminal::AttachSeat,
         ChannelLabel, CommandRunner,
     },
     refresh::RefreshSnapshot,
@@ -530,10 +531,16 @@ enum AttachTarget {
 }
 
 impl AttachTarget {
-    async fn resolve(&self, daemon: &InProcessDaemon, reference: &str, transient: bool) -> Result<ResolvedAttach, String> {
+    async fn resolve(
+        &self,
+        daemon: &InProcessDaemon,
+        reference: &str,
+        transient: bool,
+        seat: AttachSeat,
+    ) -> Result<ResolvedAttach, String> {
         match self {
             Self::Local(session) => {
-                let (plan, host) = daemon.attach_plan_for_session(reference, session).await?;
+                let (plan, host) = daemon.attach_plan_for_session(reference, session, seat).await?;
                 let labels = &session.metadata.labels;
                 let binding = AttachBinding::builder()
                     .host(host)
@@ -546,7 +553,7 @@ impl AttachTarget {
                 Ok(ResolvedAttach { plan, binding: Some(binding) })
             }
             Self::Replica { row } => {
-                let plan = daemon.recursive_attach_plan_for_remote(&row.host, reference).await?;
+                let plan = daemon.recursive_attach_plan_for_remote(&row.host, reference, seat).await?;
                 // Replica rows carry crew as "vessel/role" (or a bare role)
                 // and the owning host's namespace + session name, so
                 // cross-host panes stamp the full join key.
@@ -569,9 +576,9 @@ impl AttachTarget {
                     return Err(format!("checkout '{}' is only available as a transient attach target", row.path));
                 }
                 let plan = if row.host == daemon.host_name {
-                    daemon.local_checkout_terminal_plan(row).await?
+                    daemon.local_checkout_terminal_plan(row, seat).await?
                 } else {
-                    daemon.recursive_attach_plan_for_remote(&row.host, reference).await?
+                    daemon.recursive_attach_plan_for_remote(&row.host, reference, seat).await?
                 };
                 Ok(ResolvedAttach { plan, binding: None })
             }
@@ -608,6 +615,7 @@ impl AttachCandidateIndex {
         reference: &str,
         host: Option<&HostName>,
         transient: bool,
+        seat: AttachSeat,
     ) -> Result<ResolvedAttach, String> {
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
@@ -629,7 +637,7 @@ impl AttachCandidateIndex {
                 Some(host) => Err(format!("no attach target matching '{reference}' on host '{host}'")),
                 None => Err(format!("no attach target matching '{reference}'")),
             },
-            [index] => self.candidates[*index].target.resolve(daemon, reference, transient).await,
+            [index] => self.candidates[*index].target.resolve(daemon, reference, transient, seat).await,
             _ => {
                 let mut labels: Vec<_> = matches.iter().map(|index| self.candidates[*index].label.clone()).collect();
                 labels.sort();
@@ -6650,12 +6658,22 @@ impl InProcessDaemon {
         reference: &str,
         host: Option<&HostName>,
     ) -> Result<ResolvedAttach, String> {
+        self.resolve_attach_for_seat_internal(reference, host, false, AttachSeat::Control).await
+    }
+
+    async fn resolve_attach_for_seat_internal(
+        &self,
+        reference: &str,
+        host: Option<&HostName>,
+        transient: bool,
+        seat: AttachSeat,
+    ) -> Result<ResolvedAttach, String> {
         // Preserve validation precedence without paying to build the candidate index.
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
         }
         let index = self.attach_candidate_index().await?;
-        index.resolve(self, reference, host, false).await
+        index.resolve(self, reference, host, transient, seat).await
     }
 
     pub async fn resolve_transient_attach_command_internal(
@@ -6666,8 +6684,7 @@ impl InProcessDaemon {
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
         }
-        let index = self.attach_candidate_index().await?;
-        index.resolve(self, reference, host, true).await
+        self.resolve_attach_for_seat_internal(reference, host, true, AttachSeat::Control).await
     }
 
     pub async fn resolvable_attach_references_internal(&self, references: &[String]) -> Result<HashSet<String>, String> {
@@ -6677,7 +6694,7 @@ impl InProcessDaemon {
         let index = self.attach_candidate_index().await?;
         let mut resolved = HashSet::new();
         for reference in references {
-            if index.resolve(self, reference, None, false).await.is_ok() {
+            if index.resolve(self, reference, None, false, AttachSeat::Control).await.is_ok() {
                 resolved.insert(reference.clone());
             }
         }
@@ -6688,7 +6705,7 @@ impl InProcessDaemon {
         let index = self.attach_candidate_index().await?;
         let mut resolved = Vec::with_capacity(targets.len());
         for (reference, host) in targets {
-            resolved.push(index.resolve(self, reference, Some(host), false).await.is_ok());
+            resolved.push(index.resolve(self, reference, Some(host), false, AttachSeat::Control).await.is_ok());
         }
         Ok(resolved)
     }
@@ -6861,7 +6878,7 @@ impl InProcessDaemon {
         Ok(AttachCandidateIndex::new(candidates))
     }
 
-    async fn local_checkout_terminal_plan(&self, checkout: &CheckoutRow) -> Result<ResolvedAttachPlan, String> {
+    async fn local_checkout_terminal_plan(&self, checkout: &CheckoutRow, seat: AttachSeat) -> Result<ResolvedAttachPlan, String> {
         let cwd = ExecutionEnvironmentPath::new(&checkout.path);
         let discovery = discover_repo_for_environment(
             &self.environment_manager,
@@ -6882,7 +6899,7 @@ impl InProcessDaemon {
         let session_name = transient_checkout_session_name(checkout);
         let command = "${SHELL:-/bin/sh}";
         pool.ensure_session(&session_name, command, &cwd, &Vec::new(), &[]).await?;
-        let args = pool.attach_args(&session_name, command, &cwd, &Vec::new())?;
+        let args = pool.attach_args_for_seat(&session_name, command, &cwd, &Vec::new(), seat)?;
         Ok(ResolvedAttachPlan(vec![ResolvedAttachAction::Command(args)]))
     }
 
@@ -6892,6 +6909,7 @@ impl InProcessDaemon {
         &self,
         reference: &str,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
+        seat: AttachSeat,
     ) -> Result<(ResolvedAttachPlan, HostName), String> {
         let namespace = self.provisioning_namespace().await;
         let environments = self.resource_backend.clone().using::<ResourceEnvironment>(&namespace);
@@ -6908,15 +6926,20 @@ impl InProcessDaemon {
             .ok_or_else(|| format!("environment {} has no host binding", session.spec.env_ref))?;
         let target_host = self.target_host_for_resource_ref(host_ref);
         if target_host != self.host_name {
-            let plan = self.recursive_attach_plan_for_remote(&target_host, reference).await?;
+            let plan = self.recursive_attach_plan_for_remote(&target_host, reference, seat).await?;
             return Ok((plan, target_host));
         }
 
-        let plan = self.local_attach_plan_for_session(session, &environment).await?;
+        let plan = self.local_attach_plan_for_session(session, &environment, seat).await?;
         Ok((plan, self.host_name.clone()))
     }
 
-    async fn recursive_attach_plan_for_remote(&self, target_host: &HostName, reference: &str) -> Result<ResolvedAttachPlan, String> {
+    async fn recursive_attach_plan_for_remote(
+        &self,
+        target_host: &HostName,
+        reference: &str,
+        seat: AttachSeat,
+    ) -> Result<ResolvedAttachPlan, String> {
         let next_hop = self.host_registry.next_hop_host_for_target_host(target_host).await?.unwrap_or_else(|| target_host.clone());
         if next_hop == self.host_name {
             return Err(format!("unreachable next hop for host '{target_host}': route points back to local host"));
@@ -6930,6 +6953,9 @@ impl InProcessDaemon {
         // Recursive attaches only traverse transport boundaries; Presentation
         // Manager identity belongs to the original foreground attach.
         command.push(flotilla_protocol::arg::Arg::Literal("--transient".to_string()));
+        if seat == AttachSeat::Watch {
+            command.push(flotilla_protocol::arg::Arg::Literal("--watch".to_string()));
+        }
         command.push(flotilla_protocol::arg::Arg::Quoted(reference.to_string()));
         let hop_resolver = HopResolver::new(
             Arc::new(resolver),
@@ -6957,13 +6983,14 @@ impl InProcessDaemon {
             .as_deref()
             .or(binding.convoy.as_deref())
             .ok_or_else(|| "remote attach binding has neither a session nor convoy reference".to_string())?;
-        self.recursive_attach_plan_for_remote(&binding.host, reference).await
+        self.recursive_attach_plan_for_remote(&binding.host, reference, AttachSeat::Control).await
     }
 
     async fn local_attach_plan_for_session(
         &self,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
         environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
+        seat: AttachSeat,
     ) -> Result<ResolvedAttachPlan, String> {
         let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
         let registry = self.registry_for_resource_environment(environment, cwd.as_path()).await?;
@@ -6973,7 +7000,7 @@ impl InProcessDaemon {
             .map(|(_, pool)| Arc::clone(pool))
             .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
         let attach_target = terminal_session_attach_target(session)?;
-        let attach_args = pool.attach_args(attach_target.session_id, attach_target.launch_command, &cwd, &Vec::new())?;
+        let attach_args = pool.attach_args_for_seat(attach_target.session_id, attach_target.launch_command, &cwd, &Vec::new(), seat)?;
         if environment.spec.docker.is_some() {
             let environment_id = EnvironmentId::new(session.spec.env_ref.clone());
             let container_name = environment.status.as_ref().and_then(|status| status.docker_container_id.as_deref());
@@ -8363,7 +8390,14 @@ impl DaemonHandle for InProcessDaemon {
                     Err(error) => Ok(flotilla_protocol::CommandValue::Error { message: error.to_string() }),
                 }
             }
-            CommandAction::Attach { reference, host } => match self.resolve_attach_command_on_host_internal(reference, host.as_ref()).await
+            CommandAction::Attach { reference, host, watch } => match self
+                .resolve_attach_for_seat_internal(
+                    reference,
+                    host.as_ref(),
+                    false,
+                    if *watch { AttachSeat::Watch } else { AttachSeat::Control },
+                )
+                .await
             {
                 Ok(resolved) => {
                     if let Some(binding) = &resolved.binding {
@@ -8375,8 +8409,16 @@ impl DaemonHandle for InProcessDaemon {
                 }
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
-            CommandAction::AttachTransient { reference, host } => {
-                match self.resolve_transient_attach_command_internal(reference, host.as_ref()).await {
+            CommandAction::AttachTransient { reference, host, watch } => {
+                match self
+                    .resolve_attach_for_seat_internal(
+                        reference,
+                        host.as_ref(),
+                        true,
+                        if *watch { AttachSeat::Watch } else { AttachSeat::Control },
+                    )
+                    .await
+                {
                     Ok(resolved) => {
                         Ok(flotilla_protocol::CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding })
                     }

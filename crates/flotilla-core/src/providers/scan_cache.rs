@@ -11,7 +11,7 @@ use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{
         presentation::PresentationManager,
-        terminal::{ManagedSessionMetadata, TerminalEnvVars, TerminalPool, TerminalSession},
+        terminal::{AttachSeat, ManagedSessionMetadata, TerminalEnvVars, TerminalPool, TerminalSession},
         types::{Workspace, WorkspaceAttachRequest},
     },
 };
@@ -172,6 +172,17 @@ impl TerminalPool for SharedTerminalPool {
         env_vars: &TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         self.inner.attach_args(session_name, command, cwd, env_vars)
+    }
+
+    fn attach_args_for_seat(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        seat: AttachSeat,
+    ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+        self.inner.attach_args_for_seat(session_name, command, cwd, env_vars, seat)
     }
 
     async fn attach_command(

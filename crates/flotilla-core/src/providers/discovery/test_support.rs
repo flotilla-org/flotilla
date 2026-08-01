@@ -896,6 +896,18 @@ impl TerminalPool for FakeTerminalPool {
         Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach {session_name}"))])
     }
 
+    fn attach_args_for_seat(
+        &self,
+        session_name: &str,
+        _command: &str,
+        _cwd: &ExecutionEnvironmentPath,
+        _env_vars: &super::super::terminal::TerminalEnvVars,
+        seat: super::super::terminal::AttachSeat,
+    ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+        let watch = if seat == super::super::terminal::AttachSeat::Watch { " --watch" } else { "" };
+        Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach{watch} {session_name}"))])
+    }
+
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
         self.killed.lock().await.push(session_name.to_string());
         self.sessions.lock().await.retain(|session| session.session_name != session_name);
