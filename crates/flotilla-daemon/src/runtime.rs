@@ -2295,6 +2295,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     return Err(remove.stderr);
                 }
                 remove_checkout_path(&*runner, target_path).await?;
+                runner.run("git", &["-C", clone_path, "worktree", "prune"], Path::new("/"), &ChannelLabel::Noop).await?;
                 remove_empty_checkout_parents(clone_path, target_path).await?;
 
                 let branch_ref = format!("refs/heads/{branch}");
@@ -3804,6 +3805,95 @@ mod tests {
             .status()
             .expect("git should inspect the branch");
         assert!(!branch.success(), "zero-commit convoy branch should be deleted");
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_prunes_base_clone_after_removing_worktree() {
+        struct RecordingProcessRunner {
+            commands: Arc<StdMutex<Vec<Vec<String>>>>,
+        }
+
+        #[async_trait]
+        impl CommandRunner for RecordingProcessRunner {
+            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+                self.commands
+                    .lock()
+                    .expect("command lock")
+                    .push(std::iter::once(cmd.to_string()).chain(args.iter().map(|arg| (*arg).to_string())).collect());
+                ProcessCommandRunner.run(cmd, args, cwd, label).await
+            }
+
+            async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+                self.commands
+                    .lock()
+                    .expect("command lock")
+                    .push(std::iter::once(cmd.to_string()).chain(args.iter().map(|arg| (*arg).to_string())).collect());
+                ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+            }
+
+            async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+                ProcessCommandRunner.exists(cmd, args).await
+            }
+        }
+
+        let temp = TempDir::new().expect("tempdir");
+        let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
+        let target = temp.path().join("checkout-root/convoy-a/flotilla.feature-prune");
+        let stale_target = temp.path().join("checkout-root/stale-convoy/flotilla.feature-stale");
+        let commands = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(RecordingProcessRunner { commands: Arc::clone(&commands) }) };
+
+        runtime
+            .create_worktree(
+                clone.path().to_str().expect("utf-8 clone path"),
+                "feature/prune",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("worktree should create");
+        runtime
+            .create_worktree(
+                clone.path().to_str().expect("utf-8 clone path"),
+                "feature/stale",
+                Some("main"),
+                stale_target.to_str().expect("utf-8 stale target path"),
+            )
+            .await
+            .expect("stale worktree should create");
+        fs::remove_dir_all(&stale_target).expect("simulate checkout directory disappearing without git cleanup");
+        let stale_worktrees = ProcessCommand::new("git")
+            .args(["-C", clone.path().to_str().expect("utf-8 clone path"), "worktree", "list", "--porcelain"])
+            .output()
+            .expect("git should list stale worktree metadata");
+        assert!(String::from_utf8(stale_worktrees.stdout)
+            .expect("utf-8 stale worktree list")
+            .contains(stale_target.to_str().expect("utf-8 stale target path")));
+        let removal = CheckoutRemoval::Worktree {
+            clone_path: clone.path().to_str().expect("utf-8 clone path").to_string(),
+            branch: "feature/prune".to_string(),
+            target_path: target.to_str().expect("utf-8 target path").to_string(),
+        };
+
+        runtime.remove_checkout(&removal).await.expect("worktree cleanup should prune its base clone");
+
+        let worktrees = ProcessCommand::new("git")
+            .args(["-C", clone.path().to_str().expect("utf-8 clone path"), "worktree", "list", "--porcelain"])
+            .output()
+            .expect("git should list worktrees");
+        assert!(worktrees.status.success());
+        let worktrees = String::from_utf8(worktrees.stdout).expect("utf-8 worktree list");
+        assert!(!worktrees.contains(target.to_str().expect("utf-8 target path")));
+        assert!(
+            !worktrees.contains(stale_target.to_str().expect("utf-8 stale target path")),
+            "base-clone prune must remove stale metadata"
+        );
+        assert!(!target.exists(), "checkout resource cleanup must not retain its directory");
+        assert!(commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .any(|command| { command == &["git", "-C", clone.path().to_str().expect("utf-8 clone path"), "worktree", "prune"] }));
     }
 
     #[tokio::test]
