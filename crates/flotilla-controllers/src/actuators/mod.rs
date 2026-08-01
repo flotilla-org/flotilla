@@ -4,8 +4,9 @@ use flotilla_core::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         environment::{
-            CreateOpts, EnvironmentProvider, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind,
-            EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode,
+            contained_daemon_socket_path, CreateOpts, EnvironmentProvider, EnvironmentTool, EnvironmentToolAsset,
+            EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode,
+            CONTAINED_DAEMON_REQUIRED_ENV,
         },
         terminal::TerminalPool,
         vcs::{CloneInspection, CloneProvisioner},
@@ -46,6 +47,7 @@ impl DockerEnvironmentActuator {
     }
 
     pub fn build_create_opts(&self, spec: &DockerEnvironmentSpec) -> CreateOpts {
+        let environment_socket_path = contained_daemon_socket_path(self.daemon_socket_path.as_path());
         CreateOpts {
             tokens: self.tokens.clone(),
             working_directory: None,
@@ -55,12 +57,21 @@ impl DockerEnvironmentActuator {
             tools: vec![EnvironmentTool::new("flotilla-daemon-access", "/usr/local/bin/flotilla")
                 .with_asset(EnvironmentToolAsset::new(
                     self.daemon_socket_path.as_path().to_path_buf(),
-                    "/run/flotilla.sock",
+                    environment_socket_path.clone(),
                     EnvironmentToolAssetKind::UnixSocket,
                     EnvironmentToolAssetAccess::SharedWritable,
                     "the daemon socket",
                 ))
-                .with_environment(EnvironmentVariableUpdate::set("FLOTILLA_DAEMON_SOCKET", "/run/flotilla.sock", "the daemon socket"))],
+                .with_environment(EnvironmentVariableUpdate::set(
+                    "FLOTILLA_DAEMON_SOCKET",
+                    environment_socket_path.to_string_lossy(),
+                    "the daemon socket",
+                ))
+                .with_environment(EnvironmentVariableUpdate::set(
+                    CONTAINED_DAEMON_REQUIRED_ENV,
+                    "1",
+                    "the contained host-daemon requirement",
+                ))],
         }
     }
 }

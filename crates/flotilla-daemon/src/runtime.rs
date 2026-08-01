@@ -25,7 +25,7 @@ use flotilla_core::{
     placement_policy::reconcile_registered_policy,
     providers::{
         discovery::{run_provisioned_host_detectors, EnvironmentBag},
-        environment::{CreateOpts, EnvironmentHandle, EnvironmentVariableUpdate},
+        environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate},
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool},
         vcs::{CloneInspection, CloneProvisioner, GitCloneProvisioner},
@@ -1656,10 +1656,17 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         let tools = self.state.environment_tools.prepare(name).await?;
         for tool in &tools {
             for asset in &tool.assets {
-                if spec.mounts.iter().any(|mount| Path::new(&mount.target_path) == asset.environment_path.as_path()) {
+                let reserved_path = match asset.kind {
+                    EnvironmentToolAssetKind::UnixSocket => asset.environment_path.as_path().parent().ok_or_else(|| {
+                        DockerProvisioningError::Failed(format!("Unix socket asset {} has no parent directory", asset.environment_path))
+                    })?,
+                    EnvironmentToolAssetKind::File | EnvironmentToolAssetKind::Directory => asset.environment_path.as_path(),
+                };
+                if spec.mounts.iter().any(|mount| Path::new(&mount.target_path) == reserved_path) {
                     return Err(DockerProvisioningError::Failed(format!(
                         "mount target {} is reserved for {}",
-                        asset.environment_path, asset.purpose
+                        reserved_path.display(),
+                        asset.purpose
                     )));
                 }
             }
@@ -3329,6 +3336,10 @@ mod tests {
         assert_eq!(opts.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), vec!["flotilla", "cleat"]);
         assert_eq!(opts.tools[0].executable.as_path(), Path::new(ENVIRONMENT_FLOTILLA_PATH));
         assert_eq!(opts.tools[0].assets[1].environment_path.as_path(), Path::new(ENVIRONMENT_DAEMON_SOCKET_PATH));
+        assert_eq!(
+            opts.tools[0].environment[1],
+            EnvironmentVariableUpdate::set("FLOTILLA_CONTAINED_HOST_DAEMON", "1", "the contained host-daemon requirement",),
+        );
         assert_eq!(opts.tools[1].executable.as_path(), Path::new(ENVIRONMENT_CLEAT_PATH));
         assert_eq!(opts.tools[1].assets[1].environment_path.as_path(), Path::new(ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH));
         assert_eq!(opts.tools[1].assets[2].host_path.as_path(), cleat_state.as_path());
@@ -3659,7 +3670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn docker_provisioning_rejects_a_mount_targeting_the_reserved_cli_path() {
+    async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
         fs::create_dir_all(&config_base).expect("config directory");
@@ -3696,15 +3707,31 @@ mod tests {
             required_agent_adapters: BTreeSet::new(),
             pull_policy: Default::default(),
             mounts: vec![flotilla_resources::EnvironmentMount {
-                source_path: "/host/replacement-flotilla".to_string(),
-                target_path: "/usr/local/bin/flotilla".to_string(),
+                source_path: "/host/replacement-socket-directory".to_string(),
+                target_path: "/run/flotilla-daemon".to_string(),
                 mode: flotilla_resources::EnvironmentMountMode::Ro,
             }],
             env: BTreeMap::new(),
         };
 
-        let error = DockerControllerRuntime { state }
+        let error = DockerControllerRuntime { state: Arc::clone(&state) }
             .provision("contained-work", &spec)
+            .await
+            .expect_err("reserved socket directory mount should fail provision");
+
+        assert_eq!(error.to_string(), "mount target /run/flotilla-daemon is reserved for the daemon socket");
+        assert!(provider.create_opts.lock().await.is_none(), "reserved mount collisions should fail before invoking the provider");
+
+        let cli_collision_spec = flotilla_resources::DockerEnvironmentSpec {
+            mounts: vec![flotilla_resources::EnvironmentMount {
+                source_path: "/host/replacement-flotilla".to_string(),
+                target_path: "/usr/local/bin/flotilla".to_string(),
+                mode: flotilla_resources::EnvironmentMountMode::Ro,
+            }],
+            ..spec
+        };
+        let error = DockerControllerRuntime { state }
+            .provision("contained-work", &cli_collision_spec)
             .await
             .expect_err("reserved CLI mount should fail provision");
 

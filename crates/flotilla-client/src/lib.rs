@@ -381,6 +381,35 @@ pub async fn connect_or_spawn_with_surface(
     connect_or_spawn_with_optional_surface(socket_path, config_dir, config_dir_override, socket_override, Some(surface)).await
 }
 
+/// Connect to the host daemon exposed inside a contained environment.
+///
+/// Unlike [`connect_or_spawn`], this never acquires a spawn lock, removes a
+/// stale socket, or starts a daemon. A missing listener means the host-owned
+/// control-plane mount is stale or unreachable and must be repaired outside
+/// the contained environment.
+pub async fn connect_required_host_daemon(socket_path: &Path) -> Result<Arc<SocketDaemon>, String> {
+    connect_required_host_daemon_with_optional_surface(socket_path, None).await
+}
+
+pub async fn connect_required_host_daemon_with_surface(
+    socket_path: &Path,
+    surface: SurfaceDeclaration,
+) -> Result<Arc<SocketDaemon>, String> {
+    connect_required_host_daemon_with_optional_surface(socket_path, Some(surface)).await
+}
+
+async fn connect_required_host_daemon_with_optional_surface(
+    socket_path: &Path,
+    surface: Option<SurfaceDeclaration>,
+) -> Result<Arc<SocketDaemon>, String> {
+    connect_existing_stateful(socket_path, surface.as_ref()).await?.ok_or_else(|| {
+        format!(
+            "host daemon socket stale or unreachable at {}; this contained environment requires the host daemon, so a local daemon will not be spawned",
+            socket_path.display()
+        )
+    })
+}
+
 async fn connect_or_spawn_with_optional_surface(
     socket_path: &Path,
     config_dir: &Path,

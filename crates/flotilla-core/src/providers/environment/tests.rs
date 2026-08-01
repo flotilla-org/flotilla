@@ -8,22 +8,28 @@ use async_trait::async_trait;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, EnvironmentStatus, HostName, ImageSource};
 
 use super::{
-    docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner, CreateOpts, EnvironmentProvider, EnvironmentTool,
-    EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate, ImagePullPolicy,
-    ProvisionedMount, ProvisionedMountMode,
+    contained_daemon_socket_path, docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner, CreateOpts, EnvironmentProvider,
+    EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate,
+    ImagePullPolicy, ProvisionedMount, ProvisionedMountMode,
 };
 use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
 
 fn test_daemon_tool(socket_path: impl Into<PathBuf>) -> EnvironmentTool {
+    let socket_path = socket_path.into();
+    let environment_socket_path = contained_daemon_socket_path(&socket_path);
     EnvironmentTool::new("flotilla", "/usr/local/bin/flotilla")
         .with_asset(EnvironmentToolAsset::new(
             socket_path,
-            "/run/flotilla.sock",
+            environment_socket_path.clone(),
             EnvironmentToolAssetKind::UnixSocket,
             EnvironmentToolAssetAccess::SharedWritable,
             "the daemon socket",
         ))
-        .with_environment(EnvironmentVariableUpdate::set("FLOTILLA_DAEMON_SOCKET", "/run/flotilla.sock", "the daemon socket"))
+        .with_environment(EnvironmentVariableUpdate::set(
+            "FLOTILLA_DAEMON_SOCKET",
+            environment_socket_path.to_string_lossy(),
+            "the daemon socket",
+        ))
 }
 
 /// A mock CommandRunner that records all (cmd, args, cwd) tuples passed to run/run_output.
@@ -432,7 +438,7 @@ async fn create_reports_infrastructure_and_requested_mount_metadata() {
     let reference_repo = DaemonHostPath::new("/host/reference-repo");
     let opts = CreateOpts {
         tokens: vec![],
-        tools: vec![test_daemon_tool("/run/flotilla.sock")],
+        tools: vec![test_daemon_tool("/host/daemon/flotilla.sock")],
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new(reference_repo.as_path().to_path_buf(), "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
@@ -445,13 +451,13 @@ async fn create_reports_infrastructure_and_requested_mount_metadata() {
     let calls = runner.calls();
     let (_, args, _) = &calls[0];
     assert!(
-        args.windows(2).any(|pair| pair == ["-v", "/run/flotilla.sock:/run/flotilla.sock:rw"]),
-        "daemon socket should be mounted read-write; args: {args:?}",
+        args.windows(2).any(|pair| pair == ["-v", "/host/daemon:/run/flotilla-daemon:rw"]),
+        "daemon socket parent directory should be mounted read-write; args: {args:?}",
     );
     assert_eq!(
         handle.provisioned_mounts(),
         vec![
-            ProvisionedMount::new("/run/flotilla.sock", "/run/flotilla.sock", ProvisionedMountMode::Rw),
+            ProvisionedMount::new("/host/daemon", "/run/flotilla-daemon", ProvisionedMountMode::Rw),
             ProvisionedMount::new(reference_repo.as_path().to_path_buf(), "/ref/repo", ProvisionedMountMode::Ro),
         ],
         "docker provisioned environments should report infrastructure and requested bind mount metadata",
@@ -459,7 +465,7 @@ async fn create_reports_infrastructure_and_requested_mount_metadata() {
 }
 
 #[tokio::test]
-async fn create_rejects_a_mount_targeting_the_reserved_daemon_socket_path() {
+async fn create_rejects_a_mount_targeting_the_reserved_daemon_socket_directory() {
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
@@ -469,7 +475,11 @@ async fn create_rejects_a_mount_targeting_the_reserved_daemon_socket_path() {
         tokens: vec![],
         tools: vec![test_daemon_tool("/host/flotilla.sock")],
         working_directory: None,
-        provisioned_mounts: vec![ProvisionedMount::new("/host/replacement.sock", "/run/flotilla.sock", ProvisionedMountMode::Rw)],
+        provisioned_mounts: vec![ProvisionedMount::new(
+            "/host/replacement-socket-directory",
+            "/run/flotilla-daemon",
+            ProvisionedMountMode::Rw,
+        )],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
     };
@@ -480,7 +490,40 @@ async fn create_rejects_a_mount_targeting_the_reserved_daemon_socket_path() {
         .err()
         .expect("reserved socket mount should be rejected");
 
-    assert_eq!(error, "mount target /run/flotilla.sock is reserved for the daemon socket");
+    assert_eq!(error, "mount target /run/flotilla-daemon is reserved for the daemon socket");
+    assert!(runner.calls().is_empty(), "reserved mount collisions should fail before invoking docker");
+}
+
+#[tokio::test]
+async fn create_rejects_a_mount_targeting_a_reserved_tool_file() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let image = ImageId::new("ubuntu:22.04");
+    let tool = EnvironmentTool::new("flotilla", "/usr/local/bin/flotilla").with_asset(EnvironmentToolAsset::new(
+        "/host/flotilla",
+        "/usr/local/bin/flotilla",
+        EnvironmentToolAssetKind::File,
+        EnvironmentToolAssetAccess::ReadOnly,
+        "the flotilla CLI",
+    ));
+    let opts = CreateOpts {
+        tokens: vec![],
+        tools: vec![tool],
+        working_directory: None,
+        provisioned_mounts: vec![ProvisionedMount::new("/host/replacement-flotilla", "/usr/local/bin/flotilla", ProvisionedMountMode::Ro)],
+        image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
+    };
+
+    let error = provider
+        .create(EnvironmentId::new("test-env-reserved-cli"), &image, opts)
+        .await
+        .err()
+        .expect("reserved CLI mount should be rejected");
+
+    assert_eq!(error, "mount target /usr/local/bin/flotilla is reserved for the flotilla CLI");
     assert!(runner.calls().is_empty(), "reserved mount collisions should fail before invoking docker");
 }
 
@@ -569,7 +612,7 @@ async fn list_preserves_provisioned_mount_metadata() {
         Ok(format!(
             "container-1\ttest-env-list\tubuntu:22.04\t{}\n",
             serde_json::to_string(&vec![
-                ProvisionedMount::new("/run/flotilla.sock", "/run/flotilla.sock", ProvisionedMountMode::Rw),
+                ProvisionedMount::new("/run", "/run/flotilla-daemon", ProvisionedMountMode::Rw),
                 ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro),
             ])
             .expect("serialize mount metadata")
@@ -593,7 +636,7 @@ async fn list_preserves_provisioned_mount_metadata() {
     assert_eq!(
         handles[0].provisioned_mounts(),
         vec![
-            ProvisionedMount::new("/run/flotilla.sock", "/run/flotilla.sock", ProvisionedMountMode::Rw),
+            ProvisionedMount::new("/run", "/run/flotilla-daemon", ProvisionedMountMode::Rw),
             ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro),
         ],
         "docker list should preserve flotilla-managed bind mount metadata",

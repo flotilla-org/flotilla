@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     runner::DockerEnvironmentRunner, CreateOpts, EnvironmentHandle, EnvironmentProvider, EnvironmentToolAssetAccess,
-    EnvironmentVariableUpdate, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode,
+    EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode,
 };
 use crate::providers::{ChannelLabel, CommandRunner};
 
@@ -75,18 +75,31 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         let mut tokens = opts.tokens;
         for tool in &opts.tools {
             for asset in &tool.assets {
-                if requested_mounts.iter().chain(&provisioned_mounts).any(|mount| mount.environment_path == asset.environment_path) {
-                    return Err(format!("mount target {} is reserved for {}", asset.environment_path, asset.purpose));
-                }
                 let mode = match asset.access {
                     EnvironmentToolAssetAccess::ReadOnly => ProvisionedMountMode::Ro,
                     EnvironmentToolAssetAccess::SharedWritable => ProvisionedMountMode::Rw,
                 };
-                provisioned_mounts.push(ProvisionedMount::new(
-                    asset.host_path.as_path().to_path_buf(),
-                    asset.environment_path.as_path().to_path_buf(),
-                    mode,
-                ));
+                let (host_path, environment_path) = match asset.kind {
+                    EnvironmentToolAssetKind::UnixSocket => {
+                        let host_parent = asset
+                            .host_path
+                            .as_path()
+                            .parent()
+                            .ok_or_else(|| format!("Unix socket asset {} has no host parent directory", asset.host_path))?;
+                        let environment_parent =
+                            asset.environment_path.as_path().parent().ok_or_else(|| {
+                                format!("Unix socket asset {} has no environment parent directory", asset.environment_path)
+                            })?;
+                        (host_parent.to_path_buf(), environment_parent.to_path_buf())
+                    }
+                    EnvironmentToolAssetKind::File | EnvironmentToolAssetKind::Directory => {
+                        (asset.host_path.as_path().to_path_buf(), asset.environment_path.as_path().to_path_buf())
+                    }
+                };
+                if requested_mounts.iter().chain(&provisioned_mounts).any(|mount| mount.environment_path.as_path() == environment_path) {
+                    return Err(format!("mount target {} is reserved for {}", environment_path.display(), asset.purpose));
+                }
+                provisioned_mounts.push(ProvisionedMount::new(host_path, environment_path, mode));
             }
             for update in &tool.environment {
                 match update {
