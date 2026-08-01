@@ -37,7 +37,7 @@ pub struct CleatTerminalPool {
     runner: Arc<dyn CommandRunner>,
     binary: String,
     terminal_env_defaults: TerminalEnvVars,
-    attach_capability: tokio::sync::OnceCell<Result<(), String>>,
+    attach_capability: tokio::sync::OnceCell<()>,
 }
 
 impl CleatTerminalPool {
@@ -147,7 +147,7 @@ impl TerminalPool for CleatTerminalPool {
         // degrade-to-watch behavior, and watcher banner. Check before starting
         // the interactive attach so a stale selected pool fails on the primary screen.
         self.attach_capability
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 let help = run!(self.runner, &self.binary, &["attach", "--help"], Path::new("/"));
                 if help.as_ref().is_ok_and(|help| help.contains("--strict") && help.contains("--take")) {
                     return Ok(());
@@ -161,7 +161,7 @@ impl TerminalPool for CleatTerminalPool {
                 ))
             })
             .await
-            .clone()
+            .copied()
     }
 
     fn attach_args_for_mode(
@@ -417,6 +417,21 @@ mod tests {
         assert!(error.contains("/pool/bin/cleat"), "{error}");
         assert!(error.contains("cleat 0.5.0"), "{error}");
         assert!(error.contains("--strict/--take"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn attach_preflight_retries_after_a_stale_binary_is_upgraded() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok("Options:\n  --no-create\n".into()),
+            Ok("cleat 0.5.0".into()),
+            Ok("Options:\n  --strict\n  --take\n".into()),
+        ]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "/pool/bin/cleat");
+
+        pool.preflight_attach(AttachMode::Default).await.expect_err("stale cleat should fail preflight");
+        pool.preflight_attach(AttachMode::Default).await.expect("upgraded cleat should pass without restarting the daemon");
+
+        assert_eq!(runner.calls().len(), 3, "failed capability probes must not be cached");
     }
 
     #[test]
