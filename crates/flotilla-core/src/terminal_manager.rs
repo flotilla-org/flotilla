@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use flotilla_protocol::{arg, qualified_path::QualifiedPath, AttachableId, AttachableSet, AttachableSetId, HostName, TerminalStatus};
+use flotilla_protocol::{
+    arg, commands::AttachMode, qualified_path::QualifiedPath, AttachableId, AttachableSet, AttachableSetId, HostName, TerminalStatus,
+};
 use tracing::warn;
 
 use crate::{
@@ -168,6 +170,7 @@ impl TerminalManager {
     /// resolves it for interactive attach and flattens the sole local command to a string.
     /// For local attach (same-host), the plan is just `[AttachTerminal(id)]` with no remote hop.
     pub async fn attach_command(&self, attachable_id: &AttachableId, daemon_socket_path: Option<&str>) -> Result<String, String> {
+        self.pool.preflight_attach(AttachMode::Default).await?;
         let plan = {
             let store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
             let builder = HopPlanBuilder::new(&self.local_host);

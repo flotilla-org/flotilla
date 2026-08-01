@@ -2502,7 +2502,7 @@ fn independent_view_subscribes_and_generates_a_pane_attach_query() {
     let command = app.proto_commands.take_next().expect("attach query").0;
     assert!(matches!(
         command.action,
-        CommandAction::AttachTransient { ref reference, host: Some(ref host) }
+        CommandAction::AttachTransient { ref reference, host: Some(ref host), mode: flotilla_protocol::commands::AttachMode::Default }
             if reference == "terminal-scratch" && host == &HostName::local()
     ));
 }

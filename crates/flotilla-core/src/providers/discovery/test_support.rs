@@ -809,6 +809,7 @@ pub struct FakeTerminalPool {
     pub delivered: Arc<TokioMutex<Vec<(String, String, bool)>>>,
     pub ensured: Arc<TokioMutex<Vec<EnsuredTerminalSession>>>,
     pub captured_screens: Arc<TokioMutex<HashMap<String, String>>>,
+    attach_preflight_error: Arc<TokioMutex<Option<String>>>,
 }
 
 pub struct EnsuredTerminalSession {
@@ -832,6 +833,7 @@ impl FakeTerminalPool {
             delivered: Arc::new(TokioMutex::new(Vec::new())),
             ensured: Arc::new(TokioMutex::new(Vec::new())),
             captured_screens: Arc::new(TokioMutex::new(HashMap::new())),
+            attach_preflight_error: Arc::new(TokioMutex::new(None)),
         }
     }
 
@@ -845,6 +847,10 @@ impl FakeTerminalPool {
 
     pub async fn set_captured_screen(&self, session_name: &str, screen: &str) {
         self.captured_screens.lock().await.insert(session_name.to_string(), screen.to_string());
+    }
+
+    pub async fn set_attach_preflight_error(&self, error: impl Into<String>) {
+        *self.attach_preflight_error.lock().await = Some(error.into());
     }
 }
 
@@ -894,6 +900,29 @@ impl TerminalPool for FakeTerminalPool {
         _env_vars: &super::super::terminal::TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach {session_name}"))])
+    }
+
+    async fn preflight_attach(&self, _mode: flotilla_protocol::commands::AttachMode) -> Result<(), String> {
+        match self.attach_preflight_error.lock().await.clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn attach_args_for_mode(
+        &self,
+        session_name: &str,
+        _command: &str,
+        _cwd: &ExecutionEnvironmentPath,
+        _env_vars: &super::super::terminal::TerminalEnvVars,
+        mode: flotilla_protocol::commands::AttachMode,
+    ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+        let flag = match mode {
+            flotilla_protocol::commands::AttachMode::Default => "",
+            flotilla_protocol::commands::AttachMode::Strict => " --strict",
+            flotilla_protocol::commands::AttachMode::Take => " --take",
+        };
+        Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach{flag} {session_name}"))])
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {

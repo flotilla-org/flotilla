@@ -1,6 +1,7 @@
 use std::{
-    collections::HashSet,
-    io::stdout,
+    collections::{HashSet, VecDeque},
+    io::{stderr, stdout, Read, Write},
+    process::{ExitStatus, Stdio},
     sync::{LazyLock, Mutex, MutexGuard, Once},
 };
 
@@ -27,10 +28,18 @@ fn reinitialize_terminal() -> ratatui::DefaultTerminal {
 }
 
 trait AttachCommandRunner {
-    fn status(&mut self, program: &str, args: &[String]) -> Result<std::process::ExitStatus, String>;
+    fn run(&mut self, program: &str, args: &[String]) -> Result<AttachCommandOutput, String>;
+}
+
+#[derive(Debug)]
+struct AttachCommandOutput {
+    status: ExitStatus,
+    stderr: Vec<u8>,
 }
 
 struct SystemAttachCommandRunner;
+
+const ATTACH_STDERR_TAIL_LIMIT: usize = 64 * 1024;
 
 static ACTIVE_ATTACH_BRIDGES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static ATTACH_PANIC_HOOK: Once = Once::new();
@@ -38,9 +47,43 @@ static ATTACH_PANIC_HOOK: Once = Once::new();
 static ATTACH_SIGNAL_HANDLER: Once = Once::new();
 
 impl AttachCommandRunner for SystemAttachCommandRunner {
-    fn status(&mut self, program: &str, args: &[String]) -> Result<std::process::ExitStatus, String> {
-        std::process::Command::new(program).args(args).status().map_err(|error| format!("could not start {program}: {error}"))
+    fn run(&mut self, program: &str, args: &[String]) -> Result<AttachCommandOutput, String> {
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("could not start {program}: {error}"))?;
+        let mut child_stderr = child.stderr.take().expect("piped child stderr should be available");
+        let stderr_reader = std::thread::spawn(move || tee_stderr_tail(&mut child_stderr, stderr(), ATTACH_STDERR_TAIL_LIMIT));
+        let status = child.wait().map_err(|error| format!("could not wait for {program}: {error}"))?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| format!("stderr reader for {program} panicked"))?
+            .map_err(|error| format!("could not read stderr from {program}: {error}"))?;
+        Ok(AttachCommandOutput { status, stderr })
     }
+}
+
+fn tee_stderr_tail(mut reader: impl Read, mut live: impl Write, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut tail = VecDeque::with_capacity(limit);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        live.write_all(&chunk[..read])?;
+        live.flush()?;
+        for byte in &chunk[..read] {
+            if tail.len() == limit {
+                tail.pop_front();
+            }
+            if limit > 0 {
+                tail.push_back(*byte);
+            }
+        }
+    }
+    Ok(tail.into_iter().collect())
 }
 
 fn active_attach_bridges() -> MutexGuard<'static, HashSet<String>> {
@@ -56,7 +99,7 @@ fn register_attach_bridge(bridge: &str) {
 
 fn kill_attach_bridge(bridge: &str, runner: &mut dyn AttachCommandRunner) {
     if active_attach_bridges().remove(bridge) {
-        let _ = runner.status("cleat", &["kill".to_string(), bridge.to_string()]);
+        let _ = runner.run("cleat", &["kill".to_string(), bridge.to_string()]);
     }
 }
 
@@ -64,23 +107,20 @@ fn kill_all_attach_bridges() {
     let bridges: Vec<_> = active_attach_bridges().drain().collect();
     let mut runner = SystemAttachCommandRunner;
     for bridge in bridges {
-        let _ = runner.status("cleat", &["kill".to_string(), bridge]);
+        let _ = runner.run("cleat", &["kill".to_string(), bridge]);
     }
 }
 
-fn run_direct_attach(
-    args: &[flotilla_protocol::arg::Arg],
-    runner: &mut dyn AttachCommandRunner,
-) -> Result<std::process::ExitStatus, String> {
+fn run_direct_attach(args: &[flotilla_protocol::arg::Arg], runner: &mut dyn AttachCommandRunner) -> Result<AttachCommandOutput, String> {
     let command = arg::flatten(args, 0);
-    runner.status("sh", &["-lc".to_string(), command])
+    runner.run("sh", &["-lc".to_string(), command])
 }
 
 fn run_send_keys_attach(
     plan: &ResolvedAttachPlan,
     bridge: &str,
     runner: &mut dyn AttachCommandRunner,
-) -> Result<std::process::ExitStatus, String> {
+) -> Result<AttachCommandOutput, String> {
     let mut actions = plan.0.clone();
     let Some(ResolvedAttachAction::Command(args)) = actions.pop() else {
         return Err("attach plan must end with an outer command".to_string());
@@ -88,16 +128,16 @@ fn run_send_keys_attach(
     let command = arg::flatten(&args, 0);
     register_attach_bridge(bridge);
     let launch =
-        match runner.status("cleat", &["launch".to_string(), bridge.to_string(), "--record".to_string(), "--cmd".to_string(), command]) {
+        match runner.run("cleat", &["launch".to_string(), bridge.to_string(), "--record".to_string(), "--cmd".to_string(), command]) {
             Ok(status) => status,
             Err(error) => {
                 kill_attach_bridge(bridge, runner);
                 return Err(error);
             }
         };
-    if !launch.success() {
+    if !launch.status.success() {
         kill_attach_bridge(bridge, runner);
-        return Err(format!("could not launch attach bridge for outer command (status {launch})"));
+        return Err(format!("could not launch attach bridge for outer command (status {})", launch.status));
     }
 
     let result = (|| {
@@ -108,7 +148,7 @@ fn run_send_keys_attach(
             while let Some(step) = steps.pop() {
                 match step {
                     SendKeyStep::WaitForReady => {
-                        let status = runner.status("cleat", &[
+                        let status = runner.run("cleat", &[
                             "wait".to_string(),
                             bridge.to_string(),
                             "--screen-stable".to_string(),
@@ -116,42 +156,57 @@ fn run_send_keys_attach(
                             "--timeout".to_string(),
                             "30".to_string(),
                         ])?;
-                        if !status.success() {
-                            return Err(format!("attach hop {hop} did not become ready (cleat wait status {status})"));
+                        if !status.status.success() {
+                            return Err(format!("attach hop {hop} did not become ready (cleat wait status {})", status.status));
                         }
                     }
                     SendKeyStep::Type { text } => {
-                        let status = runner.status("cleat", &["send".to_string(), bridge.to_string(), text])?;
-                        if !status.success() {
-                            return Err(format!("could not send keys for attach hop {hop} (cleat send status {status})"));
+                        let status = runner.run("cleat", &["send".to_string(), bridge.to_string(), text])?;
+                        if !status.status.success() {
+                            return Err(format!("could not send keys for attach hop {hop} (cleat send status {})", status.status));
                         }
                     }
                 }
             }
         }
-        runner.status("cleat", &["attach".to_string(), bridge.to_string()])
+        runner.run("cleat", &["attach".to_string(), bridge.to_string()])
     })();
 
     kill_attach_bridge(bridge, runner);
     result
 }
 
+fn execute_attach_plan(plan: &ResolvedAttachPlan, runner: &mut dyn AttachCommandRunner) -> Result<AttachCommandOutput, String> {
+    match plan.0.as_slice() {
+        [ResolvedAttachAction::Command(args)] => run_direct_attach(args, runner),
+        _ => {
+            let bridge = format!("flotilla-attach-{}", uuid::Uuid::new_v4());
+            run_send_keys_attach(plan, &bridge, runner)
+        }
+    }
+}
+
+fn replay_attach_stderr(captured: &[u8], mut writer: impl Write) -> Result<(), String> {
+    writer.write_all(captured).map_err(|error| format!("could not replay attach error: {error}"))?;
+    writer.flush().map_err(|error| format!("could not replay attach error: {error}"))
+}
+
 /// Execute an interactive attach plan and return the attached process status.
-pub fn run_attach_plan(plan: &ResolvedAttachPlan) -> Result<std::process::ExitStatus, String> {
+/// Child stderr remains live during the attach. On failure, its bounded tail is
+/// replayed after the primary screen has been restored.
+pub fn run_attach_plan(plan: &ResolvedAttachPlan) -> Result<ExitStatus, String> {
     // Standalone CLI and convoy auto-attach paths do not pass through TUI
     // startup, so install the idempotent bridge cleanup hooks here too.
     install_panic_hook();
     #[cfg(unix)]
     install_sigterm_handler();
 
-    let mut runner = SystemAttachCommandRunner;
-    match plan.0.as_slice() {
-        [ResolvedAttachAction::Command(args)] => run_direct_attach(args, &mut runner),
-        _ => {
-            let bridge = format!("flotilla-attach-{}", uuid::Uuid::new_v4());
-            run_send_keys_attach(plan, &bridge, &mut runner)
-        }
+    let output = execute_attach_plan(plan, &mut SystemAttachCommandRunner)?;
+    restore_terminal();
+    if !output.status.success() {
+        replay_attach_stderr(&output.stderr, stderr())?;
     }
+    Ok(output.status)
 }
 
 /// Temporarily leave the TUI to inspect a terminal session, then restore it.
@@ -161,14 +216,20 @@ pub fn run_attach_plan(plan: &ResolvedAttachPlan) -> Result<std::process::ExitSt
 /// is only a transient foreground excursion.
 pub fn run_temporary_attach(plan: &ResolvedAttachPlan) -> (ratatui::DefaultTerminal, Result<(), String>) {
     restore_terminal();
-    let result = run_attach_plan(plan).and_then(|status| {
-        if status.success() {
+    let result = execute_attach_plan(plan, &mut SystemAttachCommandRunner).and_then(|output| {
+        if output.status.success() {
             Ok(())
         } else {
-            Err(format!(
+            let mut message = format!(
                 "attach command exited with status {}",
-                status.code().map(|code| code.to_string()).unwrap_or_else(|| "signal".to_string())
-            ))
+                output.status.code().map(|code| code.to_string()).unwrap_or_else(|| "signal".to_string())
+            );
+            let captured = String::from_utf8_lossy(&output.stderr);
+            if !captured.trim().is_empty() {
+                message.push_str(": ");
+                message.push_str(captured.trim());
+            }
+            Err(message)
         }
     });
     (reinitialize_terminal(), result)
@@ -220,7 +281,7 @@ mod tests {
 
     use flotilla_protocol::{arg::Arg, ResolvedAttachAction, ResolvedAttachPlan, SendKeyStep};
 
-    use super::{run_send_keys_attach, AttachCommandRunner};
+    use super::{replay_attach_stderr, run_send_keys_attach, tee_stderr_tail, AttachCommandOutput, AttachCommandRunner};
 
     #[derive(Default)]
     struct FakeRunner {
@@ -235,10 +296,10 @@ mod tests {
     }
 
     impl AttachCommandRunner for FakeRunner {
-        fn status(&mut self, program: &str, args: &[String]) -> Result<ExitStatus, String> {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<AttachCommandOutput, String> {
             self.calls.push((program.to_string(), args.to_vec()));
             let code = self.statuses.pop_front().unwrap_or(0);
-            Ok(ExitStatus::from_raw(code << 8))
+            Ok(AttachCommandOutput { status: ExitStatus::from_raw(code << 8), stderr: Vec::new() })
         }
     }
 
@@ -248,9 +309,9 @@ mod tests {
     }
 
     impl AttachCommandRunner for DockerProbeRunner {
-        fn status(&mut self, program: &str, args: &[String]) -> Result<ExitStatus, String> {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<AttachCommandOutput, String> {
             if program == "cleat" && args.first().is_some_and(|command| command == "attach") {
-                return self.inner.status("cleat", &[
+                return self.inner.run("cleat", &[
                     "expect".to_string(),
                     args[1].clone(),
                     "--since-marker".to_string(),
@@ -261,11 +322,11 @@ mod tests {
                     "10".to_string(),
                 ]);
             }
-            let status = self.inner.status(program, args)?;
-            if status.success() && program == "cleat" && args.first().is_some_and(|command| command == "wait") {
-                return self.inner.status("cleat", &["mark".to_string(), args[1].clone(), "before-inner-attach".to_string()]);
+            let output = self.inner.run(program, args)?;
+            if output.status.success() && program == "cleat" && args.first().is_some_and(|command| command == "wait") {
+                return self.inner.run("cleat", &["mark".to_string(), args[1].clone(), "before-inner-attach".to_string()]);
             }
-            Ok(status)
+            Ok(output)
         }
     }
 
@@ -310,6 +371,27 @@ mod tests {
     }
 
     #[test]
+    fn attach_failure_replay_preserves_the_original_error() {
+        let mut replayed = Vec::new();
+
+        replay_attach_stderr(b"session held by host feta pid 4242: already has a foreground client\n", &mut replayed)
+            .expect("refusal should replay");
+
+        let replayed = String::from_utf8(replayed).expect("replayed stderr should be UTF-8");
+        assert_eq!(replayed, "session held by host feta pid 4242: already has a foreground client\n");
+    }
+
+    #[test]
+    fn attach_stderr_is_live_and_retains_only_a_bounded_tail() {
+        let mut live = Vec::new();
+
+        let tail = tee_stderr_tail(&b"warning then refusal"[..], &mut live, 7).expect("stderr should be teed");
+
+        assert_eq!(live, b"warning then refusal");
+        assert_eq!(tail, b"refusal");
+    }
+
+    #[test]
     #[ignore = "requires Docker, cleat, and the debian:trixie-slim image"]
     fn real_docker_hop_types_the_inner_attach_into_the_container_shell() {
         let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -340,11 +422,11 @@ mod tests {
 
         let result = (|| {
             let mut runner = DockerProbeRunner { marker, inner: super::SystemAttachCommandRunner };
-            let status = run_send_keys_attach(&plan, &bridge, &mut runner)?;
-            if status.success() {
+            let output = run_send_keys_attach(&plan, &bridge, &mut runner)?;
+            if output.status.success() {
                 Ok(())
             } else {
-                Err(format!("container crew marker was not observed (status {status})"))
+                Err(format!("container crew marker was not observed (status {})", output.status))
             }
         })();
 
