@@ -837,6 +837,8 @@ mod tests {
         assert!(brief.contains("Finish, don't redo"));
         assert!(brief.contains("`pr-shepherd` skill"));
         assert!(brief.contains("For a Forgejo destination, do not use that GitHub-only helper"));
+        assert!(brief.contains("with the `pr-shepherd` skill for a GitHub destination, or through the injected Forgejo API credentials for a Forgejo destination"));
+        assert!(!brief.contains("pull request using the `pr-shepherd` skill"));
         assert!(brief.contains("Future events belong to a later engagement"));
         assert!(brief.contains("flotilla crew complete --message '<PR URL>'"));
         assert!(!brief.contains("wait-for-checks"));

@@ -80,12 +80,30 @@ impl CredentialStore {
         credential_refs: &BTreeSet<String>,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Vec<(String, String)>, String> {
-        let mut env = BTreeMap::new();
+        let mut specs = Vec::new();
         for name in credential_refs {
             let spec = self.spec(name).await?;
             if matches!(spec.consumer, CredentialConsumer::DockerRegistry { .. }) {
                 continue;
             }
+            specs.push((name.clone(), spec));
+        }
+        // Each adapter delivers fixed env-var names, so a second credential on
+        // the same adapter would silently overwrite the first's wiring. Fail
+        // loudly instead (registry credentials multiplex per image in
+        // prepare_registry_pull and are exempt).
+        let mut seen_adapters = BTreeSet::new();
+        for (name, spec) in &specs {
+            if !seen_adapters.insert(spec.consumer.adapter_name()) {
+                return Err(bounded_adapter_error(
+                    name,
+                    spec.consumer.adapter_name(),
+                    "multiple granted credentials use this adapter for one environment",
+                ));
+            }
+        }
+        let mut env = BTreeMap::new();
+        for (name, spec) in &specs {
             let cache_key = (environment_ref.to_string(), name.clone());
             let cached_material = {
                 let materials = self.materials.lock().await;
@@ -95,11 +113,11 @@ impl CredentialStore {
             // that environment. Refreshable material is resolved for every
             // preparation; static material follows the same environment cache.
             let material = if spec.lifecycle == CredentialLifecycle::Refreshable {
-                self.resolve_for_adapter(name, &spec).await?
+                self.resolve_for_adapter(name, spec).await?
             } else if let Some(material) = cached_material {
                 material
             } else {
-                let material = self.resolve_for_adapter(name, &spec).await?;
+                let material = self.resolve_for_adapter(name, spec).await?;
                 self.materials.lock().await.insert(cache_key.clone(), material.clone());
                 material
             };
@@ -109,7 +127,7 @@ impl CredentialStore {
                 self.materials.lock().await.remove(&cache_key);
                 return Err(error);
             }
-            let delivered = match self.prepare_adapter(name, &spec, material, Arc::clone(&runner), already_prepared).await {
+            let delivered = match self.prepare_adapter(name, spec, material, Arc::clone(&runner), already_prepared).await {
                 Ok(delivered) => delivered,
                 Err(message) => {
                     self.materials.lock().await.remove(&cache_key);
@@ -657,6 +675,106 @@ mod tests {
                 && String::from_utf8_lossy(input).contains(secret)
         }));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
+    }
+
+    async fn create_forgejo_spec(backend: &ResourceBackend, name: &str, api_url: &str, source_env: &str) {
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name(name.to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::Forgejo { api_url: api_url.to_string(), username: "flotilla-crew".to_string() },
+                source: CredentialSource::Env { name: source_env.to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create credential declaration");
+    }
+
+    #[tokio::test]
+    async fn forgejo_server_url_must_be_https() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_forgejo_spec(&backend, "lab-forgejo", "http://forgejo.lab", "TEST_FORGEJO_TOKEN").await;
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+
+        let error = store
+            .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
+            .await
+            .expect_err("plain-HTTP Forgejo server URL must be rejected");
+
+        assert!(error.contains("must use HTTPS"), "unexpected error: {error}");
+        assert!(runner.writes.lock().expect("writes lock").is_empty(), "no material may be written for a rejected URL");
+    }
+
+    #[tokio::test]
+    async fn forgejo_server_url_must_parse() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_forgejo_spec(&backend, "lab-forgejo", "not a url", "TEST_FORGEJO_TOKEN").await;
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+
+        let error = store
+            .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
+            .await
+            .expect_err("an unparsable Forgejo server URL must be rejected");
+
+        assert!(error.contains("invalid Forgejo server URL"), "unexpected error: {error}");
+        assert!(runner.writes.lock().expect("writes lock").is_empty(), "no material may be written for a rejected URL");
+    }
+
+    #[tokio::test]
+    async fn forgejo_helper_and_git_config_agree_on_an_explicit_port() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_forgejo_spec(&backend, "lab-forgejo", "https://forgejo.lab:3000", "TEST_FORGEJO_TOKEN").await;
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+
+        let delivered: BTreeMap<String, String> = store
+            .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
+            .await
+            .expect("prepare Forgejo credential with an explicit port")
+            .into_iter()
+            .collect();
+
+        assert_eq!(delivered.get("FORGEJO_SERVER_URL"), Some(&"https://forgejo.lab:3000".to_string()));
+        assert_eq!(delivered.get("GIT_CONFIG_KEY_0"), Some(&"credential.https://forgejo.lab:3000.helper".to_string()));
+        let writes = runner.writes.lock().expect("writes lock");
+        assert!(
+            writes[1].1.contains("[ \"$host\" = forgejo.lab:3000 ]"),
+            "helper must compare against the host:port form git passes when a port is present"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_credential_on_the_same_adapter_fails_loudly() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_forgejo_spec(&backend, "lab-a", "https://forgejo.lab", "TEST_TOKEN_A").await;
+        create_forgejo_spec(&backend, "lab-b", "https://other.lab", "TEST_TOKEN_B").await;
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            bag,
+            runner.clone(),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+
+        let error = store
+            .prepare("env-a", &BTreeSet::from(["lab-a".to_string(), "lab-b".to_string()]), runner.clone())
+            .await
+            .expect_err("two credentials on one adapter would silently clobber each other's delivery");
+
+        assert!(error.contains("multiple granted credentials use this adapter"), "unexpected error: {error}");
+        assert!(runner.writes.lock().expect("writes lock").is_empty(), "no material may be written when preparation is rejected");
     }
 
     #[tokio::test]
