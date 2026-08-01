@@ -28,6 +28,11 @@ const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Interval between polls when waiting for the socket to appear.
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Remote command that reads the accepting daemon's published socket path.
+/// The discovery file is stable dialer-facing configuration; its contents are
+/// owned by the remote daemon and may change between connection attempts.
+const REMOTE_SOCKET_PATH_COMMAND: &str = "cat \"${XDG_CONFIG_HOME:-$HOME/.config}/flotilla/run/socket-path\"";
+
 /// Channel buffer size for inbound and outbound peer data messages.
 const CHANNEL_BUFFER: usize = 256;
 
@@ -100,7 +105,8 @@ pub struct SshTransport {
     expected_node_id: Option<NodeId>,
     local_socket_path: PathBuf,
     local_daemon_socket_path: PathBuf,
-    remote_resource_socket_path: PathBuf,
+    remote_daemon_socket_path: Option<PathBuf>,
+    remote_resource_socket_path: Option<PathBuf>,
     ssh_binary: PathBuf,
     ssh_process: Option<tokio::process::Child>,
     status: PeerConnectionStatus,
@@ -134,7 +140,6 @@ impl SshTransport {
         paths: SshTransportPaths<'_>,
     ) -> Result<Self, String> {
         let local_socket_path = peer_resource_socket_path(&paths.state_dir.join("peers"), &config_label)?;
-        let remote_resource_socket_path = reverse_peer_resource_socket_path(Path::new(&config.daemon_socket), &local_node_id)?;
         let expected_host_name = HostName::new(&config.expected_host_name);
 
         Ok(Self {
@@ -146,7 +151,8 @@ impl SshTransport {
             expected_node_id,
             local_socket_path,
             local_daemon_socket_path: paths.daemon_socket.to_path_buf(),
-            remote_resource_socket_path,
+            remote_daemon_socket_path: None,
+            remote_resource_socket_path: None,
             ssh_binary: PathBuf::from("ssh"),
             ssh_process: None,
             status: PeerConnectionStatus::Disconnected,
@@ -163,6 +169,10 @@ impl SshTransport {
     async fn spawn_ssh(&mut self) -> Result<(), String> {
         // Clean up any stale local socket before spawning
         self.cleanup_socket();
+
+        let remote_daemon_socket = self.resolve_remote_daemon_socket().await?;
+        self.remote_resource_socket_path = Some(reverse_peer_resource_socket_path(&remote_daemon_socket, &self.local_node_id)?);
+        self.remote_daemon_socket_path = Some(remote_daemon_socket);
 
         // OpenSSH's client-side StreamLocalBindUnlink option only applies to
         // the local (-L) socket. The reverse (-R) socket is bound by sshd and
@@ -222,9 +232,36 @@ impl SshTransport {
         }
     }
 
+    async fn resolve_remote_daemon_socket(&self) -> Result<PathBuf, String> {
+        let destination = self.destination();
+        let output = tokio::process::Command::new(&self.ssh_binary)
+            .arg(&destination)
+            .arg(REMOTE_SOCKET_PATH_COMMAND)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        let output = tokio::time::timeout(SOCKET_POLL_TIMEOUT, output)
+            .await
+            .map_err(|_| format!("timed out resolving remote daemon socket path on {destination}"))?
+            .map_err(|error| format!("failed to resolve remote daemon socket path on {destination}: {error}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "failed to resolve remote daemon socket path on {destination}: ssh exited with {}{}",
+                output.status,
+                if stderr.trim().is_empty() { String::new() } else { format!(": {}", stderr.trim()) }
+            ));
+        }
+
+        parse_remote_socket_path(&output.stdout).map_err(|error| format!("invalid remote daemon socket path from {destination}: {error}"))
+    }
+
     async fn cleanup_remote_socket(&self) -> Result<(), String> {
         let destination = self.destination();
-        let path = self.remote_resource_socket_path.to_string_lossy();
+        let path = self.remote_resource_socket_path()?.to_string_lossy();
         let command = self.remote_cleanup_command();
         debug!(%destination, remote_socket = %path, "removing stale reverse peer socket before SSH tunnel dial");
 
@@ -254,14 +291,26 @@ impl SshTransport {
     }
 
     fn remote_cleanup_command(&self) -> String {
-        format!("rm -f -- {}", shell_quote(&self.remote_resource_socket_path.to_string_lossy()))
+        self.remote_resource_socket_path()
+            .map(|path| format!("rm -f -- {}", shell_quote(&path.to_string_lossy())))
+            .expect("remote resource socket path is resolved before cleanup")
     }
 
     fn resource_forward_specs(&self) -> (String, String) {
+        let remote_daemon_socket = self.remote_daemon_socket_path().expect("remote daemon socket path is resolved before forwarding");
+        let remote_resource_socket = self.remote_resource_socket_path().expect("remote resource socket path is resolved before forwarding");
         (
-            format!("{}:{}", self.local_socket_path.display(), self.config.daemon_socket),
-            format!("{}:{}", self.remote_resource_socket_path.display(), self.local_daemon_socket_path.display()),
+            format!("{}:{}", self.local_socket_path.display(), remote_daemon_socket.display()),
+            format!("{}:{}", remote_resource_socket.display(), self.local_daemon_socket_path.display()),
         )
+    }
+
+    fn remote_daemon_socket_path(&self) -> Result<&Path, String> {
+        self.remote_daemon_socket_path.as_deref().ok_or_else(|| "remote daemon socket path has not been resolved".to_string())
+    }
+
+    fn remote_resource_socket_path(&self) -> Result<&Path, String> {
+        self.remote_resource_socket_path.as_deref().ok_or_else(|| "remote resource socket path has not been resolved".to_string())
     }
 
     /// Wait for the forwarded local socket file to appear on disk.
@@ -403,6 +452,31 @@ impl SshTransport {
         Ok(inbound_rx)
     }
 
+    async fn diagnose_pre_hello_close(&self) -> Option<String> {
+        let remote_socket = self.remote_daemon_socket_path().ok()?;
+        let destination = self.destination();
+        let quoted_path = shell_quote(&remote_socket.to_string_lossy());
+        let command =
+            format!("test -S {quoted_path} && {{ ! command -v ss >/dev/null 2>&1 || ss -xlH | grep -F -- {quoted_path} >/dev/null; }}");
+        let output = tokio::process::Command::new(&self.ssh_binary)
+            .arg(&destination)
+            .arg(command)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let output = tokio::time::timeout(SOCKET_POLL_TIMEOUT, output).await.ok()?.ok()?;
+
+        match output.status.code() {
+            Some(0) | Some(255) | None => None,
+            Some(_) => Some(format!(
+                "remote daemon not listening at derived path {} on {destination} (peer closed before sending hello)",
+                remote_socket.display()
+            )),
+        }
+    }
+
     /// Remove the local forwarded socket file if it exists.
     fn cleanup_socket(&self) {
         if self.local_socket_path.exists() {
@@ -473,6 +547,23 @@ impl SshTransport {
     }
 }
 
+fn parse_remote_socket_path(stdout: &[u8]) -> Result<PathBuf, String> {
+    let stdout = std::str::from_utf8(stdout).map_err(|error| format!("not UTF-8: {error}"))?;
+    let mut lines = stdout.lines();
+    let path = lines.next().unwrap_or_default().trim();
+    if path.is_empty() {
+        return Err("discovery file was empty".to_string());
+    }
+    if lines.any(|line| !line.trim().is_empty()) {
+        return Err("discovery command returned more than one path".to_string());
+    }
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(format!("path is not absolute: {}", path.display()));
+    }
+    Ok(path)
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -486,9 +577,16 @@ impl PeerTransport for SshTransport {
         self.wait_for_socket().await.inspect_err(|_| {
             self.cleanup_socket();
         })?;
-        let rx = self.connect_socket().await.inspect_err(|_| {
-            self.cleanup_socket();
-        })?;
+        let rx = match self.connect_socket().await {
+            Ok(rx) => rx,
+            Err(error) => {
+                self.cleanup_socket();
+                if error == "peer closed before sending hello" {
+                    return Err(self.diagnose_pre_hello_close().await.unwrap_or(error));
+                }
+                return Err(error);
+            }
+        };
 
         // Store the inbound receiver for subscribe() to return
         self.inbound_rx = Some(rx);
@@ -591,13 +689,76 @@ mod tests {
     }
 
     #[test]
+    fn remote_socket_path_parser_requires_one_absolute_path() {
+        assert_eq!(parse_remote_socket_path(b"/tmp/flotilla.sock\n").expect("absolute path"), PathBuf::from("/tmp/flotilla.sock"));
+        assert!(parse_remote_socket_path(b"relative.sock\n").expect_err("relative path").contains("not absolute"));
+        assert!(parse_remote_socket_path(b"\n").expect_err("empty path").contains("empty"));
+        assert!(parse_remote_socket_path(b"/one.sock\n/two.sock\n").expect_err("multiple paths").contains("more than one"));
+    }
+
+    #[tokio::test]
+    async fn remote_socket_path_is_resolved_again_after_it_moves() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let published_path = tmp.path().join("published-path");
+        std::fs::write(&published_path, "/run/first.sock\n").expect("write first path");
+        let fake_ssh = tmp.path().join("ssh");
+        std::fs::write(&fake_ssh, format!("#!/bin/sh\ncat {}\n", shell_quote(&published_path.to_string_lossy()))).expect("write fake ssh");
+        let mut permissions = std::fs::metadata(&fake_ssh).expect("fake ssh metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ssh, permissions).expect("make fake ssh executable");
+
+        let mut transport = test_transport();
+        transport.ssh_binary = fake_ssh;
+        assert_eq!(transport.resolve_remote_daemon_socket().await.expect("first resolution"), PathBuf::from("/run/first.sock"));
+
+        std::fs::write(&published_path, "/run/moved.sock\n").expect("move published path");
+        assert_eq!(transport.resolve_remote_daemon_socket().await.expect("second resolution"), PathBuf::from("/run/moved.sock"));
+    }
+
+    #[tokio::test]
+    async fn pre_hello_close_names_remote_daemon_not_listening() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fake_ssh = tmp.path().join("ssh");
+        std::fs::write(&fake_ssh, "#!/bin/sh\nexit 1\n").expect("write fake ssh");
+        let mut permissions = std::fs::metadata(&fake_ssh).expect("fake ssh metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ssh, permissions).expect("make fake ssh executable");
+
+        let mut transport = test_transport();
+        transport.ssh_binary = fake_ssh;
+        transport.remote_daemon_socket_path = Some(PathBuf::from("/remote/run/flotilla.sock"));
+
+        let diagnosis = transport.diagnose_pre_hello_close().await.expect("probable cause");
+        assert!(diagnosis.contains("remote daemon not listening at derived path /remote/run/flotilla.sock"));
+        assert!(diagnosis.contains("peer closed before sending hello"));
+    }
+
+    fn test_transport() -> SshTransport {
+        SshTransport::new(
+            NodeId::new("local"),
+            "local-display".into(),
+            ConfigLabel("remote".into()),
+            RemoteHostConfig {
+                hostname: "remote.example.invalid".into(),
+                expected_host_name: "remote".into(),
+                expected_node_id: None,
+                user: None,
+                ssh_multiplex: None,
+            },
+            None,
+            uuid::Uuid::nil(),
+            SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
+        )
+        .expect("test transport")
+    }
+
+    #[test]
     fn local_socket_path_uses_host_name() {
         let config = RemoteHostConfig {
             hostname: "10.0.0.5".to_string(),
             expected_host_name: "my-server".to_string(),
             expected_node_id: None,
             user: Some("dev".to_string()),
-            daemon_socket: "/run/user/1000/flotilla.sock".to_string(),
             ssh_multiplex: None,
         };
         let transport = SshTransport::new(
@@ -620,11 +781,10 @@ mod tests {
             expected_host_name: "peer-a".to_string(),
             expected_node_id: None,
             user: Some("test-user".to_string()),
-            daemon_socket: "/home/test-remote/.config/flotilla/flotilla.sock".to_string(),
             ssh_multiplex: None,
         };
         let local_node = NodeId::new("local-node");
-        let transport = SshTransport::new(
+        let mut transport = SshTransport::new(
             local_node.clone(),
             "local-host".into(),
             ConfigLabel("peer-a".to_string()),
@@ -637,18 +797,23 @@ mod tests {
             },
         )
         .expect("valid transport");
+        transport.remote_daemon_socket_path = Some(PathBuf::from("/home/test-remote/.config/flotilla/run/flotilla.sock"));
+        transport.remote_resource_socket_path = Some(
+            reverse_peer_resource_socket_path(transport.remote_daemon_socket_path.as_deref().expect("remote daemon socket"), &local_node)
+                .expect("reverse path"),
+        );
 
         let (local_forward, reverse_forward) = transport.resource_forward_specs();
 
         assert_eq!(
             local_forward,
-            "/home/test-local/.local/state/flotilla/peers/peer-a.sock:/home/test-remote/.config/flotilla/flotilla.sock"
+            "/home/test-local/.local/state/flotilla/peers/peer-a.sock:/home/test-remote/.config/flotilla/run/flotilla.sock"
         );
         assert_eq!(
             reverse_forward,
             format!(
                 "{}:/home/test-local/.config/flotilla/flotilla.sock",
-                reverse_peer_resource_socket_path(Path::new("/home/test-remote/.config/flotilla/flotilla.sock"), &local_node)
+                reverse_peer_resource_socket_path(Path::new("/home/test-remote/.config/flotilla/run/flotilla.sock"), &local_node)
                     .expect("reverse path")
                     .display()
             )
@@ -662,10 +827,9 @@ mod tests {
             expected_host_name: "peer-a".to_string(),
             expected_node_id: None,
             user: Some("test-user".to_string()),
-            daemon_socket: "/home/O'Brien/.config/flotilla/flotilla.sock".to_string(),
             ssh_multiplex: None,
         };
-        let transport = SshTransport::new(
+        let mut transport = SshTransport::new(
             NodeId::new("local-node"),
             "local-host".into(),
             ConfigLabel("peer-a".into()),
@@ -675,12 +839,21 @@ mod tests {
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid transport");
+        transport.remote_resource_socket_path = Some(
+            reverse_peer_resource_socket_path(Path::new("/home/O'Brien/.config/flotilla/run/flotilla.sock"), &NodeId::new("local-node"))
+                .expect("reverse path"),
+        );
 
         assert_eq!(
             transport.remote_cleanup_command(),
             format!(
-                "rm -f -- '/home/O'\"'\"'Brien/.config/flotilla/{}'",
-                transport.remote_resource_socket_path.file_name().expect("socket file name").to_string_lossy()
+                "rm -f -- '/home/O'\"'\"'Brien/.config/flotilla/run/{}'",
+                transport
+                    .remote_resource_socket_path()
+                    .expect("remote resource socket")
+                    .file_name()
+                    .expect("socket file name")
+                    .to_string_lossy()
             )
         );
     }
@@ -694,7 +867,6 @@ mod tests {
             expected_host_name: "peer-a".to_string(),
             expected_node_id: None,
             user: None,
-            daemon_socket: daemon_socket.to_string_lossy().into_owned(),
             ssh_multiplex: None,
         };
         let mut transport = SshTransport::new(
@@ -707,10 +879,17 @@ mod tests {
             SshTransportPaths { state_dir: tmp.path(), daemon_socket: &daemon_socket },
         )
         .expect("valid transport");
-        std::fs::write(&transport.remote_resource_socket_path, []).expect("create stale reverse socket stand-in");
-
+        let stale_reverse_socket = reverse_peer_resource_socket_path(&daemon_socket, &NodeId::new("local-node")).expect("reverse socket");
+        std::fs::write(&stale_reverse_socket, []).expect("create stale reverse socket stand-in");
         let fake_ssh = tmp.path().join("ssh");
-        std::fs::write(&fake_ssh, "#!/bin/sh\nif [ \"$#\" -eq 2 ]; then exec /bin/sh -c \"$2\"; fi\nexit 0\n").expect("write fake ssh");
+        std::fs::write(
+            &fake_ssh,
+            format!(
+                "#!/bin/sh\n[ \"$#\" -ne 2 ] && exit 0\ncase \"$2\" in\n  *socket-path*) printf '%s\\n' '{}' ;;\n  *) exec /bin/sh -c \"$2\" ;;\nesac\n",
+                daemon_socket.display()
+            ),
+        )
+        .expect("write fake ssh");
         let mut permissions = std::fs::metadata(&fake_ssh).expect("fake ssh metadata").permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake_ssh, permissions).expect("make fake ssh executable");
@@ -718,7 +897,7 @@ mod tests {
 
         transport.spawn_ssh().await.expect("stale cleanup and tunnel spawn should succeed");
 
-        assert!(!transport.remote_resource_socket_path.exists(), "stale reverse socket must be removed before the tunnel is spawned");
+        assert!(!transport.remote_resource_socket_path().expect("resolved reverse socket").exists());
         let status = transport.ssh_process.as_mut().expect("tunnel child").wait().await.expect("wait for fake tunnel");
         assert!(status.success());
     }
@@ -732,7 +911,6 @@ mod tests {
             expected_host_name: "peer-a".to_string(),
             expected_node_id: None,
             user: None,
-            daemon_socket: daemon_socket.to_string_lossy().into_owned(),
             ssh_multiplex: None,
         };
         let mut transport = SshTransport::new(
@@ -746,7 +924,14 @@ mod tests {
         )
         .expect("valid transport");
         let fake_ssh = tmp.path().join("ssh");
-        std::fs::write(&fake_ssh, "#!/bin/sh\necho cleanup-denied >&2\nexit 23\n").expect("write failing fake ssh");
+        std::fs::write(
+            &fake_ssh,
+            format!(
+                "#!/bin/sh\n[ \"$#\" -ne 2 ] && exit 0\ncase \"$2\" in\n  *socket-path*) printf '%s\\n' '{}' ;;\n  *) echo cleanup-denied >&2; exit 23 ;;\nesac\n",
+                daemon_socket.display()
+            ),
+        )
+        .expect("write failing fake ssh");
         let mut permissions = std::fs::metadata(&fake_ssh).expect("fake ssh metadata").permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake_ssh, permissions).expect("make fake ssh executable");
@@ -755,7 +940,7 @@ mod tests {
         let error = transport.spawn_ssh().await.expect_err("cleanup failure must stop the tunnel dial");
 
         assert!(error.contains("failed to remove stale reverse peer socket"), "unexpected error: {error}");
-        assert!(error.contains(&transport.remote_resource_socket_path.to_string_lossy().into_owned()), "unexpected error: {error}");
+        assert!(error.contains(&transport.remote_resource_socket_path().expect("resolved reverse socket").to_string_lossy().into_owned()));
         assert!(error.contains("cleanup-denied"), "unexpected error: {error}");
         assert!(transport.ssh_process.is_none(), "tunnel must not spawn after cleanup failure");
     }
@@ -767,7 +952,6 @@ mod tests {
             expected_host_name: "remote".to_string(),
             expected_node_id: None,
             user: None,
-            daemon_socket: "/tmp/daemon.sock".to_string(),
             ssh_multiplex: None,
         };
         match SshTransport::new(
@@ -791,7 +975,6 @@ mod tests {
             expected_host_name: "remote".to_string(),
             expected_node_id: None,
             user: None,
-            daemon_socket: "/tmp/daemon.sock".to_string(),
             ssh_multiplex: None,
         };
         let transport = SshTransport::new(
@@ -895,7 +1078,6 @@ mod tests {
             expected_host_name: "remote".to_string(),
             expected_node_id: None,
             user: None,
-            daemon_socket: "/tmp/daemon.sock".to_string(),
             ssh_multiplex: None,
         };
         let transport = SshTransport::new(
@@ -918,7 +1100,6 @@ mod tests {
             expected_host_name: "remote".to_string(),
             expected_node_id: None,
             user: None,
-            daemon_socket: "/tmp/daemon.sock".to_string(),
             ssh_multiplex: None,
         };
         let mut transport = SshTransport::new(
@@ -949,7 +1130,6 @@ mod tests {
             expected_host_name: "remote".to_string(),
             expected_node_id: None,
             user: None,
-            daemon_socket: "/tmp/daemon.sock".to_string(),
             ssh_multiplex: None,
         };
         let mut transport = SshTransport::new(
@@ -1021,7 +1201,6 @@ mod tests {
             expected_host_name: "localhost-test".to_string(),
             expected_node_id: None,
             user: None,
-            daemon_socket: "/tmp/flotilla-test-daemon.sock".to_string(),
             ssh_multiplex: None,
         };
         let mut transport = SshTransport::new(

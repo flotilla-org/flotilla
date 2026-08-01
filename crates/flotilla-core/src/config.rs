@@ -292,7 +292,6 @@ pub struct RemoteHostConfig {
     #[serde(default)]
     pub expected_node_id: Option<NodeId>,
     pub user: Option<String>,
-    pub daemon_socket: String,
     pub ssh_multiplex: Option<bool>,
 }
 
@@ -311,7 +310,6 @@ struct RawRemoteHostConfig {
     #[serde(default)]
     expected_node_id: Option<NodeId>,
     user: Option<String>,
-    daemon_socket: String,
     ssh_multiplex: Option<bool>,
 }
 
@@ -332,7 +330,6 @@ impl<'de> Deserialize<'de> for HostsConfig {
                     expected_host_name,
                     expected_node_id: host.expected_node_id,
                     user: host.user,
-                    daemon_socket: host.daemon_socket,
                     ssh_multiplex: host.ssh_multiplex,
                 })
             })

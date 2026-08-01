@@ -271,6 +271,7 @@ pub fn spawn_test_peer_networking(
 pub struct DaemonServer {
     daemon: Arc<InProcessDaemon>,
     socket_path: PathBuf,
+    socket_discovery_path: PathBuf,
     idle_timeout: Duration,
     follower: bool,
     client_count: Arc<AtomicUsize>,
@@ -319,10 +320,12 @@ impl DaemonServer {
         let agent_state_store = Arc::clone(daemon.agent_state_store());
         let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
         let peer_resource_socket_dir = config.state_dir().as_path().join("peers");
+        let socket_discovery_path = config.base_path().as_path().join("run/socket-path");
 
         Ok(Self {
             daemon,
             socket_path,
+            socket_discovery_path,
             idle_timeout,
             follower: daemon_config.follower,
             client_count: Arc::new(AtomicUsize::new(0)),
@@ -368,6 +371,8 @@ impl DaemonServer {
         }
 
         let listener = UnixListener::bind(&self.socket_path).map_err(|e| format!("failed to bind socket: {e}"))?;
+
+        publish_socket_path(&self.socket_discovery_path, &self.socket_path)?;
 
         info!(path = %self.socket_path.display(), "daemon listening");
 
@@ -525,6 +530,14 @@ impl DaemonServer {
         info!("daemon server stopped");
         Ok(())
     }
+}
+
+fn publish_socket_path(discovery_path: &Path, socket_path: &Path) -> Result<(), String> {
+    let parent =
+        discovery_path.parent().ok_or_else(|| format!("daemon socket discovery path has no parent: {}", discovery_path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("failed to create daemon socket discovery directory: {error}"))?;
+    std::fs::write(discovery_path, format!("{}\n", socket_path.display()))
+        .map_err(|error| format!("failed to publish daemon socket path at {}: {error}", discovery_path.display()))
 }
 
 fn spawn_peer_networking_runtime(

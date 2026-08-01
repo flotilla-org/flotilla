@@ -56,6 +56,7 @@ use super::{
         disconnect_peer_and_rebuild, forward_with_keepalive_for_test, handle_remote_restart_if_needed, relay_peer_data, send_local_to_peer,
         should_send_local_version, ForwardResult,
     },
+    publish_socket_path,
     remote_commands::{
         extract_command_repo_identity, ForwardedCommand, ForwardedCommandMap, ForwardedCommandState, PendingRemoteCancelMap,
         PendingRemoteCommand, PendingRemoteCommandMap, RemoteCommandRouter,
@@ -68,6 +69,17 @@ use super::{
     AcceptErrorBackoff, DaemonServer, PeerConnectionEvent, ACCEPT_ERROR_INITIAL_BACKOFF, ACCEPT_ERROR_MAX_BACKOFF,
     CONNECTION_PREFACE_TIMEOUT, HELLO_HANDSHAKE_TIMEOUT,
 };
+
+#[test]
+fn daemon_publishes_its_actual_socket_path_for_remote_dialers() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let discovery_path = tmp.path().join("config/run/socket-path");
+    let socket_path = tmp.path().join("custom/location/flotilla.sock");
+
+    publish_socket_path(&discovery_path, &socket_path).expect("publish socket path");
+
+    assert_eq!(std::fs::read_to_string(discovery_path).expect("read discovery file"), format!("{}\n", socket_path.display()));
+}
 
 #[tokio::test]
 async fn resource_http_lists_and_watches_over_a_unix_socket() {
@@ -1780,7 +1792,6 @@ async fn remote_convoy_started_event_routes_auto_attach_back_through_the_target_
         r#"[hosts.feta]
 hostname = "feta.example"
 expected_host_name = "feta"
-daemon_socket = "/run/user/1000/flotilla.sock"
 "#,
     )
     .expect("write peer config");
@@ -3279,10 +3290,7 @@ async fn daemon_server_does_not_replay_configured_peers_without_host_environment
     let base = tmp.path().join("config");
     std::fs::create_dir_all(&base).expect("create config directory");
     std::fs::write(base.join("daemon.toml"), "machine_id = \"test-machine\"\nhost_name = \"local\"\n").expect("write daemon config");
-    std::fs::write(
-            base.join("hosts.toml"),
-            "[hosts.udder]\nhostname = \"udder\"\ndaemon_socket = \"/tmp/udder.sock\"\n\n[hosts.feta]\nhostname = \"feta\"\ndaemon_socket = \"/tmp/feta.sock\"\n",
-        )
+    std::fs::write(base.join("hosts.toml"), "[hosts.udder]\nhostname = \"udder\"\n\n[hosts.feta]\nhostname = \"feta\"\n")
         .expect("write hosts config");
 
     let config = Arc::new(ConfigStore::with_base(&base));
@@ -4370,11 +4378,8 @@ async fn peer_manager_initialized_from_config() {
     std::fs::write(base.join("daemon.toml"), "machine_id = \"test-machine\"\nhost_name = \"test-host\"\n").expect("write daemon config");
 
     // Write hosts config with one peer
-    std::fs::write(
-        base.join("hosts.toml"),
-        "[hosts.remote]\nhostname = \"10.0.0.5\"\nexpected_host_name = \"remote\"\ndaemon_socket = \"/tmp/daemon.sock\"\n",
-    )
-    .expect("write hosts config");
+    std::fs::write(base.join("hosts.toml"), "[hosts.remote]\nhostname = \"10.0.0.5\"\nexpected_host_name = \"remote\"\n")
+        .expect("write hosts config");
 
     let config = Arc::new(ConfigStore::with_base(&base));
     let server = DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60))
@@ -4406,11 +4411,8 @@ async fn daemon_server_new_returns_error_for_invalid_hosts_config() {
     let base = tmp.path().join("config");
     std::fs::create_dir_all(&base).expect("create config directory");
     std::fs::write(base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
-    std::fs::write(
-        base.join("hosts.toml"),
-        "[hosts.remote]\nhostname = \"10.0.0.5\"\nexpected_host_name = [\ndaemon_socket = \"/tmp/daemon.sock\"\n",
-    )
-    .expect("write invalid hosts config");
+    std::fs::write(base.join("hosts.toml"), "[hosts.remote]\nhostname = \"10.0.0.5\"\nexpected_host_name = [\n")
+        .expect("write invalid hosts config");
 
     let config = Arc::new(ConfigStore::with_base(&base));
     let result = DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60)).await;
