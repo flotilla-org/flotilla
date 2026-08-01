@@ -570,7 +570,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
 }
 
 #[tokio::test]
-async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
+async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() {
     let backend = ResourceBackend::InMemory(Default::default());
     let repositories = [
         RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository"),
@@ -652,6 +652,19 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
 
     for (repository, slug) in [(&repositories[0], "flotilla"), (&repositories[1], "cleat")] {
+        create_ready_clone(
+            &backend,
+            NAMESPACE,
+            &format!("clone-{slug}"),
+            match slug {
+                "flotilla" => "https://github.com/flotilla-org/flotilla",
+                "cleat" => "https://github.com/flotilla-org/cleat",
+                _ => unreachable!("fixture repository slug"),
+            },
+            &host_direct_env_name(),
+            &format!("/Users/alice/dev/flotilla-repos/{slug}"),
+        )
+        .await;
         let name = format!("checkout-convoy-multi-docker-{slug}");
         let path = format!("/Users/alice/dev/flotilla-repos/workspace-multi-docker/{slug}");
         let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
@@ -701,9 +714,13 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
         _ => None,
     });
     let mounts = mounts.expect("docker environment should be created");
-    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts.len(), 3);
     assert_eq!(mounts[0].source_path, "/Users/alice/dev/flotilla-repos/convoy-multi-docker/feature-multi");
     assert_eq!(mounts[0].target_path, "/workspace");
+    assert_eq!(mounts[1].source_path, "/Users/alice/dev/flotilla-repos/cleat/.git");
+    assert_eq!(mounts[1].target_path, "/Users/alice/dev/flotilla-repos/cleat/.git");
+    assert_eq!(mounts[2].source_path, "/Users/alice/dev/flotilla-repos/flotilla/.git");
+    assert_eq!(mounts[2].target_path, "/Users/alice/dev/flotilla-repos/flotilla/.git");
 
     let mixed = backend
         .clone()
@@ -1219,7 +1236,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
                 &host_direct_env_name(),
                 GIT_REF,
                 "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-c",
-                "clone-placeholder",
+                &clone_name,
             )))
             .build(),
     )
@@ -1232,11 +1249,18 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
         matches!(
             actuation,
             Actuation::CreateEnvironment { spec, .. }
-                if spec.docker.as_ref().map(|docker| docker.mounts.as_slice()) == Some(&[flotilla_resources::EnvironmentMount {
-                    source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-c".to_string(),
-                    target_path: "/workspace".to_string(),
-                    mode: flotilla_resources::EnvironmentMountMode::Rw,
-                }])
+                if spec.docker.as_ref().map(|docker| docker.mounts.as_slice()) == Some(&[
+                    flotilla_resources::EnvironmentMount {
+                        source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-c".to_string(),
+                        target_path: "/workspace".to_string(),
+                        mode: flotilla_resources::EnvironmentMountMode::Rw,
+                    },
+                    flotilla_resources::EnvironmentMount {
+                        source_path: "/Users/alice/dev/flotilla-repos/clone/.git".to_string(),
+                        target_path: "/Users/alice/dev/flotilla-repos/clone/.git".to_string(),
+                        mode: flotilla_resources::EnvironmentMountMode::Rw,
+                    },
+                ])
         )
     }));
 }
@@ -1277,11 +1301,18 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
         declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
         required_agent_adapters: BTreeSet::from(["codex".to_string()]),
         pull_policy: Default::default(),
-        mounts: vec![flotilla_resources::EnvironmentMount {
-            source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
-            target_path: "/workspace".to_string(),
-            mode: flotilla_resources::EnvironmentMountMode::Rw,
-        }],
+        mounts: vec![
+            flotilla_resources::EnvironmentMount {
+                source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
+                target_path: "/workspace".to_string(),
+                mode: flotilla_resources::EnvironmentMountMode::Rw,
+            },
+            flotilla_resources::EnvironmentMount {
+                source_path: "/Users/alice/dev/flotilla-repos/clone/.git".to_string(),
+                target_path: "/Users/alice/dev/flotilla-repos/clone/.git".to_string(),
+                mode: flotilla_resources::EnvironmentMountMode::Rw,
+            },
+        ],
         env: Default::default(),
     }),
 )]
@@ -2024,7 +2055,7 @@ async fn assert_terminal_cwd_for_strategy(
             .maybe_worktree(if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
                 None
             } else {
-                Some(worktree_checkout_spec(&checkout_env_ref, GIT_REF, checkout_path, "clone-placeholder"))
+                Some(worktree_checkout_spec(&checkout_env_ref, GIT_REF, checkout_path, &clone_name))
             })
             .maybe_fresh_clone(if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
                 Some(fresh_clone_checkout_spec(&checkout_env_ref, GIT_REF, checkout_path, REPO_URL))

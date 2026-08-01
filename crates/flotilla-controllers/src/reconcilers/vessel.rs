@@ -684,6 +684,41 @@ impl Reconciler for VesselReconciler {
         } else {
             shared_clone_root.clone().unwrap_or_default()
         };
+        let mut worktree_git_common_dir_mounts = Vec::new();
+        if matches!(&strategy, PlacementStrategy::DockerWorktreeOnHostAndMount { .. }) {
+            // A linked worktree's `.git` file names its administrative directory
+            // beneath the shared clone with an absolute host path. Expose the
+            // clone metadata at that same path so Git can follow the pointer from
+            // the differently-mounted workspace inside the container. Keeping the
+            // shared clone authoritative also preserves its remote configuration
+            // and the host's worktree registrations.
+            let mut mounted_common_dirs = BTreeSet::new();
+            for checkout_name in checkout_refs.values() {
+                let checkout = self.checkouts.get(checkout_name).await?;
+                let CheckoutSpec::Worktree(checkout_spec) = &checkout.spec else {
+                    return Ok(VesselDeps::failed(format!(
+                        "contained worktree placement requires checkout {checkout_name} to be a managed worktree"
+                    )));
+                };
+                let clone = match self.clones.get(&checkout_spec.clone_ref).await {
+                    Ok(clone) => clone,
+                    Err(ResourceError::NotFound { .. }) => {
+                        return Ok(VesselDeps::failed(format!(
+                            "contained worktree checkout {checkout_name} refers to missing clone {}",
+                            checkout_spec.clone_ref
+                        )))
+                    }
+                    Err(error) => return Err(error),
+                };
+                let git_common_dir = format!("{}/.git", clone.spec.path.trim_end_matches('/'));
+                mounted_common_dirs.insert(git_common_dir);
+            }
+            worktree_git_common_dir_mounts.extend(mounted_common_dirs.into_iter().map(|git_common_dir| EnvironmentMount {
+                source_path: git_common_dir.clone(),
+                target_path: git_common_dir,
+                mode: EnvironmentMountMode::Rw,
+            }));
+        }
 
         let (resolved_environment_ref, image) = match &strategy {
             PlacementStrategy::HostDirect { host_ref, .. } => {
@@ -740,6 +775,15 @@ impl Reconciler for VesselReconciler {
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {
+                        let mut mounts = has_repositories
+                            .then(|| EnvironmentMount {
+                                source_path: workspace_root.clone(),
+                                target_path: mount_path.clone(),
+                                mode: EnvironmentMountMode::Rw,
+                            })
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        mounts.extend(worktree_git_common_dir_mounts);
                         actuations.push(Actuation::CreateEnvironment {
                             meta: owned_child_meta(&env_name, obj, BTreeMap::new()),
                             spec: EnvironmentSpec {
@@ -750,14 +794,7 @@ impl Reconciler for VesselReconciler {
                                     declared_agent_adapters: declared_agent_adapters.clone(),
                                     required_agent_adapters: required_agent_adapters.clone(),
                                     pull_policy: *pull_policy,
-                                    mounts: has_repositories
-                                        .then(|| EnvironmentMount {
-                                            source_path: workspace_root.clone(),
-                                            target_path: mount_path.clone(),
-                                            mode: EnvironmentMountMode::Rw,
-                                        })
-                                        .into_iter()
-                                        .collect(),
+                                    mounts,
                                     env: environment_with_credentials(env.clone(), &requirement.credential_refs),
                                 }),
                             },
