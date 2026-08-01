@@ -1419,7 +1419,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
         }
         other => panic!("expected retried crew completion, got {other:?}"),
     };
-    router.complete_remote_command(request_id, node("feta"), CommandValue::Ok).await;
+    router.complete_remote_command(request_id, node("feta"), CommandValue::Error { message: "crew work no longer exists".into() }).await;
     assert!(
         sessions
             .get("terminal-stranded-work-coder")
@@ -1429,7 +1429,38 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
             .expect("terminal status")
             .completion_pending
             .is_none(),
-        "authority acknowledgement should retire the durable completion intent"
+        "authority rejection should retire the acknowledged durable intent"
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(delivered.lock().expect("delivered lock").len(), 1, "permanent authority rejection must not retry");
+
+    router
+        .dispatch_execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::CrewComplete {
+                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                message: Some("https://github.com/flotilla-org/flotilla/pull/1302".into()),
+            },
+        })
+        .await
+        .expect("reachable authority should accept a fresh completion");
+    let request_id = match delivered.lock().expect("delivered lock").get(1).expect("fresh completion") {
+        PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { request_id, .. }) => *request_id,
+        other => panic!("expected fresh crew completion, got {other:?}"),
+    };
+    router.complete_remote_command(request_id, node("feta"), CommandValue::Ok).await;
+    assert!(
+        sessions
+            .get("terminal-stranded-work-coder")
+            .await
+            .expect("terminal after successful acknowledgement")
+            .status
+            .expect("terminal status")
+            .completion_pending
+            .is_none(),
+        "successful authority acknowledgement should retire the durable completion intent"
     );
 
     peer_manager.lock().await.register_sender(node("feta"), Arc::new(FailingPeerSender));
