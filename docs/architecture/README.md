@@ -1,5 +1,8 @@
 # Architecture
 
+Script-facing resource get/list/watch semantics are documented in
+[Resource reads for scripts](../resource-reads.md).
+
 This directory is the canonical architecture reference for the current
 codebase.
 

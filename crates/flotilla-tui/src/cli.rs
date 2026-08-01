@@ -586,15 +586,14 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::CrewList(crew) => format_crew_list_human(crew),
         CommandValue::FleetReplicaSnapshot(_) => "fleet replica snapshot".to_string(),
         CommandValue::DaemonLogs { lines } => lines.join("\n"),
-        CommandValue::ResourceList(response) | CommandValue::ResourceObject(response) => {
-            flotilla_protocol::output::json_pretty(&response.value)
-        }
+        CommandValue::ResourceRead(response) => flotilla_protocol::output::json_pretty(response),
+        CommandValue::ResourceObject(response) => flotilla_protocol::output::json_pretty(&response.value),
         CommandValue::ResourceDeleted(response) => {
             let name = response.value["metadata"]["name"].as_str().unwrap_or("<unknown>");
             let api_version = response.value["apiVersion"].as_str().unwrap_or("<unknown>");
             format!("deleted {api_version}/{}/{}/{name}\nControllers may recreate code-owned objects.", response.kind, response.namespace,)
         }
-        CommandValue::ResourceWatchEvent(response) => flotilla_protocol::output::json_pretty(&response.event),
+        CommandValue::ResourceWatchEvent(response) => flotilla_protocol::output::json_pretty(response),
         CommandValue::EnvironmentSpecRead { .. } => "environment spec read".to_string(),
         CommandValue::IssuePage(page) => format!("issue page: {} items, has_more={}", page.items.len(), page.has_more),
         CommandValue::IssuesByIds { items } => format!("issues by ids: {} items", items.len()),

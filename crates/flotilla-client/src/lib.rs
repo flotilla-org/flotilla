@@ -19,6 +19,7 @@ use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{debug, error, warn};
 
 pub mod reconnect;
+pub mod resource;
 pub const BUILD_ID: &str = env!("FLOTILLA_BUILD_ID");
 
 /// Std RwLock for local seq tracking — the critical sections are single HashMap
