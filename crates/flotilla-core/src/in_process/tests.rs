@@ -1437,6 +1437,16 @@ async fn crew_complete_uses_ambient_identity_to_complete_callers_work() {
     let env_ref = create_local_attach_environment(&daemon).await;
     create_two_agent_crew(&daemon, &env_ref).await;
 
+    daemon
+        .mark_crew_completion_pending("flotilla", "terminal-demo-implement-coder", CrewCompletionPending {
+            message: Some("ready for review".into()),
+            attempted_at: chrono::Utc::now(),
+            authority: "remote-before-failover".into(),
+            last_error: "authority unreachable".into(),
+        })
+        .await
+        .expect("mark completion pending before authority failover");
+
     let mut events = daemon.subscribe();
     let command_id = daemon
         .execute(Command {
@@ -1456,6 +1466,19 @@ async fn crew_complete_uses_ambient_identity_to_complete_callers_work() {
     let coder = &convoy.status.expect("convoy status").crew_work["implement"]["coder"];
     assert_eq!(coder.phase, CrewWorkPhase::Done);
     assert_eq!(coder.message.as_deref(), Some("ready for review"));
+    assert!(
+        daemon
+            .resource_backend()
+            .using::<ResourceTerminalSession>("flotilla")
+            .get("terminal-demo-implement-coder")
+            .await
+            .expect("coder terminal")
+            .status
+            .expect("coder terminal status")
+            .completion_pending
+            .is_none(),
+        "successful local completion should acknowledge the durable intent"
+    );
 }
 
 #[tokio::test]

@@ -6073,10 +6073,16 @@ impl InProcessDaemon {
     }
 
     pub async fn crew_complete_internal(&self, requested: &CrewCommandContext, message: Option<String>) -> Result<(), String> {
+        let routing = self.resolve_crew_routing_context(requested).await?;
         self.apply_crew_work_patch(requested, |context| {
             convoy_external_patches::mark_crew_completed(context.vessel.clone(), context.caller_role.clone(), chrono::Utc::now(), message)
         })
-        .await
+        .await?;
+        if let Some(session_name) = routing.session_name {
+            let namespace = routing.command_context.namespace.as_deref().expect("resolved crew routing context has a namespace");
+            self.clear_crew_completion_pending(namespace, &session_name).await?;
+        }
+        Ok(())
     }
 
     pub async fn crew_fail_internal(&self, requested: &CrewCommandContext, message: String) -> Result<(), String> {
