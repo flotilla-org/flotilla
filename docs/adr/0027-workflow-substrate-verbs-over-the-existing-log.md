@@ -2,8 +2,9 @@
 
 **Status:** Accepted
 **Date:** 2026-08-01
-**Relates to:** ADR 0023 (histories are evidence; drivers read them, the machine
-stays authoritative), ADR 0024 (the convoy/vessel machine and its declared
+**Relates to:** ADR 0017 (settlement claims / conditions / observations — the
+vocabulary these primitives generalize), ADR 0023 (histories are evidence;
+drivers read them, the machine stays authoritative), ADR 0024 (the convoy/vessel machine and its declared
 transitions are one of the three primitives), #1262 (wayfinder map),
 #1283/#1270 (the exploration and its exit),
 [prototypes/1283-workflow-substrate.md](../../prototypes/1283-workflow-substrate.md)
@@ -40,8 +41,8 @@ of them resume the same way: read the log, continue.**
    round of an agent loop as it already works. A **brief** — the statement of
    what this round is for, in the glossary's existing sense (the prompt is
    only its delivery mechanism) — starts the round; the crew works; it ends
-   with the existing completion, which is a **claim** of fulfilment — never a
-   world-fact. The record is what we already keep: `crew_work`,
+   with the crew's **settlement claim** (ADR 0017, filed by `crew complete`)
+   — a claim of fulfilment, never a world-fact. The record is what we already keep: `crew_work`,
    the event history behind it, and the cleat transcript.
 3. **Observations** — projections of external systems (PR state, checks,
    containers), carrying `observed-at`, permitted to be **Unknown**.
@@ -57,17 +58,17 @@ Two additions to existing records; nothing else changes shape:
   brief: `merged | changes-pushed | blocked`; a review brief:
   `approve | request-changes`; a smoke contract: `pass | fail`). The agent
   knows the valid answers before starting. `crew complete` records the chosen
-  disposition beside the free-text message; drivers branch on the word, never
-  by parsing prose. Briefs that declare nothing keep today's free-form
-  completions.
+  disposition beside the claim's free-text message; drivers branch on the
+  word, never by parsing prose. Briefs that declare nothing keep today's
+  free-form claims.
 - **Step keys.** Mutating verbs accept `--step <key>` (author-named, e.g.
   `round-2`). Re-running a driver finds the recorded result for a key instead
   of re-issuing the action. Step keys are the whole answer to driver
   idempotency; they are explicit because the CLI cannot see a program counter.
 
-Richer completion payloads (reports, measurement bundles, collection packets)
+Richer claim payloads (reports, measurement bundles, collection packets)
 are explicitly **not** dispositions. If transcripts show the need, that is a
-future *artifact* concept hanging off completions — out of scope here.
+future *artifact* concept hanging off claims — out of scope here.
 
 ### The verb surface
 
@@ -95,7 +96,7 @@ land with the Bosun contract.
 ### Conditions: leaves only
 
 The condition language is deliberately tiny: field comparison, latest
-completion disposition/phase, before/after freshness. It stays leaf-level —
+claim disposition/phase, before/after freshness. It stays leaf-level —
 a *leaf* is one atomic predicate, a single comparison with no connectives.
 OR is built into `wait` (multiple `--for`); AND-chains, counters, loops,
 budgets, and variables live in the caller's real language — a review budget
@@ -126,8 +127,9 @@ parked script *is* an engagement-rule row — visible, coalescible, migratable.
 
 - **Postdating** (plainly: never judge work by evidence older than the
   work): continuation and escalation decisions are evaluated only against
-  observations newer than the completion they would judge; the evaluator
-  tracks what it read and triggers targeted re-observation at completion.
+  observations newer than the claim they would judge; the evaluator
+  tracks what it read and triggers targeted re-observation when a claim is
+  filed.
 - **Three-valued honesty**: Unknown triggers nothing and closes nothing;
   episodes hold.
 - **Episode identity** (plainly: one firing, one engagement — and a
@@ -171,7 +173,7 @@ level-triggered wake over the existing log (no second bus).
 - Costume rulings (sequential embeddings, compiled workflow functions) —
   only after the transcript corpus from the proving experiments (build-order
   step 4).
-- Artifacts (structured completion cargo) — future concept, separate ruling.
+- Artifacts (structured claim cargo) — future concept, separate ruling.
 
 ## Consequences
 

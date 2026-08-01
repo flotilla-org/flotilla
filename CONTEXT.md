@@ -228,7 +228,8 @@ The admission-time stage of a create verb that fills what the caller's
 *intent* left blank (branch + convoy names, workflow default) before the spec
 persists — the store never holds a half-spec. Meta-agents are upstream
 completers proposing fuller specs; admission remains the backstop.
-_Avoid_: Defaulting webhook, enrichment, the governor's job.
+_Avoid_: Defaulting webhook, enrichment, the governor's job, the crew's
+turn-ending report (that is a **Settlement Claim**, ADR 0017).
 
 **Independent**:
 A terminal session with no **Convoy** association — sailing alone, per the
@@ -479,11 +480,17 @@ code — stewardship (Governor), convoy-driving (Bosun), allocation
 **PersistentAgent** resources; Governor and Bosun arrive first.
 _Avoid_: Bot, assistant.
 
+**Settlement Claim**:
+The crew's turn-ending report (ADR 0017), filed by `crew complete` — the
+crew *claims* its brief is fulfilled. Claims are never world-facts and never
+evidence of safety; integration conditions and observations judge the world.
+_Avoid_: Completion (that is the admission-time stage), outcome, result.
+
 **Disposition**:
-The one-word answer a crew completion gives, chosen from the list its
+The one-word answer a **Settlement Claim** gives, chosen from the list its
 **Brief** declared (e.g. `merged | changes-pushed | blocked`). Recorded
 beside the free-text message so drivers branch on the word instead of
-parsing prose; a completion is always a *claim*, never a world-fact.
+parsing prose.
 _Avoid_: Outcome, result kind (the overturned objectified forms — ADR 0027).
 
 **Observation**:
@@ -494,7 +501,8 @@ claims.
 _Avoid_: Fact (histories are evidence — ADR 0023), event.
 
 **Condition Leaf**:
-One atomic predicate over the machine, completions, or **Observations** — a
+One atomic predicate over the machine, **Settlement Claims**, or
+**Observations** — a
 single comparison, no connectives. `wait` ORs leaves; all other composition
 (AND, loops, budgets) lives in the caller's own language. Named definitions
 are layered data, not new objects.
