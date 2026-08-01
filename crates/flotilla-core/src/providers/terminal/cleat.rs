@@ -37,11 +37,12 @@ pub struct CleatTerminalPool {
     runner: Arc<dyn CommandRunner>,
     binary: String,
     terminal_env_defaults: TerminalEnvVars,
+    attach_capability: tokio::sync::OnceCell<Result<(), String>>,
 }
 
 impl CleatTerminalPool {
     pub fn new(runner: Arc<dyn CommandRunner>, binary: impl Into<String>) -> Self {
-        Self { runner, binary: binary.into(), terminal_env_defaults: vec![] }
+        Self { runner, binary: binary.into(), terminal_env_defaults: vec![], attach_capability: tokio::sync::OnceCell::new() }
     }
 
     pub fn with_terminal_env_defaults(mut self, defaults: TerminalEnvVars) -> Self {
@@ -51,6 +52,18 @@ impl CleatTerminalPool {
 
     fn parse_list_output(json: &str) -> Result<Vec<SessionInfo>, String> {
         serde_json::from_str(json).map_err(|err| format!("parse session list: {err}"))
+    }
+
+    fn build_attach_args(&self, session_name: &str, mode: AttachMode) -> Vec<Arg> {
+        let mut args = vec![Arg::Literal(self.binary.clone()), Arg::Literal("attach".into()), Arg::Literal("--no-create".into())];
+        match mode {
+            AttachMode::Default => {}
+            AttachMode::Strict => args.push(Arg::Literal("--strict".into())),
+            AttachMode::Take => args.push(Arg::Literal("--take".into())),
+        }
+        // Session names are UUIDs (attachable IDs) — always shell-safe, no quoting needed.
+        args.push(Arg::Literal(session_name.into()));
+        args
     }
 }
 
@@ -126,50 +139,40 @@ impl TerminalPool for CleatTerminalPool {
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String> {
-        Ok(vec![
-            Arg::Literal(self.binary.clone()),
-            Arg::Literal("attach".into()),
-            Arg::Literal("--no-create".into()),
-            // Session names are UUIDs (attachable IDs) — always shell-safe, no quoting needed.
-            Arg::Literal(session_name.into()),
-        ])
+        Ok(self.build_attach_args(session_name, AttachMode::Default))
     }
 
     async fn preflight_attach(&self, _mode: AttachMode) -> Result<(), String> {
         // These flags arrived with cleat's controller-seat handshake, default
         // degrade-to-watch behavior, and watcher banner. Check before starting
         // the interactive attach so a stale selected pool fails on the primary screen.
-        let help = run!(self.runner, &self.binary, &["attach", "--help"], Path::new("/"));
-        if help.as_ref().is_ok_and(|help| help.contains("--strict") && help.contains("--take")) {
-            return Ok(());
-        }
-        let version =
-            run!(self.runner, &self.binary, &["--version"], Path::new("/")).unwrap_or_else(|error| format!("version unavailable: {error}"));
-        Err(format!(
-            "cleat terminal pool binary '{}' lacks controller-seat attach support (--strict/--take); detected {}",
-            self.binary,
-            version.trim()
-        ))
+        self.attach_capability
+            .get_or_init(|| async {
+                let help = run!(self.runner, &self.binary, &["attach", "--help"], Path::new("/"));
+                if help.as_ref().is_ok_and(|help| help.contains("--strict") && help.contains("--take")) {
+                    return Ok(());
+                }
+                let version = run!(self.runner, &self.binary, &["--version"], Path::new("/"))
+                    .unwrap_or_else(|error| format!("version unavailable: {error}"));
+                Err(format!(
+                    "cleat terminal pool binary '{}' lacks controller-seat attach support (--strict/--take); detected {}",
+                    self.binary,
+                    version.trim()
+                ))
+            })
+            .await
+            .clone()
     }
 
     fn attach_args_for_mode(
         &self,
         session_name: &str,
-        command: &str,
-        cwd: &ExecutionEnvironmentPath,
-        env_vars: &TerminalEnvVars,
+        _command: &str,
+        _cwd: &ExecutionEnvironmentPath,
+        _env_vars: &TerminalEnvVars,
         mode: AttachMode,
     ) -> Result<Vec<Arg>, String> {
-        let mut args = self.attach_args(session_name, command, cwd, env_vars)?;
-        let flag = match mode {
-            AttachMode::Default => None,
-            AttachMode::Strict => Some("--strict"),
-            AttachMode::Take => Some("--take"),
-        };
-        if let Some(flag) = flag {
-            args.insert(3, Arg::Literal(flag.into()));
-        }
-        Ok(args)
+        Ok(self.build_attach_args(session_name, mode))
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
@@ -399,6 +402,7 @@ mod tests {
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "/pool/bin/cleat");
 
         pool.preflight_attach(AttachMode::Default).await.expect("modern cleat should pass preflight");
+        pool.preflight_attach(AttachMode::Take).await.expect("capability result should be cached");
 
         assert_eq!(runner.calls(), [("/pool/bin/cleat".to_string(), vec!["attach".to_string(), "--help".to_string()])]);
     }
