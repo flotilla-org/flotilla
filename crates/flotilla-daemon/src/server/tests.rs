@@ -793,7 +793,7 @@ fn daemon_startup_cleanup_removes_only_reverse_peer_socket_files() {
     std::fs::write(&similarly_named_file, []).expect("create similarly named file");
     std::fs::create_dir(&peer_directory).expect("create similarly named directory");
 
-    let removed = cleanup_reverse_peer_resource_sockets(tmp.path()).expect("clean stale reverse peer sockets");
+    let removed = cleanup_reverse_peer_resource_sockets(tmp.path());
 
     assert_eq!(removed, 2);
     assert!(!stale_a.exists());
