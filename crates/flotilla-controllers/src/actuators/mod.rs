@@ -6,6 +6,7 @@ use flotilla_core::{
         environment::{
             contained_daemon_socket_path, CreateOpts, EnvironmentProvider, EnvironmentTool, EnvironmentToolAsset,
             EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode,
+            CONTAINED_DAEMON_REQUIRED_ENV,
         },
         terminal::TerminalPool,
         vcs::{CloneInspection, CloneProvisioner},
@@ -65,6 +66,11 @@ impl DockerEnvironmentActuator {
                     "FLOTILLA_DAEMON_SOCKET",
                     environment_socket_path.to_string_lossy(),
                     "the daemon socket",
+                ))
+                .with_environment(EnvironmentVariableUpdate::set(
+                    CONTAINED_DAEMON_REQUIRED_ENV,
+                    "1",
+                    "the contained host-daemon requirement",
                 ))],
         }
     }

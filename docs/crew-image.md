@@ -34,7 +34,10 @@ The mounted Flotilla CLI connects back to the host daemon through the socket
 named by `FLOTILLA_DAEMON_SOCKET`. Docker mounts the socket's parent directory,
 so replacing the socket inode during a host daemon restart remains visible
 inside the environment. Normal CLI commands honor that variable, not only
-agent-hook delivery, and never try to spawn a local daemon when it is set.
+agent-hook delivery. Contained delivery also sets a dedicated marker that
+prevents the CLI from trying to spawn a local daemon if the host socket is
+unreachable; host-side managed terminals retain their normal self-healing
+spawn behavior.
 
 This document is curation advice for the Flotilla project. It is not a schema
 or a contract that Flotilla validates. Flotilla's contract stays deliberately

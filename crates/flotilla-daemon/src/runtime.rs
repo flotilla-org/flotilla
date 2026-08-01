@@ -3336,6 +3336,10 @@ mod tests {
         assert_eq!(opts.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), vec!["flotilla", "cleat"]);
         assert_eq!(opts.tools[0].executable.as_path(), Path::new(ENVIRONMENT_FLOTILLA_PATH));
         assert_eq!(opts.tools[0].assets[1].environment_path.as_path(), Path::new(ENVIRONMENT_DAEMON_SOCKET_PATH));
+        assert_eq!(
+            opts.tools[0].environment[1],
+            EnvironmentVariableUpdate::set("FLOTILLA_CONTAINED_HOST_DAEMON", "1", "the contained host-daemon requirement",),
+        );
         assert_eq!(opts.tools[1].executable.as_path(), Path::new(ENVIRONMENT_CLEAT_PATH));
         assert_eq!(opts.tools[1].assets[1].environment_path.as_path(), Path::new(ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH));
         assert_eq!(opts.tools[1].assets[2].host_path.as_path(), cleat_state.as_path());

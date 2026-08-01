@@ -12,7 +12,7 @@ use flotilla_core::{
     providers::{
         environment::{
             contained_daemon_socket_path, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind,
-            EnvironmentVariableUpdate,
+            EnvironmentVariableUpdate, CONTAINED_DAEMON_REQUIRED_ENV,
         },
         ChannelLabel, CommandRunner,
     },
@@ -145,7 +145,8 @@ impl EnvironmentToolFactory for FlotillaCliTool {
                 "FLOTILLA_DAEMON_SOCKET",
                 environment_socket_path.to_string_lossy(),
                 "the daemon socket",
-            )))
+            ))
+            .with_environment(EnvironmentVariableUpdate::set(CONTAINED_DAEMON_REQUIRED_ENV, "1", "the contained host-daemon requirement")))
     }
 }
 

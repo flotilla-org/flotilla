@@ -38,7 +38,7 @@ struct Cli {
     #[arg(long)]
     config_dir: Option<PathBuf>,
 
-    /// Socket path (default: ${config_dir}/flotilla.sock)
+    /// Socket path (default: ${config_dir}/run/flotilla.sock)
     #[arg(long)]
     socket: Option<PathBuf>,
 
@@ -351,11 +351,11 @@ impl Cli {
 }
 
 fn socket_path_from(explicit: Option<&Path>, config_dir: &Path, environment: Option<&std::ffi::OsStr>) -> PathBuf {
-    environment.map(PathBuf::from).or_else(|| explicit.map(PathBuf::from)).unwrap_or_else(|| config_dir.join("flotilla.sock"))
+    environment.map(PathBuf::from).or_else(|| explicit.map(PathBuf::from)).unwrap_or_else(|| config_dir.join("run/flotilla.sock"))
 }
 
-fn host_daemon_socket_required(environment: Option<&std::ffi::OsStr>) -> bool {
-    environment.is_some()
+fn host_daemon_socket_required(contained_marker: Option<&std::ffi::OsStr>) -> bool {
+    contained_marker.is_some()
 }
 
 async fn connect_cli_socket(
@@ -567,7 +567,8 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
     let socket_path = cli.socket_path();
     let config_dir_override = cli.config_dir.clone();
     let socket_override = cli.socket.clone();
-    let require_host_daemon = host_daemon_socket_required(std::env::var_os("FLOTILLA_DAEMON_SOCKET").as_deref());
+    let require_host_daemon =
+        host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref());
 
     // Spawn daemon init on a separate task so full-app startup can run it
     // concurrently with the splash (which uses blocking event polling).
@@ -808,7 +809,9 @@ async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<()> {
                 &cli.config_dir(),
                 cli.config_dir.as_deref(),
                 cli.socket.as_deref(),
-                host_daemon_socket_required(std::env::var_os("FLOTILLA_DAEMON_SOCKET").as_deref()),
+                host_daemon_socket_required(
+                    std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref(),
+                ),
                 options,
             )
             .await
@@ -830,7 +833,7 @@ async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
         &config_dir,
         cli.config_dir.as_deref(),
         cli.socket.as_deref(),
-        host_daemon_socket_required(std::env::var_os("FLOTILLA_DAEMON_SOCKET").as_deref()),
+        host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
     )
     .await
     .map_err(|e| color_eyre::eyre::eyre!(e))?;
@@ -2141,8 +2144,13 @@ mod tests {
     }
 
     #[test]
+    fn default_socket_uses_a_dedicated_runtime_directory() {
+        assert_eq!(socket_path_from(None, Path::new("/config"), None), PathBuf::from("/config/run/flotilla.sock"));
+    }
+
+    #[test]
     fn contained_cli_socket_environment_requires_the_host_daemon() {
-        assert!(host_daemon_socket_required(Some(std::ffi::OsStr::new("/run/flotilla-daemon/flotilla.sock"))));
+        assert!(host_daemon_socket_required(Some(std::ffi::OsStr::new("1"))));
         assert!(!host_daemon_socket_required(None));
     }
 

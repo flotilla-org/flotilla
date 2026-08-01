@@ -19,7 +19,7 @@ use crate::{
         },
         environment::{
             contained_daemon_socket_path, CreateOpts, EnvironmentHandle, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess,
-            EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode,
+            EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode, CONTAINED_DAEMON_REQUIRED_ENV,
         },
         registry::ProviderRegistry,
         CommandRunner,
@@ -290,6 +290,11 @@ impl EnvironmentManager {
                     "FLOTILLA_DAEMON_SOCKET",
                     environment_socket_path.to_string_lossy(),
                     "the daemon socket",
+                ))
+                .with_environment(EnvironmentVariableUpdate::set(
+                    CONTAINED_DAEMON_REQUIRED_ENV,
+                    "1",
+                    "the contained host-daemon requirement",
                 ))],
             image_pull_policy: Default::default(),
             docker_config_dir: None,

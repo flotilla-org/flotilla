@@ -11,7 +11,7 @@ struct Cli {
     #[arg(long)]
     config_dir: Option<PathBuf>,
 
-    /// Socket path (default: ${config_dir}/flotilla.sock)
+    /// Socket path (default: ${config_dir}/run/flotilla.sock)
     #[arg(long)]
     socket: Option<PathBuf>,
 
@@ -31,7 +31,7 @@ impl Cli {
     }
 
     fn socket_path(&self) -> PathBuf {
-        self.socket.clone().unwrap_or_else(|| self.config_dir().join("flotilla.sock"))
+        self.socket.clone().unwrap_or_else(|| self.config_dir().join("run/flotilla.sock"))
     }
 }
 
