@@ -570,7 +570,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
 }
 
 #[tokio::test]
-async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
+async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() {
     let backend = ResourceBackend::InMemory(Default::default());
     let repositories = [
         RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository"),
@@ -652,6 +652,19 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
 
     for (repository, slug) in [(&repositories[0], "flotilla"), (&repositories[1], "cleat")] {
+        create_ready_clone(
+            &backend,
+            NAMESPACE,
+            &format!("clone-{slug}"),
+            match slug {
+                "flotilla" => "https://github.com/flotilla-org/flotilla",
+                "cleat" => "https://github.com/flotilla-org/cleat",
+                _ => unreachable!("fixture repository slug"),
+            },
+            &host_direct_env_name(),
+            &format!("/Users/alice/dev/flotilla-repos/{slug}"),
+        )
+        .await;
         let name = format!("checkout-convoy-multi-docker-{slug}");
         let path = format!("/Users/alice/dev/flotilla-repos/workspace-multi-docker/{slug}");
         let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
@@ -701,9 +714,13 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
         _ => None,
     });
     let mounts = mounts.expect("docker environment should be created");
-    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts.len(), 3);
     assert_eq!(mounts[0].source_path, "/Users/alice/dev/flotilla-repos/convoy-multi-docker/feature-multi");
     assert_eq!(mounts[0].target_path, "/workspace");
+    assert_eq!(mounts[1].source_path, "/Users/alice/dev/flotilla-repos/cleat/.git");
+    assert_eq!(mounts[1].target_path, "/Users/alice/dev/flotilla-repos/cleat/.git");
+    assert_eq!(mounts[2].source_path, "/Users/alice/dev/flotilla-repos/flotilla/.git");
+    assert_eq!(mounts[2].target_path, "/Users/alice/dev/flotilla-repos/flotilla/.git");
 
     let mixed = backend
         .clone()
@@ -1219,7 +1236,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
                 &host_direct_env_name(),
                 GIT_REF,
                 "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-c",
-                "clone-placeholder",
+                &clone_name,
             )))
             .build(),
     )
@@ -1232,13 +1249,119 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
         matches!(
             actuation,
             Actuation::CreateEnvironment { spec, .. }
-                if spec.docker.as_ref().map(|docker| docker.mounts.as_slice()) == Some(&[flotilla_resources::EnvironmentMount {
-                    source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-c".to_string(),
-                    target_path: "/workspace".to_string(),
-                    mode: flotilla_resources::EnvironmentMountMode::Rw,
-                }])
+                if spec.docker.as_ref().map(|docker| docker.mounts.as_slice()) == Some(&[
+                    flotilla_resources::EnvironmentMount {
+                        source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-c".to_string(),
+                        target_path: "/workspace".to_string(),
+                        mode: flotilla_resources::EnvironmentMountMode::Rw,
+                    },
+                    flotilla_resources::EnvironmentMount {
+                        source_path: "/Users/alice/dev/flotilla-repos/clone/.git".to_string(),
+                        target_path: "/Users/alice/dev/flotilla-repos/clone/.git".to_string(),
+                        mode: flotilla_resources::EnvironmentMountMode::Rw,
+                    },
+                ])
         )
     }));
+}
+
+#[tokio::test]
+async fn docker_worktree_rejects_an_adopted_checkout_without_shared_clone_metadata() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-adopted-docker", "implement", REPO_URL, GIT_REF).await;
+    let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
+    create_docker_worktree_policy(
+        &backend,
+        NAMESPACE,
+        DockerWorktreePolicyFixture::builder()
+            .name("policy-adopted-docker".to_string())
+            .host_ref(HOST_REF.to_string())
+            .pool("cleat".to_string())
+            .image("ghcr.io/flotilla/dev:latest".to_string())
+            .mount_path("/workspace".to_string())
+            .build(),
+    )
+    .await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-convoy-adopted-docker", "/Users/alice/dev/flotilla-existing")
+        .await;
+    let workspace = backend
+        .clone()
+        .using::<Vessel>(NAMESPACE)
+        .create(&vessel_meta("workspace-adopted-docker", REPO_URL), &VesselSpec {
+            convoy_ref: "convoy-adopted-docker".to_string(),
+            vessel_name: "implement".to_string(),
+            placement_policy_ref: "policy-adopted-docker".to_string(),
+            adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-checkout-convoy-adopted-docker".to_string())]),
+        })
+        .await
+        .expect("workspace should create");
+
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("dependencies should resolve to a vessel failure");
+    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::VesselStatusPatch::MarkFailed { ref message })
+            if message.contains("requires checkout adopted-checkout-convoy-adopted-docker to be a managed worktree")
+    ));
+}
+
+#[tokio::test]
+async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failure() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-missing-clone", "implement", REPO_URL, GIT_REF).await;
+    create_docker_worktree_policy(
+        &backend,
+        NAMESPACE,
+        DockerWorktreePolicyFixture::builder()
+            .name("policy-missing-clone".to_string())
+            .host_ref(HOST_REF.to_string())
+            .pool("cleat".to_string())
+            .image("ghcr.io/flotilla/dev:latest".to_string())
+            .mount_path("/workspace".to_string())
+            .build(),
+    )
+    .await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_checkout(
+        &backend,
+        NAMESPACE,
+        ReadyCheckoutFixture::builder()
+            .name("checkout-convoy-missing-clone".to_string())
+            .env_ref(host_direct_env_name())
+            .git_ref(GIT_REF.to_string())
+            .path("/Users/alice/dev/flotilla-repos/convoy-missing-clone/flotilla.feat-task-provisioning".to_string())
+            .maybe_worktree(Some(worktree_checkout_spec(
+                &host_direct_env_name(),
+                GIT_REF,
+                "/Users/alice/dev/flotilla-repos/convoy-missing-clone/flotilla.feat-task-provisioning",
+                "clone-missing",
+            )))
+            .build(),
+    )
+    .await;
+    let workspace = create_workspace(
+        &backend,
+        NAMESPACE,
+        "workspace-missing-clone",
+        "convoy-missing-clone",
+        "implement",
+        "policy-missing-clone",
+        REPO_URL,
+    )
+    .await;
+
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("dependencies should resolve to a vessel failure");
+    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::VesselStatusPatch::MarkFailed { ref message })
+            if message.contains("checkout-convoy-missing-clone refers to missing clone clone-missing")
+    ));
 }
 
 #[rstest]
@@ -1277,11 +1400,18 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
         declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
         required_agent_adapters: BTreeSet::from(["codex".to_string()]),
         pull_policy: Default::default(),
-        mounts: vec![flotilla_resources::EnvironmentMount {
-            source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
-            target_path: "/workspace".to_string(),
-            mode: flotilla_resources::EnvironmentMountMode::Rw,
-        }],
+        mounts: vec![
+            flotilla_resources::EnvironmentMount {
+                source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
+                target_path: "/workspace".to_string(),
+                mode: flotilla_resources::EnvironmentMountMode::Rw,
+            },
+            flotilla_resources::EnvironmentMount {
+                source_path: "/Users/alice/dev/flotilla-repos/clone/.git".to_string(),
+                target_path: "/Users/alice/dev/flotilla-repos/clone/.git".to_string(),
+                mode: flotilla_resources::EnvironmentMountMode::Rw,
+            },
+        ],
         env: Default::default(),
     }),
 )]
@@ -2024,7 +2154,7 @@ async fn assert_terminal_cwd_for_strategy(
             .maybe_worktree(if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
                 None
             } else {
-                Some(worktree_checkout_spec(&checkout_env_ref, GIT_REF, checkout_path, "clone-placeholder"))
+                Some(worktree_checkout_spec(&checkout_env_ref, GIT_REF, checkout_path, &clone_name))
             })
             .maybe_fresh_clone(if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
                 Some(fresh_clone_checkout_spec(&checkout_env_ref, GIT_REF, checkout_path, REPO_URL))
