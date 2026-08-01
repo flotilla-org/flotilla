@@ -11,11 +11,12 @@ use common::{
 use flotilla_resources::{
     controller::{Actuation, Reconciler},
     controller_patches, interactive_single_workflow_spec, reconcile, Checkout, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
-    CheckoutStatus, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatus, ConvoyStatusPatch,
-    ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, LandedEvidence,
-    ObservedCheckoutSpec, OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, StatusPatch, TargetMismatch,
-    TerminalSession, TerminalSessionSource, TerminalSessionSpec, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus,
-    WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
+    CheckoutStatus, CheckoutWorktreeSpec, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatus,
+    ConvoyStatusPatch, ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
+    LandedEvidence, LifecycleAuthority, ObservedCheckoutSpec, OwnerReference, Presentation, PresentationSpec, RepositoryKey,
+    ResourceBackend, StatusPatch, TargetMismatch, TerminalSession, TerminalSessionSource, TerminalSessionSpec, ValidationError, Vessel,
+    VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
+    VESSEL_LABEL,
 };
 
 struct AlwaysEligible;
@@ -1319,6 +1320,59 @@ async fn terminal_completed_convoy_still_emits_cleanup_actuations() {
         .actuations
         .iter()
         .any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == "convoy-a-implement")));
+}
+
+#[tokio::test]
+async fn abandoned_convoy_reclaims_managed_checkout_but_retains_adopted_owner_record() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let checkouts = backend.clone().using::<Checkout>("flotilla");
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Abandoned;
+    status.finished_at = Some(timestamp(20));
+    let source = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+    let created = convoys.create(&convoy_meta("convoy-a"), &source.spec).await.expect("convoy create");
+    convoys
+        .update_status("convoy-a", &created.metadata.resource_version, source.status.as_ref().expect("convoy status"))
+        .await
+        .expect("convoy status update");
+
+    let checkout_spec = CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+        repo_ref: RepositoryKey("repo-a".to_string()),
+        env_ref: "host-direct-a".to_string(),
+        r#ref: "feature/abandon".to_string(),
+        base_ref: Some("main".to_string()),
+        target_path: "/checkouts/convoy-a/repo-a".to_string(),
+        clone_ref: "clone-a".to_string(),
+    });
+    for (name, authority) in [("managed-checkout", LifecycleAuthority::Managed), ("adopted-checkout", LifecycleAuthority::Adopted)] {
+        checkouts
+            .create(
+                &InputMeta::builder()
+                    .name(name.to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]))
+                    .build()
+                    .with_lifecycle_authority(authority),
+                &checkout_spec,
+            )
+            .await
+            .expect("checkout create");
+    }
+
+    let convoy = convoys.get("convoy-a").await.expect("convoy get");
+    let reconciler = ConvoyReconciler::new(templates).with_checkouts(checkouts).with_teardown_runtime(Arc::new(AlwaysEligible));
+    let deps = reconciler.fetch_dependencies(&convoy).await.expect("dependencies");
+    let outcome = reconciler.reconcile(&convoy, &deps, timestamp(21));
+
+    assert!(outcome
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteCheckout { name } if name == "managed-checkout")));
+    assert!(!outcome
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteCheckout { name } if name == "adopted-checkout")));
 }
 
 #[tokio::test]
