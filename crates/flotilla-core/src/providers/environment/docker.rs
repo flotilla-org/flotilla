@@ -223,6 +223,10 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
 
         Ok(handles)
     }
+
+    async fn destroy(&self, container_id: &str) -> Result<(), String> {
+        self.inner.destroy(container_id).await
+    }
 }
 
 fn dockerfile_image_tag(spec_path: &Path, abs_path: &Path) -> Result<String, String> {

@@ -47,6 +47,10 @@ impl EnvironmentProvider for FakeEnvironmentProvider {
     async fn list(&self) -> Result<Vec<Arc<dyn ProvisionedEnvironment>>, String> {
         Ok(vec![])
     }
+
+    async fn destroy(&self, _container_id: &str) -> Result<(), String> {
+        Err("unused in test".to_string())
+    }
 }
 
 #[derive(Default)]

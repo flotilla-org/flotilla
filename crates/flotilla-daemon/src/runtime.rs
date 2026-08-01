@@ -1874,8 +1874,8 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
 
     async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String> {
         let active = self.state.provisioned_environments.lock().await.remove(container_id);
-        let handle = match active {
-            Some(active) => Some(active.handle),
+        match active {
+            Some(active) => active.handle.destroy().await?,
             None => {
                 let (_, provider) = self
                     .state
@@ -1884,11 +1884,8 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                     .get("docker")
                     .or_else(|| self.state.local_registry.environment_providers.preferred_with_desc())
                     .ok_or_else(|| "docker environment provider unavailable during teardown".to_string())?;
-                provider.list().await?.into_iter().find(|handle| handle.container_name() == Some(container_id))
+                provider.destroy(container_id).await?;
             }
-        };
-        if let Some(handle) = handle {
-            handle.destroy().await?;
         }
         let _ = self.state.daemon.remove_provisioned_environment(&EnvironmentId::new(environment_ref));
         let cleanup_errors =
@@ -3200,6 +3197,10 @@ mod tests {
         async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
             Ok(Vec::new())
         }
+
+        async fn destroy(&self, _container_id: &str) -> Result<(), String> {
+            Err("not used".to_string())
+        }
     }
 
     struct CapturingFailingEnvironmentProvider {
@@ -3218,6 +3219,10 @@ mod tests {
         }
 
         async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
+            Err("not used".to_string())
+        }
+
+        async fn destroy(&self, _container_id: &str) -> Result<(), String> {
             Err("not used".to_string())
         }
     }
@@ -3271,7 +3276,14 @@ mod tests {
         }
 
         async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
-            Ok(vec![Arc::clone(&self.handle)])
+            Err("failed to parse provisioned mount metadata: corrupt label".to_string())
+        }
+
+        async fn destroy(&self, container_id: &str) -> Result<(), String> {
+            if self.handle.container_name() != Some(container_id) {
+                return Err(format!("container {container_id} not found"));
+            }
+            self.handle.destroy().await
         }
     }
 
@@ -3578,7 +3590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn docker_teardown_after_restart_destroys_the_container_before_releasing_runtime_state() {
+    async fn docker_teardown_after_restart_does_not_parse_corrupt_mount_metadata() {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
         fs::create_dir_all(&config_base).expect("config directory");

@@ -122,4 +122,13 @@ where
     fn finalizer_name(&self) -> Option<&'static str> {
         Some("flotilla.work/environment-teardown")
     }
+
+    fn finalizer_error_patch(&self, obj: &ResourceObject<Self::Resource>, error: &ResourceError) -> Option<EnvironmentStatusPatch> {
+        let message = format!("environment teardown failed: {error}");
+        if obj.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Failed && status.message.as_deref() == Some(&message))
+        {
+            return None;
+        }
+        Some(EnvironmentStatusPatch::MarkFailed { message })
+    }
 }
