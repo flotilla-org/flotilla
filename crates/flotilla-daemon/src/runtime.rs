@@ -3839,6 +3839,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let target = temp.path().join("checkout-root/convoy-a/flotilla.feature-prune");
+        let stale_target = temp.path().join("checkout-root/stale-convoy/flotilla.feature-stale");
         let commands = Arc::new(StdMutex::new(Vec::new()));
         let runtime = CheckoutControllerRuntime { runner: Arc::new(RecordingProcessRunner { commands: Arc::clone(&commands) }) };
 
@@ -3851,6 +3852,23 @@ mod tests {
             )
             .await
             .expect("worktree should create");
+        runtime
+            .create_worktree(
+                clone.path().to_str().expect("utf-8 clone path"),
+                "feature/stale",
+                Some("main"),
+                stale_target.to_str().expect("utf-8 stale target path"),
+            )
+            .await
+            .expect("stale worktree should create");
+        fs::remove_dir_all(&stale_target).expect("simulate checkout directory disappearing without git cleanup");
+        let stale_worktrees = ProcessCommand::new("git")
+            .args(["-C", clone.path().to_str().expect("utf-8 clone path"), "worktree", "list", "--porcelain"])
+            .output()
+            .expect("git should list stale worktree metadata");
+        assert!(String::from_utf8(stale_worktrees.stdout)
+            .expect("utf-8 stale worktree list")
+            .contains(stale_target.to_str().expect("utf-8 stale target path")));
         let removal = CheckoutRemoval::Worktree {
             clone_path: clone.path().to_str().expect("utf-8 clone path").to_string(),
             branch: "feature/prune".to_string(),
@@ -3864,7 +3882,12 @@ mod tests {
             .output()
             .expect("git should list worktrees");
         assert!(worktrees.status.success());
-        assert!(!String::from_utf8(worktrees.stdout).expect("utf-8 worktree list").contains(target.to_str().expect("utf-8 target path")));
+        let worktrees = String::from_utf8(worktrees.stdout).expect("utf-8 worktree list");
+        assert!(!worktrees.contains(target.to_str().expect("utf-8 target path")));
+        assert!(
+            !worktrees.contains(stale_target.to_str().expect("utf-8 stale target path")),
+            "base-clone prune must remove stale metadata"
+        );
         assert!(!target.exists(), "checkout resource cleanup must not retain its directory");
         assert!(commands
             .lock()
