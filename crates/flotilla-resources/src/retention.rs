@@ -47,6 +47,16 @@ pub struct ResourceDecodeQuarantine {
     pub quarantined_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ResourceEventDecodeQuarantine {
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub event_version: u64,
+    pub error: String,
+    pub quarantined_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ResourceStoreDiagnostics {
     pub object_count: u64,
@@ -57,6 +67,8 @@ pub struct ResourceStoreDiagnostics {
     pub warnings: Vec<ResourceStoreWarning>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decode_quarantines: Vec<ResourceDecodeQuarantine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_decode_quarantines: Vec<ResourceEventDecodeQuarantine>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub field_ownership_violations: Vec<FieldOwnershipViolation>,
 }
@@ -81,6 +93,7 @@ impl ResourceStoreDiagnostics {
             max_retained_events,
             warnings,
             decode_quarantines: Vec::new(),
+            event_decode_quarantines: Vec::new(),
             field_ownership_violations: Vec::new(),
         }
     }

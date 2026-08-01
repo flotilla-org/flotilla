@@ -1224,26 +1224,60 @@ async fn resource_replication_content_condition(daemon: &Arc<InProcessDaemon>, n
 }
 
 fn resource_decode_quarantine_condition(diagnostics: Option<&flotilla_resources::ResourceStoreDiagnostics>) -> Option<HostCondition> {
-    let quarantines = &diagnostics?.decode_quarantines;
-    if quarantines.is_empty() {
+    let diagnostics = diagnostics?;
+    let object_quarantines = &diagnostics.decode_quarantines;
+    let event_quarantines = &diagnostics.event_decode_quarantines;
+    if object_quarantines.is_empty() && event_quarantines.is_empty() {
         return None;
     }
-    let identities = quarantines
+    let identities = object_quarantines
         .iter()
         .map(|quarantine| format!("{}/{}: {}", quarantine.kind, quarantine.name, quarantine.error))
+        .chain(
+            event_quarantines
+                .iter()
+                .map(|quarantine| format!("{}/{}@{}: {}", quarantine.kind, quarantine.name, quarantine.event_version, quarantine.error)),
+        )
         .collect::<Vec<_>>()
         .join("; ");
+    let (reason, message) = if event_quarantines.is_empty() {
+        (
+            "StoredObjectDecodeFailed",
+            format!(
+                "{} stored resource object{} quarantined after typed decode failure{}: {identities}",
+                object_quarantines.len(),
+                if object_quarantines.len() == 1 { "" } else { "s" },
+                if object_quarantines.len() == 1 { "" } else { "s" },
+            ),
+        )
+    } else if object_quarantines.is_empty() {
+        (
+            "StoredEventDecodeFailed",
+            format!(
+                "{} stored resource event{} quarantined after typed decode failure{}: {identities}",
+                event_quarantines.len(),
+                if event_quarantines.len() == 1 { "" } else { "s" },
+                if event_quarantines.len() == 1 { "" } else { "s" },
+            ),
+        )
+    } else {
+        (
+            "StoredResourceDecodeFailed",
+            format!(
+                "{} stored resource object{} and {} event{} quarantined after typed decode failures: {identities}",
+                object_quarantines.len(),
+                if object_quarantines.len() == 1 { "" } else { "s" },
+                event_quarantines.len(),
+                if event_quarantines.len() == 1 { "" } else { "s" },
+            ),
+        )
+    };
     Some(
         HostCondition::builder()
             .condition_type("ResourceStore/DecodeQuarantine")
             .value(ConditionValue::False)
-            .reason("StoredObjectDecodeFailed")
-            .message(format!(
-                "{} stored resource object{} quarantined after typed decode failure{}: {identities}",
-                quarantines.len(),
-                if quarantines.len() == 1 { "" } else { "s" },
-                if quarantines.len() == 1 { "" } else { "s" },
-            ))
+            .reason(reason)
+            .message(message)
             .observed_at(Utc::now())
             .build(),
     )
@@ -5383,6 +5417,27 @@ mod tests {
             "startup recovery must retain leases until an environment's finalizer removes it from the store"
         );
         world.runtime.take().expect("sequence restarted daemon runtime").shutdown();
+    }
+
+    #[test]
+    fn fleet_diagnosis_surfaces_event_decode_quarantines() {
+        let mut diagnostics = flotilla_resources::ResourceStoreDiagnostics::default();
+        diagnostics.event_decode_quarantines.push(
+            flotilla_resources::ResourceEventDecodeQuarantine::builder()
+                .kind("CredentialSpec".to_string())
+                .namespace("flotilla".to_string())
+                .name("forgejo-token".to_string())
+                .event_version(17)
+                .error("missing field `username`".to_string())
+                .quarantined_at(Utc::now())
+                .build(),
+        );
+
+        let condition = resource_decode_quarantine_condition(Some(&diagnostics)).expect("quarantine should degrade fleet health");
+        assert_eq!(condition.condition_type, "ResourceStore/DecodeQuarantine");
+        assert_eq!(condition.reason, "StoredEventDecodeFailed");
+        assert!(condition.message.contains("CredentialSpec/forgejo-token@17"), "unexpected diagnosis: {}", condition.message);
+        assert!(condition.message.contains("missing field `username`"), "unexpected diagnosis: {}", condition.message);
     }
 
     fn insert_undecodable_resource<T: Resource>(connection: &rusqlite::Connection, name: &str) {

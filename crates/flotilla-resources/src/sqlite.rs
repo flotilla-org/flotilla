@@ -17,7 +17,9 @@ use crate::{
     error::ResourceError,
     replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, K8sResourceObject, MergeMetadata, ObjectMeta, Resource, ResourceObject},
-    retention::{EventRetention, ResourceDecodeQuarantine, ResourceStoreDiagnostics, MAX_FIELD_OWNERSHIP_VIOLATIONS},
+    retention::{
+        EventRetention, ResourceDecodeQuarantine, ResourceEventDecodeQuarantine, ResourceStoreDiagnostics, MAX_FIELD_OWNERSHIP_VIOLATIONS,
+    },
     watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
     FieldOwnershipViolation,
 };
@@ -44,6 +46,17 @@ pub struct SqliteBackend {
 struct StoredEvent {
     kind: StoredEventKind,
     object: Value,
+}
+
+struct ReplayedEvents<T: Resource> {
+    events: Vec<WatchEvent<T>>,
+    quarantines: Vec<EventDecodeWarning>,
+}
+
+struct EventDecodeWarning {
+    event_version: u64,
+    name: String,
+    error: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -192,6 +205,19 @@ impl SqliteBackend {
                     namespace TEXT NOT NULL,
                     compacted_through INTEGER NOT NULL,
                     PRIMARY KEY (group_name, version, kind, namespace)
+                );
+
+                CREATE TABLE IF NOT EXISTS resource_event_decode_quarantine (
+                    group_name TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    event_version INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    body_json TEXT NOT NULL,
+                    error TEXT NOT NULL,
+                    quarantined_at TEXT NOT NULL,
+                    PRIMARY KEY (group_name, version, kind, namespace, event_version)
                 );
 
                 CREATE TABLE IF NOT EXISTS field_ownership_violations (
@@ -358,6 +384,36 @@ impl SqliteBackend {
         let mut diagnostics = ResourceStoreDiagnostics::new(object_count, event_count, resource_stream_count, event_retention);
         diagnostics.decode_quarantines = decode_quarantines;
         let mut statement = connection
+            .prepare(
+                r#"
+                SELECT kind, namespace, name, event_version, error, quarantined_at
+                FROM resource_event_decode_quarantine
+                ORDER BY kind, namespace, event_version
+                "#,
+            )
+            .map_err(|err| Self::map_sqlite(err, "prepare sqlite resource event decode quarantine diagnostics"))?;
+        diagnostics.event_decode_quarantines = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|err| Self::map_sqlite(err, "query sqlite resource event decode quarantine diagnostics"))?
+            .map(|row| {
+                let (kind, namespace, name, event_version, error, quarantined_at) =
+                    row.map_err(|err| Self::map_sqlite(err, "read sqlite resource event decode quarantine diagnostic"))?;
+                let quarantined_at = DateTime::parse_from_rfc3339(&quarantined_at)
+                    .map_err(|err| ResourceError::decode(format!("decode resource event quarantine timestamp: {err}")))?
+                    .with_timezone(&Utc);
+                Ok(ResourceEventDecodeQuarantine { kind, namespace, name, event_version, error, quarantined_at })
+            })
+            .collect::<Result<Vec<_>, ResourceError>>()?;
+        let mut statement = connection
             .prepare("SELECT body_json FROM field_ownership_violations ORDER BY id")
             .map_err(|err| Self::map_sqlite(err, "prepare field ownership violation diagnostics"))?;
         diagnostics.field_ownership_violations = statement
@@ -501,6 +557,14 @@ impl SqliteBackend {
             params![key.0, key.1, key.2, key.3, compacted_through],
         )
         .map_err(|err| Self::map_sqlite(err, "compact sqlite resource events"))?;
+        tx.execute(
+            r#"
+            DELETE FROM resource_event_decode_quarantine
+            WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND event_version <= ?5
+            "#,
+            params![key.0, key.1, key.2, key.3, compacted_through],
+        )
+        .map_err(|err| Self::map_sqlite(err, "compact sqlite resource event decode quarantine"))?;
         tx.execute(
             r#"
             INSERT INTO resource_event_compaction (group_name, version, kind, namespace, compacted_through)
@@ -1315,15 +1379,26 @@ impl SqliteBackend {
         let replay = self
             .call(move |connection| {
                 let replay = match replay_from {
-                    Some(version) => Self::replay_events(connection, &key, version)?,
-                    None => Vec::new(),
+                    Some(version) => Self::replay_events::<T>(connection, &key, version)?,
+                    None => ReplayedEvents { events: Vec::new(), quarantines: Vec::new() },
                 };
                 Self::lock_watchers(&watchers)?.entry(key).or_default().push(sender);
                 Ok(replay)
             })
             .await?;
 
-        let replay_stream = stream::iter(replay.into_iter().map(Self::decode_event::<T>));
+        for warning in replay.quarantines {
+            tracing::warn!(
+                kind = T::API_PATHS.kind,
+                namespace,
+                name = %warning.name,
+                event_version = warning.event_version,
+                error = %warning.error,
+                "quarantined undecodable stored resource event"
+            );
+        }
+
+        let replay_stream = stream::iter(replay.events.into_iter().map(Ok));
         let live_stream = stream::unfold(receiver, |mut receiver| async {
             receiver.recv().await.map(|event| (Self::decode_event::<T>(event), receiver))
         });
@@ -1386,7 +1461,11 @@ impl SqliteBackend {
         Ok(())
     }
 
-    fn replay_events(conn: &RusqliteConnection, key: &StoreKey, replay_from: u64) -> Result<Vec<StoredEvent>, ResourceError> {
+    fn replay_events<T: Resource>(
+        conn: &mut RusqliteConnection,
+        key: &StoreKey,
+        replay_from: u64,
+    ) -> Result<ReplayedEvents<T>, ResourceError> {
         let compacted_through = conn
             .query_row(
                 r#"
@@ -1408,22 +1487,62 @@ impl SqliteBackend {
         let mut statement = conn
             .prepare(
                 r#"
-                SELECT event_type, body_json FROM resource_events
+                SELECT event_version, event_type, body_json FROM resource_events
                 WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND event_version > ?5
                 ORDER BY event_version
                 "#,
             )
             .map_err(|err| Self::map_sqlite(err, "prepare sqlite resource event replay"))?;
         let rows = statement
-            .query_map(params![key.0, key.1, key.2, key.3, replay_from], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map(params![key.0, key.1, key.2, key.3, replay_from], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
             .map_err(|err| Self::map_sqlite(err, "query sqlite resource event replay"))?;
+        let rows = rows.collect::<Result<Vec<_>, _>>().map_err(|err| Self::map_sqlite(err, "read sqlite resource event replay row"))?;
+        drop(statement);
         let mut events = Vec::new();
-        for row in rows {
-            let (event_type, body_json) = row.map_err(|err| Self::map_sqlite(err, "read sqlite resource event replay row"))?;
-            let object =
-                serde_json::from_str(&body_json).map_err(|err| ResourceError::decode(format!("decode stored event JSON: {err}")))?;
-            events.push(StoredEvent { kind: StoredEventKind::from_str(&event_type)?, object });
+        let mut failures = Vec::new();
+        for (event_version, event_type, body_json) in rows {
+            let value =
+                serde_json::from_str::<Value>(&body_json).map_err(|err| ResourceError::decode(format!("decode stored event JSON: {err}")));
+            let name = value
+                .as_ref()
+                .ok()
+                .and_then(|value| value.pointer("/metadata/name"))
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>")
+                .to_string();
+            let decoded = value
+                .and_then(|object| Ok(StoredEvent { kind: StoredEventKind::from_str(&event_type)?, object }))
+                .and_then(Self::decode_event::<T>);
+            match decoded {
+                Ok(event) => events.push(event),
+                Err(error) => failures.push((event_version, name, body_json, error.to_string())),
+            }
         }
-        Ok(events)
+        if !failures.is_empty() {
+            let quarantined_at = Utc::now().to_rfc3339();
+            let tx = conn.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource event decode quarantine"))?;
+            for (event_version, name, body_json, error) in &failures {
+                tx.execute(
+                    r#"
+                    INSERT INTO resource_event_decode_quarantine
+                        (group_name, version, kind, namespace, event_version, name, body_json, error, quarantined_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    ON CONFLICT(group_name, version, kind, namespace, event_version)
+                    DO UPDATE SET name = excluded.name,
+                                  body_json = excluded.body_json,
+                                  error = excluded.error,
+                                  quarantined_at = excluded.quarantined_at
+                    "#,
+                    params![key.0, key.1, key.2, key.3, event_version, name, body_json, error, quarantined_at],
+                )
+                .map_err(|err| Self::map_sqlite(err, "persist sqlite resource event decode quarantine"))?;
+            }
+            tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource event decode quarantine"))?;
+        }
+        let quarantines =
+            failures.into_iter().map(|(event_version, name, _, error)| EventDecodeWarning { event_version, name, error }).collect();
+        Ok(ReplayedEvents { events, quarantines })
     }
 }

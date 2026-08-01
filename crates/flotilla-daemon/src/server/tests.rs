@@ -33,9 +33,9 @@ use flotilla_protocol::{
 use flotilla_resources::{
     list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus,
     HttpBackend, InMemoryBackend, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, ResourceBackend,
-    ResourceError, ResourceProvenance, Selector, Stance, StatusPatch, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
-    TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, WatchEvent, WatchStart,
-    WorkflowTemplate,
+    ResourceError, ResourceList, ResourceProvenance, Selector, SqliteBackend, Stance, StatusPatch, TerminalAttentionState, TerminalBrief,
+    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
+    WatchEvent, WatchStart, WorkflowTemplate,
 };
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
@@ -142,6 +142,120 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
     ));
 
     server.await.expect("resource HTTP server task");
+    std::fs::remove_file(&socket_path).expect("remove resource HTTP socket");
+}
+
+#[tokio::test]
+async fn http_replication_skips_an_old_schema_event_and_reaches_unrelated_resources() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let origin_path = temp.path().join("origin.sqlite");
+    let origin = ResourceBackend::Sqlite(SqliteBackend::open(&origin_path).expect("open origin store"));
+    let origin_convoys = origin.using::<Convoy>("flotilla");
+    let first = origin_convoys
+        .create(
+            &InputMeta::builder().name("superseded".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("old-workflow".to_string()).build(),
+        )
+        .await
+        .expect("create event that predates the schema change");
+    origin_convoys
+        .update(
+            &InputMeta::builder().name("superseded".to_string()).build(),
+            &first.metadata.resource_version,
+            &ConvoySpec::builder().workflow_ref("current-workflow".to_string()).build(),
+        )
+        .await
+        .expect("write a full superseding event");
+    origin_convoys
+        .create(
+            &InputMeta::builder().name("unrelated".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("healthy-workflow".to_string()).build(),
+        )
+        .await
+        .expect("write an unrelated later event");
+    drop(origin_convoys);
+    drop(origin);
+
+    let connection = rusqlite::Connection::open(&origin_path).expect("open raw origin store");
+    let body: String = connection
+        .query_row("SELECT body_json FROM resource_events WHERE event_version = 1", [], |row| row.get(0))
+        .expect("read historical event");
+    let mut body: serde_json::Value = serde_json::from_str(&body).expect("decode historical event");
+    body.pointer_mut("/spec")
+        .expect("historical event should contain a spec")
+        .as_object_mut()
+        .expect("historical spec should be an object")
+        .remove("workflow_ref");
+    connection
+        .execute("UPDATE resource_events SET body_json = ?1 WHERE event_version = 1", [
+            serde_json::to_string(&body).expect("encode old-schema event")
+        ])
+        .expect("remove a now-required field from the historical event");
+    drop(connection);
+    let origin = ResourceBackend::Sqlite(SqliteBackend::open(&origin_path).expect("reopen origin after schema upgrade"));
+
+    let holder_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let origin_root = NodeId::new("origin-root");
+    holder_backend
+        .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
+        .replace(&ResourceList { items: Vec::new(), resource_version: "0".to_string(), generation: None }, chrono::Utc::now())
+        .await
+        .expect("seed a pre-upgrade replica cursor");
+    let holder = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        test_config_store(temp.path().join("holder")),
+        fake_discovery(false),
+        HostName::new("holder"),
+        holder_backend.clone(),
+    )
+    .await;
+
+    let socket_path = PathBuf::from(format!("/tmp/flotilla-event-quarantine-http-{}.sock", uuid::Uuid::new_v4()));
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind origin resource HTTP socket");
+    let server_backend = origin.clone();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.expect("accept resource HTTP request");
+            let first_byte = tokio::io::AsyncReadExt::read_u8(&mut stream).await.expect("read HTTP preface");
+            let backend = server_backend.clone();
+            tokio::spawn(async move {
+                serve_resource_http(stream, first_byte, backend).await.expect("serve resource HTTP request");
+            });
+        }
+    });
+
+    let http = HttpBackend::from_unix_socket(&socket_path).expect("build resource HTTP client");
+    let holder_for_replication = Arc::clone(&holder);
+    let origin_for_replication = origin_root.clone();
+    let replicator =
+        tokio::spawn(async move { replicate_kind_over_http::<Convoy>(http, &holder_for_replication, &origin_for_replication).await });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let replicas = holder_backend.including_replicas::<Convoy>("flotilla").list().await.expect("list replicated convoys");
+            let names = replicas.items.iter().map(|item| item.object.metadata.name.as_str()).collect::<Vec<_>>();
+            if names.contains(&"superseded") && names.contains(&"unrelated") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replication should advance past the quarantined event");
+
+    let diagnostics = origin.diagnostics().await.expect("read origin diagnostics").expect("sqlite diagnostics");
+    let [quarantine] = diagnostics.event_decode_quarantines.as_slice() else {
+        panic!("expected one visible event quarantine, got {:?}", diagnostics.event_decode_quarantines)
+    };
+    assert_eq!(quarantine.kind, "Convoy");
+    assert_eq!(quarantine.name, "superseded");
+    assert_eq!(quarantine.event_version, 1);
+    assert!(quarantine.error.contains("workflow_ref"), "unexpected quarantine error: {}", quarantine.error);
+
+    replicator.abort();
+    server.abort();
+    let _ = replicator.await;
+    let _ = server.await;
     std::fs::remove_file(&socket_path).expect("remove resource HTTP socket");
 }
 

@@ -81,6 +81,39 @@ impl Resource for SlowResource {
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.test", version: "v1", plural: "slowresources", kind: "SlowResource" };
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LegacyReplayCredential;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyReplayCredentialSpec {
+    service: String,
+}
+
+impl Resource for LegacyReplayCredential {
+    type Spec = LegacyReplayCredentialSpec;
+    type Status = ();
+    type StatusPatch = NoStatusPatch;
+
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.test", version: "v1", plural: "replaycredentials", kind: "ReplayCredential" };
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CurrentReplayCredential;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CurrentReplayCredentialSpec {
+    service: String,
+    username: String,
+}
+
+impl Resource for CurrentReplayCredential {
+    type Spec = CurrentReplayCredentialSpec;
+    type Status = ();
+    type StatusPatch = NoStatusPatch;
+
+    const API_PATHS: ApiPaths = LegacyReplayCredential::API_PATHS;
+}
+
 macro_rules! resource_contract_tests {
     ($module:ident, $fixture:ty) => {
         mod $module {
@@ -670,6 +703,126 @@ async fn watch_from_version_replays_events_persisted_before_restart() {
         WatchEvent::Modified(object) => assert_eq!(object.metadata.resource_version, updated.metadata.resource_version),
         other => panic!("expected modified event, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn watch_replay_skips_an_undecodable_historical_event_and_reaches_later_resources() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("resources.sqlite");
+
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should open"));
+    backend
+        .using::<LegacyReplayCredential>("flotilla")
+        .create(&resource_meta().name("superseded").call(), &LegacyReplayCredentialSpec { service: "forgejo".to_string() })
+        .await
+        .expect("create old-schema event");
+    drop(backend);
+
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should reopen after schema upgrade"));
+    backend
+        .using::<CurrentReplayCredential>("flotilla")
+        .create(&resource_meta().name("healthy").call(), &CurrentReplayCredentialSpec {
+            service: "forgejo".to_string(),
+            username: "robert".to_string(),
+        })
+        .await
+        .expect("create current-schema event");
+
+    let mut watch = backend
+        .using::<CurrentReplayCredential>("flotilla")
+        .watch(WatchStart::FromVersion("0".to_string()))
+        .await
+        .expect("watch should start");
+    let event = timeout(Duration::from_secs(1), watch.next())
+        .await
+        .expect("watch replay should remain live past the poison event")
+        .expect("later event should be delivered")
+        .expect("later event should decode");
+
+    let WatchEvent::Added(object) = event else { panic!("expected added event") };
+    assert_eq!(object.metadata.name, "healthy");
+
+    let diagnostics = backend.diagnostics().await.expect("read quarantine diagnostics").expect("sqlite diagnostics");
+    let [quarantine] = diagnostics.event_decode_quarantines.as_slice() else {
+        panic!("expected one event quarantine, got {:?}", diagnostics.event_decode_quarantines)
+    };
+    assert_eq!(quarantine.kind, "ReplayCredential");
+    assert_eq!(quarantine.namespace, "flotilla");
+    assert_eq!(quarantine.name, "superseded");
+    assert_eq!(quarantine.event_version, 1);
+    assert!(quarantine.error.contains("missing field `username`"), "unexpected quarantine error: {}", quarantine.error);
+}
+
+#[tokio::test]
+async fn compaction_removes_a_superseded_event_quarantine_with_its_event() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("resources.sqlite");
+    let retention = EventRetention::new(2).expect("valid retention");
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open_with_event_retention(&path, retention).expect("sqlite backend should open"));
+    let resolver = backend.using::<CurrentReplayCredential>("flotilla");
+    let first = resolver
+        .create(&resource_meta().name("superseded").call(), &CurrentReplayCredentialSpec {
+            service: "forgejo".to_string(),
+            username: "old".to_string(),
+        })
+        .await
+        .expect("create first event");
+    resolver
+        .update(&resource_meta().name("superseded").call(), &first.metadata.resource_version, &CurrentReplayCredentialSpec {
+            service: "forgejo".to_string(),
+            username: "current".to_string(),
+        })
+        .await
+        .expect("replace resource with a superseding event");
+    drop(resolver);
+    drop(backend);
+
+    let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
+    let body: String = connection
+        .query_row("SELECT body_json FROM resource_events WHERE event_version = 1", [], |row| row.get(0))
+        .expect("read first event body");
+    let mut body: serde_json::Value = serde_json::from_str(&body).expect("decode first event body");
+    body.pointer_mut("/spec")
+        .expect("event body should contain spec")
+        .as_object_mut()
+        .expect("spec should be an object")
+        .remove("username");
+    connection
+        .execute("UPDATE resource_events SET body_json = ?1 WHERE event_version = 1", [
+            serde_json::to_string(&body).expect("encode old-schema body")
+        ])
+        .expect("downgrade first event body");
+    drop(connection);
+
+    let backend =
+        ResourceBackend::Sqlite(SqliteBackend::open_with_event_retention(&path, retention).expect("sqlite backend should reopen"));
+    let resolver = backend.using::<CurrentReplayCredential>("flotilla");
+    let mut watch = resolver.watch(WatchStart::FromVersion("0".to_string())).await.expect("watch should start");
+    let replayed = watch.next().await.expect("superseding event should replay").expect("superseding event should decode");
+    let WatchEvent::Modified(object) = replayed else { panic!("expected modified event") };
+    assert_eq!(object.spec.username, "current");
+    assert_eq!(
+        backend.diagnostics().await.expect("read quarantine diagnostics").expect("sqlite diagnostics").event_decode_quarantines.len(),
+        1
+    );
+
+    resolver
+        .create(&resource_meta().name("compaction-trigger").call(), &CurrentReplayCredentialSpec {
+            service: "forgejo".to_string(),
+            username: "healthy".to_string(),
+        })
+        .await
+        .expect("create event that advances the compaction floor");
+    assert!(
+        backend
+            .diagnostics()
+            .await
+            .expect("read post-compaction diagnostics")
+            .expect("sqlite diagnostics")
+            .event_decode_quarantines
+            .is_empty(),
+        "compaction should retire the quarantine when it removes the superseded event"
+    );
 }
 
 #[tokio::test]
