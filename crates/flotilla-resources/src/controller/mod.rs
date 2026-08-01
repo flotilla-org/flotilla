@@ -78,6 +78,11 @@ pub trait Reconciler: Send + Sync + 'static {
         false
     }
 
+    /// Allow a lifecycle change to wake an otherwise parked degraded object.
+    async fn degraded_object_needs_reconcile(&self, _obj: &ResourceObject<Self::Resource>) -> Result<bool, ResourceError> {
+        Ok(false)
+    }
+
     /// Map a finalizer failure to a status update.
     ///
     /// Other object-scoped errors remain isolated and are retried on a later
@@ -107,12 +112,15 @@ impl ReconcileErrorPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileFailure {
+    /// Stable error identity for one object and failure cause. Reconcilers
+    /// opting into a budget should avoid errors containing volatile data.
     pub message: String,
     pub consecutive_failures: u32,
 }
 
 struct ObjectFailure {
     failure: ReconcileFailure,
+    creation_timestamp: DateTime<Utc>,
     retry_at: Instant,
     terminal: bool,
 }
@@ -570,7 +578,10 @@ impl<R: Reconciler> ControllerLoop<R> {
             if let Some(name) = pending.pop_front() {
                 let object = match primary.get(&name).await {
                     Ok(object) => object,
-                    Err(ResourceError::NotFound { .. }) => continue,
+                    Err(ResourceError::NotFound { .. }) => {
+                        object_failures.remove(&name);
+                        continue;
+                    }
                     Err(err) => {
                         warn!(
                             resource_kind = R::Resource::API_PATHS.kind,
@@ -626,11 +637,16 @@ impl<R: Reconciler> ControllerLoop<R> {
                     if !lifecycle_owned {
                         return Ok(());
                     }
-                    if reconciler.is_reconcile_degraded(&object) {
+                    let degraded_needs_reconcile =
+                        reconciler.is_reconcile_degraded(&object) && reconciler.degraded_object_needs_reconcile(&object).await?;
+                    if reconciler.is_reconcile_degraded(&object) && !degraded_needs_reconcile {
                         return Ok(());
                     }
+                    if object_failures.get(&name).is_some_and(|failure| failure.creation_timestamp != object.metadata.creation_timestamp) {
+                        object_failures.remove(&name);
+                    }
                     if let Some(failure) = object_failures.get(&name) {
-                        if failure.terminal || Instant::now() < failure.retry_at {
+                        if !degraded_needs_reconcile && (failure.terminal || Instant::now() < failure.retry_at) {
                             return Ok(());
                         }
                     }
@@ -677,27 +693,38 @@ impl<R: Reconciler> ControllerLoop<R> {
                                 let failure = ReconcileFailure { message, consecutive_failures };
                                 terminal = consecutive_failures >= policy.max_consecutive_failures;
                                 let delay = policy.backoff(consecutive_failures);
-                                object_failures.insert(name.clone(), ObjectFailure {
-                                    failure: failure.clone(),
-                                    retry_at: Instant::now() + delay,
-                                    terminal,
-                                });
                                 if terminal {
                                     if let Some(patch) = reconciler.reconcile_degraded_patch(&object, &failure) {
-                                        if let Err(patch_error) =
-                                            Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await
-                                        {
-                                            warn!(
-                                                resource_kind = R::Resource::API_PATHS.kind,
-                                                resource = %name,
-                                                %patch_error,
-                                                "controller failed to record degraded reconcile condition",
-                                            );
+                                        match apply_status_patch(&primary, &name, &patch).await {
+                                            Ok(_) => {}
+                                            Err(ResourceError::NotFound { .. }) => {
+                                                object_failures.remove(&name);
+                                                continue;
+                                            }
+                                            Err(patch_error) => {
+                                                terminal = false;
+                                                retry_after = Some(delay);
+                                                warn!(
+                                                    resource_kind = R::Resource::API_PATHS.kind,
+                                                    resource = %name,
+                                                    %patch_error,
+                                                    "controller failed to record degraded reconcile condition; retrying",
+                                                );
+                                            }
                                         }
+                                    } else {
+                                        terminal = false;
+                                        retry_after = Some(delay);
                                     }
                                 } else {
                                     retry_after = Some(delay);
                                 }
+                                object_failures.insert(name.clone(), ObjectFailure {
+                                    failure,
+                                    creation_timestamp: object.metadata.creation_timestamp,
+                                    retry_at: Instant::now() + delay,
+                                    terminal,
+                                });
                             }
                         }
                         warn!(

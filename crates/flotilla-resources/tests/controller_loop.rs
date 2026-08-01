@@ -87,6 +87,7 @@ impl Resource for FailureResource {
 #[derive(Clone)]
 struct BudgetedFailureReconciler {
     attempts: Arc<AtomicUsize>,
+    persist_degraded: bool,
 }
 
 impl Reconciler for BudgetedFailureReconciler {
@@ -124,7 +125,7 @@ impl Reconciler for BudgetedFailureReconciler {
     }
 
     fn reconcile_degraded_patch(&self, _obj: &ResourceObject<Self::Resource>, failure: &ReconcileFailure) -> Option<MarkDegraded> {
-        Some(MarkDegraded(failure.clone()))
+        self.persist_degraded.then(|| MarkDegraded(failure.clone()))
     }
 
     fn is_reconcile_degraded(&self, obj: &ResourceObject<Self::Resource>) -> bool {
@@ -1285,7 +1286,7 @@ async fn repeated_identical_reconcile_errors_back_off_and_park_as_degraded() {
         ControllerLoop {
             primary: failures.clone(),
             secondaries: Vec::new(),
-            reconciler: BudgetedFailureReconciler { attempts: Arc::clone(&attempts) },
+            reconciler: BudgetedFailureReconciler { attempts: Arc::clone(&attempts), persist_degraded: true },
             resync_interval: Duration::from_secs(60),
             backend,
         }
@@ -1334,6 +1335,56 @@ async fn repeated_identical_reconcile_errors_back_off_and_park_as_degraded() {
         tokio::task::yield_now().await;
     }
     assert_eq!(attempts.load(Ordering::SeqCst), 3, "degraded object must remain parked across resyncs");
+
+    failures.delete("terminal-a").await.expect("degraded resource should be deleted");
+    failures
+        .create(&primary_meta("terminal-a"), &PrimarySpec { value: "replacement".to_string() })
+        .await
+        .expect("same-name replacement should be created");
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        if attempts.load(Ordering::SeqCst) == 4 {
+            break;
+        }
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 4, "same-name replacement must not inherit the deleted object's failure budget");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn exhausted_budget_keeps_retrying_until_degraded_status_is_persistable() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let failures = backend.clone().using::<FailureResource>("flotilla");
+    failures
+        .create(&primary_meta("terminal-a"), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("failure resource should be created");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: failures.clone(),
+            secondaries: Vec::new(),
+            reconciler: BudgetedFailureReconciler { attempts: Arc::clone(&attempts), persist_degraded: false },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    for delay in [10, 20, 40] {
+        tokio::time::advance(Duration::from_millis(delay)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 4, "missing degraded persistence must not silently park the object");
+    assert!(failures.get("terminal-a").await.expect("failure resource should remain").status.is_none());
 
     harness.shutdown().await;
 }

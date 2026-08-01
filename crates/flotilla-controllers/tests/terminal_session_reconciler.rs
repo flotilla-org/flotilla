@@ -165,6 +165,7 @@ impl TerminalRuntime for UnavailableRunningRuntime {
 async fn repeated_runtime_probe_failure_becomes_visible_and_stops_retrying() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
+    let convoys = backend.clone().using::<Convoy>("flotilla");
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
         .create(
@@ -233,6 +234,22 @@ async fn repeated_runtime_probe_failure_becomes_visible_and_stops_retrying() {
         tokio::task::yield_now().await;
     }
     assert_eq!(runtime.probes.load(Ordering::SeqCst), 5, "degraded terminal must stay parked across resyncs");
+
+    let convoy = convoys.get("demo").await.expect("owning convoy should remain");
+    let mut convoy_status = convoy.status.expect("owning convoy should have status");
+    convoy_status.phase = ConvoyPhase::Abandoned;
+    convoys.update_status("demo", &convoy.metadata.resource_version, &convoy_status).await.expect("owning convoy should be abandoned");
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    for _ in 0..40 {
+        tokio::task::yield_now().await;
+        if matches!(sessions.get("terminal-demo-work-coder").await, Err(ResourceError::NotFound { .. })) {
+            break;
+        }
+    }
+    assert!(
+        matches!(sessions.get("terminal-demo-work-coder").await, Err(ResourceError::NotFound { .. })),
+        "abandonment must wake and reap a previously degraded terminal"
+    );
 
     loop_task.abort();
     let _ = loop_task.await;
