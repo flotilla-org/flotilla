@@ -46,6 +46,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
+    cleanup_reverse_peer_resource_sockets,
     client_connection::QuerySubscriptions,
     handle_client, handle_client_session,
     peer_connection::PEER_IDLE_TIMEOUT,
@@ -776,6 +777,30 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
         restarted.daemon().resource_backend().using::<Convoy>("flotilla").get("persisted").await.expect("convoy should survive restart");
 
     assert_eq!(fetched.spec.workflow_ref, "scratch");
+}
+
+#[test]
+fn daemon_startup_cleanup_removes_only_reverse_peer_socket_files() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let stale_a = tmp.path().join(".peer-0123456789abcdef");
+    let stale_b = tmp.path().join(".peer-fedcba9876543210");
+    let daemon_socket = tmp.path().join("flotilla.sock");
+    let similarly_named_file = tmp.path().join(".peer-not-a-node-hash");
+    let peer_directory = tmp.path().join(".peer-preserve-directory");
+    std::fs::write(&stale_a, []).expect("create first stale socket stand-in");
+    std::fs::write(&stale_b, []).expect("create second stale socket stand-in");
+    std::fs::write(&daemon_socket, []).expect("create unrelated daemon socket stand-in");
+    std::fs::write(&similarly_named_file, []).expect("create similarly named file");
+    std::fs::create_dir(&peer_directory).expect("create similarly named directory");
+
+    let removed = cleanup_reverse_peer_resource_sockets(tmp.path());
+
+    assert_eq!(removed, 2);
+    assert!(!stale_a.exists());
+    assert!(!stale_b.exists());
+    assert!(daemon_socket.exists());
+    assert!(similarly_named_file.exists());
+    assert!(peer_directory.exists());
 }
 
 #[tokio::test]
