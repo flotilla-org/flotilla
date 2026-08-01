@@ -37,10 +37,11 @@ of them resume the same way: read the log, continue.**
 1. **The machine** — convoy/vessel phases and declared transitions per
    ADR 0024. Authored by us; its history is already in the event log.
 2. **Agent turns** — not a new concept and not a new resource: a turn is one
-   round of an agent loop as it already works. A **brief** (a concrete,
-   normally textual prompt) is delivered into a crew session; the crew works;
-   it ends with the existing completion, which is a **claim** of fulfilment —
-   never a world-fact. The record is what we already keep: `crew_work`,
+   round of an agent loop as it already works. A **brief** — the statement of
+   what this round is for, in the glossary's existing sense (the prompt is
+   only its delivery mechanism) — starts the round; the crew works; it ends
+   with the existing completion, which is a **claim** of fulfilment — never a
+   world-fact. The record is what we already keep: `crew_work`,
    the event history behind it, and the cleat transcript.
 3. **Observations** — projections of external systems (PR state, checks,
    containers), carrying `observed-at`, permitted to be **Unknown**.

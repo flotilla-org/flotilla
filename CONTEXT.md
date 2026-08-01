@@ -172,8 +172,10 @@ _Avoid_: Permission mode, sandbox flag (those are harness spellings).
 
 **Brief**:
 The per-crew-member statement of why they are here — a durable file in the
-vessel workspace (also delivered agent-natively). Accumulated briefs on a
-revisited vessel are the script as executed, per character.
+vessel workspace (also delivered agent-natively). Each engagement round is
+started by a brief; accumulated briefs on a revisited vessel are the script
+as executed, per character. A brief is the question: it may declare the
+valid **Dispositions** as its answers (ADR 0027).
 _Avoid_: Prompt (the delivery mechanism), task description.
 
 **Process**:
@@ -476,13 +478,6 @@ code — stewardship (Governor), convoy-driving (Bosun), allocation
 (Quartermaster), accounting (Purser), presentation (Yeoman). Realised as
 **PersistentAgent** resources; Governor and Bosun arrive first.
 _Avoid_: Bot, assistant.
-
-**Brief**:
-The concrete prompt (normally text) delivered into a crew session to start
-one round of the agent's loop. The brief is the question; it may declare the
-valid **Dispositions** as its answers. Not a new object — the mechanism
-crews already run on (ADR 0027).
-_Avoid_: Task, ticket (a brief is one round, not the whole assignment).
 
 **Disposition**:
 The one-word answer a crew completion gives, chosen from the list its
