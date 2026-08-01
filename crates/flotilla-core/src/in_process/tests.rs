@@ -62,6 +62,7 @@ fn attach_plan_text(plan: &flotilla_protocol::ResolvedAttachPlan) -> String {
         .iter()
         .map(|action| match action {
             flotilla_protocol::ResolvedAttachAction::Command(args) => flotilla_protocol::arg::flatten(args, 0),
+            flotilla_protocol::ResolvedAttachAction::Cleanup(args) => flotilla_protocol::arg::flatten(args, 0),
             flotilla_protocol::ResolvedAttachAction::SendKeys { steps, .. } => steps
                 .iter()
                 .filter_map(|step| match step {

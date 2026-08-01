@@ -52,6 +52,14 @@ fn expect_send_keys(action: &ResolvedAction) -> &[SendKeyStep] {
 }
 
 #[track_caller]
+fn expect_cleanup(action: &ResolvedAction) -> &[Arg] {
+    match action {
+        ResolvedAction::Cleanup(args) => args,
+        other => panic!("expected Cleanup, got {other:?}"),
+    }
+}
+
+#[track_caller]
 fn expect_type_step(step: &SendKeyStep) -> &str {
     match step {
         SendKeyStep::Type { text } => text,
@@ -72,6 +80,7 @@ fn flatten_actions(actions: &[ResolvedAction]) -> Vec<String> {
         .iter()
         .map(|action| match action {
             ResolvedAction::Command(args) => format!("Command: {}", flatten(args, 0)),
+            ResolvedAction::Cleanup(args) => format!("Cleanup: {}", flatten(args, 0)),
             ResolvedAction::SendKeys { hop, steps } => format!("SendKeys({hop}): {steps:?}"),
         })
         .collect()
@@ -1323,17 +1332,26 @@ fn enter_environment_enter_produces_docker_exec_shell_and_sendkeys() {
 
     // Terminal pushes Command(mock-attach, sess-1)
     // Environment enter pops it, converts to SendKeys, pushes docker exec -it container /bin/sh
-    assert_eq!(resolved.0.len(), 2);
+    assert_eq!(resolved.0.len(), 3);
 
     // First action: SendKeys with the terminal attach command
     let steps = expect_send_keys(&resolved.0[0]);
     assert_eq!(steps.len(), 2);
     let text = expect_type_step(&steps[0]);
     assert!(text.contains("mock-attach"), "SendKeys should contain terminal command: {text}");
+    assert!(text.contains("echo $$ > /tmp/flotilla-attach-"), "SendKeys should publish the interior PID lease: {text}");
     assert_eq!(steps[1], SendKeyStep::WaitForReady);
 
-    // Second action: docker exec enter command
-    let args = expect_command(&resolved.0[1]);
+    let pid_file_start = text.find("/tmp/flotilla-attach-").expect("PID lease path in typed command");
+    let pid_file_end = text[pid_file_start..].find(".pid").expect("PID lease suffix") + pid_file_start + 4;
+    let pid_file = &text[pid_file_start..pid_file_end];
+    let cleanup = flatten(expect_cleanup(&resolved.0[1]), 0);
+    assert!(cleanup.contains("docker exec 'my-container'"), "cleanup should run in the owning Docker environment: {cleanup}");
+    assert!(cleanup.contains(pid_file), "cleanup should consume the same PID lease: {cleanup}");
+    assert!(cleanup.contains("kill -KILL"), "cleanup should explicitly reap the interior attach: {cleanup}");
+
+    // Final action: docker exec enter command
+    let args = expect_command(&resolved.0[2]);
     assert_eq!(args[0], Arg::Literal("docker".into()));
     assert_eq!(args[1], Arg::Literal("exec".into()));
     assert_eq!(args[2], Arg::Literal("-it".into()));
@@ -1356,8 +1374,18 @@ fn send_keys_quotes_hostile_attach_names_exactly_once() {
     resolver.resolve_enter(&env_id, &mut context).expect("hostile names should resolve");
 
     let steps = expect_send_keys(&context.actions[0]);
-    assert_eq!(expect_type_step(&steps[0]), "exec flotilla attach 'crew with '\\''quote'\\'' 雪'");
-    let command = expect_command(&context.actions[1]);
+    let inner = "flotilla attach 'crew with '\\''quote'\\'' 雪'";
+    let expected = flatten(
+        &[
+            Arg::Literal("exec".into()),
+            Arg::Literal("sh".into()),
+            Arg::Literal("-c".into()),
+            Arg::Quoted(format!("echo $$ > /tmp/flotilla-attach-{}.pid; exec {inner}", flotilla_protocol::ATTACH_LEASE_PLACEHOLDER)),
+        ],
+        0,
+    );
+    assert_eq!(expect_type_step(&steps[0]), expected);
+    let command = expect_command(&context.actions[2]);
     assert_eq!(
         flatten(command, 0),
         "docker exec -it 'container with '\\''quote'\\'' 雪' /bin/sh",

@@ -28,7 +28,7 @@ pub mod test_support;
 
 use std::fmt;
 
-pub use attach_plan::{ResolvedAttachAction, ResolvedAttachPlan, SendKeyStep};
+pub use attach_plan::{ResolvedAttachAction, ResolvedAttachPlan, SendKeyStep, ATTACH_LEASE_PLACEHOLDER};
 pub use environment::{EnvironmentId, EnvironmentInfo, EnvironmentKind, EnvironmentSpec, EnvironmentStatus, ImageId, ImageSource};
 pub use host::{HostName, HostPath, RepoIdentity};
 pub use host_summary::{
