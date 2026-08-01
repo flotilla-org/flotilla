@@ -223,6 +223,10 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
     }
     let (peer_data_tx, peer_data_rx) = mpsc::channel(256);
     let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
+    {
+        let router = remote_command_router.clone();
+        tokio::spawn(async move { router.resume_pending_crew_completions().await });
+    }
     let (handle, _peer_connected_tx) = spawn_peer_networking_runtime(
         daemon,
         peer_manager,
@@ -384,6 +388,8 @@ impl DaemonServer {
         let agent_state_store = self.agent_state_store;
         let remote_command_router = self.remote_command_router;
         let peer_resource_socket_dir = self.peer_resource_socket_dir;
+
+        remote_command_router.resume_pending_crew_completions().await;
 
         // Spawn idle timeout watcher (disabled for follower-mode daemons
         // which serve peer connections and should stay up indefinitely)

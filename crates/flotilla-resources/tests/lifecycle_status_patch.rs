@@ -72,6 +72,8 @@ define_patch_kinds! {
     TerminalMarkRunning => DUPLICATE,
     TerminalMarkMessageDelivered => NONE,
     TerminalObserveAttention => NONE,
+    TerminalMarkCompletionPending => NONE,
+    TerminalClearCompletionPending => NONE,
     TerminalMarkStopped => DUPLICATE,
     TerminalMarkFailed => DUPLICATE,
     TerminalMarkReconcileDegraded => NONE,
@@ -119,6 +121,8 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
         TerminalSessionStatusPatch::MarkFailed { .. } => PatchKind::TerminalMarkFailed,
         TerminalSessionStatusPatch::MarkReconcileDegraded { .. } => PatchKind::TerminalMarkReconcileDegraded,
         TerminalSessionStatusPatch::ObserveAttention { .. } => PatchKind::TerminalObserveAttention,
+        TerminalSessionStatusPatch::MarkCompletionPending { .. } => PatchKind::TerminalMarkCompletionPending,
+        TerminalSessionStatusPatch::ClearCompletionPending => PatchKind::TerminalClearCompletionPending,
     }
 }
 
@@ -547,6 +551,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     launch_command: Some("bash".to_string()),
                     delivered_message_id: None,
                     attention: None,
+                    completion_pending: None,
                     degraded: None,
                 };
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };

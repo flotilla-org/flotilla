@@ -23,17 +23,18 @@ use flotilla_protocol::{
     qualified_path::QualifiedPath,
     result_set::{QueryChanges, QueryId, ResultDelta},
     AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachBinding, AttachableId, Checkout, CheckoutTarget, Command,
-    CommandAction, CommandPeerEvent, CommandValue, ConfigLabel, ConvoyStartIntent, DaemonEvent, EnvironmentId, HostName, HostPath,
-    HostProviderStatus, HostSummary, Message, NodeId, NodeInfo, PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage,
-    PreparedWorkspace, ProviderData, QueryCursor, RepoIdentity, RepoSelector, Request, ResourceCursor, Response, ResponseResult,
-    RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome, StepStatus, StreamKey, VectorClock, AGENT_ADAPTER_PROVIDER_CATEGORY,
-    PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
+    CommandAction, CommandPeerEvent, CommandValue, ConfigLabel, ConvoyStartIntent, CrewCommandContext, DaemonEvent, EnvironmentId,
+    HostName, HostPath, HostProviderStatus, HostSummary, Message, NodeId, NodeInfo, PeerConnectionState, PeerDataKind, PeerDataMessage,
+    PeerWireMessage, PreparedWorkspace, ProviderData, QueryCursor, RepoIdentity, RepoSelector, Request, ResourceCursor, Response,
+    ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome, StepStatus, StreamKey, VectorClock,
+    AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, HttpBackend,
-    InMemoryBackend, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, ResourceBackend, ResourceError,
-    ResourceProvenance, Stance, StatusPatch, TerminalAttentionState, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, TerminalSessionStatusPatch, WatchEvent, WatchStart, WorkflowTemplate,
+    list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus,
+    HttpBackend, InMemoryBackend, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, ResourceBackend,
+    ResourceError, ResourceProvenance, Selector, Stance, StatusPatch, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
+    TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, WatchEvent, WatchStart,
+    WorkflowTemplate,
 };
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
@@ -549,6 +550,20 @@ struct FailingPeerSender;
 impl PeerSender for FailingPeerSender {
     async fn send(&self, _msg: PeerWireMessage) -> Result<(), String> {
         Err("outbound channel closed".to_string())
+    }
+
+    async fn retire(&self, _reason: flotilla_protocol::GoodbyeReason) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct CapturePeerSender(Arc<StdMutex<Vec<PeerWireMessage>>>);
+
+#[async_trait::async_trait]
+impl PeerSender for CapturePeerSender {
+    async fn send(&self, message: PeerWireMessage) -> Result<(), String> {
+        self.0.lock().expect("capture sender lock").push(message);
+        Ok(())
     }
 
     async fn retire(&self, _reason: flotilla_protocol::GoodbyeReason) -> Result<(), String> {
@@ -1300,6 +1315,195 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
         .expect_err("failed peer send should reject dispatch");
 
     assert_eq!(message, "connect to feta at ssh://feta.example: outbound channel closed");
+}
+
+#[tokio::test]
+async fn crew_completion_partition_is_persisted_and_names_the_unreachable_authority() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let home = HostName::new("feta");
+    apply_convoy_replica_feed(&daemon, "flotilla", "stranded", home.clone()).await;
+    daemon
+        .publish_peer_summary(
+            HostSummary::builder()
+                .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host")))
+                .host_name(home.clone())
+                .node(node_info("feta"))
+                .system(flotilla_protocol::SystemInfo::default())
+                .providers(vec![])
+                .build(),
+        )
+        .await;
+
+    let sessions = daemon.resource_backend().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(&InputMeta::builder().name("terminal-stranded-work-coder".to_string()).build(), &TerminalSessionSpec {
+            env_ref: "local".into(),
+            role: "coder".into(),
+            source: TerminalSessionSource::Agent {
+                selector: Selector { capability: "code".into() },
+                brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: String::new(), copies: vec![] },
+                context: TerminalCrewContext {
+                    namespace: "flotilla".into(),
+                    convoy: "stranded".into(),
+                    vessel_ref: "stranded-work".into(),
+                },
+                message: None,
+            },
+            cwd: "/repo".into(),
+            pool: "cleat".into(),
+        })
+        .await
+        .expect("terminal create");
+    let mut status = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "terminal-stranded-work-coder".into(),
+        pid: None,
+        started_at: chrono::Utc::now(),
+        crew: Some(
+            CrewSessionStatus::builder().id("crew-coder".to_string()).adapter("codex".to_string()).stance("trusted".to_string()).build(),
+        ),
+        launch_command: "codex".into(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
+    sessions.update_status(&created.metadata.name, &created.metadata.resource_version, &status).await.expect("running terminal");
+
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    {
+        let mut manager = peer_manager.lock().await;
+        manager.add_configured_target(ConfigLabel("feta".to_string()), home, Some(node("feta")), Box::new(FailingPeerTransport));
+        manager.register_sender(node("feta"), Arc::new(FailingPeerSender));
+    }
+    let router = empty_remote_command_router(&daemon, &peer_manager);
+
+    let error = router
+        .dispatch_execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::CrewComplete {
+                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
+            },
+        })
+        .await
+        .expect_err("partitioned completion should report that it was queued");
+
+    assert_eq!(
+        error,
+        "completion pending: authority unreachable for stranded at feta: connect to feta at ssh://feta.example: outbound channel closed"
+    );
+    let terminal = sessions.get("terminal-stranded-work-coder").await.expect("terminal");
+    let pending = terminal.status.expect("terminal status").completion_pending.expect("durable completion intent");
+    assert_eq!(pending.authority, "feta");
+    assert!(pending.last_error.contains("authority unreachable for stranded"));
+
+    router
+        .dispatch_execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::CrewComplete {
+                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                message: Some("https://github.com/flotilla-org/flotilla/pull/1301".into()),
+            },
+        })
+        .await
+        .expect_err("corrected completion should remain queued during the partition");
+    let pending = sessions
+        .get("terminal-stranded-work-coder")
+        .await
+        .expect("terminal after corrected completion")
+        .status
+        .expect("terminal status")
+        .completion_pending
+        .expect("corrected durable completion intent");
+    assert_eq!(pending.message.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/1301"));
+
+    let delivered = Arc::new(StdMutex::new(Vec::new()));
+    peer_manager.lock().await.register_sender(node("feta"), Arc::new(CapturePeerSender(Arc::clone(&delivered))));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !delivered.lock().expect("delivered lock").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("queued completion should retry when the authority route heals");
+
+    let request_id = match delivered.lock().expect("delivered lock").first().expect("retried command") {
+        PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { request_id, command, .. }) => {
+            assert!(matches!(
+                &command.action,
+                CommandAction::CrewComplete { message: Some(message), .. }
+                    if message == "https://github.com/flotilla-org/flotilla/pull/1301"
+            ));
+            *request_id
+        }
+        other => panic!("expected retried crew completion, got {other:?}"),
+    };
+    router.complete_remote_command(request_id, node("feta"), CommandValue::Error { message: "crew work no longer exists".into() }).await;
+    assert!(
+        sessions
+            .get("terminal-stranded-work-coder")
+            .await
+            .expect("terminal after acknowledgement")
+            .status
+            .expect("terminal status")
+            .completion_pending
+            .is_none(),
+        "authority rejection should retire the acknowledged durable intent"
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(delivered.lock().expect("delivered lock").len(), 1, "permanent authority rejection must not retry");
+
+    router
+        .dispatch_execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::CrewComplete {
+                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                message: Some("https://github.com/flotilla-org/flotilla/pull/1302".into()),
+            },
+        })
+        .await
+        .expect("reachable authority should accept a fresh completion");
+    let request_id = match delivered.lock().expect("delivered lock").get(1).expect("fresh completion") {
+        PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { request_id, .. }) => *request_id,
+        other => panic!("expected fresh crew completion, got {other:?}"),
+    };
+    router.complete_remote_command(request_id, node("feta"), CommandValue::Ok).await;
+    assert!(
+        sessions
+            .get("terminal-stranded-work-coder")
+            .await
+            .expect("terminal after successful acknowledgement")
+            .status
+            .expect("terminal status")
+            .completion_pending
+            .is_none(),
+        "successful authority acknowledgement should retire the durable completion intent"
+    );
+
+    peer_manager.lock().await.register_sender(node("feta"), Arc::new(FailingPeerSender));
+    let query_error = router
+        .dispatch_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryCrewList {
+                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                },
+            },
+            uuid::Uuid::nil(),
+        )
+        .await
+        .expect_err("partitioned follower query should name the authority");
+    assert_eq!(query_error, "authority unreachable for stranded at feta: outbound channel closed");
 }
 
 #[tokio::test]

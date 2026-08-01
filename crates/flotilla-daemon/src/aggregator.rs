@@ -1819,19 +1819,28 @@ impl Aggregator {
             .collect();
         let work_unsettled = !state.is_some_and(|state| state.phase.is_terminal());
         let now = chrono::Utc::now();
-        let needs_attention = self.terminal_sessions.values().any(|session| {
-            session.object.metadata.namespace == convoy_ref.namespace
-                && session.object.metadata.labels.get(CONVOY_LABEL) == Some(&convoy_ref.name)
-                && session.object.metadata.labels.get(VESSEL_LABEL) == Some(&definition.name)
-                && self.read_host(&session.provenance).as_ref() == Some(&vessel_host)
-                && session.object.status.as_ref().is_some_and(|status| {
+        let matching_sessions = || {
+            self.terminal_sessions.values().filter(|session| {
+                session.object.metadata.namespace == convoy_ref.namespace
+                    && session.object.metadata.labels.get(CONVOY_LABEL) == Some(&convoy_ref.name)
+                    && session.object.metadata.labels.get(VESSEL_LABEL) == Some(&definition.name)
+                    && self.read_host(&session.provenance).as_ref() == Some(&vessel_host)
+            })
+        };
+        let completion_pending = matching_sessions()
+            .filter_map(|session| session.object.status.as_ref()?.completion_pending.as_ref())
+            .min_by_key(|pending| pending.attempted_at)
+            .cloned();
+        let needs_attention = completion_pending.is_some()
+            || matching_sessions().any(|session| {
+                session.object.status.as_ref().is_some_and(|status| {
                     status.phase == TerminalSessionPhase::Running
                         && status
                             .attention
                             .as_ref()
                             .is_some_and(|attention| !attention.is_stale_at(now) && attention_needs_human(attention.state, work_unsettled))
                 })
-        });
+            });
         VesselRow::builder()
             .resource(convoy_ref.subresource(format!("vessels/{}", definition.name)))
             .maybe_vessel_resource(vessel_resource)
@@ -1842,7 +1851,11 @@ impl Aggregator {
             .maybe_ready_at(state.and_then(|state| state.ready_at))
             .maybe_started_at(state.and_then(|state| state.started_at))
             .maybe_finished_at(state.and_then(|state| state.finished_at))
-            .maybe_message(state.and_then(|state| state.message.clone()))
+            .maybe_message(
+                completion_pending
+                    .map(|pending| format!("completion pending: {}", pending.last_error))
+                    .or_else(|| state.and_then(|state| state.message.clone())),
+            )
             .requested_stance(requested_stance)
             .maybe_effective_stance(effective_stance)
             .maybe_image_ref(image_ref)
@@ -2079,6 +2092,33 @@ mod tests {
         let convoy = result_set.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
         assert!(convoy.vessels.first().expect("vessel row").needs_attention);
         assert!(convoy.needs_attention);
+    }
+
+    #[tokio::test]
+    async fn pending_crew_completion_is_visible_on_the_convoy() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+
+        let mut session = session_object("terminal-convoy-a-implement").await;
+        session.metadata.labels =
+            BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        session.status.as_mut().expect("running status").completion_pending = Some(flotilla_resources::CrewCompletionPending {
+            message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
+            attempted_at: Utc::now(),
+            authority: "kiwi".into(),
+            last_error: "authority unreachable for convoy-a".into(),
+        });
+
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
+
+        let result_set = state.result_set().await;
+        let convoy = result_set.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
+        assert!(convoy.needs_attention);
+        let vessel = convoy.vessels.first().expect("vessel row");
+        assert!(vessel.needs_attention);
+        assert_eq!(vessel.message.as_deref(), Some("completion pending: authority unreachable for convoy-a"));
     }
 
     #[tokio::test]
