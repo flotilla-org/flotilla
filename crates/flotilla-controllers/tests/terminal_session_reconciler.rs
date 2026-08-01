@@ -4,20 +4,22 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
 use flotilla_resources::{
-    controller::{Actuation, Reconciler},
+    controller::{Actuation, ControllerLoop, Reconciler},
     test_support::{
         run_transition_sequence, FixpointPredicate, LivenessEnrollment, LivenessScenario, LivenessStep, ReconcileStep, Transition,
         TransitionDriver, TransitionSequence, WorldBuilder,
     },
-    EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta, ResourceBackend, ResourceError,
-    ResourceObject, StatusPatch, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSpec, TerminalSessionStatusPatch, VirtualClock, CONVOY_LABEL, VESSEL_REF_LABEL,
+    Convoy, ConvoyPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta, ResourceBackend,
+    ResourceError, ResourceObject, StatusPatch, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, VirtualClock, CONVOY_LABEL,
+    VESSEL_REF_LABEL,
 };
 
 mod common;
@@ -85,6 +87,172 @@ impl TerminalRuntime for FailingTerminalRuntime {
     async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let convoy = create_convoy_with_single_task(
+        &backend,
+        "flotilla",
+        "abandoned-convoy",
+        "work",
+        "https://github.com/flotilla-org/flotilla",
+        "main",
+    )
+    .await;
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let mut status = convoy.status.expect("convoy should have status");
+    status.phase = ConvoyPhase::Abandoned;
+    convoys.update_status("abandoned-convoy", &convoy.metadata.resource_version, &status).await.expect("convoy should be abandoned");
+
+    let session = backend
+        .clone()
+        .using::<TerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("terminal-abandoned-convoy-work-coder".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "abandoned-convoy".to_string())]))
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "missing-environment".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("terminal should exist");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(RecordingTerminalRuntime::default()), backend, "flotilla");
+
+    let deps = reconciler.fetch_dependencies(&session).await.expect("abandoned owner should be handled as lifecycle state");
+    let outcome = reconciler.reconcile(&session, &deps, Utc::now());
+
+    assert!(matches!(
+        outcome.actuations.as_slice(),
+        [Actuation::DeleteTerminalSession { name }] if name == "terminal-abandoned-convoy-work-coder"
+    ));
+}
+
+#[derive(Default)]
+struct UnavailableRunningRuntime {
+    probes: AtomicUsize,
+}
+
+#[async_trait]
+impl TerminalRuntime for UnavailableRunningRuntime {
+    async fn ensure_session(
+        &self,
+        _name: &str,
+        _spec: &TerminalSessionSpec,
+        _tags: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
+        panic!("a running session must be probed, not ensured")
+    }
+
+    async fn session_is_running(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<bool, String> {
+        self.probes.fetch_add(1, Ordering::SeqCst);
+        Err("provider registry unavailable for environment env-a".to_string())
+    }
+
+    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_runtime_probe_failure_becomes_visible_and_stops_retrying() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(
+            &InputMeta::builder()
+                .name("terminal-demo-work-coder".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "demo".to_string())]))
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("terminal should be created");
+    let mut running = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "cleat-demo-work-coder".to_string(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "cargo test".to_string(),
+        delivered_message_id: None,
+    }
+    .apply(&mut running);
+    sessions.update_status(&created.metadata.name, &created.metadata.resource_version, &running).await.expect("terminal should be running");
+
+    let runtime = Arc::new(UnavailableRunningRuntime::default());
+    let loop_task = tokio::spawn(
+        ControllerLoop {
+            primary: sessions.clone(),
+            secondaries: Vec::new(),
+            reconciler: TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla"),
+            resync_interval: Duration::from_secs(3600),
+            backend,
+        }
+        .run(),
+    );
+
+    for delay in [0, 60, 120, 240, 480] {
+        if delay > 0 {
+            tokio::time::advance(Duration::from_secs(delay)).await;
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let status = sessions
+        .get("terminal-demo-work-coder")
+        .await
+        .expect("terminal should remain inspectable")
+        .status
+        .expect("terminal should retain status");
+    let degraded = status.degraded.expect("retry budget should produce a degraded condition");
+    assert_eq!(status.phase, TerminalSessionPhase::Failed);
+    assert_eq!(degraded.reason, "ReconcileErrorBudgetExhausted");
+    assert_eq!(degraded.consecutive_failures, 5);
+    assert!(degraded.message.contains("provider registry unavailable"));
+    assert_eq!(runtime.probes.load(Ordering::SeqCst), 5);
+
+    tokio::time::advance(Duration::from_secs(7200)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(runtime.probes.load(Ordering::SeqCst), 5, "degraded terminal must stay parked across resyncs");
+
+    let convoy = convoys.get("demo").await.expect("owning convoy should remain");
+    let mut convoy_status = convoy.status.expect("owning convoy should have status");
+    convoy_status.phase = ConvoyPhase::Abandoned;
+    convoys.update_status("demo", &convoy.metadata.resource_version, &convoy_status).await.expect("owning convoy should be abandoned");
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    for _ in 0..40 {
+        tokio::task::yield_now().await;
+        if matches!(sessions.get("terminal-demo-work-coder").await, Err(ResourceError::NotFound { .. })) {
+            break;
+        }
+    }
+    assert!(
+        matches!(sessions.get("terminal-demo-work-coder").await, Err(ResourceError::NotFound { .. })),
+        "abandonment must wake and reap a previously degraded terminal"
+    );
+
+    loop_task.abort();
+    let _ = loop_task.await;
 }
 
 const GHOST_SESSION_NAME: &str = "terminal-deleted-convoy-work-coder";

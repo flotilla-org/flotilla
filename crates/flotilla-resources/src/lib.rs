@@ -119,8 +119,8 @@ pub use status_patch::{apply_status_patch, apply_status_patch_checked, NoStatusP
 pub use terminal_session::{
     terminal_session_attach_target, CrewSessionStatus, InnerCommandStatus, TerminalAttention, TerminalAttentionSource,
     TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession, TerminalSessionAttachTarget,
-    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
-    TerminalSessionStatusPatch, TerminalSessionTag,
+    TerminalSessionDegradedCondition, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTag,
 };
 pub use vessel::{
     Vessel, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
