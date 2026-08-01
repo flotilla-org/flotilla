@@ -1,10 +1,4 @@
-use std::{
-    collections::HashSet,
-    io::stdout,
-    path::PathBuf,
-    process::{Child, Stdio},
-    sync::{LazyLock, Mutex, MutexGuard, Once},
-};
+use std::{io::stdout, sync::Once};
 
 use crossterm::{event::DisableMouseCapture, execute};
 use flotilla_protocol::{arg, ResolvedAttachAction, ResolvedAttachPlan, SendKeyStep};
@@ -30,15 +24,10 @@ fn reinitialize_terminal() -> ratatui::DefaultTerminal {
 
 trait AttachCommandRunner {
     fn status(&mut self, program: &str, args: &[String]) -> Result<std::process::ExitStatus, String>;
-
-    fn start_cleanup_watchdog(&mut self, _commands: &[String]) -> Result<Option<CleanupWatchdog>, String> {
-        Ok(None)
-    }
 }
 
 struct SystemAttachCommandRunner;
 
-static ACTIVE_ATTACH_BRIDGES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static ATTACH_PANIC_HOOK: Once = Once::new();
 #[cfg(unix)]
 static ATTACH_SIGNAL_HANDLER: Once = Once::new();
@@ -46,88 +35,6 @@ static ATTACH_SIGNAL_HANDLER: Once = Once::new();
 impl AttachCommandRunner for SystemAttachCommandRunner {
     fn status(&mut self, program: &str, args: &[String]) -> Result<std::process::ExitStatus, String> {
         std::process::Command::new(program).args(args).status().map_err(|error| format!("could not start {program}: {error}"))
-    }
-
-    fn start_cleanup_watchdog(&mut self, commands: &[String]) -> Result<Option<CleanupWatchdog>, String> {
-        CleanupWatchdog::spawn(commands).map(Some)
-    }
-}
-
-struct CleanupWatchdog {
-    lease: PathBuf,
-    child: Child,
-}
-
-impl CleanupWatchdog {
-    fn spawn(commands: &[String]) -> Result<Self, String> {
-        #[cfg(unix)]
-        use std::os::unix::process::CommandExt;
-
-        let lease = std::env::temp_dir().join(format!("flotilla-attach-watchdog-{}", uuid::Uuid::new_v4()));
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lease)
-            .map_err(|error| format!("could not create attach cleanup lease {}: {error}", lease.display()))?;
-        let mut command = std::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg(
-                "parent=$1; lease=$2; shift 2; while kill -0 \"$parent\" 2>/dev/null && [ -e \"$lease\" ]; do sleep 0.05; done; \
-                 for command in \"$@\"; do sh -lc \"$command\"; done; rm -f \"$lease\"",
-            )
-            .arg("flotilla-attach-watchdog")
-            .arg(std::process::id().to_string())
-            .arg(&lease)
-            .args(commands)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(unix)]
-        unsafe {
-            // The watchdog must survive the attach owner's entire terminal
-            // session disappearing, not merely an individual-process signal.
-            command.pre_exec(|| if libc::setsid() == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
-        }
-        match command.spawn() {
-            Ok(child) => Ok(Self { lease, child }),
-            Err(error) => {
-                let _ = std::fs::remove_file(&lease);
-                Err(format!("could not start attach cleanup watchdog: {error}"))
-            }
-        }
-    }
-}
-
-impl Drop for CleanupWatchdog {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.lease);
-        let _ = self.child.wait();
-    }
-}
-
-fn active_attach_bridges() -> MutexGuard<'static, HashSet<String>> {
-    match ACTIVE_ATTACH_BRIDGES.lock() {
-        Ok(bridges) => bridges,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-fn register_attach_bridge(bridge: &str) {
-    active_attach_bridges().insert(bridge.to_string());
-}
-
-fn kill_attach_bridge(bridge: &str, runner: &mut dyn AttachCommandRunner) {
-    if active_attach_bridges().remove(bridge) {
-        let _ = runner.status("cleat", &["kill".to_string(), bridge.to_string()]);
-    }
-}
-
-fn kill_all_attach_bridges() {
-    let bridges: Vec<_> = active_attach_bridges().drain().collect();
-    let mut runner = SystemAttachCommandRunner;
-    for bridge in bridges {
-        let _ = runner.status("cleat", &["kill".to_string(), bridge]);
     }
 }
 
@@ -144,41 +51,14 @@ fn run_send_keys_attach(
     bridge: &str,
     runner: &mut dyn AttachCommandRunner,
 ) -> Result<std::process::ExitStatus, String> {
-    let plan = instantiate_attach_plan(plan);
-    let cleanup_commands = std::iter::once(vec![
-        flotilla_protocol::arg::Arg::Literal("cleat".into()),
-        flotilla_protocol::arg::Arg::Literal("kill".into()),
-        flotilla_protocol::arg::Arg::Quoted(bridge.to_string()),
-    ])
-    .chain(plan.0.iter().filter_map(|action| match action {
-        ResolvedAttachAction::Cleanup(args) => Some(args.clone()),
-        _ => None,
-    }))
-    .map(|args| arg::flatten(&args, 0))
-    .collect::<Vec<_>>();
-    let mut actions = plan.0.iter().filter(|action| !matches!(action, ResolvedAttachAction::Cleanup(_))).cloned().collect::<Vec<_>>();
+    let mut actions = plan.0.clone();
     let Some(ResolvedAttachAction::Command(args)) = actions.pop() else {
         return Err("attach plan must end with an outer command".to_string());
     };
     let command = arg::flatten(&args, 0);
-    register_attach_bridge(bridge);
-    let _watchdog = match runner.start_cleanup_watchdog(&cleanup_commands) {
-        Ok(watchdog) => watchdog,
-        Err(error) => {
-            kill_attach_bridge(bridge, runner);
-            return Err(error);
-        }
-    };
     let launch =
-        match runner.status("cleat", &["launch".to_string(), bridge.to_string(), "--record".to_string(), "--cmd".to_string(), command]) {
-            Ok(status) => status,
-            Err(error) => {
-                kill_attach_bridge(bridge, runner);
-                return Err(error);
-            }
-        };
+        runner.status("cleat", &["launch".to_string(), bridge.to_string(), "--record".to_string(), "--cmd".to_string(), command])?;
     if !launch.success() {
-        kill_attach_bridge(bridge, runner);
         return Err(format!("could not launch attach bridge for outer command (status {launch})"));
     }
 
@@ -214,19 +94,23 @@ fn run_send_keys_attach(
         runner.status("cleat", &["attach".to_string(), bridge.to_string()])
     })();
 
-    kill_attach_bridge(bridge, runner);
     result
 }
 
+#[cfg(test)]
 fn instantiate_attach_plan(plan: &ResolvedAttachPlan) -> ResolvedAttachPlan {
     let lease = uuid::Uuid::new_v4().simple().to_string();
+    instantiate_attach_plan_with_lease(plan, &lease)
+}
+
+fn instantiate_attach_plan_with_lease(plan: &ResolvedAttachPlan, lease: &str) -> ResolvedAttachPlan {
     ResolvedAttachPlan(
         plan.0
             .iter()
             .cloned()
             .map(|action| match action {
-                ResolvedAttachAction::Command(args) => ResolvedAttachAction::Command(instantiate_args(args, &lease)),
-                ResolvedAttachAction::Cleanup(args) => ResolvedAttachAction::Cleanup(instantiate_args(args, &lease)),
+                ResolvedAttachAction::Command(args) => ResolvedAttachAction::Command(instantiate_args(args, lease)),
+                ResolvedAttachAction::Cleanup(args) => ResolvedAttachAction::Cleanup(instantiate_args(args, lease)),
                 ResolvedAttachAction::SendKeys { hop, steps } => ResolvedAttachAction::SendKeys {
                     hop,
                     steps: steps
@@ -234,7 +118,7 @@ fn instantiate_attach_plan(plan: &ResolvedAttachPlan) -> ResolvedAttachPlan {
                         .map(|step| match step {
                             SendKeyStep::WaitForReady => SendKeyStep::WaitForReady,
                             SendKeyStep::Type { text } => {
-                                SendKeyStep::Type { text: text.replace(flotilla_protocol::ATTACH_LEASE_PLACEHOLDER, &lease) }
+                                SendKeyStep::Type { text: text.replace(flotilla_protocol::ATTACH_LEASE_PLACEHOLDER, lease) }
                             }
                         })
                         .collect(),
@@ -258,21 +142,57 @@ fn instantiate_args(args: Vec<flotilla_protocol::arg::Arg>, lease: &str) -> Vec<
         .collect()
 }
 
+/// An attach execution whose side effects have been split from their
+/// compensating teardown. Callers register `cleanup_actions` with the daemon
+/// before running the plan.
+pub struct PreparedAttachPlan {
+    executable: ResolvedAttachPlan,
+    bridge: Option<String>,
+    pub excursion_id: Option<flotilla_protocol::AttachExcursionId>,
+    pub cleanup_actions: Vec<Vec<flotilla_protocol::arg::Arg>>,
+}
+
+pub fn prepare_attach_plan(plan: &ResolvedAttachPlan) -> PreparedAttachPlan {
+    if matches!(plan.0.as_slice(), [ResolvedAttachAction::Command(_)]) {
+        return PreparedAttachPlan { executable: plan.clone(), bridge: None, excursion_id: None, cleanup_actions: Vec::new() };
+    }
+
+    let excursion_id = flotilla_protocol::AttachExcursionId::new();
+    let lease = excursion_id.0.simple().to_string();
+    let bridge = format!("flotilla-attach-{}", uuid::Uuid::new_v4());
+    let instantiated = instantiate_attach_plan_with_lease(plan, &lease);
+    let mut cleanup_actions = instantiated
+        .0
+        .iter()
+        .filter_map(|action| match action {
+            ResolvedAttachAction::Cleanup(args) => Some(args.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // The bridge is the outermost acquired resource, so it is released last.
+    cleanup_actions.push(vec![
+        flotilla_protocol::arg::Arg::Literal("cleat".into()),
+        flotilla_protocol::arg::Arg::Literal("kill".into()),
+        flotilla_protocol::arg::Arg::Quoted(bridge.clone()),
+    ]);
+    let executable =
+        ResolvedAttachPlan(instantiated.0.into_iter().filter(|action| !matches!(action, ResolvedAttachAction::Cleanup(_))).collect());
+    PreparedAttachPlan { executable, bridge: Some(bridge), excursion_id: Some(excursion_id), cleanup_actions }
+}
+
 /// Execute an interactive attach plan and return the attached process status.
-pub fn run_attach_plan(plan: &ResolvedAttachPlan) -> Result<std::process::ExitStatus, String> {
+pub fn run_attach_plan(plan: &PreparedAttachPlan) -> Result<std::process::ExitStatus, String> {
     // Standalone CLI and convoy auto-attach paths do not pass through TUI
-    // startup, so install the idempotent bridge cleanup hooks here too.
+    // startup, so install the terminal restoration hooks here too.
     install_panic_hook();
     #[cfg(unix)]
     install_sigterm_handler();
 
     let mut runner = SystemAttachCommandRunner;
-    match plan.0.as_slice() {
-        [ResolvedAttachAction::Command(args)] => run_direct_attach(args, &mut runner),
-        _ => {
-            let bridge = format!("flotilla-attach-{}", uuid::Uuid::new_v4());
-            run_send_keys_attach(plan, &bridge, &mut runner)
-        }
+    match (plan.executable.0.as_slice(), plan.bridge.as_deref()) {
+        ([ResolvedAttachAction::Command(args)], None) => run_direct_attach(args, &mut runner),
+        (_, Some(bridge)) => run_send_keys_attach(&plan.executable, bridge, &mut runner),
+        _ => Err("attach plan is missing its bridge".to_string()),
     }
 }
 
@@ -281,7 +201,7 @@ pub fn run_attach_plan(plan: &ResolvedAttachPlan) -> Result<std::process::ExitSt
 /// This deliberately does not stamp Presentation Manager metadata: the pane
 /// remains owned by its existing project/archipelago context while the attach
 /// is only a transient foreground excursion.
-pub fn run_temporary_attach(plan: &ResolvedAttachPlan) -> (ratatui::DefaultTerminal, Result<(), String>) {
+pub fn run_temporary_attach(plan: &PreparedAttachPlan) -> (ratatui::DefaultTerminal, Result<(), String>) {
     restore_terminal();
     let result = run_attach_plan(plan).and_then(|status| {
         if status.success() {
@@ -306,7 +226,6 @@ pub fn install_panic_hook() {
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             restore_terminal();
-            kill_all_attach_bridges();
             hook(info);
         }));
     });
@@ -330,7 +249,6 @@ pub fn install_sigterm_handler() {
                 _ = sigterm.recv() => 0,
             };
             restore_terminal();
-            kill_all_attach_bridges();
             std::process::exit(exit_code);
         });
     });
@@ -338,20 +256,11 @@ pub fn install_sigterm_handler() {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{
-        collections::VecDeque,
-        os::unix::process::ExitStatusExt,
-        path::Path,
-        process::ExitStatus,
-        time::{Duration, Instant},
-    };
+    use std::{collections::VecDeque, os::unix::process::ExitStatusExt, process::ExitStatus};
 
-    use flotilla_protocol::{
-        arg::{self, Arg},
-        ResolvedAttachAction, ResolvedAttachPlan, SendKeyStep,
-    };
+    use flotilla_protocol::{arg::Arg, ResolvedAttachAction, ResolvedAttachPlan, SendKeyStep};
 
-    use super::{instantiate_attach_plan, run_send_keys_attach, AttachCommandRunner};
+    use super::{instantiate_attach_plan, prepare_attach_plan, run_send_keys_attach, AttachCommandRunner};
 
     #[derive(Default)]
     struct FakeRunner {
@@ -376,39 +285,6 @@ mod tests {
     struct DockerProbeRunner {
         marker: String,
         inner: super::SystemAttachCommandRunner,
-    }
-
-    struct SigkillProbeRunner {
-        ready: String,
-        inner: super::SystemAttachCommandRunner,
-    }
-
-    struct DockerLivenessCleanup {
-        bridge: String,
-        container: String,
-    }
-
-    impl Drop for DockerLivenessCleanup {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("cleat").args(["kill", &self.bridge]).status();
-            let _ = std::process::Command::new("docker").args(["rm", "-f", &self.container]).status();
-        }
-    }
-
-    impl AttachCommandRunner for SigkillProbeRunner {
-        fn status(&mut self, program: &str, args: &[String]) -> Result<ExitStatus, String> {
-            if program == "cleat" && args.first().is_some_and(|command| command == "attach") {
-                std::fs::write(&self.ready, b"ready").map_err(|error| format!("write SIGKILL probe marker: {error}"))?;
-                loop {
-                    std::thread::sleep(Duration::from_secs(60));
-                }
-            }
-            self.inner.status(program, args)
-        }
-
-        fn start_cleanup_watchdog(&mut self, commands: &[String]) -> Result<Option<super::CleanupWatchdog>, String> {
-            self.inner.start_cleanup_watchdog(commands)
-        }
     }
 
     impl AttachCommandRunner for DockerProbeRunner {
@@ -457,7 +333,7 @@ mod tests {
 
         assert!(error.contains("docker environment 'crew-box'"), "{error}");
         assert!(error.contains("did not become ready"), "{error}");
-        assert_eq!(runner.calls.last().expect("cleanup call").1[0], "kill");
+        assert_eq!(runner.calls.last().expect("failed wait call").1[0], "wait");
     }
 
     #[test]
@@ -467,7 +343,7 @@ mod tests {
         run_send_keys_attach(&two_hop_plan(), "ready-bridge", &mut runner).expect("attach plan should run");
 
         let commands: Vec<_> = runner.calls.iter().map(|(_, args)| args[0].as_str()).collect();
-        assert_eq!(commands, ["launch", "wait", "send", "attach", "kill"]);
+        assert_eq!(commands, ["launch", "wait", "send", "attach"]);
         let wait = &runner.calls[1].1;
         assert!(wait.windows(2).any(|pair| pair == ["--screen-stable", "100ms"]));
         assert!(!runner.calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "expect")));
@@ -491,198 +367,19 @@ mod tests {
     }
 
     #[test]
-    fn attach_sigkill_helper() {
-        let Ok(bridge) = std::env::var("FLOTILLA_ATTACH_SIGKILL_BRIDGE") else { return };
-        let ready = std::env::var("FLOTILLA_ATTACH_SIGKILL_READY").expect("SIGKILL helper ready path");
-        let cleaned = std::env::var("FLOTILLA_ATTACH_SIGKILL_CLEANED").expect("SIGKILL helper cleanup path");
-        let plan = if let Ok(container) = std::env::var("FLOTILLA_ATTACH_SIGKILL_CONTAINER") {
-            let pid_file = std::env::var("FLOTILLA_ATTACH_SIGKILL_PID_FILE").expect("SIGKILL helper PID file");
-            let seat = std::env::var("FLOTILLA_ATTACH_SIGKILL_SEAT").expect("SIGKILL helper seat path");
-            ResolvedAttachPlan(vec![
-                ResolvedAttachAction::SendKeys {
-                    hop: "Docker SIGKILL probe".into(),
-                    steps: vec![
-                        SendKeyStep::Type {
-                            text: arg::flatten(
-                                &[
-                                    Arg::Literal("exec".into()),
-                                    Arg::Literal("sh".into()),
-                                    Arg::Literal("-c".into()),
-                                    Arg::Quoted(format!("echo $$ > {pid_file}; exec flock -n {seat} sleep 300")),
-                                ],
-                                0,
-                            ),
-                        },
-                        SendKeyStep::WaitForReady,
-                    ],
-                },
-                ResolvedAttachAction::Cleanup(vec![
-                    Arg::Literal("docker".into()),
-                    Arg::Literal("exec".into()),
-                    Arg::Quoted(container.clone()),
-                    Arg::Literal("sh".into()),
-                    Arg::Literal("-c".into()),
-                    Arg::Quoted(format!(
-                        "pid=$(cat {pid_file} 2>/dev/null) || exit 0; kill -KILL \"$pid\" 2>/dev/null || true; rm -f {pid_file}"
-                    )),
-                ]),
-                ResolvedAttachAction::Cleanup(vec![Arg::Literal("touch".into()), Arg::Quoted(cleaned)]),
-                ResolvedAttachAction::Command(vec![
-                    Arg::Literal("docker".into()),
-                    Arg::Literal("exec".into()),
-                    Arg::Literal("-it".into()),
-                    Arg::Quoted(container),
-                    Arg::Literal("/bin/sh".into()),
-                ]),
-            ])
-        } else {
-            ResolvedAttachPlan(vec![
-                ResolvedAttachAction::SendKeys {
-                    hop: "SIGKILL probe".into(),
-                    steps: vec![SendKeyStep::Type { text: "exec sleep 300".into() }, SendKeyStep::WaitForReady],
-                },
-                ResolvedAttachAction::Cleanup(vec![Arg::Literal("touch".into()), Arg::Quoted(cleaned)]),
-                ResolvedAttachAction::Command(vec![Arg::Literal("sh".into())]),
-            ])
-        };
-        let mut runner = SigkillProbeRunner { ready, inner: super::SystemAttachCommandRunner };
+    fn preparation_orders_cleanup_inside_out_and_bridge_last() {
+        let plan = ResolvedAttachPlan(vec![
+            ResolvedAttachAction::SendKeys { hop: "inner".into(), steps: vec![] },
+            ResolvedAttachAction::Cleanup(vec![Arg::Literal("kill-inner".into())]),
+            ResolvedAttachAction::Command(vec![Arg::Literal("outer".into())]),
+        ]);
 
-        run_send_keys_attach(&plan, &bridge, &mut runner).expect("SIGKILL helper attach");
-    }
+        let prepared = prepare_attach_plan(&plan);
 
-    #[test]
-    #[ignore = "requires the cleat binary"]
-    fn killing_attach_owner_reaps_the_bridge() {
-        let temp = tempfile::tempdir().expect("SIGKILL probe tempdir");
-        let ready = temp.path().join("ready");
-        let cleaned = temp.path().join("cleaned");
-        let bridge = format!("flotilla-attach-sigkill-{}", uuid::Uuid::new_v4());
-        let mut helper = std::process::Command::new(std::env::current_exe().expect("current test executable"))
-            .args(["attach_sigkill_helper", "--nocapture"])
-            .env("FLOTILLA_ATTACH_SIGKILL_BRIDGE", &bridge)
-            .env("FLOTILLA_ATTACH_SIGKILL_READY", &ready)
-            .env("FLOTILLA_ATTACH_SIGKILL_CLEANED", &cleaned)
-            .spawn()
-            .expect("spawn SIGKILL attach helper");
-
-        wait_for_path(&ready, Duration::from_secs(10));
-        unsafe {
-            libc::kill(helper.id() as libc::pid_t, libc::SIGKILL);
-        }
-        let _ = helper.wait();
-
-        wait_for_path(&cleaned, Duration::from_secs(3));
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let reaped = loop {
-            let output = std::process::Command::new("cleat").args(["list", "--json"]).output().expect("list cleat sessions");
-            if !String::from_utf8_lossy(&output.stdout).contains(&bridge) {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        let _ = std::process::Command::new("cleat").args(["kill", &bridge]).status();
-        assert!(reaped, "attach bridge {bridge} survived its SIGKILLed owner");
-    }
-
-    #[test]
-    #[ignore = "requires Docker, cleat, and the debian:trixie-slim image"]
-    fn killing_attach_owner_reaps_docker_exec_and_frees_the_interior_seat() {
-        let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let container = format!("flotilla-attach-liveness-{suffix}");
-        let bridge = format!("flotilla-attach-liveness-{suffix}");
-        let pid_file = format!("/tmp/flotilla-attach-{suffix}.pid");
-        let seat = format!("/tmp/flotilla-attach-{suffix}.seat");
-        let temp = tempfile::tempdir().expect("Docker liveness tempdir");
-        let ready = temp.path().join("ready");
-        let cleaned = temp.path().join("cleaned");
-
-        let started = std::process::Command::new("docker")
-            .args(["run", "-d", "--name", &container, "debian:trixie-slim", "sleep", "infinity"])
-            .status()
-            .expect("start Docker liveness container");
-        assert!(started.success(), "Docker liveness container should start");
-        let _cleanup = DockerLivenessCleanup { bridge: bridge.clone(), container: container.clone() };
-
-        let mut helper = std::process::Command::new(std::env::current_exe().expect("current test executable"))
-            .args(["attach_sigkill_helper", "--nocapture"])
-            .env("FLOTILLA_ATTACH_SIGKILL_BRIDGE", &bridge)
-            .env("FLOTILLA_ATTACH_SIGKILL_READY", &ready)
-            .env("FLOTILLA_ATTACH_SIGKILL_CLEANED", &cleaned)
-            .env("FLOTILLA_ATTACH_SIGKILL_CONTAINER", &container)
-            .env("FLOTILLA_ATTACH_SIGKILL_PID_FILE", &pid_file)
-            .env("FLOTILLA_ATTACH_SIGKILL_SEAT", &seat)
-            .spawn()
-            .expect("spawn Docker attach helper");
-        wait_for_path(&ready, Duration::from_secs(10));
-
-        let pid = wait_for_docker_pid(&container, &pid_file, Duration::from_secs(5));
-        unsafe {
-            libc::kill(helper.id() as libc::pid_t, libc::SIGKILL);
-        }
-        let _ = helper.wait();
-        wait_for_path(&cleaned, Duration::from_secs(3));
-
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            let bridge_gone = !cleat_sessions().contains(&bridge);
-            let interior_gone = !docker_process_exists(&container, &pid);
-            let exec_gone = !host_processes().contains(&format!("docker exec -it {container} /bin/sh"));
-            if bridge_gone && interior_gone && exec_gone {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "attach chain survived owner death: bridge={bridge_gone}, interior={interior_gone}, exec={exec_gone}"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
-        let second = std::process::Command::new("docker")
-            .args(["exec", &container, "flock", "-n", &seat, "true"])
-            .status()
-            .expect("attempt second interior attach");
-        assert!(second.success(), "the second attach should acquire the freed controller seat");
-    }
-
-    fn wait_for_docker_pid(container: &str, pid_file: &str, timeout: Duration) -> String {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let output =
-                std::process::Command::new("docker").args(["exec", container, "cat", pid_file]).output().expect("read interior PID");
-            if output.status.success() {
-                return String::from_utf8_lossy(&output.stdout).trim().to_string();
-            }
-            assert!(Instant::now() < deadline, "timed out waiting for interior attach PID");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    fn docker_process_exists(container: &str, pid: &str) -> bool {
-        std::process::Command::new("docker")
-            .args(["exec", container, "test", "-e", &format!("/proc/{pid}")])
-            .status()
-            .is_ok_and(|status| status.success())
-    }
-
-    fn cleat_sessions() -> String {
-        let output = std::process::Command::new("cleat").args(["list", "--json"]).output().expect("list cleat sessions");
-        String::from_utf8_lossy(&output.stdout).into_owned()
-    }
-
-    fn host_processes() -> String {
-        let output = std::process::Command::new("ps").args(["-eo", "args="]).output().expect("list host processes");
-        String::from_utf8_lossy(&output.stdout).into_owned()
-    }
-
-    fn wait_for_path(path: &Path, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while !path.exists() {
-            assert!(Instant::now() < deadline, "timed out waiting for {}", path.display());
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        assert_eq!(prepared.cleanup_actions.len(), 2);
+        assert_eq!(prepared.cleanup_actions[0][0], Arg::Literal("kill-inner".into()));
+        assert_eq!(prepared.cleanup_actions[1][0], Arg::Literal("cleat".into()));
+        assert_eq!(prepared.cleanup_actions[1][1], Arg::Literal("kill".into()));
     }
 
     #[test]

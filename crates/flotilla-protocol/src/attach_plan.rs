@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::arg::Arg;
 
@@ -6,6 +7,25 @@ use crate::arg::Arg;
 /// placeholder in resolved plans makes resolution deterministic and lets all
 /// actions in a plan share one lifecycle lease.
 pub const ATTACH_LEASE_PLACEHOLDER: &str = "__FLOTILLA_ATTACH_LEASE__";
+
+/// Identifies one client-owned interactive excursion. The daemon keeps its
+/// cleanup actions until the client explicitly finishes the excursion or the
+/// owning connection disappears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AttachExcursionId(pub Uuid);
+
+impl AttachExcursionId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for AttachExcursionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// An interactive attach plan in execution-stack order.
 ///

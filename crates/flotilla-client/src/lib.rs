@@ -995,6 +995,24 @@ impl DaemonHandle for SocketDaemon {
         }
     }
 
+    async fn begin_attach_excursion(
+        &self,
+        excursion_id: flotilla_protocol::AttachExcursionId,
+        cleanup_actions: Vec<Vec<flotilla_protocol::arg::Arg>>,
+    ) -> Result<(), String> {
+        match into_success_response(self.request(Request::BeginAttachExcursion { excursion_id, cleanup_actions }).await?)? {
+            Response::BeginAttachExcursion => Ok(()),
+            other => Err(format!("unexpected response for begin attach excursion: {other:?}")),
+        }
+    }
+
+    async fn finish_attach_excursion(&self, excursion_id: flotilla_protocol::AttachExcursionId) -> Result<(), String> {
+        match into_success_response(self.request(Request::FinishAttachExcursion { excursion_id }).await?)? {
+            Response::FinishAttachExcursion => Ok(()),
+            other => Err(format!("unexpected response for finish attach excursion: {other:?}")),
+        }
+    }
+
     /// Execute a query command and return the result directly.
     ///
     /// The `session_id` parameter is ignored by `SocketDaemon` because cursor
