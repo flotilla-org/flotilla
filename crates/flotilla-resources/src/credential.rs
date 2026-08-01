@@ -25,7 +25,7 @@ pub struct CredentialSpecSpec {
 #[serde(tag = "adapter", rename_all = "kebab-case")]
 pub enum CredentialConsumer {
     Gh,
-    Forgejo { api_url: String },
+    Forgejo { api_url: String, username: String },
     Claude,
     Codex,
     DockerRegistry { registry: String, username: String },

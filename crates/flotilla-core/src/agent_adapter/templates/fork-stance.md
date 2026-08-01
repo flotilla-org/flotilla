@@ -1,5 +1,5 @@
 {% block operating_instructions %}{{ super() }}Fork-stance constraints:
-- Never add a git remote. Provisioned checkouts intentionally contain only the fork remote (`origin`).
+- Never add or repoint a git remote. Use the existing remote whose URL matches the delivery repository.
 - Never open issues, pull requests, or comments against the upstream repository.
-- Open the fork PR with its base set to the repository target named in the work context.
+- Open the fork PR against the exact repository URL and target ref named in `## Work context`.
 {% endblock %}

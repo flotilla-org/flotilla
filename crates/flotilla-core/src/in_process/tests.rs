@@ -1407,7 +1407,7 @@ async fn fork_review_handoff_launches_reviewer_with_diff_review_and_fork_brief()
     assert_eq!(selector.capability, "review");
     assert_eq!(message.as_ref().map(|message| message.text.as_str()), Some("handoff from coder@implement\n\nReview the fork PR"));
     assert!(brief.content.contains("sign off on the fork PR"));
-    assert!(brief.content.contains("Never add a git remote"));
+    assert!(brief.content.contains("Never add or repoint a git remote"));
     assert!(brief.content.contains("Never open issues, pull requests, or comments against the upstream repository"));
 
     daemon

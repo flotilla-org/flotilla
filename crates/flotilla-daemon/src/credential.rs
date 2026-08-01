@@ -13,6 +13,7 @@ use flotilla_resources::{
     CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, ResourceBackend, ResourceError,
 };
 use tokio::sync::Mutex;
+use url::Url;
 
 pub(crate) struct CredentialStore {
     backend: ResourceBackend,
@@ -79,12 +80,30 @@ impl CredentialStore {
         credential_refs: &BTreeSet<String>,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Vec<(String, String)>, String> {
-        let mut env = BTreeMap::new();
+        let mut specs = Vec::new();
         for name in credential_refs {
             let spec = self.spec(name).await?;
             if matches!(spec.consumer, CredentialConsumer::DockerRegistry { .. }) {
                 continue;
             }
+            specs.push((name.clone(), spec));
+        }
+        // Each adapter delivers fixed env-var names, so a second credential on
+        // the same adapter would silently overwrite the first's wiring. Fail
+        // loudly instead (registry credentials multiplex per image in
+        // prepare_registry_pull and are exempt).
+        let mut seen_adapters = BTreeSet::new();
+        for (name, spec) in &specs {
+            if !seen_adapters.insert(spec.consumer.adapter_name()) {
+                return Err(bounded_adapter_error(
+                    name,
+                    spec.consumer.adapter_name(),
+                    "multiple granted credentials use this adapter for one environment",
+                ));
+            }
+        }
+        let mut env = BTreeMap::new();
+        for (name, spec) in &specs {
             let cache_key = (environment_ref.to_string(), name.clone());
             let cached_material = {
                 let materials = self.materials.lock().await;
@@ -94,11 +113,11 @@ impl CredentialStore {
             // that environment. Refreshable material is resolved for every
             // preparation; static material follows the same environment cache.
             let material = if spec.lifecycle == CredentialLifecycle::Refreshable {
-                self.resolve_for_adapter(name, &spec).await?
+                self.resolve_for_adapter(name, spec).await?
             } else if let Some(material) = cached_material {
                 material
             } else {
-                let material = self.resolve_for_adapter(name, &spec).await?;
+                let material = self.resolve_for_adapter(name, spec).await?;
                 self.materials.lock().await.insert(cache_key.clone(), material.clone());
                 material
             };
@@ -108,7 +127,7 @@ impl CredentialStore {
                 self.materials.lock().await.remove(&cache_key);
                 return Err(error);
             }
-            let delivered = match self.prepare_adapter(name, &spec, material, Arc::clone(&runner), already_prepared).await {
+            let delivered = match self.prepare_adapter(name, spec, material, Arc::clone(&runner), already_prepared).await {
                 Ok(delivered) => delivered,
                 Err(message) => {
                     self.materials.lock().await.remove(&cache_key);
@@ -281,15 +300,38 @@ impl CredentialStore {
                 }
                 env.insert("GH_TOKEN".to_string(), material.to_string());
             }
-            CredentialConsumer::Forgejo { api_url } => {
+            CredentialConsumer::Forgejo { api_url, username } => {
+                let server_url = api_url.trim_end_matches('/');
+                let parsed_url = Url::parse(server_url).map_err(|error| format!("invalid Forgejo server URL: {error}"))?;
+                if parsed_url.scheme() != "https" {
+                    return Err("Forgejo server URL must use HTTPS".to_string());
+                }
+                let host = parsed_url.host_str().ok_or_else(|| "Forgejo server URL has no host".to_string())?;
+                let credential_url = match parsed_url.port() {
+                    Some(port) => format!("https://{host}:{port}"),
+                    None => format!("https://{host}"),
+                };
                 let path = format!("/run/flotilla/credentials/{}/token", safe_component(name));
+                let helper_path = format!("/run/flotilla/credentials/{}/git-credential-forgejo", safe_component(name));
                 if !already_prepared {
                     runner.write_file(Path::new(&path), material).await.map_err(|error| format!("write token file: {error}"))?;
                     runner
                         .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Noop)
                         .await
                         .map_err(|error| format!("protect token file: {error}"))?;
-                    let url = format!("{}/api/v1/user", api_url.trim_end_matches('/'));
+                    let helper = format!(
+                        "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nprotocol=\nhost=\nwhile IFS='=' read -r key value; do\n  case \"$key\" in\n    protocol) protocol=$value ;;\n    host) host=$value ;;\n  esac\ndone\n[ \"$protocol\" = https ] || exit 0\n[ \"$host\" = {host}{} ] || exit 0\nprintf 'username=%s\\n' \"$FORGEJO_USERNAME\"\nprintf 'password='\ncat \"$FORGEJO_TOKEN_FILE\"\nprintf '\\n'\n",
+                        parsed_url.port().map(|port| format!(":{port}")).unwrap_or_default()
+                    );
+                    runner
+                        .write_file(Path::new(&helper_path), &helper)
+                        .await
+                        .map_err(|error| format!("write Git credential helper: {error}"))?;
+                    runner
+                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Noop)
+                        .await
+                        .map_err(|error| format!("protect Git credential helper: {error}"))?;
+                    let url = format!("{server_url}/api/v1/user");
                     let curl_config = format!(
                         "silent\nshow-error\nfail\nheader = \"Authorization: token {}\"\nurl = \"{}\"\n",
                         sanitize_curl_config(material),
@@ -301,6 +343,13 @@ impl CredentialStore {
                         .map_err(|error| format!("authentication preflight failed: {error}"))?;
                 }
                 env.insert("FORGEJO_TOKEN_FILE".to_string(), path);
+                env.insert("FORGEJO_SERVER_URL".to_string(), server_url.to_string());
+                env.insert("FORGEJO_API_URL".to_string(), format!("{server_url}/api/v1"));
+                env.insert("FORGEJO_USERNAME".to_string(), username.to_string());
+                env.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
+                env.insert("GIT_CONFIG_KEY_0".to_string(), format!("credential.{credential_url}.helper"));
+                env.insert("GIT_CONFIG_VALUE_0".to_string(), format!("!{helper_path}"));
+                env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
             }
             CredentialConsumer::Claude => {
                 if !runner.exists("claude", &["--version"]).await {
@@ -581,7 +630,7 @@ mod tests {
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("lab-forgejo".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Forgejo { api_url: "https://forgejo.lab".to_string() },
+                consumer: CredentialConsumer::Forgejo { api_url: "https://forgejo.lab".to_string(), username: "flotilla-crew".to_string() },
                 source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
@@ -597,13 +646,28 @@ mod tests {
         let delivered =
             store.prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone()).await.expect("prepare Forgejo credential");
 
-        assert_eq!(delivered, vec![("FORGEJO_TOKEN_FILE".to_string(), "/run/flotilla/credentials/lab-forgejo/token".to_string(),)]);
-        assert_eq!(runner.writes.lock().expect("writes lock").as_slice(), &[(
-            PathBuf::from("/run/flotilla/credentials/lab-forgejo/token"),
-            secret.to_string()
-        )]);
+        assert_eq!(delivered, vec![
+            ("FORGEJO_API_URL".to_string(), "https://forgejo.lab/api/v1".to_string()),
+            ("FORGEJO_SERVER_URL".to_string(), "https://forgejo.lab".to_string()),
+            ("FORGEJO_TOKEN_FILE".to_string(), "/run/flotilla/credentials/lab-forgejo/token".to_string()),
+            ("FORGEJO_USERNAME".to_string(), "flotilla-crew".to_string()),
+            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+            ("GIT_CONFIG_KEY_0".to_string(), "credential.https://forgejo.lab.helper".to_string()),
+            ("GIT_CONFIG_VALUE_0".to_string(), "!/run/flotilla/credentials/lab-forgejo/git-credential-forgejo".to_string(),),
+            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        ]);
+        let writes = runner.writes.lock().expect("writes lock");
+        assert_eq!(writes[0], (PathBuf::from("/run/flotilla/credentials/lab-forgejo/token"), secret.to_string()));
+        assert_eq!(writes[1].0, PathBuf::from("/run/flotilla/credentials/lab-forgejo/git-credential-forgejo"));
+        assert!(writes[1].1.contains("[ \"$protocol\" = https ]"));
+        assert!(writes[1].1.contains("[ \"$host\" = forgejo.lab ]"));
+        assert!(writes[1].1.contains("$FORGEJO_USERNAME"));
+        assert!(!writes[1].1.contains(secret));
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, _)| cmd == "chmod" && args == &["0600", "/run/flotilla/credentials/lab-forgejo/token"]));
+        assert!(calls
+            .iter()
+            .any(|(cmd, args, _)| { cmd == "chmod" && args == &["0700", "/run/flotilla/credentials/lab-forgejo/git-credential-forgejo"] }));
         assert!(calls.iter().any(|(cmd, args, input)| {
             cmd == "curl"
                 && args == &["--config", "-"]
@@ -611,6 +675,106 @@ mod tests {
                 && String::from_utf8_lossy(input).contains(secret)
         }));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
+    }
+
+    async fn create_forgejo_spec(backend: &ResourceBackend, name: &str, api_url: &str, source_env: &str) {
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name(name.to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::Forgejo { api_url: api_url.to_string(), username: "flotilla-crew".to_string() },
+                source: CredentialSource::Env { name: source_env.to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create credential declaration");
+    }
+
+    #[tokio::test]
+    async fn forgejo_server_url_must_be_https() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_forgejo_spec(&backend, "lab-forgejo", "http://forgejo.lab", "TEST_FORGEJO_TOKEN").await;
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+
+        let error = store
+            .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
+            .await
+            .expect_err("plain-HTTP Forgejo server URL must be rejected");
+
+        assert!(error.contains("must use HTTPS"), "unexpected error: {error}");
+        assert!(runner.writes.lock().expect("writes lock").is_empty(), "no material may be written for a rejected URL");
+    }
+
+    #[tokio::test]
+    async fn forgejo_server_url_must_parse() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_forgejo_spec(&backend, "lab-forgejo", "not a url", "TEST_FORGEJO_TOKEN").await;
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+
+        let error = store
+            .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
+            .await
+            .expect_err("an unparsable Forgejo server URL must be rejected");
+
+        assert!(error.contains("invalid Forgejo server URL"), "unexpected error: {error}");
+        assert!(runner.writes.lock().expect("writes lock").is_empty(), "no material may be written for a rejected URL");
+    }
+
+    #[tokio::test]
+    async fn forgejo_helper_and_git_config_agree_on_an_explicit_port() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_forgejo_spec(&backend, "lab-forgejo", "https://forgejo.lab:3000", "TEST_FORGEJO_TOKEN").await;
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+
+        let delivered: BTreeMap<String, String> = store
+            .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
+            .await
+            .expect("prepare Forgejo credential with an explicit port")
+            .into_iter()
+            .collect();
+
+        assert_eq!(delivered.get("FORGEJO_SERVER_URL"), Some(&"https://forgejo.lab:3000".to_string()));
+        assert_eq!(delivered.get("GIT_CONFIG_KEY_0"), Some(&"credential.https://forgejo.lab:3000.helper".to_string()));
+        let writes = runner.writes.lock().expect("writes lock");
+        assert!(
+            writes[1].1.contains("[ \"$host\" = forgejo.lab:3000 ]"),
+            "helper must compare against the host:port form git passes when a port is present"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_credential_on_the_same_adapter_fails_loudly() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_forgejo_spec(&backend, "lab-a", "https://forgejo.lab", "TEST_TOKEN_A").await;
+        create_forgejo_spec(&backend, "lab-b", "https://other.lab", "TEST_TOKEN_B").await;
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            bag,
+            runner.clone(),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+
+        let error = store
+            .prepare("env-a", &BTreeSet::from(["lab-a".to_string(), "lab-b".to_string()]), runner.clone())
+            .await
+            .expect_err("two credentials on one adapter would silently clobber each other's delivery");
+
+        assert!(error.contains("multiple granted credentials use this adapter"), "unexpected error: {error}");
+        assert!(runner.writes.lock().expect("writes lock").is_empty(), "no material may be written when preparation is rejected");
     }
 
     #[tokio::test]
