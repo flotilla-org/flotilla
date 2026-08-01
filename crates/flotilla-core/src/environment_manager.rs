@@ -18,8 +18,8 @@ use crate::{
             FactoryRegistry,
         },
         environment::{
-            CreateOpts, EnvironmentHandle, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind,
-            EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode,
+            contained_daemon_socket_path, CreateOpts, EnvironmentHandle, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess,
+            EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode,
         },
         registry::ProviderRegistry,
         CommandRunner,
@@ -273,6 +273,7 @@ impl EnvironmentManager {
             .as_ref()
             .map(|repo| vec![ProvisionedMount::new(repo.as_path().to_path_buf(), PathBuf::from("/ref/repo"), ProvisionedMountMode::Ro)])
             .unwrap_or_default();
+        let environment_socket_path = contained_daemon_socket_path(daemon_socket_path.as_path());
         let opts = CreateOpts {
             tokens,
             working_directory: None,
@@ -280,12 +281,16 @@ impl EnvironmentManager {
             tools: vec![EnvironmentTool::new("flotilla-daemon-access", "/usr/local/bin/flotilla")
                 .with_asset(EnvironmentToolAsset::new(
                     daemon_socket_path.as_path().to_path_buf(),
-                    "/run/flotilla.sock",
+                    environment_socket_path.clone(),
                     EnvironmentToolAssetKind::UnixSocket,
                     EnvironmentToolAssetAccess::SharedWritable,
                     "the daemon socket",
                 ))
-                .with_environment(EnvironmentVariableUpdate::set("FLOTILLA_DAEMON_SOCKET", "/run/flotilla.sock", "the daemon socket"))],
+                .with_environment(EnvironmentVariableUpdate::set(
+                    "FLOTILLA_DAEMON_SOCKET",
+                    environment_socket_path.to_string_lossy(),
+                    "the daemon socket",
+                ))],
             image_pull_policy: Default::default(),
             docker_config_dir: None,
         };

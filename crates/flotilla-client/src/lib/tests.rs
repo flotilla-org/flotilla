@@ -214,6 +214,19 @@ async fn connect_or_spawn_never_spawns_over_daemon_that_appeared_during_lock_con
 }
 
 #[tokio::test]
+async fn required_host_daemon_connection_never_enters_the_spawn_path() {
+    let dir = TestSocketDir::new();
+    let socket_path = dir.socket_path("missing-host-daemon.sock");
+    let lock_path = std::path::PathBuf::from(format!("{}.lock", socket_path.display()));
+
+    let error = connect_required_host_daemon(&socket_path).await.err().expect("a missing host daemon socket should fail");
+
+    assert!(error.contains("host daemon socket stale or unreachable"), "unexpected error: {error}");
+    assert!(error.contains("a local daemon will not be spawned"), "unexpected error: {error}");
+    assert!(!lock_path.exists(), "connect-only mode must not create a daemon spawn lock");
+}
+
+#[tokio::test]
 async fn connect_or_spawn_reports_wedged_daemon_instead_of_hanging_or_respawning() {
     let dir = TestSocketDir::new();
     let socket_path = dir.socket_path("daemon.sock");

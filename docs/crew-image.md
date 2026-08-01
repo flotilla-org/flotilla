@@ -30,9 +30,11 @@ records sessions by default, so recordings remain on the host after container
 teardown. A future image release should bake cleat into the image; the shared
 runtime root remains the durability boundary either way.
 
-The mounted Flotilla CLI connects back to the host daemon through the mounted
-socket named by `FLOTILLA_DAEMON_SOCKET`; normal CLI commands honor that
-variable, not only agent-hook delivery.
+The mounted Flotilla CLI connects back to the host daemon through the socket
+named by `FLOTILLA_DAEMON_SOCKET`. Docker mounts the socket's parent directory,
+so replacing the socket inode during a host daemon restart remains visible
+inside the environment. Normal CLI commands honor that variable, not only
+agent-hook delivery, and never try to spawn a local daemon when it is set.
 
 This document is curation advice for the Flotilla project. It is not a schema
 or a contract that Flotilla validates. Flotilla's contract stays deliberately

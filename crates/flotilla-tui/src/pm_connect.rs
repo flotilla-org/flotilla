@@ -310,6 +310,7 @@ pub async fn run(
     config_dir: &Path,
     config_dir_override: Option<&Path>,
     socket_override: Option<&Path>,
+    require_host_daemon: bool,
     options: PmConnectOptions,
 ) -> Result<(), String> {
     // The connector runs headless in a PM pane: structured logs to stderr.
@@ -323,14 +324,12 @@ pub async fn run(
     let mint: Arc<dyn RecipeMint> = Arc::new(FlotillaRecipes::new(options.flotilla_bin.clone()));
     run_reconnecting(
         || async {
-            crate::socket::connect_or_spawn_with_surface(
-                socket_path,
-                config_dir,
-                config_dir_override,
-                socket_override,
-                flotilla_protocol::SurfaceDeclaration::ambient_for_namespace("flotilla"),
-            )
-            .await
+            let surface = flotilla_protocol::SurfaceDeclaration::ambient_for_namespace("flotilla");
+            if require_host_daemon {
+                crate::socket::connect_required_host_daemon_with_surface(socket_path, surface).await
+            } else {
+                crate::socket::connect_or_spawn_with_surface(socket_path, config_dir, config_dir_override, socket_override, surface).await
+            }
             .map(|daemon| daemon as Arc<dyn DaemonHandle>)
         },
         |daemon| run_connector(daemon, sink.clone(), mint.clone(), Duration::from_millis(REASSERT_INTERVAL_MS)),

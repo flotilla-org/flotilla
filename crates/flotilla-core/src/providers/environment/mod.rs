@@ -104,6 +104,17 @@ pub enum EnvironmentToolAssetAccess {
     SharedWritable,
 }
 
+/// Stable directory used for the host daemon socket inside contained
+/// environments. Docker bind-mounts the host socket's parent directory here
+/// so a daemon restart can replace the socket inode without breaking the
+/// container's view of it.
+pub const CONTAINED_DAEMON_SOCKET_DIRECTORY: &str = "/run/flotilla-daemon";
+
+pub fn contained_daemon_socket_path(host_socket_path: &Path) -> PathBuf {
+    let file_name = host_socket_path.file_name().expect("daemon socket path must name a socket file");
+    Path::new(CONTAINED_DAEMON_SOCKET_DIRECTORY).join(file_name)
+}
+
 /// A tool's requested mutation to the environment it runs in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentVariableUpdate {

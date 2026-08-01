@@ -11,7 +11,8 @@ use flotilla_core::{
     path_context::DaemonHostPath,
     providers::{
         environment::{
-            EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate,
+            contained_daemon_socket_path, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind,
+            EnvironmentVariableUpdate,
         },
         ChannelLabel, CommandRunner,
     },
@@ -19,7 +20,8 @@ use flotilla_core::{
 use tokio::sync::OnceCell;
 
 pub(crate) const ENVIRONMENT_FLOTILLA_PATH: &str = "/usr/local/bin/flotilla";
-pub(crate) const ENVIRONMENT_DAEMON_SOCKET_PATH: &str = "/run/flotilla.sock";
+#[cfg(test)]
+pub(crate) const ENVIRONMENT_DAEMON_SOCKET_PATH: &str = "/run/flotilla-daemon/flotilla.sock";
 pub(crate) const ENVIRONMENT_CLEAT_PATH: &str = "/usr/local/bin/cleat";
 pub(crate) const ENVIRONMENT_CLEAT_LIBRARY_DIR: &str = "/usr/local/lib/flotilla";
 pub(crate) const ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH: &str = "/usr/local/lib/flotilla/libghostty-vt.so.0";
@@ -123,6 +125,7 @@ impl EnvironmentToolFactory for FlotillaCliTool {
             self.binary_path.as_ref().map_err(|error| format!("flotilla CLI unavailable for environment provisioning: {error}"))?;
         let daemon_socket_path =
             self.daemon_socket_path.as_ref().map_err(|error| format!("flotilla CLI unavailable for environment provisioning: {error}"))?;
+        let environment_socket_path = contained_daemon_socket_path(daemon_socket_path.as_path());
         Ok(EnvironmentTool::new("flotilla", ENVIRONMENT_FLOTILLA_PATH)
             .with_asset(EnvironmentToolAsset::new(
                 binary_path.as_path().to_path_buf(),
@@ -133,14 +136,14 @@ impl EnvironmentToolFactory for FlotillaCliTool {
             ))
             .with_asset(EnvironmentToolAsset::new(
                 daemon_socket_path.as_path().to_path_buf(),
-                ENVIRONMENT_DAEMON_SOCKET_PATH,
+                environment_socket_path.clone(),
                 EnvironmentToolAssetKind::UnixSocket,
                 EnvironmentToolAssetAccess::SharedWritable,
                 "the daemon socket",
             ))
             .with_environment(EnvironmentVariableUpdate::set(
                 "FLOTILLA_DAEMON_SOCKET",
-                ENVIRONMENT_DAEMON_SOCKET_PATH,
+                environment_socket_path.to_string_lossy(),
                 "the daemon socket",
             )))
     }
