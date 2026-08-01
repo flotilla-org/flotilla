@@ -47,6 +47,38 @@ const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_ERROR_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
+fn is_reverse_peer_resource_socket_name(name: &str) -> bool {
+    name.strip_prefix(".peer-").is_some_and(|hash| hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn cleanup_reverse_peer_resource_sockets(socket_dir: &Path) -> Result<usize, String> {
+    let entries = match std::fs::read_dir(socket_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("failed to inspect daemon socket directory {}: {error}", socket_dir.display())),
+    };
+
+    let mut removed = 0;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("failed to inspect entry in daemon socket directory {}: {error}", socket_dir.display()))?;
+        if !is_reverse_peer_resource_socket_name(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let file_type =
+            entry.file_type().map_err(|error| format!("failed to inspect stale peer socket {}: {error}", entry.path().display()))?;
+        if file_type.is_dir() {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("failed to remove stale reverse peer socket {}: {error}", entry.path().display())),
+        }
+    }
+    Ok(removed)
+}
+
 #[derive(Debug)]
 struct AcceptErrorBackoff {
     next: Duration,
@@ -309,6 +341,10 @@ impl DaemonServer {
         // Ensure parent directory exists
         if let Some(parent) = self.socket_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("failed to create socket directory: {e}"))?;
+            let removed = cleanup_reverse_peer_resource_sockets(parent)?;
+            if removed > 0 {
+                info!(socket_dir = %parent.display(), removed, "removed stale reverse peer sockets");
+            }
         }
 
         let listener = UnixListener::bind(&self.socket_path).map_err(|e| format!("failed to bind socket: {e}"))?;

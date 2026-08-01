@@ -101,6 +101,7 @@ pub struct SshTransport {
     local_socket_path: PathBuf,
     local_daemon_socket_path: PathBuf,
     remote_resource_socket_path: PathBuf,
+    ssh_binary: PathBuf,
     ssh_process: Option<tokio::process::Child>,
     status: PeerConnectionStatus,
     /// Receiver for inbound peer data, produced by `connect_socket()` and
@@ -146,6 +147,7 @@ impl SshTransport {
             local_socket_path,
             local_daemon_socket_path: paths.daemon_socket.to_path_buf(),
             remote_resource_socket_path,
+            ssh_binary: PathBuf::from("ssh"),
             ssh_process: None,
             status: PeerConnectionStatus::Disconnected,
             inbound_rx: None,
@@ -162,6 +164,13 @@ impl SshTransport {
         // Clean up any stale local socket before spawning
         self.cleanup_socket();
 
+        // OpenSSH's client-side StreamLocalBindUnlink option only applies to
+        // the local (-L) socket. The reverse (-R) socket is bound by sshd and
+        // survives a dead tunnel unless the server is configured to unlink
+        // it. Remove our deterministic reverse socket explicitly so a stale
+        // file cannot make every subsequent tunnel attempt fail.
+        self.cleanup_remote_socket().await?;
+
         // Ensure peers directory exists
         if let Some(parent) = self.local_socket_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("failed to create peers directory: {e}"))?;
@@ -169,10 +178,7 @@ impl SshTransport {
 
         let (forward_spec, reverse_forward_spec) = self.resource_forward_specs();
 
-        let destination = match &self.config.user {
-            Some(user) => format!("{user}@{}", self.config.hostname),
-            None => self.config.hostname.clone(),
-        };
+        let destination = self.destination();
 
         info!(
             expected_host = %self.expected_host_name,
@@ -183,7 +189,7 @@ impl SshTransport {
             "spawning SSH tunnel"
         );
 
-        let child = tokio::process::Command::new("ssh")
+        let child = tokio::process::Command::new(&self.ssh_binary)
             .arg("-N") // no remote command
             .arg("-L")
             .arg(&forward_spec)
@@ -207,6 +213,48 @@ impl SshTransport {
 
         self.ssh_process = Some(child);
         Ok(())
+    }
+
+    fn destination(&self) -> String {
+        match &self.config.user {
+            Some(user) => format!("{user}@{}", self.config.hostname),
+            None => self.config.hostname.clone(),
+        }
+    }
+
+    async fn cleanup_remote_socket(&self) -> Result<(), String> {
+        let destination = self.destination();
+        let path = self.remote_resource_socket_path.to_string_lossy();
+        let command = self.remote_cleanup_command();
+        debug!(%destination, remote_socket = %path, "removing stale reverse peer socket before SSH tunnel dial");
+
+        let output = tokio::process::Command::new(&self.ssh_binary)
+            .arg(&destination)
+            .arg(&command)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        let output = tokio::time::timeout(SOCKET_POLL_TIMEOUT, output)
+            .await
+            .map_err(|_| format!("timed out removing stale reverse peer socket at {path} on {destination}"))?
+            .map_err(|e| format!("failed to run remote stale peer socket cleanup at {path} on {destination}: {e}"))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "failed to remove stale reverse peer socket at {path} on {destination}: ssh exited with {}{}",
+            output.status,
+            if stderr.trim().is_empty() { String::new() } else { format!(": {}", stderr.trim()) }
+        ))
+    }
+
+    fn remote_cleanup_command(&self) -> String {
+        format!("rm -f -- {}", shell_quote(&self.remote_resource_socket_path.to_string_lossy()))
     }
 
     fn resource_forward_specs(&self) -> (String, String) {
@@ -425,6 +473,10 @@ impl SshTransport {
     }
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 #[async_trait]
 impl PeerTransport for SshTransport {
     async fn connect(&mut self) -> Result<(), String> {
@@ -518,6 +570,8 @@ impl Drop for SshTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use flotilla_protocol::PeerDataMessage;
     use tokio::io::AsyncWriteExt;
 
@@ -596,6 +650,111 @@ mod tests {
                     .display()
             )
         );
+    }
+
+    #[test]
+    fn remote_socket_cleanup_command_quotes_the_derived_path() {
+        let config = RemoteHostConfig {
+            hostname: "feta.local".to_string(),
+            expected_host_name: "feta".to_string(),
+            expected_node_id: None,
+            user: Some("flotilla".to_string()),
+            daemon_socket: "/home/O'Brien/.config/flotilla/flotilla.sock".to_string(),
+            ssh_multiplex: None,
+        };
+        let transport = SshTransport::new(
+            NodeId::new("kiwi"),
+            "kiwi".into(),
+            ConfigLabel("feta".into()),
+            config,
+            None,
+            uuid::Uuid::nil(),
+            SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
+        )
+        .expect("valid transport");
+
+        assert_eq!(
+            transport.remote_cleanup_command(),
+            format!(
+                "rm -f -- '/home/O'\"'\"'Brien/.config/flotilla/{}'",
+                transport.remote_resource_socket_path.file_name().expect("socket file name").to_string_lossy()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn spawning_tunnel_removes_stale_reverse_socket_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon_socket = tmp.path().join("flotilla.sock");
+        let config = RemoteHostConfig {
+            hostname: "feta.local".to_string(),
+            expected_host_name: "feta".to_string(),
+            expected_node_id: None,
+            user: None,
+            daemon_socket: daemon_socket.to_string_lossy().into_owned(),
+            ssh_multiplex: None,
+        };
+        let mut transport = SshTransport::new(
+            NodeId::new("kiwi"),
+            "kiwi".into(),
+            ConfigLabel("feta".into()),
+            config,
+            None,
+            uuid::Uuid::nil(),
+            SshTransportPaths { state_dir: tmp.path(), daemon_socket: &daemon_socket },
+        )
+        .expect("valid transport");
+        std::fs::write(&transport.remote_resource_socket_path, []).expect("create stale reverse socket stand-in");
+
+        let fake_ssh = tmp.path().join("ssh");
+        std::fs::write(&fake_ssh, "#!/bin/sh\nif [ \"$#\" -eq 2 ]; then exec /bin/sh -c \"$2\"; fi\nexit 0\n").expect("write fake ssh");
+        let mut permissions = std::fs::metadata(&fake_ssh).expect("fake ssh metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ssh, permissions).expect("make fake ssh executable");
+        transport.ssh_binary = fake_ssh;
+
+        transport.spawn_ssh().await.expect("stale cleanup and tunnel spawn should succeed");
+
+        assert!(!transport.remote_resource_socket_path.exists(), "stale reverse socket must be removed before the tunnel is spawned");
+        let status = transport.ssh_process.as_mut().expect("tunnel child").wait().await.expect("wait for fake tunnel");
+        assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn remote_socket_cleanup_failure_names_the_stale_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let daemon_socket = tmp.path().join("flotilla.sock");
+        let config = RemoteHostConfig {
+            hostname: "feta.local".to_string(),
+            expected_host_name: "feta".to_string(),
+            expected_node_id: None,
+            user: None,
+            daemon_socket: daemon_socket.to_string_lossy().into_owned(),
+            ssh_multiplex: None,
+        };
+        let mut transport = SshTransport::new(
+            NodeId::new("kiwi"),
+            "kiwi".into(),
+            ConfigLabel("feta".into()),
+            config,
+            None,
+            uuid::Uuid::nil(),
+            SshTransportPaths { state_dir: tmp.path(), daemon_socket: &daemon_socket },
+        )
+        .expect("valid transport");
+        let fake_ssh = tmp.path().join("ssh");
+        std::fs::write(&fake_ssh, "#!/bin/sh\necho cleanup-denied >&2\nexit 23\n").expect("write failing fake ssh");
+        let mut permissions = std::fs::metadata(&fake_ssh).expect("fake ssh metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_ssh, permissions).expect("make fake ssh executable");
+        transport.ssh_binary = fake_ssh;
+
+        let error = transport.spawn_ssh().await.expect_err("cleanup failure must stop the tunnel dial");
+
+        assert!(error.contains("failed to remove stale reverse peer socket"), "unexpected error: {error}");
+        assert!(error.contains(&transport.remote_resource_socket_path.to_string_lossy().into_owned()), "unexpected error: {error}");
+        assert!(error.contains("cleanup-denied"), "unexpected error: {error}");
+        assert!(transport.ssh_process.is_none(), "tunnel must not spawn after cleanup failure");
     }
 
     #[test]
