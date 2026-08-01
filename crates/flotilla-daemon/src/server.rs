@@ -306,6 +306,18 @@ impl DaemonServer {
         socket_path: PathBuf,
         idle_timeout: Duration,
     ) -> Result<Self, String> {
+        let socket_discovery_path = config.base_path().as_path().join("run/socket-path");
+        Self::new_with_socket_discovery_path(repo_paths, config, discovery, socket_path, socket_discovery_path, idle_timeout).await
+    }
+
+    pub async fn new_with_socket_discovery_path(
+        repo_paths: Vec<PathBuf>,
+        config: Arc<ConfigStore>,
+        discovery: DiscoveryRuntime,
+        socket_path: PathBuf,
+        socket_discovery_path: PathBuf,
+        idle_timeout: Duration,
+    ) -> Result<Self, String> {
         let daemon_config = config.load_daemon_config()?;
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
         let resource_backend = build_embedded_resource_backend(&config).await?;
@@ -320,8 +332,6 @@ impl DaemonServer {
         let agent_state_store = Arc::clone(daemon.agent_state_store());
         let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
         let peer_resource_socket_dir = config.state_dir().as_path().join("peers");
-        let socket_discovery_path = config.base_path().as_path().join("run/socket-path");
-
         Ok(Self {
             daemon,
             socket_path,
@@ -536,8 +546,14 @@ fn publish_socket_path(discovery_path: &Path, socket_path: &Path) -> Result<(), 
     let parent =
         discovery_path.parent().ok_or_else(|| format!("daemon socket discovery path has no parent: {}", discovery_path.display()))?;
     std::fs::create_dir_all(parent).map_err(|error| format!("failed to create daemon socket discovery directory: {error}"))?;
-    std::fs::write(discovery_path, format!("{}\n", socket_path.display()))
-        .map_err(|error| format!("failed to publish daemon socket path at {}: {error}", discovery_path.display()))
+    let temporary_path = parent.join(format!(".socket-path-{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&temporary_path, format!("{}\n", socket_path.display()))
+        .map_err(|error| format!("failed to write daemon socket discovery file at {}: {error}", temporary_path.display()))?;
+    if let Err(error) = std::fs::rename(&temporary_path, discovery_path) {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(format!("failed to publish daemon socket path at {}: {error}", discovery_path.display()));
+    }
+    Ok(())
 }
 
 fn spawn_peer_networking_runtime(

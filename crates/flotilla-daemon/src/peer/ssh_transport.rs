@@ -31,7 +31,9 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Remote command that reads the accepting daemon's published socket path.
 /// The discovery file is stable dialer-facing configuration; its contents are
 /// owned by the remote daemon and may change between connection attempts.
-const REMOTE_SOCKET_PATH_COMMAND: &str = "cat \"${XDG_CONFIG_HOME:-$HOME/.config}/flotilla/run/socket-path\"";
+const REMOTE_SOCKET_PATH_COMMAND: &str = "cat \"$HOME/.config/flotilla/run/socket-path\"";
+
+const PRE_HELLO_CLOSE_ERROR: &str = "peer closed before sending hello";
 
 /// Channel buffer size for inbound and outbound peer data messages.
 const CHANNEL_BUFFER: usize = 256;
@@ -368,7 +370,7 @@ impl SshTransport {
             .next_line()
             .await
             .map_err(|e| format!("failed to read peer hello: {e}"))?
-            .ok_or_else(|| "peer closed before sending hello".to_string())?;
+            .ok_or_else(|| PRE_HELLO_CLOSE_ERROR.to_string())?;
         let hello = serde_json::from_str(&line).map_err(|e| format!("failed to parse peer hello: {e}"))?;
         let (remote_node_info, remote_session_id) =
             Self::validate_remote_hello(&self.expected_host_name, self.expected_node_id.as_ref(), hello)?;
@@ -581,7 +583,7 @@ impl PeerTransport for SshTransport {
             Ok(rx) => rx,
             Err(error) => {
                 self.cleanup_socket();
-                if error == "peer closed before sending hello" {
+                if error == PRE_HELLO_CLOSE_ERROR {
                     return Err(self.diagnose_pre_hello_close().await.unwrap_or(error));
                 }
                 return Err(error);
