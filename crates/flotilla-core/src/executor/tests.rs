@@ -768,11 +768,8 @@ async fn create_workspace_from_prepared_terminal_wraps_remote_commands_in_ssh() 
     let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
     let repo_root = temp.path().join("repo");
     std::fs::create_dir_all(&repo_root).expect("create repo root");
-    std::fs::write(
-        temp.path().join("hosts.toml"),
-        "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n",
-    )
-    .expect("write hosts config");
+    std::fs::write(temp.path().join("hosts.toml"), "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\n")
+        .expect("write hosts config");
     let attachable_set_id = {
         let mut store = attachable_store.lock().expect("store lock");
         store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/remote/feat").into()))
@@ -819,11 +816,8 @@ async fn create_workspace_from_prepared_terminal_prefixes_name_with_host() {
     let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
     let repo_root = temp.path().join("repo");
     std::fs::create_dir_all(&repo_root).expect("create repo root");
-    std::fs::write(
-        temp.path().join("hosts.toml"),
-        "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n",
-    )
-    .expect("write hosts config");
+    std::fs::write(temp.path().join("hosts.toml"), "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\n")
+        .expect("write hosts config");
     let attachable_set_id = {
         let mut store = attachable_store.lock().expect("store lock");
         store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/remote/feat").into()))
@@ -862,11 +856,8 @@ async fn create_workspace_from_prepared_terminal_persists_remote_attachable_set_
     let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
     let repo_root = temp.path().join("repo");
     std::fs::create_dir_all(&repo_root).expect("create repo root");
-    std::fs::write(
-        temp.path().join("hosts.toml"),
-        "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n",
-    )
-    .expect("write hosts config");
+    std::fs::write(temp.path().join("hosts.toml"), "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\n")
+        .expect("write hosts config");
 
     let set_id = {
         let mut store = attachable_store.lock().expect("store lock");
@@ -990,11 +981,8 @@ async fn create_workspace_from_prepared_terminal_uses_local_fallback_for_remote_
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
     let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
-    std::fs::write(
-        temp.path().join("hosts.toml"),
-        "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n",
-    )
-    .expect("write hosts config");
+    std::fs::write(temp.path().join("hosts.toml"), "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\n")
+        .expect("write hosts config");
     let attachable_set_id = {
         let mut store = attachable_store.lock().expect("store lock");
         store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/remote/feat").into()))

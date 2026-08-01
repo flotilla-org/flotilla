@@ -489,12 +489,10 @@ hostname = "desktop.local"
 expected_host_name = "desktop"
 expected_node_id = "1b4d1d6b-f7b5-4c1c-8f61-6f2d8e4c91ab"
 user = "robert"
-daemon_socket = "/run/user/1000/flotilla/daemon.sock"
 
 [hosts.cloud]
 hostname = "10.0.1.50"
 expected_host_name = "cloud"
-daemon_socket = "/home/robert/.config/flotilla/daemon.sock"
 "#;
     let config: HostsConfig = toml::from_str(toml).unwrap();
     assert_eq!(config.hosts.len(), 2);
@@ -511,7 +509,6 @@ fn parse_hosts_config_defaults_expected_host_name_to_table_key() {
     let toml = r#"
 [hosts.desktop]
 hostname = "desktop.local"
-daemon_socket = "/run/user/1000/flotilla/daemon.sock"
 "#;
     let config: HostsConfig = toml::from_str(toml).unwrap();
     assert_eq!(config.hosts.len(), 1);
@@ -594,7 +591,7 @@ fn load_hosts_from_file() {
     let base = dir.path();
     std::fs::write(
         base.join("hosts.toml"),
-        "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\nexpected_node_id = \"1b4d1d6b-f7b5-4c1c-8f61-6f2d8e4c91ab\"\ndaemon_socket = \"/tmp/d.sock\"\n",
+        "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\nexpected_node_id = \"1b4d1d6b-f7b5-4c1c-8f61-6f2d8e4c91ab\"\n",
     )
     .unwrap();
     let store = ConfigStore::with_base(base);
@@ -609,11 +606,7 @@ fn load_hosts_from_file() {
 fn load_hosts_invalid_file_returns_error() {
     let dir = tempdir().unwrap();
     let base = dir.path();
-    std::fs::write(
-        base.join("hosts.toml"),
-        "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = [\ndaemon_socket = \"/tmp/d.sock\"\n",
-    )
-    .unwrap();
+    std::fs::write(base.join("hosts.toml"), "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = [\n").unwrap();
     let store = ConfigStore::with_base(base);
     let err = store.load_hosts().expect_err("invalid hosts config should error");
     assert!(err.contains("failed to parse"));
@@ -686,8 +679,8 @@ fn load_hosts_with_ssh_config() {
         base.join("hosts.toml"),
         "\
 [ssh]\nmultiplex = false\n\n\
-[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/d.sock\"\n\n\
-[hosts.feta]\nhostname = \"feta.local\"\nexpected_host_name = \"feta\"\ndaemon_socket = \"/tmp/f.sock\"\nssh_multiplex = true\n",
+[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\n\n\
+[hosts.feta]\nhostname = \"feta.local\"\nexpected_host_name = \"feta\"\nssh_multiplex = true\n",
     )
     .unwrap();
     let store = ConfigStore::with_base(base);
@@ -706,11 +699,7 @@ fn load_hosts_with_ssh_config() {
 fn load_hosts_ssh_defaults_to_multiplex_true() {
     let dir = tempdir().unwrap();
     let base = dir.path();
-    std::fs::write(
-        base.join("hosts.toml"),
-        "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\ndaemon_socket = \"/tmp/d.sock\"\n",
-    )
-    .unwrap();
+    std::fs::write(base.join("hosts.toml"), "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\n").unwrap();
     let store = ConfigStore::with_base(base);
     let config = store.load_hosts().unwrap();
     // No [ssh] section — defaults to multiplex=true

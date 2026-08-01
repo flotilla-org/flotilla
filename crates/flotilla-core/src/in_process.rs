@@ -739,8 +739,6 @@ fn fleet_replica_ssh_args(remote: &RemoteHostConfig, multiplex: bool) -> Vec<Str
         Arg::Literal("&&".to_string()),
         Arg::Literal("exec".to_string()),
         Arg::Literal("flotilla".to_string()),
-        Arg::Literal("--socket".to_string()),
-        Arg::Quoted(remote.daemon_socket.clone()),
         Arg::Literal("--json".to_string()),
         Arg::Quoted("replica-snapshot".to_string()),
     ];

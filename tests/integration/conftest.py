@@ -190,7 +190,6 @@ def topology():
                     "[hosts.node-b]",
                     'hostname = "node-b"',
                     'expected_host_name = "node-b"',
-                    'daemon_socket = "/home/flotilla/.config/flotilla/flotilla.sock"',
                     "TOML",
                 ]
             ),

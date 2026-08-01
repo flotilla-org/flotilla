@@ -144,12 +144,10 @@ def hub_spoke_topology():
                     "[hosts.homelab-1]",
                     'hostname = "homelab-1"',
                     'expected_host_name = "homelab-1"',
-                    'daemon_socket = "/home/flotilla/.config/flotilla/flotilla.sock"',
                     "",
                     "[hosts.homelab-2]",
                     'hostname = "homelab-2"',
                     'expected_host_name = "homelab-2"',
-                    'daemon_socket = "/home/flotilla/.config/flotilla/flotilla.sock"',
                     "TOML",
                 ]
             ),

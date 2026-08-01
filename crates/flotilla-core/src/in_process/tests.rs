@@ -918,9 +918,7 @@ async fn create_remote_attach_environment(daemon: &InProcessDaemon, host: &str) 
 fn write_attach_hosts_config(config_base: &Path, hosts: &[(&str, &str, Option<&str>)]) {
     let mut toml = "[ssh]\nmultiplex = false\n".to_string();
     for (label, hostname, user) in hosts {
-        toml.push_str(&format!(
-            "\n[hosts.{label}]\nhostname = \"{hostname}\"\nexpected_host_name = \"{label}\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n"
-        ));
+        toml.push_str(&format!("\n[hosts.{label}]\nhostname = \"{hostname}\"\nexpected_host_name = \"{label}\"\n"));
         if let Some(user) = user {
             toml.push_str(&format!("user = \"{user}\"\n"));
         }
@@ -1925,7 +1923,6 @@ fn fleet_replica_ssh_args_wraps_snapshot_command_in_remote_login_shell() {
         expected_host_name: "feta".to_string(),
         expected_node_id: None,
         user: Some("alice".to_string()),
-        daemon_socket: "/tmp/flotilla.sock".to_string(),
         ssh_multiplex: None,
     };
 
@@ -1939,8 +1936,8 @@ fn fleet_replica_ssh_args_wraps_snapshot_command_in_remote_login_shell() {
 
     let remote_command = args.last().expect("remote command arg");
     assert!(remote_command.starts_with("${SHELL:-/bin/sh} -l -c "), "remote command should start with login shell: {remote_command}");
-    assert!(remote_command.contains("exec flotilla --socket"), "remote command should execute flotilla: {remote_command}");
-    assert!(remote_command.contains("/tmp/flotilla.sock"), "remote command should include socket: {remote_command}");
+    assert!(remote_command.contains("exec flotilla --json"), "remote command should execute flotilla: {remote_command}");
+    assert!(!remote_command.contains("--socket"), "remote command should derive the daemon socket: {remote_command}");
     assert!(remote_command.contains("replica-snapshot"), "remote command should include hidden subcommand: {remote_command}");
     assert!(!args.iter().any(|arg| arg == "&&"), "shell operators must not be separate SSH argv elements: {args:?}");
 }
@@ -1952,7 +1949,6 @@ fn fleet_replica_ssh_args_preserves_multiplex_options() {
         expected_host_name: "feta".to_string(),
         expected_node_id: None,
         user: None,
-        daemon_socket: "/tmp/flotilla.sock".to_string(),
         ssh_multiplex: None,
     };
 

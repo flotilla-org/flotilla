@@ -1,15 +1,24 @@
-use std::{io::IsTerminal, path::Path, sync::Arc, time::Duration};
+use std::{
+    io::IsTerminal,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use flotilla_core::{
     config::ConfigStore,
     log_file::{rotating_log_writer, DAEMON_LOG_DIRECTORY, DAEMON_LOG_FILE},
     path_context::DaemonHostPath,
+    path_policy::PathPolicy,
     providers::discovery::DiscoveryRuntime,
 };
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{resource_limits::raise_file_descriptor_limit, restart_history::DaemonLifecycle, runtime::DaemonRuntime, server::DaemonServer};
+use crate::{
+    resource_limits::raise_file_descriptor_limit, restart_history::DaemonLifecycle, runtime::DaemonRuntime, server::DaemonServer,
+    DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH,
+};
 
 pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeout_secs: u64) -> Result<(), String> {
     let lifecycle = DaemonLifecycle::begin(state_dir)?;
@@ -45,7 +54,15 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
 
     let discovery = DiscoveryRuntime::for_process(daemon_config.follower);
     let repo_root_paths = repo_roots.into_iter().map(|p| p.into_path_buf()).collect();
-    let server = DaemonServer::new(repo_root_paths, Arc::clone(&config), discovery, socket_path.to_path_buf(), timeout).await?;
+    let server = DaemonServer::new_with_socket_discovery_path(
+        repo_root_paths,
+        Arc::clone(&config),
+        discovery,
+        socket_path.to_path_buf(),
+        stable_socket_discovery_path(),
+        timeout,
+    )
+    .await?;
     let daemon = server.daemon();
     let runtime = DaemonRuntime::start(daemon, Arc::clone(&config), Some(socket_path.to_path_buf())).await?;
 
@@ -58,4 +75,11 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
         lifecycle.finish()?;
     }
     result
+}
+
+fn stable_socket_discovery_path() -> PathBuf {
+    // This path is a dialer-facing contract derived from the remote user's
+    // home, so deliberately do not inherit config-directory overrides.
+    let home_policy = PathPolicy::from_env(|key| if key == "HOME" { std::env::var_os(key) } else { None });
+    home_policy.config_dir.into_path_buf().join(DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH)
 }

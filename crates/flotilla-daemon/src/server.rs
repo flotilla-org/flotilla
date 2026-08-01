@@ -41,7 +41,10 @@ use self::{
     remote_commands::{ForwardedCommandMap, PendingRemoteCancelMap, PendingRemoteCommandMap, RemoteCommandRouter},
     shared::{sync_peer_query_state, SocketPeerSender},
 };
-use crate::peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, SshTransport, SshTransportPaths};
+use crate::{
+    peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, SshTransport, SshTransportPaths},
+    DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH,
+};
 
 const CONNECTION_PREFACE_TIMEOUT: Duration = Duration::from_secs(10);
 const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -271,6 +274,7 @@ pub fn spawn_test_peer_networking(
 pub struct DaemonServer {
     daemon: Arc<InProcessDaemon>,
     socket_path: PathBuf,
+    socket_discovery_path: PathBuf,
     idle_timeout: Duration,
     follower: bool,
     client_count: Arc<AtomicUsize>,
@@ -305,6 +309,18 @@ impl DaemonServer {
         socket_path: PathBuf,
         idle_timeout: Duration,
     ) -> Result<Self, String> {
+        let socket_discovery_path = config.base_path().as_path().join(DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH);
+        Self::new_with_socket_discovery_path(repo_paths, config, discovery, socket_path, socket_discovery_path, idle_timeout).await
+    }
+
+    pub async fn new_with_socket_discovery_path(
+        repo_paths: Vec<PathBuf>,
+        config: Arc<ConfigStore>,
+        discovery: DiscoveryRuntime,
+        socket_path: PathBuf,
+        socket_discovery_path: PathBuf,
+        idle_timeout: Duration,
+    ) -> Result<Self, String> {
         let daemon_config = config.load_daemon_config()?;
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
         let resource_backend = build_embedded_resource_backend(&config).await?;
@@ -319,10 +335,10 @@ impl DaemonServer {
         let agent_state_store = Arc::clone(daemon.agent_state_store());
         let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
         let peer_resource_socket_dir = config.state_dir().as_path().join("peers");
-
         Ok(Self {
             daemon,
             socket_path,
+            socket_discovery_path,
             idle_timeout,
             follower: daemon_config.follower,
             client_count: Arc::new(AtomicUsize::new(0)),
@@ -368,6 +384,8 @@ impl DaemonServer {
         }
 
         let listener = UnixListener::bind(&self.socket_path).map_err(|e| format!("failed to bind socket: {e}"))?;
+
+        publish_socket_path(&self.socket_discovery_path, &self.socket_path)?;
 
         info!(path = %self.socket_path.display(), "daemon listening");
 
@@ -525,6 +543,20 @@ impl DaemonServer {
         info!("daemon server stopped");
         Ok(())
     }
+}
+
+fn publish_socket_path(discovery_path: &Path, socket_path: &Path) -> Result<(), String> {
+    let parent =
+        discovery_path.parent().ok_or_else(|| format!("daemon socket discovery path has no parent: {}", discovery_path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("failed to create daemon socket discovery directory: {error}"))?;
+    let temporary_path = parent.join(format!(".socket-path-{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&temporary_path, format!("{}\n", socket_path.display()))
+        .map_err(|error| format!("failed to write daemon socket discovery file at {}: {error}", temporary_path.display()))?;
+    if let Err(error) = std::fs::rename(&temporary_path, discovery_path) {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(format!("failed to publish daemon socket path at {}: {error}", discovery_path.display()));
+    }
+    Ok(())
 }
 
 fn spawn_peer_networking_runtime(
