@@ -177,6 +177,10 @@ pub struct TerminalSessionStatus {
     /// intent so a daemon restart or mesh partition cannot lose the final act.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_pending: Option<CrewCompletionPending>,
+    /// Set when the controller exhausts its budget for one repeated reconcile
+    /// error. The session remains parked until an explicit restart clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<TerminalSessionDegradedCondition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +189,14 @@ pub struct CrewCompletionPending {
     pub attempted_at: DateTime<Utc>,
     pub authority: String,
     pub last_error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSessionDegradedCondition {
+    pub reason: String,
+    pub message: String,
+    pub consecutive_failures: u32,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +296,11 @@ pub enum TerminalSessionStatusPatch {
         message: String,
         stopped_at: Option<DateTime<Utc>>,
     },
+    MarkReconcileDegraded {
+        message: String,
+        consecutive_failures: u32,
+        observed_at: DateTime<Utc>,
+    },
     ObserveAttention {
         attention: TerminalAttention,
     },
@@ -334,6 +351,20 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     if let Some(stopped_at) = stopped_at {
                         attention.as_of = *stopped_at;
                     }
+                }
+            }
+            Self::MarkReconcileDegraded { message, consecutive_failures, observed_at } => {
+                status.phase = TerminalSessionPhase::Failed;
+                status.message = Some(format!("reconcile stopped after {consecutive_failures} consecutive failures: {message}"));
+                status.degraded = Some(TerminalSessionDegradedCondition {
+                    reason: "ReconcileErrorBudgetExhausted".to_string(),
+                    message: message.clone(),
+                    consecutive_failures: *consecutive_failures,
+                    observed_at: *observed_at,
+                });
+                if let Some(attention) = &mut status.attention {
+                    attention.state = TerminalAttentionState::Unobservable;
+                    attention.as_of = *observed_at;
                 }
             }
             Self::ObserveAttention { attention } => {

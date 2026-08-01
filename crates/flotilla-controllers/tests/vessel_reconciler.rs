@@ -2205,6 +2205,7 @@ async fn create_running_terminal(
             delivered_message_id: None,
             attention: None,
             completion_pending: None,
+            degraded: None,
         })
         .await
         .expect("terminal status update should succeed");

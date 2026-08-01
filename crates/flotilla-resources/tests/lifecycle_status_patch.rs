@@ -76,6 +76,7 @@ define_patch_kinds! {
     TerminalClearCompletionPending => NONE,
     TerminalMarkStopped => DUPLICATE,
     TerminalMarkFailed => DUPLICATE,
+    TerminalMarkReconcileDegraded => NONE,
     VesselMarkProvisioning => DUPLICATE,
     VesselMarkReady => DUPLICATE,
     VesselMarkInterrupted => NONE,
@@ -118,6 +119,7 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
         TerminalSessionStatusPatch::MarkMessageDelivered { .. } => PatchKind::TerminalMarkMessageDelivered,
         TerminalSessionStatusPatch::MarkStopped { .. } => PatchKind::TerminalMarkStopped,
         TerminalSessionStatusPatch::MarkFailed { .. } => PatchKind::TerminalMarkFailed,
+        TerminalSessionStatusPatch::MarkReconcileDegraded { .. } => PatchKind::TerminalMarkReconcileDegraded,
         TerminalSessionStatusPatch::ObserveAttention { .. } => PatchKind::TerminalObserveAttention,
         TerminalSessionStatusPatch::MarkCompletionPending { .. } => PatchKind::TerminalMarkCompletionPending,
         TerminalSessionStatusPatch::ClearCompletionPending => PatchKind::TerminalClearCompletionPending,
@@ -550,6 +552,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     delivered_message_id: None,
                     attention: None,
                     completion_pending: None,
+                    degraded: None,
                 };
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
                 let patch = TerminalSessionStatusPatch::MarkRunning {
