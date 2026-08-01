@@ -1373,6 +1373,28 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
     assert_eq!(pending.authority, "feta");
     assert!(pending.last_error.contains("authority unreachable for stranded"));
 
+    router
+        .dispatch_execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::CrewComplete {
+                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                message: Some("https://github.com/flotilla-org/flotilla/pull/1301".into()),
+            },
+        })
+        .await
+        .expect_err("corrected completion should remain queued during the partition");
+    let pending = sessions
+        .get("terminal-stranded-work-coder")
+        .await
+        .expect("terminal after corrected completion")
+        .status
+        .expect("terminal status")
+        .completion_pending
+        .expect("corrected durable completion intent");
+    assert_eq!(pending.message.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/1301"));
+
     let delivered = Arc::new(StdMutex::new(Vec::new()));
     peer_manager.lock().await.register_sender(node("feta"), Arc::new(CapturePeerSender(Arc::clone(&delivered))));
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -1388,7 +1410,11 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
 
     let request_id = match delivered.lock().expect("delivered lock").first().expect("retried command") {
         PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { request_id, command, .. }) => {
-            assert!(matches!(command.action, CommandAction::CrewComplete { .. }));
+            assert!(matches!(
+                &command.action,
+                CommandAction::CrewComplete { message: Some(message), .. }
+                    if message == "https://github.com/flotilla-org/flotilla/pull/1301"
+            ));
             *request_id
         }
         other => panic!("expected retried crew completion, got {other:?}"),

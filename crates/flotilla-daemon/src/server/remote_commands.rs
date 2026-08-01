@@ -49,6 +49,12 @@ pub(super) struct PendingCrewCompletionRoute {
     authority: Option<HostName>,
 }
 
+#[derive(Clone)]
+struct CrewCompletionRetryState {
+    completion: PendingCrewCompletionRoute,
+    generation: u64,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ForwardedCommand {
     pub(super) state: ForwardedCommandState,
@@ -113,9 +119,8 @@ pub(super) struct RemoteCommandRouter {
     pending_remote_step_cancels: PendingRemoteStepCancelMap,
     forwarded_remote_step_batches: ForwardedRemoteStepBatchMap,
     next_remote_command_id: Arc<AtomicU64>,
-    /// Session name -> whether another retry was requested while its retry
-    /// task was dispatching.
-    retrying_crew_completions: Arc<StdMutex<HashMap<String, bool>>>,
+    /// Session name -> latest completion intent and its update generation.
+    retrying_crew_completions: Arc<StdMutex<HashMap<String, CrewCompletionRetryState>>>,
 }
 
 #[derive(bon::Builder)]
@@ -1017,34 +1022,38 @@ impl RemoteCommandRouter {
     }
 
     fn spawn_crew_completion_retry(&self, completion: PendingCrewCompletionRoute) {
+        let session_name = completion.session_name.clone();
         {
             let mut retrying = self.retrying_crew_completions.lock().expect("crew completion retry lock");
-            if let Some(retry_requested) = retrying.get_mut(&completion.session_name) {
-                *retry_requested = true;
+            if let Some(state) = retrying.get_mut(&session_name) {
+                state.completion = completion;
+                state.generation = state.generation.wrapping_add(1);
                 return;
             }
-            retrying.insert(completion.session_name.clone(), false);
+            retrying.insert(session_name.clone(), CrewCompletionRetryState { completion, generation: 0 });
         }
         let router = self.clone();
         tokio::spawn(async move {
             let mut delay = Duration::from_secs(1);
             loop {
                 tokio::time::sleep(delay).await;
-                if let Some(retry_requested) =
-                    router.retrying_crew_completions.lock().expect("crew completion retry lock").get_mut(&completion.session_name)
-                {
-                    *retry_requested = false;
-                }
+                let Some(state) = router.retrying_crew_completions.lock().expect("crew completion retry lock").get(&session_name).cloned()
+                else {
+                    return;
+                };
                 let command = Command {
                     node_id: None,
                     provisioning_target: None,
                     context_repo: None,
-                    action: CommandAction::CrewComplete { context: completion.context.clone(), message: completion.message.clone() },
+                    action: CommandAction::CrewComplete {
+                        context: state.completion.context.clone(),
+                        message: state.completion.message.clone(),
+                    },
                 };
                 if router.dispatch_execute_for_principal(command, None).await.is_ok() {
                     let mut retrying = router.retrying_crew_completions.lock().expect("crew completion retry lock");
-                    if !retrying.get(&completion.session_name).copied().unwrap_or(false) {
-                        retrying.remove(&completion.session_name);
+                    if retrying.get(&session_name).is_some_and(|current| current.generation == state.generation) {
+                        retrying.remove(&session_name);
                         return;
                     }
                 }
