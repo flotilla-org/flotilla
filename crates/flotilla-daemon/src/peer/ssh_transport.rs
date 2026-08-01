@@ -23,7 +23,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// How long to wait for the forwarded socket to appear after spawning SSH.
-const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(10);
+const FORWARDED_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long to wait for an SSH discovery, cleanup, or diagnostic command.
+const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Interval between polls when waiting for the socket to appear.
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -244,7 +247,7 @@ impl SshTransport {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output();
-        let output = tokio::time::timeout(SOCKET_POLL_TIMEOUT, output)
+        let output = tokio::time::timeout(REMOTE_COMMAND_TIMEOUT, output)
             .await
             .map_err(|_| format!("timed out resolving remote daemon socket path on {destination}"))?
             .map_err(|error| format!("failed to resolve remote daemon socket path on {destination}: {error}"))?;
@@ -275,7 +278,7 @@ impl SshTransport {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .output();
-        let output = tokio::time::timeout(SOCKET_POLL_TIMEOUT, output)
+        let output = tokio::time::timeout(REMOTE_COMMAND_TIMEOUT, output)
             .await
             .map_err(|_| format!("timed out removing stale reverse peer socket at {path} on {destination}"))?
             .map_err(|e| format!("failed to run remote stale peer socket cleanup at {path} on {destination}: {e}"))?;
@@ -321,7 +324,7 @@ impl SshTransport {
     /// unreachable host, etc.) to fail fast instead of waiting the
     /// full timeout.
     async fn wait_for_socket(&mut self) -> Result<(), String> {
-        let deadline = tokio::time::Instant::now() + SOCKET_POLL_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + FORWARDED_SOCKET_TIMEOUT;
 
         loop {
             if self.local_socket_path.exists() {
@@ -468,7 +471,7 @@ impl SshTransport {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output();
-        let output = tokio::time::timeout(SOCKET_POLL_TIMEOUT, output).await.ok()?.ok()?;
+        let output = tokio::time::timeout(REMOTE_COMMAND_TIMEOUT, output).await.ok()?.ok()?;
 
         match output.status.code() {
             Some(0) | Some(255) | None => None,
