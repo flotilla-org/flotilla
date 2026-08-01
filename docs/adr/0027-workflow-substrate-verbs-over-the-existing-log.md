@@ -116,12 +116,13 @@ registrations as well as by standing rules.
 | Plain shell | blocks on the watch stream |
 | Crew script, parked | daemon registers condition → resume, SIGSTOPs the process |
 | Crew script, evicted | process killed; re-run from the top; step keys make this sound |
-| Agent | turn ends; resume is a new engagement carrying the which-condition digest |
+| Agent | turn ends; resume is a new turn carrying the which-condition digest |
 
 `wait` ships block-only first, but its contract declares the full ladder so
 park/evict/wake are compatible deepenings. Discipline: `wait` must be a
 script's only blocking point against flotilla state for evict to be sound. A
-parked script *is* an engagement-rule row — visible, coalescible, migratable.
+parked script *is* a row in that table — a rule that engages crew — visible,
+coalescible, migratable.
 
 ### Machinery obligations
 
@@ -132,11 +133,11 @@ parked script *is* an engagement-rule row — visible, coalescible, migratable.
   filed.
 - **Three-valued honesty**: Unknown triggers nothing and closes nothing;
   episodes hold.
-- **Episode identity** (plainly: one firing, one engagement — and a
-  re-fire is a new, escalated round, not a re-trigger): one open engagement
-  per (condition source, convoy, vessel, role); a predicate that holds again
-  after a completed, freshly-judged engagement opens a new episode and
-  climbs a machinery-owned escalation ladder.
+- **Episode identity** (plainly: one firing, one turn — and a re-fire is a
+  new, escalated round, not a re-trigger): one open turn per (condition
+  source, convoy, vessel, role); a predicate that holds again after a
+  completed, freshly-judged turn opens a new episode and climbs a
+  machinery-owned escalation ladder.
 - **Pinning at admission** (unchanged from the #1268 grill; load-bearing):
   definitions are pinned when the convoy is admitted, so a driver only ever
   replays a log it wrote.
@@ -154,7 +155,7 @@ acceptance posture for every workflow built on this substrate.
 | Ruling | What it said | What stands now |
 |--------|--------------|-----------------|
 | #1265 (event vocabulary) | Dotted semantic transitions as the workflow event language | Condition leaves over the three primitives, plus named definitions as layered data. Interpreters survive only where external reality must be projected into observed fields |
-| #1268 (workflow model core) | "No imperative scripts"; adaptive workflows = engagements that write declarations | "No durable hidden control state competing with the machine" — which drivers satisfy, since all durable state is in the store. Adaptivity = a Bosun over the same verbs; recurring behavior compiles down later |
+| #1268 (workflow model core) | "No imperative scripts"; adaptive workflows = agent turns that write declarations | "No durable hidden control state competing with the machine" — which drivers satisfy, since all durable state is in the store. Adaptivity = a Bosun over the same verbs; recurring behavior compiles down later |
 | #1266 (subscription surface) | Rules-only subscriptions, defined in workflow data | Structurally intact — one condition table — but its rows now also come from `wait` parkings and agent wake registrations |
 | #1263 (prior art posture) | "Temporal Signals middle" as the durability model | Reconcile-style pure policy and memoized replay over existing records; the store is the durability, never suspended stacks |
 
@@ -167,7 +168,7 @@ level-triggered wake over the existing log (no second bus).
 - Leaf-language enumeration against the six #1269 scenario files — the
   `wait` contract.
 - `Interrupted` semantics when the world overtakes the plan (human merges
-  mid-loop; default: propagate and end the engagement) and step-key
+  mid-loop; default: propagate and end the turn) and step-key
   collision/dead-turn behavior — the `wait` contract.
 - Multi-convoy scope-widening rules — the Bosun contract.
 - Costume rulings (sequential embeddings, compiled workflow functions) —

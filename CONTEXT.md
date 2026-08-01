@@ -172,9 +172,9 @@ _Avoid_: Permission mode, sandbox flag (those are harness spellings).
 
 **Brief**:
 The per-crew-member statement of why they are here — a durable file in the
-vessel workspace (also delivered agent-natively). Each engagement round is
-started by a brief; accumulated briefs on a revisited vessel are the script
-as executed, per character. A brief is the question: it may declare the
+vessel workspace (also delivered agent-natively). Each turn is started by a
+brief; accumulated briefs on a revisited vessel are the script as executed,
+per character. A brief is the question: it may declare the
 valid **Dispositions** as its answers (ADR 0027).
 _Avoid_: Prompt (the delivery mechanism), task description.
 
@@ -506,7 +506,8 @@ One atomic predicate over the machine, **Settlement Claims**, or
 single comparison, no connectives. `wait` ORs leaves; all other composition
 (AND, loops, budgets) lives in the caller's own language. Named definitions
 are layered data, not new objects.
-_Avoid_: Rule (that is a leaf bound to an engagement), expression language.
+_Avoid_: Rule (that is a leaf bound to a wake or crew turn), expression
+language.
 
 ## External Collaborators
 
