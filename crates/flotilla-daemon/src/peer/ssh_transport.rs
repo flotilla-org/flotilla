@@ -616,36 +616,39 @@ mod tests {
     #[test]
     fn resource_socket_forward_specs_are_bidirectional() {
         let config = RemoteHostConfig {
-            hostname: "feta.local".to_string(),
-            expected_host_name: "feta".to_string(),
+            hostname: "peer-a.example.invalid".to_string(),
+            expected_host_name: "peer-a".to_string(),
             expected_node_id: None,
-            user: Some("flotilla".to_string()),
-            daemon_socket: "/home/flotilla/.config/flotilla/flotilla.sock".to_string(),
+            user: Some("test-user".to_string()),
+            daemon_socket: "/home/test-remote/.config/flotilla/flotilla.sock".to_string(),
             ssh_multiplex: None,
         };
-        let local_node = NodeId::new("kiwi-root");
+        let local_node = NodeId::new("local-node");
         let transport = SshTransport::new(
             local_node.clone(),
-            "kiwi".into(),
-            ConfigLabel("feta".to_string()),
+            "local-host".into(),
+            ConfigLabel("peer-a".to_string()),
             config,
             None,
             uuid::Uuid::nil(),
             SshTransportPaths {
-                state_dir: Path::new("/home/kiwi/.local/state/flotilla"),
-                daemon_socket: Path::new("/home/kiwi/.config/flotilla/flotilla.sock"),
+                state_dir: Path::new("/home/test-local/.local/state/flotilla"),
+                daemon_socket: Path::new("/home/test-local/.config/flotilla/flotilla.sock"),
             },
         )
         .expect("valid transport");
 
         let (local_forward, reverse_forward) = transport.resource_forward_specs();
 
-        assert_eq!(local_forward, "/home/kiwi/.local/state/flotilla/peers/feta.sock:/home/flotilla/.config/flotilla/flotilla.sock");
+        assert_eq!(
+            local_forward,
+            "/home/test-local/.local/state/flotilla/peers/peer-a.sock:/home/test-remote/.config/flotilla/flotilla.sock"
+        );
         assert_eq!(
             reverse_forward,
             format!(
-                "{}:/home/kiwi/.config/flotilla/flotilla.sock",
-                reverse_peer_resource_socket_path(Path::new("/home/flotilla/.config/flotilla/flotilla.sock"), &local_node)
+                "{}:/home/test-local/.config/flotilla/flotilla.sock",
+                reverse_peer_resource_socket_path(Path::new("/home/test-remote/.config/flotilla/flotilla.sock"), &local_node)
                     .expect("reverse path")
                     .display()
             )
@@ -655,17 +658,17 @@ mod tests {
     #[test]
     fn remote_socket_cleanup_command_quotes_the_derived_path() {
         let config = RemoteHostConfig {
-            hostname: "feta.local".to_string(),
-            expected_host_name: "feta".to_string(),
+            hostname: "peer-a.example.invalid".to_string(),
+            expected_host_name: "peer-a".to_string(),
             expected_node_id: None,
-            user: Some("flotilla".to_string()),
+            user: Some("test-user".to_string()),
             daemon_socket: "/home/O'Brien/.config/flotilla/flotilla.sock".to_string(),
             ssh_multiplex: None,
         };
         let transport = SshTransport::new(
-            NodeId::new("kiwi"),
-            "kiwi".into(),
-            ConfigLabel("feta".into()),
+            NodeId::new("local-node"),
+            "local-host".into(),
+            ConfigLabel("peer-a".into()),
             config,
             None,
             uuid::Uuid::nil(),
@@ -687,17 +690,17 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let daemon_socket = tmp.path().join("flotilla.sock");
         let config = RemoteHostConfig {
-            hostname: "feta.local".to_string(),
-            expected_host_name: "feta".to_string(),
+            hostname: "peer-a.example.invalid".to_string(),
+            expected_host_name: "peer-a".to_string(),
             expected_node_id: None,
             user: None,
             daemon_socket: daemon_socket.to_string_lossy().into_owned(),
             ssh_multiplex: None,
         };
         let mut transport = SshTransport::new(
-            NodeId::new("kiwi"),
-            "kiwi".into(),
-            ConfigLabel("feta".into()),
+            NodeId::new("local-node"),
+            "local-host".into(),
+            ConfigLabel("peer-a".into()),
             config,
             None,
             uuid::Uuid::nil(),
@@ -725,17 +728,17 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let daemon_socket = tmp.path().join("flotilla.sock");
         let config = RemoteHostConfig {
-            hostname: "feta.local".to_string(),
-            expected_host_name: "feta".to_string(),
+            hostname: "peer-a.example.invalid".to_string(),
+            expected_host_name: "peer-a".to_string(),
             expected_node_id: None,
             user: None,
             daemon_socket: daemon_socket.to_string_lossy().into_owned(),
             ssh_multiplex: None,
         };
         let mut transport = SshTransport::new(
-            NodeId::new("kiwi"),
-            "kiwi".into(),
-            ConfigLabel("feta".into()),
+            NodeId::new("local-node"),
+            "local-host".into(),
+            ConfigLabel("peer-a".into()),
             config,
             None,
             uuid::Uuid::nil(),
