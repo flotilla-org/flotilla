@@ -15,7 +15,10 @@ use flotilla_core::{
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{resource_limits::raise_file_descriptor_limit, restart_history::DaemonLifecycle, runtime::DaemonRuntime, server::DaemonServer};
+use crate::{
+    resource_limits::raise_file_descriptor_limit, restart_history::DaemonLifecycle, runtime::DaemonRuntime, server::DaemonServer,
+    DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH,
+};
 
 pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeout_secs: u64) -> Result<(), String> {
     let lifecycle = DaemonLifecycle::begin(state_dir)?;
@@ -75,6 +78,8 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
 }
 
 fn stable_socket_discovery_path() -> PathBuf {
+    // This path is a dialer-facing contract derived from the remote user's
+    // home, so deliberately do not inherit config-directory overrides.
     let home_policy = PathPolicy::from_env(|key| if key == "HOME" { std::env::var_os(key) } else { None });
-    home_policy.config_dir.into_path_buf().join("run/socket-path")
+    home_policy.config_dir.into_path_buf().join(DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH)
 }

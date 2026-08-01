@@ -15,6 +15,7 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use super::transport::{PeerConnectionStatus, PeerSender, PeerTransport};
+use crate::DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH;
 
 /// Maximum backoff delay between reconnection attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -31,10 +32,7 @@ const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Interval between polls when waiting for the socket to appear.
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Remote command that reads the accepting daemon's published socket path.
-/// The discovery file is stable dialer-facing configuration; its contents are
-/// owned by the remote daemon and may change between connection attempts.
-const REMOTE_SOCKET_PATH_COMMAND: &str = "cat \"$HOME/.config/flotilla/run/socket-path\"";
+const REMOTE_SOCKET_PATH_PREFIX: &str = "FLOTILLA_DAEMON_SOCKET_PATH=";
 
 const PRE_HELLO_CLOSE_ERROR: &str = "peer closed before sending hello";
 
@@ -239,9 +237,13 @@ impl SshTransport {
 
     async fn resolve_remote_daemon_socket(&self) -> Result<PathBuf, String> {
         let destination = self.destination();
+        let command = remote_socket_path_command();
         let output = tokio::process::Command::new(&self.ssh_binary)
+            .arg("-T")
+            .arg("-o")
+            .arg("BatchMode=yes")
             .arg(&destination)
-            .arg(REMOTE_SOCKET_PATH_COMMAND)
+            .arg(&command)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -271,6 +273,9 @@ impl SshTransport {
         debug!(%destination, remote_socket = %path, "removing stale reverse peer socket before SSH tunnel dial");
 
         let output = tokio::process::Command::new(&self.ssh_binary)
+            .arg("-T")
+            .arg("-o")
+            .arg("BatchMode=yes")
             .arg(&destination)
             .arg(&command)
             .kill_on_drop(true)
@@ -464,6 +469,9 @@ impl SshTransport {
         let command =
             format!("test -S {quoted_path} && {{ ! command -v ss >/dev/null 2>&1 || ss -xlH | grep -F -- {quoted_path} >/dev/null; }}");
         let output = tokio::process::Command::new(&self.ssh_binary)
+            .arg("-T")
+            .arg("-o")
+            .arg("BatchMode=yes")
             .arg(&destination)
             .arg(command)
             .kill_on_drop(true)
@@ -554,19 +562,25 @@ impl SshTransport {
 
 fn parse_remote_socket_path(stdout: &[u8]) -> Result<PathBuf, String> {
     let stdout = std::str::from_utf8(stdout).map_err(|error| format!("not UTF-8: {error}"))?;
-    let mut lines = stdout.lines();
-    let path = lines.next().unwrap_or_default().trim();
+    let mut paths = stdout.lines().filter_map(|line| line.strip_prefix(REMOTE_SOCKET_PATH_PREFIX));
+    let path = paths.next().ok_or_else(|| "discovery command returned no tagged path".to_string())?.trim();
     if path.is_empty() {
-        return Err("discovery file was empty".to_string());
+        return Err("discovery command returned an empty tagged path".to_string());
     }
-    if lines.any(|line| !line.trim().is_empty()) {
-        return Err("discovery command returned more than one path".to_string());
+    if paths.next().is_some() {
+        return Err("discovery command returned more than one tagged path".to_string());
     }
     let path = PathBuf::from(path);
     if !path.is_absolute() {
         return Err(format!("path is not absolute: {}", path.display()));
     }
     Ok(path)
+}
+
+fn remote_socket_path_command() -> String {
+    format!(
+        "path=$(cat \"$HOME/.config/flotilla/{DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH}\") || exit; printf '{REMOTE_SOCKET_PATH_PREFIX}%s\\n' \"$path\""
+    )
 }
 
 fn shell_quote(value: &str) -> String {
@@ -695,10 +709,25 @@ mod tests {
 
     #[test]
     fn remote_socket_path_parser_requires_one_absolute_path() {
-        assert_eq!(parse_remote_socket_path(b"/tmp/flotilla.sock\n").expect("absolute path"), PathBuf::from("/tmp/flotilla.sock"));
-        assert!(parse_remote_socket_path(b"relative.sock\n").expect_err("relative path").contains("not absolute"));
-        assert!(parse_remote_socket_path(b"\n").expect_err("empty path").contains("empty"));
-        assert!(parse_remote_socket_path(b"/one.sock\n/two.sock\n").expect_err("multiple paths").contains("more than one"));
+        assert_eq!(
+            parse_remote_socket_path(b"login banner\nFLOTILLA_DAEMON_SOCKET_PATH=/tmp/flotilla.sock\nmotd\n").expect("absolute path"),
+            PathBuf::from("/tmp/flotilla.sock")
+        );
+        assert!(parse_remote_socket_path(b"relative.sock\n").expect_err("untagged path").contains("no tagged path"));
+        assert!(parse_remote_socket_path(b"FLOTILLA_DAEMON_SOCKET_PATH=relative.sock\n")
+            .expect_err("relative path")
+            .contains("not absolute"));
+        assert!(parse_remote_socket_path(b"FLOTILLA_DAEMON_SOCKET_PATH=\n").expect_err("empty path").contains("empty"));
+        assert!(parse_remote_socket_path(b"FLOTILLA_DAEMON_SOCKET_PATH=/one.sock\nFLOTILLA_DAEMON_SOCKET_PATH=/two.sock\n")
+            .expect_err("multiple paths")
+            .contains("more than one"));
+    }
+
+    #[test]
+    fn remote_socket_path_command_uses_shared_discovery_contract() {
+        let command = remote_socket_path_command();
+        assert!(command.contains("$HOME/.config/flotilla/run/socket-path"));
+        assert!(command.contains(REMOTE_SOCKET_PATH_PREFIX));
     }
 
     #[tokio::test]
@@ -707,7 +736,14 @@ mod tests {
         let published_path = tmp.path().join("published-path");
         std::fs::write(&published_path, "/run/first.sock\n").expect("write first path");
         let fake_ssh = tmp.path().join("ssh");
-        std::fs::write(&fake_ssh, format!("#!/bin/sh\ncat {}\n", shell_quote(&published_path.to_string_lossy()))).expect("write fake ssh");
+        std::fs::write(
+            &fake_ssh,
+            format!(
+                "#!/bin/sh\nprintf 'login banner\\n{REMOTE_SOCKET_PATH_PREFIX}'; cat {}\nprintf 'motd\\n'\n",
+                shell_quote(&published_path.to_string_lossy())
+            ),
+        )
+        .expect("write fake ssh");
         let mut permissions = std::fs::metadata(&fake_ssh).expect("fake ssh metadata").permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake_ssh, permissions).expect("make fake ssh executable");
@@ -890,7 +926,7 @@ mod tests {
         std::fs::write(
             &fake_ssh,
             format!(
-                "#!/bin/sh\n[ \"$#\" -ne 2 ] && exit 0\ncase \"$2\" in\n  *socket-path*) printf '%s\\n' '{}' ;;\n  *) exec /bin/sh -c \"$2\" ;;\nesac\n",
+                "#!/bin/sh\n[ \"$1\" = \"-N\" ] && exit 0\nfor command do :; done\ncase \"$command\" in\n  *socket-path*) printf '{REMOTE_SOCKET_PATH_PREFIX}%s\\n' '{}' ;;\n  *) exec /bin/sh -c \"$command\" ;;\nesac\n",
                 daemon_socket.display()
             ),
         )
@@ -932,7 +968,7 @@ mod tests {
         std::fs::write(
             &fake_ssh,
             format!(
-                "#!/bin/sh\n[ \"$#\" -ne 2 ] && exit 0\ncase \"$2\" in\n  *socket-path*) printf '%s\\n' '{}' ;;\n  *) echo cleanup-denied >&2; exit 23 ;;\nesac\n",
+                "#!/bin/sh\n[ \"$1\" = \"-N\" ] && exit 0\nfor command do :; done\ncase \"$command\" in\n  *socket-path*) printf '{REMOTE_SOCKET_PATH_PREFIX}%s\\n' '{}' ;;\n  *) echo cleanup-denied >&2; exit 23 ;;\nesac\n",
                 daemon_socket.display()
             ),
         )

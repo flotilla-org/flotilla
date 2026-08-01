@@ -41,7 +41,10 @@ use self::{
     remote_commands::{ForwardedCommandMap, PendingRemoteCancelMap, PendingRemoteCommandMap, RemoteCommandRouter},
     shared::{sync_peer_query_state, SocketPeerSender},
 };
-use crate::peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, SshTransport, SshTransportPaths};
+use crate::{
+    peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, SshTransport, SshTransportPaths},
+    DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH,
+};
 
 const CONNECTION_PREFACE_TIMEOUT: Duration = Duration::from_secs(10);
 const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -306,7 +309,7 @@ impl DaemonServer {
         socket_path: PathBuf,
         idle_timeout: Duration,
     ) -> Result<Self, String> {
-        let socket_discovery_path = config.base_path().as_path().join("run/socket-path");
+        let socket_discovery_path = config.base_path().as_path().join(DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH);
         Self::new_with_socket_discovery_path(repo_paths, config, discovery, socket_path, socket_discovery_path, idle_timeout).await
     }
 
