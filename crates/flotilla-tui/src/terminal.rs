@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     io::{stderr, stdout, Read, Write},
     process::{ExitStatus, Stdio},
     sync::{LazyLock, Mutex, MutexGuard, Once},
@@ -39,6 +39,8 @@ struct AttachCommandOutput {
 
 struct SystemAttachCommandRunner;
 
+const ATTACH_STDERR_TAIL_LIMIT: usize = 64 * 1024;
+
 static ACTIVE_ATTACH_BRIDGES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static ATTACH_PANIC_HOOK: Once = Once::new();
 #[cfg(unix)]
@@ -52,10 +54,7 @@ impl AttachCommandRunner for SystemAttachCommandRunner {
             .spawn()
             .map_err(|error| format!("could not start {program}: {error}"))?;
         let mut child_stderr = child.stderr.take().expect("piped child stderr should be available");
-        let stderr_reader = std::thread::spawn(move || {
-            let mut captured = Vec::new();
-            child_stderr.read_to_end(&mut captured).map(|_| captured)
-        });
+        let stderr_reader = std::thread::spawn(move || tee_stderr_tail(&mut child_stderr, stderr(), ATTACH_STDERR_TAIL_LIMIT));
         let status = child.wait().map_err(|error| format!("could not wait for {program}: {error}"))?;
         let stderr = stderr_reader
             .join()
@@ -63,6 +62,28 @@ impl AttachCommandRunner for SystemAttachCommandRunner {
             .map_err(|error| format!("could not read stderr from {program}: {error}"))?;
         Ok(AttachCommandOutput { status, stderr })
     }
+}
+
+fn tee_stderr_tail(mut reader: impl Read, mut live: impl Write, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut tail = VecDeque::with_capacity(limit);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        live.write_all(&chunk[..read])?;
+        live.flush()?;
+        for byte in &chunk[..read] {
+            if tail.len() == limit {
+                tail.pop_front();
+            }
+            if limit > 0 {
+                tail.push_back(*byte);
+            }
+        }
+    }
+    Ok(tail.into_iter().collect())
 }
 
 fn active_attach_bridges() -> MutexGuard<'static, HashSet<String>> {
@@ -171,7 +192,8 @@ fn replay_attach_stderr(captured: &[u8], mut writer: impl Write) -> Result<(), S
 }
 
 /// Execute an interactive attach plan and return the attached process status.
-/// Child stderr is replayed only after the primary screen has been restored.
+/// Child stderr remains live during the attach. On failure, its bounded tail is
+/// replayed after the primary screen has been restored.
 pub fn run_attach_plan(plan: &ResolvedAttachPlan) -> Result<ExitStatus, String> {
     // Standalone CLI and convoy auto-attach paths do not pass through TUI
     // startup, so install the idempotent bridge cleanup hooks here too.
@@ -181,7 +203,9 @@ pub fn run_attach_plan(plan: &ResolvedAttachPlan) -> Result<ExitStatus, String> 
 
     let output = execute_attach_plan(plan, &mut SystemAttachCommandRunner)?;
     restore_terminal();
-    replay_attach_stderr(&output.stderr, stderr())?;
+    if !output.status.success() {
+        replay_attach_stderr(&output.stderr, stderr())?;
+    }
     Ok(output.status)
 }
 
@@ -257,7 +281,7 @@ mod tests {
 
     use flotilla_protocol::{arg::Arg, ResolvedAttachAction, ResolvedAttachPlan, SendKeyStep};
 
-    use super::{replay_attach_stderr, run_send_keys_attach, AttachCommandOutput, AttachCommandRunner};
+    use super::{replay_attach_stderr, run_send_keys_attach, tee_stderr_tail, AttachCommandOutput, AttachCommandRunner};
 
     #[derive(Default)]
     struct FakeRunner {
@@ -355,6 +379,16 @@ mod tests {
 
         let replayed = String::from_utf8(replayed).expect("replayed stderr should be UTF-8");
         assert_eq!(replayed, "session held by host feta pid 4242: already has a foreground client\n");
+    }
+
+    #[test]
+    fn attach_stderr_is_live_and_retains_only_a_bounded_tail() {
+        let mut live = Vec::new();
+
+        let tail = tee_stderr_tail(&b"warning then refusal"[..], &mut live, 7).expect("stderr should be teed");
+
+        assert_eq!(live, b"warning then refusal");
+        assert_eq!(tail, b"refusal");
     }
 
     #[test]
