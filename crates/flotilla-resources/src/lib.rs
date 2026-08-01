@@ -113,7 +113,9 @@ pub use resource::{
     api_version, ApiPaths, CausalDot, FieldMergeMetadata, InputMeta, K8sListMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject,
     K8sWatchEvent, MergeConflictSibling, MergeMetadata, ObjectMeta, OwnerReference, Resource, ResourceObject,
 };
-pub use retention::{EventRetention, ResourceDecodeQuarantine, ResourceStoreDiagnostics, ResourceStoreWarning};
+pub use retention::{
+    EventRetention, ResourceDecodeQuarantine, ResourceEventDecodeQuarantine, ResourceStoreDiagnostics, ResourceStoreWarning,
+};
 pub use sqlite::SqliteBackend;
 pub use status_patch::{apply_status_patch, apply_status_patch_checked, NoStatusPatch, StatusPatch};
 pub use terminal_session::{
