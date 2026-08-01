@@ -816,7 +816,7 @@ async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) 
     if let CommandValue::ConvoyStarted { name, attach_plan: Some(plan), binding } = result {
         if matches!(format, OutputFormat::Human) {
             stamp_pane_identity(&name, binding.as_ref()).await;
-            return run_attach_plan(&plan);
+            return run_attach_plan(&*daemon, &plan).await;
         }
     }
     Ok(())
@@ -880,7 +880,7 @@ async fn run_attach(
                 if !transient {
                     stamp_pane_identity(reference, binding.as_ref()).await;
                 }
-                run_attach_plan(&plan)
+                run_attach_plan(&*daemon, &plan).await
             }
         },
         CommandValue::Error { message } => match format {
@@ -1146,8 +1146,26 @@ fn print_resource_watch_event(response: &flotilla_protocol::ResourceReadEnvelope
     }
 }
 
-fn run_attach_plan(plan: &flotilla_protocol::ResolvedAttachPlan) -> Result<()> {
-    let status = flotilla_tui::terminal::run_attach_plan(plan).map_err(|error| color_eyre::eyre::eyre!(error))?;
+async fn run_attach_plan(daemon: &dyn DaemonHandle, plan: &flotilla_protocol::ResolvedAttachPlan) -> Result<()> {
+    let prepared = flotilla_tui::terminal::prepare_attach_plan(plan);
+    if let Some(excursion_id) = prepared.excursion_id {
+        daemon
+            .begin_attach_excursion(excursion_id, prepared.cleanup_actions.clone())
+            .await
+            .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    }
+    let attach_result = flotilla_tui::terminal::run_attach_plan(&prepared).map_err(|error| color_eyre::eyre::eyre!(error));
+    let cleanup_result = match prepared.excursion_id {
+        Some(excursion_id) => daemon.finish_attach_excursion(excursion_id).await.map_err(|error| color_eyre::eyre::eyre!(error)),
+        None => Ok(()),
+    };
+    let status = match (attach_result, cleanup_result) {
+        (Ok(status), Ok(())) => status,
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+        (Err(attach_error), Err(cleanup_error)) => {
+            return Err(color_eyre::eyre::eyre!("{attach_error}; attach cleanup also failed: {cleanup_error}"));
+        }
+    };
     terminate_with_attach_status(status)
 }
 

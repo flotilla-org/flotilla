@@ -60,9 +60,12 @@ impl SshRemoteHopResolver {
         Ok(SshInfo { target, multiplex })
     }
 
-    /// Build the SSH prefix args: `ssh -t [-o ControlMaster=auto ...] <target>`
-    fn ssh_prefix_args(&self, info: &SshInfo) -> Vec<Arg> {
-        let mut args = vec![Arg::Literal("ssh".into()), Arg::Literal("-t".into())];
+    /// Build the SSH prefix args: `ssh [-t] [-o ControlMaster=auto ...] <target>`
+    fn ssh_prefix_args(&self, info: &SshInfo, allocate_tty: bool) -> Vec<Arg> {
+        let mut args = vec![Arg::Literal("ssh".into())];
+        if allocate_tty {
+            args.push(Arg::Literal("-t".into()));
+        }
 
         if info.multiplex {
             if let Some(ref ctrl_path) = self.multiplex_ctrl_path {
@@ -91,7 +94,7 @@ impl SshRemoteHopResolver {
     /// user-installed tools such as `flotilla` under `~/.cargo/bin` are found.
     pub fn one_hop_command_args(&self, host: &HostName, command: Vec<Arg>) -> Result<Vec<Arg>, String> {
         let info = self.ssh_info(host)?;
-        let mut ssh_args = self.ssh_prefix_args(&info);
+        let mut ssh_args = self.ssh_prefix_args(&info, true);
         ssh_args.push(Arg::NestedCommand(vec![
             Arg::Literal("${SHELL:-/bin/sh}".into()),
             Arg::Literal("-l".into()),
@@ -99,6 +102,20 @@ impl SshRemoteHopResolver {
             Arg::NestedCommand(command),
         ]));
         Ok(ssh_args)
+    }
+
+    fn route_cleanup_actions(&self, info: &SshInfo, context: &mut ResolutionContext) {
+        for action in &mut context.actions {
+            let ResolvedAction::Cleanup(command) = action else { continue };
+            let mut ssh_args = self.ssh_prefix_args(info, false);
+            ssh_args.push(Arg::NestedCommand(vec![
+                Arg::Literal("${SHELL:-/bin/sh}".into()),
+                Arg::Literal("-l".into()),
+                Arg::Literal("-c".into()),
+                Arg::NestedCommand(std::mem::take(command)),
+            ]));
+            *command = ssh_args;
+        }
     }
 }
 
@@ -114,6 +131,7 @@ impl RemoteHopResolver for SshRemoteHopResolver {
     ///       NestedCommand([Literal("cd"), Quoted("/dir"), Literal("&&"), ...inner...])])]
     fn resolve_wrap(&self, host: &HostName, context: &mut ResolutionContext) -> Result<(), String> {
         let info = self.ssh_info(host)?;
+        self.route_cleanup_actions(&info, context);
 
         // Pop the inner action — must be a Command
         let inner_action = context.actions.pop().ok_or("resolve_wrap: no inner action on stack")?;
@@ -150,7 +168,7 @@ impl RemoteHopResolver for SshRemoteHopResolver {
         ];
 
         // Build: ssh -t [multiplex] target <NestedCommand(login_wrapper)>
-        let mut ssh_args = self.ssh_prefix_args(&info);
+        let mut ssh_args = self.ssh_prefix_args(&info, true);
         ssh_args.push(Arg::NestedCommand(login_wrapper));
 
         context.actions.push(ResolvedAction::Command(ssh_args));
@@ -166,6 +184,7 @@ impl RemoteHopResolver for SshRemoteHopResolver {
     ///   2. SendKeys: Type(flattened inner command) + WaitForReady (top)
     fn resolve_enter(&self, host: &HostName, context: &mut ResolutionContext) -> Result<(), String> {
         let info = self.ssh_info(host)?;
+        self.route_cleanup_actions(&info, context);
 
         // Pop the inner action — must be a Command
         let inner_action = context.actions.pop().ok_or("resolve_enter: no inner action on stack")?;
@@ -197,7 +216,7 @@ impl RemoteHopResolver for SshRemoteHopResolver {
         }
 
         // Push SSH enter command (no remote command — just open the session)
-        let ssh_args = self.ssh_prefix_args(&info);
+        let ssh_args = self.ssh_prefix_args(&info, true);
         context.actions.push(ResolvedAction::Command(ssh_args));
 
         // Working directory consumed

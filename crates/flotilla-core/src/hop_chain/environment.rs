@@ -68,11 +68,37 @@ impl EnvironmentHopResolver for DockerEnvironmentHopResolver {
 
         // Convert inner command to SendKeys (if non-empty)
         if !inner_args.is_empty() {
-            let text = format!("exec {}", flotilla_protocol::arg::flatten(&inner_args, 0));
+            let pid_file = format!("/tmp/flotilla-attach-{}.pid", flotilla_protocol::ATTACH_LEASE_PLACEHOLDER);
+            let inner_command = flotilla_protocol::arg::flatten(&inner_args, 0);
+            let supervised_command = flotilla_protocol::arg::flatten(
+                &[
+                    Arg::Literal("exec".into()),
+                    Arg::Literal("sh".into()),
+                    Arg::Literal("-c".into()),
+                    Arg::Quoted(format!(
+                        "export FLOTILLA_ATTACH_LEASE={}; echo $$ > {pid_file}; exec {inner_command}",
+                        flotilla_protocol::ATTACH_LEASE_PLACEHOLDER
+                    )),
+                ],
+                0,
+            );
             context.actions.push(ResolvedAction::SendKeys {
                 hop: format!("docker environment '{env_id}'"),
-                steps: vec![SendKeyStep::Type { text }, SendKeyStep::WaitForReady],
+                steps: vec![SendKeyStep::Type { text: supervised_command }, SendKeyStep::WaitForReady],
             });
+            context.actions.push(ResolvedAction::Cleanup(vec![
+                Arg::Literal("docker".into()),
+                Arg::Literal("exec".into()),
+                Arg::Quoted(container.to_string()),
+                Arg::Literal("sh".into()),
+                Arg::Literal("-c".into()),
+                Arg::Quoted(format!(
+                    "pid=$(cat {pid_file} 2>/dev/null) || exit 0; \
+                     if [ -r \"/proc/$pid/environ\" ] && tr '\\000' '\\n' < \"/proc/$pid/environ\" | \
+                     grep -Fqx 'FLOTILLA_ATTACH_LEASE={}' ; then kill -KILL \"$pid\" 2>/dev/null || true; fi; rm -f {pid_file}",
+                    flotilla_protocol::ATTACH_LEASE_PLACEHOLDER
+                )),
+            ]));
         }
 
         // Push docker exec enter command

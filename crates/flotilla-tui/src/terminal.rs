@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     io::{stderr, stdout, Read, Write},
     process::{ExitStatus, Stdio},
-    sync::{LazyLock, Mutex, MutexGuard, Once},
+    sync::Once,
 };
 
 use crossterm::{event::DisableMouseCapture, execute};
@@ -40,8 +40,6 @@ struct AttachCommandOutput {
 struct SystemAttachCommandRunner;
 
 const ATTACH_STDERR_TAIL_LIMIT: usize = 64 * 1024;
-
-static ACTIVE_ATTACH_BRIDGES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static ATTACH_PANIC_HOOK: Once = Once::new();
 #[cfg(unix)]
 static ATTACH_SIGNAL_HANDLER: Once = Once::new();
@@ -86,31 +84,6 @@ fn tee_stderr_tail(mut reader: impl Read, mut live: impl Write, limit: usize) ->
     Ok(tail.into_iter().collect())
 }
 
-fn active_attach_bridges() -> MutexGuard<'static, HashSet<String>> {
-    match ACTIVE_ATTACH_BRIDGES.lock() {
-        Ok(bridges) => bridges,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-fn register_attach_bridge(bridge: &str) {
-    active_attach_bridges().insert(bridge.to_string());
-}
-
-fn kill_attach_bridge(bridge: &str, runner: &mut dyn AttachCommandRunner) {
-    if active_attach_bridges().remove(bridge) {
-        let _ = runner.run("cleat", &["kill".to_string(), bridge.to_string()]);
-    }
-}
-
-fn kill_all_attach_bridges() {
-    let bridges: Vec<_> = active_attach_bridges().drain().collect();
-    let mut runner = SystemAttachCommandRunner;
-    for bridge in bridges {
-        let _ = runner.run("cleat", &["kill".to_string(), bridge]);
-    }
-}
-
 fn run_direct_attach(args: &[flotilla_protocol::arg::Arg], runner: &mut dyn AttachCommandRunner) -> Result<AttachCommandOutput, String> {
     let command = arg::flatten(args, 0);
     runner.run("sh", &["-lc".to_string(), command])
@@ -126,17 +99,8 @@ fn run_send_keys_attach(
         return Err("attach plan must end with an outer command".to_string());
     };
     let command = arg::flatten(&args, 0);
-    register_attach_bridge(bridge);
-    let launch =
-        match runner.run("cleat", &["launch".to_string(), bridge.to_string(), "--record".to_string(), "--cmd".to_string(), command]) {
-            Ok(status) => status,
-            Err(error) => {
-                kill_attach_bridge(bridge, runner);
-                return Err(error);
-            }
-        };
+    let launch = runner.run("cleat", &["launch".to_string(), bridge.to_string(), "--record".to_string(), "--cmd".to_string(), command])?;
     if !launch.status.success() {
-        kill_attach_bridge(bridge, runner);
         return Err(format!("could not launch attach bridge for outer command (status {})", launch.status));
     }
 
@@ -172,17 +136,97 @@ fn run_send_keys_attach(
         runner.run("cleat", &["attach".to_string(), bridge.to_string()])
     })();
 
-    kill_attach_bridge(bridge, runner);
     result
 }
 
-fn execute_attach_plan(plan: &ResolvedAttachPlan, runner: &mut dyn AttachCommandRunner) -> Result<AttachCommandOutput, String> {
-    match plan.0.as_slice() {
-        [ResolvedAttachAction::Command(args)] => run_direct_attach(args, runner),
-        _ => {
-            let bridge = format!("flotilla-attach-{}", uuid::Uuid::new_v4());
-            run_send_keys_attach(plan, &bridge, runner)
-        }
+#[cfg(test)]
+fn instantiate_attach_plan(plan: &ResolvedAttachPlan) -> ResolvedAttachPlan {
+    let lease = uuid::Uuid::new_v4().simple().to_string();
+    instantiate_attach_plan_with_lease(plan, &lease)
+}
+
+fn instantiate_attach_plan_with_lease(plan: &ResolvedAttachPlan, lease: &str) -> ResolvedAttachPlan {
+    ResolvedAttachPlan(
+        plan.0
+            .iter()
+            .cloned()
+            .map(|action| match action {
+                ResolvedAttachAction::Command(args) => ResolvedAttachAction::Command(instantiate_args(args, lease)),
+                ResolvedAttachAction::Cleanup(args) => ResolvedAttachAction::Cleanup(instantiate_args(args, lease)),
+                ResolvedAttachAction::SendKeys { hop, steps } => ResolvedAttachAction::SendKeys {
+                    hop,
+                    steps: steps
+                        .into_iter()
+                        .map(|step| match step {
+                            SendKeyStep::WaitForReady => SendKeyStep::WaitForReady,
+                            SendKeyStep::Type { text } => {
+                                SendKeyStep::Type { text: text.replace(flotilla_protocol::ATTACH_LEASE_PLACEHOLDER, lease) }
+                            }
+                        })
+                        .collect(),
+                },
+            })
+            .collect(),
+    )
+}
+
+fn instantiate_args(args: Vec<flotilla_protocol::arg::Arg>, lease: &str) -> Vec<flotilla_protocol::arg::Arg> {
+    args.into_iter()
+        .map(|arg| match arg {
+            flotilla_protocol::arg::Arg::Literal(value) => {
+                flotilla_protocol::arg::Arg::Literal(value.replace(flotilla_protocol::ATTACH_LEASE_PLACEHOLDER, lease))
+            }
+            flotilla_protocol::arg::Arg::Quoted(value) => {
+                flotilla_protocol::arg::Arg::Quoted(value.replace(flotilla_protocol::ATTACH_LEASE_PLACEHOLDER, lease))
+            }
+            flotilla_protocol::arg::Arg::NestedCommand(args) => flotilla_protocol::arg::Arg::NestedCommand(instantiate_args(args, lease)),
+        })
+        .collect()
+}
+
+/// An attach execution whose side effects have been split from their
+/// compensating teardown. Callers register `cleanup_actions` with the daemon
+/// before running the plan.
+pub struct PreparedAttachPlan {
+    executable: ResolvedAttachPlan,
+    bridge: Option<String>,
+    pub excursion_id: Option<flotilla_protocol::AttachExcursionId>,
+    pub cleanup_actions: Vec<Vec<flotilla_protocol::arg::Arg>>,
+}
+
+pub fn prepare_attach_plan(plan: &ResolvedAttachPlan) -> PreparedAttachPlan {
+    if matches!(plan.0.as_slice(), [ResolvedAttachAction::Command(_)]) {
+        return PreparedAttachPlan { executable: plan.clone(), bridge: None, excursion_id: None, cleanup_actions: Vec::new() };
+    }
+
+    let excursion_id = flotilla_protocol::AttachExcursionId::new();
+    let lease = excursion_id.0.simple().to_string();
+    let bridge = format!("flotilla-attach-{}", uuid::Uuid::new_v4());
+    let instantiated = instantiate_attach_plan_with_lease(plan, &lease);
+    let mut cleanup_actions = instantiated
+        .0
+        .iter()
+        .filter_map(|action| match action {
+            ResolvedAttachAction::Cleanup(args) => Some(args.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // The bridge is the outermost acquired resource, so it is released last.
+    cleanup_actions.push(vec![
+        flotilla_protocol::arg::Arg::Literal("cleat".into()),
+        flotilla_protocol::arg::Arg::Literal("kill".into()),
+        flotilla_protocol::arg::Arg::Quoted(bridge.clone()),
+    ]);
+    let executable =
+        ResolvedAttachPlan(instantiated.0.into_iter().filter(|action| !matches!(action, ResolvedAttachAction::Cleanup(_))).collect());
+    PreparedAttachPlan { executable, bridge: Some(bridge), excursion_id: Some(excursion_id), cleanup_actions }
+}
+
+fn execute_attach_plan(plan: &PreparedAttachPlan, runner: &mut dyn AttachCommandRunner) -> Result<AttachCommandOutput, String> {
+    match (plan.executable.0.as_slice(), plan.bridge.as_deref()) {
+        ([ResolvedAttachAction::Command(args)], None) => run_direct_attach(args, runner),
+        (_, Some(bridge)) => run_send_keys_attach(&plan.executable, bridge, runner),
+        _ => Err("attach plan is missing its bridge".to_string()),
     }
 }
 
@@ -194,9 +238,9 @@ fn replay_attach_stderr(captured: &[u8], mut writer: impl Write) -> Result<(), S
 /// Execute an interactive attach plan and return the attached process status.
 /// Child stderr remains live during the attach. On failure, its bounded tail is
 /// replayed after the primary screen has been restored.
-pub fn run_attach_plan(plan: &ResolvedAttachPlan) -> Result<ExitStatus, String> {
+pub fn run_attach_plan(plan: &PreparedAttachPlan) -> Result<ExitStatus, String> {
     // Standalone CLI and convoy auto-attach paths do not pass through TUI
-    // startup, so install the idempotent bridge cleanup hooks here too.
+    // startup, so install the terminal restoration hooks here too.
     install_panic_hook();
     #[cfg(unix)]
     install_sigterm_handler();
@@ -214,7 +258,7 @@ pub fn run_attach_plan(plan: &ResolvedAttachPlan) -> Result<ExitStatus, String> 
 /// This deliberately does not stamp Presentation Manager metadata: the pane
 /// remains owned by its existing project/archipelago context while the attach
 /// is only a transient foreground excursion.
-pub fn run_temporary_attach(plan: &ResolvedAttachPlan) -> (ratatui::DefaultTerminal, Result<(), String>) {
+pub fn run_temporary_attach(plan: &PreparedAttachPlan) -> (ratatui::DefaultTerminal, Result<(), String>) {
     restore_terminal();
     let result = execute_attach_plan(plan, &mut SystemAttachCommandRunner).and_then(|output| {
         if output.status.success() {
@@ -245,7 +289,6 @@ pub fn install_panic_hook() {
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             restore_terminal();
-            kill_all_attach_bridges();
             hook(info);
         }));
     });
@@ -269,7 +312,6 @@ pub fn install_sigterm_handler() {
                 _ = sigterm.recv() => 0,
             };
             restore_terminal();
-            kill_all_attach_bridges();
             std::process::exit(exit_code);
         });
     });
@@ -281,7 +323,10 @@ mod tests {
 
     use flotilla_protocol::{arg::Arg, ResolvedAttachAction, ResolvedAttachPlan, SendKeyStep};
 
-    use super::{replay_attach_stderr, run_send_keys_attach, tee_stderr_tail, AttachCommandOutput, AttachCommandRunner};
+    use super::{
+        instantiate_attach_plan, prepare_attach_plan, replay_attach_stderr, run_send_keys_attach, tee_stderr_tail, AttachCommandOutput,
+        AttachCommandRunner,
+    };
 
     #[derive(Default)]
     struct FakeRunner {
@@ -354,7 +399,7 @@ mod tests {
 
         assert!(error.contains("docker environment 'crew-box'"), "{error}");
         assert!(error.contains("did not become ready"), "{error}");
-        assert_eq!(runner.calls.last().expect("cleanup call").1[0], "kill");
+        assert_eq!(runner.calls.last().expect("failed wait call").1[0], "wait");
     }
 
     #[test]
@@ -364,10 +409,43 @@ mod tests {
         run_send_keys_attach(&two_hop_plan(), "ready-bridge", &mut runner).expect("attach plan should run");
 
         let commands: Vec<_> = runner.calls.iter().map(|(_, args)| args[0].as_str()).collect();
-        assert_eq!(commands, ["launch", "wait", "send", "attach", "kill"]);
+        assert_eq!(commands, ["launch", "wait", "send", "attach"]);
         let wait = &runner.calls[1].1;
         assert!(wait.windows(2).any(|pair| pair == ["--screen-stable", "100ms"]));
         assert!(!runner.calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "expect")));
+    }
+
+    #[test]
+    fn attach_plan_instantiation_shares_one_fresh_lease() {
+        let placeholder = flotilla_protocol::ATTACH_LEASE_PLACEHOLDER;
+        let plan = ResolvedAttachPlan(vec![
+            ResolvedAttachAction::SendKeys { hop: "Docker".into(), steps: vec![SendKeyStep::Type { text: format!("echo {placeholder}") }] },
+            ResolvedAttachAction::Cleanup(vec![Arg::Quoted(format!("kill {placeholder}"))]),
+            ResolvedAttachAction::Command(vec![Arg::NestedCommand(vec![Arg::Quoted(format!("run {placeholder}"))])]),
+        ]);
+
+        let instantiated = instantiate_attach_plan(&plan);
+        let rendered = format!("{instantiated:?}");
+        assert!(!rendered.contains(placeholder));
+        let lease = rendered.split("echo ").nth(1).and_then(|rest| rest.split('"').next()).expect("instantiated lease");
+        assert_eq!(rendered.matches(lease).count(), 3, "all lifecycle actions should share the lease: {rendered}");
+        assert!(format!("{plan:?}").contains(placeholder), "instantiation must not mutate the deterministic resolved plan");
+    }
+
+    #[test]
+    fn preparation_orders_cleanup_inside_out_and_bridge_last() {
+        let plan = ResolvedAttachPlan(vec![
+            ResolvedAttachAction::SendKeys { hop: "inner".into(), steps: vec![] },
+            ResolvedAttachAction::Cleanup(vec![Arg::Literal("kill-inner".into())]),
+            ResolvedAttachAction::Command(vec![Arg::Literal("outer".into())]),
+        ]);
+
+        let prepared = prepare_attach_plan(&plan);
+
+        assert_eq!(prepared.cleanup_actions.len(), 2);
+        assert_eq!(prepared.cleanup_actions[0][0], Arg::Literal("kill-inner".into()));
+        assert_eq!(prepared.cleanup_actions[1][0], Arg::Literal("cleat".into()));
+        assert_eq!(prepared.cleanup_actions[1][1], Arg::Literal("kill".into()));
     }
 
     #[test]

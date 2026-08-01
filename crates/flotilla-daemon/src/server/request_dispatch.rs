@@ -8,17 +8,19 @@ use flotilla_core::{
 use flotilla_protocol::{AgentHookEvent, Command, CommandAction, Message, RepoSelector, Request, Response};
 use tracing::warn;
 
-use super::{client_connection::QuerySubscriptions, remote_commands::RemoteCommandRouter};
+use super::{attach_excursions::AttachExcursions, client_connection::QuerySubscriptions, remote_commands::RemoteCommandRouter};
 
 pub(super) struct RequestDispatcher<'a> {
     daemon: &'a Arc<InProcessDaemon>,
     remote_command_router: &'a RemoteCommandRouter,
     agent_state_store: &'a SharedAgentStateStore,
+    attach_excursions: Arc<AttachExcursions>,
     session_id: uuid::Uuid,
     query_subscriptions: QuerySubscriptions,
 }
 
 impl<'a> RequestDispatcher<'a> {
+    #[cfg(test)]
     pub(super) fn new(
         daemon: &'a Arc<InProcessDaemon>,
         remote_command_router: &'a RemoteCommandRouter,
@@ -26,7 +28,25 @@ impl<'a> RequestDispatcher<'a> {
         session_id: uuid::Uuid,
         query_subscriptions: QuerySubscriptions,
     ) -> Self {
-        Self { daemon, remote_command_router, agent_state_store, session_id, query_subscriptions }
+        Self::with_attach_excursions(
+            daemon,
+            remote_command_router,
+            agent_state_store,
+            Arc::new(AttachExcursions::default()),
+            session_id,
+            query_subscriptions,
+        )
+    }
+
+    pub(super) fn with_attach_excursions(
+        daemon: &'a Arc<InProcessDaemon>,
+        remote_command_router: &'a RemoteCommandRouter,
+        agent_state_store: &'a SharedAgentStateStore,
+        attach_excursions: Arc<AttachExcursions>,
+        session_id: uuid::Uuid,
+        query_subscriptions: QuerySubscriptions,
+    ) -> Self {
+        Self { daemon, remote_command_router, agent_state_store, attach_excursions, session_id, query_subscriptions }
     }
 
     pub(super) async fn dispatch(&self, id: u64, request: Request) -> Message {
@@ -139,6 +159,18 @@ impl<'a> RequestDispatcher<'a> {
 
             Request::ObserveFocus { targets } => match self.daemon.observe_surface_focus(self.session_id, targets).await {
                 Ok(()) => Message::ok_response(id, Response::ObserveFocus),
+                Err(error) => Message::error_response(id, error),
+            },
+
+            Request::BeginAttachExcursion { excursion_id, cleanup_actions } => {
+                match self.attach_excursions.begin(excursion_id, cleanup_actions).await {
+                    Ok(()) => Message::ok_response(id, Response::BeginAttachExcursion),
+                    Err(error) => Message::error_response(id, error),
+                }
+            }
+
+            Request::FinishAttachExcursion { excursion_id } => match self.attach_excursions.finish(excursion_id).await {
+                Ok(()) => Message::ok_response(id, Response::FinishAttachExcursion),
                 Err(error) => Message::error_response(id, error),
             },
 

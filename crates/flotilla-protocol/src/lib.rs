@@ -28,7 +28,7 @@ pub mod test_support;
 
 use std::fmt;
 
-pub use attach_plan::{ResolvedAttachAction, ResolvedAttachPlan, SendKeyStep};
+pub use attach_plan::{AttachExcursionId, ResolvedAttachAction, ResolvedAttachPlan, SendKeyStep, ATTACH_LEASE_PLACEHOLDER};
 pub use environment::{EnvironmentId, EnvironmentInfo, EnvironmentKind, EnvironmentSpec, EnvironmentStatus, ImageId, ImageSource};
 pub use host::{HostName, HostPath, RepoIdentity};
 pub use host_summary::{
@@ -276,6 +276,17 @@ pub enum Request {
     ObserveFocus {
         targets: Vec<ResourceRef>,
     },
+    /// Register teardown for an interactive attach before launching it. The
+    /// actions are ordered innermost-to-outermost and belong to this socket
+    /// connection until finished.
+    BeginAttachExcursion {
+        excursion_id: AttachExcursionId,
+        cleanup_actions: Vec<Vec<arg::Arg>>,
+    },
+    /// Run and forget a registered attach teardown.
+    FinishAttachExcursion {
+        excursion_id: AttachExcursionId,
+    },
     GetStatus,
     GetTopology,
     AgentHook {
@@ -305,6 +316,8 @@ pub enum Response {
     SubscribeQueries(Vec<DaemonEvent>),
     FetchMore,
     ObserveFocus,
+    BeginAttachExcursion,
+    FinishAttachExcursion,
     GetStatus(StatusResponse),
     GetTopology(TopologyResponse),
     AgentHook,
