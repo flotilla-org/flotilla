@@ -41,11 +41,11 @@ use flotilla_resources::{
     watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout,
     CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec,
-    ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewSource, Environment as ResourceEnvironment, EnvironmentPhase,
-    Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
-    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
+    ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, Environment as ResourceEnvironment,
+    EnvironmentPhase, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
+    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
+    Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
     ResourceObject, ResourceProvenance, SystemClock, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
@@ -1441,6 +1441,13 @@ struct ResolvedCrewContext {
     caller_session: Option<flotilla_resources::ResourceObject<ResourceTerminalSession>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrewRoutingContext {
+    pub command_context: CrewCommandContext,
+    pub session_name: Option<String>,
+    pub convoy: String,
+}
+
 fn input_meta_from_resource<T: Resource>(resource: &flotilla_resources::ResourceObject<T>) -> InputMeta {
     InputMeta::builder()
         .name(resource.metadata.name.clone())
@@ -2632,6 +2639,14 @@ impl InProcessDaemon {
             flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, .. } => {
                 (self.provisioning_namespace().await, convoy.as_str())
             }
+            flotilla_protocol::CommandAction::CrewComplete { context, .. }
+            | flotilla_protocol::CommandAction::CrewFail { context, .. }
+            | flotilla_protocol::CommandAction::CrewHandoff { context, .. }
+            | flotilla_protocol::CommandAction::QueryCrewList { context } => {
+                let namespace = context.namespace.clone().unwrap_or(self.provisioning_namespace().await);
+                let name = context.convoy.as_deref().ok_or_else(|| "crew command was not resolved to a convoy".to_string())?;
+                (namespace, name)
+            }
             _ => return Ok(None),
         };
 
@@ -2665,6 +2680,14 @@ impl InProcessDaemon {
             .await?
             .ok_or_else(|| format!("connect to {home} for convoy {name}: no routed node address found for host"))?;
         Ok(Some(ExistingConvoyTarget { home, node_id }))
+    }
+
+    pub async fn has_authoritative_convoy(&self, namespace: &str, name: &str) -> Result<bool, String> {
+        match self.resource_backend.clone().using::<ResourceConvoy>(namespace).get(name).await {
+            Ok(_) => Ok(true),
+            Err(ResourceError::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     /// Admit a convoy against this daemon's authoritative project resources,
@@ -5844,7 +5867,10 @@ impl InProcessDaemon {
         Ok(FleetListResponse { rows, replicas })
     }
 
-    async fn resolve_crew_context(&self, requested: &CrewCommandContext) -> Result<ResolvedCrewContext, String> {
+    /// Resolve enough crew identity locally to route a verb to the convoy
+    /// authority. Unlike `resolve_crew_context`, this does not read the
+    /// authority-owned Convoy or Vessel.
+    pub async fn resolve_crew_routing_context(&self, requested: &CrewCommandContext) -> Result<CrewRoutingContext, String> {
         let provisioning_namespace = self.provisioning_namespace().await;
         let namespace = requested.namespace.clone().unwrap_or_else(|| provisioning_namespace.clone());
         if namespace != provisioning_namespace {
@@ -5855,7 +5881,7 @@ impl InProcessDaemon {
 
         if let Some(crew_id) = requested.crew_id.as_deref() {
             let session = session_list
-                .into_iter()
+                .iter()
                 .find(|session| session.status.as_ref().and_then(|status| status.crew.as_ref()).is_some_and(|crew| crew.id == crew_id))
                 .ok_or_else(|| format!("unknown FLOTILLA_CREW_ID `{crew_id}`"))?;
             let role = session.spec.role.clone();
@@ -5865,7 +5891,17 @@ impl InProcessDaemon {
                     return Err(format!("crew identity `{crew_id}` belongs to a non-agent process"));
                 }
             };
-            return self.resolved_crew_context(namespace, convoy, vessel_ref, role, Some(session)).await;
+            return Ok(CrewRoutingContext {
+                command_context: CrewCommandContext {
+                    crew_id: None,
+                    namespace: Some(namespace),
+                    convoy: Some(convoy.clone()),
+                    vessel_ref: Some(vessel_ref),
+                    role: Some(role),
+                },
+                session_name: Some(session.metadata.name.clone()),
+                convoy,
+            });
         }
 
         let convoy = requested
@@ -5880,10 +5916,87 @@ impl InProcessDaemon {
             .role
             .clone()
             .ok_or_else(|| "crew context requires FLOTILLA_CREW_ID or --convoy, --vessel-ref, and --role".to_string())?;
-        let caller = session_list.into_iter().find(|session| {
-            session.spec.role == role && session.metadata.labels.get(VESSEL_REF_LABEL).map(String::as_str) == Some(vessel_ref.as_str())
+        let caller = session_list.iter().find(|session| {
+            session.spec.role == role
+                && (session.metadata.labels.get(VESSEL_REF_LABEL).map(String::as_str) == Some(vessel_ref.as_str())
+                    || matches!(
+                        &session.spec.source,
+                        TerminalSessionSource::Agent { context, .. } if context.vessel_ref == vessel_ref && context.convoy == convoy
+                    ))
         });
+        Ok(CrewRoutingContext {
+            command_context: CrewCommandContext {
+                crew_id: None,
+                namespace: Some(namespace),
+                convoy: Some(convoy.clone()),
+                vessel_ref: Some(vessel_ref),
+                role: Some(role),
+            },
+            session_name: caller.map(|session| session.metadata.name.clone()),
+            convoy,
+        })
+    }
+
+    async fn resolve_crew_context(&self, requested: &CrewCommandContext) -> Result<ResolvedCrewContext, String> {
+        let routing = self.resolve_crew_routing_context(requested).await?;
+        let CrewCommandContext { namespace, convoy, vessel_ref, role, .. } = routing.command_context;
+        let namespace = namespace.expect("routing context always has namespace");
+        let convoy = convoy.expect("routing context always has convoy");
+        let vessel_ref = vessel_ref.expect("routing context always has vessel ref");
+        let role = role.expect("routing context always has role");
+        let caller = match routing.session_name {
+            Some(name) => self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).get(&name).await.ok(),
+            None => None,
+        };
         self.resolved_crew_context(namespace, convoy, vessel_ref, role, caller).await
+    }
+
+    pub async fn mark_crew_completion_pending(
+        &self,
+        namespace: &str,
+        session_name: &str,
+        pending: CrewCompletionPending,
+    ) -> Result<(), String> {
+        apply_resource_status_patch(
+            &self.resource_backend.clone().using::<ResourceTerminalSession>(namespace),
+            session_name,
+            &TerminalSessionStatusPatch::MarkCompletionPending { pending },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    pub async fn clear_crew_completion_pending(&self, namespace: &str, session_name: &str) -> Result<(), String> {
+        apply_resource_status_patch(
+            &self.resource_backend.clone().using::<ResourceTerminalSession>(namespace),
+            session_name,
+            &TerminalSessionStatusPatch::ClearCompletionPending,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    pub async fn pending_crew_completions(&self) -> Result<Vec<(String, CrewCompletionPending, CrewCommandContext)>, String> {
+        let namespace = self.provisioning_namespace().await;
+        let sessions =
+            self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).list().await.map_err(|error| error.to_string())?;
+        Ok(sessions
+            .items
+            .into_iter()
+            .filter_map(|session| {
+                let pending = session.status.as_ref()?.completion_pending.clone()?;
+                let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { return None };
+                Some((session.metadata.name, pending, CrewCommandContext {
+                    crew_id: None,
+                    namespace: Some(context.namespace.clone()),
+                    convoy: Some(context.convoy.clone()),
+                    vessel_ref: Some(context.vessel_ref.clone()),
+                    role: Some(session.spec.role),
+                }))
+            })
+            .collect())
     }
 
     async fn resolved_crew_context(

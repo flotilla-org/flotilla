@@ -172,6 +172,19 @@ pub struct TerminalSessionStatus {
     /// This deliberately does not participate in the session lifecycle phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<TerminalAttention>,
+    /// A crew completion accepted by this host but not yet acknowledged by
+    /// the convoy authority. The local terminal session owns this durable
+    /// intent so a daemon restart or mesh partition cannot lose the final act.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_pending: Option<CrewCompletionPending>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrewCompletionPending {
+    pub message: Option<String>,
+    pub attempted_at: DateTime<Utc>,
+    pub authority: String,
+    pub last_error: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,13 +287,18 @@ pub enum TerminalSessionStatusPatch {
     ObserveAttention {
         attention: TerminalAttention,
     },
+    MarkCompletionPending {
+        pending: CrewCompletionPending,
+    },
+    ClearCompletionPending,
 }
 
 impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
     fn apply(&self, status: &mut TerminalSessionStatus) {
         match self {
             Self::MarkStarting => {
-                *status = TerminalSessionStatus::default();
+                let completion_pending = status.completion_pending.take();
+                *status = TerminalSessionStatus { completion_pending, ..Default::default() };
             }
             Self::MarkRunning { session_id, pid, started_at, crew, launch_command, delivered_message_id } => {
                 status.phase = TerminalSessionPhase::Running;
@@ -324,6 +342,8 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     status.attention = Some(attention.clone());
                 }
             }
+            Self::MarkCompletionPending { pending } => status.completion_pending = Some(pending.clone()),
+            Self::ClearCompletionPending => status.completion_pending = None,
         }
     }
 }
@@ -401,5 +421,23 @@ mod tests {
             .apply(&mut status);
 
         assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Unobservable);
+    }
+
+    #[test]
+    fn pending_completion_survives_terminal_restart_until_acknowledged() {
+        let pending = CrewCompletionPending {
+            message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
+            attempted_at: Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).single().expect("valid timestamp"),
+            authority: "kiwi".into(),
+            last_error: "authority unreachable for convoy-a".into(),
+        };
+        let mut status =
+            TerminalSessionStatus { phase: TerminalSessionPhase::Running, completion_pending: Some(pending.clone()), ..Default::default() };
+
+        TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
+        assert_eq!(status.completion_pending, Some(pending));
+
+        TerminalSessionStatusPatch::ClearCompletionPending.apply(&mut status);
+        assert_eq!(status.completion_pending, None);
     }
 }
