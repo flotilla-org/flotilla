@@ -495,6 +495,39 @@ async fn create_rejects_a_mount_targeting_the_reserved_daemon_socket_directory()
 }
 
 #[tokio::test]
+async fn create_rejects_a_mount_targeting_a_reserved_tool_file() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let image = ImageId::new("ubuntu:22.04");
+    let tool = EnvironmentTool::new("flotilla", "/usr/local/bin/flotilla").with_asset(EnvironmentToolAsset::new(
+        "/host/flotilla",
+        "/usr/local/bin/flotilla",
+        EnvironmentToolAssetKind::File,
+        EnvironmentToolAssetAccess::ReadOnly,
+        "the flotilla CLI",
+    ));
+    let opts = CreateOpts {
+        tokens: vec![],
+        tools: vec![tool],
+        working_directory: None,
+        provisioned_mounts: vec![ProvisionedMount::new("/host/replacement-flotilla", "/usr/local/bin/flotilla", ProvisionedMountMode::Ro)],
+        image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
+    };
+
+    let error = provider
+        .create(EnvironmentId::new("test-env-reserved-cli"), &image, opts)
+        .await
+        .err()
+        .expect("reserved CLI mount should be rejected");
+
+    assert_eq!(error, "mount target /usr/local/bin/flotilla is reserved for the flotilla CLI");
+    assert!(runner.calls().is_empty(), "reserved mount collisions should fail before invoking docker");
+}
+
+#[tokio::test]
 async fn create_delivers_tool_assets_and_applies_tool_environment() {
     use flotilla_protocol::ImageId;
 

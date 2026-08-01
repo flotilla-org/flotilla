@@ -3670,7 +3670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn docker_provisioning_rejects_a_mount_targeting_the_reserved_socket_directory() {
+    async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
         fs::create_dir_all(&config_base).expect("config directory");
@@ -3714,12 +3714,28 @@ mod tests {
             env: BTreeMap::new(),
         };
 
-        let error = DockerControllerRuntime { state }
+        let error = DockerControllerRuntime { state: Arc::clone(&state) }
             .provision("contained-work", &spec)
             .await
             .expect_err("reserved socket directory mount should fail provision");
 
         assert_eq!(error.to_string(), "mount target /run/flotilla-daemon is reserved for the daemon socket");
+        assert!(provider.create_opts.lock().await.is_none(), "reserved mount collisions should fail before invoking the provider");
+
+        let cli_collision_spec = flotilla_resources::DockerEnvironmentSpec {
+            mounts: vec![flotilla_resources::EnvironmentMount {
+                source_path: "/host/replacement-flotilla".to_string(),
+                target_path: "/usr/local/bin/flotilla".to_string(),
+                mode: flotilla_resources::EnvironmentMountMode::Ro,
+            }],
+            ..spec
+        };
+        let error = DockerControllerRuntime { state }
+            .provision("contained-work", &cli_collision_spec)
+            .await
+            .expect_err("reserved CLI mount should fail provision");
+
+        assert_eq!(error.to_string(), "mount target /usr/local/bin/flotilla is reserved for the flotilla CLI");
         assert!(provider.create_opts.lock().await.is_none(), "reserved mount collisions should fail before invoking the provider");
     }
 
