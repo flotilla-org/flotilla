@@ -241,6 +241,7 @@ def test_03_idle_link_survives_three_ping_windows(topology):
 def test_04_long_transport_outage_recovers_with_capped_backoff(topology):
     """#1045: prolonged transport failure cannot strand a recovered peer."""
     initial_generation = max(peer_generations())
+
     stop_daemon("node-b")
 
     def capped_attempt_observed():
