@@ -669,7 +669,8 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let hosts = backend.using::<Host>(NAMESPACE);
         create_host(&hosts).await;
-        create_convoy(&backend.using::<Convoy>(NAMESPACE), "lagging", ConvoyPhase::Active, None).await;
+        let convoys = backend.using::<Convoy>(NAMESPACE);
+        let lagging = create_convoy(&convoys, "lagging", ConvoyPhase::Active, None).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let task = tokio::spawn(run_with_inhibitor(
@@ -682,6 +683,20 @@ mod tests {
 
         assert!(next_state(&mut rx).await);
         assert!(next_state(&mut rx).await);
+        convoys
+            .update_status("lagging", &lagging.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                placement_decision: Some(PlacementDecision {
+                    policy_name: "test-policy".to_string(),
+                    target_host: PlacementTargetHost { reference: "other-host".to_string(), display_name: "other-host".to_string() },
+                    refused_candidates: vec![],
+                    viable_not_selected: vec![],
+                }),
+                ..ConvoyStatus::default()
+            })
+            .await
+            .expect("resolve placement after lag");
+        assert!(!next_state(&mut rx).await);
         task.abort();
     }
 
