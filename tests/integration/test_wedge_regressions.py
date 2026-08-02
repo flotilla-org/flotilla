@@ -15,8 +15,6 @@ from conftest import (
     wait_for,
 )
 
-GENERATION_RE = re.compile(r"\bgeneration=(\d+)\b")
-BACKOFF_RE = re.compile(r"\battempt=(\d+)\b.*\bdelay_secs=(\d+)\b")
 RECONNECT_MESSAGES = (
     "SSH connection dropped, will reconnect",
     "reconnecting after backoff",
