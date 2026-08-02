@@ -1051,7 +1051,8 @@ impl Reconciler for VesselReconciler {
         let selector = BTreeMap::from([(VESSEL_REF_LABEL.to_string(), obj.metadata.name.clone())]);
 
         delete_lifecycle_owned_matching(&self.terminal_sessions, &selector).await?;
-        delete_lifecycle_owned_matching(&self.checkouts, &selector).await?;
+        // Checkouts are convoy-owned and are removed by the convoy finalizer's
+        // ownership cascade, independently of vessel teardown.
         delete_lifecycle_owned_matching(&self.environments, &selector).await?;
 
         Ok(())

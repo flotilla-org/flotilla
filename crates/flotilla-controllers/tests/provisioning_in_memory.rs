@@ -818,7 +818,7 @@ async fn presentation_controller_marks_presentation_active_for_live_convoy_sessi
 }
 
 #[tokio::test]
-async fn vessel_controller_finalizer_deletes_labeled_children_on_delete() {
+async fn vessel_controller_finalizer_deletes_vessel_owned_children_but_preserves_checkout() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_workspace(
         &backend,
@@ -926,7 +926,7 @@ async fn vessel_controller_finalizer_deletes_labeled_children_on_delete() {
             async move {
                 matches!(workspaces.get("workspace-delete").await, Err(ResourceError::NotFound { .. }))
                     && matches!(environments.get("env-workspace-delete").await, Err(ResourceError::NotFound { .. }))
-                    && matches!(checkouts.get("checkout-workspace-delete").await, Err(ResourceError::NotFound { .. }))
+                    && checkouts.get("checkout-workspace-delete").await.is_ok()
                     && matches!(terminals.get("terminal-workspace-delete-coder").await, Err(ResourceError::NotFound { .. }))
             }
         })

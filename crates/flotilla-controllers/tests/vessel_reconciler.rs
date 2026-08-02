@@ -1928,7 +1928,7 @@ async fn observed_checkout_at_managed_name_marks_workspace_failed() {
 }
 
 #[tokio::test]
-async fn run_finalizer_deletes_all_labeled_children() {
+async fn run_finalizer_deletes_vessel_owned_children_but_preserves_checkout() {
     let backend = ResourceBackend::InMemory(Default::default());
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-finalize", "convoy-a", "implement", "policy-a", REPO_URL).await;
 
@@ -1943,10 +1943,7 @@ async fn run_finalizer_deletes_all_labeled_children() {
         backend.clone().using::<Environment>(NAMESPACE).get("env-workspace-finalize").await,
         Err(ResourceError::NotFound { .. })
     ));
-    assert!(matches!(
-        backend.clone().using::<Checkout>(NAMESPACE).get("checkout-workspace-finalize").await,
-        Err(ResourceError::NotFound { .. })
-    ));
+    backend.clone().using::<Checkout>(NAMESPACE).get("checkout-workspace-finalize").await.expect("convoy cascade owns checkout cleanup");
     assert!(matches!(
         backend.clone().using::<TerminalSession>(NAMESPACE).get("terminal-workspace-finalize-coder").await,
         Err(ResourceError::NotFound { .. })
