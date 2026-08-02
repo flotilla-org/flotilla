@@ -14,7 +14,10 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY assets/ assets/
+COPY src/ src/
+COPY crates/ crates/
 RUN cargo build --release
 
 # === Shared runtime base (used by both full and dev) ===
