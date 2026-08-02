@@ -10,6 +10,7 @@ on:
       - ".dockerignore"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "assets/**"
       - "src/**"
       - "crates/**"
       - "tests/integration/**"
