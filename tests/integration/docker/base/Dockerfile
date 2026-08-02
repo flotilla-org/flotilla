@@ -7,6 +7,7 @@ WORKDIR /app
 
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
+COPY assets/ assets/
 COPY src/ src/
 COPY crates/ crates/
 RUN cargo chef prepare --recipe-path recipe.json
