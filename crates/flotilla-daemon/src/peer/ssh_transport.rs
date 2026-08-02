@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::{
     config::RemoteHostConfig,
-    providers::{ChannelLabel, CommandOutput, CommandProcess, CommandRunner, ProcessCommandRunner},
+    providers::{ChannelLabel, CommandOutput, CommandProcess, CommandRunner},
 };
 use flotilla_protocol::{ConfigLabel, GoodbyeReason, HostName, Message, NodeId, NodeInfo, PeerWireMessage, PROTOCOL_VERSION};
 use tokio::{
@@ -139,6 +139,7 @@ impl SshTransport {
     ///
     /// The local forwarded socket will be placed at
     /// `~/.config/flotilla/peers/<host-name>.sock`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         local_node_id: NodeId,
         local_display_name: String,
@@ -146,6 +147,7 @@ impl SshTransport {
         config: RemoteHostConfig,
         expected_node_id: Option<NodeId>,
         local_session_id: uuid::Uuid,
+        command_runner: Arc<dyn CommandRunner>,
         paths: SshTransportPaths<'_>,
     ) -> Result<Self, String> {
         let local_socket_path = peer_resource_socket_path(&paths.state_dir.join("peers"), &config_label)?;
@@ -163,7 +165,7 @@ impl SshTransport {
             remote_daemon_socket_path: None,
             remote_resource_socket_path: None,
             ssh_binary: PathBuf::from("ssh"),
-            command_runner: Arc::new(ProcessCommandRunner),
+            command_runner,
             ssh_process: None,
             status: PeerConnectionStatus::Disconnected,
             inbound_rx: None,
@@ -812,8 +814,7 @@ mod tests {
             ],
             events,
         ));
-        let mut transport = test_transport();
-        transport.command_runner = runner.clone();
+        let transport = test_transport(runner.clone());
         assert_eq!(transport.resolve_remote_daemon_socket().await.expect("first resolution"), PathBuf::from("/run/first.sock"));
         assert_eq!(transport.resolve_remote_daemon_socket().await.expect("second resolution"), PathBuf::from("/run/moved.sock"));
 
@@ -829,8 +830,7 @@ mod tests {
     async fn pre_hello_close_names_remote_daemon_not_listening() {
         let events = Arc::new(StdMutex::new(Vec::new()));
         let runner = Arc::new(FakeCommandRunner::new(vec![successful_output(format!("{REMOTE_DAEMON_NOT_LISTENING}\n"))], events));
-        let mut transport = test_transport();
-        transport.command_runner = runner.clone();
+        let mut transport = test_transport(runner.clone());
         transport.remote_daemon_socket_path = Some(PathBuf::from("/remote/run/flotilla.sock"));
 
         let diagnosis = transport.diagnose_pre_hello_close().await.expect("probable cause");
@@ -841,7 +841,7 @@ mod tests {
         assert!(command.args[4].contains("test -S '/remote/run/flotilla.sock'"));
     }
 
-    fn test_transport() -> SshTransport {
+    fn test_transport(command_runner: Arc<dyn CommandRunner>) -> SshTransport {
         SshTransport::new(
             NodeId::new("local"),
             "local-display".into(),
@@ -855,6 +855,7 @@ mod tests {
             },
             None,
             uuid::Uuid::nil(),
+            command_runner,
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("test transport")
@@ -876,6 +877,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
+            Arc::new(flotilla_core::providers::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
@@ -899,6 +901,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
+            Arc::new(flotilla_core::providers::ProcessCommandRunner),
             SshTransportPaths {
                 state_dir: Path::new("/home/test-local/.local/state/flotilla"),
                 daemon_socket: Path::new("/home/test-local/.config/flotilla/flotilla.sock"),
@@ -944,6 +947,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
+            Arc::new(flotilla_core::providers::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid transport");
@@ -977,6 +981,11 @@ mod tests {
             user: None,
             ssh_multiplex: None,
         };
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let runner = Arc::new(FakeCommandRunner::new(
+            vec![successful_output(format!("{REMOTE_SOCKET_PATH_PREFIX}{}\n", daemon_socket.display())), successful_output("")],
+            events.clone(),
+        ));
         let mut transport = SshTransport::new(
             NodeId::new("local-node"),
             "local-host".into(),
@@ -984,15 +993,10 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
+            runner.clone(),
             SshTransportPaths { state_dir: tmp.path(), daemon_socket: &daemon_socket },
         )
         .expect("valid transport");
-        let events = Arc::new(StdMutex::new(Vec::new()));
-        let runner = Arc::new(FakeCommandRunner::new(
-            vec![successful_output(format!("{REMOTE_SOCKET_PATH_PREFIX}{}\n", daemon_socket.display())), successful_output("")],
-            events.clone(),
-        ));
-        transport.command_runner = runner.clone();
 
         transport.spawn_ssh().await.expect("stale cleanup and tunnel spawn should succeed");
         transport.wait_for_socket().await.expect("fake tunnel creates forwarded socket");
@@ -1035,16 +1039,6 @@ mod tests {
             user: None,
             ssh_multiplex: None,
         };
-        let mut transport = SshTransport::new(
-            NodeId::new("local-node"),
-            "local-host".into(),
-            ConfigLabel("peer-a".into()),
-            config,
-            None,
-            uuid::Uuid::nil(),
-            SshTransportPaths { state_dir: tmp.path(), daemon_socket: &daemon_socket },
-        )
-        .expect("valid transport");
         let events = Arc::new(StdMutex::new(Vec::new()));
         let runner = Arc::new(FakeCommandRunner::new(
             vec![
@@ -1053,7 +1047,17 @@ mod tests {
             ],
             events.clone(),
         ));
-        transport.command_runner = runner.clone();
+        let mut transport = SshTransport::new(
+            NodeId::new("local-node"),
+            "local-host".into(),
+            ConfigLabel("peer-a".into()),
+            config,
+            None,
+            uuid::Uuid::nil(),
+            runner.clone(),
+            SshTransportPaths { state_dir: tmp.path(), daemon_socket: &daemon_socket },
+        )
+        .expect("valid transport");
 
         let error = transport.spawn_ssh().await.expect_err("cleanup failure must stop the tunnel dial");
 
@@ -1081,6 +1085,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
+            Arc::new(flotilla_core::providers::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         ) {
             Err(e) => assert!(e.contains("path separators"), "unexpected error: {e}"),
@@ -1104,6 +1109,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
+            Arc::new(flotilla_core::providers::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
@@ -1207,6 +1213,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
+            Arc::new(flotilla_core::providers::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
@@ -1229,6 +1236,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
+            Arc::new(flotilla_core::providers::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
@@ -1259,6 +1267,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
+            Arc::new(flotilla_core::providers::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
@@ -1330,6 +1339,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
+            Arc::new(flotilla_core::providers::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
