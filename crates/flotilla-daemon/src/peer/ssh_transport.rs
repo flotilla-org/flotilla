@@ -111,6 +111,8 @@ pub struct SshTransport {
     remote_daemon_socket_path: Option<PathBuf>,
     remote_resource_socket_path: Option<PathBuf>,
     ssh_binary: PathBuf,
+    #[cfg(test)]
+    ssh_args_prefix: Vec<PathBuf>,
     ssh_process: Option<tokio::process::Child>,
     status: PeerConnectionStatus,
     /// Receiver for inbound peer data, produced by `connect_socket()` and
@@ -157,6 +159,8 @@ impl SshTransport {
             remote_daemon_socket_path: None,
             remote_resource_socket_path: None,
             ssh_binary: PathBuf::from("ssh"),
+            #[cfg(test)]
+            ssh_args_prefix: Vec::new(),
             ssh_process: None,
             status: PeerConnectionStatus::Disconnected,
             inbound_rx: None,
@@ -166,6 +170,17 @@ impl SshTransport {
             remote_session_id: None,
             remote_node_info: None,
         })
+    }
+
+    fn ssh_command(&self) -> tokio::process::Command {
+        let command = tokio::process::Command::new(&self.ssh_binary);
+        #[cfg(test)]
+        let command = {
+            let mut command = command;
+            command.args(&self.ssh_args_prefix);
+            command
+        };
+        command
     }
 
     /// Spawn the SSH child process that forwards the remote socket locally.
@@ -202,7 +217,8 @@ impl SshTransport {
             "spawning SSH tunnel"
         );
 
-        let child = tokio::process::Command::new(&self.ssh_binary)
+        let child = self
+            .ssh_command()
             .arg("-N") // no remote command
             .arg("-L")
             .arg(&forward_spec)
@@ -238,7 +254,8 @@ impl SshTransport {
     async fn resolve_remote_daemon_socket(&self) -> Result<PathBuf, String> {
         let destination = self.destination();
         let command = remote_socket_path_command();
-        let output = tokio::process::Command::new(&self.ssh_binary)
+        let output = self
+            .ssh_command()
             .arg("-T")
             .arg("-o")
             .arg("BatchMode=yes")
@@ -272,7 +289,8 @@ impl SshTransport {
         let command = self.remote_cleanup_command();
         debug!(%destination, remote_socket = %path, "removing stale reverse peer socket before SSH tunnel dial");
 
-        let output = tokio::process::Command::new(&self.ssh_binary)
+        let output = self
+            .ssh_command()
             .arg("-T")
             .arg("-o")
             .arg("BatchMode=yes")
@@ -468,7 +486,8 @@ impl SshTransport {
         let quoted_path = shell_quote(&remote_socket.to_string_lossy());
         let command =
             format!("test -S {quoted_path} && {{ ! command -v ss >/dev/null 2>&1 || ss -xlH | grep -F -- {quoted_path} >/dev/null; }}");
-        let output = tokio::process::Command::new(&self.ssh_binary)
+        let output = self
+            .ssh_command()
             .arg("-T")
             .arg("-o")
             .arg("BatchMode=yes")
@@ -687,8 +706,6 @@ impl Drop for SshTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use flotilla_protocol::PeerDataMessage;
     use tokio::io::AsyncWriteExt;
 
@@ -736,20 +753,15 @@ mod tests {
         let published_path = tmp.path().join("published-path");
         std::fs::write(&published_path, "/run/first.sock\n").expect("write first path");
         let fake_ssh = tmp.path().join("ssh");
-        std::fs::write(
+        let mut transport = test_transport();
+        install_fake_ssh(
+            &mut transport,
             &fake_ssh,
             format!(
                 "#!/bin/sh\nprintf 'login banner\\n{REMOTE_SOCKET_PATH_PREFIX}'; cat {}\nprintf 'motd\\n'\n",
                 shell_quote(&published_path.to_string_lossy())
             ),
-        )
-        .expect("write fake ssh");
-        let mut permissions = std::fs::metadata(&fake_ssh).expect("fake ssh metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake_ssh, permissions).expect("make fake ssh executable");
-
-        let mut transport = test_transport();
-        transport.ssh_binary = fake_ssh;
+        );
         assert_eq!(transport.resolve_remote_daemon_socket().await.expect("first resolution"), PathBuf::from("/run/first.sock"));
 
         std::fs::write(&published_path, "/run/moved.sock\n").expect("move published path");
@@ -760,13 +772,8 @@ mod tests {
     async fn pre_hello_close_names_remote_daemon_not_listening() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let fake_ssh = tmp.path().join("ssh");
-        std::fs::write(&fake_ssh, "#!/bin/sh\nexit 1\n").expect("write fake ssh");
-        let mut permissions = std::fs::metadata(&fake_ssh).expect("fake ssh metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake_ssh, permissions).expect("make fake ssh executable");
-
         let mut transport = test_transport();
-        transport.ssh_binary = fake_ssh;
+        install_fake_ssh(&mut transport, &fake_ssh, "#!/bin/sh\nexit 1\n");
         transport.remote_daemon_socket_path = Some(PathBuf::from("/remote/run/flotilla.sock"));
 
         let diagnosis = transport.diagnose_pre_hello_close().await.expect("probable cause");
@@ -791,6 +798,16 @@ mod tests {
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("test transport")
+    }
+
+    fn install_fake_ssh(transport: &mut SshTransport, path: &Path, script: impl AsRef<[u8]>) {
+        std::fs::write(path, script).expect("write fake ssh");
+
+        // Execute the freshly written stub as data through sh instead of exec-ing it
+        // directly. On Linux, another test spawning during our write can inherit the
+        // write fd in the fork/exec CLOEXEC window, making direct exec fail with ETXTBSY.
+        transport.ssh_binary = PathBuf::from("/bin/sh");
+        transport.ssh_args_prefix = vec![path.to_path_buf()];
     }
 
     #[test]
@@ -923,18 +940,14 @@ mod tests {
         let stale_reverse_socket = reverse_peer_resource_socket_path(&daemon_socket, &NodeId::new("local-node")).expect("reverse socket");
         std::fs::write(&stale_reverse_socket, []).expect("create stale reverse socket stand-in");
         let fake_ssh = tmp.path().join("ssh");
-        std::fs::write(
+        install_fake_ssh(
+            &mut transport,
             &fake_ssh,
             format!(
                 "#!/bin/sh\n[ \"$1\" = \"-N\" ] && exit 0\nfor command do :; done\ncase \"$command\" in\n  *socket-path*) printf '{REMOTE_SOCKET_PATH_PREFIX}%s\\n' '{}' ;;\n  *) exec /bin/sh -c \"$command\" ;;\nesac\n",
                 daemon_socket.display()
             ),
-        )
-        .expect("write fake ssh");
-        let mut permissions = std::fs::metadata(&fake_ssh).expect("fake ssh metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake_ssh, permissions).expect("make fake ssh executable");
-        transport.ssh_binary = fake_ssh;
+        );
 
         transport.spawn_ssh().await.expect("stale cleanup and tunnel spawn should succeed");
 
@@ -965,18 +978,14 @@ mod tests {
         )
         .expect("valid transport");
         let fake_ssh = tmp.path().join("ssh");
-        std::fs::write(
+        install_fake_ssh(
+            &mut transport,
             &fake_ssh,
             format!(
                 "#!/bin/sh\n[ \"$1\" = \"-N\" ] && exit 0\nfor command do :; done\ncase \"$command\" in\n  *socket-path*) printf '{REMOTE_SOCKET_PATH_PREFIX}%s\\n' '{}' ;;\n  *) echo cleanup-denied >&2; exit 23 ;;\nesac\n",
                 daemon_socket.display()
             ),
-        )
-        .expect("write failing fake ssh");
-        let mut permissions = std::fs::metadata(&fake_ssh).expect("fake ssh metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake_ssh, permissions).expect("make fake ssh executable");
-        transport.ssh_binary = fake_ssh;
+        );
 
         let error = transport.spawn_ssh().await.expect_err("cleanup failure must stop the tunnel dial");
 
