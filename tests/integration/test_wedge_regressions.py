@@ -34,9 +34,9 @@ def peer_status():
     return flotilla_json("node-a", "host node-b status")
 
 
-def daemon_events(service: str) -> list[dict]:
+def daemon_events(service: str, offset: int = 0) -> list[dict]:
     events = []
-    for line in daemon_log(service).splitlines():
+    for line in daemon_log(service)[offset:].splitlines():
         try:
             events.append(json.loads(line))
         except json.JSONDecodeError:
@@ -48,7 +48,10 @@ def peer_generations() -> list[int]:
     return [
         int(event["fields"]["generation"])
         for event in daemon_events("node-a")
-        if event.get("fields", {}).get("message") == "reconnected successfully"
+        if (
+            "connected successfully"
+            in event.get("fields", {}).get("message", "")
+        )
         and "generation" in event["fields"]
     ]
 
@@ -247,13 +250,14 @@ def test_03_idle_link_survives_three_ping_windows(topology):
 def test_04_long_transport_outage_recovers_with_capped_backoff(topology):
     """#1045: prolonged transport failure cannot strand a recovered peer."""
     initial_generation = max(peer_generations())
+    log_offset = len(daemon_log("node-a"))
 
     stop_daemon("node-b")
 
     def capped_attempt_observed():
         attempts = [
             (int(event["fields"]["attempt"]), int(event["fields"]["delay_secs"]))
-            for event in daemon_events("node-a")
+            for event in daemon_events("node-a", log_offset)
             if event.get("fields", {}).get("message") == "reconnecting after backoff"
             and "attempt" in event["fields"]
             and "delay_secs" in event["fields"]
