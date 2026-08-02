@@ -176,6 +176,7 @@ fn build_peer_manager(
 
     let peer_count = hosts_config.hosts.len();
     let mut peer_manager = PeerManager::new(local_node_id.clone());
+    let command_runner = daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
     for (name, host_config) in hosts_config.hosts {
         let expected_host_name = HostName::new(&host_config.expected_host_name);
         let expected_node_id = host_config.expected_node_id.clone();
@@ -186,6 +187,7 @@ fn build_peer_manager(
             host_config,
             expected_node_id.clone(),
             daemon.session_id(),
+            Arc::clone(&command_runner),
             SshTransportPaths { state_dir: config.state_dir().as_path(), daemon_socket: local_daemon_socket_path },
         ) {
             Ok(transport) => {

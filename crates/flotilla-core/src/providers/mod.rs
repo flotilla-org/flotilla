@@ -150,6 +150,19 @@ pub struct CommandOutput {
     pub success: bool,
 }
 
+/// Handle to a supervised long-lived command spawned by a [`CommandRunner`].
+#[async_trait]
+pub trait CommandProcess: Send + Sync {
+    /// Return the exit status when the command has exited, without waiting.
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String>;
+
+    /// Request termination of the command.
+    async fn kill(&mut self) -> Result<(), String>;
+
+    /// Wait for the command to exit.
+    async fn wait(&mut self) -> Result<std::process::ExitStatus, String>;
+}
+
 pub(crate) fn helper_exec_script(helper_path: &str, subcommand: &str, args: &[&str]) -> Result<String, String> {
     let helper_dir = Path::new(helper_path).parent().ok_or_else(|| format!("installed helper path has no parent: {helper_path}"))?;
     let mut parts = vec![
@@ -214,6 +227,20 @@ pub trait CommandRunner: Send + Sync {
     /// `Err` only if the process could not be spawned at all.
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String>;
 
+    /// Spawn a supervised command that is expected to outlive this call.
+    ///
+    /// Implementations should ensure dropping the returned handle terminates
+    /// the command so cancellation cannot orphan a child process.
+    async fn spawn_long_lived(
+        &self,
+        _cmd: &str,
+        _args: &[&str],
+        _cwd: &Path,
+        _label: &ChannelLabel,
+    ) -> Result<Box<dyn CommandProcess>, String> {
+        Err("command runner does not support long-lived processes".to_string())
+    }
+
     /// Run a command with bytes supplied on stdin. The input is deliberately
     /// separate from argv so sensitive content cannot leak into process lists
     /// or recorded command transcripts.
@@ -256,6 +283,25 @@ pub trait CommandRunner: Send + Sync {
 /// Production implementation that delegates to `tokio::process::Command`.
 pub struct ProcessCommandRunner;
 
+struct TokioCommandProcess {
+    child: tokio::process::Child,
+}
+
+#[async_trait]
+impl CommandProcess for TokioCommandProcess {
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        self.child.try_wait().map_err(|error| error.to_string())
+    }
+
+    async fn kill(&mut self) -> Result<(), String> {
+        self.child.kill().await.map_err(|error| error.to_string())
+    }
+
+    async fn wait(&mut self) -> Result<std::process::ExitStatus, String> {
+        self.child.wait().await.map_err(|error| error.to_string())
+    }
+}
+
 #[async_trait]
 impl CommandRunner for ProcessCommandRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
@@ -277,6 +323,7 @@ impl CommandRunner for ProcessCommandRunner {
         let output = tokio::process::Command::new(cmd)
             .args(args)
             .current_dir(cwd)
+            .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .output()
             .await
@@ -286,6 +333,25 @@ impl CommandRunner for ProcessCommandRunner {
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
             success: output.status.success(),
         })
+    }
+
+    async fn spawn_long_lived(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        _label: &ChannelLabel,
+    ) -> Result<Box<dyn CommandProcess>, String> {
+        let child = tokio::process::Command::new(cmd)
+            .args(args)
+            .current_dir(cwd)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        Ok(Box::new(TokioCommandProcess { child }))
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
@@ -617,6 +683,63 @@ pub(crate) mod testing {
         .expect("child command");
 
         assert_eq!(output.len(), 131_072);
+    }
+
+    #[tokio::test]
+    async fn process_runner_long_lived_process_supports_lifecycle_contract() {
+        let runner = super::ProcessCommandRunner;
+        let mut process = runner.spawn_long_lived("sleep", &["30"], Path::new("/"), &ChannelLabel::Noop).await.expect("spawn sleep");
+
+        assert!(process.try_wait().expect("poll running child").is_none());
+        process.kill().await.expect("kill child");
+        let status = process.wait().await.expect("reap killed child");
+        assert!(!status.success());
+        assert!(process.try_wait().expect("poll reaped child").is_some());
+    }
+
+    #[tokio::test]
+    async fn process_runner_long_lived_process_drop_does_not_leak_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_path = dir.path().join("child.pid");
+        let pid_path_arg = pid_path.to_string_lossy();
+        let runner = super::ProcessCommandRunner;
+        let process = runner
+            .spawn_long_lived("sh", &["-c", "echo $$ > \"$1\"; exec sleep 30", "sh", &pid_path_arg], Path::new("/"), &ChannelLabel::Noop)
+            .await
+            .expect("spawn tracked sleep");
+
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = tokio::fs::read_to_string(&pid_path).await {
+                    let pid = contents.trim();
+                    if !pid.is_empty() {
+                        break pid.to_string();
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("child should publish pid");
+
+        drop(process);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = tokio::process::Command::new("kill")
+                    .args(["-0", &pid])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await
+                    .expect("poll child pid");
+                if !status.success() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped process must terminate its child");
     }
 }
 
