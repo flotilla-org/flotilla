@@ -859,6 +859,15 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
         })
         .collect::<Vec<_>>();
     assert_eq!(checkout_paths, ["/workspace/flotilla", "/workspace/cleat"]);
+    for actuation in &outcome.actuations {
+        let Actuation::CreateCheckout { meta, spec: CheckoutSpec::FreshClone(_) } = actuation else {
+            continue;
+        };
+        assert_eq!(meta.labels.get(CONVOY_LABEL).map(String::as_str), Some("convoy-multi-fresh"));
+        assert_eq!(meta.owner_references.len(), 1);
+        assert_eq!(meta.owner_references[0].kind, "Convoy");
+        assert_eq!(meta.owner_references[0].name, "convoy-multi-fresh");
+    }
 }
 
 #[tokio::test]

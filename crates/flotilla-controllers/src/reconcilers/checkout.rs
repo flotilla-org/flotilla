@@ -15,6 +15,7 @@ const CHECKOUT_PROVISIONING_REQUEUE_AFTER: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutRemoval {
     Worktree { clone_path: String, branch: String, target_path: String },
+    OrphanedWorktree { target_path: String },
     FreshClone { target_path: String },
 }
 
@@ -209,10 +210,15 @@ where
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         let removal = match &obj.spec {
-            CheckoutSpec::Worktree(spec) => {
-                let clone = self.clones.get(&spec.clone_ref).await?;
-                CheckoutRemoval::Worktree { clone_path: clone.spec.path, branch: spec.r#ref.clone(), target_path: spec.target_path.clone() }
-            }
+            CheckoutSpec::Worktree(spec) => match self.clones.get(&spec.clone_ref).await {
+                Ok(clone) => CheckoutRemoval::Worktree {
+                    clone_path: clone.spec.path,
+                    branch: spec.r#ref.clone(),
+                    target_path: spec.target_path.clone(),
+                },
+                Err(ResourceError::NotFound { .. }) => CheckoutRemoval::OrphanedWorktree { target_path: spec.target_path.clone() },
+                Err(err) => return Err(err),
+            },
             CheckoutSpec::FreshClone(spec) => CheckoutRemoval::FreshClone { target_path: spec.target_path.clone() },
             CheckoutSpec::Observed(_) => return Ok(()),
         };

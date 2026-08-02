@@ -72,7 +72,9 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
         self.removals.lock().expect("removals lock").push(removal.clone());
         let target_path = match removal {
-            CheckoutRemoval::Worktree { target_path, .. } | CheckoutRemoval::FreshClone { target_path } => target_path,
+            CheckoutRemoval::Worktree { target_path, .. }
+            | CheckoutRemoval::OrphanedWorktree { target_path }
+            | CheckoutRemoval::FreshClone { target_path } => target_path,
         };
         if self.failed_removal_target.as_deref() == Some(target_path) {
             return Err("permission denied removing root-owned debris".to_string());
@@ -231,6 +233,34 @@ async fn worktree_finalizer_supplies_clone_branch_and_target_to_runtime() {
     assert_eq!(runtime.removals.lock().expect("removals lock").as_slice(), &[CheckoutRemoval::Worktree {
         clone_path: "/checkouts/repo".to_string(),
         branch: "feature/cleanup".to_string(),
+        target_path: "/checkouts/convoy-a/repo.feature-cleanup".to_string(),
+    }]);
+}
+
+#[tokio::test]
+async fn worktree_finalizer_removes_checkout_when_clone_resource_is_already_gone() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let created = checkouts
+        .create(
+            &meta("checkout-a"),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-a".to_string(),
+                r#ref: "feature/cleanup".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/convoy-a/repo.feature-cleanup".to_string(),
+                clone_ref: "missing-clone".to_string(),
+            }),
+        )
+        .await
+        .expect("checkout create should succeed");
+    let runtime = Arc::new(RecordingCheckoutRuntime::default());
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE);
+
+    reconciler.run_finalizer(&created).await.expect("missing clone must not wedge checkout deletion");
+
+    assert_eq!(runtime.removals.lock().expect("removals lock").as_slice(), &[CheckoutRemoval::OrphanedWorktree {
         target_path: "/checkouts/convoy-a/repo.feature-cleanup".to_string(),
     }]);
 }

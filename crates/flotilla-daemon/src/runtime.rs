@@ -2318,6 +2318,10 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 remove_checkout_path(&*runner, &clone_staging_path(target_path)).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
+            CheckoutRemoval::OrphanedWorktree { target_path } => {
+                remove_checkout_path(&*runner, utf8_path(target_path)?).await?;
+                Ok(CheckoutRemovalOutcome::Removed)
+            }
             CheckoutRemoval::Worktree { clone_path, branch, target_path } => {
                 let clone_path = utf8_path(clone_path)?;
                 let target_path = utf8_path(target_path)?;
@@ -4392,6 +4396,20 @@ mod tests {
 
         assert_eq!(outcome, CheckoutRemovalOutcome::Removed);
         assert!(!Path::new(&staging_path).exists());
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_treats_an_already_missing_orphaned_worktree_as_removed() {
+        let temp = TempDir::new().expect("tempdir");
+        let target = temp.path().join("already-removed-worktree");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        let outcome = runtime
+            .remove_checkout(&CheckoutRemoval::OrphanedWorktree { target_path: target.to_str().expect("utf-8 target path").to_string() })
+            .await
+            .expect("an absent checkout directory should not wedge finalization");
+
+        assert_eq!(outcome, CheckoutRemovalOutcome::Removed);
     }
 
     #[tokio::test]
