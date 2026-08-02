@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/compose-integration.yml
 
 permissions:
   contents: read
@@ -24,7 +27,7 @@ jobs:
         run: python -m pip install ./tests/integration
       - name: Run real-boundary topology and wedge regressions
         run: >-
-          python -m pytest -v
+          python -m pytest -v --timeout=1800
           tests/integration/test_minimal_topology.py
           tests/integration/test_wedge_regressions.py
       - name: Print compose logs
@@ -36,7 +39,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      # The fixture builds flotilla-base into the host image store before the
+      # role images; a container-driver buildx builder cannot resolve it.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

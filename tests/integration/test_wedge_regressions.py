@@ -1,7 +1,6 @@
 """Real-boundary regressions for the multi-host wedge family."""
 
 import json
-import re
 import time
 
 import pytest
@@ -16,8 +15,6 @@ from conftest import (
     wait_for,
 )
 
-GENERATION_RE = re.compile(r"\bgeneration=(\d+)\b")
-BACKOFF_RE = re.compile(r"\battempt=(\d+)\b.*\bdelay_secs=(\d+)\b")
 RECONNECT_MESSAGES = (
     "SSH connection dropped, will reconnect",
     "reconnecting after backoff",
@@ -26,29 +23,55 @@ RECONNECT_MESSAGES = (
 
 
 def peer_entry():
-    hosts = flotilla_json("node-a", "host list")["hosts"]
-    return next(host for host in hosts if host["host_name"] == "node-b")
+    return next(
+        host
+        for host in flotilla_json("node-a", "host list")["hosts"]
+        if host["host"] == "node-b"
+    )
+
+
+def peer_status():
+    return flotilla_json("node-a", "host node-b status")
+
+
+def daemon_events(service: str, offset: int = 0) -> list[dict]:
+    events = []
+    for line in daemon_log(service)[offset:].splitlines():
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
 
 
 def peer_generations() -> list[int]:
-    generations = []
-    for line in daemon_log("node-a").splitlines():
-        if "connected successfully" not in line:
-            continue
-        match = GENERATION_RE.search(line)
-        if match:
-            generations.append(int(match.group(1)))
-    return generations
+    return [
+        int(event["fields"]["generation"])
+        for event in daemon_events("node-a")
+        if (
+            "connected successfully"
+            in event.get("fields", {}).get("message", "")
+        )
+        and "generation" in event["fields"]
+    ]
+
+
+def listed_objects(response: dict) -> list[dict]:
+    return [
+        record["object"]
+        for record in response["records"]
+        if record.get("object") is not None
+    ]
 
 
 def replicated_peer_host() -> dict:
-    peer = peer_entry()
+    peer = peer_status()
     peer_node_id = peer["node"]["node_id"]
     peer_host_id = peer["environment_id"].removeprefix("host:")
     listed = flotilla_json(
         "node-a", "resource list hosts --include-replicas"
     )
-    for item in listed["items"]:
+    for item in listed_objects(listed):
         annotations = item["metadata"].get("annotations", {})
         if (
             item["metadata"]["name"] == peer_host_id
@@ -65,7 +88,7 @@ def replicated_host_by_identity(name: str, origin: str) -> dict:
     listed = flotilla_json(
         "node-a", "resource list hosts --include-replicas"
     )
-    for item in listed["items"]:
+    for item in listed_objects(listed):
         annotations = item["metadata"].get("annotations", {})
         if (
             item["metadata"]["name"] == name
@@ -84,7 +107,7 @@ def heartbeat_at() -> str:
 
 def wait_connected():
     wait_for(
-        lambda: peer_entry()["connection_status"] == "Connected",
+        lambda: peer_entry()["link"] == "Connected",
         "node-a reports node-b connected",
         timeout=30,
         interval=0.5,
@@ -193,7 +216,7 @@ def test_02_transport_death_re_resolves_forwarded_socket(topology):
         )
         return any(
             item["metadata"]["name"] == "transport-recovery"
-            for item in listed["items"]
+            for item in listed_objects(listed)
         )
 
     wait_for(
@@ -214,7 +237,7 @@ def test_03_idle_link_survives_three_ping_windows(topology):
 
     time.sleep(95)
 
-    assert peer_entry()["connection_status"] == "Connected"
+    assert peer_entry()["link"] == "Connected"
     assert replicated_peer_host()["status"]["ready"] is True
     assert max(peer_generations()) == generation
     final_log = daemon_log("node-a")
@@ -227,15 +250,17 @@ def test_03_idle_link_survives_three_ping_windows(topology):
 def test_04_long_transport_outage_recovers_with_capped_backoff(topology):
     """#1045: prolonged transport failure cannot strand a recovered peer."""
     initial_generation = max(peer_generations())
-    initial_log = daemon_log("node-a")
+    log_offset = len(daemon_log("node-a"))
 
     stop_daemon("node-b")
 
     def capped_attempt_observed():
-        recovery_log = daemon_log("node-a")[len(initial_log):]
         attempts = [
-            (int(attempt), int(delay))
-            for attempt, delay in BACKOFF_RE.findall(recovery_log)
+            (int(event["fields"]["attempt"]), int(event["fields"]["delay_secs"]))
+            for event in daemon_events("node-a", log_offset)
+            if event.get("fields", {}).get("message") == "reconnecting after backoff"
+            and "attempt" in event["fields"]
+            and "delay_secs" in event["fields"]
         ]
         assert all(delay <= 60 for _, delay in attempts), (
             f"redial delay exceeded its 60-second cap: {attempts}"
