@@ -6,11 +6,11 @@ use common::{
 };
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
-    apply_status_patch, controller::ControllerLoop, external_patches, reconcile, Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler,
-    InMemoryBackend, InputMeta, IssueSnapshot, LifecycleAuthority, PlacementPolicy, PlacementPolicySpec, PreparedSnapshotGarbageCollector,
-    Presentation, PresentationSpec, RepositorySpec, ResourceBackend, ResourceError, Vessel, VesselPhase, VesselStatus, WorkflowTemplate,
-    WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, VESSEL_LABEL,
-    WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
+    apply_status_patch, controller::ControllerLoop, external_patches, reconcile, Checkout, CheckoutSpec, Convoy, ConvoyIssue, ConvoyPhase,
+    ConvoyReconciler, FreshCloneCheckoutSpec, InMemoryBackend, InputMeta, IssueSnapshot, LifecycleAuthority, PlacementPolicy,
+    PlacementPolicySpec, PreparedSnapshotGarbageCollector, Presentation, PresentationSpec, RepositoryKey, RepositorySpec, ResourceBackend,
+    ResourceError, Vessel, VesselPhase, VesselStatus, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION,
+    PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
 };
 use tokio::time::{timeout, Duration};
 
@@ -293,6 +293,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let workspaces = backend.clone().using::<Vessel>("flotilla");
     let presentations = backend.clone().using::<Presentation>("flotilla");
+    let checkouts = backend.clone().using::<Checkout>("flotilla");
     let workflow_snapshot_name = "workflow-snapshot-012345abcdef";
     let placement_snapshot_name = "placement-snapshot-012345abcdef";
     let snapshot_labels = |kind: &str| [(PREPARED_SNAPSHOT_LABEL.to_string(), kind.to_string())].into_iter().collect();
@@ -369,6 +370,23 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
         )
         .await
         .expect("presentation create should succeed");
+    checkouts
+        .create(
+            &InputMeta::builder()
+                .name("checkout-convoy-delete".to_string())
+                .labels([(CONVOY_LABEL.to_string(), "convoy-delete".to_string())].into_iter().collect())
+                .build(),
+            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                repo_ref: RepositoryKey("repo-a".to_string()),
+                env_ref: "env-convoy-delete".to_string(),
+                r#ref: "feature/delete".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/convoy-delete".to_string(),
+                url: "https://github.com/flotilla-org/flotilla".to_string(),
+            }),
+        )
+        .await
+        .expect("checkout create should succeed");
     workspaces
         .create(
             &InputMeta::builder()
@@ -467,6 +485,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
             reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
                 .with_vessels(workspaces.clone())
                 .with_presentations(presentations.clone())
+                .with_checkouts(checkouts.clone())
                 .with_prepared_snapshot_gc(PreparedSnapshotGarbageCollector::new(backend.clone(), "flotilla")),
             resync_interval: Duration::from_millis(50),
             backend: backend.clone(),
@@ -493,6 +512,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
             if matches!(convoys.get("convoy-delete").await, Err(ResourceError::NotFound { .. }))
                 && matches!(workspaces.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. }))
                 && matches!(presentations.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. }))
+                && matches!(checkouts.get("checkout-convoy-delete").await, Err(ResourceError::NotFound { .. }))
                 && matches!(
                     backend.clone().using::<WorkflowTemplate>("flotilla").get(workflow_snapshot_name).await,
                     Err(ResourceError::NotFound { .. })

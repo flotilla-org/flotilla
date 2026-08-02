@@ -662,12 +662,7 @@ impl Reconciler for VesselReconciler {
                     {
                         labels.insert(CHANGE_REQUEST_ID_LABEL.to_string(), change_request.id.clone());
                     }
-                    let meta = match &strategy {
-                        PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
-                            convoy_owned_child_meta(&checkout_name, &convoy, obj, labels)
-                        }
-                        PlacementStrategy::DockerFreshCloneInContainer { .. } => owned_child_meta(&checkout_name, obj, labels),
-                    };
+                    let meta = convoy_owned_child_meta(&checkout_name, &convoy, obj, labels);
                     actuations.push(Actuation::CreateCheckout { meta, spec });
                     waiting_for_checkouts.push(checkout_name);
                 }
