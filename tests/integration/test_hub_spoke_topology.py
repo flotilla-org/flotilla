@@ -69,8 +69,8 @@ def wait_for_follower(follower: str):
             next(
                 host
                 for host in hub_json("workstation", "host list")["hosts"]
-                if host["host_name"] == follower
-            )["connection_status"]
+                if host["host"] == follower
+            )["link"]
             == "Connected"
         ),
         f"{follower} connected to workstation",
@@ -177,9 +177,18 @@ def hub_spoke_topology():
             )
             hub_start_daemon(node)
 
+        def daemon_ready(node):
+            result = hub_exec(node, "flotilla status --json")
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"flotilla status failed on {node} (rc={result.returncode}): "
+                    f"{result.stderr.strip()}"
+                )
+            return True
+
         for node in NODES:
             wait_for(
-                lambda n=node: hub_exec(n, "flotilla status --json").returncode == 0,
+                lambda n=node: daemon_ready(n),
                 f"daemon ready on {node}",
                 timeout=30,
                 interval=0.5,
