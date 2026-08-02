@@ -26,8 +26,7 @@ RECONNECT_MESSAGES = (
 
 
 def peer_entry():
-    hosts = flotilla_json("node-a", "host list")["hosts"]
-    return next(host for host in hosts if host["host_name"] == "node-b")
+    return flotilla_json("node-a", "host node-b status")
 
 
 def peer_generations() -> list[int]:
