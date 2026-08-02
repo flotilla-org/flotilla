@@ -23,6 +23,14 @@ RECONNECT_MESSAGES = (
 
 
 def peer_entry():
+    return next(
+        host
+        for host in flotilla_json("node-a", "host list")
+        if host["host"] == "node-b"
+    )
+
+
+def peer_status():
     return flotilla_json("node-a", "host node-b status")
 
 
@@ -54,7 +62,7 @@ def listed_objects(response: dict) -> list[dict]:
 
 
 def replicated_peer_host() -> dict:
-    peer = peer_entry()
+    peer = peer_status()
     peer_node_id = peer["node"]["node_id"]
     peer_host_id = peer["environment_id"].removeprefix("host:")
     listed = flotilla_json(
@@ -96,7 +104,7 @@ def heartbeat_at() -> str:
 
 def wait_connected():
     wait_for(
-        lambda: peer_entry()["connection_status"] == "Connected",
+        lambda: peer_entry()["link"] == "Connected",
         "node-a reports node-b connected",
         timeout=30,
         interval=0.5,
@@ -226,7 +234,7 @@ def test_03_idle_link_survives_three_ping_windows(topology):
 
     time.sleep(95)
 
-    assert peer_entry()["connection_status"] == "Connected"
+    assert peer_entry()["link"] == "Connected"
     assert replicated_peer_host()["status"]["ready"] is True
     assert max(peer_generations()) == generation
     final_log = daemon_log("node-a")
