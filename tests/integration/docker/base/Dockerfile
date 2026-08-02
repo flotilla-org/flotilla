@@ -1,5 +1,7 @@
 # === Cargo build stages (only executed when building 'full' target) ===
 FROM rust:slim-trixie AS chef
+ARG FLOTILLA_BUILD_ID=compose-integration
+ENV FLOTILLA_BUILD_ID=$FLOTILLA_BUILD_ID
 RUN cargo install cargo-chef
 WORKDIR /app
 
