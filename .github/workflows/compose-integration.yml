@@ -6,7 +6,13 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - .github/workflows/compose-integration.yml
+      - ".github/workflows/compose-integration.yml"
+      - ".dockerignore"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "src/**"
+      - "crates/**"
+      - "tests/integration/**"
 
 permissions:
   contents: read
@@ -17,7 +23,27 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-docker-action@v4
+        with:
+          daemon-config: |
+            {
+              "features": {
+                "containerd-snapshotter": true
+              }
+            }
       - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+      - name: Build integration base image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: tests/integration/docker/base/Dockerfile
+          target: full
+          tags: flotilla-base
+          load: true
+          cache-from: type=gha,scope=compose-integration-base
+          cache-to: type=gha,mode=max,scope=compose-integration-base
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -39,8 +65,29 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # The fixture builds flotilla-base into the host image store before the
-      # role images; a container-driver buildx builder cannot resolve it.
+      - uses: docker/setup-docker-action@v4
+        with:
+          daemon-config: |
+            {
+              "features": {
+                "containerd-snapshotter": true
+              }
+            }
+      # Keep the docker driver: the fixture builds flotilla-base into the host
+      # image store before the role images, which resolve it by image name.
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+      - name: Build integration base image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: tests/integration/docker/base/Dockerfile
+          target: full
+          tags: flotilla-base
+          load: true
+          cache-from: type=gha,scope=compose-integration-base
+          cache-to: type=gha,mode=max,scope=compose-integration-base
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
