@@ -219,10 +219,19 @@ def topology():
             )
             start_daemon(node)
 
+        def daemon_ready(node):
+            result = docker_exec(node, "flotilla status --json")
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"flotilla status failed on {node} (rc={result.returncode}): "
+                    f"{result.stderr.strip()}"
+                )
+            return True
+
         # Wait for daemon readiness on each node
         for node in ("node-a", "node-b"):
             wait_for(
-                lambda n=node: docker_exec(n, "flotilla status --json").returncode == 0,
+                lambda n=node: daemon_ready(n),
                 f"daemon ready on {node}",
                 timeout=30,
             )
@@ -236,7 +245,7 @@ def topology():
         def peers_connected():
             result = flotilla_json("node-a", "host list")
             return any(
-                h["host_name"] == "node-b" and h["connection_status"] == "Connected"
+                h["host"] == "node-b" and h["link"] == "Connected"
                 for h in result.get("hosts", [])
             )
 
