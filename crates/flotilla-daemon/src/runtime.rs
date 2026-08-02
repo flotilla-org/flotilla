@@ -932,10 +932,11 @@ fn spawn_sleep_inhibitor_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         supervise_controller("sleep_inhibitor", supervision, runtime_health, move || {
-            let convoys = backend.clone().using::<Convoy>(&namespace);
+            let convoys = backend.clone().including_replicas::<Convoy>(&namespace);
+            let vessels = backend.clone().using::<Vessel>(&namespace);
             let hosts = backend.clone().using::<Host>(&namespace);
             let host_id = host_id.clone();
-            async move { sleep_inhibitor::run(convoys, hosts, host_id).await }
+            async move { sleep_inhibitor::run(convoys, vessels, hosts, host_id).await }
         })
         .await;
     })

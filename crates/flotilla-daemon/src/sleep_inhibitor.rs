@@ -7,7 +7,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::SleepInhibitionHealth;
 use flotilla_resources::{
-    apply_status_patch, Convoy, ConvoyPhase, Host, HostStatusPatch, ResourceError, ResourceObject, TypedResolver, WatchEvent, WatchStart,
+    apply_status_patch, Convoy, ConvoyPhase, Host, HostStatusPatch, ReadResourceList, ReadResourceObject, ReadWatchEvent,
+    ReplicaReadResolver, ResourceError, ResourceObject, ResourceProvenance, TypedResolver, Vessel, WatchEvent, WatchStart,
 };
 use futures::StreamExt;
 use tokio::{
@@ -30,22 +31,38 @@ trait SleepInhibitor: Send {
     async fn maintain(&mut self, required: bool) -> Result<SleepInhibitionHealth, String>;
 }
 
-pub(super) async fn run(convoys: TypedResolver<Convoy>, hosts: TypedResolver<Host>, host_id: String) -> Result<(), ResourceError> {
-    run_with_inhibitor(convoys, hosts, host_id, SystemSleepInhibitor::default()).await
+pub(super) async fn run(
+    convoys: ReplicaReadResolver<Convoy>,
+    vessels: TypedResolver<Vessel>,
+    hosts: TypedResolver<Host>,
+    host_id: String,
+) -> Result<(), ResourceError> {
+    run_with_inhibitor(convoys, vessels, hosts, host_id, SystemSleepInhibitor::default()).await
 }
 
 async fn run_with_inhibitor<I: SleepInhibitor>(
-    convoys: TypedResolver<Convoy>,
+    convoys: ReplicaReadResolver<Convoy>,
+    vessels: TypedResolver<Vessel>,
     hosts: TypedResolver<Host>,
     host_id: String,
     mut inhibitor: I,
 ) -> Result<(), ResourceError> {
-    let listed = convoys.list().await?;
-    let mut active = ActiveConvoys::from_objects(&listed.items);
     let mut health = InhibitionHealthTracker::default();
-    maintain_and_publish(&mut inhibitor, active.required(), &mut health, &hosts, &host_id).await?;
+    // Hold while the federated view is being established. Sleeping during an
+    // unknown replica state is more expensive than briefly holding needlessly.
+    maintain_and_publish(&mut inhibitor, true, &mut health, &hosts, &host_id).await?;
 
-    let mut watch = convoys.watch(WatchStart::resuming_from(&listed)).await?;
+    // Overlay watches cannot resume from a list cursor. Start the watch first,
+    // then list, so events racing with the snapshot remain queued for us.
+    let mut watch = convoys.watch().await?;
+    let listed = convoys.list().await?;
+    let mut active_convoys = ActiveConvoys::from_objects(&listed, &host_id);
+
+    let listed_vessels = vessels.list().await?;
+    let mut active_vessels = ActiveVessels::from_objects(&listed_vessels.items);
+    let mut vessel_watch = vessels.watch(WatchStart::resuming_from(&listed_vessels)).await?;
+    maintain_and_publish(&mut inhibitor, active_convoys.required() || active_vessels.required(), &mut health, &hosts, &host_id).await?;
+
     let recheck = tokio::time::sleep(health.recheck_interval());
     tokio::pin!(recheck);
 
@@ -54,19 +71,86 @@ async fn run_with_inhibitor<I: SleepInhibitor>(
             event = watch.next() => {
                 match event {
                     Some(Ok(event)) => {
-                        active.apply(event);
-                        maintain_and_publish(&mut inhibitor, active.required(), &mut health, &hosts, &host_id).await?;
+                        active_convoys.apply(event, &host_id);
+                        maintain_and_publish(
+                            &mut inhibitor,
+                            active_convoys.required() || active_vessels.required(),
+                            &mut health,
+                            &hosts,
+                            &host_id,
+                        ).await?;
                         recheck.as_mut().reset(tokio::time::Instant::now() + health.recheck_interval());
                     }
-                    Some(Err(error)) => return Err(error),
-                    None => return Err(ResourceError::other("sleep inhibitor convoy watch ended")),
+                    Some(Err(error)) => {
+                        maintain_and_publish(&mut inhibitor, true, &mut health, &hosts, &host_id).await?;
+                        return Err(error);
+                    }
+                    None => {
+                        maintain_and_publish(&mut inhibitor, true, &mut health, &hosts, &host_id).await?;
+                        return Err(ResourceError::other("sleep inhibitor convoy watch ended"));
+                    }
+                }
+            }
+            event = vessel_watch.next() => {
+                match event {
+                    Some(Ok(event)) => {
+                        active_vessels.apply(event);
+                        maintain_and_publish(
+                            &mut inhibitor,
+                            active_convoys.required() || active_vessels.required(),
+                            &mut health,
+                            &hosts,
+                            &host_id,
+                        ).await?;
+                        recheck.as_mut().reset(tokio::time::Instant::now() + health.recheck_interval());
+                    }
+                    Some(Err(error)) => {
+                        maintain_and_publish(&mut inhibitor, true, &mut health, &hosts, &host_id).await?;
+                        return Err(error);
+                    }
+                    None => {
+                        maintain_and_publish(&mut inhibitor, true, &mut health, &hosts, &host_id).await?;
+                        return Err(ResourceError::other("sleep inhibitor vessel watch ended"));
+                    }
                 }
             }
             _ = &mut recheck => {
-                maintain_and_publish(&mut inhibitor, active.required(), &mut health, &hosts, &host_id).await?;
+                maintain_and_publish(
+                    &mut inhibitor,
+                    active_convoys.required() || active_vessels.required(),
+                    &mut health,
+                    &hosts,
+                    &host_id,
+                ).await?;
                 recheck.as_mut().reset(tokio::time::Instant::now() + health.recheck_interval());
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct ActiveVessels {
+    names: BTreeSet<String>,
+}
+
+impl ActiveVessels {
+    fn from_objects(objects: &[ResourceObject<Vessel>]) -> Self {
+        Self { names: objects.iter().map(|vessel| vessel.metadata.name.clone()).collect() }
+    }
+
+    fn apply(&mut self, event: WatchEvent<Vessel>) {
+        match event {
+            WatchEvent::Added(vessel) | WatchEvent::Modified(vessel) => {
+                self.names.insert(vessel.metadata.name);
+            }
+            WatchEvent::Deleted(vessel) => {
+                self.names.remove(&vessel.metadata.name);
+            }
+        }
+    }
+
+    fn required(&self) -> bool {
+        !self.names.is_empty()
     }
 }
 
@@ -162,40 +246,55 @@ enum FailureLog {
 
 #[derive(Default)]
 struct ActiveConvoys {
-    names: BTreeSet<String>,
+    keys: BTreeSet<(Option<flotilla_protocol::NodeId>, String)>,
 }
 
 impl ActiveConvoys {
-    fn from_objects(objects: &[ResourceObject<Convoy>]) -> Self {
-        let names = objects.iter().filter(|convoy| convoy_requires_inhibitor(convoy)).map(|convoy| convoy.metadata.name.clone()).collect();
-        Self { names }
+    fn from_objects(listed: &ReadResourceList<Convoy>, host_id: &str) -> Self {
+        let keys = listed.items.iter().filter(|convoy| convoy_requires_inhibitor(&convoy.object, host_id)).map(convoy_key).collect();
+        Self { keys }
     }
 
-    fn apply(&mut self, event: WatchEvent<Convoy>) {
+    fn apply(&mut self, event: ReadWatchEvent<Convoy>, host_id: &str) {
         match event {
-            WatchEvent::Added(convoy) | WatchEvent::Modified(convoy) => {
-                if convoy_requires_inhibitor(&convoy) {
-                    self.names.insert(convoy.metadata.name);
+            ReadWatchEvent::Added(convoy) | ReadWatchEvent::Modified(convoy) => {
+                let key = convoy_key(&convoy);
+                if convoy_requires_inhibitor(&convoy.object, host_id) {
+                    self.keys.insert(key);
                 } else {
-                    self.names.remove(&convoy.metadata.name);
+                    self.keys.remove(&key);
                 }
             }
-            WatchEvent::Deleted(convoy) => {
-                self.names.remove(&convoy.metadata.name);
+            ReadWatchEvent::Deleted(convoy) => {
+                self.keys.remove(&convoy_key(&convoy));
             }
         }
     }
 
     fn required(&self) -> bool {
-        !self.names.is_empty()
+        !self.keys.is_empty()
     }
 }
 
-fn convoy_requires_inhibitor(convoy: &ResourceObject<Convoy>) -> bool {
-    !matches!(
+fn convoy_key(convoy: &ReadResourceObject<Convoy>) -> (Option<flotilla_protocol::NodeId>, String) {
+    let origin = match &convoy.provenance {
+        ResourceProvenance::Local => None,
+        ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
+    };
+    (origin, convoy.object.metadata.name.clone())
+}
+
+fn convoy_requires_inhibitor(convoy: &ResourceObject<Convoy>, host_id: &str) -> bool {
+    let non_terminal = !matches!(
         convoy.status.as_ref().map(|status| status.phase),
         Some(ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned)
-    )
+    );
+    non_terminal
+        && convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.placement_decision.as_ref())
+            .is_none_or(|decision| decision.target_host.reference == host_id)
 }
 
 #[derive(Default)]
@@ -371,8 +470,9 @@ fn platform_inhibitor_commands(_daemon_pid: u32) -> Result<Vec<InhibitorCommand>
 mod tests {
     use std::collections::BTreeMap;
 
-    use flotilla_protocol::PrincipalRef;
-    use flotilla_resources::{ConvoySpec, ConvoyStatus, HostSpec, InMemoryBackend, InputMeta, ResourceBackend};
+    use chrono::Utc;
+    use flotilla_protocol::{NodeId, PlacementDecision, PlacementTargetHost, PrincipalRef};
+    use flotilla_resources::{ConvoySpec, ConvoyStatus, HostSpec, InMemoryBackend, InputMeta, ResourceBackend, VesselSpec};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -416,12 +516,31 @@ mod tests {
         }
     }
 
-    async fn create_convoy(convoys: &TypedResolver<Convoy>, name: &str, phase: ConvoyPhase) -> ResourceObject<Convoy> {
+    async fn create_convoy(
+        convoys: &TypedResolver<Convoy>,
+        name: &str,
+        phase: ConvoyPhase,
+        target_host: Option<&str>,
+    ) -> ResourceObject<Convoy> {
         let created = convoys.create(&InputMeta::builder().name(name.to_string()).build(), &convoy_spec()).await.expect("create convoy");
         convoys
-            .update_status(name, &created.metadata.resource_version, &ConvoyStatus { phase, ..ConvoyStatus::default() })
+            .update_status(name, &created.metadata.resource_version, &ConvoyStatus {
+                phase,
+                placement_decision: target_host.map(|host| PlacementDecision {
+                    policy_name: "test-policy".to_string(),
+                    target_host: PlacementTargetHost { reference: host.to_string(), display_name: host.to_string() },
+                    refused_candidates: vec![],
+                    viable_not_selected: vec![],
+                }),
+                ..ConvoyStatus::default()
+            })
             .await
             .expect("update convoy status")
+    }
+
+    async fn replicate_convoys(source: &TypedResolver<Convoy>, target: &ResourceBackend, origin: &str) {
+        let listed = source.list().await.expect("list convoy authority");
+        target.replica_writer::<Convoy>(NodeId::new(origin), NAMESPACE).replace(&listed, Utc::now()).await.expect("replicate convoys");
     }
 
     async fn create_host(hosts: &TypedResolver<Host>) {
@@ -441,11 +560,18 @@ mod tests {
         let convoys = backend.using::<Convoy>(NAMESPACE);
         let hosts = backend.using::<Host>(NAMESPACE);
         create_host(&hosts).await;
-        create_convoy(&convoys, "active", ConvoyPhase::Active).await;
+        create_convoy(&convoys, "active", ConvoyPhase::Active, Some("test-host")).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let task = tokio::spawn(run_with_inhibitor(convoys, hosts.clone(), "test-host".to_string(), RecordingInhibitor { states: tx }));
+        let task = tokio::spawn(run_with_inhibitor(
+            backend.including_replicas::<Convoy>(NAMESPACE),
+            backend.using::<Vessel>(NAMESPACE),
+            hosts.clone(),
+            "test-host".to_string(),
+            RecordingInhibitor { states: tx },
+        ));
 
+        assert!(next_state(&mut rx).await, "uncertain startup must hold");
         assert!(next_state(&mut rx).await);
         assert_eq!(
             hosts.get("test-host").await.expect("get host").status.expect("host status").sleep_inhibition,
@@ -460,10 +586,17 @@ mod tests {
         let convoys = backend.using::<Convoy>(NAMESPACE);
         let hosts = backend.using::<Host>(NAMESPACE);
         create_host(&hosts).await;
-        let first = create_convoy(&convoys, "first", ConvoyPhase::Active).await;
-        let second = create_convoy(&convoys, "second", ConvoyPhase::Active).await;
+        let first = create_convoy(&convoys, "first", ConvoyPhase::Active, Some("test-host")).await;
+        let second = create_convoy(&convoys, "second", ConvoyPhase::Active, Some("test-host")).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run_with_inhibitor(convoys.clone(), hosts, "test-host".to_string(), RecordingInhibitor { states: tx }));
+        let task = tokio::spawn(run_with_inhibitor(
+            backend.including_replicas::<Convoy>(NAMESPACE),
+            backend.using::<Vessel>(NAMESPACE),
+            hosts,
+            "test-host".to_string(),
+            RecordingInhibitor { states: tx },
+        ));
+        assert!(next_state(&mut rx).await);
         assert!(next_state(&mut rx).await);
 
         convoys
@@ -482,6 +615,120 @@ mod tests {
             })
             .await
             .expect("complete second convoy");
+        assert!(!next_state(&mut rx).await);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn remotely_dispatched_convoy_placed_here_holds_inhibition() {
+        let local = ResourceBackend::InMemory(InMemoryBackend::default());
+        let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+        let hosts = local.using::<Host>(NAMESPACE);
+        create_host(&hosts).await;
+        let remote_convoys = remote.using::<Convoy>(NAMESPACE);
+        create_convoy(&remote_convoys, "remote", ConvoyPhase::Active, Some("test-host")).await;
+        replicate_convoys(&remote_convoys, &local, "dispatch-host").await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let task = tokio::spawn(run_with_inhibitor(
+            local.including_replicas::<Convoy>(NAMESPACE),
+            local.using::<Vessel>(NAMESPACE),
+            hosts,
+            "test-host".to_string(),
+            RecordingInhibitor { states: tx },
+        ));
+
+        assert!(next_state(&mut rx).await);
+        assert!(next_state(&mut rx).await);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn locally_dispatched_convoy_placed_elsewhere_does_not_hold_inhibition() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let hosts = backend.using::<Host>(NAMESPACE);
+        create_host(&hosts).await;
+        create_convoy(&backend.using::<Convoy>(NAMESPACE), "remote-work", ConvoyPhase::Active, Some("other-host")).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let task = tokio::spawn(run_with_inhibitor(
+            backend.including_replicas::<Convoy>(NAMESPACE),
+            backend.using::<Vessel>(NAMESPACE),
+            hosts,
+            "test-host".to_string(),
+            RecordingInhibitor { states: tx },
+        ));
+
+        assert!(next_state(&mut rx).await);
+        assert!(!next_state(&mut rx).await);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_placement_holds_until_replica_catches_up() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let hosts = backend.using::<Host>(NAMESPACE);
+        create_host(&hosts).await;
+        let convoys = backend.using::<Convoy>(NAMESPACE);
+        let lagging = create_convoy(&convoys, "lagging", ConvoyPhase::Active, None).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let task = tokio::spawn(run_with_inhibitor(
+            backend.including_replicas::<Convoy>(NAMESPACE),
+            backend.using::<Vessel>(NAMESPACE),
+            hosts,
+            "test-host".to_string(),
+            RecordingInhibitor { states: tx },
+        ));
+
+        assert!(next_state(&mut rx).await);
+        assert!(next_state(&mut rx).await);
+        convoys
+            .update_status("lagging", &lagging.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                placement_decision: Some(PlacementDecision {
+                    policy_name: "test-policy".to_string(),
+                    target_host: PlacementTargetHost { reference: "other-host".to_string(), display_name: "other-host".to_string() },
+                    refused_candidates: vec![],
+                    viable_not_selected: vec![],
+                }),
+                ..ConvoyStatus::default()
+            })
+            .await
+            .expect("resolve placement after lag");
+        assert!(!next_state(&mut rx).await);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn local_vessel_holds_after_its_convoy_no_longer_requires_inhibition() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let hosts = backend.using::<Host>(NAMESPACE);
+        let vessels = backend.using::<Vessel>(NAMESPACE);
+        create_host(&hosts).await;
+        create_convoy(&backend.using::<Convoy>(NAMESPACE), "winding-down", ConvoyPhase::Landed, Some("test-host")).await;
+        vessels
+            .create(&InputMeta::builder().name("local-vessel".to_string()).build(), &VesselSpec {
+                convoy_ref: "winding-down".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "test-policy".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            })
+            .await
+            .expect("create local vessel");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let task = tokio::spawn(run_with_inhibitor(
+            backend.including_replicas::<Convoy>(NAMESPACE),
+            vessels.clone(),
+            hosts,
+            "test-host".to_string(),
+            RecordingInhibitor { states: tx },
+        ));
+
+        assert!(next_state(&mut rx).await);
+        assert!(next_state(&mut rx).await);
+        vessels.delete("local-vessel").await.expect("delete torn-down vessel");
         assert!(!next_state(&mut rx).await);
         task.abort();
     }
