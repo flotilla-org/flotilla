@@ -22,9 +22,9 @@ def test_host_list_shows_peer(topology):
     # Should see at least local host + node-b
     assert len(hosts) >= 2
 
-    peer = next((h for h in hosts if h["host_name"] == "node-b"), None)
+    peer = next((h for h in hosts if h["host"] == "node-b"), None)
     assert peer is not None, f"node-b not in host list: {hosts}"
-    assert peer["connection_status"] == "Connected"
+    assert peer["link"] == "Connected"
     assert not peer["is_local"]
     assert peer["configured"]
 
@@ -34,7 +34,7 @@ def test_host_list_shows_local(topology):
     result = flotilla_json(topology["node-a"], "host list")
     local = next((h for h in result["hosts"] if h["is_local"]), None)
     assert local is not None, "no local host in host list"
-    assert local["host_name"] == "node-a"
+    assert local["host"] == "node-a"
 
 
 def test_topology_shows_direct_route(topology):
