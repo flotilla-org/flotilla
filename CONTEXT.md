@@ -172,8 +172,10 @@ _Avoid_: Permission mode, sandbox flag (those are harness spellings).
 
 **Brief**:
 The per-crew-member statement of why they are here — a durable file in the
-vessel workspace (also delivered agent-natively). Accumulated briefs on a
-revisited vessel are the script as executed, per character.
+vessel workspace (also delivered agent-natively). Each turn is started by a
+brief; accumulated briefs on a revisited vessel are the script as executed,
+per character. A brief is the question: it may declare the
+valid **Dispositions** as its answers (ADR 0027).
 _Avoid_: Prompt (the delivery mechanism), task description.
 
 **Process**:
@@ -226,7 +228,8 @@ The admission-time stage of a create verb that fills what the caller's
 *intent* left blank (branch + convoy names, workflow default) before the spec
 persists — the store never holds a half-spec. Meta-agents are upstream
 completers proposing fuller specs; admission remains the backstop.
-_Avoid_: Defaulting webhook, enrichment, the governor's job.
+_Avoid_: Defaulting webhook, enrichment, the governor's job, the crew's
+turn-ending report (that is a **Settlement Claim**, ADR 0017).
 
 **Independent**:
 A terminal session with no **Convoy** association — sailing alone, per the
@@ -476,6 +479,35 @@ code — stewardship (Governor), convoy-driving (Bosun), allocation
 (Quartermaster), accounting (Purser), presentation (Yeoman). Realised as
 **PersistentAgent** resources; Governor and Bosun arrive first.
 _Avoid_: Bot, assistant.
+
+**Settlement Claim**:
+The crew's turn-ending report (ADR 0017), filed by `crew complete` — the
+crew *claims* its brief is fulfilled. Claims are never world-facts and never
+evidence of safety; integration conditions and observations judge the world.
+_Avoid_: Completion (that is the admission-time stage), outcome, result.
+
+**Disposition**:
+The one-word answer a **Settlement Claim** gives, chosen from the list its
+**Brief** declared (e.g. `merged | changes-pushed | blocked`). Recorded
+beside the free-text message so drivers branch on the word instead of
+parsing prose.
+_Avoid_: Outcome, result kind (the overturned objectified forms — ADR 0027).
+
+**Observation**:
+A projection of an external system's state (PR state, checks, a container),
+carrying `observed-at` and permitted to be Unknown. Unknown triggers nothing
+and closes nothing. Exit conditions of workflows should be observations, not
+claims.
+_Avoid_: Fact (histories are evidence — ADR 0023), event.
+
+**Condition Leaf**:
+One atomic predicate over the machine, **Settlement Claims**, or
+**Observations** — a
+single comparison, no connectives. `wait` ORs leaves; all other composition
+(AND, loops, budgets) lives in the caller's own language. Named definitions
+are layered data, not new objects.
+_Avoid_: Rule (that is a leaf bound to a wake or crew turn), expression
+language.
 
 ## External Collaborators
 
