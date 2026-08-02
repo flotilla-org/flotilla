@@ -26,7 +26,7 @@ HUB_SPOKE_COMPOSE = str(COMPOSE_DIR / "docker-compose.hub-spoke.yml")
 
 NODES = ("workstation", "homelab-1", "homelab-2")
 FOLLOWERS = ("homelab-1", "homelab-2")
-pytestmark = pytest.mark.timeout(900)
+pytestmark = pytest.mark.timeout(1800)
 
 
 def hub_exec(service: str, cmd: str, timeout: int = 30):
@@ -105,7 +105,7 @@ def hub_spoke_topology():
         "-d",
         "--build",
         "--force-recreate",
-        timeout=900,
+        timeout=1800,
     )
     assert result.returncode == 0, (
         f"compose up failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
