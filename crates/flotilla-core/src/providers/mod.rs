@@ -684,6 +684,63 @@ pub(crate) mod testing {
 
         assert_eq!(output.len(), 131_072);
     }
+
+    #[tokio::test]
+    async fn process_runner_long_lived_process_supports_lifecycle_contract() {
+        let runner = super::ProcessCommandRunner;
+        let mut process = runner.spawn_long_lived("sleep", &["30"], Path::new("/"), &ChannelLabel::Noop).await.expect("spawn sleep");
+
+        assert!(process.try_wait().expect("poll running child").is_none());
+        process.kill().await.expect("kill child");
+        let status = process.wait().await.expect("reap killed child");
+        assert!(!status.success());
+        assert!(process.try_wait().expect("poll reaped child").is_some());
+    }
+
+    #[tokio::test]
+    async fn process_runner_long_lived_process_drop_does_not_leak_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_path = dir.path().join("child.pid");
+        let pid_path_arg = pid_path.to_string_lossy();
+        let runner = super::ProcessCommandRunner;
+        let process = runner
+            .spawn_long_lived("sh", &["-c", "echo $$ > \"$1\"; exec sleep 30", "sh", &pid_path_arg], Path::new("/"), &ChannelLabel::Noop)
+            .await
+            .expect("spawn tracked sleep");
+
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = tokio::fs::read_to_string(&pid_path).await {
+                    let pid = contents.trim();
+                    if !pid.is_empty() {
+                        break pid.to_string();
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("child should publish pid");
+
+        drop(process);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = tokio::process::Command::new("kill")
+                    .args(["-0", &pid])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await
+                    .expect("poll child pid");
+                if !status.success() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped process must terminate its child");
+    }
 }
 
 #[cfg(test)]
