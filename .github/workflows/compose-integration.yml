@@ -42,8 +42,8 @@ jobs:
           target: full
           tags: flotilla-base
           load: true
-          cache-from: type=gha,scope=compose-integration-base
-          cache-to: type=gha,mode=max,scope=compose-integration-base
+          cache-from: type=gha,scope=compose-integration-wedge
+          cache-to: type=gha,mode=max,scope=compose-integration-wedge
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -86,8 +86,8 @@ jobs:
           target: full
           tags: flotilla-base
           load: true
-          cache-from: type=gha,scope=compose-integration-base
-          cache-to: type=gha,mode=max,scope=compose-integration-base
+          cache-from: type=gha,scope=compose-integration-hub-spoke
+          cache-to: type=gha,mode=max,scope=compose-integration-hub-spoke
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
