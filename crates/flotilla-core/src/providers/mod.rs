@@ -150,6 +150,19 @@ pub struct CommandOutput {
     pub success: bool,
 }
 
+/// Handle to a supervised long-lived command spawned by a [`CommandRunner`].
+#[async_trait]
+pub trait CommandProcess: Send + Sync {
+    /// Return the exit status when the command has exited, without waiting.
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String>;
+
+    /// Request termination of the command.
+    async fn kill(&mut self) -> Result<(), String>;
+
+    /// Wait for the command to exit.
+    async fn wait(&mut self) -> Result<std::process::ExitStatus, String>;
+}
+
 pub(crate) fn helper_exec_script(helper_path: &str, subcommand: &str, args: &[&str]) -> Result<String, String> {
     let helper_dir = Path::new(helper_path).parent().ok_or_else(|| format!("installed helper path has no parent: {helper_path}"))?;
     let mut parts = vec![
@@ -214,6 +227,20 @@ pub trait CommandRunner: Send + Sync {
     /// `Err` only if the process could not be spawned at all.
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String>;
 
+    /// Spawn a supervised command that is expected to outlive this call.
+    ///
+    /// Implementations should ensure dropping the returned handle terminates
+    /// the command so cancellation cannot orphan a child process.
+    async fn spawn_long_lived(
+        &self,
+        _cmd: &str,
+        _args: &[&str],
+        _cwd: &Path,
+        _label: &ChannelLabel,
+    ) -> Result<Box<dyn CommandProcess>, String> {
+        Err("command runner does not support long-lived processes".to_string())
+    }
+
     /// Run a command with bytes supplied on stdin. The input is deliberately
     /// separate from argv so sensitive content cannot leak into process lists
     /// or recorded command transcripts.
@@ -256,6 +283,25 @@ pub trait CommandRunner: Send + Sync {
 /// Production implementation that delegates to `tokio::process::Command`.
 pub struct ProcessCommandRunner;
 
+struct TokioCommandProcess {
+    child: tokio::process::Child,
+}
+
+#[async_trait]
+impl CommandProcess for TokioCommandProcess {
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        self.child.try_wait().map_err(|error| error.to_string())
+    }
+
+    async fn kill(&mut self) -> Result<(), String> {
+        self.child.kill().await.map_err(|error| error.to_string())
+    }
+
+    async fn wait(&mut self) -> Result<std::process::ExitStatus, String> {
+        self.child.wait().await.map_err(|error| error.to_string())
+    }
+}
+
 #[async_trait]
 impl CommandRunner for ProcessCommandRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
@@ -277,6 +323,7 @@ impl CommandRunner for ProcessCommandRunner {
         let output = tokio::process::Command::new(cmd)
             .args(args)
             .current_dir(cwd)
+            .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .output()
             .await
@@ -286,6 +333,25 @@ impl CommandRunner for ProcessCommandRunner {
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
             success: output.status.success(),
         })
+    }
+
+    async fn spawn_long_lived(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        _label: &ChannelLabel,
+    ) -> Result<Box<dyn CommandProcess>, String> {
+        let child = tokio::process::Command::new(cmd)
+            .args(args)
+            .current_dir(cwd)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        Ok(Box::new(TokioCommandProcess { child }))
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel, input: &[u8]) -> Result<String, String> {

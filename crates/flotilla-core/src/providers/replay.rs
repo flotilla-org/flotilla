@@ -748,6 +748,19 @@ impl CommandRunner for RecordingRunner {
         result
     }
 
+    async fn spawn_long_lived(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+    ) -> Result<Box<dyn super::CommandProcess>, String> {
+        // Lifecycle recording needs distinct spawn/kill/wait interactions.
+        // Until that fixture shape is introduced, preserve the shared runner
+        // boundary by delegating rather than bypassing the wrapped runner.
+        self.inner.spawn_long_lived(cmd, args, cwd, label).await
+    }
+
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         let result = self.inner.run_with_input(cmd, args, cwd, label, input).await;
 

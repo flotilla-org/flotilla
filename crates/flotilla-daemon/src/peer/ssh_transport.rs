@@ -5,7 +5,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::config::RemoteHostConfig;
+use flotilla_core::{
+    config::RemoteHostConfig,
+    providers::{ChannelLabel, CommandOutput, CommandProcess, CommandRunner, ProcessCommandRunner},
+};
 use flotilla_protocol::{ConfigLabel, GoodbyeReason, HostName, Message, NodeId, NodeInfo, PeerWireMessage, PROTOCOL_VERSION};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -35,6 +38,8 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REMOTE_SOCKET_PATH_PREFIX: &str = "FLOTILLA_DAEMON_SOCKET_PATH=";
 
 const PRE_HELLO_CLOSE_ERROR: &str = "peer closed before sending hello";
+
+const REMOTE_DAEMON_NOT_LISTENING: &str = "FLOTILLA_DAEMON_NOT_LISTENING";
 
 /// Channel buffer size for inbound and outbound peer data messages.
 const CHANNEL_BUFFER: usize = 256;
@@ -111,9 +116,8 @@ pub struct SshTransport {
     remote_daemon_socket_path: Option<PathBuf>,
     remote_resource_socket_path: Option<PathBuf>,
     ssh_binary: PathBuf,
-    #[cfg(test)]
-    ssh_args_prefix: Vec<PathBuf>,
-    ssh_process: Option<tokio::process::Child>,
+    command_runner: Arc<dyn CommandRunner>,
+    ssh_process: Option<Box<dyn CommandProcess>>,
     status: PeerConnectionStatus,
     /// Receiver for inbound peer data, produced by `connect_socket()` and
     /// returned once via `subscribe()`.
@@ -159,8 +163,7 @@ impl SshTransport {
             remote_daemon_socket_path: None,
             remote_resource_socket_path: None,
             ssh_binary: PathBuf::from("ssh"),
-            #[cfg(test)]
-            ssh_args_prefix: Vec::new(),
+            command_runner: Arc::new(ProcessCommandRunner),
             ssh_process: None,
             status: PeerConnectionStatus::Disconnected,
             inbound_rx: None,
@@ -170,17 +173,6 @@ impl SshTransport {
             remote_session_id: None,
             remote_node_info: None,
         })
-    }
-
-    fn ssh_command(&self) -> tokio::process::Command {
-        let command = tokio::process::Command::new(&self.ssh_binary);
-        #[cfg(test)]
-        let command = {
-            let mut command = command;
-            command.args(&self.ssh_args_prefix);
-            command
-        };
-        command
     }
 
     /// Spawn the SSH child process that forwards the remote socket locally.
@@ -217,28 +209,29 @@ impl SshTransport {
             "spawning SSH tunnel"
         );
 
+        let args = vec![
+            "-N".to_string(),
+            "-L".to_string(),
+            forward_spec,
+            "-R".to_string(),
+            reverse_forward_spec,
+            "-o".to_string(),
+            "ExitOnForwardFailure=yes".to_string(),
+            "-o".to_string(),
+            "StreamLocalBindUnlink=yes".to_string(),
+            "-o".to_string(),
+            "ServerAliveInterval=15".to_string(),
+            "-o".to_string(),
+            "ServerAliveCountMax=3".to_string(),
+            destination,
+        ];
+        let binary = self.ssh_binary.to_string_lossy();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let child = self
-            .ssh_command()
-            .arg("-N") // no remote command
-            .arg("-L")
-            .arg(&forward_spec)
-            .arg("-R")
-            .arg(&reverse_forward_spec)
-            .arg("-o")
-            .arg("ExitOnForwardFailure=yes")
-            .arg("-o")
-            .arg("StreamLocalBindUnlink=yes")
-            .arg("-o")
-            .arg("ServerAliveInterval=15")
-            .arg("-o")
-            .arg("ServerAliveCountMax=3")
-            .arg(&destination)
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("failed to spawn ssh: {e}"))?;
+            .command_runner
+            .spawn_long_lived(&binary, &arg_refs, Path::new("/"), &ChannelLabel::Noop)
+            .await
+            .map_err(|error| format!("failed to spawn ssh: {error}"))?;
 
         self.ssh_process = Some(child);
         Ok(())
@@ -254,33 +247,20 @@ impl SshTransport {
     async fn resolve_remote_daemon_socket(&self) -> Result<PathBuf, String> {
         let destination = self.destination();
         let command = remote_socket_path_command();
-        let output = self
-            .ssh_command()
-            .arg("-T")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg(&destination)
-            .arg(&command)
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output();
-        let output = tokio::time::timeout(REMOTE_COMMAND_TIMEOUT, output)
+        let output = tokio::time::timeout(REMOTE_COMMAND_TIMEOUT, self.run_ssh_output(&destination, command))
             .await
             .map_err(|_| format!("timed out resolving remote daemon socket path on {destination}"))?
             .map_err(|error| format!("failed to resolve remote daemon socket path on {destination}: {error}"))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.success {
             return Err(format!(
-                "failed to resolve remote daemon socket path on {destination}: ssh exited with {}{}",
-                output.status,
-                if stderr.trim().is_empty() { String::new() } else { format!(": {}", stderr.trim()) }
+                "failed to resolve remote daemon socket path on {destination}: ssh exited unsuccessfully{}",
+                if output.stderr.trim().is_empty() { String::new() } else { format!(": {}", output.stderr.trim()) }
             ));
         }
 
-        parse_remote_socket_path(&output.stdout).map_err(|error| format!("invalid remote daemon socket path from {destination}: {error}"))
+        parse_remote_socket_path(output.stdout.as_bytes())
+            .map_err(|error| format!("invalid remote daemon socket path from {destination}: {error}"))
     }
 
     async fn cleanup_remote_socket(&self) -> Result<(), String> {
@@ -289,33 +269,26 @@ impl SshTransport {
         let command = self.remote_cleanup_command();
         debug!(%destination, remote_socket = %path, "removing stale reverse peer socket before SSH tunnel dial");
 
-        let output = self
-            .ssh_command()
-            .arg("-T")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg(&destination)
-            .arg(&command)
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output();
-        let output = tokio::time::timeout(REMOTE_COMMAND_TIMEOUT, output)
+        let output = tokio::time::timeout(REMOTE_COMMAND_TIMEOUT, self.run_ssh_output(&destination, command))
             .await
             .map_err(|_| format!("timed out removing stale reverse peer socket at {path} on {destination}"))?
             .map_err(|e| format!("failed to run remote stale peer socket cleanup at {path} on {destination}: {e}"))?;
 
-        if output.status.success() {
+        if output.success {
             return Ok(());
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!(
-            "failed to remove stale reverse peer socket at {path} on {destination}: ssh exited with {}{}",
-            output.status,
-            if stderr.trim().is_empty() { String::new() } else { format!(": {}", stderr.trim()) }
+            "failed to remove stale reverse peer socket at {path} on {destination}: ssh exited unsuccessfully{}",
+            if output.stderr.trim().is_empty() { String::new() } else { format!(": {}", output.stderr.trim()) }
         ))
+    }
+
+    async fn run_ssh_output(&self, destination: &str, command: String) -> Result<CommandOutput, String> {
+        let binary = self.ssh_binary.to_string_lossy();
+        self.command_runner
+            .run_output(&binary, &["-T", "-o", "BatchMode=yes", destination, &command], Path::new("/"), &ChannelLabel::Noop)
+            .await
     }
 
     fn remote_cleanup_command(&self) -> String {
@@ -484,28 +457,18 @@ impl SshTransport {
         let remote_socket = self.remote_daemon_socket_path().ok()?;
         let destination = self.destination();
         let quoted_path = shell_quote(&remote_socket.to_string_lossy());
-        let command =
-            format!("test -S {quoted_path} && {{ ! command -v ss >/dev/null 2>&1 || ss -xlH | grep -F -- {quoted_path} >/dev/null; }}");
-        let output = self
-            .ssh_command()
-            .arg("-T")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg(&destination)
-            .arg(command)
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output();
-        let output = tokio::time::timeout(REMOTE_COMMAND_TIMEOUT, output).await.ok()?.ok()?;
+        let command = format!(
+            "test -S {quoted_path} && {{ ! command -v ss >/dev/null 2>&1 || ss -xlH | grep -F -- {quoted_path} >/dev/null; }} || printf '%s\\n' {REMOTE_DAEMON_NOT_LISTENING}"
+        );
+        let output = tokio::time::timeout(REMOTE_COMMAND_TIMEOUT, self.run_ssh_output(&destination, command)).await.ok()?.ok()?;
 
-        match output.status.code() {
-            Some(0) | Some(255) | None => None,
-            Some(_) => Some(format!(
+        if output.success && output.stdout.lines().any(|line| line.trim() == REMOTE_DAEMON_NOT_LISTENING) {
+            Some(format!(
                 "remote daemon not listening at derived path {} on {destination} (peer closed before sending hello)",
                 remote_socket.display()
-            )),
+            ))
+        } else {
+            None
         }
     }
 
@@ -706,10 +669,102 @@ impl Drop for SshTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::VecDeque, sync::Mutex as StdMutex};
+
     use flotilla_protocol::PeerDataMessage;
     use tokio::io::AsyncWriteExt;
 
     use super::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedCommand {
+        binary: String,
+        args: Vec<String>,
+    }
+
+    struct FakeCommandRunner {
+        outputs: StdMutex<VecDeque<Result<CommandOutput, String>>>,
+        commands: StdMutex<Vec<RecordedCommand>>,
+        spawns: StdMutex<Vec<RecordedCommand>>,
+        events: Arc<StdMutex<Vec<&'static str>>>,
+    }
+
+    impl FakeCommandRunner {
+        fn new(outputs: Vec<Result<CommandOutput, String>>, events: Arc<StdMutex<Vec<&'static str>>>) -> Self {
+            Self { outputs: StdMutex::new(outputs.into()), commands: StdMutex::new(Vec::new()), spawns: StdMutex::new(Vec::new()), events }
+        }
+
+        fn commands(&self) -> Vec<RecordedCommand> {
+            self.commands.lock().expect("command lock").clone()
+        }
+
+        fn spawns(&self) -> Vec<RecordedCommand> {
+            self.spawns.lock().expect("spawn lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for FakeCommandRunner {
+        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            panic!("ssh transport only uses run_output")
+        }
+
+        async fn run_output(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            self.events.lock().expect("event lock").push("command");
+            self.commands
+                .lock()
+                .expect("command lock")
+                .push(RecordedCommand { binary: cmd.to_string(), args: args.iter().map(|arg| (*arg).to_string()).collect() });
+            self.outputs.lock().expect("output lock").pop_front().expect("queued command output")
+        }
+
+        async fn spawn_long_lived(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            _cwd: &Path,
+            _label: &ChannelLabel,
+        ) -> Result<Box<dyn CommandProcess>, String> {
+            self.events.lock().expect("event lock").push("spawn");
+            self.spawns
+                .lock()
+                .expect("spawn lock")
+                .push(RecordedCommand { binary: cmd.to_string(), args: args.iter().map(|arg| (*arg).to_string()).collect() });
+            let local_forward =
+                args.windows(2).find_map(|pair| (pair[0] == "-L").then_some(pair[1])).expect("tunnel spawn has a local forward");
+            let (local_socket, _) = local_forward.split_once(':').expect("local forward spec");
+            std::fs::write(local_socket, []).expect("simulate forwarded socket");
+            Ok(Box::new(FakeCommandProcess))
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeCommandProcess;
+
+    #[async_trait]
+    impl CommandProcess for FakeCommandProcess {
+        fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+            Ok(None)
+        }
+
+        async fn kill(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn wait(&mut self) -> Result<std::process::ExitStatus, String> {
+            use std::os::unix::process::ExitStatusExt;
+
+            Ok(std::process::ExitStatus::from_raw(0))
+        }
+    }
+
+    fn successful_output(stdout: impl Into<String>) -> Result<CommandOutput, String> {
+        Ok(CommandOutput { stdout: stdout.into(), stderr: String::new(), success: true })
+    }
 
     #[test]
     fn backoff_delay_exponential_with_cap() {
@@ -749,36 +804,41 @@ mod tests {
 
     #[tokio::test]
     async fn remote_socket_path_is_resolved_again_after_it_moves() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let published_path = tmp.path().join("published-path");
-        std::fs::write(&published_path, "/run/first.sock\n").expect("write first path");
-        let fake_ssh = tmp.path().join("ssh");
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let runner = Arc::new(FakeCommandRunner::new(
+            vec![
+                successful_output(format!("login banner\n{REMOTE_SOCKET_PATH_PREFIX}/run/first.sock\nmotd\n")),
+                successful_output(format!("login banner\n{REMOTE_SOCKET_PATH_PREFIX}/run/moved.sock\nmotd\n")),
+            ],
+            events,
+        ));
         let mut transport = test_transport();
-        install_fake_ssh(
-            &mut transport,
-            &fake_ssh,
-            format!(
-                "#!/bin/sh\nprintf 'login banner\\n{REMOTE_SOCKET_PATH_PREFIX}'; cat {}\nprintf 'motd\\n'\n",
-                shell_quote(&published_path.to_string_lossy())
-            ),
-        );
+        transport.command_runner = runner.clone();
         assert_eq!(transport.resolve_remote_daemon_socket().await.expect("first resolution"), PathBuf::from("/run/first.sock"));
-
-        std::fs::write(&published_path, "/run/moved.sock\n").expect("move published path");
         assert_eq!(transport.resolve_remote_daemon_socket().await.expect("second resolution"), PathBuf::from("/run/moved.sock"));
+
+        let commands = runner.commands();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0], commands[1]);
+        assert_eq!(commands[0].binary, "ssh");
+        assert_eq!(&commands[0].args[..4], ["-T", "-o", "BatchMode=yes", "remote.example.invalid"]);
+        assert_eq!(commands[0].args[4], remote_socket_path_command());
     }
 
     #[tokio::test]
     async fn pre_hello_close_names_remote_daemon_not_listening() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let fake_ssh = tmp.path().join("ssh");
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let runner = Arc::new(FakeCommandRunner::new(vec![successful_output(format!("{REMOTE_DAEMON_NOT_LISTENING}\n"))], events));
         let mut transport = test_transport();
-        install_fake_ssh(&mut transport, &fake_ssh, "#!/bin/sh\nexit 1\n");
+        transport.command_runner = runner.clone();
         transport.remote_daemon_socket_path = Some(PathBuf::from("/remote/run/flotilla.sock"));
 
         let diagnosis = transport.diagnose_pre_hello_close().await.expect("probable cause");
         assert!(diagnosis.contains("remote daemon not listening at derived path /remote/run/flotilla.sock"));
         assert!(diagnosis.contains("peer closed before sending hello"));
+        let command = runner.commands().pop().expect("diagnostic command");
+        assert_eq!(&command.args[..4], ["-T", "-o", "BatchMode=yes", "remote.example.invalid"]);
+        assert!(command.args[4].contains("test -S '/remote/run/flotilla.sock'"));
     }
 
     fn test_transport() -> SshTransport {
@@ -798,16 +858,6 @@ mod tests {
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("test transport")
-    }
-
-    fn install_fake_ssh(transport: &mut SshTransport, path: &Path, script: impl AsRef<[u8]>) {
-        std::fs::write(path, script).expect("write fake ssh");
-
-        // Execute the freshly written stub as data through sh instead of exec-ing it
-        // directly. On Linux, another test spawning during our write can inherit the
-        // write fd in the fork/exec CLOEXEC window, making direct exec fail with ETXTBSY.
-        transport.ssh_binary = PathBuf::from("/bin/sh");
-        transport.ssh_args_prefix = vec![path.to_path_buf()];
     }
 
     #[test]
@@ -937,23 +987,41 @@ mod tests {
             SshTransportPaths { state_dir: tmp.path(), daemon_socket: &daemon_socket },
         )
         .expect("valid transport");
-        let stale_reverse_socket = reverse_peer_resource_socket_path(&daemon_socket, &NodeId::new("local-node")).expect("reverse socket");
-        std::fs::write(&stale_reverse_socket, []).expect("create stale reverse socket stand-in");
-        let fake_ssh = tmp.path().join("ssh");
-        install_fake_ssh(
-            &mut transport,
-            &fake_ssh,
-            format!(
-                "#!/bin/sh\n[ \"$1\" = \"-N\" ] && exit 0\nfor command do :; done\ncase \"$command\" in\n  *socket-path*) printf '{REMOTE_SOCKET_PATH_PREFIX}%s\\n' '{}' ;;\n  *) exec /bin/sh -c \"$command\" ;;\nesac\n",
-                daemon_socket.display()
-            ),
-        );
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let runner = Arc::new(FakeCommandRunner::new(
+            vec![successful_output(format!("{REMOTE_SOCKET_PATH_PREFIX}{}\n", daemon_socket.display())), successful_output("")],
+            events.clone(),
+        ));
+        transport.command_runner = runner.clone();
 
         transport.spawn_ssh().await.expect("stale cleanup and tunnel spawn should succeed");
+        transport.wait_for_socket().await.expect("fake tunnel creates forwarded socket");
 
-        assert!(!transport.remote_resource_socket_path().expect("resolved reverse socket").exists());
-        let status = transport.ssh_process.as_mut().expect("tunnel child").wait().await.expect("wait for fake tunnel");
-        assert!(status.success());
+        assert_eq!(*events.lock().expect("event lock"), ["command", "command", "spawn"]);
+        let commands = runner.commands();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[1].args[4], transport.remote_cleanup_command());
+        let tunnel = runner.spawns().pop().expect("tunnel invocation");
+        let (forward, reverse) = transport.resource_forward_specs();
+        assert_eq!(tunnel, RecordedCommand {
+            binary: "ssh".into(),
+            args: vec![
+                "-N".into(),
+                "-L".into(),
+                forward,
+                "-R".into(),
+                reverse,
+                "-o".into(),
+                "ExitOnForwardFailure=yes".into(),
+                "-o".into(),
+                "StreamLocalBindUnlink=yes".into(),
+                "-o".into(),
+                "ServerAliveInterval=15".into(),
+                "-o".into(),
+                "ServerAliveCountMax=3".into(),
+                "peer-a.example.invalid".into(),
+            ],
+        });
     }
 
     #[tokio::test]
@@ -977,15 +1045,15 @@ mod tests {
             SshTransportPaths { state_dir: tmp.path(), daemon_socket: &daemon_socket },
         )
         .expect("valid transport");
-        let fake_ssh = tmp.path().join("ssh");
-        install_fake_ssh(
-            &mut transport,
-            &fake_ssh,
-            format!(
-                "#!/bin/sh\n[ \"$1\" = \"-N\" ] && exit 0\nfor command do :; done\ncase \"$command\" in\n  *socket-path*) printf '{REMOTE_SOCKET_PATH_PREFIX}%s\\n' '{}' ;;\n  *) echo cleanup-denied >&2; exit 23 ;;\nesac\n",
-                daemon_socket.display()
-            ),
-        );
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let runner = Arc::new(FakeCommandRunner::new(
+            vec![
+                successful_output(format!("{REMOTE_SOCKET_PATH_PREFIX}{}\n", daemon_socket.display())),
+                Ok(CommandOutput { stdout: String::new(), stderr: "cleanup-denied".into(), success: false }),
+            ],
+            events.clone(),
+        ));
+        transport.command_runner = runner.clone();
 
         let error = transport.spawn_ssh().await.expect_err("cleanup failure must stop the tunnel dial");
 
@@ -993,6 +1061,8 @@ mod tests {
         assert!(error.contains(&transport.remote_resource_socket_path().expect("resolved reverse socket").to_string_lossy().into_owned()));
         assert!(error.contains("cleanup-denied"), "unexpected error: {error}");
         assert!(transport.ssh_process.is_none(), "tunnel must not spawn after cleanup failure");
+        assert!(runner.spawns().is_empty(), "tunnel must not be invoked after cleanup failure");
+        assert_eq!(*events.lock().expect("event lock"), ["command", "command"]);
     }
 
     #[test]
