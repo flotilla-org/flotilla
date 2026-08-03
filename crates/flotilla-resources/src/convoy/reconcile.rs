@@ -40,13 +40,14 @@ pub trait ConvoyTeardownRuntime: Send + Sync {
         _convoy: &ResourceObject<Convoy>,
         checkouts: &[ResourceObject<Checkout>],
     ) -> Result<bool, String> {
-        Ok(checkouts
-            .iter()
-            .all(|checkout| checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)))
+        Ok(!checkouts.is_empty()
+            && checkouts.iter().all(|checkout| {
+                checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)
+            }))
     }
 
     /// Re-verify ADR 0017 teardown eligibility at the execution edge.
-    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String>;
+    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, checkouts: &[ResourceObject<Checkout>]) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,16 +272,22 @@ impl Reconciler for ConvoyReconciler {
                     let checkout_list = checkouts.values().cloned().collect::<Vec<_>>();
                     runtime.no_change_request_outstanding(obj, &checkout_list).await.unwrap_or(false)
                 }
-                None => checkouts.values().all(|checkout| {
-                    checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)
-                }),
+                None => {
+                    !checkouts.is_empty()
+                        && checkouts.values().all(|checkout| {
+                            checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)
+                        })
+                }
             }
         } else {
             false
         };
         let reclaim_eligible = if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             match &self.teardown_runtime {
-                Some(runtime) => runtime.verify_reclaim(obj).await.is_ok(),
+                Some(runtime) => {
+                    let checkout_list = checkouts.values().cloned().collect::<Vec<_>>();
+                    runtime.verify_reclaim(obj, &checkout_list).await.is_ok()
+                }
                 None => false,
             }
         } else {

@@ -4994,7 +4994,7 @@ async fn convoy_delete_command_targets_requested_namespace_or_configured_default
             node_id: None,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ConvoyDelete { namespace: None, name: "failed-convoy".to_string(), force: false },
+            action: CommandAction::ConvoyDelete { namespace: None, name: "failed-convoy".to_string(), force: true },
         })
         .await
         .expect("execute should return a command id");
@@ -5012,7 +5012,7 @@ async fn convoy_delete_command_targets_requested_namespace_or_configured_default
             action: CommandAction::ConvoyDelete {
                 namespace: Some("explicit-ns".to_string()),
                 name: "completed-convoy".to_string(),
-                force: false,
+                force: true,
             },
         })
         .await
@@ -5394,7 +5394,7 @@ async fn landing_settlement_uses_latched_terminal_change_request_after_stale_rep
 }
 
 #[tokio::test]
-async fn convoy_reclaim_allows_managed_checkout_whose_path_is_already_gone() {
+async fn convoy_reclaim_refuses_when_missing_path_leaves_no_integration_evidence() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -5418,10 +5418,11 @@ async fn convoy_reclaim_allows_managed_checkout_whose_path_is_already_gone() {
     )
     .await;
 
-    daemon
+    let refusal = daemon
         .verify_convoy_teardown_gate("flotilla", "half-reclaimed", false)
         .await
-        .expect("a missing checkout path has no integration work left to protect");
+        .expect_err("a missing checkout path alone is not positive integration evidence");
+    assert!(refusal.contains("no checkout integration evidence"), "unexpected refusal: {refusal}");
 }
 
 #[tokio::test]
@@ -5607,7 +5608,7 @@ async fn convoy_delete_refuses_ignored_embedded_repository_with_local_commits() 
 }
 
 #[tokio::test]
-async fn convoy_delete_allows_env_scoped_checkout_when_environment_is_destroyed() {
+async fn convoy_delete_refuses_when_destroyed_environment_leaves_no_integration_evidence() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -5656,8 +5657,12 @@ async fn convoy_delete_allows_env_scoped_checkout_when_environment_is_destroyed(
         .await
         .expect("execute should return a command id");
 
-    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
-    assert!(matches!(convoys.get("corpse-convoy").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+    let result = wait_for_command_result(&mut events, command_id).await;
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("no checkout integration evidence")),
+        "unexpected delete result: {result:?}"
+    );
+    convoys.get("corpse-convoy").await.expect("refused convoy should remain");
 }
 
 #[tokio::test]
@@ -6295,6 +6300,74 @@ async fn local_convoy_admission_pins_the_grant_resolved_workflow() {
         .await
         .expect("get standalone resolved workflow snapshot");
     assert_eq!(snapshot.spec.vessels[0].credential_refs, BTreeSet::from(["model-api".to_string()]));
+}
+
+#[tokio::test]
+async fn empty_checkout_evidence_neither_settles_nor_allows_reclaim() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    daemon
+        .resource_backend()
+        .using::<Convoy>("flotilla")
+        .create(&empty_input_meta("empty-convoy"), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
+        .await
+        .expect("create convoy");
+
+    assert!(!daemon.convoy_change_requests_settled("flotilla", "empty-convoy").await.expect("evaluate settlement"));
+    let refusal = daemon
+        .verify_convoy_teardown_gate("flotilla", "empty-convoy", false)
+        .await
+        .expect_err("empty checkout evidence must refuse reclaim");
+    assert!(refusal.contains("no checkout integration evidence"), "unexpected refusal: {refusal}");
+}
+
+#[tokio::test]
+async fn adopted_checkout_with_open_change_request_holds_settlement() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let created = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("adopted-open".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "adopted-convoy".to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                r#ref: "feature/adopted-open".to_string(),
+                path: "/adopted".to_string(),
+                repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
+                host_ref: "host-01".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("create adopted checkout");
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    checkouts
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &ResourceCheckoutStatus {
+            phase: ResourceCheckoutPhase::Ready,
+            path: Some("/adopted".to_string()),
+            commit: None,
+            branch_provenance: Default::default(),
+            integration: CheckoutIntegrationStatus {
+                landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at).build(),
+                ..Default::default()
+            },
+            message: None,
+        })
+        .await
+        .expect("record open adopted change request");
+
+    assert!(!daemon.convoy_change_requests_settled("flotilla", "adopted-convoy").await.expect("evaluate adopted settlement"));
 }
 
 #[tokio::test]

@@ -6120,20 +6120,30 @@ impl InProcessDaemon {
     /// anything unknown or unprobeable holds Landing — absence of evidence
     /// never releases the gate. Recent observations are trusted as-is, which
     /// bounds forge lookups and keeps the persist from re-triggering the
-    /// reconcile in a loop. Adopted checkouts are exempt, exactly as they are
-    /// from teardown deletion: the convoy does not own their integration
-    /// lifecycle.
+    /// reconcile in a loop. Adopted checkouts participate because an adopted
+    /// open change request is still outstanding, even though its checkout is
+    /// exempt from deletion.
     pub async fn convoy_change_requests_settled(&self, namespace: &str, name: &str) -> Result<bool, String> {
-        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
-        let checkout_list = checkouts
+        let checkout_list = self
+            .resource_backend
+            .clone()
+            .using::<ResourceCheckout>(namespace)
             .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]))
             .await
             .map_err(|err| err.to_string())?
             .items;
+        self.convoy_change_requests_settled_for_checkouts(&checkout_list).await
+    }
+
+    pub async fn convoy_change_requests_settled_for_checkouts(
+        &self,
+        checkout_list: &[ResourceObject<ResourceCheckout>],
+    ) -> Result<bool, String> {
+        let Some(first_checkout) = checkout_list.first() else {
+            return Ok(false);
+        };
+        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(&first_checkout.metadata.namespace);
         for checkout in checkout_list {
-            if checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted) {
-                continue;
-            }
             if let Some(landed) = checkout.status.as_ref().map(|status| &status.integration.landed) {
                 let recent = landed
                     .observed_at
@@ -6147,10 +6157,10 @@ impl InProcessDaemon {
                     return Ok(false);
                 }
             }
-            let Some(path) = checkout_path(&checkout).map(|path| Path::new(path).to_path_buf()) else {
+            let Some(path) = checkout_path(checkout).map(|path| Path::new(path).to_path_buf()) else {
                 return Ok(false);
             };
-            let runner = match self.runner_for_resource_checkout(&checkout).await {
+            let runner = match self.runner_for_resource_checkout(checkout).await {
                 Ok(runner) => runner,
                 Err(_) => return Ok(false),
             };
@@ -6196,7 +6206,30 @@ impl InProcessDaemon {
             .await
             .map_err(|err| err.to_string())?
             .items;
+        self.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkout_list, false).await
+    }
+
+    pub async fn verify_convoy_teardown_gate_for_checkouts(
+        &self,
+        convoy: &ResourceObject<ResourceConvoy>,
+        checkout_list: &[ResourceObject<ResourceCheckout>],
+        force: bool,
+    ) -> Result<(), String> {
+        if force {
+            return Ok(());
+        }
+        let namespace = &convoy.metadata.namespace;
+        let name = &convoy.metadata.name;
+        if convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Abandoned) {
+            return Ok(());
+        }
+        if checkout_list.is_empty() {
+            return Err(format!("convoy {namespace}/{name} is not safe to delete: no checkout integration evidence"));
+        }
+
+        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
         let mut refusals = Vec::new();
+        let mut verified = false;
         for checkout in checkout_list {
             let is_adopted = checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted);
             if let Some(env_ref) = checkout.spec.env_ref() {
@@ -6209,7 +6242,7 @@ impl InProcessDaemon {
                     continue;
                 }
             }
-            let path = match checkout_path(&checkout) {
+            let path = match checkout_path(checkout) {
                 Some(path) => Path::new(path).to_path_buf(),
                 None => {
                     if is_adopted {
@@ -6220,7 +6253,7 @@ impl InProcessDaemon {
                     continue;
                 }
             };
-            let runner = match self.runner_for_resource_checkout(&checkout).await {
+            let runner = match self.runner_for_resource_checkout(checkout).await {
                 Ok(runner) => runner,
                 Err(error) => {
                     if is_adopted {
@@ -6261,6 +6294,7 @@ impl InProcessDaemon {
                 checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
             )
             .await;
+            verified = true;
             if let Some(existing) = checkout.status.as_ref() {
                 latch_evidence_backed_integration(&existing.integration, &mut integration);
             }
@@ -6280,19 +6314,24 @@ impl InProcessDaemon {
                 }
             }
             if is_adopted {
-                if let Some(summary) = checkout_integration_summary(&checkout, &integration) {
-                    warn!(checkout = %checkout.metadata.name, summary = %summary, "adopted checkout has integration dirt; releasing without deletion");
+                if !condition_is_true(&integration.landed) {
+                    refusals.push(
+                        checkout_integration_summary(checkout, &integration)
+                            .unwrap_or_else(|| format!("{}: Landed is not verified", checkout.metadata.name)),
+                    );
                 }
                 continue;
             }
             if !(condition_is_true(&integration.clean) && condition_is_true(&integration.pushed) && condition_is_true(&integration.landed))
             {
-                if let Some(summary) = checkout_integration_summary(&checkout, &integration) {
+                if let Some(summary) = checkout_integration_summary(checkout, &integration) {
                     refusals.push(summary);
                 }
             }
         }
-        if refusals.is_empty() {
+        if !verified {
+            Err(format!("convoy {namespace}/{name} is not safe to delete: no checkout integration evidence"))
+        } else if refusals.is_empty() {
             Ok(())
         } else {
             refusals.sort();
