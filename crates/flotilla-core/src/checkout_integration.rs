@@ -57,6 +57,8 @@ pub fn checkout_path_from_status_and_spec<'a>(status: Option<&'a CheckoutStatus>
     })
 }
 
+/// Inspect a checkout without claiming that a checkout-ref lookup covers its
+/// owning convoy. An absent change request therefore cannot produce Landed.
 pub async fn inspect_checkout_integration(
     runner: &dyn CommandRunner,
     checkout_path: &Path,
@@ -66,6 +68,8 @@ pub async fn inspect_checkout_integration(
     inspect_checkout_integration_with_association(runner, checkout_path, spec, change_request_id, change_request_id.is_some()).await
 }
 
+/// Inspect a checkout for settlement after the caller has resolved the
+/// convoy's associated change request, if any.
 pub async fn inspect_convoy_checkout_integration(
     runner: &dyn CommandRunner,
     checkout_path: &Path,
