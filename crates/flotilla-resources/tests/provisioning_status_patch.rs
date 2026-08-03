@@ -10,6 +10,7 @@ use flotilla_resources::{
 #[test]
 fn host_status_patch_updates_heartbeat_snapshot() {
     let mut status = HostStatus::default();
+    let observed_at = Utc.with_ymd_and_hms(2026, 8, 3, 12, 40, 0).single().expect("valid timestamp");
     HostStatusPatch::Heartbeat {
         capabilities: [("docker".to_string(), serde_json::Value::Bool(true))].into_iter().collect(),
         heartbeat_at: Utc::now(),
@@ -27,10 +28,27 @@ fn host_status_patch_updates_heartbeat_snapshot() {
 
     HostStatusPatch::SleepInhibition {
         health: SleepInhibitionHealth::Failed { consecutive_failures: 3, message: "polkit denied".to_string() },
+        observed_at,
     }
     .apply(&mut status);
 
     assert_eq!(status.sleep_inhibition, SleepInhibitionHealth::Failed { consecutive_failures: 3, message: "polkit denied".to_string() });
+    assert_eq!(status.conditions.len(), 1);
+    assert_eq!(status.conditions[0].condition_type, "SleepInhibition");
+    assert_eq!(status.conditions[0].reason, "InhibitorNotHeld");
+    assert_eq!(status.conditions[0].observed_at, observed_at);
+    assert!(status.conditions[0].message.contains("polkit denied"));
+
+    HostStatusPatch::SleepInhibition {
+        health: SleepInhibitionHealth::Acquiring { consecutive_failures: 1, message: "polkit denied again".to_string() },
+        observed_at: observed_at + chrono::Duration::minutes(1),
+    }
+    .apply(&mut status);
+    assert_eq!(status.conditions.len(), 1, "a retry alone must not clear a persisted failure");
+
+    HostStatusPatch::SleepInhibition { health: SleepInhibitionHealth::Held, observed_at: observed_at + chrono::Duration::minutes(2) }
+        .apply(&mut status);
+    assert!(status.conditions.is_empty(), "successful acquisition should clear the condition");
 }
 
 #[test]

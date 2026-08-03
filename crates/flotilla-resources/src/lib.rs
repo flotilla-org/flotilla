@@ -67,7 +67,7 @@ pub use field_ownership::{FieldOwnedResource, FieldOwnership, FieldOwnershipViol
 pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use host::{
     Host, HostCondition, HostSpec, HostStatus, HostStatusPatch, AGENT_ADAPTERS_CAPABILITY, HEARTBEAT_READY_TTL_SECS,
-    HELD_CREDENTIALS_CAPABILITY, TERMINAL_POOLS_CAPABILITY,
+    HELD_CREDENTIALS_CAPABILITY, SLEEP_INHIBITION_CONDITION_TYPE, TERMINAL_POOLS_CAPABILITY,
 };
 pub use http::{ensure_crd, ensure_namespace, HttpBackend};
 pub use in_memory::InMemoryBackend;
