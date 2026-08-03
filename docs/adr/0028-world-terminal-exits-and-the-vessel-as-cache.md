@@ -45,8 +45,13 @@ Comma is OR; the table is the whole exit.
 
 What may **not** appear in the table, and where it goes instead:
 
-- **Budget** is a *delivery policy*, not an exit. The substrate refuses to
-  deliver a turn past the declared round budget and escalates loudly; the
+- **Budget** is a *delivery policy*, not an exit. Where a caller exists — a
+  script, a resident driver — its budget stays in the caller's real language,
+  exactly as ADR 0027 rules. But wakeup-delivered turns have no caller to own
+  the count; there the bound is ADR 0027's own machinery-owned **episode
+  escalation ladder** doing the counting: past the declared round budget the
+  engine refuses to deliver another turn for the same episode and escalates
+  loudly (the `convoy hold` of 0027's example, raised by the machinery). The
   convoy stays in `Landing`, context intact.
 - **Staleness** is an *attention flag* in the fleet view, never an exit.
 - **Give-up is always an explicit act** — the governor reaps. No automatic
@@ -167,6 +172,7 @@ attention flag; `Landed` rows show their disposition name.
 | ADR 0021 (Anchored wiring) | Entry/exit wiring deferred to a shared event-source design | That design is the leaf engine (#1322); Anchored and Landing subscribe to the same table |
 | ADR 0027 (dispositions) | Declared per-brief, recorded on the claim | Unchanged at brief scope; exit tables reuse the same vocabulary at convoy scope, bound to world-terminal leaves |
 | ADR 0027 (suspend ladder) | Caller-side suspend semantics | Composes with the delivery ladder: suspend is how a watcher sleeps, delivery is how a turn wakes |
+| ADR 0027 (budgets live in the caller) | Counters and budgets in the caller's real language; exhaustion is a loud `convoy hold` | Unchanged where a caller exists. Wakeup-delivered turns have no caller, so their bound is 0027's machinery-owned episode escalation ladder, surfaced as delivery refusal plus the same loud hold |
 
 ## Deferred, with owners
 
