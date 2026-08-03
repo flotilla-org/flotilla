@@ -12,7 +12,7 @@ impl Resource for ChangeRequest {
     type StatusPatch = ChangeRequestStatusPatch;
 
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "changerequests", kind: "ChangeRequest" };
-    const REPLICATION_CLASS: ReplicationClass = ReplicationClass::HomeBoundRuntime;
+    const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Observations;
 
     fn validate_spec_update(current: &Self::Spec, requested: &Self::Spec) -> Result<(), ResourceError> {
         if current == requested {
@@ -103,4 +103,60 @@ pub fn change_request_record_name(service: &str, scope: &str, number: u64) -> St
         value.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
     }
     format!("cr-{}-{}-{number}", hex(service), hex(scope))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{InMemoryBackend, InputMeta, ResourceBackend, SqliteBackend};
+
+    fn status(state: ObservedChangeRequestState, observed_at: DateTime<Utc>) -> ChangeRequestStatus {
+        ChangeRequestStatus {
+            state: Observation::known(state, observed_at),
+            head_sha: Observation::known("abc".to_string(), observed_at),
+            checks: Observation::known(ObservedChecks::Pass, observed_at),
+            review: ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, observed_at) },
+            mergeable: Observation::known(ObservedMergeability::Mergeable, observed_at),
+        }
+    }
+
+    async fn assert_observation_history_is_thin(backend: ResourceBackend) {
+        let records = backend.using::<ChangeRequest>("flotilla");
+        let spec = ChangeRequestSpec::builder()
+            .service("github.com".to_string())
+            .scope("flotilla-org/flotilla".to_string())
+            .number(1366)
+            .observing_authority("authority".to_string())
+            .build();
+        let created = records.create(&InputMeta::builder().name("cr".to_string()).build(), &spec).await.expect("create observation");
+        let opened = records
+            .update_status(
+                "cr",
+                &created.metadata.resource_version,
+                &status(ObservedChangeRequestState::Open, "2026-08-03T20:00:00Z".parse().expect("time")),
+            )
+            .await
+            .expect("publish open observation");
+        records
+            .update_status(
+                "cr",
+                &opened.metadata.resource_version,
+                &status(ObservedChangeRequestState::Merged, "2026-08-03T20:01:00Z".parse().expect("time")),
+            )
+            .await
+            .expect("publish merged observation");
+
+        let diagnostics = backend.diagnostics().await.expect("diagnostics").expect("embedded store diagnostics");
+        assert_eq!(diagnostics.event_count, 1, "observations retain only the latest watch handoff event");
+    }
+
+    #[tokio::test]
+    async fn in_memory_observation_history_is_thin() {
+        assert_observation_history_is_thin(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_observation_history_is_thin() {
+        assert_observation_history_is_thin(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend"))).await;
+    }
 }

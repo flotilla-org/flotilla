@@ -500,7 +500,7 @@ mod tests {
             stale_after: Duration::from_secs(120),
         };
         let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source, cadence);
-        let table = LeafSubscriptionTable::new(backend, event_tx, refresher.clone());
+        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher.clone());
         let connection_id = uuid::Uuid::new_v4();
         let request = WaitSubscriptionRequest {
             namespace: "flotilla".to_string(),
@@ -516,12 +516,21 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backend.using::<ChangeRequest>("flotilla").list().await.expect("list demanded CR").items.len(),
+            1,
+            "subscription must materialize its individually bound subject"
+        );
         tokio::time::advance(Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "freshness demand must use tighter cadence");
 
         table.unsubscribe_connection(connection_id).await;
         assert_eq!(refresher.active_demands().await, 0);
+        assert!(
+            backend.using::<ChangeRequest>("flotilla").list().await.expect("list released CRs").items.is_empty(),
+            "last unsubscribe must garbage collect the observed record"
+        );
         let stopped_at = calls.load(Ordering::SeqCst);
         tokio::time::advance(Duration::from_secs(300)).await;
         tokio::task::yield_now().await;

@@ -209,4 +209,15 @@ mod tests {
         });
         assert_eq!(leaf.to_string(), "cr/github.com/flotilla-org/flotilla/1363 .state == merged");
     }
+
+    #[test]
+    fn rejects_change_request_collection_and_query_addresses() {
+        for address in [
+            "cr/github.com/flotilla-org/flotilla",
+            "cr/github.com/flotilla-org/flotilla/*",
+            "cr/github.com/flotilla-org/flotilla?state=open",
+        ] {
+            assert!(address.parse::<LeafAddress>().is_err(), "collection or query address must be rejected: {address}");
+        }
+    }
 }

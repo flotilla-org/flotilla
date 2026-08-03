@@ -207,11 +207,35 @@ impl ChangeRequestRefresher {
                 refresh.demands.is_empty().then_some(subject.clone())
             })
             .collect::<Vec<_>>();
-        for subject in empty {
-            if let Some(refresh) = active.remove(&subject) {
-                refresh.task.abort();
+        let stopped =
+            empty.into_iter().filter_map(|subject| active.remove(&subject).map(|refresh| (subject, refresh.task))).collect::<Vec<_>>();
+        drop(active);
+
+        for (subject, task) in stopped {
+            task.abort();
+            let _ = task.await;
+            let active = self.inner.active.lock().await;
+            if active.contains_key(&subject) {
+                continue;
             }
+            let result = self.inner.backend.using::<ChangeRequest>(&subject.namespace).delete(&subject.record_name()).await;
+            if let Err(error) = result {
+                if !matches!(error, flotilla_resources::ResourceError::NotFound { .. }) {
+                    tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "garbage collect undemanded change request failed");
+                }
+            }
+            drop(active);
         }
+    }
+
+    /// A daemon restart has no surviving leaf subscriptions, so locally
+    /// authoritative observations from the previous process are all orphans.
+    pub async fn garbage_collect_orphans(&self) -> Result<(), String> {
+        let records = self.inner.backend.using::<ChangeRequest>("flotilla");
+        for record in records.list().await.map_err(|error| error.to_string())?.items {
+            records.delete(&record.metadata.name).await.map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -264,6 +288,9 @@ impl ChangeRequestRefresher {
     async fn publish(&self, subject: &ChangeRequestRef, name: &str, status: ChangeRequestStatus) -> Result<(), String> {
         let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
         let current = self.get_or_create_record(subject, name).await?;
+        if current.status.as_ref().is_some_and(|current| observed_values_equal(current, &status)) {
+            return Ok(());
+        }
         records.update_status(name, &current.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -296,6 +323,14 @@ impl ChangeRequestRefresher {
             Err(error) => Err(error.to_string()),
         }
     }
+}
+
+fn observed_values_equal(left: &ChangeRequestStatus, right: &ChangeRequestStatus) -> bool {
+    left.state.value == right.state.value
+        && left.head_sha.value == right.head_sha.value
+        && left.checks.value == right.checks.value
+        && left.review.actionable_at_head.value == right.review.actionable_at_head.value
+        && left.mergeable.value == right.mergeable.value
 }
 
 #[cfg(test)]
@@ -392,6 +427,71 @@ mod tests {
         second.expect("concurrent demand");
         assert_eq!(backend.using::<ChangeRequest>("flotilla").list().await.expect("list CRs").items.len(), 1);
         assert_eq!(refresher.active_demands().await, 2);
+    }
+
+    #[tokio::test]
+    async fn last_released_demand_garbage_collects_observed_record() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "authority".to_string(),
+            Arc::new(UnavailableSource),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let subject = ChangeRequestRef {
+            namespace: "flotilla".to_string(),
+            service: "github.com".to_string(),
+            scope: "flotilla-org/flotilla".to_string(),
+            number: 1366,
+        };
+        let first = uuid::Uuid::new_v4();
+        let last = uuid::Uuid::new_v4();
+        refresher.demand(first, subject.clone(), None).await.expect("first demand");
+        refresher.demand(last, subject.clone(), None).await.expect("last demand");
+        assert_eq!(backend.using::<ChangeRequest>("flotilla").list().await.expect("list CRs").items.len(), 1);
+
+        refresher.release(first).await;
+        assert_eq!(backend.using::<ChangeRequest>("flotilla").list().await.expect("list CRs").items.len(), 1);
+
+        refresher.release(last).await;
+        assert!(backend.using::<ChangeRequest>("flotilla").list().await.expect("list CRs").items.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn identical_polls_do_not_write_status() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "authority".to_string(),
+            Arc::new(CountingSource(Arc::clone(&calls))),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let subject = ChangeRequestRef {
+            namespace: "flotilla".to_string(),
+            service: "github.com".to_string(),
+            scope: "flotilla-org/flotilla".to_string(),
+            number: 1366,
+        };
+        refresher.demand(uuid::Uuid::new_v4(), subject.clone(), None).await.expect("demand");
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let records = backend.using::<ChangeRequest>("flotilla");
+        let first = records.get(&subject.record_name()).await.expect("first observation");
+
+        const IDENTICAL_POLLS: usize = 4;
+        for _ in 0..IDENTICAL_POLLS {
+            tokio::time::advance(Duration::from_secs(90)).await;
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let after = records.get(&subject.record_name()).await.expect("observation after identical polls");
+        assert_eq!(calls.load(Ordering::SeqCst), IDENTICAL_POLLS + 1);
+        assert_eq!(after.metadata.resource_version, first.metadata.resource_version, "identical observed values must produce no writes");
+        assert_eq!(after.status, first.status, "poll timestamps are not persisted unless an observed value changes");
     }
 
     #[tokio::test(start_paused = true)]

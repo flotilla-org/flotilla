@@ -82,8 +82,8 @@ impl ResourceStore {
         version
     }
 
-    fn push_event(&mut self, event: StoredEvent, retention: EventRetention) {
-        let excess = self.event_log.len().saturating_add(1).saturating_sub(retention.max_events_per_resource_stream());
+    fn push_event(&mut self, event: StoredEvent, max_events: usize) {
+        let excess = self.event_log.len().saturating_add(1).saturating_sub(max_events);
         if excess > 0 {
             if let Some(last_removed) = self.event_log.get(excess - 1) {
                 self.compacted_through = last_removed.version;
@@ -479,7 +479,10 @@ impl InMemoryBackend {
 
             let encoded = Self::encode_object(&object)?;
             store.objects.insert(meta.name.clone(), encoded.clone());
-            store.push_event(StoredEvent { version, kind: StoredEventKind::Added, object: encoded }, self.event_retention);
+            store.push_event(
+                StoredEvent { version, kind: StoredEventKind::Added, object: encoded },
+                T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
+            );
             Ok(object)
         })
         .await
@@ -545,10 +548,16 @@ impl InMemoryBackend {
                 && object.metadata.finalizers.is_empty()
             {
                 store.objects.remove(&meta.name);
-                store.push_event(StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded }, self.event_retention);
+                store.push_event(
+                    StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded },
+                    T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
+                );
             } else {
                 store.objects.insert(meta.name.clone(), encoded.clone());
-                store.push_event(StoredEvent { version, kind: StoredEventKind::Modified, object: encoded }, self.event_retention);
+                store.push_event(
+                    StoredEvent { version, kind: StoredEventKind::Modified, object: encoded },
+                    T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
+                );
             }
             Ok(object)
         })
@@ -578,7 +587,10 @@ impl InMemoryBackend {
 
             let encoded = Self::encode_object(&object)?;
             store.objects.insert(name.to_string(), encoded.clone());
-            store.push_event(StoredEvent { version, kind: StoredEventKind::Modified, object: encoded }, self.event_retention);
+            store.push_event(
+                StoredEvent { version, kind: StoredEventKind::Modified, object: encoded },
+                T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
+            );
             Ok(object)
         })
         .await
@@ -597,13 +609,19 @@ impl InMemoryBackend {
                 object.metadata.deletion_timestamp = Some(Utc::now());
                 let encoded = Self::encode_object(&object)?;
                 store.objects.insert(name.to_string(), encoded.clone());
-                store.push_event(StoredEvent { version, kind: StoredEventKind::Modified, object: encoded }, self.event_retention);
+                store.push_event(
+                    StoredEvent { version, kind: StoredEventKind::Modified, object: encoded },
+                    T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
+                );
                 return Ok(());
             }
 
             let encoded = Self::encode_object(&object)?;
             store.objects.remove(name);
-            store.push_event(StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded }, self.event_retention);
+            store.push_event(
+                StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded },
+                T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
+            );
             Ok(())
         })
         .await

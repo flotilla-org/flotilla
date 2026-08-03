@@ -2020,6 +2020,9 @@ impl InProcessDaemon {
             Arc::new(crate::change_request_observer::GhChangeRequestObservationSource::new(discovery.runner.clone())),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
+        if let Err(error) = change_request_refresher.garbage_collect_orphans().await {
+            tracing::warn!(%error, "garbage collect orphaned change request observations at startup failed");
+        }
         let leaf_subscriptions = LeafSubscriptionTable::new(resource_backend.clone(), event_tx.clone(), change_request_refresher);
         let daemon = Arc::new_cyclic(|self_weak| Self {
             repos: RwLock::new(repos),

@@ -16,6 +16,19 @@ pub enum ReplicationClass {
     None,
     Definitions,
     HomeBoundRuntime,
+    /// Demand-scoped observed state. Retain only the latest watch handoff
+    /// event so lagging peers relist current state instead of replaying history.
+    Observations,
+}
+
+impl ReplicationClass {
+    pub(crate) fn event_retention(self, configured: usize) -> usize {
+        if self == Self::Observations {
+            1
+        } else {
+            configured
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
