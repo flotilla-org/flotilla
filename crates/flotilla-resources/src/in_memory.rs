@@ -167,6 +167,19 @@ impl InMemoryBackend {
         (T::API_PATHS.group.to_string(), T::API_PATHS.version.to_string(), T::API_PATHS.plural.to_string(), namespace.to_string())
     }
 
+    pub(crate) async fn local_namespaces_typed<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
+        let stores = self.stores.lock().await;
+        let mut namespaces = stores
+            .iter()
+            .filter(|(key, store)| {
+                key.0 == T::API_PATHS.group && key.1 == T::API_PATHS.version && key.2 == T::API_PATHS.plural && !store.objects.is_empty()
+            })
+            .map(|(key, _)| key.3.clone())
+            .collect::<Vec<_>>();
+        namespaces.sort();
+        Ok(namespaces)
+    }
+
     fn clone_through_serde<T>(value: &T) -> Result<T, ResourceError>
     where
         T: serde::Serialize + serde::de::DeserializeOwned,

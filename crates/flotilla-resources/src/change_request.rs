@@ -150,6 +150,23 @@ mod tests {
         assert_eq!(diagnostics.event_count, 1, "observations retain only the latest watch handoff event");
     }
 
+    async fn assert_local_namespace_enumeration(backend: ResourceBackend) {
+        let spec = ChangeRequestSpec::builder()
+            .service("github.com".to_string())
+            .scope("flotilla-org/flotilla".to_string())
+            .number(1366)
+            .observing_authority("authority".to_string())
+            .build();
+        for namespace in ["flotilla", "ops"] {
+            backend
+                .using::<ChangeRequest>(namespace)
+                .create(&InputMeta::builder().name("cr".to_string()).build(), &spec)
+                .await
+                .expect("create namespaced observation");
+        }
+        assert_eq!(backend.local_namespaces::<ChangeRequest>().await.expect("local namespaces"), vec!["flotilla", "ops"]);
+    }
+
     #[tokio::test]
     async fn in_memory_observation_history_is_thin() {
         assert_observation_history_is_thin(ResourceBackend::InMemory(InMemoryBackend::default())).await;
@@ -158,5 +175,15 @@ mod tests {
     #[tokio::test]
     async fn sqlite_observation_history_is_thin() {
         assert_observation_history_is_thin(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend"))).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_enumerates_local_observation_namespaces() {
+        assert_local_namespace_enumeration(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_enumerates_local_observation_namespaces() {
+        assert_local_namespace_enumeration(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend"))).await;
     }
 }

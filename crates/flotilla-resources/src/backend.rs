@@ -56,6 +56,15 @@ impl ResourceBackend {
         TypedResolver { backend: self.clone(), namespace: namespace.to_string(), _marker: PhantomData }
     }
 
+    /// Namespaces containing locally-authored objects of this kind.
+    pub async fn local_namespaces<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
+        match self {
+            Self::InMemory(backend) => backend.local_namespaces_typed::<T>().await,
+            Self::Sqlite(backend) => backend.local_namespaces_typed::<T>().await,
+            Self::Http(_) => Err(ResourceError::invalid("HTTP backends cannot enumerate local resource namespaces")),
+        }
+    }
+
     pub fn definitions<T: Resource>(&self, namespace: &str) -> DefinitionResolver<T> {
         DefinitionResolver::new(self.clone(), namespace.to_string())
     }

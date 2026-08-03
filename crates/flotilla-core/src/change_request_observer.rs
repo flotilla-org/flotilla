@@ -231,9 +231,12 @@ impl ChangeRequestRefresher {
     /// A daemon restart has no surviving leaf subscriptions, so locally
     /// authoritative observations from the previous process are all orphans.
     pub async fn garbage_collect_orphans(&self) -> Result<(), String> {
-        let records = self.inner.backend.using::<ChangeRequest>("flotilla");
-        for record in records.list().await.map_err(|error| error.to_string())?.items {
-            records.delete(&record.metadata.name).await.map_err(|error| error.to_string())?;
+        let namespaces = self.inner.backend.local_namespaces::<ChangeRequest>().await.map_err(|error| error.to_string())?;
+        for namespace in namespaces {
+            let records = self.inner.backend.using::<ChangeRequest>(&namespace);
+            for record in records.list().await.map_err(|error| error.to_string())?.items {
+                records.delete(&record.metadata.name).await.map_err(|error| error.to_string())?;
+            }
         }
         Ok(())
     }
@@ -455,6 +458,30 @@ mod tests {
 
         refresher.release(last).await;
         assert!(backend.using::<ChangeRequest>("flotilla").list().await.expect("list CRs").items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_garbage_collection_covers_non_default_namespaces() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "authority".to_string(),
+            Arc::new(UnavailableSource),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let subject = ChangeRequestRef {
+            namespace: "ops".to_string(),
+            service: "github.com".to_string(),
+            scope: "flotilla-org/flotilla".to_string(),
+            number: 1366,
+        };
+        refresher.demand(uuid::Uuid::new_v4(), subject, None).await.expect("non-default namespace demand");
+        assert_eq!(backend.local_namespaces::<ChangeRequest>().await.expect("local namespaces"), vec!["ops"]);
+
+        refresher.garbage_collect_orphans().await.expect("startup garbage collection");
+
+        assert!(backend.using::<ChangeRequest>("ops").list().await.expect("list ops CRs").items.is_empty());
+        assert!(backend.local_namespaces::<ChangeRequest>().await.expect("local namespaces after GC").is_empty());
     }
 
     #[tokio::test(start_paused = true)]
