@@ -61,7 +61,7 @@ use tracing::{debug, info, warn};
 use crate::{
     agent_adapter::CapabilityTable,
     aggregator_projection::AggregatorProjectionState,
-    checkout_integration::{checkout_path_from_status_and_spec, inspect_checkout_integration},
+    checkout_integration::{checkout_path_from_status_and_spec, inspect_checkout_integration, inspect_convoy_checkout_integration},
     config::{ConfigStore, RemoteHostConfig, StaticEnvironmentConfig},
     convert::snapshot_to_proto,
     daemon::{DaemonHandle, QuerySubscription},
@@ -1695,13 +1695,13 @@ fn convoy_change_request_id_for_checkout(
 }
 
 fn change_request_id_from_completion_message(message: &str, repository_url: &str) -> Option<String> {
-    let message = message.trim().trim_end_matches(['/', '.', ',', ')', ']']);
     let repository_url = repository_url.trim().trim_end_matches('/').trim_end_matches(".git");
     ["pull", "pulls"].into_iter().find_map(|segment| {
-        message
-            .strip_prefix(&format!("{repository_url}/{segment}/"))
-            .filter(|id| !id.is_empty() && id.chars().all(|character| character.is_ascii_digit()))
-            .map(str::to_string)
+        let prefix = format!("{repository_url}/{segment}/");
+        message.match_indices(&prefix).find_map(|(start, _)| {
+            let id = message[start + prefix.len()..].chars().take_while(char::is_ascii_digit).collect::<String>();
+            (!id.is_empty()).then_some(id)
+        })
     })
 }
 
@@ -6195,10 +6195,11 @@ impl InProcessDaemon {
                     .and_then(|observed_at| chrono::DateTime::parse_from_rfc3339(observed_at).ok())
                     .is_some_and(|observed_at| self.clock.now().signed_duration_since(observed_at) < LANDING_EVIDENCE_TTL);
                 if recent {
-                    if condition_is_true(landed) {
-                        continue;
+                    match landed.value {
+                        ConditionValue::True => continue,
+                        ConditionValue::False => return Ok(false),
+                        ConditionValue::Unknown => {}
                     }
-                    return Ok(false);
                 }
             }
             let Some(path) = checkout_path(checkout).map(|path| Path::new(path).to_path_buf()) else {
@@ -6209,7 +6210,7 @@ impl InProcessDaemon {
                 Err(_) => return Ok(false),
             };
             let change_request_id = convoy_change_request_id_for_checkout(convoy, checkout);
-            let mut integration = inspect_checkout_integration(&*runner, &path, &checkout.spec, change_request_id.as_deref()).await;
+            let mut integration = inspect_convoy_checkout_integration(&*runner, &path, &checkout.spec, change_request_id.as_deref()).await;
             if let Some(existing) = checkout.status.as_ref() {
                 latch_evidence_backed_integration(&existing.integration, &mut integration);
             }
@@ -6339,7 +6340,7 @@ impl InProcessDaemon {
                 }
             }
             let change_request_id = convoy_change_request_id_for_checkout(convoy, checkout);
-            let mut integration = inspect_checkout_integration(&*runner, &path, &checkout.spec, change_request_id.as_deref()).await;
+            let mut integration = inspect_convoy_checkout_integration(&*runner, &path, &checkout.spec, change_request_id.as_deref()).await;
             verified = true;
             if let Some(existing) = checkout.status.as_ref() {
                 latch_evidence_backed_integration(&existing.integration, &mut integration);

@@ -57,6 +57,37 @@ use crate::{
 
 const TEST_LOCAL_ATTACH_HOST: &str = "local";
 
+#[test]
+fn completion_message_extracts_github_and_forgejo_change_request_urls_from_prose() {
+    assert_eq!(
+        change_request_id_from_completion_message(
+            "Opened [PR #1338](https://github.com/flotilla-org/flotilla/pull/1338); checks are green.",
+            "https://github.com/flotilla-org/flotilla.git",
+        )
+        .as_deref(),
+        Some("1338")
+    );
+    assert_eq!(
+        change_request_id_from_completion_message(
+            "Ready: https://forgejo.lab/fork-issues/zellij/pulls/9 (reviewed)",
+            "https://forgejo.lab/fork-issues/zellij",
+        )
+        .as_deref(),
+        Some("9")
+    );
+}
+
+#[test]
+fn completion_message_ignores_change_request_urls_for_other_repositories() {
+    assert_eq!(
+        change_request_id_from_completion_message(
+            "https://github.com/flotilla-org/other/pull/42",
+            "https://github.com/flotilla-org/flotilla",
+        ),
+        None
+    );
+}
+
 fn attach_plan_text(plan: &flotilla_protocol::ResolvedAttachPlan) -> String {
     plan.0
         .iter()

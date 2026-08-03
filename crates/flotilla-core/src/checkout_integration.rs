@@ -63,6 +63,25 @@ pub async fn inspect_checkout_integration(
     spec: &CheckoutSpec,
     change_request_id: Option<&str>,
 ) -> CheckoutIntegrationStatus {
+    inspect_checkout_integration_with_association(runner, checkout_path, spec, change_request_id, change_request_id.is_some()).await
+}
+
+pub async fn inspect_convoy_checkout_integration(
+    runner: &dyn CommandRunner,
+    checkout_path: &Path,
+    spec: &CheckoutSpec,
+    change_request_id: Option<&str>,
+) -> CheckoutIntegrationStatus {
+    inspect_checkout_integration_with_association(runner, checkout_path, spec, change_request_id, true).await
+}
+
+async fn inspect_checkout_integration_with_association(
+    runner: &dyn CommandRunner,
+    checkout_path: &Path,
+    spec: &CheckoutSpec,
+    change_request_id: Option<&str>,
+    convoy_association_complete: bool,
+) -> CheckoutIntegrationStatus {
     let observed_at = Utc::now().to_rfc3339();
     let clean = inspect_clean(runner, checkout_path, &observed_at).await;
     let pushed = inspect_pushed(runner, checkout_path, &observed_at).await;
@@ -72,6 +91,7 @@ pub async fn inspect_checkout_integration(
         checkout_branch_from_spec(spec),
         checkout_base_ref_from_spec(spec),
         change_request_id,
+        convoy_association_complete,
         &observed_at,
     )
     .await;
@@ -244,6 +264,7 @@ async fn inspect_landed(
     branch: &str,
     base_ref: Option<&str>,
     change_request_id: Option<&str>,
+    convoy_association_complete: bool,
     observed_at: &str,
 ) -> (IntegrationCondition, Option<LandedEvidence>, Option<ChangeRequestObservation>) {
     // Git evidence alone cannot prove that no change request remains
@@ -320,7 +341,7 @@ async fn inspect_landed(
                             )
                         }
                     }
-                    None => (landed_without_change_request(&comparison, observed_at), None, None),
+                    None => (landed_without_change_request(&comparison, convoy_association_complete, observed_at), None, None),
                 }
             }
             Err(_) => (
@@ -395,7 +416,18 @@ async fn compare_branch_to_base(runner: &dyn CommandRunner, checkout_path: &Path
 /// (absence of evidence, not evidence of absence). The nothing-beyond-base
 /// case is true only after the forge lookup has also found no associated
 /// change request.
-fn landed_without_change_request(comparison: &BaseComparison, observed_at: &str) -> IntegrationCondition {
+fn landed_without_change_request(
+    comparison: &BaseComparison,
+    convoy_association_complete: bool,
+    observed_at: &str,
+) -> IntegrationCondition {
+    if !convoy_association_complete {
+        return IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec!["no change request exists for the checkout ref, but convoy association was not available".to_string()])
+            .observed_at(observed_at.to_string())
+            .build();
+    }
     match comparison {
         BaseComparison::Counted { base_ref, count: 0 } => IntegrationCondition::builder()
             .value(ConditionValue::True)
@@ -431,14 +463,16 @@ mod tests {
 
     async fn landed_with_responses(responses: Vec<Result<String, String>>) -> IntegrationCondition {
         let runner = MockRunner::new(responses);
-        let (landed, _, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, "2026-07-27T00:00:00Z").await;
+        let (landed, _, _) =
+            inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, true, "2026-07-27T00:00:00Z").await;
         landed
     }
 
     #[tokio::test]
     async fn untouched_branch_is_landed_after_forge_reports_no_change_request() {
         let runner = MockRunner::new(vec![Ok("0".into()), Ok("[]".into())]);
-        let (landed, _, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, "2026-07-27T00:00:00Z").await;
+        let (landed, _, _) =
+            inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, true, "2026-07-27T00:00:00Z").await;
 
         assert_eq!(landed.value, ConditionValue::True);
         assert_eq!(runner.calls()[1].0, "gh");
@@ -449,7 +483,8 @@ mod tests {
         let runner =
             MockRunner::new(vec![Ok("0".into()), Ok(r#"{"number":1338,"state":"OPEN","mergedAt":null,"baseRefName":"main"}"#.into())]);
         let (landed, _, change_request) =
-            inspect_landed(&runner, Path::new("/checkout"), "provisioned-ref", Some("main"), Some("1338"), "2026-07-27T00:00:00Z").await;
+            inspect_landed(&runner, Path::new("/checkout"), "provisioned-ref", Some("main"), Some("1338"), true, "2026-07-27T00:00:00Z")
+                .await;
 
         assert_eq!(landed.value, ConditionValue::False);
         assert_eq!(change_request.expect("associated change request should be observed").state, ChangeRequestState::Open);
@@ -459,6 +494,15 @@ mod tests {
     #[tokio::test]
     async fn untouched_branch_is_unknown_when_forge_cannot_be_consulted() {
         let landed = landed_with_responses(vec![Ok("0".into()), Err("authentication unavailable".into())]).await;
+        assert_eq!(landed.value, ConditionValue::Unknown);
+    }
+
+    #[tokio::test]
+    async fn checkout_only_lookup_cannot_prove_that_the_convoy_has_no_change_request() {
+        let runner = MockRunner::new(vec![Ok("0".into()), Ok("[]".into())]);
+        let (landed, _, _) =
+            inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, false, "2026-07-27T00:00:00Z").await;
+
         assert_eq!(landed.value, ConditionValue::Unknown);
     }
 
@@ -489,7 +533,7 @@ mod tests {
             Ok(r#"{"number":1071,"state":"MERGED","mergedAt":"2026-07-27T12:00:00Z","baseRefName":"main"}"#.into()),
         ]);
         let (landed, evidence, change_request) =
-            inspect_landed(&runner, Path::new("/checkout"), "renamed-head", Some("main"), Some("1071"), "2026-07-27T00:00:00Z").await;
+            inspect_landed(&runner, Path::new("/checkout"), "renamed-head", Some("main"), Some("1071"), true, "2026-07-27T00:00:00Z").await;
 
         assert_eq!(landed.value, ConditionValue::True);
         assert_eq!(evidence.as_ref().map(|evidence| evidence.change_request_id.as_str()), Some("1071"));
@@ -515,7 +559,7 @@ mod tests {
         ]);
 
         let (_, _, change_request) =
-            inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, "2026-07-27T00:00:00Z").await;
+            inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, true, "2026-07-27T00:00:00Z").await;
 
         assert_eq!(change_request.expect("open change request should be observed").mergeability, ChangeRequestMergeability::Conflicting);
     }
@@ -533,7 +577,7 @@ mod tests {
     #[tokio::test]
     async fn indeterminate_base_without_change_request_is_unknown() {
         let runner = MockRunner::new(vec![Err("fatal: ambiguous argument".into()), Ok("[]".into())]);
-        let (landed, _, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", None, None, "2026-07-27T00:00:00Z").await;
+        let (landed, _, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", None, None, true, "2026-07-27T00:00:00Z").await;
         assert_eq!(landed.value, ConditionValue::Unknown);
     }
 }
