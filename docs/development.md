@@ -1,5 +1,15 @@
 # Development
 
+## Daemon logs
+
+The daemon's canonical structured log is
+`$XDG_STATE_HOME/flotilla/log/flotillad.jsonl`, or
+`~/.local/state/flotilla/log/flotillad.jsonl` when `XDG_STATE_HOME` is unset.
+Older size-rotated generations use numeric suffixes such as
+`flotillad.jsonl.1`. Detached daemons write their normal tracing output only
+to this JSON-lines log; `daemon-panic.log` under the configuration directory
+is reserved for panics and errors that occur before tracing initializes.
+
 ## Cargo target cache policy
 
 A checkout's `target/` is managed cache state. The fleet uses two complementary controls: a daily, per-host mtime-based sweep for old Cargo artifact families and a per-checkout size-cap backstop for unusually large targets.
