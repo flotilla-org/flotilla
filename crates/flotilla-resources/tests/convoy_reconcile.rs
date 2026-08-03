@@ -143,6 +143,12 @@ async fn reconcile_landing_with_observed_change_request(
             member.phase = CrewWorkPhase::Done;
         }
     }
+    status.work.get_mut("implement").expect("implement work").placement = Some(flotilla_resources::PlacementStatus {
+        fields: BTreeMap::from([(
+            "checkout_refs".to_string(),
+            serde_json::json!(BTreeMap::from([(RepositoryKey("repo-a".to_string()), "checkout-a".to_string())])),
+        )]),
+    });
     let mut spec = valid_convoy_spec();
     spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec::builder()
         .url("https://example.com/repo-a".to_string())
@@ -687,8 +693,22 @@ async fn landing_without_checkout_evidence_stays_landing() {
 }
 
 #[tokio::test]
-async fn teardown_runtime_default_rejects_empty_checkout_evidence() {
+async fn teardown_runtime_default_accepts_artifactless_convoy() {
     let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
+
+    assert!(AlwaysEligible.no_change_request_outstanding(&convoy, &[]).await.expect("default settlement condition should evaluate"));
+}
+
+#[tokio::test]
+async fn teardown_runtime_default_rejects_unobserved_expected_checkout() {
+    let mut status = bootstrapped_convoy_status();
+    status.work.get_mut("implement").expect("implement work").placement = Some(flotilla_resources::PlacementStatus {
+        fields: BTreeMap::from([(
+            "checkout_refs".to_string(),
+            serde_json::json!(BTreeMap::from([(RepositoryKey("repo-a".to_string()), "checkout-a".to_string())])),
+        )]),
+    });
+    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
 
     assert!(!AlwaysEligible.no_change_request_outstanding(&convoy, &[]).await.expect("default settlement condition should evaluate"));
 }
@@ -709,6 +729,12 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
             member.phase = CrewWorkPhase::Done;
         }
     }
+    status.work.get_mut("implement").expect("implement work").placement = Some(flotilla_resources::PlacementStatus {
+        fields: BTreeMap::from([(
+            "checkout_refs".to_string(),
+            serde_json::json!(BTreeMap::from([(RepositoryKey("repo-a".to_string()), "remote-checkout".to_string())])),
+        )]),
+    });
     let source = convoy_object("cross-host", valid_convoy_spec(), Some(status));
     let created = convoys.create(&convoy_meta("cross-host"), &source.spec).await.expect("create authority convoy");
     convoys

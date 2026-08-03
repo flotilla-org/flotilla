@@ -49,7 +49,7 @@ use flotilla_resources::{
     apply_status_patch, controller_patches as convoy_controller_patches, implement_review_workflow_spec,
     single_agent_contained_workflow_spec, Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase,
     CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy as ResourceConvoy, ConvoyPhase,
-    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
+    ConvoySpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, IntegrationCondition, LifecycleAuthority, ObservedCheckoutSpec,
     PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource,
     Repository, RepositoryKey, RepositoryRelation, RepositorySpec, Stance, TypedResolver, VirtualClock, WorkPhase, WorkState,
@@ -6796,6 +6796,18 @@ async fn convoy_landing_reprobes_after_injected_clock_crosses_evidence_ttl() {
         clock.clone() as Arc<dyn flotilla_resources::Clock>,
     )
     .await;
+    backend
+        .clone()
+        .using::<ResourceConvoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("convoy-a".to_string()).build(),
+            &ConvoySpec::builder()
+                .workflow_ref("review-and-fix".to_string())
+                .adopted_checkout_refs(BTreeMap::from([(RepositoryKey("repo-a".to_string()), "checkout-a".to_string())]))
+                .build(),
+        )
+        .await
+        .expect("create convoy with expected checkout");
     let checkouts = backend.using::<ResourceCheckout>("flotilla");
     let checkout = checkouts
         .create(

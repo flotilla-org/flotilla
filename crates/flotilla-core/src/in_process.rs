@@ -6132,18 +6132,22 @@ impl InProcessDaemon {
             .await
             .map_err(|err| err.to_string())?
             .items;
-        self.convoy_change_requests_settled_for_checkouts(&checkout_list).await
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
+        self.convoy_change_requests_settled_for_checkouts(&convoy, &checkout_list).await
     }
 
     pub async fn convoy_change_requests_settled_for_checkouts(
         &self,
+        convoy: &ResourceObject<ResourceConvoy>,
         checkout_list: &[ResourceObject<ResourceCheckout>],
     ) -> Result<bool, String> {
-        let Some(first_checkout) = checkout_list.first() else {
-            return Ok(false);
-        };
-        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(&first_checkout.metadata.namespace);
-        for checkout in checkout_list {
+        let expected = flotilla_resources::expected_checkout_refs(convoy)?;
+        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(&convoy.metadata.namespace);
+        for checkout_name in expected {
+            let Some(checkout) = checkout_list.iter().find(|checkout| checkout.metadata.name == checkout_name) else {
+                return Ok(false);
+            };
             if let Some(landed) = checkout.status.as_ref().map(|status| &status.integration.landed) {
                 let recent = landed
                     .observed_at
@@ -6223,14 +6227,26 @@ impl InProcessDaemon {
         if convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Abandoned) {
             return Ok(());
         }
-        if checkout_list.is_empty() {
-            return Err(format!("convoy {namespace}/{name} is not safe to delete: no checkout integration evidence"));
+        let expected = flotilla_resources::expected_checkout_refs(convoy)?;
+        if expected.is_empty() {
+            return Ok(());
+        }
+        let missing = expected
+            .iter()
+            .filter(|checkout_name| !checkout_list.iter().any(|checkout| &checkout.metadata.name == *checkout_name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "convoy {namespace}/{name} is not safe to delete: missing checkout integration evidence for {}",
+                missing.join(", ")
+            ));
         }
 
         let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
         let mut refusals = Vec::new();
         let mut verified = false;
-        for checkout in checkout_list {
+        for checkout in checkout_list.iter().filter(|checkout| expected.contains(&checkout.metadata.name)) {
             let is_adopted = checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted);
             if let Some(env_ref) = checkout.spec.env_ref() {
                 if self.checkout_environment_is_destroyed(namespace, env_ref).await? {

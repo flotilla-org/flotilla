@@ -87,10 +87,10 @@ impl DaemonConvoyTeardownRuntime {
 impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
     async fn no_change_request_outstanding(
         &self,
-        _convoy: &ResourceObject<Convoy>,
+        convoy: &ResourceObject<Convoy>,
         checkouts: &[ResourceObject<Checkout>],
     ) -> Result<bool, String> {
-        self.daemon.convoy_change_requests_settled_for_checkouts(checkouts).await
+        self.daemon.convoy_change_requests_settled_for_checkouts(convoy, checkouts).await
     }
 
     async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, checkouts: &[ResourceObject<Checkout>]) -> Result<(), String> {

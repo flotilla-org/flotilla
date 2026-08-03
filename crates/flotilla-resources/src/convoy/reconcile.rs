@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use super::{
-    controller_patches, provisioning_patches, Convoy, ConvoyPhase, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, VesselRequirement,
-    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    controller_patches, expected_checkout_refs, provisioning_patches, Convoy, ConvoyPhase, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState,
+    VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use crate::{
     checkout::Checkout,
@@ -37,13 +37,15 @@ pub trait ConvoyTeardownRuntime: Send + Sync {
     /// before answering; the default keeps in-memory reconcilers deterministic.
     async fn no_change_request_outstanding(
         &self,
-        _convoy: &ResourceObject<Convoy>,
+        convoy: &ResourceObject<Convoy>,
         checkouts: &[ResourceObject<Checkout>],
     ) -> Result<bool, String> {
-        Ok(!checkouts.is_empty()
-            && checkouts.iter().all(|checkout| {
+        let expected = expected_checkout_refs(convoy)?;
+        Ok(expected.iter().all(|name| {
+            checkouts.iter().find(|checkout| &checkout.metadata.name == name).is_some_and(|checkout| {
                 checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)
-            }))
+            })
+        }))
     }
 
     /// Re-verify ADR 0017 teardown eligibility at the execution edge.
@@ -272,12 +274,13 @@ impl Reconciler for ConvoyReconciler {
                     let checkout_list = checkouts.values().cloned().collect::<Vec<_>>();
                     runtime.no_change_request_outstanding(obj, &checkout_list).await.unwrap_or(false)
                 }
-                None => {
-                    !checkouts.is_empty()
-                        && checkouts.values().all(|checkout| {
+                None => expected_checkout_refs(obj).is_ok_and(|expected| {
+                    expected.iter().all(|name| {
+                        checkouts.get(name).is_some_and(|checkout| {
                             checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)
                         })
-                }
+                    })
+                }),
             }
         } else {
             false

@@ -26,8 +26,8 @@ use flotilla_resources::{
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase,
     CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost, HostCondition,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus, Selector, Stance,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, PlacementStatus,
+    Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus, Selector, Stance,
     TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
     Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
@@ -1077,6 +1077,47 @@ async fn create_ready_observed_checkout_for_convoy(
         })
         .await
         .expect("checkout should be ready");
+    record_expected_checkout_for_convoy(daemon, namespace, convoy, checkout_name).await;
+}
+
+async fn record_expected_checkout_for_convoy(daemon: &InProcessDaemon, namespace: &str, convoy_name: &str, checkout_name: &str) {
+    let convoys = daemon.resource_backend().using::<Convoy>(namespace);
+    let convoy = match convoys.get(convoy_name).await {
+        Ok(convoy) => convoy,
+        Err(flotilla_resources::ResourceError::NotFound { .. }) => convoys
+            .create(&empty_input_meta(convoy_name), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
+            .await
+            .expect("expected-checkout convoy should be created"),
+        Err(error) => panic!("expected-checkout convoy should resolve: {error}"),
+    };
+    let mut status = convoy.status.clone().unwrap_or_default();
+    let placement = status
+        .work
+        .entry("__test_checkout_expectations".to_string())
+        .or_insert(WorkState {
+            phase: WorkPhase::Pending,
+            completion_authority: WorkCompletionAuthority::CrewRollup,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            message: None,
+            placement: None,
+        })
+        .placement
+        .get_or_insert_with(PlacementStatus::default);
+    let mut checkout_refs = placement
+        .fields
+        .get("checkout_refs")
+        .map(|value| serde_json::from_value::<BTreeMap<flotilla_resources::RepositoryKey, String>>(value.clone()))
+        .transpose()
+        .expect("test checkout refs should deserialize")
+        .unwrap_or_default();
+    checkout_refs.insert(flotilla_resources::RepositoryKey(format!("test:{checkout_name}")), checkout_name.to_string());
+    placement.fields.insert("checkout_refs".to_string(), serde_json::json!(checkout_refs));
+    convoys
+        .update_status(convoy_name, &convoy.metadata.resource_version, &status)
+        .await
+        .expect("expected checkout should be recorded on convoy work");
 }
 
 #[builder]
@@ -5645,6 +5686,7 @@ async fn convoy_delete_refuses_when_destroyed_environment_leaves_no_integration_
         })
         .await
         .expect("checkout status should update");
+    record_expected_checkout_for_convoy(&daemon, "flotilla", "corpse-convoy", "checkout-corpse").await;
 
     let mut events = daemon.subscribe();
     let command_id = daemon
@@ -6303,7 +6345,7 @@ async fn local_convoy_admission_pins_the_grant_resolved_workflow() {
 }
 
 #[tokio::test]
-async fn empty_checkout_evidence_neither_settles_nor_allows_reclaim() {
+async fn expected_but_unobserved_checkout_neither_settles_nor_allows_reclaim() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -6316,13 +6358,36 @@ async fn empty_checkout_evidence_neither_settles_nor_allows_reclaim() {
         .create(&empty_input_meta("empty-convoy"), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
         .await
         .expect("create convoy");
+    record_expected_checkout_for_convoy(&daemon, "flotilla", "empty-convoy", "missing-checkout").await;
 
     assert!(!daemon.convoy_change_requests_settled("flotilla", "empty-convoy").await.expect("evaluate settlement"));
     let refusal = daemon
         .verify_convoy_teardown_gate("flotilla", "empty-convoy", false)
         .await
         .expect_err("empty checkout evidence must refuse reclaim");
-    assert!(refusal.contains("no checkout integration evidence"), "unexpected refusal: {refusal}");
+    assert!(refusal.contains("missing checkout integration evidence for missing-checkout"), "unexpected refusal: {refusal}");
+}
+
+#[tokio::test]
+async fn artifactless_convoy_settles_and_allows_reclaim_on_claims() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    daemon
+        .resource_backend()
+        .using::<Convoy>("flotilla")
+        .create(&empty_input_meta("artifactless-convoy"), &ConvoySpec::builder().workflow_ref("tool-only".to_string()).build())
+        .await
+        .expect("create artifactless convoy");
+
+    assert!(daemon.convoy_change_requests_settled("flotilla", "artifactless-convoy").await.expect("evaluate settlement"));
+    daemon
+        .verify_convoy_teardown_gate("flotilla", "artifactless-convoy", false)
+        .await
+        .expect("artifactless convoy should pass reclaim gate");
 }
 
 #[tokio::test]
@@ -6366,6 +6431,7 @@ async fn adopted_checkout_with_open_change_request_holds_settlement() {
         })
         .await
         .expect("record open adopted change request");
+    record_expected_checkout_for_convoy(&daemon, "flotilla", "adopted-convoy", "adopted-open").await;
 
     assert!(!daemon.convoy_change_requests_settled("flotilla", "adopted-convoy").await.expect("evaluate adopted settlement"));
 }
@@ -6453,6 +6519,7 @@ async fn landing_holds_when_fresh_probe_contradicts_stale_vacuous_landed() {
         })
         .await
         .expect("checkout status should update");
+    record_expected_checkout_for_convoy(&daemon, "flotilla", "split-convoy", "checkout-split").await;
 
     // First pass: the stale True is re-probed; the open change request holds
     // Landing and the fresh False observation is persisted un-latched.
