@@ -365,20 +365,22 @@ fn spawn_daemon(config_dir: &Path, config_dir_override: Option<&Path>, socket_ov
 pub async fn connect_or_spawn(
     socket_path: &Path,
     config_dir: &Path,
+    state_dir: &Path,
     config_dir_override: Option<&Path>,
     socket_override: Option<&Path>,
 ) -> Result<Arc<SocketDaemon>, String> {
-    connect_or_spawn_with_optional_surface(socket_path, config_dir, config_dir_override, socket_override, None).await
+    connect_or_spawn_with_optional_surface(socket_path, config_dir, state_dir, config_dir_override, socket_override, None).await
 }
 
 pub async fn connect_or_spawn_with_surface(
     socket_path: &Path,
     config_dir: &Path,
+    state_dir: &Path,
     config_dir_override: Option<&Path>,
     socket_override: Option<&Path>,
     surface: SurfaceDeclaration,
 ) -> Result<Arc<SocketDaemon>, String> {
-    connect_or_spawn_with_optional_surface(socket_path, config_dir, config_dir_override, socket_override, Some(surface)).await
+    connect_or_spawn_with_optional_surface(socket_path, config_dir, state_dir, config_dir_override, socket_override, Some(surface)).await
 }
 
 /// Connect to the host daemon exposed inside a contained environment.
@@ -413,6 +415,7 @@ async fn connect_required_host_daemon_with_optional_surface(
 async fn connect_or_spawn_with_optional_surface(
     socket_path: &Path,
     config_dir: &Path,
+    state_dir: &Path,
     config_dir_override: Option<&Path>,
     socket_override: Option<&Path>,
     surface: Option<SurfaceDeclaration>,
@@ -431,6 +434,8 @@ async fn connect_or_spawn_with_optional_surface(
     if let Some(daemon) = connect_existing_stateful(socket_path, surface.as_ref()).await? {
         return Ok(daemon);
     }
+
+    ensure_no_live_daemon_without_socket(state_dir, socket_path)?;
 
     // Acquire spawn lock (tmux-style flock). The loser blocks until the
     // winner's daemon is ready, then retries connect.
@@ -521,6 +526,8 @@ async fn connect_or_spawn_with_optional_surface(
         }
     }
 
+    ensure_no_live_daemon_without_socket(state_dir, socket_path)?;
+
     {
         // Clean up stale socket
         let _ = std::fs::remove_file(socket_path);
@@ -552,6 +559,33 @@ async fn connect_or_spawn_with_optional_surface(
             });
         }
     }
+}
+
+fn ensure_no_live_daemon_without_socket(state_dir: &Path, socket_path: &Path) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+
+    let lock_path = state_dir.join(flotilla_core::DAEMON_LIFECYCLE_LOCK_FILE);
+    let file = match std::fs::OpenOptions::new().read(true).write(true).open(&lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("failed to inspect daemon lifecycle lock {}: {error}", lock_path.display())),
+    };
+    // SAFETY: `file` owns this descriptor for the duration of the flock calls.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        // SAFETY: the descriptor is still valid, and explicitly unlocking keeps
+        // this read-only health probe from retaining daemon lifecycle authority.
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) || error.raw_os_error() == Some(libc::EAGAIN) {
+        return Err(format!(
+            "daemon process is alive (lifecycle lock {} is held), but its socket is missing or unreachable at {}; refusing to spawn a competing daemon — restart the existing daemon",
+            lock_path.display(),
+            socket_path.display()
+        ));
+    }
+    Err(format!("failed to inspect daemon lifecycle lock {}: {error}", lock_path.display()))
 }
 
 /// Deadline for a listening daemon to complete the Hello handshake. Generous

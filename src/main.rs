@@ -361,6 +361,7 @@ fn host_daemon_socket_required(contained_marker: Option<&std::ffi::OsStr>) -> bo
 async fn connect_cli_socket(
     socket_path: &Path,
     config_dir: &Path,
+    state_dir: &Path,
     config_dir_override: Option<&Path>,
     socket_override: Option<&Path>,
     require_host_daemon: bool,
@@ -368,7 +369,7 @@ async fn connect_cli_socket(
     if require_host_daemon {
         flotilla_tui::socket::connect_required_host_daemon(socket_path).await
     } else {
-        flotilla_tui::socket::connect_or_spawn(socket_path, config_dir, config_dir_override, socket_override).await
+        flotilla_tui::socket::connect_or_spawn(socket_path, config_dir, state_dir, config_dir_override, socket_override).await
     }
 }
 
@@ -577,12 +578,14 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
     let daemon_panic_log_path = resolved_config_dir.join("daemon-panic.log");
     let initial_socket_path = socket_path.clone();
     let initial_config_dir = resolved_config_dir.clone();
+    let initial_state_dir = paths.state_dir.clone();
     let initial_config_override = config_dir_override.clone();
     let initial_socket_override = socket_override.clone();
     let daemon_task = tokio::spawn(async move {
         connect_cli_socket(
             &initial_socket_path,
             &initial_config_dir,
+            initial_state_dir.as_path(),
             initial_config_override.as_deref(),
             initial_socket_override.as_deref(),
             require_host_daemon,
@@ -675,6 +678,7 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
                 connect_cli_socket(
                     &socket_path,
                     &resolved_config_dir,
+                    paths.state_dir.as_path(),
                     config_dir_override.as_deref(),
                     socket_override.as_deref(),
                     require_host_daemon,
@@ -828,9 +832,11 @@ async fn run_watch(cli: &Cli, format: OutputFormat) -> Result<()> {
 async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
     let socket_path = cli.socket_path();
     let config_dir = cli.config_dir();
+    let paths = PathPolicy::from_process_env();
     let daemon = connect_cli_socket(
         &socket_path,
         &config_dir,
+        paths.state_dir.as_path(),
         cli.config_dir.as_deref(),
         cli.socket.as_deref(),
         host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
