@@ -4013,15 +4013,25 @@ async fn resolve_workflow_credentials(
             .as_ref()
             .map(|repositories| repositories.iter().cloned().collect())
             .unwrap_or_else(|| all_repositories.clone());
-        let granted = grants
-            .iter()
-            .filter(|grant| grant.spec.selector.matches(vessel.stance, project_ref, &vessel_repositories))
-            .flat_map(|grant| grant.spec.credentials.iter().cloned())
-            .collect::<BTreeSet<_>>();
+        let matching_grants =
+            grants.iter().filter(|grant| grant.spec.selector.matches(vessel.stance, project_ref, &vessel_repositories)).collect::<Vec<_>>();
+        let granted = matching_grants.iter().flat_map(|grant| grant.spec.credentials.iter().cloned()).collect::<BTreeSet<_>>();
         if let Some(missing) = granted.iter().find(|name| !specs.contains(*name)) {
             return Err(format!("credential grant references missing credential `{missing}`"));
         }
+        let mut credential_scopes = BTreeMap::<String, BTreeSet<_>>::new();
+        for grant in matching_grants {
+            let covered_repositories = if grant.spec.selector.repositories.is_empty() {
+                vessel_repositories.clone()
+            } else {
+                grant.spec.selector.repositories.intersection(&vessel_repositories).cloned().collect()
+            };
+            for credential in &grant.spec.credentials {
+                credential_scopes.entry(credential.clone()).or_default().extend(covered_repositories.iter().cloned());
+            }
+        }
         vessel.credential_refs = granted;
+        vessel.credential_scopes = credential_scopes;
     }
     Ok(())
 }

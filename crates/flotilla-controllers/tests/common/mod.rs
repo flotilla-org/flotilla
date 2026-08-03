@@ -107,6 +107,7 @@ pub async fn create_convoy_with_single_task(
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
+                    credential_scopes: Default::default(),
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
                         .source(CrewSource::Tool { command: "cargo test".to_string() })

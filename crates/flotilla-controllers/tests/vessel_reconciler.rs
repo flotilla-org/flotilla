@@ -25,7 +25,8 @@ use flotilla_resources::{
     ObservedCheckoutSpec, PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend, ResourceError, Selector, Stance, TerminalBrief,
     TerminalCrewContext, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel,
     VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use rstest::rstest;
 use tokio::time::{timeout, Duration};
@@ -119,6 +120,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
+                    credential_scopes: Default::default(),
                     crew: vec![CrewSpec::builder()
                         .role("shell".to_string())
                         .source(CrewSource::Tool { command: "bash".to_string() })
@@ -242,6 +244,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
         depends_on: vec!["implement".to_string()],
         repository_refs: None,
         credential_refs: Default::default(),
+        credential_scopes: Default::default(),
         crew: Vec::new(),
     });
     backend
@@ -493,6 +496,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
+                    credential_scopes: Default::default(),
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
                         .source(CrewSource::Agent {
@@ -671,6 +675,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
+                    credential_scopes: Default::default(),
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
                         .source(CrewSource::Tool { command: "cargo test".to_string() })
@@ -844,6 +849,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
+                    credential_scopes: Default::default(),
                     crew: Vec::new(),
                 }],
             }),
@@ -970,6 +976,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
                     depends_on: Vec::new(),
                     repository_refs: Some(vec![cleat.key()]),
                     credential_refs: Default::default(),
+                    credential_scopes: Default::default(),
                     crew: Vec::new(),
                 }],
             }),
@@ -2161,6 +2168,13 @@ async fn terminal_session_actuation_includes_system_and_user_labels() {
     assert_eq!(terminal.0.labels.get(ROLE_LABEL).map(String::as_str), Some("test"));
     assert_eq!(terminal.0.labels.get(VESSEL_ORDINAL_LABEL).map(String::as_str), Some("001"));
     assert_eq!(terminal.0.labels.get(CREW_ORDINAL_LABEL).map(String::as_str), Some("001"));
+    let encoded_scopes = terminal.0.annotations.get(CREDENTIAL_SCOPES_ANNOTATION).expect("credential scopes annotation");
+    let scopes = serde_json::from_str::<BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>>(encoded_scopes)
+        .expect("credential scopes should decode");
+    assert_eq!(
+        scopes,
+        BTreeMap::from([("github-app".to_string(), BTreeSet::from([RepositorySpec::remote(REPO_URL).expect("repository spec").key()]),)])
+    );
 }
 
 async fn assert_terminal_cwd_for_strategy(
@@ -2282,7 +2296,7 @@ async fn create_convoy_with_labeled_processes(
             placement_policy: None,
             repositories: vec![ConvoyRepositorySpec {
                 url: repo_url.to_string(),
-                repo_ref: repository_key,
+                repo_ref: repository_key.clone(),
                 source_ref: git_ref.to_string(),
                 target_ref: "landing-target".to_string(),
                 workspace_slug: repository_spec.leaf_slug(),
@@ -2307,6 +2321,7 @@ async fn create_convoy_with_labeled_processes(
                         depends_on: Vec::new(),
                         repository_refs: None,
                         credential_refs: Default::default(),
+                        credential_scopes: Default::default(),
                         crew: vec![CrewSpec::builder()
                             .role("coder".to_string())
                             .source(CrewSource::Tool { command: "cargo fmt --check".to_string() })
@@ -2317,7 +2332,8 @@ async fn create_convoy_with_labeled_processes(
                         stance: Default::default(),
                         depends_on: vec!["implement".to_string()],
                         repository_refs: None,
-                        credential_refs: Default::default(),
+                        credential_refs: BTreeSet::from(["github-app".to_string()]),
+                        credential_scopes: BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]),
                         crew: vec![
                             CrewSpec::builder()
                                 .role("build".to_string())

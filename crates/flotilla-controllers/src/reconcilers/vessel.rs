@@ -23,7 +23,7 @@ use flotilla_resources::{
     ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
     TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
-    VESSEL_REF_LABEL,
+    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, VESSEL_REF_LABEL,
 };
 use tracing::warn;
 
@@ -433,7 +433,11 @@ impl Reconciler for VesselReconciler {
                                     required_agent_adapters: required_agent_adapters.clone(),
                                     pull_policy: *pull_policy,
                                     mounts: Vec::new(),
-                                    env: environment_with_credentials(env.clone(), &requirement.credential_refs),
+                                    env: environment_with_credentials(
+                                        env.clone(),
+                                        &requirement.credential_refs,
+                                        &requirement.credential_scopes,
+                                    ),
                                 }),
                             },
                         });
@@ -788,7 +792,11 @@ impl Reconciler for VesselReconciler {
                                     required_agent_adapters: required_agent_adapters.clone(),
                                     pull_policy: *pull_policy,
                                     mounts,
-                                    env: environment_with_credentials(env.clone(), &requirement.credential_refs),
+                                    env: environment_with_credentials(
+                                        env.clone(),
+                                        &requirement.credential_refs,
+                                        &requirement.credential_scopes,
+                                    ),
                                 }),
                             },
                         });
@@ -953,6 +961,12 @@ impl Reconciler for VesselReconciler {
                             serde_json::to_string(&requirement.credential_refs).expect("credential names serialize"),
                         );
                     }
+                    if !requirement.credential_scopes.is_empty() {
+                        terminal_meta.annotations.insert(
+                            CREDENTIAL_SCOPES_ANNOTATION.to_string(),
+                            serde_json::to_string(&requirement.credential_scopes).expect("credential scopes serialize"),
+                        );
+                    }
                     actuations.push(Actuation::CreateTerminalSession {
                         meta: terminal_meta,
                         spec: TerminalSessionSpec {
@@ -1074,9 +1088,13 @@ fn image_stamp(environment: &ResourceObject<Environment>) -> Result<ImageStamp, 
 fn environment_with_credentials(
     mut env: BTreeMap<String, String>,
     credentials: &std::collections::BTreeSet<String>,
+    scopes: &BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>,
 ) -> BTreeMap<String, String> {
     if !credentials.is_empty() {
         env.insert(CREDENTIAL_REFS_ENV.to_string(), serde_json::to_string(credentials).expect("credential names serialize"));
+    }
+    if !scopes.is_empty() {
+        env.insert(CREDENTIAL_SCOPES_ENV.to_string(), serde_json::to_string(scopes).expect("credential scopes serialize"));
     }
     env
 }
@@ -1325,12 +1343,15 @@ impl PlacementStrategy {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::{Arc, Mutex},
+    };
 
     use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
     use flotilla_resources::ResourceBackend;
 
-    use super::{legible_waiting_for, VesselReconciler};
+    use super::{environment_with_credentials, legible_waiting_for, VesselReconciler};
 
     #[derive(Clone)]
     struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
@@ -1363,6 +1384,27 @@ mod tests {
             legible_waiting_for("checkout checkout-01HXYZ to become ready".to_string(), Some(&decision)),
             "checkout checkout-01HXYZ to become ready",
             "unrelated names containing the host ref must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn environment_metadata_round_trips_non_empty_credential_scopes() {
+        let repository = flotilla_resources::RepositoryKey("github.com-flotilla-org-flotilla".to_string());
+        let credentials = BTreeSet::from(["github-app".to_string()]);
+        let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository]))]);
+
+        let env = environment_with_credentials(BTreeMap::new(), &credentials, &scopes);
+
+        assert_eq!(
+            serde_json::from_str::<BTreeSet<String>>(&env[flotilla_resources::CREDENTIAL_REFS_ENV]).expect("decode credential refs"),
+            credentials
+        );
+        assert_eq!(
+            serde_json::from_str::<BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>>(
+                &env[flotilla_resources::CREDENTIAL_SCOPES_ENV]
+            )
+            .expect("decode credential scopes"),
+            scopes
         );
     }
 

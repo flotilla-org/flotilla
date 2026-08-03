@@ -189,6 +189,7 @@ async fn generated_table_action_completes_work() {
             depends_on: vec![],
             repository_refs: None,
             credential_refs: Default::default(),
+            credential_scopes: Default::default(),
             crew: vec![],
         }],
     };

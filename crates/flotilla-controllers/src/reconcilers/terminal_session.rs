@@ -7,7 +7,7 @@ use flotilla_resources::{
     Convoy, ConvoyPhase, Environment, EnvironmentPhase, ReplicaReadResolver, ResourceBackend, ResourceError, ResourceObject,
     ResourceProvenance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
-    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, VESSEL_REF_LABEL,
+    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -195,6 +195,9 @@ where
             let credentials = serde_json::from_str::<std::collections::BTreeSet<String>>(encoded)
                 .map_err(|error| ResourceError::invalid(format!("invalid credential references: {error}")))?;
             tags.extend(credentials.into_iter().map(|credential| TerminalSessionTag::new(CREDENTIAL_REF_SESSION_TAG, credential)));
+        }
+        if let Some(encoded) = obj.metadata.annotations.get(CREDENTIAL_SCOPES_ANNOTATION) {
+            tags.push(TerminalSessionTag::new(CREDENTIAL_SCOPES_SESSION_TAG, encoded));
         }
         Ok(match self.runtime.ensure_session(&obj.metadata.name, &obj.spec, &tags).await {
             Ok(state) => TerminalDeps::Running(state),

@@ -19,7 +19,7 @@ use flotilla_resources::{
     Convoy, ConvoyPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta, ResourceBackend,
     ResourceError, ResourceObject, StatusPatch, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
     TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, VirtualClock, CONVOY_LABEL,
-    VESSEL_REF_LABEL,
+    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
 };
 
 mod common;
@@ -532,6 +532,10 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
     let input = InputMeta::builder()
         .name("term-a".to_string())
         .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "demo".to_string()), (VESSEL_REF_LABEL.to_string(), "demo-work".to_string())]))
+        .annotations(BTreeMap::from([(
+            CREDENTIAL_SCOPES_ANNOTATION.to_string(),
+            r#"{"github-app":["github.com-flotilla-org-flotilla"]}"#.to_string(),
+        )]))
         .build();
     let session = sessions
         .create(&input, &TerminalSessionSpec {
@@ -551,6 +555,10 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
     assert_eq!(runtime.tags.lock().expect("tags mutex").as_slice(), &[
         flotilla_resources::TerminalSessionTag::new("convoy", "demo"),
         flotilla_resources::TerminalSessionTag::new("vessel", "demo-work"),
+        flotilla_resources::TerminalSessionTag::new(
+            CREDENTIAL_SCOPES_SESSION_TAG,
+            r#"{"github-app":["github.com-flotilla-org-flotilla"]}"#,
+        ),
     ]);
 }
 

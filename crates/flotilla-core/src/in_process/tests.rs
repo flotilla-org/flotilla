@@ -1207,6 +1207,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
                         depends_on: Vec::new(),
                         repository_refs: None,
                         credential_refs: BTreeSet::new(),
+                        credential_scopes: BTreeMap::new(),
                         crew: Vec::new(),
                     },
                     VesselRequirement {
@@ -1215,6 +1216,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
                         depends_on: Vec::new(),
                         repository_refs: None,
                         credential_refs: BTreeSet::new(),
+                        credential_scopes: BTreeMap::new(),
                         crew: processes,
                     },
                 ],
@@ -6194,6 +6196,70 @@ async fn contained_workflow_grants_default_deny_and_admission_names_an_unheld_cr
         .expect_err("host without granted credential must be refused");
     assert!(error.contains("model-api"));
     assert!(error.contains("host-a"));
+}
+
+#[tokio::test]
+async fn credential_grant_repository_selector_becomes_the_vessel_credential_scope() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let granted_repository = RepositoryKey("github.com-flotilla-org-flotilla".to_string());
+    let other_repository = RepositoryKey("github.com-flotilla-org-other".to_string());
+    backend
+        .clone()
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&empty_input_meta("github-app"), &CredentialSpecSpec {
+            consumer: CredentialConsumer::GithubApp { installation_id: 123 },
+            source: CredentialSource::GithubApp {
+                app_id_path: "/host/github-app.id".to_string(),
+                private_key_path: "/host/github-app.pem".to_string(),
+            },
+            lifecycle: CredentialLifecycle::Refreshable,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("create credential declaration");
+    backend
+        .clone()
+        .definitions::<CredentialGrant>("flotilla")
+        .create(
+            &empty_input_meta("github-app-grant"),
+            &CredentialGrantSpec::builder()
+                .selector(
+                    CredentialGrantSelector::builder()
+                        .stance(Stance::Contained)
+                        .repositories(BTreeSet::from([granted_repository.clone()]))
+                        .build(),
+                )
+                .credentials(BTreeSet::from(["github-app".to_string()]))
+                .build(),
+        )
+        .await
+        .expect("create credential grant");
+    let repositories = [
+        (granted_repository.clone(), "https://github.com/flotilla-org/flotilla"),
+        (other_repository.clone(), "https://github.com/flotilla-org/other"),
+    ]
+    .into_iter()
+    .map(|(repo_ref, url)| {
+        ConvoyRepositorySpec::builder()
+            .url(url.to_string())
+            .repo_ref(repo_ref)
+            .source_ref("main".to_string())
+            .target_ref("main".to_string())
+            .workspace_slug("repo".to_string())
+            .subpaths(Vec::new())
+            .build()
+    })
+    .collect::<Vec<_>>();
+    let mut workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder().name("work".to_string()).stance(Stance::Contained).crew(Vec::new()).build()])
+        .build();
+
+    resolve_workflow_credentials(&backend, "flotilla", Some("project-a"), &repositories, &mut workflow)
+        .await
+        .expect("resolve credential grants");
+
+    assert_eq!(workflow.vessels[0].credential_refs, BTreeSet::from(["github-app".to_string()]));
+    assert_eq!(workflow.vessels[0].credential_scopes, BTreeMap::from([("github-app".to_string(), BTreeSet::from([granted_repository]))]));
 }
 
 #[tokio::test]
