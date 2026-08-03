@@ -44,7 +44,12 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
     // structured stream into that file.
     let stderr_layer = std::io::stderr().is_terminal().then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     let file_layer = tracing_subscriber::fmt::layer().json().with_ansi(false).with_writer(file_appender);
-    tracing_subscriber::registry().with(filter).with(stderr_layer).with(file_layer).try_init().ok();
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer)
+        .with(file_layer)
+        .try_init()
+        .map_err(|error| format!("initialize daemon logging: {error}"))?;
     raise_file_descriptor_limit();
 
     let timeout = if timeout_secs == 0 { Duration::from_secs(u64::MAX) } else { Duration::from_secs(timeout_secs) };
@@ -86,9 +91,11 @@ fn stable_socket_discovery_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::AsRawFd;
+    use std::{fs, os::fd::AsRawFd};
 
-    use tempfile::TempDir;
+    use flotilla_core::log_file::{rotating_log_writer, DAEMON_LOG_FILE};
+    use tempfile::{tempdir, TempDir};
+    use tracing_subscriber::{layer::SubscriberExt, Registry};
 
     use super::*;
 
@@ -112,5 +119,21 @@ mod tests {
 
         assert!(error.contains("another flotillad process holds the lifecycle lock"), "unexpected error: {error}");
         assert_eq!(std::fs::read_to_string(&socket_path).expect("live socket stand-in survives"), "owned by live daemon");
+    }
+
+    #[test]
+    fn structured_file_layer_writes_boot_record() {
+        let log_dir = tempdir().expect("log directory");
+        let writer = rotating_log_writer(log_dir.path(), DAEMON_LOG_FILE, 1024 * 1024, 1).expect("rotating log writer");
+        let file_layer = tracing_subscriber::fmt::layer().json().with_ansi(false).with_writer(writer);
+        let subscriber = Registry::default().with(file_layer);
+
+        tracing::subscriber::with_default(subscriber, || tracing::info!(repo_count = 0, "starting daemon"));
+
+        let contents = fs::read_to_string(log_dir.path().join(DAEMON_LOG_FILE)).expect("structured daemon log");
+        let record: serde_json::Value = serde_json::from_str(contents.trim()).expect("JSON log record");
+        assert_eq!(record["level"], "INFO");
+        assert_eq!(record["fields"]["message"], "starting daemon");
+        assert_eq!(record["fields"]["repo_count"], 0);
     }
 }
