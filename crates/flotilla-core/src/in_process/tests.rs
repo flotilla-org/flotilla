@@ -4684,7 +4684,7 @@ async fn direct_repository_admission_snapshots_its_resolved_default_branch() {
                 name: "direct-repository".to_string(),
                 workflow_ref: "scratch".to_string(),
                 inputs: Vec::new(),
-                repository_url: Some("https://github.com/flotilla-org/flotilla".to_string()),
+                repository_url: Some("https://GitHub.com/flotilla-org/flotilla.git".to_string()),
                 r#ref: Some("feature/direct".to_string()),
                 project_ref: None,
                 placement_policy: None,
@@ -4698,6 +4698,7 @@ async fn direct_repository_admission_snapshots_its_resolved_default_branch() {
         name: "direct-repository".to_string()
     });
     let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("direct-repository").await.expect("convoy");
+    assert_eq!(convoy.spec.repositories[0].url, "https://github.com/flotilla-org/flotilla");
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");
     assert_eq!(convoy.spec.repositories[0].target_ref, "main");
 }
@@ -4795,7 +4796,7 @@ async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource()
 
     assert_eq!(fixture.create_convoy().await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
     let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("convoy-adopted").await.expect("convoy should exist");
-    assert_eq!(convoy.spec.repositories.first().map(|repo| repo.url.as_str()), Some(ADOPTED_CHECKOUT_REMOTE));
+    assert_eq!(convoy.spec.repositories.first().map(|repo| repo.url.as_str()), Some("https://github.com/flotilla-org/flotilla"));
     assert_eq!(convoy.spec.r#ref.as_deref(), Some("main"));
     assert_eq!(convoy.spec.adopted_checkout_refs.values().next().map(String::as_str), Some("adopted-checkout-convoy-adopted"));
 

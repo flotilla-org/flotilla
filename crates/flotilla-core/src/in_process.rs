@@ -7873,6 +7873,12 @@ impl InProcessDaemon {
             } else if let Some(url) = direct_repository_url {
                 let resolved = async {
                     let repository_spec = self.resolve_repository_remote(&url).await?;
+                    let canonical_url = match repository_spec.identity() {
+                        flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
+                        flotilla_resources::RepositoryIdentity::Local { .. } => {
+                            return Err(format!("repository {url} did not resolve to a remote identity"));
+                        }
+                    };
                     let repo_ref = repository_spec.key();
                     let repository = flotilla_resources::ensure_repository(
                         &self.resource_backend.clone().using::<Repository>(&namespace),
@@ -7891,7 +7897,7 @@ impl InProcessDaemon {
                         .remove(&repo_ref)
                         .expect("repository slug should resolve");
                     Ok::<_, String>(vec![ConvoyRepositorySpec {
-                        url,
+                        url: canonical_url,
                         repo_ref,
                         source_ref: default_ref.clone(),
                         target_ref: default_ref,
