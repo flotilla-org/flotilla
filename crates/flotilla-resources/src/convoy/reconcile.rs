@@ -350,18 +350,26 @@ impl Reconciler for ConvoyReconciler {
     }
 }
 
+/// Test-support reconcile entry that carries no vessel, presentation, or
+/// checkout state. Settlement can therefore only be judged from the convoy
+/// record itself: a convoy expecting no checkouts (no placement
+/// `checkout_refs`, no adoptions) settles on claims alone, and any expected
+/// checkout holds settlement here because this path has no integration
+/// evidence to offer. Production callers go through `ConvoyReconciler`,
+/// which supplies the federated checkout list.
 pub fn reconcile(
     convoy: &ResourceObject<Convoy>,
     template: Option<&ResourceObject<WorkflowTemplate>>,
     now: DateTime<Utc>,
 ) -> ReconcileOutcome {
+    let no_change_request_outstanding = expected_checkout_refs(convoy).is_ok_and(|expected| expected.is_empty());
     let outcome = reconcile_internal(
         convoy,
         template,
         &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
-        LifecycleConditions { no_change_request_outstanding: true, reclaim_eligible: false },
+        LifecycleConditions { no_change_request_outstanding, reclaim_eligible: false },
         now,
     );
     ReconcileOutcome { patch: outcome.patch, events: outcome.events }

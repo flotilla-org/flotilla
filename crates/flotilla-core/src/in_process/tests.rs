@@ -6437,6 +6437,88 @@ async fn adopted_checkout_with_open_change_request_holds_settlement() {
 }
 
 #[tokio::test]
+async fn adopted_checkout_with_unlanded_change_request_refuses_reclaim_gate() {
+    // Gate-side twin of the settle-condition test above: the reclaim gate's
+    // adopted branch must refuse while an Adopted checkout's landed condition
+    // is not True, rather than the old warn-and-release semantics.
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/adopted-gate\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/adopted-gate..HEAD"], Ok("0\n".into()))
+        .on_run(
+            "gh",
+            &[
+                "pr",
+                "list",
+                "--head",
+                "feature/adopted-gate",
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName,mergeable",
+                "--limit",
+                "1",
+            ],
+            Ok("[]".into()),
+        )
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("1\n".into()))
+        .build();
+    let mut discovery = fake_discovery(false);
+    discovery.runner = Arc::new(runner);
+    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), discovery, HostName::local()).await;
+    daemon
+        .resource_backend()
+        .using::<Convoy>("flotilla")
+        .create(&empty_input_meta("adopted-gate-convoy"), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
+        .await
+        .expect("convoy create should succeed");
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let created = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("adopted-gate-open".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "adopted-gate-convoy".to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                r#ref: "feature/adopted-gate".to_string(),
+                path: "/repo".to_string(),
+                repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
+                host_ref: "host-01".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("create adopted checkout");
+    checkouts
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &ResourceCheckoutStatus {
+            phase: ResourceCheckoutPhase::Ready,
+            path: Some("/repo".to_string()),
+            commit: None,
+            branch_provenance: Default::default(),
+            integration: Default::default(),
+            message: None,
+        })
+        .await
+        .expect("adopted checkout should be ready");
+    record_expected_checkout_for_convoy(&daemon, "flotilla", "adopted-gate-convoy", "adopted-gate-open").await;
+
+    let error = daemon
+        .verify_convoy_teardown_gate("flotilla", "adopted-gate-convoy", false)
+        .await
+        .expect_err("unlanded adopted checkout must refuse reclaim");
+    assert!(error.contains("adopted-gate-open"), "refusal should name the adopted checkout: {error}");
+    assert!(error.contains("Landed=False"), "refusal should identify the landed condition: {error}");
+}
+
+#[tokio::test]
 async fn landing_holds_when_fresh_probe_contradicts_stale_vacuous_landed() {
     // #1163 replay: a checkout's landed condition was recorded True while the
     // branch was untouched ("nothing to land"), the crew then pushed and
