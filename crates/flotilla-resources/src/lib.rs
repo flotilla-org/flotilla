@@ -1,4 +1,5 @@
 mod backend;
+mod change_request;
 mod checkout;
 mod clock;
 mod clone;
@@ -37,6 +38,10 @@ mod watch;
 mod workflow_template;
 
 pub use backend::{ReplicaReadResolver, ReplicaWriter, ResourceBackend, TypedResolver};
+pub use change_request::{
+    change_request_record_name, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus,
+    ChangeRequestStatusPatch, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
+};
 pub use checkout::{
     ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus,
     CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, CheckoutWorktreeSpec, ConditionValue, FreshCloneCheckoutSpec,
@@ -77,8 +82,8 @@ pub use labels::{
     REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 pub use leaf::{
-    admit_leaf, evaluate_leaf, ConvoyLeafSubject, LeafEvaluation, LeafSubject, LeafValue, ThreeValue, VesselLeafSubject, WorkLeafSubject,
-    ADMITTED_LEAF_VOCABULARY,
+    admit_leaf, evaluate_leaf, ChangeRequestLeafSubject, ConvoyLeafSubject, LeafEvaluation, LeafSubject, LeafValue, ThreeValue,
+    VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
 };
 pub use material_pool::{
     MaterialPool, MaterialPoolLease, MaterialPoolSpec, MaterialPoolStatus, MaterialPoolStatusPatch, MaterialPoolUnitSpec,
@@ -139,6 +144,7 @@ pub use watch::{ResourceList, WatchEvent, WatchStart, WatchStream};
 macro_rules! for_each_registered_resource {
     ($callback:ident, $($argument:expr),* $(,)?) => {{
         $callback::<$crate::Checkout>($($argument),*);
+        $callback::<$crate::ChangeRequest>($($argument),*);
         $callback::<$crate::Clone>($($argument),*);
         $callback::<$crate::Convoy>($($argument),*);
         $callback::<$crate::CredentialGrant>($($argument),*);

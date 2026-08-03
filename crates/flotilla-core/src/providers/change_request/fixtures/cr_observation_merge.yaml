@@ -1,0 +1,13 @@
+interactions:
+- channel: command
+  cmd: gh
+  args: [pr, view, '1363', --repo, flotilla-org/flotilla, --json, 'state,headRefOid,statusCheckRollup,reviewDecision,mergeable']
+  cwd: /
+  stdout: '{"state":"OPEN","headRefOid":"abc123","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"reviewDecision":"APPROVED","mergeable":"MERGEABLE"}'
+  exit_code: 0
+- channel: command
+  cmd: gh
+  args: [pr, view, '1363', --repo, flotilla-org/flotilla, --json, 'state,headRefOid,statusCheckRollup,reviewDecision,mergeable']
+  cwd: /
+  stdout: '{"state":"MERGED","headRefOid":"abc123","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"reviewDecision":"APPROVED","mergeable":"UNKNOWN"}'
+  exit_code: 0

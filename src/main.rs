@@ -95,8 +95,8 @@ enum SubCommand {
         namespace: String,
         /// Require claim evidence observed at or after this RFC3339 instant
         ///
-        /// This slice has observation timestamps for work claim leaves only;
-        /// other leaves remain Unknown when a freshness demand is present.
+        /// Observation and claim leaves remain Unknown until their evidence
+        /// is at least this fresh.
         #[arg(long)]
         fresher_than: Option<chrono::DateTime<chrono::Utc>>,
         /// Maximum seconds to block

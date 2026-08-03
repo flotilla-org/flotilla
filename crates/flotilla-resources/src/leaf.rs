@@ -1,9 +1,9 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, time::Duration};
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafKind, LeafOperator};
 
-use crate::{Convoy, CrewWorkPhase, CrewWorkState, ResourceObject, Vessel, WorkState};
+use crate::{ChangeRequest, Convoy, CrewWorkPhase, CrewWorkState, ResourceObject, Vessel, WorkState};
 
 pub const ADMITTED_LEAF_VOCABULARY: &[(&str, &str)] = &[
     ("convoy", ".status.phase"),
@@ -11,6 +11,11 @@ pub const ADMITTED_LEAF_VOCABULARY: &[(&str, &str)] = &[
     ("work", ".status.phase"),
     ("work", ".latest-claim.disposition"),
     ("work", ".latest-claim.claimed-at"),
+    ("cr", ".state"),
+    ("cr", ".head-sha"),
+    ("cr", ".checks"),
+    ("cr", ".review.actionable-at-head"),
+    ("cr", ".mergeable"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +53,7 @@ pub struct LeafEvaluation {
 pub trait LeafSubject {
     fn kind(&self) -> LeafKind;
     fn value(&self, field_path: &str) -> Option<LeafValue>;
-    fn observed_at(&self) -> Option<DateTime<Utc>> {
+    fn observed_at(&self, _field_path: &str) -> Option<DateTime<Utc>> {
         None
     }
 }
@@ -84,7 +89,7 @@ pub fn evaluate_leaf(
     if subject.kind() != leaf.address.kind() {
         return Err(format!("leaf addresses {} but subject is {}", leaf.address.kind(), subject.kind()));
     }
-    if freshness_demand.is_some_and(|demand| subject.observed_at().is_none_or(|observed_at| observed_at < demand)) {
+    if freshness_demand.is_some_and(|demand| subject.observed_at(&leaf.field_path).is_none_or(|observed_at| observed_at < demand)) {
         return Ok(LeafEvaluation { result: ThreeValue::Unknown, value: None });
     }
     let Some(value) = subject.value(&leaf.field_path) else {
@@ -180,8 +185,71 @@ impl LeafSubject for WorkLeafSubject<'_> {
         }
     }
 
-    fn observed_at(&self) -> Option<DateTime<Utc>> {
+    fn observed_at(&self, _field_path: &str) -> Option<DateTime<Utc>> {
         self.latest_claim()?.finished_at
+    }
+}
+
+pub struct ChangeRequestLeafSubject<'a> {
+    pub change_request: &'a ResourceObject<ChangeRequest>,
+    pub now: DateTime<Utc>,
+    pub stale_after: Duration,
+}
+
+impl ChangeRequestLeafSubject<'_> {
+    fn field_observed_at(&self, field_path: &str) -> Option<DateTime<Utc>> {
+        let status = self.change_request.status.as_ref()?;
+        Some(match field_path {
+            ".state" => status.state.observed_at,
+            ".head-sha" => status.head_sha.observed_at,
+            ".checks" => status.checks.observed_at,
+            ".review.actionable-at-head" => status.review.actionable_at_head.observed_at,
+            ".mergeable" => status.mergeable.observed_at,
+            _ => return None,
+        })
+    }
+
+    fn is_fresh(&self, field_path: &str) -> bool {
+        self.field_observed_at(field_path)
+            .and_then(|observed_at| self.now.signed_duration_since(observed_at).to_std().ok())
+            .is_some_and(|age| age <= self.stale_after)
+    }
+}
+
+impl LeafSubject for ChangeRequestLeafSubject<'_> {
+    fn kind(&self) -> LeafKind {
+        LeafKind::ChangeRequest
+    }
+
+    fn value(&self, field_path: &str) -> Option<LeafValue> {
+        if !self.is_fresh(field_path) {
+            return None;
+        }
+        let status = self.change_request.status.as_ref()?;
+        let value = match field_path {
+            ".state" => match status.state.value? {
+                crate::ObservedChangeRequestState::Open => "open".to_string(),
+                crate::ObservedChangeRequestState::Merged => "merged".to_string(),
+                crate::ObservedChangeRequestState::Closed => "closed".to_string(),
+            },
+            ".head-sha" => status.head_sha.value.clone()?,
+            ".checks" => match status.checks.value? {
+                crate::ObservedChecks::Pass => "pass".to_string(),
+                crate::ObservedChecks::Fail => "fail".to_string(),
+                crate::ObservedChecks::Pending => "pending".to_string(),
+            },
+            ".review.actionable-at-head" => status.review.actionable_at_head.value?.to_string(),
+            ".mergeable" => match status.mergeable.value? {
+                crate::ObservedMergeability::Mergeable => "mergeable".to_string(),
+                crate::ObservedMergeability::Conflicting => "conflicting".to_string(),
+            },
+            _ => return None,
+        };
+        Some(LeafValue::Text(value))
+    }
+
+    fn observed_at(&self, field_path: &str) -> Option<DateTime<Utc>> {
+        self.field_observed_at(field_path)
     }
 }
 
@@ -204,7 +272,7 @@ mod tests {
             Some(LeafValue::Text("Landed".to_string()))
         }
 
-        fn observed_at(&self) -> Option<DateTime<Utc>> {
+        fn observed_at(&self, _field_path: &str) -> Option<DateTime<Utc>> {
             self.observed_at
         }
     }
@@ -241,5 +309,53 @@ mod tests {
         let error = admit_leaf(&leaf).expect_err("text ordering should be rejected");
         assert!(error.contains("operator `>` is not admitted"));
         assert!(error.contains("use `==` or `!=`"));
+    }
+
+    #[test]
+    fn stale_change_request_field_is_structurally_unknown() {
+        let observed_at = "2026-08-03T20:00:00Z".parse().expect("time");
+        let object = ResourceObject::<ChangeRequest> {
+            metadata: crate::ObjectMeta {
+                name: "cr".to_string(),
+                namespace: "flotilla".to_string(),
+                resource_version: "1".to_string(),
+                labels: Default::default(),
+                annotations: Default::default(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: observed_at,
+                merge: None,
+            },
+            spec: crate::ChangeRequestSpec::builder()
+                .service("github.com".to_string())
+                .scope("flotilla-org/flotilla".to_string())
+                .number(1363)
+                .observing_authority("feta".to_string())
+                .build(),
+            status: Some(crate::ChangeRequestStatus {
+                state: crate::Observation::known(crate::ObservedChangeRequestState::Merged, observed_at),
+                head_sha: crate::Observation::known("abc".to_string(), observed_at),
+                checks: crate::Observation::known(crate::ObservedChecks::Pass, observed_at),
+                review: crate::ChangeRequestReviewObservation { actionable_at_head: crate::Observation::known(false, observed_at) },
+                mergeable: crate::Observation::known(crate::ObservedMergeability::Mergeable, observed_at),
+            }),
+        };
+        let subject = ChangeRequestLeafSubject {
+            change_request: &object,
+            now: "2026-08-03T20:03:01Z".parse().expect("time"),
+            stale_after: Duration::from_secs(180),
+        };
+        let leaf = Leaf {
+            address: LeafAddress::ChangeRequest {
+                service: "github.com".to_string(),
+                scope: "flotilla-org/flotilla".to_string(),
+                number: 1363,
+            },
+            field_path: ".state".to_string(),
+            operator: LeafOperator::Equal,
+            literal: "merged".to_string(),
+        };
+        assert_eq!(evaluate_leaf(&leaf, Some(&subject), None).expect("evaluate").result, ThreeValue::Unknown);
     }
 }

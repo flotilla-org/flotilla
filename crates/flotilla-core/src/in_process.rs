@@ -2014,7 +2014,16 @@ impl InProcessDaemon {
         .await;
 
         let (fleet_replica_tx, _) = broadcast::channel(32);
-        let leaf_subscriptions = LeafSubscriptionTable::new(resource_backend.clone(), event_tx.clone());
+        let change_request_refresher = crate::change_request_observer::ChangeRequestRefresher::new(
+            resource_backend.clone(),
+            local_node_id.to_string(),
+            Arc::new(crate::change_request_observer::GhChangeRequestObservationSource::new(discovery.runner.clone())),
+            crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        );
+        if let Err(error) = change_request_refresher.garbage_collect_orphans().await {
+            tracing::warn!(%error, "garbage collect orphaned change request observations at startup failed");
+        }
+        let leaf_subscriptions = LeafSubscriptionTable::new(resource_backend.clone(), event_tx.clone(), change_request_refresher);
         let daemon = Arc::new_cyclic(|self_weak| Self {
             repos: RwLock::new(repos),
             repo_order: RwLock::new(order),

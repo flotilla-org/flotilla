@@ -82,8 +82,8 @@ impl ResourceStore {
         version
     }
 
-    fn push_event(&mut self, event: StoredEvent, retention: EventRetention) {
-        let excess = self.event_log.len().saturating_add(1).saturating_sub(retention.max_events_per_resource_stream());
+    fn push_event(&mut self, event: StoredEvent, max_events: usize) {
+        let excess = self.event_log.len().saturating_add(1).saturating_sub(max_events);
         if excess > 0 {
             if let Some(last_removed) = self.event_log.get(excess - 1) {
                 self.compacted_through = last_removed.version;
@@ -165,6 +165,19 @@ impl InMemoryBackend {
 
     fn store_key<T: Resource>(namespace: &str) -> StoreKey {
         (T::API_PATHS.group.to_string(), T::API_PATHS.version.to_string(), T::API_PATHS.plural.to_string(), namespace.to_string())
+    }
+
+    pub(crate) async fn local_namespaces_typed<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
+        let stores = self.stores.lock().await;
+        let mut namespaces = stores
+            .iter()
+            .filter(|(key, store)| {
+                key.0 == T::API_PATHS.group && key.1 == T::API_PATHS.version && key.2 == T::API_PATHS.plural && !store.objects.is_empty()
+            })
+            .map(|(key, _)| key.3.clone())
+            .collect::<Vec<_>>();
+        namespaces.sort();
+        Ok(namespaces)
     }
 
     fn clone_through_serde<T>(value: &T) -> Result<T, ResourceError>
@@ -479,7 +492,10 @@ impl InMemoryBackend {
 
             let encoded = Self::encode_object(&object)?;
             store.objects.insert(meta.name.clone(), encoded.clone());
-            store.push_event(StoredEvent { version, kind: StoredEventKind::Added, object: encoded }, self.event_retention);
+            store.push_event(
+                StoredEvent { version, kind: StoredEventKind::Added, object: encoded },
+                T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
+            );
             Ok(object)
         })
         .await
@@ -545,10 +561,16 @@ impl InMemoryBackend {
                 && object.metadata.finalizers.is_empty()
             {
                 store.objects.remove(&meta.name);
-                store.push_event(StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded }, self.event_retention);
+                store.push_event(
+                    StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded },
+                    T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
+                );
             } else {
                 store.objects.insert(meta.name.clone(), encoded.clone());
-                store.push_event(StoredEvent { version, kind: StoredEventKind::Modified, object: encoded }, self.event_retention);
+                store.push_event(
+                    StoredEvent { version, kind: StoredEventKind::Modified, object: encoded },
+                    T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
+                );
             }
             Ok(object)
         })
@@ -578,7 +600,10 @@ impl InMemoryBackend {
 
             let encoded = Self::encode_object(&object)?;
             store.objects.insert(name.to_string(), encoded.clone());
-            store.push_event(StoredEvent { version, kind: StoredEventKind::Modified, object: encoded }, self.event_retention);
+            store.push_event(
+                StoredEvent { version, kind: StoredEventKind::Modified, object: encoded },
+                T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
+            );
             Ok(object)
         })
         .await
@@ -597,13 +622,19 @@ impl InMemoryBackend {
                 object.metadata.deletion_timestamp = Some(Utc::now());
                 let encoded = Self::encode_object(&object)?;
                 store.objects.insert(name.to_string(), encoded.clone());
-                store.push_event(StoredEvent { version, kind: StoredEventKind::Modified, object: encoded }, self.event_retention);
+                store.push_event(
+                    StoredEvent { version, kind: StoredEventKind::Modified, object: encoded },
+                    T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
+                );
                 return Ok(());
             }
 
             let encoded = Self::encode_object(&object)?;
             store.objects.remove(name);
-            store.push_event(StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded }, self.event_retention);
+            store.push_event(
+                StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded },
+                T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
+            );
             Ok(())
         })
         .await
