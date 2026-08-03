@@ -174,6 +174,8 @@ fn integration_is_fresh(status: &CheckoutStatus, now: DateTime<Utc>, max_age: Du
     now.signed_duration_since(oldest_observation).to_std().is_ok_and(|age| age < max_age)
 }
 
+/// Terminal convoys keep the Landing TTL because teardown consumes the same
+/// fresh evidence and no longer probes a checkout on demand.
 fn convoy_needs_terminal_evidence(convoy: Option<&ResourceObject<Convoy>>) -> bool {
     convoy.and_then(|convoy| convoy.status.as_ref()).is_some_and(|status| {
         status.phase == ConvoyPhase::Landing || (status.phase.is_terminal() && status.phase != ConvoyPhase::Abandoned)
@@ -198,7 +200,7 @@ where
                     && (!integration_is_fresh(status, self.clock.now(), refresh_after)
                         || (terminal_evidence && checkout_observation_lacks_convoy_association(&status.integration))
                         || expected_change_request_id.as_ref().is_some_and(|expected| {
-                            status.integration.change_request.as_ref().map(|observed| &observed.id) != Some(expected)
+                            status.integration.change_request.as_ref().is_some_and(|observed| &observed.id != expected)
                         }))
             }) {
                 return Ok(match self.runtime.inspect_integration(obj, convoy.as_ref()).await {

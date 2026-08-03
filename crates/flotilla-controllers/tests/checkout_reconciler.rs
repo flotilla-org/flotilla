@@ -19,7 +19,8 @@ use flotilla_resources::{
     controller::{ControllerLoop, Reconciler},
     repo_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, ConditionValue,
     Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, FreshCloneCheckoutSpec, InMemoryBackend, InputMeta, IntegrationCondition, RepositoryKey,
-    ResourceBackend, ResourceError, ResourceObject, StatusPatch, VirtualClock, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    ResourceBackend, ResourceError, ResourceObject, StatusPatch, VirtualClock, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL,
+    CONVOY_LABEL,
 };
 use tokio::time::timeout;
 
@@ -439,4 +440,73 @@ async fn checkout_authority_observes_when_replicated_convoy_enters_landing() {
 
     assert!(matches!(deps, CheckoutDeps::Integration { .. }), "Landing must shorten the observation TTL to 30 seconds");
     assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 1, "only the checkout authority should probe its checkout");
+}
+
+#[tokio::test]
+async fn fresh_failed_change_request_lookup_waits_for_the_landing_ttl_before_retrying() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let now = chrono::DateTime::parse_from_rfc3339("2026-08-03T21:45:00Z").expect("timestamp").with_timezone(&chrono::Utc);
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    let convoy = convoys
+        .create(
+            &InputMeta::builder().name("convoy-a".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+    convoys
+        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Landing,
+            ..Default::default()
+        })
+        .await
+        .expect("mark convoy Landing");
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let checkout = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("checkout-a".to_string())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
+                    (CHANGE_REQUEST_ID_LABEL.to_string(), "42".to_string()),
+                ]))
+                .build(),
+            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-a".to_string(),
+                r#ref: "feature/a".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/a".to_string(),
+                url: REPO_URL.to_string(),
+            }),
+        )
+        .await
+        .expect("create checkout");
+    let failed_lookup = IntegrationCondition::builder()
+        .value(ConditionValue::Unknown)
+        .details(vec!["gh PR lookup failed".to_string()])
+        .observed_at(now.to_rfc3339())
+        .build();
+    checkouts
+        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Ready,
+            path: Some("/checkouts/a".to_string()),
+            integration: flotilla_resources::CheckoutIntegrationStatus {
+                clean: failed_lookup.clone(),
+                pushed: failed_lookup.clone(),
+                landed: failed_lookup,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("record failed lookup");
+
+    let runtime = Arc::new(RecordingCheckoutRuntime::default());
+    let reconciler = CheckoutReconciler::with_clock(runtime.clone(), backend, NAMESPACE, Arc::new(VirtualClock::new(now)));
+    let checkout = checkouts.get("checkout-a").await.expect("get checkout");
+    let deps = reconciler.fetch_dependencies(&checkout).await.expect("fetch dependencies");
+
+    assert!(matches!(deps, CheckoutDeps::None));
+    assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 0, "forge failures should be rate-limited by the TTL");
 }
