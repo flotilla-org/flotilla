@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fmt::Debug};
 
 use chrono::{DateTime, Utc};
+use facet::Facet;
 use flotilla_protocol::NodeId;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -12,6 +13,20 @@ use crate::{
 };
 
 macro_rules! define_resource {
+    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr, facet) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, facet::Facet)]
+        pub struct $name;
+
+        impl $crate::resource::Resource for $name {
+            type Spec = $spec;
+            type Status = $status;
+            type StatusPatch = $patch;
+
+            const API_PATHS: $crate::resource::ApiPaths =
+                $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
+            const REPLICATION_CLASS: $crate::ReplicationClass = $replication;
+        }
+    };
     ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, validate_spec_update = $validator:path) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name;
@@ -106,9 +121,10 @@ pub trait Resource: Send + Sync + 'static {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet)]
 pub struct OwnerReference {
     #[serde(rename = "apiVersion")]
+    #[facet(rename = "apiVersion")]
     pub api_version: String,
     pub kind: String,
     pub name: String,
@@ -116,7 +132,7 @@ pub struct OwnerReference {
 }
 
 /// One causally unique write in a definitions-class record.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Facet)]
 pub struct CausalDot {
     pub author_root: NodeId,
     pub author_counter: u64,
@@ -126,7 +142,7 @@ pub struct CausalDot {
 ///
 /// The field-local context keeps a later disjoint-field edit from
 /// accidentally resolving an existing conflict in this field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet)]
 pub struct FieldMergeMetadata {
     pub dot: CausalDot,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -135,15 +151,16 @@ pub struct FieldMergeMetadata {
 }
 
 /// One causally-maximal value shown when a definitions field conflicts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet)]
 pub struct MergeConflictSibling {
+    #[facet(opaque)]
     pub value: serde_json::Value,
     pub dot: CausalDot,
     pub written_at: DateTime<Utc>,
 }
 
 /// Store-authored causal metadata for a definitions-class object.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet)]
 pub struct MergeMetadata {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fields: BTreeMap<String, FieldMergeMetadata>,
@@ -203,7 +220,7 @@ impl InputMeta {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet)]
 pub struct ObjectMeta {
     pub name: String,
     pub namespace: String,
@@ -211,6 +228,7 @@ pub struct ObjectMeta {
     pub labels: BTreeMap<String, String>,
     pub annotations: BTreeMap<String, String>,
     #[serde(default, rename = "ownerReferences", skip_serializing_if = "Vec::is_empty")]
+    #[facet(rename = "ownerReferences")]
     pub owner_references: Vec<OwnerReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub finalizers: Vec<String>,
@@ -238,7 +256,8 @@ impl ObjectMeta {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Facet)]
+#[facet(where T::Spec: Facet<'static>, T::Status: Facet<'static>)]
 #[serde(bound(
     serialize = "T::Spec: Serialize, T::Status: Serialize",
     deserialize = "T::Spec: DeserializeOwned, T::Status: DeserializeOwned"

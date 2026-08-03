@@ -51,8 +51,9 @@ pub use view_address::ViewAddress;
 /// This is the routing key for peer discovery, vector clocks, replay cursors,
 /// and event attribution. `HostName` remains only for display metadata and
 /// legacy execution/path contexts that are not mesh identity.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, facet::Facet)]
 #[serde(transparent)]
+#[facet(transparent)]
 pub struct NodeId(String);
 
 impl NodeId {
@@ -72,7 +73,7 @@ impl fmt::Display for NodeId {
 }
 
 /// Stable reference to the human principal whose attention Flotilla may route.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, facet::Facet)]
 pub struct PrincipalRef {
     pub namespace: String,
     pub name: String,

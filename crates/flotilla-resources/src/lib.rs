@@ -77,8 +77,8 @@ pub use labels::{
     REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 pub use leaf::{
-    admit_leaf, evaluate_leaf, ConvoyLeafSubject, LeafEvaluation, LeafSubject, LeafValue, ThreeValue, VesselLeafSubject, WorkLeafSubject,
-    ADMITTED_LEAF_VOCABULARY,
+    admit_leaf, evaluate_leaf, ConvoyLeafSubject, FacetConvoyLeafSubject, LeafEvaluation, LeafSubject, LeafValue, ThreeValue,
+    VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
 };
 pub use material_pool::{
     MaterialPool, MaterialPoolLease, MaterialPoolSpec, MaterialPoolStatus, MaterialPoolStatusPatch, MaterialPoolUnitSpec,

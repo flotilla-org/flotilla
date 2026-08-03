@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
+use facet::Facet;
 use flotilla_protocol::{IssueRef, IssueState, PlacementDecision, PrincipalRef};
 use serde::{Deserialize, Serialize};
 
@@ -10,13 +11,13 @@ mod reconcile;
 
 pub use reconcile::{reconcile, ConvoyEvent, ConvoyReconciler, ConvoyTeardownRuntime, ReconcileOutcome};
 
-define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
+define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch, replication = ReplicationClass::HomeBoundRuntime, facet);
 
 pub const WORKFLOW_SNAPSHOT_ANNOTATION: &str = "flotilla.work/workflow-snapshot";
 pub const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapshot";
 pub const PREPARED_SNAPSHOT_PENDING_ANNOTATION: &str = "flotilla.work/prepared-snapshot-pending";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet, bon::Builder)]
 pub struct ConvoySpec {
     pub workflow_ref: String,
     #[builder(default)]
@@ -31,6 +32,7 @@ pub struct ConvoySpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repositories: Vec<ConvoyRepositorySpec>,
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    #[facet(rename = "ref")]
     pub r#ref: Option<String>,
     /// The [`Project`](crate::Project) whose repository set was snapshotted at admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,7 +101,7 @@ pub fn prepared_snapshot_pending(convoy: &crate::ResourceObject<Convoy>) -> bool
 /// Durable source-qualified issue context captured when a convoy is admitted.
 /// The reference remains stable if the Project later changes its Issue Source;
 /// the snapshot records exactly what the crew was asked to act on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet)]
 pub struct ConvoyIssue {
     pub reference: IssueRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,7 +109,7 @@ pub struct ConvoyIssue {
     pub snapshot: IssueSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet)]
 pub struct IssueSnapshot {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -118,14 +120,14 @@ pub struct IssueSnapshot {
     pub as_of: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet, bon::Builder)]
 pub struct BoundChangeRequest {
     pub id: String,
     pub repository_ref: RepositoryKey,
     pub title: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet, bon::Builder)]
 pub struct ConvoyRepositorySpec {
     pub url: String,
     pub repo_ref: RepositoryKey,
@@ -136,15 +138,17 @@ pub struct ConvoyRepositorySpec {
     pub subpaths: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet)]
+#[repr(C)]
 #[serde(untagged)]
+#[facet(untagged)]
 pub enum InputValue {
     // Keep inputs untagged so today's plain strings serialize naturally while leaving room
     // for future structured input sources without changing the field shape.
     String(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet, Default)]
 pub struct ConvoyStatus {
     pub phase: ConvoyPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,7 +181,7 @@ pub struct ConvoyStatus {
     pub target_mismatches: Vec<TargetMismatch>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet, bon::Builder)]
 pub struct TargetMismatch {
     pub repo_ref: RepositoryKey,
     pub change_request_id: String,
@@ -185,12 +189,13 @@ pub struct TargetMismatch {
     pub observed_target_ref: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet)]
 pub struct WorkflowSnapshot {
     pub vessels: Vec<VesselRequirement>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Facet, Default)]
+#[repr(u8)]
 pub enum ConvoyPhase {
     #[default]
     Pending,
@@ -210,7 +215,7 @@ impl ConvoyPhase {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet, bon::Builder)]
 pub struct WorkState {
     pub phase: WorkPhase,
     /// A human explicitly completed this vessel's work at the roll-up level.
@@ -230,7 +235,8 @@ pub struct WorkState {
     pub placement: Option<PlacementStatus>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Facet)]
+#[repr(u8)]
 pub enum WorkPhase {
     Pending,
     Ready,
@@ -249,7 +255,8 @@ impl WorkPhase {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Facet, Default)]
+#[repr(u8)]
 pub enum WorkCompletionAuthority {
     #[default]
     CrewRollup,
@@ -262,7 +269,7 @@ impl WorkCompletionAuthority {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet, bon::Builder)]
 pub struct CrewWorkState {
     pub phase: CrewWorkPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,7 +282,8 @@ pub struct CrewWorkState {
     pub disposition: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Facet, Default)]
+#[repr(u8)]
 pub enum CrewWorkPhase {
     #[default]
     Pending,
@@ -286,9 +294,10 @@ pub enum CrewWorkPhase {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet, Default)]
 pub struct PlacementStatus {
     #[serde(flatten)]
+    #[facet(flatten, opaque)]
     pub fields: BTreeMap<String, serde_json::Value>,
 }
 

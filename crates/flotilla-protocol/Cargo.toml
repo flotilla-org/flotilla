@@ -9,6 +9,7 @@ default = []
 test-support = []
 
 [dependencies]
+facet = "0.46.5"
 base64 = "0.22"
 bon = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["serde"] }

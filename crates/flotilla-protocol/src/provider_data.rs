@@ -1,6 +1,7 @@
 use std::{cmp::Ordering, path::PathBuf};
 
 use chrono::{DateTime, Utc};
+use facet::Facet;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -98,13 +99,13 @@ impl std::fmt::Display for ChangeRequestStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Facet)]
 pub struct IssueSource {
     pub service: String,
     pub scope: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Facet)]
 pub struct IssueRef {
     pub source: IssueSource,
     pub id: String,
@@ -125,8 +126,10 @@ impl IssueRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Facet)]
+#[repr(u8)]
 #[serde(rename_all = "snake_case")]
+#[facet(rename_all = "snake_case")]
 pub enum IssueState {
     Open,
     Closed,

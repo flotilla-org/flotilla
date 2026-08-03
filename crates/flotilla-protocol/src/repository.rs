@@ -1,5 +1,6 @@
 //! Portable repository identity types shared by resources and query scopes.
 
+use facet::Facet;
 use serde::{Deserialize, Serialize};
 
 pub const UNKNOWN_REPOSITORY_LABEL: &str = "Unknown repository";
@@ -28,8 +29,9 @@ pub struct RepositoryUpstream {
 ///
 /// The key is opaque on the wire. Its derivation and referent verification
 /// remain owned by `flotilla-resources`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Facet)]
 #[serde(transparent)]
+#[facet(transparent)]
 pub struct RepositoryKey(pub String);
 
 impl std::fmt::Display for RepositoryKey {

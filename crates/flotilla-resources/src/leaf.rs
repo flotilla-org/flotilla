@@ -1,6 +1,9 @@
 use std::cmp::Ordering;
 
 use chrono::{DateTime, Utc};
+use facet::Peek;
+#[cfg(test)]
+use facet::{Def, Shape, Type, UserType};
 use flotilla_protocol::{Leaf, LeafKind, LeafOperator};
 
 use crate::{Convoy, CrewWorkPhase, CrewWorkState, ResourceObject, Vessel, WorkState};
@@ -136,6 +139,65 @@ impl LeafSubject for ConvoyLeafSubject<'_> {
     }
 }
 
+/// Spike-only descriptor-backed Convoy subject. The handwritten
+/// [`ConvoyLeafSubject`] remains the active implementation used by core.
+pub struct FacetConvoyLeafSubject<'a>(pub &'a ResourceObject<Convoy>);
+
+impl LeafSubject for FacetConvoyLeafSubject<'_> {
+    fn kind(&self) -> LeafKind {
+        LeafKind::Convoy
+    }
+
+    fn value(&self, field_path: &str) -> Option<LeafValue> {
+        let value = facet_value_at_path(Peek::new(self.0), field_path)?;
+        let variant = value.into_enum().ok()?.active_variant().ok()?;
+        Some(LeafValue::Text(variant.rename.unwrap_or(variant.name).to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
+enum FacetComparableType {
+    Text,
+}
+
+fn facet_value_at_path<'mem, 'facet>(mut value: Peek<'mem, 'facet>, field_path: &str) -> Option<Peek<'mem, 'facet>> {
+    for segment in field_path.strip_prefix('.')?.split('.') {
+        if let Ok(option) = value.into_option() {
+            value = option.value()?;
+        }
+        let structure = value.into_struct().ok()?;
+        let index = structure.ty().fields.iter().position(|field| field.rename.unwrap_or(field.name) == segment)?;
+        value = structure.field(index).ok()?;
+    }
+    if let Ok(option) = value.into_option() {
+        value = option.value()?;
+    }
+    Some(value)
+}
+
+#[cfg(test)]
+fn facet_schema_at_path(mut shape: &'static Shape, field_path: &str) -> Option<FacetComparableType> {
+    for segment in field_path.strip_prefix('.')?.split('.') {
+        if let Def::Option(option) = shape.def {
+            shape = option.t();
+        }
+        let Type::User(UserType::Struct(structure)) = shape.ty else {
+            return None;
+        };
+        shape = structure.fields.iter().find(|field| field.rename.unwrap_or(field.name) == segment)?.shape();
+    }
+    if let Def::Option(option) = shape.def {
+        shape = option.t();
+    }
+    match shape.ty {
+        Type::User(UserType::Enum(enumeration)) if enumeration.variants.iter().all(|variant| variant.data.fields.is_empty()) => {
+            Some(FacetComparableType::Text)
+        }
+        _ => None,
+    }
+}
+
 pub struct VesselLeafSubject<'a>(pub &'a ResourceObject<Vessel>);
 
 impl LeafSubject for VesselLeafSubject<'_> {
@@ -187,6 +249,7 @@ impl LeafSubject for WorkLeafSubject<'_> {
 
 #[cfg(test)]
 mod tests {
+    use facet::{Facet, Type, UserType};
     use flotilla_protocol::LeafAddress;
 
     use super::*;
@@ -241,5 +304,108 @@ mod tests {
         let error = admit_leaf(&leaf).expect_err("text ordering should be rejected");
         assert!(error.contains("operator `>` is not admitted"));
         assert!(error.contains("use `==` or `!=`"));
+    }
+
+    #[test]
+    fn facet_convoy_subject_matches_the_active_handwritten_subject() {
+        let timestamp = "2026-08-03T20:00:00Z".parse().expect("timestamp");
+        let mut object = ResourceObject {
+            metadata: crate::ObjectMeta {
+                name: "demo".to_string(),
+                namespace: "flotilla".to_string(),
+                resource_version: "1".to_string(),
+                labels: Default::default(),
+                annotations: Default::default(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: timestamp,
+                merge: None,
+            },
+            spec: crate::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+            status: None,
+        };
+        object.status = Some(crate::ConvoyStatus { phase: crate::ConvoyPhase::Landing, ..Default::default() });
+
+        let handwritten = ConvoyLeafSubject(&object);
+        let descriptor_backed = FacetConvoyLeafSubject(&object);
+        assert_eq!(descriptor_backed.value(".status.phase"), handwritten.value(".status.phase"));
+        assert_eq!(descriptor_backed.value(".status.nope"), None);
+    }
+
+    #[test]
+    fn facet_shape_validates_a_comparable_path_without_a_value() {
+        let shape = <ResourceObject<Convoy> as Facet>::SHAPE;
+        assert_eq!(facet_schema_at_path(shape, ".status.phase"), Some(FacetComparableType::Text));
+        assert_eq!(facet_schema_at_path(shape, ".status.nope"), None);
+        assert_eq!(facet_schema_at_path(shape, ".spec.workflow_ref"), None);
+    }
+
+    #[test]
+    fn facet_attributes_match_serde_names_and_shapes() {
+        assert_struct_field_rename::<crate::ConvoySpec>("ref", "ref");
+        assert_struct_field_rename::<crate::ObjectMeta>("owner_references", "ownerReferences");
+        assert_struct_field_rename::<crate::OwnerReference>("api_version", "apiVersion");
+        assert_struct_field_rename::<flotilla_protocol::PlacementTargetHost>("reference", "ref");
+        assert_enum_variant_rename::<flotilla_protocol::IssueState>("Open", "open");
+        assert_enum_variant_rename::<crate::Stance>("WorkspaceWrite", "workspace-write");
+
+        let spec = crate::ConvoySpec::builder().workflow_ref("workflow".to_string()).r#ref("branch".to_string()).build();
+        let spec_json = serde_json::to_value(spec).expect("serialize ConvoySpec");
+        assert_eq!(spec_json.get("ref"), Some(&serde_json::json!("branch")));
+        let metadata = crate::ObjectMeta {
+            name: "demo".to_string(),
+            namespace: "flotilla".to_string(),
+            resource_version: "1".to_string(),
+            labels: Default::default(),
+            annotations: Default::default(),
+            owner_references: vec![crate::OwnerReference {
+                api_version: "flotilla.work/v1".to_string(),
+                kind: "Convoy".to_string(),
+                name: "parent".to_string(),
+                controller: true,
+            }],
+            finalizers: Vec::new(),
+            deletion_timestamp: None,
+            creation_timestamp: "2026-08-03T20:00:00Z".parse().expect("timestamp"),
+            merge: None,
+        };
+        let metadata_json = serde_json::to_value(metadata).expect("serialize ObjectMeta");
+        assert_eq!(metadata_json["ownerReferences"][0]["apiVersion"], serde_json::json!("flotilla.work/v1"));
+        let target =
+            flotilla_protocol::PlacementTargetHost::builder().reference("host-a".to_string()).display_name("Host A".to_string()).build();
+        let target_json = serde_json::to_value(target).expect("serialize PlacementTargetHost");
+        assert_eq!(target_json.get("ref"), Some(&serde_json::json!("host-a")));
+        assert_eq!(serde_json::to_value(flotilla_protocol::IssueState::Open).expect("serialize IssueState"), serde_json::json!("open"));
+        assert_eq!(serde_json::to_value(crate::Stance::WorkspaceWrite).expect("serialize Stance"), serde_json::json!("workspace-write"));
+
+        let Type::User(UserType::Struct(placement)) = <crate::PlacementStatus as Facet>::SHAPE.ty else {
+            panic!("PlacementStatus should have a struct shape");
+        };
+        assert!(placement.fields.iter().find(|field| field.name == "fields").expect("fields shape").is_flattened());
+        assert!(<crate::InputValue as Facet>::SHAPE.is_untagged());
+
+        let placement = crate::PlacementStatus { fields: [("host".to_string(), serde_json::json!("host-a"))].into() };
+        assert_eq!(serde_json::to_value(placement).expect("serialize PlacementStatus"), serde_json::json!({ "host": "host-a" }));
+        assert_eq!(
+            serde_json::to_value(crate::InputValue::String("value".to_string())).expect("serialize InputValue"),
+            serde_json::json!("value")
+        );
+    }
+
+    fn assert_struct_field_rename<T: for<'facet> Facet<'facet>>(rust_name: &str, serialized_name: &str) {
+        let Type::User(UserType::Struct(structure)) = T::SHAPE.ty else {
+            panic!("expected struct shape");
+        };
+        let field = structure.fields.iter().find(|field| field.name == rust_name).expect("field shape");
+        assert_eq!(field.rename.unwrap_or(field.name), serialized_name);
+    }
+
+    fn assert_enum_variant_rename<T: for<'facet> Facet<'facet>>(rust_name: &str, serialized_name: &str) {
+        let Type::User(UserType::Enum(enumeration)) = T::SHAPE.ty else {
+            panic!("expected enum shape");
+        };
+        let variant = enumeration.variants.iter().find(|variant| variant.name == rust_name).expect("variant shape");
+        assert_eq!(variant.rename.unwrap_or(variant.name), serialized_name);
     }
 }

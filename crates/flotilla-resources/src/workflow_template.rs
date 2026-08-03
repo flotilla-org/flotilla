@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use facet::Facet;
 use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::NoStatusPatch, RepositoryKey};
@@ -21,7 +22,7 @@ pub struct InputDefinition {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet, bon::Builder)]
 pub struct VesselRequirement {
     pub name: String,
     #[builder(default)]
@@ -67,8 +68,10 @@ impl VesselRequirement {
 }
 
 /// The minimum isolation guarantee required while a vessel runs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Facet)]
+#[repr(u8)]
 #[serde(rename_all = "kebab-case")]
+#[facet(rename_all = "kebab-case")]
 pub enum Stance {
     #[default]
     Trusted,
@@ -86,18 +89,21 @@ impl std::fmt::Display for Stance {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet, bon::Builder)]
 pub struct CrewSpec {
     pub role: String,
     #[serde(flatten)]
+    #[facet(flatten)]
     pub source: CrewSource,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet)]
+#[repr(C)]
 #[serde(untagged, deny_unknown_fields)]
+#[facet(untagged, deny_unknown_fields)]
 pub enum CrewSource {
     Agent {
         selector: Selector,
@@ -111,7 +117,7 @@ pub enum CrewSource {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Facet)]
 pub struct Selector {
     pub capability: String,
 }
