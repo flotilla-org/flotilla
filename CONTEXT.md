@@ -501,11 +501,19 @@ claims.
 _Avoid_: Fact (histories are evidence — ADR 0023), event.
 
 **Condition Leaf**:
-One atomic predicate over the machine, **Settlement Claims**, or
-**Observations** — a
-single comparison, no connectives. `wait` ORs leaves; all other composition
-(AND, loops, budgets) lives in the caller's own language. Named definitions
-are layered data, not new objects.
+One serializable, three-valued comparison against one stored record:
+`(record address, field path, operator, bound literal)` evaluating to
+True, False, or Unknown — over the machine, **Settlement Claims**, or
+**Observations**. Unknown is structural (absent record, Unknown
+observation, or staler than the demanded freshness) and triggers nothing.
+Cross-record references (a claim's timestamp for postdating, a prior head
+SHA) are **bound at subscription time** and frozen into the row as
+literals — evaluation stays single-record and pure. The admitted path
+vocabulary is closed: an unknown path is a loud admission error, never
+Unknown-forever. No connectives; `wait` ORs leaves; all other composition
+(AND, loops, budgets) lives in the caller's own language. Named
+definitions are layered data, not new objects. (Ruled in the #1322 grill,
+2026-08-03.)
 _Avoid_: Rule (that is a leaf bound to a wake or crew turn), expression
 language.
 
