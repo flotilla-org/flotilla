@@ -690,6 +690,7 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
                 delta.changes.removed_len()
             )
         }
+        DaemonEvent::LeafFired(fire) => format!("[leaf]      {} fired (value: {})", fire.leaf, fire.value),
     }
 }
 
@@ -708,7 +709,8 @@ fn event_stream_seq(event: &DaemonEvent) -> Option<(StreamKey, u64)> {
         | DaemonEvent::CommandStarted { .. }
         | DaemonEvent::CommandFinished { .. }
         | DaemonEvent::CommandStepUpdate { .. }
-        | DaemonEvent::PeerStatusChanged { .. } => None,
+        | DaemonEvent::PeerStatusChanged { .. }
+        | DaemonEvent::LeafFired(_) => None,
     }
 }
 

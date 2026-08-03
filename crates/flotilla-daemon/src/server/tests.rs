@@ -1557,6 +1557,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
             action: CommandAction::CrewComplete {
                 context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
                 message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
+                disposition: None,
             },
         })
         .await
@@ -1579,6 +1580,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
             action: CommandAction::CrewComplete {
                 context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
                 message: Some("https://github.com/flotilla-org/flotilla/pull/1301".into()),
+                disposition: None,
             },
         })
         .await
@@ -1640,6 +1642,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
             action: CommandAction::CrewComplete {
                 context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
                 message: Some("https://github.com/flotilla-org/flotilla/pull/1302".into()),
+                disposition: None,
             },
         })
         .await

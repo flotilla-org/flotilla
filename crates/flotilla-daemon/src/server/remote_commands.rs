@@ -46,6 +46,7 @@ pub(super) struct PendingCrewCompletionRoute {
     session_name: String,
     context: CrewCommandContext,
     message: Option<String>,
+    disposition: Option<String>,
     authority: Option<HostName>,
 }
 
@@ -968,8 +969,8 @@ impl RemoteStepExecutor for RemoteCommandRouter {
 
 impl RemoteCommandRouter {
     async fn resolve_crew_command_routing(&self, action: &mut CommandAction) -> Result<Option<PendingCrewCompletionRoute>, String> {
-        let (context, completion_message) = match action {
-            CommandAction::CrewComplete { context, message } => (context, Some(message.clone())),
+        let (context, completion) = match action {
+            CommandAction::CrewComplete { context, message, disposition } => (context, Some((message.clone(), disposition.clone()))),
             CommandAction::CrewFail { context, .. }
             | CommandAction::CrewHandoff { context, .. }
             | CommandAction::QueryCrewList { context } => (context, None),
@@ -977,7 +978,7 @@ impl RemoteCommandRouter {
         };
         let routing = self.daemon.resolve_crew_routing_context(context).await?;
         *context = routing.command_context.clone();
-        let Some(message) = completion_message else { return Ok(None) };
+        let Some((message, disposition)) = completion else { return Ok(None) };
         let Some(session_name) = routing.session_name else { return Ok(None) };
         Ok(Some(PendingCrewCompletionRoute {
             namespace: context.namespace.clone().expect("resolved crew context has namespace"),
@@ -985,6 +986,7 @@ impl RemoteCommandRouter {
             session_name,
             context: context.clone(),
             message,
+            disposition,
             authority: None,
         }))
     }
@@ -996,6 +998,7 @@ impl RemoteCommandRouter {
     async fn persist_crew_completion(&self, completion: &PendingCrewCompletionRoute, authority: &HostName, last_error: &str) {
         let pending = CrewCompletionPending {
             message: completion.message.clone(),
+            disposition: completion.disposition.clone(),
             attempted_at: chrono::Utc::now(),
             authority: authority.to_string(),
             last_error: last_error.to_string(),
@@ -1043,6 +1046,7 @@ impl RemoteCommandRouter {
                     action: CommandAction::CrewComplete {
                         context: state.completion.context.clone(),
                         message: state.completion.message.clone(),
+                        disposition: state.completion.disposition.clone(),
                     },
                 };
                 if router.dispatch_execute_for_principal(command, None).await.is_ok() {
@@ -1073,6 +1077,7 @@ impl RemoteCommandRouter {
                 session_name,
                 context,
                 message: pending.message,
+                disposition: pending.disposition,
                 authority: Some(HostName::new(pending.authority)),
             });
         }

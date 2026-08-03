@@ -18,10 +18,11 @@ use super::{attach_excursions::AttachExcursions, remote_commands::RemoteCommandR
 /// for other queries are not relayed to the connection.
 pub(super) type QuerySubscriptions = Arc<RwLock<HashSet<QueryId>>>;
 
-fn event_subscribed(event: &DaemonEvent, subscriptions: &QuerySubscriptions) -> bool {
+fn event_subscribed(event: &DaemonEvent, subscriptions: &QuerySubscriptions, session_id: uuid::Uuid) -> bool {
     let query = match event {
         DaemonEvent::ResultSet(result_set) => result_set.query(),
         DaemonEvent::ResultDelta(delta) => delta.query(),
+        DaemonEvent::LeafFired(fire) => return fire.watcher_id == session_id,
         _ => return true,
     };
     subscriptions.read().expect("query subscriptions lock poisoned").contains(&query)
@@ -91,7 +92,7 @@ impl ClientConnection {
             loop {
                 match event_rx.recv().await {
                     Ok(event) => {
-                        if !event_subscribed(&event, &event_subscriptions) {
+                        if !event_subscribed(&event, &event_subscriptions, session_id) {
                             continue;
                         }
                         let msg = Message::Event { event: Box::new(event) };
@@ -123,6 +124,7 @@ impl ClientConnection {
         event_task.abort();
         self.attach_excursions.finish_all().await;
         self.daemon.unsubscribe_queries(session_id).await;
+        self.daemon.unsubscribe_waits(session_id).await;
         if let Err(error) = self.daemon.disconnect_surface(session_id).await {
             warn!(%error, "failed to disconnect client surface");
         }

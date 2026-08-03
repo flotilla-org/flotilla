@@ -447,6 +447,8 @@ pub enum CommandAction {
         context: CrewCommandContext,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disposition: Option<String>,
     },
     CrewFail {
         context: CrewCommandContext,
@@ -1045,6 +1047,7 @@ mod tests {
                 action: CommandAction::CrewComplete {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     message: Some("ready for review".into()),
+                    disposition: Some("changes-pushed".into()),
                 },
             },
             Command {

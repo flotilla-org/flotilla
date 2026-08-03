@@ -2106,6 +2106,7 @@ mod tests {
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
         session.status.as_mut().expect("running status").completion_pending = Some(flotilla_resources::CrewCompletionPending {
             message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
+            disposition: None,
             attempted_at: Utc::now(),
             authority: "kiwi".into(),
             last_error: "authority unreachable for convoy-a".into(),

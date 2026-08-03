@@ -56,11 +56,13 @@ fn test_context(
     pending: &SharedPending,
     next_id: &Arc<AtomicU64>,
 ) -> EventContext {
+    let (wait_event_tx, _) = broadcast::channel(1);
     EventContext::builder()
         .local_seqs(Arc::clone(local_seqs))
         .subscribed_queries(Arc::clone(subscribed_queries))
         .recovering(Arc::clone(recovering))
         .event_tx(event_tx.downgrade())
+        .wait_event_tx(wait_event_tx.downgrade())
         .session(Arc::clone(session))
         .pending(Arc::clone(pending))
         .next_id(Arc::clone(next_id))

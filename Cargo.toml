@@ -65,3 +65,4 @@ serde_yml = "0.0.12"
 libc = "0.2"
 uuid = { version = "1", features = ["v4"] }
 humantime = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

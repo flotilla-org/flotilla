@@ -1860,6 +1860,7 @@ impl App {
                     }
                 }
             }
+            DaemonEvent::LeafFired(_) => {}
         }
     }
 

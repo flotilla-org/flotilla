@@ -162,6 +162,11 @@ impl<'a> RequestDispatcher<'a> {
                 Err(error) => Message::error_response(id, error),
             },
 
+            Request::SubscribeWait { subscription } => match self.daemon.subscribe_wait(self.session_id, subscription).await {
+                Ok(subscription_id) => Message::ok_response(id, Response::WaitSubscribed { subscription_id }),
+                Err(error) => Message::error_response(id, error),
+            },
+
             Request::BeginAttachExcursion { excursion_id, cleanup_actions } => {
                 match self.attach_excursions.begin(excursion_id, cleanup_actions).await {
                     Ok(()) => Message::ok_response(id, Response::BeginAttachExcursion),

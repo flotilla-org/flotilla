@@ -190,7 +190,7 @@ fn work_state(phase: WorkPhase, started_at: Option<DateTime<Utc>>, finished_at: 
 }
 
 fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> CrewWorkState {
-    CrewWorkState { phase, started_at, finished_at, message: None }
+    CrewWorkState { phase, started_at, finished_at, message: None, disposition: None }
 }
 
 fn active_convoy_status() -> ConvoyStatus {
@@ -511,6 +511,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     role: "coder".to_string(),
                     finished_at: ts(30),
                     message: Some("still complete".to_string()),
+                    disposition: None,
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, crew_timestamps(&status))
@@ -903,6 +904,7 @@ fn settling_again_after_a_continuation_records_the_new_outcome_time() {
                     role: "coder".to_string(),
                     finished_at: ts(30),
                     message: Some("addressed".to_string()),
+                    disposition: None,
                 };
                 apply_and_replay(&mut status, &resettle);
                 (before, crew_timestamps(&status))

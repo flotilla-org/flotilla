@@ -7,6 +7,7 @@ pub mod framing;
 mod host;
 mod host_summary;
 pub mod issue_query;
+pub mod leaf;
 mod lifecycle;
 pub mod output;
 pub mod path_context;
@@ -35,6 +36,7 @@ pub use host_summary::{
     DiscoveryFact, HostEnvironment, HostProviderStatus, HostSnapshot, HostSummary, NodeInfo, SystemInfo, ToolInventory,
     AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
+pub use leaf::{Leaf, LeafAddress, LeafFire, LeafKind, LeafOperator, WaitSubscriptionRequest};
 pub use lifecycle::LifecycleAuthority;
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
@@ -276,6 +278,10 @@ pub enum Request {
     ObserveFocus {
         targets: Vec<ResourceRef>,
     },
+    /// Register an ephemeral, connection-owned OR-set of condition leaves.
+    SubscribeWait {
+        subscription: WaitSubscriptionRequest,
+    },
     /// Register teardown for an interactive attach before launching it. The
     /// actions are ordered innermost-to-outermost and belong to this socket
     /// connection until finished.
@@ -316,6 +322,9 @@ pub enum Response {
     SubscribeQueries(Vec<DaemonEvent>),
     FetchMore,
     ObserveFocus,
+    WaitSubscribed {
+        subscription_id: uuid::Uuid,
+    },
     BeginAttachExcursion,
     FinishAttachExcursion,
     GetStatus(StatusResponse),
@@ -449,6 +458,9 @@ pub enum DaemonEvent {
     /// Incremental result-set update for a subscribed named query.
     #[serde(rename = "result_delta")]
     ResultDelta(Box<ResultDelta>),
+    /// One leaf in a connection-owned wait subscription evaluated true.
+    #[serde(rename = "leaf_fired")]
+    LeafFired(LeafFire),
 }
 
 /// Peer connection state as seen by the TUI.

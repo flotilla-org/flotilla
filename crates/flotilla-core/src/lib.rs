@@ -17,6 +17,7 @@ pub mod host_identity;
 pub(crate) mod host_registry;
 pub mod host_summary;
 pub mod in_process;
+pub mod leaf_engine;
 pub mod log_file;
 pub mod merge;
 pub mod model;

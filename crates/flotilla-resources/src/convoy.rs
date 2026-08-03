@@ -271,6 +271,8 @@ pub struct CrewWorkState {
     pub finished_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -371,6 +373,7 @@ pub enum ConvoyStatusPatch {
         role: String,
         finished_at: DateTime<Utc>,
         message: Option<String>,
+        disposition: Option<String>,
     },
     MarkCrewFailed {
         vessel: String,
@@ -563,15 +566,20 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.message = Some(reason.clone());
                 }
             }
-            Self::MarkCrewCompleted { vessel, role, finished_at, message } => {
+            Self::MarkCrewCompleted { vessel, role, finished_at, message, disposition } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     // Duplicate settlement is sticky; changing the settled outcome records its own time.
-                    if state.phase != CrewWorkPhase::Done {
+                    if state.phase != CrewWorkPhase::Done
+                        || disposition.as_ref().is_some_and(|disposition| state.disposition.as_ref() != Some(disposition))
+                    {
                         state.finished_at = None;
                     }
                     state.phase = CrewWorkPhase::Done;
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = message.clone();
+                    if disposition.is_some() {
+                        state.disposition = disposition.clone();
+                    }
                 }
                 enter_landing_if_completion_claims_settled(status);
             }
@@ -753,8 +761,14 @@ pub mod external_patches {
         ConvoyStatusPatch::MarkConvoyAbandoned { finished_at, authority, reason }
     }
 
-    pub fn mark_crew_completed(vessel: String, role: String, finished_at: DateTime<Utc>, message: Option<String>) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::MarkCrewCompleted { vessel, role, finished_at, message }
+    pub fn mark_crew_completed(
+        vessel: String,
+        role: String,
+        finished_at: DateTime<Utc>,
+        message: Option<String>,
+        disposition: Option<String>,
+    ) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::MarkCrewCompleted { vessel, role, finished_at, message, disposition }
     }
 
     pub fn mark_crew_failed(vessel: String, role: String, finished_at: DateTime<Utc>, message: String) -> ConvoyStatusPatch {
