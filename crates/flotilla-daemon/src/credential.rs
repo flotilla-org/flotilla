@@ -290,7 +290,10 @@ impl CredentialStore {
                     runner
                         .run_with_input(
                             "sh",
-                            &["-c", "IFS= read -r token; GH_TOKEN=\"$token\" gh api user --silent"],
+                            &[
+                                "-c",
+                                "IFS= read -r token; export GH_TOKEN=\"$token\" GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.https://github.com.helper GIT_CONFIG_VALUE_0='!gh auth git-credential' GIT_TERMINAL_PROMPT=0; gh api user --silent && printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill >/dev/null",
+                            ],
                             Path::new("/"),
                             &ChannelLabel::Noop,
                             material.as_bytes(),
@@ -299,6 +302,10 @@ impl CredentialStore {
                         .map_err(|error| format!("authentication preflight failed: {error}"))?;
                 }
                 env.insert("GH_TOKEN".to_string(), material.to_string());
+                env.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
+                env.insert("GIT_CONFIG_KEY_0".to_string(), "credential.https://github.com.helper".to_string());
+                env.insert("GIT_CONFIG_VALUE_0".to_string(), "!gh auth git-credential".to_string());
+                env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
             }
             CredentialConsumer::Forgejo { api_url, username } => {
                 let server_url = api_url.trim_end_matches('/');
@@ -621,6 +628,46 @@ mod tests {
             store.materials.lock().await.clone(),
             BTreeMap::from([(("env-b".to_string(), "model-api".to_string()), "secret-b".to_string())])
         );
+    }
+
+    #[tokio::test]
+    async fn gh_material_authenticates_both_gh_and_git_without_interactive_prompts() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::Gh,
+                source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create credential declaration");
+        let secret = "github-test-token";
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_GITHUB_TOKEN".to_string(), secret.to_string())])));
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+
+        let delivered =
+            store.prepare("env-a", &BTreeSet::from(["github".to_string()]), runner.clone()).await.expect("prepare GitHub credential");
+
+        assert_eq!(delivered, vec![
+            ("GH_TOKEN".to_string(), secret.to_string()),
+            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+            ("GIT_CONFIG_KEY_0".to_string(), "credential.https://github.com.helper".to_string()),
+            ("GIT_CONFIG_VALUE_0".to_string(), "!gh auth git-credential".to_string()),
+            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        ]);
+        let calls = runner.calls.lock().expect("calls lock");
+        assert!(calls.iter().any(|(cmd, args, input)| {
+            cmd == "sh"
+                && args.iter().any(|arg| arg.contains("gh api user --silent"))
+                && args.iter().any(|arg| arg.contains("git credential fill"))
+                && input == secret.as_bytes()
+        }));
+        assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
     }
 
     #[tokio::test]
