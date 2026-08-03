@@ -980,6 +980,14 @@ interactions:
         let oversized_scope = (0..501).map(|index| RepositoryKey(format!("repository-{index}"))).collect();
         let error = store.github_repository_names(&oversized_scope).await.expect_err("oversized repository scope must fail");
         assert!(error.contains("500-repository API limit"), "unexpected error: {error}");
+        let mut static_spec = spec;
+        static_spec.lifecycle = CredentialLifecycle::Static;
+        let non_empty_scope = BTreeSet::from([RepositoryKey("not-resolved".to_string())]);
+        let error = store
+            .resolve_for_adapter("github-app", &static_spec, Some(&non_empty_scope))
+            .await
+            .expect_err("non-refreshable GitHub App credentials must fail");
+        assert!(error.contains("must use the refreshable lifecycle"), "unexpected error: {error}");
     }
 
     #[tokio::test]
