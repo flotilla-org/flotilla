@@ -100,6 +100,7 @@ mod tests {
 
     #[test]
     fn tracing_init_failure_is_returned_with_operator_context() {
+        // This must remain the only test in this binary that installs a global tracing subscriber; another would make ordering matter.
         tracing_subscriber::registry().try_init().expect("install first global tracing subscriber");
 
         let error = init_daemon_tracing(tracing_subscriber::registry()).expect_err("second global subscriber must be rejected");
