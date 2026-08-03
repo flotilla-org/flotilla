@@ -61,6 +61,29 @@ impl ConvoySpec {
     }
 }
 
+/// Checkout object names durably recorded as provisioned for this convoy.
+///
+/// Placements are copied onto work state before vessels can disappear, so the
+/// expected set remains available while federated checkout observations lag.
+/// Adopted refs are also declarations on the convoy itself and therefore count
+/// as expected even before a placement has repeated them.
+pub fn expected_checkout_refs(convoy: &crate::ResourceObject<Convoy>) -> Result<BTreeSet<String>, String> {
+    let mut expected = convoy.spec.adopted_checkout_refs.values().cloned().collect::<BTreeSet<_>>();
+    let Some(status) = &convoy.status else {
+        return Ok(expected);
+    };
+    for (work_name, work) in &status.work {
+        let Some(checkout_refs) = work.placement.as_ref().and_then(|placement| placement.fields.get("checkout_refs")) else {
+            continue;
+        };
+        let checkout_refs = serde_json::from_value::<BTreeMap<RepositoryKey, String>>(checkout_refs.clone()).map_err(|error| {
+            format!("convoy {}/{} has invalid checkout_refs in work {work_name}: {error}", convoy.metadata.namespace, convoy.metadata.name)
+        })?;
+        expected.extend(checkout_refs.into_values());
+    }
+    Ok(expected)
+}
+
 pub fn pinned_workflow_ref(convoy: &crate::ResourceObject<Convoy>) -> &str {
     convoy.metadata.annotations.get(WORKFLOW_SNAPSHOT_ANNOTATION).map(String::as_str).unwrap_or(&convoy.spec.workflow_ref)
 }

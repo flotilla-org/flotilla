@@ -277,7 +277,11 @@ impl ConvoyTeardownRuntime for LandingRuntime {
         Ok(!self.contradictory)
     }
 
-    async fn verify_reclaim(&self, _convoy: &ResourceObject<Convoy>) -> Result<(), String> {
+    async fn verify_reclaim(
+        &self,
+        _convoy: &ResourceObject<Convoy>,
+        _checkouts: &[ResourceObject<flotilla_resources::Checkout>],
+    ) -> Result<(), String> {
         Err("not terminal".to_string())
     }
 }

@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use super::{
-    controller_patches, provisioning_patches, Convoy, ConvoyPhase, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, VesselRequirement,
-    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    controller_patches, expected_checkout_refs, provisioning_patches, Convoy, ConvoyPhase, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState,
+    VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use crate::{
     checkout::Checkout,
@@ -37,16 +37,19 @@ pub trait ConvoyTeardownRuntime: Send + Sync {
     /// before answering; the default keeps in-memory reconcilers deterministic.
     async fn no_change_request_outstanding(
         &self,
-        _convoy: &ResourceObject<Convoy>,
+        convoy: &ResourceObject<Convoy>,
         checkouts: &[ResourceObject<Checkout>],
     ) -> Result<bool, String> {
-        Ok(checkouts
-            .iter()
-            .all(|checkout| checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)))
+        let expected = expected_checkout_refs(convoy)?;
+        Ok(expected.iter().all(|name| {
+            checkouts.iter().find(|checkout| &checkout.metadata.name == name).is_some_and(|checkout| {
+                checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)
+            })
+        }))
     }
 
     /// Re-verify ADR 0017 teardown eligibility at the execution edge.
-    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String>;
+    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, checkouts: &[ResourceObject<Checkout>]) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,8 +274,12 @@ impl Reconciler for ConvoyReconciler {
                     let checkout_list = checkouts.values().cloned().collect::<Vec<_>>();
                     runtime.no_change_request_outstanding(obj, &checkout_list).await.unwrap_or(false)
                 }
-                None => checkouts.values().all(|checkout| {
-                    checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)
+                None => expected_checkout_refs(obj).is_ok_and(|expected| {
+                    expected.iter().all(|name| {
+                        checkouts.get(name).is_some_and(|checkout| {
+                            checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)
+                        })
+                    })
                 }),
             }
         } else {
@@ -280,7 +287,10 @@ impl Reconciler for ConvoyReconciler {
         };
         let reclaim_eligible = if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             match &self.teardown_runtime {
-                Some(runtime) => runtime.verify_reclaim(obj).await.is_ok(),
+                Some(runtime) => {
+                    let checkout_list = checkouts.values().cloned().collect::<Vec<_>>();
+                    runtime.verify_reclaim(obj, &checkout_list).await.is_ok()
+                }
                 None => false,
             }
         } else {
@@ -340,18 +350,26 @@ impl Reconciler for ConvoyReconciler {
     }
 }
 
+/// Test-support reconcile entry that carries no vessel, presentation, or
+/// checkout state. Settlement can therefore only be judged from the convoy
+/// record itself: a convoy expecting no checkouts (no placement
+/// `checkout_refs`, no adoptions) settles on claims alone, and any expected
+/// checkout holds settlement here because this path has no integration
+/// evidence to offer. Production callers go through `ConvoyReconciler`,
+/// which supplies the federated checkout list.
 pub fn reconcile(
     convoy: &ResourceObject<Convoy>,
     template: Option<&ResourceObject<WorkflowTemplate>>,
     now: DateTime<Utc>,
 ) -> ReconcileOutcome {
+    let no_change_request_outstanding = expected_checkout_refs(convoy).is_ok_and(|expected| expected.is_empty());
     let outcome = reconcile_internal(
         convoy,
         template,
         &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
-        LifecycleConditions { no_change_request_outstanding: true, reclaim_eligible: false },
+        LifecycleConditions { no_change_request_outstanding, reclaim_eligible: false },
         now,
     );
     ReconcileOutcome { patch: outcome.patch, events: outcome.events }

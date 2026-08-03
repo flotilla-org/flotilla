@@ -88,13 +88,13 @@ impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
     async fn no_change_request_outstanding(
         &self,
         convoy: &ResourceObject<Convoy>,
-        _checkouts: &[ResourceObject<Checkout>],
+        checkouts: &[ResourceObject<Checkout>],
     ) -> Result<bool, String> {
-        self.daemon.convoy_change_requests_settled(&convoy.metadata.namespace, &convoy.metadata.name).await
+        self.daemon.convoy_change_requests_settled_for_checkouts(convoy, checkouts).await
     }
 
-    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
-        let result = self.daemon.verify_convoy_teardown_gate(&convoy.metadata.namespace, &convoy.metadata.name, false).await;
+    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, checkouts: &[ResourceObject<Checkout>]) -> Result<(), String> {
+        let result = self.daemon.verify_convoy_teardown_gate_for_checkouts(convoy, checkouts, false).await;
         let key = format!("{}/{}", convoy.metadata.namespace, convoy.metadata.name);
         match &result {
             Err(error) => {

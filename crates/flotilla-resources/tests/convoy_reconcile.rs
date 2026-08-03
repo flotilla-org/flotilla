@@ -1,6 +1,12 @@
 mod common;
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use async_trait::async_trait;
 use common::{
@@ -23,7 +29,35 @@ struct AlwaysEligible;
 
 #[async_trait]
 impl ConvoyTeardownRuntime for AlwaysEligible {
-    async fn verify_reclaim(&self, _convoy: &flotilla_resources::ResourceObject<Convoy>) -> Result<(), String> {
+    async fn verify_reclaim(
+        &self,
+        _convoy: &flotilla_resources::ResourceObject<Convoy>,
+        _checkouts: &[flotilla_resources::ResourceObject<Checkout>],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct RecordingUnsettledRuntime {
+    checkout_count: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ConvoyTeardownRuntime for RecordingUnsettledRuntime {
+    async fn no_change_request_outstanding(
+        &self,
+        _convoy: &flotilla_resources::ResourceObject<Convoy>,
+        checkouts: &[flotilla_resources::ResourceObject<Checkout>],
+    ) -> Result<bool, String> {
+        self.checkout_count.store(checkouts.len(), Ordering::SeqCst);
+        Ok(false)
+    }
+
+    async fn verify_reclaim(
+        &self,
+        _convoy: &flotilla_resources::ResourceObject<Convoy>,
+        _checkouts: &[flotilla_resources::ResourceObject<Checkout>],
+    ) -> Result<(), String> {
         Ok(())
     }
 }
@@ -109,6 +143,12 @@ async fn reconcile_landing_with_observed_change_request(
             member.phase = CrewWorkPhase::Done;
         }
     }
+    status.work.get_mut("implement").expect("implement work").placement = Some(flotilla_resources::PlacementStatus {
+        fields: BTreeMap::from([(
+            "checkout_refs".to_string(),
+            serde_json::json!(BTreeMap::from([(RepositoryKey("repo-a".to_string()), "checkout-a".to_string())])),
+        )]),
+    });
     let mut spec = valid_convoy_spec();
     spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec::builder()
         .url("https://example.com/repo-a".to_string())
@@ -646,10 +686,109 @@ async fn landing_on_a_different_target_records_a_fact_and_still_becomes_landed()
 }
 
 #[tokio::test]
-async fn landing_without_a_change_request_becomes_landed_on_first_evaluation() {
+async fn landing_without_checkout_evidence_stays_landing() {
     let outcome = reconcile_landing_with_observed_change_request(None, None).await;
 
-    assert_eq!(outcome.patch, Some(controller_patches::settle(Vec::new(), timestamp(40))));
+    assert_eq!(outcome.patch, None);
+}
+
+#[tokio::test]
+async fn teardown_runtime_default_accepts_artifactless_convoy() {
+    let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
+
+    assert!(AlwaysEligible.no_change_request_outstanding(&convoy, &[]).await.expect("default settlement condition should evaluate"));
+}
+
+#[tokio::test]
+async fn teardown_runtime_default_rejects_unobserved_expected_checkout() {
+    let mut status = bootstrapped_convoy_status();
+    status.work.get_mut("implement").expect("implement work").placement = Some(flotilla_resources::PlacementStatus {
+        fields: BTreeMap::from([(
+            "checkout_refs".to_string(),
+            serde_json::json!(BTreeMap::from([(RepositoryKey("repo-a".to_string()), "checkout-a".to_string())])),
+        )]),
+    });
+    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
+
+    assert!(!AlwaysEligible.no_change_request_outstanding(&convoy, &[]).await.expect("default settlement condition should evaluate"));
+}
+
+#[tokio::test]
+async fn federated_open_checkout_holds_landing_on_authority_host() {
+    let authority = ResourceBackend::InMemory(InMemoryBackend::default());
+    let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = authority.clone().using::<Convoy>("flotilla");
+    let remote_checkouts = remote.clone().using::<Checkout>("flotilla");
+    let mut status = bootstrapped_convoy_status();
+    status.phase = ConvoyPhase::Landing;
+    for work in status.work.values_mut() {
+        work.phase = WorkPhase::Complete;
+    }
+    for crew in status.crew_work.values_mut() {
+        for member in crew.values_mut() {
+            member.phase = CrewWorkPhase::Done;
+        }
+    }
+    status.work.get_mut("implement").expect("implement work").placement = Some(flotilla_resources::PlacementStatus {
+        fields: BTreeMap::from([(
+            "checkout_refs".to_string(),
+            serde_json::json!(BTreeMap::from([(RepositoryKey("repo-a".to_string()), "remote-checkout".to_string())])),
+        )]),
+    });
+    let source = convoy_object("cross-host", valid_convoy_spec(), Some(status));
+    let created = convoys.create(&convoy_meta("cross-host"), &source.spec).await.expect("create authority convoy");
+    convoys
+        .update_status("cross-host", &created.metadata.resource_version, source.status.as_ref().expect("convoy status"))
+        .await
+        .expect("set landing status");
+
+    let checkout = remote_checkouts
+        .create(
+            &InputMeta::builder()
+                .name("remote-checkout".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "cross-host".to_string())]))
+                .build(),
+            &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "feature/open-pr".to_string(),
+                path: "/remote/worktree".to_string(),
+                repo_ref: RepositoryKey("repo-a".to_string()),
+                host_ref: "feta".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("create remote checkout");
+    remote_checkouts
+        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Ready,
+            path: Some("/remote/worktree".to_string()),
+            commit: None,
+            branch_provenance: Default::default(),
+            integration: CheckoutIntegrationStatus {
+                landed: IntegrationCondition::builder().value(ConditionValue::False).build(),
+                ..Default::default()
+            },
+            message: None,
+        })
+        .await
+        .expect("record open change request");
+    authority
+        .replica_writer::<Checkout>(flotilla_protocol::NodeId::new("feta"), "flotilla")
+        .replace(&remote_checkouts.list().await.expect("list remote checkouts"), chrono::Utc::now())
+        .await
+        .expect("replicate remote checkout");
+
+    let checkout_count = Arc::new(AtomicUsize::new(0));
+    let runtime = Arc::new(RecordingUnsettledRuntime { checkout_count: checkout_count.clone() });
+    let current = convoys.get("cross-host").await.expect("get authority convoy");
+    let reconciler = ConvoyReconciler::new(authority.clone().using::<WorkflowTemplate>("flotilla"))
+        .with_federated_checkouts(authority.including_replicas::<Checkout>("flotilla"))
+        .with_teardown_runtime(runtime);
+    let deps = reconciler.fetch_dependencies(&current).await.expect("resolve federated dependencies");
+    let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
+
+    assert_eq!(checkout_count.load(Ordering::SeqCst), 1, "runtime must receive the federated checkout");
+    assert_eq!(outcome.patch, None, "an open remote change request must hold Landing");
 }
 
 #[test]

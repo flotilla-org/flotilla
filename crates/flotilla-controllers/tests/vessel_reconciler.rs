@@ -39,7 +39,11 @@ struct AlwaysEligible;
 
 #[async_trait]
 impl ConvoyTeardownRuntime for AlwaysEligible {
-    async fn verify_reclaim(&self, _convoy: &flotilla_resources::ResourceObject<Convoy>) -> Result<(), String> {
+    async fn verify_reclaim(
+        &self,
+        _convoy: &flotilla_resources::ResourceObject<Convoy>,
+        _checkouts: &[flotilla_resources::ResourceObject<flotilla_resources::Checkout>],
+    ) -> Result<(), String> {
         Ok(())
     }
 }
