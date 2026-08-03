@@ -48,6 +48,7 @@ pub enum LeafAddress {
     Convoy { name: String },
     Vessel { name: String },
     Work { convoy: String, work: String },
+    ChangeRequest { service: String, scope: String, number: u64 },
 }
 
 impl LeafAddress {
@@ -56,6 +57,7 @@ impl LeafAddress {
             Self::Convoy { .. } => LeafKind::Convoy,
             Self::Vessel { .. } => LeafKind::Vessel,
             Self::Work { .. } => LeafKind::Work,
+            Self::ChangeRequest { .. } => LeafKind::ChangeRequest,
         }
     }
 }
@@ -71,7 +73,13 @@ impl FromStr for LeafAddress {
             ["work", convoy, work] if !convoy.is_empty() && !work.is_empty() => {
                 Ok(Self::Work { convoy: (*convoy).to_string(), work: (*work).to_string() })
             }
-            _ => Err(format!("invalid leaf address `{value}`; expected convoy/<name>, vessel/<name>, or work/<convoy>/<work>")),
+            ["cr", service, scope @ .., number] if !service.is_empty() && !scope.is_empty() => {
+                let number = number.parse().map_err(|_| format!("invalid change request number `{number}` in leaf address `{value}`"))?;
+                Ok(Self::ChangeRequest { service: (*service).to_string(), scope: scope.join("/"), number })
+            }
+            _ => Err(format!(
+                "invalid leaf address `{value}`; expected convoy/<name>, vessel/<name>, work/<convoy>/<work>, or cr/<service>/<scope>/<number>"
+            )),
         }
     }
 }
@@ -82,6 +90,7 @@ impl fmt::Display for LeafAddress {
             Self::Convoy { name } => write!(f, "convoy/{name}"),
             Self::Vessel { name } => write!(f, "vessel/{name}"),
             Self::Work { convoy, work } => write!(f, "work/{convoy}/{work}"),
+            Self::ChangeRequest { service, scope, number } => write!(f, "cr/{service}/{scope}/{number}"),
         }
     }
 }
@@ -92,6 +101,7 @@ pub enum LeafKind {
     Convoy,
     Vessel,
     Work,
+    ChangeRequest,
 }
 
 impl fmt::Display for LeafKind {
@@ -100,6 +110,7 @@ impl fmt::Display for LeafKind {
             Self::Convoy => "convoy",
             Self::Vessel => "vessel",
             Self::Work => "work",
+            Self::ChangeRequest => "cr",
         })
     }
 }
@@ -186,5 +197,16 @@ mod tests {
         let leaf: Leaf = "work/demo/implement .latest-claim.disposition == 'changes pushed'".parse().expect("parse claim leaf");
         assert_eq!(leaf.address, LeafAddress::Work { convoy: "demo".to_string(), work: "implement".to_string() });
         assert_eq!(leaf.literal, "changes pushed");
+    }
+
+    #[test]
+    fn parses_subject_keyed_change_request_address() {
+        let leaf: Leaf = "cr/github.com/flotilla-org/flotilla/1363 .state == merged".parse().expect("parse CR leaf");
+        assert_eq!(leaf.address, LeafAddress::ChangeRequest {
+            service: "github.com".to_string(),
+            scope: "flotilla-org/flotilla".to_string(),
+            number: 1363,
+        });
+        assert_eq!(leaf.to_string(), "cr/github.com/flotilla-org/flotilla/1363 .state == merged");
     }
 }

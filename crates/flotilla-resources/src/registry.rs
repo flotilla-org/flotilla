@@ -10,9 +10,9 @@ use crate::{
     field_ownership::merge_owned_spec,
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
-    Checkout, Clone as CloneResource, Convoy, CredentialGrant, CredentialSpec, Demand, Environment, FieldOwnedResource, Host, InputMeta,
-    MaterialPool, ObjectMeta, OwnerReference, PlacementPolicy, Presentation, Project, ReadResourceList, ReadWatchEvent, Regard,
-    ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
+    ChangeRequest, Checkout, Clone as CloneResource, Convoy, CredentialGrant, CredentialSpec, Demand, Environment, FieldOwnedResource,
+    Host, InputMeta, MaterialPool, ObjectMeta, OwnerReference, PlacementPolicy, Presentation, Project, ReadResourceList, ReadWatchEvent,
+    Regard, ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
     ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
 };
 
@@ -27,6 +27,7 @@ pub struct RegisteredResourceKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegisteredResource {
+    ChangeRequest,
     Checkout,
     Clone,
     Convoy,
@@ -74,6 +75,7 @@ pub struct DynamicResourceWatch {
 }
 
 pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
+    kind::<ChangeRequest>(RegisteredResource::ChangeRequest, &["cr", "change_request", "change-request"]),
     kind::<Checkout>(RegisteredResource::Checkout, &[]),
     kind::<CloneResource>(RegisteredResource::Clone, &[]),
     kind::<Convoy>(RegisteredResource::Convoy, &[]),
@@ -142,6 +144,7 @@ const fn kind<T: Resource>(resource: RegisteredResource, aliases: &'static [&'st
 macro_rules! dispatch_resource_kind {
     ($resource:expr, $body:ident($($arg:expr),*).await) => {
         match $resource {
+            RegisteredResource::ChangeRequest => $body::<ChangeRequest>($($arg),*).await,
             RegisteredResource::Checkout => $body::<Checkout>($($arg),*).await,
             RegisteredResource::Clone => $body::<CloneResource>($($arg),*).await,
             RegisteredResource::Convoy => $body::<Convoy>($($arg),*).await,
@@ -163,6 +166,7 @@ macro_rules! dispatch_resource_kind {
     };
     ($resource:expr, $body:ident()) => {
         match $resource {
+            RegisteredResource::ChangeRequest => $body::<ChangeRequest>(),
             RegisteredResource::Checkout => $body::<Checkout>(),
             RegisteredResource::Clone => $body::<CloneResource>(),
             RegisteredResource::Convoy => $body::<Convoy>(),
@@ -184,6 +188,7 @@ macro_rules! dispatch_resource_kind {
     };
     ($resource:expr, $body:ident($($arg:expr),*)) => {
         match $resource {
+            RegisteredResource::ChangeRequest => $body::<ChangeRequest>($($arg),*),
             RegisteredResource::Checkout => $body::<Checkout>($($arg),*),
             RegisteredResource::Clone => $body::<CloneResource>($($arg),*),
             RegisteredResource::Convoy => $body::<Convoy>($($arg),*),
