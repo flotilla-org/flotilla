@@ -6758,7 +6758,11 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::CrewComplete { context: crew_context.clone(), message: Some("implementation ready".to_string()) },
+                action: CommandAction::CrewComplete {
+                    context: crew_context.clone(),
+                    message: Some("implementation ready".to_string()),
+                    disposition: None,
+                },
             })
             .await
             .expect("coder complete");
@@ -6950,6 +6954,7 @@ mod tests {
                 action: CommandAction::CrewComplete {
                     context: CrewCommandContext { crew_id: Some(revived_coder_id.clone()), ..Default::default() },
                     message: Some("review findings addressed".to_string()),
+                    disposition: None,
                 },
             })
             .await
@@ -6996,6 +7001,7 @@ mod tests {
                 action: CommandAction::CrewComplete {
                     context: CrewCommandContext { crew_id: Some(reviewer_id), ..Default::default() },
                     message: Some("changes accepted".to_string()),
+                    disposition: None,
                 },
             })
             .await

@@ -1513,6 +1513,7 @@ async fn crew_complete_uses_ambient_identity_to_complete_callers_work() {
     daemon
         .mark_crew_completion_pending("flotilla", "terminal-demo-implement-coder", CrewCompletionPending {
             message: Some("ready for review".into()),
+            disposition: None,
             attempted_at: chrono::Utc::now(),
             authority: "remote-before-failover".into(),
             last_error: "authority unreachable".into(),
@@ -1529,6 +1530,7 @@ async fn crew_complete_uses_ambient_identity_to_complete_callers_work() {
             action: CommandAction::CrewComplete {
                 context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
                 message: Some("ready for review".into()),
+                disposition: Some("changes-pushed".into()),
             },
         })
         .await
@@ -1539,6 +1541,7 @@ async fn crew_complete_uses_ambient_identity_to_complete_callers_work() {
     let coder = &convoy.status.expect("convoy status").crew_work["implement"]["coder"];
     assert_eq!(coder.phase, CrewWorkPhase::Done);
     assert_eq!(coder.message.as_deref(), Some("ready for review"));
+    assert_eq!(coder.disposition.as_deref(), Some("changes-pushed"));
     assert!(
         daemon
             .resource_backend()
@@ -1869,7 +1872,11 @@ async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
             node_id: None,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::CrewComplete { context: context.clone(), message: Some("implementation ready".into()) },
+            action: CommandAction::CrewComplete {
+                context: context.clone(),
+                message: Some("implementation ready".into()),
+                disposition: None,
+            },
         })
         .await
         .expect("complete coder work");

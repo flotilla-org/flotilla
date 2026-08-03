@@ -11,8 +11,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    Command, ConnectionRole, DaemonEvent, Message, NodeId, QueryCursor, QueryId, ReplayCursor, RepoIdentity, RepoInfo, RepoSnapshot,
-    Request, Response, ResponseResult, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, PROTOCOL_VERSION,
+    Command, ConnectionRole, DaemonEvent, LeafFire, Message, NodeId, QueryCursor, QueryId, ReplayCursor, RepoIdentity, RepoInfo,
+    RepoSnapshot, Request, Response, ResponseResult, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, PROTOCOL_VERSION,
 };
 use flotilla_transport::message::{connect_unix_message_session, MessageSession};
 use tokio::sync::{broadcast, oneshot, Mutex};
@@ -115,6 +115,7 @@ pub struct SocketDaemon {
     session: Arc<MessageSession>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
     event_tx: broadcast::WeakSender<DaemonEvent>,
+    wait_event_tx: broadcast::WeakSender<LeafFire>,
     next_id: Arc<AtomicU64>,
     reader_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Local snapshot seq per repo, for gap detection.
@@ -164,6 +165,10 @@ impl SocketDaemon {
 
         let (event_tx, _) = broadcast::channel(256);
         let event_tx_weak = event_tx.downgrade();
+        // Wait fires are one-shot and must not be displaced by unrelated
+        // daemon traffic on the general event fan-out.
+        let (wait_event_tx, _) = broadcast::channel(256);
+        let wait_event_tx_weak = wait_event_tx.downgrade();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(AtomicU64::new(1));
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
@@ -178,6 +183,7 @@ impl SocketDaemon {
             .subscribed_queries(Arc::clone(&subscribed_queries))
             .recovering(recovering)
             .event_tx(event_tx_weak.clone())
+            .wait_event_tx(wait_event_tx_weak.clone())
             .session(Arc::clone(&session))
             .pending(Arc::clone(&pending))
             .next_id(Arc::clone(&next_id))
@@ -185,6 +191,7 @@ impl SocketDaemon {
             .build();
         let reader_task = tokio::spawn(async move {
             let _event_channel_guard = event_tx;
+            let _wait_event_channel_guard = wait_event_tx;
             loop {
                 match reader_session.read().await {
                     Ok(Some(msg)) => match msg {
@@ -234,6 +241,7 @@ impl SocketDaemon {
             session,
             pending: Arc::clone(&pending),
             event_tx: event_tx_weak,
+            wait_event_tx: wait_event_tx_weak,
             next_id: Arc::clone(&next_id),
             reader_task: std::sync::Mutex::new(Some(reader_task)),
             local_seqs: Arc::clone(&local_seqs),
@@ -252,6 +260,26 @@ impl SocketDaemon {
         match into_success_response(result)? {
             Response::AgentHook => Ok(()),
             other => Err(format!("unexpected agent hook response: {other:?}")),
+        }
+    }
+
+    /// Register a connection-owned wait and return a receiver that was opened
+    /// before admission, so an immediately true leaf cannot race delivery.
+    pub async fn subscribe_wait(
+        &self,
+        subscription: flotilla_protocol::WaitSubscriptionRequest,
+    ) -> Result<(uuid::Uuid, broadcast::Receiver<LeafFire>), String> {
+        let events = match self.wait_event_tx.upgrade() {
+            Some(event_tx) => event_tx.subscribe(),
+            None => {
+                let (event_tx, receiver) = broadcast::channel(1);
+                drop(event_tx);
+                receiver
+            }
+        };
+        match into_success_response(self.request(Request::SubscribeWait { subscription }).await?)? {
+            Response::WaitSubscribed { subscription_id } => Ok((subscription_id, events)),
+            other => Err(format!("unexpected response for wait subscription: {other:?}")),
         }
     }
 
@@ -690,6 +718,7 @@ struct EventContext {
     subscribed_queries: Arc<QuerySet>,
     recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>>,
     event_tx: broadcast::WeakSender<DaemonEvent>,
+    wait_event_tx: broadcast::WeakSender<LeafFire>,
     session: Arc<MessageSession>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
     next_id: Arc<AtomicU64>,
@@ -718,6 +747,12 @@ fn send_event(event_tx: &broadcast::WeakSender<DaemonEvent>, event: DaemonEvent)
     }
 }
 
+fn send_wait_event(event_tx: &broadcast::WeakSender<LeafFire>, event: LeafFire) {
+    if let Some(event_tx) = event_tx.upgrade() {
+        let _ = event_tx.send(event);
+    }
+}
+
 /// Handle a daemon event in the background reader: update local seq tracking,
 /// forward to TUI subscribers, and spawn gap recovery if needed.
 ///
@@ -725,7 +760,7 @@ fn send_event(event_tx: &broadcast::WeakSender<DaemonEvent>, event: DaemonEvent)
 /// is spawned on a separate task to avoid deadlocking the reader (which must
 /// remain free to route the recovery response).
 fn handle_event(event: DaemonEvent, ctx: &EventContext) {
-    let EventContext { local_seqs, recovering, event_tx, .. } = ctx;
+    let EventContext { local_seqs, recovering, event_tx, wait_event_tx, .. } = ctx;
     match &event {
         DaemonEvent::RepoSnapshot(snap) => {
             debug!(repo_identity = %snap.repo_identity, repo = ?snap.repo, seq = snap.seq, "received full snapshot");
@@ -860,6 +895,10 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
         | DaemonEvent::PeerStatusChanged { .. } => {
             send_event(event_tx, event);
         }
+        DaemonEvent::LeafFired(fire) => {
+            send_wait_event(wait_event_tx, fire.clone());
+            send_event(event_tx, event);
+        }
     }
 }
 
@@ -921,7 +960,8 @@ async fn recover_from_gap(ctx: &EventContext) {
                             | DaemonEvent::CommandStepUpdate { .. }
                             | DaemonEvent::PeerStatusChanged { .. }
                             | DaemonEvent::ResultSet(_)
-                            | DaemonEvent::ResultDelta(_) => {}
+                            | DaemonEvent::ResultDelta(_)
+                            | DaemonEvent::LeafFired(_) => {}
                         }
                     }
                 }
@@ -1124,7 +1164,8 @@ impl DaemonHandle for SocketDaemon {
                     | DaemonEvent::CommandStepUpdate { .. }
                     | DaemonEvent::PeerStatusChanged { .. }
                     | DaemonEvent::ResultSet(_)
-                    | DaemonEvent::ResultDelta(_) => continue,
+                    | DaemonEvent::ResultDelta(_)
+                    | DaemonEvent::LeafFired(_) => continue,
                 };
                 seqs.entry(stream_key).and_modify(|s| *s = (*s).max(seq)).or_insert(seq);
             }

@@ -80,6 +80,7 @@ use crate::{
         resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
     },
     host_registry::HostCounts,
+    leaf_engine::LeafSubscriptionTable,
     model::{provider_names_from_registry, repo_name, RepoModel},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
@@ -1848,6 +1849,7 @@ pub struct InProcessDaemon {
     resource_replication_failures: RwLock<HashMap<NodeId, BTreeMap<String, String>>>,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
     local_placement_provider_statuses: RwLock<Vec<HostProviderStatus>>,
+    leaf_subscriptions: LeafSubscriptionTable,
 }
 
 /// Default provisioning namespace used until [`InProcessDaemon::set_provisioning_namespace`]
@@ -2012,10 +2014,11 @@ impl InProcessDaemon {
         .await;
 
         let (fleet_replica_tx, _) = broadcast::channel(32);
+        let leaf_subscriptions = LeafSubscriptionTable::new(resource_backend.clone(), event_tx.clone());
         let daemon = Arc::new_cyclic(|self_weak| Self {
             repos: RwLock::new(repos),
             repo_order: RwLock::new(order),
-            event_tx,
+            event_tx: event_tx.clone(),
             config,
             next_command_id: AtomicU64::new(1),
             node_id: local_node_id.clone(),
@@ -2050,6 +2053,7 @@ impl InProcessDaemon {
             resource_replication_failures: RwLock::new(HashMap::new()),
             repository_inspector: RwLock::new(None),
             local_placement_provider_statuses: RwLock::new(Vec::new()),
+            leaf_subscriptions: leaf_subscriptions.clone(),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -2365,6 +2369,18 @@ impl InProcessDaemon {
 
     pub fn resource_backend(&self) -> ResourceBackend {
         self.resource_backend.clone()
+    }
+
+    pub async fn subscribe_wait(
+        &self,
+        connection_id: uuid::Uuid,
+        request: flotilla_protocol::WaitSubscriptionRequest,
+    ) -> Result<uuid::Uuid, String> {
+        self.leaf_subscriptions.subscribe_wait(connection_id, request).await
+    }
+
+    pub async fn unsubscribe_waits(&self, connection_id: uuid::Uuid) {
+        self.leaf_subscriptions.unsubscribe_connection(connection_id).await;
     }
 
     pub fn connect_surface(&self, surface_id: uuid::Uuid, declaration: SurfaceDeclaration) {
@@ -6128,9 +6144,24 @@ impl InProcessDaemon {
     }
 
     pub async fn crew_complete_internal(&self, requested: &CrewCommandContext, message: Option<String>) -> Result<(), String> {
+        self.crew_complete_with_disposition_internal(requested, message, None).await
+    }
+
+    pub async fn crew_complete_with_disposition_internal(
+        &self,
+        requested: &CrewCommandContext,
+        message: Option<String>,
+        disposition: Option<String>,
+    ) -> Result<(), String> {
         let routing = self.resolve_crew_routing_context(requested).await?;
         self.apply_crew_work_patch(requested, |context| {
-            convoy_external_patches::mark_crew_completed(context.vessel.clone(), context.caller_role.clone(), chrono::Utc::now(), message)
+            convoy_external_patches::mark_crew_completed(
+                context.vessel.clone(),
+                context.caller_role.clone(),
+                chrono::Utc::now(),
+                message,
+                disposition,
+            )
         })
         .await?;
         if let Some(session_name) = routing.session_name {
@@ -7574,9 +7605,9 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::CrewComplete { context, message } = &command.action {
+        if let flotilla_protocol::CommandAction::CrewComplete { context, message, disposition } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result = match self.crew_complete_internal(context, message.clone()).await {
+            let result = match self.crew_complete_with_disposition_internal(context, message.clone(), disposition.clone()).await {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };

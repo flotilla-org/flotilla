@@ -348,6 +348,7 @@ impl HighFidelityHarness {
             DaemonEvent::HostRemoved { environment_id, .. } => format!("host_removed {environment_id}"),
             DaemonEvent::ResultSet(result_set) => format!("result_set query={} seq={}", result_set.query(), result_set.seq),
             DaemonEvent::ResultDelta(delta) => format!("result_delta query={} seq={}", delta.query(), delta.seq),
+            DaemonEvent::LeafFired(fire) => format!("leaf_fired subscription={}", fire.subscription_id),
         };
         self.recent_events.push(summary);
         if self.recent_events.len() > 20 {
@@ -458,6 +459,7 @@ fn record_recent_event(recent: &mut Vec<String>, source: &str, event: &DaemonEve
         DaemonEvent::HostRemoved { environment_id, .. } => format!("{source}: host_removed {environment_id}"),
         DaemonEvent::ResultSet(result_set) => format!("{source}: result_set query={} seq={}", result_set.query(), result_set.seq),
         DaemonEvent::ResultDelta(delta) => format!("{source}: result_delta query={} seq={}", delta.query(), delta.seq),
+        DaemonEvent::LeafFired(fire) => format!("{source}: leaf_fired subscription={}", fire.subscription_id),
     };
     recent.push(summary);
     if recent.len() > 20 {

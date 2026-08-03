@@ -13,6 +13,7 @@ mod host;
 mod http;
 mod in_memory;
 mod labels;
+mod leaf;
 mod material_pool;
 mod placement_policy;
 mod prepared_snapshot;
@@ -74,6 +75,10 @@ pub use in_memory::InMemoryBackend;
 pub use labels::{
     LifecycleAuthority, AUTHORITY_LABEL, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREW_ORDINAL_LABEL, MANAGED_BY_LABEL, REPO_KEY_LABEL,
     REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+};
+pub use leaf::{
+    admit_leaf, evaluate_leaf, ConvoyLeafSubject, LeafEvaluation, LeafSubject, LeafValue, ThreeValue, VesselLeafSubject, WorkLeafSubject,
+    ADMITTED_LEAF_VOCABULARY,
 };
 pub use material_pool::{
     MaterialPool, MaterialPoolLease, MaterialPoolSpec, MaterialPoolStatus, MaterialPoolStatusPatch, MaterialPoolUnitSpec,

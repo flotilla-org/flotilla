@@ -30,6 +30,9 @@ pub struct CrewNoun {
     /// Completion or failure message
     #[arg(long)]
     pub message: Option<String>,
+    /// Machine-readable settlement answer declared by the brief
+    #[arg(long)]
+    pub disposition: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -52,11 +55,18 @@ impl CrewNoun {
             .build();
         let subject = self.subjects.resolve()?.ok_or_else(|| "crew command requires a command or target subject".to_string())?;
         let action = match (subject.value.as_str(), subject.interpretation, self.verb) {
-            ("list", SubjectInterpretation::Ordinary, None) if self.message.is_none() => CommandAction::QueryCrewList { context },
-            ("list", SubjectInterpretation::Ordinary, None) => {
-                return Err("`flotilla crew list` does not accept --message".to_string());
+            ("list", SubjectInterpretation::Ordinary, None) if self.message.is_none() && self.disposition.is_none() => {
+                CommandAction::QueryCrewList { context }
             }
-            ("complete", SubjectInterpretation::Ordinary, None) => CommandAction::CrewComplete { context, message: self.message },
+            ("list", SubjectInterpretation::Ordinary, None) => {
+                return Err("`flotilla crew list` does not accept --message or --disposition".to_string());
+            }
+            ("complete", SubjectInterpretation::Ordinary, None) => {
+                CommandAction::CrewComplete { context, message: self.message, disposition: self.disposition }
+            }
+            ("fail", SubjectInterpretation::Ordinary, None) if self.disposition.is_some() => {
+                return Err("`flotilla crew fail` does not accept --disposition".to_string());
+            }
             ("fail", SubjectInterpretation::Ordinary, None) => CommandAction::CrewFail {
                 context,
                 message: self.message.ok_or_else(|| "`flotilla crew fail` requires --message".to_string())?,
@@ -96,6 +106,9 @@ impl std::fmt::Display for CrewNoun {
         }
         if let Some(message) = &self.message {
             write!(f, " --message {}", quote_value(message))?;
+        }
+        if let Some(disposition) = &self.disposition {
+            write!(f, " --disposition {}", quote_value(disposition))?;
         }
         if let Some(CrewVerb::Handoff { message }) = &self.verb {
             write!(f, " handoff --message {}", quote_value(message))?;
@@ -184,6 +197,18 @@ mod tests {
         assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewComplete {
             context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
             message: Some("ready for review".into()),
+            disposition: None,
+        });
+    }
+
+    #[test]
+    fn complete_preserves_declared_disposition() {
+        let noun = CrewNoun::try_parse_from(["crew", "complete", "--message", "ready for review", "--disposition", "changes-pushed"])
+            .expect("parse complete disposition");
+        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewComplete {
+            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+            message: Some("ready for review".into()),
+            disposition: Some("changes-pushed".into()),
         });
     }
 

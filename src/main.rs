@@ -85,6 +85,24 @@ enum SubCommand {
     Status,
     /// Stream daemon events to stdout
     Watch,
+    /// Block until one condition leaf becomes true
+    Wait {
+        /// Condition leaf; repeat to wait for any leaf (OR)
+        #[arg(long = "for", required = true)]
+        leaves: Vec<flotilla_protocol::Leaf>,
+        /// Resource namespace
+        #[arg(long, default_value = "flotilla")]
+        namespace: String,
+        /// Require claim evidence observed at or after this RFC3339 instant
+        ///
+        /// This slice has observation timestamps for work claim leaves only;
+        /// other leaves remain Unknown when a freshness demand is present.
+        #[arg(long)]
+        fresher_than: Option<chrono::DateTime<chrono::Utc>>,
+        /// Maximum seconds to block
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
     /// Show the daemon's current multi-host routing view
     Topology,
     /// Read structured daemon logs from this host or a peer
@@ -397,6 +415,9 @@ async fn main() -> Result<()> {
         Some(SubCommand::Daemon { timeout }) => run_daemon(&cli, timeout).await,
         Some(SubCommand::Status) => run_status(&cli, format).await,
         Some(SubCommand::Watch) => run_watch(&cli, format).await,
+        Some(SubCommand::Wait { leaves, namespace, fresher_than, timeout }) => {
+            run_wait(&cli, leaves, namespace, fresher_than, timeout, format).await
+        }
         Some(SubCommand::Topology) => run_topology_command(&cli, format).await,
         Some(SubCommand::Logs { host, since, level, target }) => run_logs(&cli, host.as_deref(), since, level, target).await,
         Some(SubCommand::Fleet) => run_fleet_health(&cli, format).await,
@@ -827,6 +848,57 @@ async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<()> {
 async fn run_watch(cli: &Cli, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     flotilla_tui::cli::run_watch(&cli.socket_path(), format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+}
+
+async fn run_wait(
+    cli: &Cli,
+    leaves: Vec<flotilla_protocol::Leaf>,
+    namespace: String,
+    freshness_demand: Option<chrono::DateTime<chrono::Utc>>,
+    timeout_seconds: Option<u64>,
+    format: OutputFormat,
+) -> Result<()> {
+    reset_sigpipe();
+    let socket_path = cli.socket_path();
+    let config_dir = cli.config_dir();
+    let paths = PathPolicy::from_process_env();
+    let daemon = connect_cli_socket(
+        &socket_path,
+        &config_dir,
+        paths.state_dir.as_path(),
+        cli.config_dir.as_deref(),
+        cli.socket.as_deref(),
+        host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
+    )
+    .await
+    .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    let request = flotilla_protocol::WaitSubscriptionRequest { namespace, leaves, freshness_demand };
+    let (subscription_id, mut events) = daemon.subscribe_wait(request).await.map_err(|error| color_eyre::eyre::eyre!(error))?;
+    let wait = async move {
+        loop {
+            match events.recv().await {
+                Ok(fire) if fire.subscription_id == subscription_id => break Ok(fire),
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    break Err(color_eyre::eyre::eyre!("wait event stream lagged by {skipped} event(s); condition may have fired"));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break Err(color_eyre::eyre::eyre!("daemon restarted"));
+                }
+            }
+        }
+    };
+    let fire = match timeout_seconds {
+        Some(seconds) => tokio::time::timeout(Duration::from_secs(seconds), wait)
+            .await
+            .map_err(|_| color_eyre::eyre::eyre!("timed out waiting for condition after {seconds}s"))??,
+        None => wait.await?,
+    };
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string(&fire)?),
+        OutputFormat::Human => println!("condition fired: {} (value: {})", fire.leaf, fire.value),
+    }
+    Ok(())
 }
 
 async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
@@ -1806,6 +1878,24 @@ mod tests {
             provider_health: Default::default(),
             loading: false,
         }
+    }
+
+    #[test]
+    fn wait_cli_accepts_an_or_set_and_timeout() {
+        let cli = Cli::try_parse_from([
+            "flotilla",
+            "wait",
+            "--for",
+            "convoy/demo .status.phase == Landed",
+            "--for",
+            "work/demo/implement .latest-claim.disposition == changes-pushed",
+            "--timeout",
+            "30",
+        ])
+        .expect("parse wait command");
+        let Some(SubCommand::Wait { leaves, timeout, .. }) = cli.command else { panic!("expected wait command") };
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(timeout, Some(30));
     }
 
     fn landing_project(name: &str, repositories: &[(&str, Option<&str>)]) -> ProjectListEntry {
