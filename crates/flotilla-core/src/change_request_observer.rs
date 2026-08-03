@@ -101,7 +101,7 @@ fn check_failed(check: &serde_json::Value) -> bool {
 }
 
 fn check_pending(check: &serde_json::Value) -> bool {
-    check["conclusion"].is_null()
+    check.get("conclusion").is_some_and(serde_json::Value::is_null)
         || matches!(check["status"].as_str(), Some("QUEUED" | "IN_PROGRESS" | "WAITING" | "PENDING"))
         || matches!(check["state"].as_str(), Some("PENDING" | "EXPECTED"))
 }
@@ -291,5 +291,15 @@ mod tests {
         assert_eq!(status.checks.value, Some(ObservedChecks::Pass));
         assert_eq!(status.review.actionable_at_head.value, Some(true));
         assert_eq!(status.mergeable.value, Some(ObservedMergeability::Conflicting));
+    }
+
+    #[test]
+    fn classic_success_status_without_check_run_fields_passes() {
+        let status = parse_gh_observation(
+            r#"{"state":"OPEN","headRefOid":"abc","statusCheckRollup":[{"state":"SUCCESS"}],"reviewDecision":"APPROVED","mergeable":"MERGEABLE"}"#,
+            "2026-08-03T20:00:00Z".parse().expect("time"),
+        )
+        .expect("parse");
+        assert_eq!(status.checks.value, Some(ObservedChecks::Pass));
     }
 }
