@@ -112,6 +112,7 @@ impl CheckoutRuntime for FakeCheckoutRuntime {
     async fn inspect_integration(
         &self,
         _checkout: &flotilla_resources::ResourceObject<Checkout>,
+        _convoy: Option<&flotilla_resources::ResourceObject<Convoy>>,
     ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String> {
         Ok(flotilla_resources::CheckoutIntegrationStatus::default())
     }
@@ -153,6 +154,7 @@ impl CheckoutRuntime for CountingCheckoutRuntime {
     async fn inspect_integration(
         &self,
         _checkout: &ResourceObject<Checkout>,
+        _convoy: Option<&ResourceObject<Convoy>>,
     ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String> {
         Ok(flotilla_resources::CheckoutIntegrationStatus::default())
     }

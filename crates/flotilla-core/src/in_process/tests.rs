@@ -60,7 +60,7 @@ const TEST_LOCAL_ATTACH_HOST: &str = "local";
 #[test]
 fn completion_message_extracts_github_and_forgejo_change_request_urls_from_prose() {
     assert_eq!(
-        change_request_id_from_completion_message(
+        crate::checkout_integration::change_request_id_from_completion_message(
             "Opened [PR #1338](https://github.com/flotilla-org/flotilla/pull/1338); checks are green.",
             "https://github.com/flotilla-org/flotilla.git",
         )
@@ -68,7 +68,7 @@ fn completion_message_extracts_github_and_forgejo_change_request_urls_from_prose
         Some("1338")
     );
     assert_eq!(
-        change_request_id_from_completion_message(
+        crate::checkout_integration::change_request_id_from_completion_message(
             "Ready: https://forgejo.lab/fork-issues/zellij/pulls/9 (reviewed)",
             "https://forgejo.lab/fork-issues/zellij",
         )
@@ -80,7 +80,7 @@ fn completion_message_extracts_github_and_forgejo_change_request_urls_from_prose
 #[test]
 fn completion_message_ignores_change_request_urls_for_other_repositories() {
     assert_eq!(
-        change_request_id_from_completion_message(
+        crate::checkout_integration::change_request_id_from_completion_message(
             "https://github.com/flotilla-org/other/pull/42",
             "https://github.com/flotilla-org/flotilla",
         ),
@@ -1109,6 +1109,28 @@ async fn create_ready_observed_checkout_for_convoy(
         .await
         .expect("checkout should be ready");
     record_expected_checkout_for_convoy(daemon, namespace, convoy, checkout_name).await;
+}
+
+async fn observe_checkout_for_convoy(daemon: &InProcessDaemon, namespace: &str, convoy_name: &str, checkout_name: &str) {
+    let convoys = daemon.resource_backend().using::<Convoy>(namespace);
+    let convoy = convoys.get(convoy_name).await.expect("owning convoy should exist");
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>(namespace);
+    let checkout = checkouts.get(checkout_name).await.expect("checkout should exist");
+    let path = checkout_path(&checkout).expect("checkout should have a resolved path");
+    let runner = daemon.runner_for_resource_checkout(&checkout).await.expect("checkout authority runner should exist");
+    let change_request_id = crate::checkout_integration::convoy_change_request_id_for_checkout(&convoy, &checkout);
+    let integration = crate::checkout_integration::inspect_convoy_checkout_integration(
+        &*runner,
+        Path::new(path),
+        &checkout.spec,
+        change_request_id.as_deref(),
+    )
+    .await;
+    apply_resource_status_patch(&checkouts, checkout_name, &flotilla_resources::CheckoutStatusPatch::UpdateIntegration {
+        integration: Box::new(integration),
+    })
+    .await
+    .expect("authority-side integration observation should persist");
 }
 
 async fn record_expected_checkout_for_convoy(daemon: &InProcessDaemon, namespace: &str, convoy_name: &str, checkout_name: &str) {
@@ -5174,6 +5196,7 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
         "feature/missing-push",
     )
     .await;
+    observe_checkout_for_convoy(&daemon, "custom-ns", "completed-convoy", "checkout-missing-push").await;
 
     let mut events = daemon.subscribe();
     let command_id = daemon
@@ -5250,6 +5273,7 @@ async fn convoy_delete_refuses_diverged_checkout_without_a_change_request() {
         .expect("convoy create should succeed");
     create_ready_observed_checkout_for_convoy(&daemon, "flotilla", "diverged-convoy", "checkout-diverged", "/repo", "feature/diverged")
         .await;
+    observe_checkout_for_convoy(&daemon, "flotilla", "diverged-convoy", "checkout-diverged").await;
 
     let result = daemon.verify_convoy_teardown_gate("flotilla", "diverged-convoy", false).await;
 
@@ -5373,21 +5397,22 @@ async fn teardown_gate_does_not_rewrite_a_latched_terminal_change_request() {
         .expect("convoy create should succeed");
     create_ready_observed_checkout_for_convoy(&daemon, "flotilla", "merged-convoy", "checkout-merged", "/repo", "feature/merged").await;
 
-    let condition = |value, observed_at: &str| IntegrationCondition::builder().value(value).observed_at(observed_at.to_string()).build();
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    let condition = |value| IntegrationCondition::builder().value(value).observed_at(observed_at.clone()).build();
     let evidence = flotilla_resources::LandedEvidence::builder().change_request_id("1162".to_string()).build();
     let change_request = flotilla_resources::ChangeRequestObservation::builder()
         .id("1162".to_string())
         .state(flotilla_resources::ChangeRequestState::Merged)
         .mergeability(flotilla_resources::ChangeRequestMergeability::Unknown)
-        .observed_at("2026-07-28T00:00:00Z".to_string())
+        .observed_at(observed_at.clone())
         .build();
     let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
     let checkout = checkouts.get("checkout-merged").await.expect("ready checkout");
     let mut status = checkout.status.expect("ready checkout status");
     status.integration = CheckoutIntegrationStatus {
-        clean: condition(ConditionValue::True, "2026-07-28T00:00:00Z"),
-        pushed: condition(ConditionValue::True, "2026-07-28T00:00:00Z"),
-        landed: condition(ConditionValue::True, "2026-07-28T00:00:00Z"),
+        clean: condition(ConditionValue::True),
+        pushed: condition(ConditionValue::True),
+        landed: condition(ConditionValue::True),
         landed_evidence: Some(evidence),
         change_request: Some(change_request),
     };
@@ -5404,7 +5429,7 @@ async fn teardown_gate_does_not_rewrite_a_latched_terminal_change_request() {
 }
 
 #[tokio::test]
-async fn landing_settlement_uses_latched_terminal_change_request_after_stale_reprobe() {
+async fn stale_latched_terminal_change_request_cannot_settle_landing() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -5465,8 +5490,8 @@ async fn landing_settlement_uses_latched_terminal_change_request_after_stale_rep
     checkouts.update_status("checkout-merged", &checkout.metadata.resource_version, &status).await.expect("persist landed checkout");
 
     assert!(
-        daemon.convoy_change_requests_settled("flotilla", "merged-convoy").await.expect("landing evaluation"),
-        "evidence-backed landed status must survive a stale reprobe that can no longer discover the merged PR"
+        !daemon.convoy_change_requests_settled("flotilla", "merged-convoy").await.expect("landing evaluation"),
+        "stale latched landed evidence must hold until the checkout authority publishes a fresh observation"
     );
     let stored = checkouts.get("checkout-merged").await.expect("checkout after landing evaluation");
     assert_eq!(
@@ -5543,7 +5568,6 @@ async fn completion_pr_from_another_branch_holds_landing_when_checkout_spec_ref_
         "provisioned-ref",
     )
     .await;
-
     assert!(
         !daemon.convoy_change_requests_settled("flotilla", "different-pr-branch").await.expect("evaluate settlement"),
         "the open completion PR must hold Landing even though its head differs from the checkout spec ref"
@@ -5551,7 +5575,7 @@ async fn completion_pr_from_another_branch_holds_landing_when_checkout_spec_ref_
 }
 
 #[tokio::test]
-async fn convoy_reclaim_refuses_when_missing_path_leaves_no_integration_evidence() {
+async fn convoy_reclaim_refuses_when_checkout_has_no_fresh_integration_evidence() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -5579,7 +5603,7 @@ async fn convoy_reclaim_refuses_when_missing_path_leaves_no_integration_evidence
         .verify_convoy_teardown_gate("flotilla", "half-reclaimed", false)
         .await
         .expect_err("a missing checkout path alone is not positive integration evidence");
-    assert!(refusal.contains("no checkout integration evidence"), "unexpected refusal: {refusal}");
+    assert!(refusal.contains("evidence is missing or stale"), "unexpected refusal: {refusal}");
 }
 
 #[tokio::test]
@@ -5741,6 +5765,7 @@ async fn convoy_delete_refuses_ignored_embedded_repository_with_local_commits() 
         "main",
     )
     .await;
+    observe_checkout_for_convoy(&daemon, "flotilla", "embedded-repo-convoy", "checkout-embedded-repo").await;
 
     let mut events = daemon.subscribe();
     let command_id = daemon
@@ -5817,7 +5842,7 @@ async fn convoy_delete_refuses_when_destroyed_environment_leaves_no_integration_
 
     let result = wait_for_command_result(&mut events, command_id).await;
     assert!(
-        matches!(&result, CommandValue::Error { message } if message.contains("no checkout integration evidence")),
+        matches!(&result, CommandValue::Error { message } if message.contains("evidence is missing or stale")),
         "unexpected delete result: {result:?}"
     );
     convoys.get("corpse-convoy").await.expect("refused convoy should remain");
@@ -6677,13 +6702,17 @@ async fn adopted_checkout_with_unlanded_change_request_refuses_reclaim_gate() {
         )
         .await
         .expect("create adopted checkout");
+    let observed_at = chrono::Utc::now().to_rfc3339();
     checkouts
         .update_status(&created.metadata.name, &created.metadata.resource_version, &ResourceCheckoutStatus {
             phase: ResourceCheckoutPhase::Ready,
             path: Some("/repo".to_string()),
             commit: None,
             branch_provenance: Default::default(),
-            integration: Default::default(),
+            integration: CheckoutIntegrationStatus {
+                landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at).build(),
+                ..Default::default()
+            },
             message: None,
         })
         .await
@@ -6699,13 +6728,13 @@ async fn adopted_checkout_with_unlanded_change_request_refuses_reclaim_gate() {
 }
 
 #[tokio::test]
-async fn landing_holds_when_fresh_probe_contradicts_stale_vacuous_landed() {
+async fn landing_holds_on_stale_vacuous_landed_without_probing() {
     // #1163 replay: a checkout's landed condition was recorded True while the
     // branch was untouched ("nothing to land"), the crew then pushed and
     // opened a change request, and the convoy entered Landing before any
-    // re-observation. The landing decision must re-probe, hold on the fresh
-    // open-change-request evidence, and the persisted condition must not be
-    // resurrected to True by the evidence latch.
+    // re-observation. The landing decision must hold until the checkout's
+    // authority publishes a fresh observation, without probing or rewriting
+    // the stored checkout itself.
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -6759,10 +6788,11 @@ async fn landing_holds_when_fresh_probe_contradicts_stale_vacuous_landed() {
         )
         .await
         .expect("checkout create should succeed");
+    let stale_observed_at = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
     let stale_vacuous = flotilla_resources::IntegrationCondition::builder()
         .value(flotilla_resources::ConditionValue::True)
         .details(vec!["no change request exists for branch".to_string()])
-        .observed_at((chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339())
+        .observed_at(stale_observed_at.clone())
         .build();
     checkouts
         .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &ResourceCheckoutStatus {
@@ -6783,13 +6813,11 @@ async fn landing_holds_when_fresh_probe_contradicts_stale_vacuous_landed() {
         .expect("checkout status should update");
     record_expected_checkout_for_convoy(&daemon, "flotilla", "split-convoy", "checkout-split").await;
 
-    // First pass: the stale True is re-probed; the open change request holds
-    // Landing and the fresh False observation is persisted un-latched.
+    // The convoy authority consumes only stored evidence. The stale True
+    // cannot release Landing, and evaluating it must not probe or rewrite a
+    // checkout that may be a replica from another host.
     assert!(!daemon.convoy_change_requests_settled("flotilla", "split-convoy").await.expect("landing evaluation should succeed"));
     let stored = checkouts.get("checkout-split").await.expect("checkout should exist").status.expect("checkout status");
-    assert_eq!(stored.integration.landed.value, flotilla_resources::ConditionValue::False);
-
-    // Second pass, within the evidence TTL: the recent False is trusted from
-    // cache and still holds Landing.
-    assert!(!daemon.convoy_change_requests_settled("flotilla", "split-convoy").await.expect("landing evaluation should succeed"));
+    assert_eq!(stored.integration.landed.value, flotilla_resources::ConditionValue::True);
+    assert_eq!(stored.integration.landed.observed_at, Some(stale_observed_at));
 }
