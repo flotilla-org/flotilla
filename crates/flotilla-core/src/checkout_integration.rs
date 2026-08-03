@@ -246,24 +246,11 @@ async fn inspect_landed(
     change_request_id: Option<&str>,
     observed_at: &str,
 ) -> (IntegrationCondition, Option<LandedEvidence>, Option<ChangeRequestObservation>) {
-    // Git evidence first: a branch with no commits beyond its base has
-    // nothing to land, so it counts as landed without consulting the forge at
-    // all. This keeps untouched checkouts landable in environments where `gh`
-    // is absent or unauthenticated.
+    // Git evidence alone cannot prove that no change request remains
+    // outstanding. In particular, a crew may publish its work from a branch
+    // other than the checkout's provisioned ref. Always consult the forge;
+    // failure to do so leaves the condition unknown.
     let comparison = compare_branch_to_base(runner, checkout_path, base_ref).await;
-    if change_request_id.is_none() {
-        if let BaseComparison::Counted { base_ref, count: 0 } = &comparison {
-            return (
-                IntegrationCondition::builder()
-                    .value(ConditionValue::True)
-                    .details(vec![format!("branch has no commits beyond {base_ref}")])
-                    .observed_at(observed_at.to_string())
-                    .build(),
-                None,
-                None,
-            );
-        }
-    }
     let args = match change_request_id {
         Some(id) => vec!["pr", "view", id, "--json", "number,state,mergedAt,baseRefName,mergeable"],
         None => {
@@ -406,9 +393,15 @@ async fn compare_branch_to_base(runner: &dyn CommandRunner, checkout_path: &Path
 /// no commits beyond its base: "work exists but no change request is visible
 /// yet" is not landed — the observation may simply predate the change request
 /// (absence of evidence, not evidence of absence). The nothing-beyond-base
-/// case is answered before the forge lookup and never reaches here.
+/// case is true only after the forge lookup has also found no associated
+/// change request.
 fn landed_without_change_request(comparison: &BaseComparison, observed_at: &str) -> IntegrationCondition {
     match comparison {
+        BaseComparison::Counted { base_ref, count: 0 } => IntegrationCondition::builder()
+            .value(ConditionValue::True)
+            .details(vec![format!("no change request exists; branch has no commits beyond {base_ref}")])
+            .observed_at(observed_at.to_string())
+            .build(),
         BaseComparison::Counted { base_ref, count } => IntegrationCondition::builder()
             .value(ConditionValue::False)
             .details(vec![format!("no change request exists; {count} commit{} beyond {base_ref}", if *count == 1 { "" } else { "s" })])
@@ -443,13 +436,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untouched_branch_is_landed_without_consulting_the_forge() {
-        // One response only: the MockRunner panics on extra calls, so this
-        // also asserts gh is never invoked for a branch with nothing beyond
-        // its base — landing must not depend on forge availability when there
-        // is nothing to land.
-        let landed = landed_with_responses(vec![Ok("0".into())]).await;
+    async fn untouched_branch_is_landed_after_forge_reports_no_change_request() {
+        let runner = MockRunner::new(vec![Ok("0".into()), Ok("[]".into())]);
+        let (landed, _, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, "2026-07-27T00:00:00Z").await;
+
         assert_eq!(landed.value, ConditionValue::True);
+        assert_eq!(runner.calls()[1].0, "gh");
+    }
+
+    #[tokio::test]
+    async fn open_associated_change_request_from_another_branch_holds_landing_when_spec_ref_is_at_base() {
+        let runner =
+            MockRunner::new(vec![Ok("0".into()), Ok(r#"{"number":1338,"state":"OPEN","mergedAt":null,"baseRefName":"main"}"#.into())]);
+        let (landed, _, change_request) =
+            inspect_landed(&runner, Path::new("/checkout"), "provisioned-ref", Some("main"), Some("1338"), "2026-07-27T00:00:00Z").await;
+
+        assert_eq!(landed.value, ConditionValue::False);
+        assert_eq!(change_request.expect("associated change request should be observed").state, ChangeRequestState::Open);
+        assert_eq!(runner.calls()[1].1[2], "1338");
+    }
+
+    #[tokio::test]
+    async fn untouched_branch_is_unknown_when_forge_cannot_be_consulted() {
+        let landed = landed_with_responses(vec![Ok("0".into()), Err("authentication unavailable".into())]).await;
+        assert_eq!(landed.value, ConditionValue::Unknown);
     }
 
     #[tokio::test]

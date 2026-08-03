@@ -5435,6 +5435,81 @@ async fn landing_settlement_uses_latched_terminal_change_request_after_stale_rep
 }
 
 #[tokio::test]
+async fn completion_pr_from_another_branch_holds_landing_when_checkout_spec_ref_is_at_base() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/provisioned-ref\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/provisioned-ref..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("0\n".into()))
+        .on_run(
+            "gh",
+            &["pr", "view", "1338", "--json", "number,state,mergedAt,baseRefName,mergeable"],
+            Ok(r#"{"number":1338,"state":"OPEN","mergedAt":null,"baseRefName":"main"}"#.into()),
+        )
+        .build();
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(&config_base)),
+        fake_discovery_with_runner(false, Arc::new(runner)),
+        HostName::local(),
+    )
+    .await;
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    let convoy = convoys
+        .create(
+            &empty_input_meta("different-pr-branch"),
+            &ConvoySpec::builder()
+                .workflow_ref("review-and-fix".to_string())
+                .repositories(vec![ConvoyRepositorySpec::builder()
+                    .url("https://github.com/flotilla-org/flotilla".to_string())
+                    .repo_ref(flotilla_resources::RepositoryKey("repo".to_string()))
+                    .source_ref("main".to_string())
+                    .target_ref("main".to_string())
+                    .workspace_slug("flotilla".to_string())
+                    .subpaths(Vec::new())
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("create convoy");
+    let finished_at = chrono::Utc::now();
+    let mut status = ConvoyStatus::default();
+    status.crew_work.insert(
+        "work".to_string(),
+        BTreeMap::from([(
+            "coder".to_string(),
+            CrewWorkState::builder()
+                .phase(CrewWorkPhase::Done)
+                .finished_at(finished_at)
+                .message("https://github.com/flotilla-org/flotilla/pull/1338".to_string())
+                .build(),
+        )]),
+    );
+    convoys.update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &status).await.expect("record completion PR");
+    create_ready_observed_checkout_for_convoy(
+        &daemon,
+        "flotilla",
+        "different-pr-branch",
+        "checkout-different-pr-branch",
+        "/repo",
+        "provisioned-ref",
+    )
+    .await;
+
+    assert!(
+        !daemon.convoy_change_requests_settled("flotilla", "different-pr-branch").await.expect("evaluate settlement"),
+        "the open completion PR must hold Landing even though its head differs from the checkout spec ref"
+    );
+}
+
+#[tokio::test]
 async fn convoy_reclaim_refuses_when_missing_path_leaves_no_integration_evidence() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");

@@ -41,16 +41,16 @@ use flotilla_resources::{
     watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout,
     CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec,
-    ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, Environment as ResourceEnvironment,
-    EnvironmentPhase, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
-    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
-    IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
-    Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
-    ResourceObject, ResourceProvenance, SystemClock, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
-    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase,
+    Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
+    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
+    PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource,
+    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SystemClock, TerminalBrief, TerminalCrewContext,
+    TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent,
+    WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
+    HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -1663,6 +1663,46 @@ fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<Strin
 
 fn checkout_path(checkout: &ResourceObject<ResourceCheckout>) -> Option<&str> {
     checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
+}
+
+fn convoy_change_request_id_for_checkout(
+    convoy: &ResourceObject<ResourceConvoy>,
+    checkout: &ResourceObject<ResourceCheckout>,
+) -> Option<String> {
+    if let Some(id) = checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL) {
+        return Some(id.clone());
+    }
+    if let Some(change_request) =
+        convoy.spec.change_request.as_ref().filter(|change_request| change_request.repository_ref == *checkout.spec.repo_ref())
+    {
+        return Some(change_request.id.clone());
+    }
+
+    let repository = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref())?;
+    convoy
+        .status
+        .as_ref()?
+        .crew_work
+        .values()
+        .flat_map(BTreeMap::values)
+        .filter(|work| work.phase == CrewWorkPhase::Done)
+        .filter_map(|work| {
+            let id = change_request_id_from_completion_message(work.message.as_deref()?, &repository.url)?;
+            Some((work.finished_at, id))
+        })
+        .max_by_key(|(finished_at, _)| *finished_at)
+        .map(|(_, id)| id)
+}
+
+fn change_request_id_from_completion_message(message: &str, repository_url: &str) -> Option<String> {
+    let message = message.trim().trim_end_matches(['/', '.', ',', ')', ']']);
+    let repository_url = repository_url.trim().trim_end_matches('/').trim_end_matches(".git");
+    ["pull", "pulls"].into_iter().find_map(|segment| {
+        message
+            .strip_prefix(&format!("{repository_url}/{segment}/"))
+            .filter(|id| !id.is_empty() && id.chars().all(|character| character.is_ascii_digit()))
+            .map(str::to_string)
+    })
 }
 
 fn condition_is_true(condition: &IntegrationCondition) -> bool {
@@ -6168,13 +6208,8 @@ impl InProcessDaemon {
                 Ok(runner) => runner,
                 Err(_) => return Ok(false),
             };
-            let mut integration = inspect_checkout_integration(
-                &*runner,
-                &path,
-                &checkout.spec,
-                checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
-            )
-            .await;
+            let change_request_id = convoy_change_request_id_for_checkout(convoy, checkout);
+            let mut integration = inspect_checkout_integration(&*runner, &path, &checkout.spec, change_request_id.as_deref()).await;
             if let Some(existing) = checkout.status.as_ref() {
                 latch_evidence_backed_integration(&existing.integration, &mut integration);
             }
@@ -6303,13 +6338,8 @@ impl InProcessDaemon {
                     continue;
                 }
             }
-            let mut integration = inspect_checkout_integration(
-                &*runner,
-                &path,
-                &checkout.spec,
-                checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
-            )
-            .await;
+            let change_request_id = convoy_change_request_id_for_checkout(convoy, checkout);
+            let mut integration = inspect_checkout_integration(&*runner, &path, &checkout.spec, change_request_id.as_deref()).await;
             verified = true;
             if let Some(existing) = checkout.status.as_ref() {
                 latch_evidence_backed_integration(&existing.integration, &mut integration);
