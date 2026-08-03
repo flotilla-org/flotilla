@@ -4,7 +4,8 @@ use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers:
 use flotilla_daemon::server::test_support::spawn_in_memory_request_topology;
 use flotilla_protocol::{HostName, PeerConnectionState};
 use flotilla_resources::{
-    watch_resource_kind_replica_sources, Convoy, ConvoySpec, Host, HostSpec, HostStatus, InMemoryBackend, InputMeta, Project, ProjectSpec,
+    watch_resource_kind_replica_sources, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, ConditionValue, Convoy, ConvoySpec, Host,
+    HostSpec, HostStatus, InMemoryBackend, InputMeta, IntegrationCondition, ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey,
     ResourceBackend, ResourceProvenance, SqliteBackend, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec,
 };
 use futures::StreamExt;
@@ -254,6 +255,66 @@ async fn connected_daemons_replicate_home_bound_runtime_kinds_and_deletes() {
     .await
     .expect("reconnect replication timed out");
     drop(reconnected);
+}
+
+#[tokio::test]
+async fn connected_in_process_daemons_replicate_checkout_settlement_evidence() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
+    let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    let feta_checkouts = feta.resource_backend().using::<Checkout>("flotilla");
+    let checkout = feta_checkouts
+        .create(
+            &InputMeta::builder().name("remote-checkout".to_string()).build(),
+            &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "feature/remote".to_string(),
+                path: "/srv/remote/repo".to_string(),
+                repo_ref: RepositoryKey("remote-repo".to_string()),
+                host_ref: "feta".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("create checkout on vessel host");
+    feta_checkouts
+        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Ready,
+            path: Some("/srv/remote/repo".to_string()),
+            integration: flotilla_resources::CheckoutIntegrationStatus {
+                landed: IntegrationCondition::builder().value(ConditionValue::True).build(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("publish checkout settlement evidence on vessel host");
+
+    let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect topology");
+
+    let replicated = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let checkouts =
+                kiwi.resource_backend().including_replicas::<Checkout>("flotilla").list().await.expect("list federated checkouts");
+            if let Some(checkout) = checkouts.items.into_iter().find(|checkout| checkout.object.metadata.name == "remote-checkout") {
+                break checkout;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("checkout did not replicate to authority host");
+
+    assert!(matches!(replicated.provenance, ResourceProvenance::Replica { .. }));
+    assert_eq!(
+        replicated.object.status.as_ref().map(|status| status.integration.landed.value),
+        Some(ConditionValue::True),
+        "checkout settlement evidence must replicate with the resource"
+    );
+    assert!(
+        kiwi.resource_backend().using::<Checkout>("flotilla").list().await.expect("list authority-local checkouts").items.is_empty(),
+        "replication must not re-author the vessel-host checkout on the authority"
+    );
+    drop(topology);
 }
 
 fn project_spec(display_name: &str, workflow: &str) -> ProjectSpec {
