@@ -26,6 +26,7 @@ pub(crate) struct CredentialStore {
     state_dir: PathBuf,
     prepared: Mutex<BTreeSet<(String, String)>>,
     materials: Mutex<BTreeMap<(String, String), String>>,
+    git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, GitConfigFragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
 }
 
@@ -40,6 +41,7 @@ struct GitCredentialContribution {
     preflight: Option<GitCredentialPreflight>,
 }
 
+#[derive(Clone)]
 struct GitConfigFragment {
     target: String,
     content: String,
@@ -54,9 +56,9 @@ struct PendingGitPreflight {
     preflight: GitCredentialPreflight,
 }
 
-fn render_gitconfig(fragments: &[GitConfigFragment]) -> String {
+fn render_gitconfig<'a>(fragments: impl IntoIterator<Item = &'a GitConfigFragment>) -> String {
     fragments
-        .iter()
+        .into_iter()
         .map(|fragment| format!("[credential \"{}\"]\n\thelper = {}\n", fragment.target, fragment.content))
         .collect::<Vec<_>>()
         .join("\n")
@@ -128,6 +130,7 @@ impl CredentialStore {
             state_dir,
             prepared: Mutex::new(BTreeSet::new()),
             materials: Mutex::new(BTreeMap::new()),
+            git_config_fragments: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
         }
     }
@@ -186,7 +189,7 @@ impl CredentialStore {
             }
         }
         let mut env = BTreeMap::new();
-        let mut git_config_fragments = Vec::new();
+        let mut new_git_config_fragments = BTreeMap::new();
         let mut git_config_owner = None;
         let mut pending_git_preflights = Vec::new();
         let mut prepared_cache_keys = Vec::new();
@@ -224,7 +227,7 @@ impl CredentialStore {
             env.extend(delivered.env);
             if let Some(git_credential) = delivered.git_credential {
                 git_config_owner.get_or_insert_with(|| (name.clone(), spec.consumer.adapter_name().to_string(), cache_key.clone()));
-                git_config_fragments.push(git_credential.fragment);
+                new_git_config_fragments.insert(name.clone(), git_credential.fragment);
                 if let Some(preflight) = git_credential.preflight {
                     pending_git_preflights.push(
                         PendingGitPreflight::builder()
@@ -239,8 +242,11 @@ impl CredentialStore {
             }
             prepared_cache_keys.push(cache_key);
         }
-        if !git_config_fragments.is_empty() {
-            let gitconfig = render_gitconfig(&git_config_fragments);
+        if !new_git_config_fragments.is_empty() {
+            let mut fragments_by_environment = self.git_config_fragments.lock().await;
+            let mut composed_fragments = fragments_by_environment.get(environment_ref).cloned().unwrap_or_default();
+            composed_fragments.extend(new_git_config_fragments);
+            let gitconfig = render_gitconfig(composed_fragments.values());
             if let Err(error) = runner.write_file(Path::new(GIT_CONFIG_PATH), &gitconfig).await {
                 let (name, adapter, cache_key) = git_config_owner.expect("Git config fragments have an owner");
                 self.materials.lock().await.remove(&cache_key);
@@ -258,6 +264,7 @@ impl CredentialStore {
                     ));
                 }
             }
+            fragments_by_environment.insert(environment_ref.to_string(), composed_fragments);
         }
         self.prepared.lock().await.extend(prepared_cache_keys);
         Ok(env.into_iter().collect())
@@ -337,6 +344,7 @@ impl CredentialStore {
     pub(crate) async fn forget_environment(&self, environment_ref: &str) -> Result<(), String> {
         self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
+        self.git_config_fragments.lock().await.remove(environment_ref);
         let config_dir = self.registry_configs.lock().await.remove(environment_ref);
         if let Some(config_dir) = config_dir {
             remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
@@ -751,6 +759,15 @@ mod tests {
             (("env-a".to_string(), "model-api".to_string()), "secret-a".to_string()),
             (("env-b".to_string(), "model-api".to_string()), "secret-b".to_string()),
         ]);
+        for environment_ref in ["env-a", "env-b"] {
+            store.git_config_fragments.lock().await.insert(
+                environment_ref.to_string(),
+                BTreeMap::from([("github".to_string(), GitConfigFragment {
+                    target: "https://github.com".to_string(),
+                    content: "!gh auth git-credential".to_string(),
+                })]),
+            );
+        }
 
         store.forget_environment("env-a").await.expect("forget environment");
 
@@ -759,6 +776,7 @@ mod tests {
             store.materials.lock().await.clone(),
             BTreeMap::from([(("env-b".to_string(), "model-api".to_string()), "secret-b".to_string())])
         );
+        assert_eq!(store.git_config_fragments.lock().await.keys().cloned().collect::<Vec<_>>(), vec!["env-b".to_string()]);
     }
 
     #[tokio::test]
@@ -861,6 +879,46 @@ mod tests {
                 && args.iter().any(|arg| arg.contains("host=%s"))
                 && args.iter().any(|arg| arg == "forgejo.lab")
         }));
+    }
+
+    #[tokio::test]
+    async fn gitconfig_keeps_fragments_from_disjoint_preparations_of_one_environment() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::Gh,
+                source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create GitHub credential declaration");
+        create_forgejo_spec(&backend, "lab-forgejo", "https://forgejo.lab", "TEST_FORGEJO_TOKEN").await;
+        let env = Arc::new(TestEnv(BTreeMap::from([
+            ("TEST_GITHUB_TOKEN".to_string(), "github-test-token".to_string()),
+            ("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string()),
+        ])));
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::binary("gh", "/usr/bin/gh"))
+            .with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+
+        store.prepare("env-a", &BTreeSet::from(["github".to_string()]), runner.clone()).await.expect("prepare GitHub credential");
+        store.prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone()).await.expect("prepare Forgejo credential");
+
+        let writes = runner.writes.lock().expect("writes lock");
+        let gitconfig = writes
+            .iter()
+            .rev()
+            .find(|(path, _)| path == Path::new("/run/flotilla/credentials/gitconfig"))
+            .map(|(_, content)| content)
+            .expect("staged shared Git config");
+        assert!(gitconfig.contains("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential"));
+        assert!(gitconfig
+            .contains("[credential \"https://forgejo.lab\"]\n\thelper = !/run/flotilla/credentials/lab-forgejo/git-credential-forgejo"));
     }
 
     #[tokio::test]
