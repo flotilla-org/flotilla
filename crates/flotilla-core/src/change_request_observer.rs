@@ -80,7 +80,7 @@ fn parse_gh_observation(json: &str, observed_at: DateTime<Utc>) -> Result<Change
             ObservedChecks::Pass
         }
     });
-    let actionable_at_head = value["reviewDecision"].as_str().map(|decision| decision == "CHANGES_REQUESTED");
+    let actionable_at_head = value.get("reviewDecision").map(|decision| decision.as_str() == Some("CHANGES_REQUESTED"));
     let mergeable = match value["mergeable"].as_str() {
         Some("MERGEABLE") => Some(ObservedMergeability::Mergeable),
         Some("CONFLICTING") => Some(ObservedMergeability::Conflicting),
@@ -246,7 +246,13 @@ impl ChangeRequestRefresher {
                     .number(subject.number)
                     .observing_authority(self.inner.authority.clone())
                     .build();
-                records.create(&InputMeta::builder().name(name.to_string()).build(), &spec).await.map_err(|error| error.to_string())?
+                match records.create(&InputMeta::builder().name(name.to_string()).build(), &spec).await {
+                    Ok(created) => created,
+                    Err(flotilla_resources::ResourceError::Conflict { .. }) => {
+                        records.get(name).await.map_err(|error| error.to_string())?
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
             }
             Err(error) => return Err(error.to_string()),
         };
@@ -265,11 +271,13 @@ impl ChangeRequestRefresher {
                     .number(subject.number)
                     .observing_authority(self.inner.authority.clone())
                     .build();
-                records
-                    .create(&InputMeta::builder().name(name.to_string()).build(), &spec)
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
+                match records.create(&InputMeta::builder().name(name.to_string()).build(), &spec).await {
+                    Ok(_) => Ok(()),
+                    Err(flotilla_resources::ResourceError::Conflict { .. }) => {
+                        records.get(name).await.map(|_| ()).map_err(|error| error.to_string())
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
             }
             Err(error) => Err(error.to_string()),
         }
@@ -278,7 +286,21 @@ impl ChangeRequestRefresher {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use flotilla_resources::{InMemoryBackend, ResourceBackend};
+
     use super::*;
+
+    struct UnavailableSource;
+
+    #[async_trait]
+    impl ChangeRequestObservationSource for UnavailableSource {
+        async fn observe(&self, _subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+            Err("unavailable".to_string())
+        }
+    }
 
     #[test]
     fn parses_gh_observation_vocabulary() {
@@ -301,5 +323,40 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(status.checks.value, Some(ObservedChecks::Pass));
+    }
+
+    #[test]
+    fn explicit_null_review_decision_is_not_actionable() {
+        let status = parse_gh_observation(
+            r#"{"state":"OPEN","headRefOid":"abc","statusCheckRollup":[],"reviewDecision":null,"mergeable":"MERGEABLE"}"#,
+            "2026-08-03T20:00:00Z".parse().expect("time"),
+        )
+        .expect("parse");
+        assert_eq!(status.review.actionable_at_head.value, Some(false));
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_demands_converge_on_one_authority_record() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "authority".to_string(),
+            Arc::new(UnavailableSource),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let subject = ChangeRequestRef {
+            namespace: "flotilla".to_string(),
+            service: "github.com".to_string(),
+            scope: "flotilla-org/flotilla".to_string(),
+            number: 1366,
+        };
+        let (first, second) = tokio::join!(
+            refresher.demand(uuid::Uuid::new_v4(), subject.clone(), None),
+            refresher.demand(uuid::Uuid::new_v4(), subject, None),
+        );
+        first.expect("first demand");
+        second.expect("concurrent demand");
+        assert_eq!(backend.using::<ChangeRequest>("flotilla").list().await.expect("list CRs").items.len(), 1);
+        assert_eq!(refresher.active_demands().await, 2);
     }
 }
