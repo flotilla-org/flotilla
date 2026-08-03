@@ -66,9 +66,32 @@ use super::{
     resource_http::serve_resource_http,
     shared::{sync_peer_query_state, write_message, SocketPeerSender},
     test_support::{apply_convoy_replica_feed, seed_trusted_remote_convoy_project},
-    AcceptErrorBackoff, DaemonServer, PeerConnectionEvent, ACCEPT_ERROR_INITIAL_BACKOFF, ACCEPT_ERROR_MAX_BACKOFF,
+    AcceptErrorBackoff, BoundSocketGuard, DaemonServer, PeerConnectionEvent, ACCEPT_ERROR_INITIAL_BACKOFF, ACCEPT_ERROR_MAX_BACKOFF,
     CONNECTION_PREFACE_TIMEOUT, HELLO_HANDSHAKE_TIMEOUT,
 };
+
+#[tokio::test]
+async fn socket_guard_does_not_unlink_replacement_listener() {
+    let dir = TestSocketDir::new();
+    let socket_path = dir.socket_path("daemon.sock");
+    let first_listener = match tokio::net::UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping socket_guard_does_not_unlink_replacement_listener: unix socket bind not permitted: {error}");
+            return;
+        }
+        Err(error) => panic!("bind first listener: {error}"),
+    };
+    let guard = BoundSocketGuard::new(socket_path.clone()).expect("guard first listener");
+
+    std::fs::remove_file(&socket_path).expect("unlink first listener path");
+    let replacement_listener = tokio::net::UnixListener::bind(&socket_path).expect("bind replacement listener");
+    drop(guard);
+
+    assert!(socket_path.exists(), "old listener cleanup must preserve the replacement socket");
+    drop(replacement_listener);
+    drop(first_listener);
+}
 
 #[test]
 fn daemon_publishes_its_actual_socket_path_for_remote_dialers() {

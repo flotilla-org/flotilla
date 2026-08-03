@@ -13,6 +13,7 @@ pub mod test_support;
 
 use std::{
     collections::HashMap,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -50,6 +51,35 @@ const CONNECTION_PREFACE_TIMEOUT: Duration = Duration::from_secs(10);
 const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_ERROR_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+struct BoundSocketGuard {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl BoundSocketGuard {
+    fn new(path: PathBuf) -> Result<Self, String> {
+        let metadata =
+            std::fs::symlink_metadata(&path).map_err(|error| format!("failed to identify bound socket {}: {error}", path.display()))?;
+        Ok(Self { path, device: metadata.dev(), inode: metadata.ino() })
+    }
+}
+
+impl Drop for BoundSocketGuard {
+    fn drop(&mut self) {
+        let still_owned = std::fs::symlink_metadata(&self.path)
+            .map(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+            .unwrap_or(false);
+        if still_owned {
+            if let Err(error) = std::fs::remove_file(&self.path) {
+                warn!(path = %self.path.display(), %error, "failed to remove owned socket file on shutdown");
+            }
+        } else {
+            warn!(path = %self.path.display(), "daemon socket path no longer names this server's socket; leaving it untouched");
+        }
+    }
+}
 
 fn is_reverse_peer_resource_socket_name(name: &str) -> bool {
     name.strip_prefix(".peer-").is_some_and(|hash| hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -386,6 +416,7 @@ impl DaemonServer {
         }
 
         let listener = UnixListener::bind(&self.socket_path).map_err(|e| format!("failed to bind socket: {e}"))?;
+        let _socket_guard = BoundSocketGuard::new(self.socket_path.clone())?;
 
         publish_socket_path(&self.socket_discovery_path, &self.socket_path)?;
 
@@ -403,7 +434,6 @@ impl DaemonServer {
         let shutdown_tx = self.shutdown_tx;
         let mut shutdown_rx = self.shutdown_rx;
         let idle_timeout = self.idle_timeout;
-        let socket_path = self.socket_path.clone();
         let client_notify = self.client_notify;
         let peer_data_tx = self.peer_data_tx;
         let agent_state_store = self.agent_state_store;
@@ -535,11 +565,6 @@ impl DaemonServer {
                     break;
                 }
             }
-        }
-
-        // Clean up socket file on shutdown
-        if let Err(e) = std::fs::remove_file(&socket_path) {
-            warn!(err = %e, "failed to remove socket file on shutdown");
         }
 
         info!("daemon server stopped");

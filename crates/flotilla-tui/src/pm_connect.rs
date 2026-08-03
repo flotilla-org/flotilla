@@ -328,7 +328,16 @@ pub async fn run(
             if require_host_daemon {
                 crate::socket::connect_required_host_daemon_with_surface(socket_path, surface).await
             } else {
-                crate::socket::connect_or_spawn_with_surface(socket_path, config_dir, config_dir_override, socket_override, surface).await
+                let state_dir = flotilla_core::path_policy::PathPolicy::from_process_env().state_dir;
+                crate::socket::connect_or_spawn_with_surface(
+                    socket_path,
+                    config_dir,
+                    state_dir.as_path(),
+                    config_dir_override,
+                    socket_override,
+                    surface,
+                )
+                .await
             }
             .map(|daemon| daemon as Arc<dyn DaemonHandle>)
         },

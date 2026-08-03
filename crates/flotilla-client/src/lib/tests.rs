@@ -162,7 +162,8 @@ async fn connect_or_spawn_never_spawns_over_daemon_that_appeared_during_lock_con
 
     let client_socket = socket_path.clone();
     let client_dir = dir.path().to_path_buf();
-    let client_task = tokio::spawn(async move { connect_or_spawn(&client_socket, &client_dir, None, Some(&client_socket)).await });
+    let client_task =
+        tokio::spawn(async move { connect_or_spawn(&client_socket, &client_dir, &client_dir, None, Some(&client_socket)).await });
 
     // Give A time to run its first probe (nothing listening) and block on the lock.
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -227,6 +228,28 @@ async fn required_host_daemon_connection_never_enters_the_spawn_path() {
 }
 
 #[tokio::test]
+async fn connect_or_spawn_reports_live_daemon_with_missing_socket() {
+    use std::os::fd::AsRawFd;
+
+    let dir = TestSocketDir::new();
+    let socket_path = dir.socket_path("missing-daemon.sock");
+    let lifecycle_path = dir.path().join(flotilla_core::DAEMON_LIFECYCLE_LOCK_FILE);
+    let lifecycle =
+        std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lifecycle_path).expect("open lifecycle lock");
+    // SAFETY: the file owns this descriptor for the rest of the test.
+    assert_eq!(unsafe { libc::flock(lifecycle.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0, "hold lifecycle lock");
+
+    let error = connect_or_spawn(&socket_path, dir.path(), dir.path(), None, Some(&socket_path))
+        .await
+        .err()
+        .expect("a live daemon with no socket should be diagnosed");
+
+    assert!(error.contains("daemon process is alive"), "unexpected error: {error}");
+    assert!(error.contains("socket is missing or unreachable"), "unexpected error: {error}");
+    assert!(!socket_path.exists(), "the client must not spawn a competing daemon");
+}
+
+#[tokio::test]
 async fn connect_or_spawn_reports_wedged_daemon_instead_of_hanging_or_respawning() {
     let dir = TestSocketDir::new();
     let socket_path = dir.socket_path("daemon.sock");
@@ -248,7 +271,7 @@ async fn connect_or_spawn_reports_wedged_daemon_instead_of_hanging_or_respawning
         std::future::pending::<()>().await;
     });
 
-    let error = match connect_or_spawn(&socket_path, dir.path(), None, Some(&socket_path)).await {
+    let error = match connect_or_spawn(&socket_path, dir.path(), dir.path(), None, Some(&socket_path)).await {
         Ok(_) => panic!("a wedged daemon must surface an error, not hang or be replaced"),
         Err(error) => error,
     };
@@ -395,7 +418,7 @@ async fn connect_or_spawn_rejects_existing_daemon_protocol_version_mismatch() {
             .expect("write stale daemon hello");
     });
 
-    let result = connect_or_spawn(&socket_path, dir.path(), None, Some(&socket_path)).await;
+    let result = connect_or_spawn(&socket_path, dir.path(), dir.path(), None, Some(&socket_path)).await;
     server_task.await.expect("join server task");
 
     let error = match result {

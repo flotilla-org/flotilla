@@ -6,12 +6,12 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use flotilla_core::DAEMON_LIFECYCLE_LOCK_FILE;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 const ACTIVE_RUN_FILE: &str = "flotillad-active-run.json";
 const HISTORY_FILE: &str = "flotillad-abnormal-exits.json";
-const LOCK_FILE: &str = "flotillad-lifecycle.lock";
 pub(crate) const ABNORMAL_RESTART_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -48,7 +48,7 @@ impl DaemonLifecycle {
 
     fn begin_at(state_dir: &Path, now: DateTime<Utc>) -> Result<Self, String> {
         fs::create_dir_all(state_dir).map_err(|error| format!("create daemon state directory {}: {error}", state_dir.display()))?;
-        let lock_path = state_dir.join(LOCK_FILE);
+        let lock_path = state_dir.join(DAEMON_LIFECYCLE_LOCK_FILE);
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)

@@ -83,3 +83,34 @@ fn stable_socket_discovery_path() -> PathBuf {
     let home_policy = PathPolicy::from_env(|key| if key == "HOME" { std::env::var_os(key) } else { None });
     home_policy.config_dir.into_path_buf().join(DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsRawFd;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn lifecycle_loser_never_removes_live_daemon_socket() {
+        let temp = TempDir::new().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let config_dir = temp.path().join("config");
+        let socket_path = config_dir.join("run/flotilla.sock");
+        std::fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("create socket parent");
+        std::fs::write(&socket_path, "owned by live daemon").expect("create live socket stand-in");
+
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        let lock_path = state_dir.join(flotilla_core::DAEMON_LIFECYCLE_LOCK_FILE);
+        let lifecycle =
+            std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lock_path).expect("open lifecycle lock");
+        // SAFETY: the file owns this descriptor for the rest of the test.
+        assert_eq!(unsafe { libc::flock(lifecycle.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0, "hold lifecycle lock");
+
+        let error = run(&socket_path, &config_dir, &state_dir, 0).await.expect_err("competing daemon must lose lifecycle lock");
+
+        assert!(error.contains("another flotillad process holds the lifecycle lock"), "unexpected error: {error}");
+        assert_eq!(std::fs::read_to_string(&socket_path).expect("live socket stand-in survives"), "owned by live daemon");
+    }
+}
