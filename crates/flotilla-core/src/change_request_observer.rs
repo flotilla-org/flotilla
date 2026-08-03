@@ -7,7 +7,10 @@ use flotilla_resources::{
     change_request_record_name, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, InputMeta,
     Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ResourceBackend, ResourceProvenance,
 };
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, Notify},
+    task::JoinHandle,
+};
 
 use crate::providers::{run, CommandRunner};
 
@@ -127,6 +130,7 @@ impl Default for ChangeRequestRefreshCadence {
 
 struct ActiveRefresh {
     demands: HashMap<uuid::Uuid, Option<DateTime<Utc>>>,
+    wake: Arc<Notify>,
     task: JoinHandle<()>,
 }
 
@@ -178,12 +182,19 @@ impl ChangeRequestRefresher {
         let mut active = self.inner.active.lock().await;
         if let Some(refresh) = active.get_mut(&subject) {
             refresh.demands.insert(subscription_id, freshness);
+            if freshness.is_some() {
+                refresh.wake.notify_one();
+            }
             return Ok(());
         }
         let this = self.clone();
         let task_subject = subject.clone();
         let task = tokio::spawn(async move { this.refresh_loop(task_subject).await });
-        active.insert(subject, ActiveRefresh { demands: HashMap::from([(subscription_id, freshness)]), task });
+        active.insert(subject, ActiveRefresh {
+            demands: HashMap::from([(subscription_id, freshness)]),
+            wake: Arc::new(Notify::new()),
+            task,
+        });
         Ok(())
     }
 
@@ -225,45 +236,50 @@ impl ChangeRequestRefresher {
                     } else {
                         self.inner.cadence.state
                     };
-                    tokio::time::sleep(delay).await;
+                    if !self.wait_for_next(&subject, delay).await {
+                        break;
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "change request observation failed");
-                    tokio::time::sleep(self.inner.cadence.checks_pending).await;
+                    if !self.wait_for_next(&subject, self.inner.cadence.checks_pending).await {
+                        break;
+                    }
                 }
             }
         }
     }
 
+    async fn wait_for_next(&self, subject: &ChangeRequestRef, delay: Duration) -> bool {
+        let Some(wake) = self.inner.active.lock().await.get(subject).map(|refresh| Arc::clone(&refresh.wake)) else {
+            return false;
+        };
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            () = wake.notified() => {}
+        }
+        true
+    }
+
     async fn publish(&self, subject: &ChangeRequestRef, name: &str, status: ChangeRequestStatus) -> Result<(), String> {
         let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
-        let current = match records.get(name).await {
-            Ok(current) => current,
-            Err(flotilla_resources::ResourceError::NotFound { .. }) => {
-                let spec = ChangeRequestSpec::builder()
-                    .service(subject.service.clone())
-                    .scope(subject.scope.clone())
-                    .number(subject.number)
-                    .observing_authority(self.inner.authority.clone())
-                    .build();
-                match records.create(&InputMeta::builder().name(name.to_string()).build(), &spec).await {
-                    Ok(created) => created,
-                    Err(flotilla_resources::ResourceError::Conflict { .. }) => {
-                        records.get(name).await.map_err(|error| error.to_string())?
-                    }
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
-            Err(error) => return Err(error.to_string()),
-        };
+        let current = self.get_or_create_record(subject, name).await?;
         records.update_status(name, &current.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
         Ok(())
     }
 
     async fn ensure_record(&self, subject: &ChangeRequestRef, name: &str) -> Result<(), String> {
+        self.get_or_create_record(subject, name).await.map(|_| ())
+    }
+
+    async fn get_or_create_record(
+        &self,
+        subject: &ChangeRequestRef,
+        name: &str,
+    ) -> Result<flotilla_resources::ResourceObject<ChangeRequest>, String> {
         let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
         match records.get(name).await {
-            Ok(_) => Ok(()),
+            Ok(current) => Ok(current),
             Err(flotilla_resources::ResourceError::NotFound { .. }) => {
                 let spec = ChangeRequestSpec::builder()
                     .service(subject.service.clone())
@@ -272,10 +288,8 @@ impl ChangeRequestRefresher {
                     .observing_authority(self.inner.authority.clone())
                     .build();
                 match records.create(&InputMeta::builder().name(name.to_string()).build(), &spec).await {
-                    Ok(_) => Ok(()),
-                    Err(flotilla_resources::ResourceError::Conflict { .. }) => {
-                        records.get(name).await.map(|_| ()).map_err(|error| error.to_string())
-                    }
+                    Ok(created) => Ok(created),
+                    Err(flotilla_resources::ResourceError::Conflict { .. }) => records.get(name).await.map_err(|error| error.to_string()),
                     Err(error) => Err(error.to_string()),
                 }
             }
@@ -286,7 +300,10 @@ impl ChangeRequestRefresher {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use async_trait::async_trait;
     use flotilla_resources::{InMemoryBackend, ResourceBackend};
@@ -299,6 +316,23 @@ mod tests {
     impl ChangeRequestObservationSource for UnavailableSource {
         async fn observe(&self, _subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
             Err("unavailable".to_string())
+        }
+    }
+
+    struct CountingSource(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl ChangeRequestObservationSource for CountingSource {
+        async fn observe(&self, _subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let observed_at = Utc::now();
+            Ok(ChangeRequestStatus {
+                state: Observation::known(ObservedChangeRequestState::Open, observed_at),
+                head_sha: Observation::known("abc".to_string(), observed_at),
+                checks: Observation::known(ObservedChecks::Pass, observed_at),
+                review: ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, observed_at) },
+                mergeable: Observation::known(ObservedMergeability::Mergeable, observed_at),
+            })
         }
     }
 
@@ -358,5 +392,40 @@ mod tests {
         second.expect("concurrent demand");
         assert_eq!(backend.using::<ChangeRequest>("flotilla").list().await.expect("list CRs").items.len(), 1);
         assert_eq!(refresher.active_demands().await, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_freshness_demand_preempts_existing_state_cadence_sleep() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresher = ChangeRequestRefresher::new(
+            backend,
+            "authority".to_string(),
+            Arc::new(CountingSource(Arc::clone(&calls))),
+            ChangeRequestRefreshCadence {
+                state: Duration::from_secs(90),
+                checks_pending: Duration::from_secs(15),
+                freshness_demanded: Duration::from_secs(10),
+                stale_after: Duration::from_secs(180),
+            },
+        );
+        let subject = ChangeRequestRef {
+            namespace: "flotilla".to_string(),
+            service: "github.com".to_string(),
+            scope: "flotilla-org/flotilla".to_string(),
+            number: 1366,
+        };
+        refresher.demand(uuid::Uuid::new_v4(), subject.clone(), None).await.expect("initial demand");
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        refresher.demand(uuid::Uuid::new_v4(), subject, Some(Utc::now())).await.expect("late freshness demand");
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "freshness demand must preempt the remaining 85-second sleep");
     }
 }
