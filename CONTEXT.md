@@ -509,6 +509,50 @@ are layered data, not new objects.
 _Avoid_: Rule (that is a leaf bound to a wake or crew turn), expression
 language.
 
+**World Terminal**:
+An **Observation** about a workflow's artifact that makes the work genuinely
+over (`cr.merged`, `cr.closed`) — the only legal right-hand side of an
+**Exit Table** (ADR 0028). Facts about the convoy's own effort (budget,
+staleness) are never world terminals: budget is a delivery policy, staleness
+an attention flag, give-up an explicit reap.
+_Avoid_: Completion (the admission-time stage), done.
+
+**Exit Table**:
+A workflow definition's declared exit: named **Dispositions** each bound to
+one **World Terminal** leaf; the first to fire writes `Landed` and records
+its name (ADR 0028). `exit: claim` is the declarable degenerate case for
+artifact-less work.
+_Avoid_: Success criteria, completion condition.
+
+**Durability Fence**:
+The obligation a **Settlement Claim** carries: everything the convoy will
+ever need again is durable at claim time — commits pushed, session log
+flushed (ADR 0028). Enforcement flags rather than rejects; delivery restores
+durable records only, and work not durable at the fence is legitimately
+lost.
+_Avoid_: Checkpoint, sync.
+
+**Delivery Ladder**:
+The degradation ladder ensure-flavored turn delivery walks to restore agent
+context: warm session → adapter resume from the session log → fresh agent
+with a reconstructed brief, the never-fails floor (ADR 0028). Every delivery
+records its rung; rung selection is an experiment, not an edict.
+_Avoid_: Retry, failover.
+
+**Leaf Engine**:
+The single daemon-side event-delivery mechanism evaluating **Condition
+Leaves** for all watcher kinds — hanging `wait` callers and parked convoys
+(the `Landing`/`Anchored` reconcilers) alike (ADR 0028; built by #1322). Its
+leaf enumeration is the shared legal vocabulary for **Exit Tables**, wakeups,
+and waits.
+_Avoid_: Event bus (there is no second one — ADR 0027), scheduler.
+
+**Park Depth**:
+Where on the vessel-is-a-cache spectrum a parked vessel sits: warm process →
+suspended vessel → no vessel, logs archived (ADR 0028). Depth changes
+delivery latency and re-provisioning work, never what `Landing` means.
+_Avoid_: Hibernation tier, vessel state (the vessel has its own lifecycle).
+
 ## External Collaborators
 
 These are sibling products in separate repositories, reached over
