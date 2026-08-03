@@ -175,7 +175,7 @@ async fn maintain_and_publish(
         ),
     }
     if let Some(health) = observation.changed {
-        apply_status_patch(hosts, host_id, &HostStatusPatch::SleepInhibition { health }).await?;
+        apply_status_patch(hosts, host_id, &HostStatusPatch::SleepInhibition { health, observed_at: chrono::Utc::now() }).await?;
     }
     Ok(())
 }
@@ -468,7 +468,7 @@ fn platform_inhibitor_commands(_daemon_pid: u32) -> Result<Vec<InhibitorCommand>
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
 
     use chrono::Utc;
     use flotilla_protocol::{NodeId, PlacementDecision, PlacementTargetHost, PrincipalRef};
@@ -483,7 +483,9 @@ mod tests {
         states: mpsc::UnboundedSender<bool>,
     }
 
-    struct FailingInhibitor;
+    struct ScriptedInhibitor {
+        results: VecDeque<Result<SleepInhibitionHealth, String>>,
+    }
 
     #[async_trait]
     impl SleepInhibitor for RecordingInhibitor {
@@ -494,9 +496,9 @@ mod tests {
     }
 
     #[async_trait]
-    impl SleepInhibitor for FailingInhibitor {
+    impl SleepInhibitor for ScriptedInhibitor {
         async fn maintain(&mut self, _required: bool) -> Result<SleepInhibitionHealth, String> {
-            Err("polkit denied".to_string())
+            self.results.pop_front().expect("scripted inhibitor result")
         }
     }
 
@@ -751,21 +753,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn three_consecutive_failures_publish_a_failed_host_condition() {
+    async fn persistent_failure_publishes_a_host_condition_that_recovery_clears() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let hosts = backend.using::<Host>(NAMESPACE);
         create_host(&hosts).await;
-        let mut inhibitor = FailingInhibitor;
+        let mut inhibitor = ScriptedInhibitor {
+            results: VecDeque::from([
+                Err("polkit denied".to_string()),
+                Err("polkit denied".to_string()),
+                Err("polkit denied".to_string()),
+                Ok(SleepInhibitionHealth::Held),
+            ]),
+        };
         let mut tracker = InhibitionHealthTracker::default();
 
         for _ in 0..FAILURE_THRESHOLD {
             maintain_and_publish(&mut inhibitor, true, &mut tracker, &hosts, "test-host").await.expect("publish sleep inhibition health");
         }
 
-        assert_eq!(
-            hosts.get("test-host").await.expect("get host").status.expect("host status").sleep_inhibition,
-            SleepInhibitionHealth::Failed { consecutive_failures: FAILURE_THRESHOLD, message: "polkit denied".to_string() }
-        );
+        let failed = hosts.get("test-host").await.expect("get failed host").status.expect("failed host status");
+        assert_eq!(failed.sleep_inhibition, SleepInhibitionHealth::Failed {
+            consecutive_failures: FAILURE_THRESHOLD,
+            message: "polkit denied".to_string()
+        });
+        assert_eq!(failed.conditions.len(), 1);
+        assert_eq!(failed.conditions[0].condition_type, "SleepInhibition");
+        assert_eq!(failed.conditions[0].reason, "InhibitorNotHeld");
+        assert!(failed.conditions[0].message.contains("sleep inhibition required but not held"));
+        assert!(failed.conditions[0].message.contains("polkit denied"));
+
+        maintain_and_publish(&mut inhibitor, true, &mut tracker, &hosts, "test-host").await.expect("publish sleep inhibition recovery");
+
+        let recovered = hosts.get("test-host").await.expect("get recovered host").status.expect("recovered host status");
+        assert_eq!(recovered.sleep_inhibition, SleepInhibitionHealth::Held);
+        assert!(recovered.conditions.iter().all(|condition| condition.condition_type != "SleepInhibition"));
     }
 
     #[tokio::test]

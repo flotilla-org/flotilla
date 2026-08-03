@@ -41,7 +41,7 @@ use flotilla_resources::{
     InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicationClass, Repository, ResourceBackend,
     ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate,
     WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
-    MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS,
+    MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -1159,6 +1159,13 @@ async fn apply_host_heartbeat_with_credentials(
     }
     if let Some(condition) = resource_replication_content_condition(daemon, namespace).await? {
         conditions.push(condition);
+    }
+    if let Some(condition) = host
+        .status
+        .as_ref()
+        .and_then(|status| status.conditions.iter().find(|condition| condition.condition_type == SLEEP_INHIBITION_CONDITION_TYPE))
+    {
+        conditions.push(condition.clone());
     }
     let status = HostStatus {
         capabilities: host_capabilities(&summary, profile, &held_credentials),
@@ -5914,6 +5921,7 @@ mod tests {
         let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
         flotilla_resources::apply_status_patch(&hosts, &host_id, &flotilla_resources::HostStatusPatch::SleepInhibition {
             health: flotilla_protocol::SleepInhibitionHealth::Failed { consecutive_failures: 3, message: "polkit denied".to_string() },
+            observed_at: Utc::now(),
         })
         .await
         .expect("seed sleep inhibition health");
@@ -5923,11 +5931,11 @@ mod tests {
         wait_until_with_timeout(Duration::from_secs(30), || {
             let hosts = hosts.clone();
             let host_id = host_id.clone();
-            async move { hosts.get(&host_id).await.ok().and_then(|host| host.status).is_some_and(|status| status.ready) }
+            async move { hosts.get(&host_id).await.ok().and_then(|host| host.status).is_some_and(|status| status.heartbeat_at.is_some()) }
         })
         .await;
         let status = hosts.get(&host_id).await.expect("get host").status.expect("host status");
-        assert!(status.ready, "heartbeat should mark host ready");
+        assert!(!status.ready, "sleep inhibition failure should keep the host degraded");
         assert_eq!(status.agent_adapters().expect("valid agent adapter capability"), BTreeSet::new());
         assert_eq!(status.capabilities.get("docker"), Some(&json!(false)));
         assert_eq!(status.capabilities.get("terminal_pools"), Some(&json!(["passthrough"])));
@@ -5936,9 +5944,19 @@ mod tests {
         assert!(status.daemon_started_at.is_some());
         assert!(status.disk_free_bytes.is_some());
         assert!(matches!(status.sleep_inhibition, flotilla_protocol::SleepInhibitionHealth::Failed { consecutive_failures: 3, .. }));
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].condition_type, SLEEP_INHIBITION_CONDITION_TYPE);
+        assert!(status.conditions[0].message.contains("polkit denied"));
         assert!(
             status.resource_store.expect("heartbeat should publish resource store diagnostics").event_log_within_retention(),
             "heartbeat should report a bounded resource event log"
+        );
+        let fleet = daemon.fleet_health_internal().await.expect("query fleet health");
+        let local = fleet.hosts.iter().find(|host| host.is_local).expect("local fleet-health row");
+        assert!(
+            local.degraded_conditions.iter().any(|condition| condition.contains("SleepInhibition") && condition.contains("polkit denied")),
+            "fleet health should expose the sleep-inhibition condition: {:?}",
+            local.degraded_conditions
         );
 
         heartbeat.abort();

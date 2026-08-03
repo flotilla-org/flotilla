@@ -14,6 +14,7 @@ pub const AGENT_ADAPTERS_CAPABILITY: &str = "agent_adapters";
 pub const HELD_CREDENTIALS_CAPABILITY: &str = "held_credentials";
 pub const TERMINAL_POOLS_CAPABILITY: &str = "terminal_pools";
 pub const HEARTBEAT_READY_TTL_SECS: i64 = 60;
+pub const SLEEP_INHIBITION_CONDITION_TYPE: &str = "SleepInhibition";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSpec {
@@ -102,6 +103,7 @@ pub enum HostStatusPatch {
     },
     SleepInhibition {
         health: SleepInhibitionHealth,
+        observed_at: DateTime<Utc>,
     },
 }
 
@@ -125,7 +127,27 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 status.daemon_started_at = *daemon_started_at;
                 status.disk_free_bytes = *disk_free_bytes;
             }
-            Self::SleepInhibition { health } => status.sleep_inhibition.clone_from(health),
+            Self::SleepInhibition { health, observed_at } => {
+                status.sleep_inhibition.clone_from(health);
+                match health {
+                    SleepInhibitionHealth::Failed { message, .. } => {
+                        status.conditions.retain(|condition| condition.condition_type != SLEEP_INHIBITION_CONDITION_TYPE);
+                        status.conditions.push(
+                            HostCondition::builder()
+                                .condition_type(SLEEP_INHIBITION_CONDITION_TYPE)
+                                .value(ConditionValue::False)
+                                .reason("InhibitorNotHeld")
+                                .message(format!("sleep inhibition required but not held ({message})"))
+                                .observed_at(*observed_at)
+                                .build(),
+                        );
+                    }
+                    SleepInhibitionHealth::Held | SleepInhibitionHealth::NotRequired => {
+                        status.conditions.retain(|condition| condition.condition_type != SLEEP_INHIBITION_CONDITION_TYPE);
+                    }
+                    SleepInhibitionHealth::Acquiring { .. } => {}
+                }
+            }
         }
     }
 }
