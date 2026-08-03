@@ -41,16 +41,16 @@ use flotilla_resources::{
     watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout,
     CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec,
-    ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, Environment as ResourceEnvironment,
-    EnvironmentPhase, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
-    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
-    IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
-    Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
-    ResourceObject, ResourceProvenance, SystemClock, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
-    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase,
+    Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
+    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
+    PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource,
+    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SystemClock, TerminalBrief, TerminalCrewContext,
+    TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent,
+    WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
+    HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -61,7 +61,7 @@ use tracing::{debug, info, warn};
 use crate::{
     agent_adapter::CapabilityTable,
     aggregator_projection::AggregatorProjectionState,
-    checkout_integration::{checkout_path_from_status_and_spec, inspect_checkout_integration},
+    checkout_integration::{checkout_path_from_status_and_spec, inspect_checkout_integration, inspect_convoy_checkout_integration},
     config::{ConfigStore, RemoteHostConfig, StaticEnvironmentConfig},
     convert::snapshot_to_proto,
     daemon::{DaemonHandle, QuerySubscription},
@@ -1663,6 +1663,46 @@ fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<Strin
 
 fn checkout_path(checkout: &ResourceObject<ResourceCheckout>) -> Option<&str> {
     checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
+}
+
+fn convoy_change_request_id_for_checkout(
+    convoy: &ResourceObject<ResourceConvoy>,
+    checkout: &ResourceObject<ResourceCheckout>,
+) -> Option<String> {
+    if let Some(id) = checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL) {
+        return Some(id.clone());
+    }
+    if let Some(change_request) =
+        convoy.spec.change_request.as_ref().filter(|change_request| change_request.repository_ref == *checkout.spec.repo_ref())
+    {
+        return Some(change_request.id.clone());
+    }
+
+    let repository = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref())?;
+    convoy
+        .status
+        .as_ref()?
+        .crew_work
+        .values()
+        .flat_map(BTreeMap::values)
+        .filter(|work| work.phase == CrewWorkPhase::Done)
+        .filter_map(|work| {
+            let id = change_request_id_from_completion_message(work.message.as_deref()?, &repository.url)?;
+            Some((work.finished_at, id))
+        })
+        .max_by_key(|(finished_at, _)| *finished_at)
+        .map(|(_, id)| id)
+}
+
+fn change_request_id_from_completion_message(message: &str, repository_url: &str) -> Option<String> {
+    let repository_url = repository_url.trim().trim_end_matches('/').trim_end_matches(".git");
+    ["pull", "pulls"].into_iter().find_map(|segment| {
+        let prefix = format!("{repository_url}/{segment}/");
+        message.match_indices(&prefix).find_map(|(start, _)| {
+            let id = message[start + prefix.len()..].chars().take_while(char::is_ascii_digit).collect::<String>();
+            (!id.is_empty()).then_some(id)
+        })
+    })
 }
 
 fn condition_is_true(condition: &IntegrationCondition) -> bool {
@@ -6165,10 +6205,11 @@ impl InProcessDaemon {
                     .and_then(|observed_at| chrono::DateTime::parse_from_rfc3339(observed_at).ok())
                     .is_some_and(|observed_at| self.clock.now().signed_duration_since(observed_at) < LANDING_EVIDENCE_TTL);
                 if recent {
-                    if condition_is_true(landed) {
-                        continue;
+                    match landed.value {
+                        ConditionValue::True => continue,
+                        ConditionValue::False => return Ok(false),
+                        ConditionValue::Unknown => {}
                     }
-                    return Ok(false);
                 }
             }
             let Some(path) = checkout_path(checkout).map(|path| Path::new(path).to_path_buf()) else {
@@ -6178,13 +6219,8 @@ impl InProcessDaemon {
                 Ok(runner) => runner,
                 Err(_) => return Ok(false),
             };
-            let mut integration = inspect_checkout_integration(
-                &*runner,
-                &path,
-                &checkout.spec,
-                checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
-            )
-            .await;
+            let change_request_id = convoy_change_request_id_for_checkout(convoy, checkout);
+            let mut integration = inspect_convoy_checkout_integration(&*runner, &path, &checkout.spec, change_request_id.as_deref()).await;
             if let Some(existing) = checkout.status.as_ref() {
                 latch_evidence_backed_integration(&existing.integration, &mut integration);
             }
@@ -6313,13 +6349,8 @@ impl InProcessDaemon {
                     continue;
                 }
             }
-            let mut integration = inspect_checkout_integration(
-                &*runner,
-                &path,
-                &checkout.spec,
-                checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
-            )
-            .await;
+            let change_request_id = convoy_change_request_id_for_checkout(convoy, checkout);
+            let mut integration = inspect_convoy_checkout_integration(&*runner, &path, &checkout.spec, change_request_id.as_deref()).await;
             verified = true;
             if let Some(existing) = checkout.status.as_ref() {
                 latch_evidence_backed_integration(&existing.integration, &mut integration);
@@ -7852,6 +7883,12 @@ impl InProcessDaemon {
             } else if let Some(url) = direct_repository_url {
                 let resolved = async {
                     let repository_spec = self.resolve_repository_remote(&url).await?;
+                    let canonical_url = match repository_spec.identity() {
+                        flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
+                        flotilla_resources::RepositoryIdentity::Local { .. } => {
+                            return Err(format!("repository {url} did not resolve to a remote identity"));
+                        }
+                    };
                     let repo_ref = repository_spec.key();
                     let repository = flotilla_resources::ensure_repository(
                         &self.resource_backend.clone().using::<Repository>(&namespace),
@@ -7870,7 +7907,7 @@ impl InProcessDaemon {
                         .remove(&repo_ref)
                         .expect("repository slug should resolve");
                     Ok::<_, String>(vec![ConvoyRepositorySpec {
-                        url,
+                        url: canonical_url,
                         repo_ref,
                         source_ref: default_ref.clone(),
                         target_ref: default_ref,

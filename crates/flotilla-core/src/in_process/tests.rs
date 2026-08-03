@@ -57,6 +57,37 @@ use crate::{
 
 const TEST_LOCAL_ATTACH_HOST: &str = "local";
 
+#[test]
+fn completion_message_extracts_github_and_forgejo_change_request_urls_from_prose() {
+    assert_eq!(
+        change_request_id_from_completion_message(
+            "Opened [PR #1338](https://github.com/flotilla-org/flotilla/pull/1338); checks are green.",
+            "https://github.com/flotilla-org/flotilla.git",
+        )
+        .as_deref(),
+        Some("1338")
+    );
+    assert_eq!(
+        change_request_id_from_completion_message(
+            "Ready: https://forgejo.lab/fork-issues/zellij/pulls/9 (reviewed)",
+            "https://forgejo.lab/fork-issues/zellij",
+        )
+        .as_deref(),
+        Some("9")
+    );
+}
+
+#[test]
+fn completion_message_ignores_change_request_urls_for_other_repositories() {
+    assert_eq!(
+        change_request_id_from_completion_message(
+            "https://github.com/flotilla-org/other/pull/42",
+            "https://github.com/flotilla-org/flotilla",
+        ),
+        None
+    );
+}
+
 fn attach_plan_text(plan: &flotilla_protocol::ResolvedAttachPlan) -> String {
     plan.0
         .iter()
@@ -4655,7 +4686,7 @@ async fn direct_repository_admission_snapshots_its_resolved_default_branch() {
                 name: "direct-repository".to_string(),
                 workflow_ref: "scratch".to_string(),
                 inputs: Vec::new(),
-                repository_url: Some("https://github.com/flotilla-org/flotilla".to_string()),
+                repository_url: Some("https://GitHub.com/flotilla-org/flotilla.git".to_string()),
                 r#ref: Some("feature/direct".to_string()),
                 project_ref: None,
                 placement_policy: None,
@@ -4669,6 +4700,7 @@ async fn direct_repository_admission_snapshots_its_resolved_default_branch() {
         name: "direct-repository".to_string()
     });
     let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("direct-repository").await.expect("convoy");
+    assert_eq!(convoy.spec.repositories[0].url, "https://github.com/flotilla-org/flotilla");
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");
     assert_eq!(convoy.spec.repositories[0].target_ref, "main");
 }
@@ -4766,7 +4798,7 @@ async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource()
 
     assert_eq!(fixture.create_convoy().await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
     let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("convoy-adopted").await.expect("convoy should exist");
-    assert_eq!(convoy.spec.repositories.first().map(|repo| repo.url.as_str()), Some(ADOPTED_CHECKOUT_REMOTE));
+    assert_eq!(convoy.spec.repositories.first().map(|repo| repo.url.as_str()), Some("https://github.com/flotilla-org/flotilla"));
     assert_eq!(convoy.spec.r#ref.as_deref(), Some("main"));
     assert_eq!(convoy.spec.adopted_checkout_refs.values().next().map(String::as_str), Some("adopted-checkout-convoy-adopted"));
 
@@ -5433,6 +5465,81 @@ async fn landing_settlement_uses_latched_terminal_change_request_after_stale_rep
     assert_eq!(
         stored.status.expect("checkout status").integration.change_request.unwrap().state,
         flotilla_resources::ChangeRequestState::Merged
+    );
+}
+
+#[tokio::test]
+async fn completion_pr_from_another_branch_holds_landing_when_checkout_spec_ref_is_at_base() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/provisioned-ref\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/provisioned-ref..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("0\n".into()))
+        .on_run(
+            "gh",
+            &["pr", "view", "1338", "--json", "number,state,mergedAt,baseRefName,mergeable"],
+            Ok(r#"{"number":1338,"state":"OPEN","mergedAt":null,"baseRefName":"main"}"#.into()),
+        )
+        .build();
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(&config_base)),
+        fake_discovery_with_runner(false, Arc::new(runner)),
+        HostName::local(),
+    )
+    .await;
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    let convoy = convoys
+        .create(
+            &empty_input_meta("different-pr-branch"),
+            &ConvoySpec::builder()
+                .workflow_ref("review-and-fix".to_string())
+                .repositories(vec![ConvoyRepositorySpec::builder()
+                    .url("https://github.com/flotilla-org/flotilla".to_string())
+                    .repo_ref(flotilla_resources::RepositoryKey("repo".to_string()))
+                    .source_ref("main".to_string())
+                    .target_ref("main".to_string())
+                    .workspace_slug("flotilla".to_string())
+                    .subpaths(Vec::new())
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("create convoy");
+    let finished_at = chrono::Utc::now();
+    let mut status = ConvoyStatus::default();
+    status.crew_work.insert(
+        "work".to_string(),
+        BTreeMap::from([(
+            "coder".to_string(),
+            CrewWorkState::builder()
+                .phase(CrewWorkPhase::Done)
+                .finished_at(finished_at)
+                .message("https://github.com/flotilla-org/flotilla/pull/1338".to_string())
+                .build(),
+        )]),
+    );
+    convoys.update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &status).await.expect("record completion PR");
+    create_ready_observed_checkout_for_convoy(
+        &daemon,
+        "flotilla",
+        "different-pr-branch",
+        "checkout-different-pr-branch",
+        "/repo",
+        "provisioned-ref",
+    )
+    .await;
+
+    assert!(
+        !daemon.convoy_change_requests_settled("flotilla", "different-pr-branch").await.expect("evaluate settlement"),
+        "the open completion PR must hold Landing even though its head differs from the checkout spec ref"
     );
 }
 
