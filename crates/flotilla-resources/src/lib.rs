@@ -55,7 +55,7 @@ pub use convoy::{
 pub use credential::{
     CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
-    CREDENTIAL_REF_SESSION_TAG,
+    CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG,
 };
 pub use definition::DefinitionResolver;
 pub use environment::{

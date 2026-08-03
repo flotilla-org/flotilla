@@ -58,6 +58,20 @@ spec:
                         items:
                           type: string
                           minLength: 1
+                      credential_refs:
+                        type: array
+                        uniqueItems: true
+                        items:
+                          type: string
+                          minLength: 1
+                      credential_scopes:
+                        type: object
+                        additionalProperties:
+                          type: array
+                          uniqueItems: true
+                          items:
+                            type: string
+                            minLength: 1
                       depends_on:
                         type: array
                         items:

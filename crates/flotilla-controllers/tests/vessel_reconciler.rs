@@ -119,6 +119,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
+                    credential_scopes: Default::default(),
                     crew: vec![CrewSpec::builder()
                         .role("shell".to_string())
                         .source(CrewSource::Tool { command: "bash".to_string() })
@@ -242,6 +243,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
         depends_on: vec!["implement".to_string()],
         repository_refs: None,
         credential_refs: Default::default(),
+        credential_scopes: Default::default(),
         crew: Vec::new(),
     });
     backend
@@ -493,6 +495,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
+                    credential_scopes: Default::default(),
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
                         .source(CrewSource::Agent {
@@ -671,6 +674,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
+                    credential_scopes: Default::default(),
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
                         .source(CrewSource::Tool { command: "cargo test".to_string() })
@@ -844,6 +848,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
+                    credential_scopes: Default::default(),
                     crew: Vec::new(),
                 }],
             }),
@@ -970,6 +975,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
                     depends_on: Vec::new(),
                     repository_refs: Some(vec![cleat.key()]),
                     credential_refs: Default::default(),
+                    credential_scopes: Default::default(),
                     crew: Vec::new(),
                 }],
             }),
@@ -2307,6 +2313,7 @@ async fn create_convoy_with_labeled_processes(
                         depends_on: Vec::new(),
                         repository_refs: None,
                         credential_refs: Default::default(),
+                        credential_scopes: Default::default(),
                         crew: vec![CrewSpec::builder()
                             .role("coder".to_string())
                             .source(CrewSource::Tool { command: "cargo fmt --check".to_string() })
@@ -2318,6 +2325,7 @@ async fn create_convoy_with_labeled_processes(
                         depends_on: vec!["implement".to_string()],
                         repository_refs: None,
                         credential_refs: Default::default(),
+                        credential_scopes: Default::default(),
                         crew: vec![
                             CrewSpec::builder()
                                 .role("build".to_string())

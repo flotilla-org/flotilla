@@ -40,8 +40,9 @@ use flotilla_resources::{
     Host, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
     InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicationClass, Repository, ResourceBackend,
     ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
-    MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
+    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
+    CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS,
+    SLEEP_INHIBITION_CONDITION_TYPE,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -1721,6 +1722,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             }
         }
         let credential_refs = credential_refs_from_environment(spec)?;
+        let credential_scopes = credential_scopes_from_environment(spec)?;
         let (_, provider) = self
             .state
             .local_registry
@@ -1734,7 +1736,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         let mut environment_variables = spec
             .env
             .iter()
-            .filter(|(name, _)| name.as_str() != CREDENTIAL_REFS_ENV)
+            .filter(|(name, _)| !matches!(name.as_str(), CREDENTIAL_REFS_ENV | CREDENTIAL_SCOPES_ENV))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
         let credential_adapters = match &self.state.credential_store {
@@ -1845,7 +1847,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
 
         let container_id = handle.container_name().map(ToString::to_string).unwrap_or_else(|| format!("flotilla-env-{}", env_id));
         if let Some(store) = &self.state.credential_store {
-            if let Err(error) = store.prepare(name, &credential_refs, handle.runner()).await {
+            if let Err(error) = store.prepare_scoped(name, &credential_refs, &credential_scopes, handle.runner()).await {
                 return Err(discard_failed_environment(&handle, Some(store), self.state.agent_material.as_deref(), name, error)
                     .await
                     .into());
@@ -1966,6 +1968,16 @@ fn credential_refs_from_environment(spec: &flotilla_resources::DockerEnvironment
     spec.env
         .get(CREDENTIAL_REFS_ENV)
         .map(|encoded| serde_json::from_str(encoded).map_err(|error| format!("invalid credential references: {error}")))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn credential_scopes_from_environment(
+    spec: &flotilla_resources::DockerEnvironmentSpec,
+) -> Result<BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>, String> {
+    spec.env
+        .get(CREDENTIAL_SCOPES_ENV)
+        .map(|encoded| serde_json::from_str(encoded).map_err(|error| format!("invalid credential scopes: {error}")))
         .transpose()
         .map(Option::unwrap_or_default)
 }
@@ -2549,11 +2561,21 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let cwd = ExecutionEnvironmentPath::new(&spec.cwd);
         let credential_refs =
             tags.iter().filter(|tag| tag.key == CREDENTIAL_REF_SESSION_TAG).map(|tag| tag.value.clone()).collect::<BTreeSet<_>>();
-        let pool_tags = tags.iter().filter(|tag| tag.key != CREDENTIAL_REF_SESSION_TAG).cloned().collect::<Vec<_>>();
+        let credential_scopes = tags
+            .iter()
+            .find(|tag| tag.key == CREDENTIAL_SCOPES_SESSION_TAG)
+            .map(|tag| serde_json::from_str(&tag.value).map_err(|error| format!("invalid credential scopes: {error}")))
+            .transpose()?
+            .unwrap_or_default();
+        let pool_tags = tags
+            .iter()
+            .filter(|tag| tag.key != CREDENTIAL_REF_SESSION_TAG && tag.key != CREDENTIAL_SCOPES_SESSION_TAG)
+            .cloned()
+            .collect::<Vec<_>>();
         let credential_env = match &self.state.credential_store {
             Some(store) => {
                 let runner = self.runner_for_env(&spec.env_ref)?;
-                store.prepare(&spec.env_ref, &credential_refs, runner).await?
+                store.prepare_scoped(&spec.env_ref, &credential_refs, &credential_scopes, runner).await?
             }
             None if credential_refs.is_empty() => Vec::new(),
             None => return Err("host-local credential store unavailable".to_string()),

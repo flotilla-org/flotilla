@@ -550,7 +550,7 @@ impl HttpClient for ReqwestHttpClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "replay"))]
 pub mod replay;
 
 #[cfg(test)]

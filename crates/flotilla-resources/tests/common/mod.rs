@@ -386,6 +386,7 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
                 depends_on: task.depends_on,
                 repository_refs: task.repository_refs,
                 credential_refs: Default::default(),
+                credential_scopes: Default::default(),
                 crew: task.crew,
             })
             .collect(),

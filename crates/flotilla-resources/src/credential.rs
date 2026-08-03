@@ -7,6 +7,9 @@ use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationC
 pub const CREDENTIAL_REFS_ANNOTATION: &str = "flotilla.work/credential-refs";
 pub const CREDENTIAL_REFS_ENV: &str = "FLOTILLA_CREDENTIAL_REFS";
 pub const CREDENTIAL_REF_SESSION_TAG: &str = "flotilla-credential";
+pub const CREDENTIAL_SCOPES_ANNOTATION: &str = "flotilla.work/credential-scopes";
+pub const CREDENTIAL_SCOPES_ENV: &str = "FLOTILLA_CREDENTIAL_SCOPES";
+pub const CREDENTIAL_SCOPES_SESSION_TAG: &str = "flotilla-credential-scopes";
 
 define_resource!(CredentialSpec, "credentialspecs", CredentialSpecSpec, (), NoStatusPatch, replication = ReplicationClass::Definitions);
 define_resource!(CredentialGrant, "credentialgrants", CredentialGrantSpec, (), NoStatusPatch, replication = ReplicationClass::Definitions);
@@ -25,6 +28,7 @@ pub struct CredentialSpecSpec {
 #[serde(tag = "adapter", rename_all = "kebab-case")]
 pub enum CredentialConsumer {
     Gh,
+    GithubApp { installation_id: u64 },
     Forgejo { api_url: String, username: String },
     Claude,
     Codex,
@@ -35,10 +39,18 @@ impl CredentialConsumer {
     pub fn adapter_name(&self) -> &'static str {
         match self {
             Self::Gh => "gh",
+            Self::GithubApp { .. } => "github-app",
             Self::Forgejo { .. } => "forgejo",
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::DockerRegistry { .. } => "docker-registry",
+        }
+    }
+
+    pub fn delivery_slot(&self) -> &'static str {
+        match self {
+            Self::Gh | Self::GithubApp { .. } => "github",
+            _ => self.adapter_name(),
         }
     }
 }
@@ -56,6 +68,10 @@ pub enum CredentialSource {
         command: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
+    },
+    GithubApp {
+        app_id_path: String,
+        private_key_path: String,
     },
 }
 

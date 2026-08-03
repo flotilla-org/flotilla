@@ -29,6 +29,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 url = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 futures = "0.3"
 visibility = "0.1.1"
 
@@ -40,6 +42,6 @@ flotilla-test-support = { path = "../flotilla-test-support" }
 indexmap = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"
-flotilla-core = { path = "../flotilla-core", features = ["test-support"] }
+flotilla-core = { path = "../flotilla-core", features = ["test-support", "replay"] }
 flotilla-daemon = { path = ".", features = ["test-support"] }
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }

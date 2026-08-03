@@ -35,6 +35,9 @@ pub struct VesselRequirement {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub credential_refs: BTreeSet<String>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credential_scopes: BTreeMap<String, BTreeSet<RepositoryKey>>,
     pub crew: Vec<CrewSpec>,
 }
 

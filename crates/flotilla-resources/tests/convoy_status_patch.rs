@@ -21,6 +21,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                 depends_on: Vec::new(),
                 repository_refs: None,
                 credential_refs: Default::default(),
+                credential_scopes: Default::default(),
                 crew: vec![
                     CrewSpec {
                         role: "coder".to_string(),
@@ -44,6 +45,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                 depends_on: vec!["implement".to_string()],
                 repository_refs: None,
                 credential_refs: Default::default(),
+                credential_scopes: Default::default(),
                 crew: vec![CrewSpec {
                     role: "reviewer".to_string(),
                     source: CrewSource::Agent {
