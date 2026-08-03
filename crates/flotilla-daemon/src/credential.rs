@@ -939,6 +939,50 @@ interactions:
     }
 
     #[tokio::test]
+    async fn github_app_repository_scope_rejections_fail_before_minting() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let non_github_spec = RepositorySpec::remote("https://gitlab.example/flotilla-org/flotilla").expect("non-GitHub repository spec");
+        let non_github_key = non_github_spec.key();
+        backend
+            .clone()
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name("non-github".to_string()).build(), &non_github_spec)
+            .await
+            .expect("create non-GitHub repository");
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner,
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+        let spec = CredentialSpecSpec {
+            consumer: CredentialConsumer::GithubApp { installation_id: 9876 },
+            source: CredentialSource::GithubApp {
+                app_id_path: "/not-read/github-app.id".to_string(),
+                private_key_path: "/not-read/github-app.pem".to_string(),
+            },
+            lifecycle: CredentialLifecycle::Refreshable,
+            placement: CredentialPlacementRequirements::default(),
+        };
+
+        for scope in [None, Some(&BTreeSet::new())] {
+            let error = store.resolve_for_adapter("github-app", &spec, scope).await.expect_err("empty scopes must fail");
+            assert!(error.contains("empty repository scope"), "unexpected error: {error}");
+        }
+        let missing_key = RepositoryKey("missing-repository".to_string());
+        let error = store.github_repository_names(&BTreeSet::from([missing_key])).await.expect_err("missing repository must fail");
+        assert!(error.contains("missing repository"), "unexpected error: {error}");
+        let error = store.github_repository_names(&BTreeSet::from([non_github_key])).await.expect_err("non-GitHub repository must fail");
+        assert!(error.contains("not hosted on github.com"), "unexpected error: {error}");
+        let oversized_scope = (0..501).map(|index| RepositoryKey(format!("repository-{index}"))).collect();
+        let error = store.github_repository_names(&oversized_scope).await.expect_err("oversized repository scope must fail");
+        assert!(error.contains("500-repository API limit"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
     async fn codex_material_is_transformed_by_stdin_login_and_never_passed_through_as_env() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend

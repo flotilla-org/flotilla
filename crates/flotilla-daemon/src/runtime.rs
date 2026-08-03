@@ -2883,6 +2883,23 @@ mod tests {
         )
     }
 
+    #[test]
+    fn docker_environment_metadata_decodes_non_empty_credential_scopes() {
+        let repository = flotilla_resources::RepositoryKey("github.com-flotilla-org-flotilla".to_string());
+        let expected = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository]))]);
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host-a".to_string(),
+            image: "crew:latest".to_string(),
+            declared_agent_adapters: BTreeSet::new(),
+            required_agent_adapters: BTreeSet::new(),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: BTreeMap::from([(CREDENTIAL_SCOPES_ENV.to_string(), serde_json::to_string(&expected).expect("encode credential scopes"))]),
+        };
+
+        assert_eq!(credential_scopes_from_environment(&spec).expect("decode credential scopes"), expected);
+    }
+
     #[tokio::test]
     async fn local_profile_does_not_advertise_docker_without_interior_cleat() {
         use flotilla_core::providers::discovery::{ProviderCategory, ProviderDescriptor};

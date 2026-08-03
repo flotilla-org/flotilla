@@ -1343,12 +1343,15 @@ impl PlacementStrategy {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::{Arc, Mutex},
+    };
 
     use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
     use flotilla_resources::ResourceBackend;
 
-    use super::{legible_waiting_for, VesselReconciler};
+    use super::{environment_with_credentials, legible_waiting_for, VesselReconciler};
 
     #[derive(Clone)]
     struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
@@ -1381,6 +1384,27 @@ mod tests {
             legible_waiting_for("checkout checkout-01HXYZ to become ready".to_string(), Some(&decision)),
             "checkout checkout-01HXYZ to become ready",
             "unrelated names containing the host ref must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn environment_metadata_round_trips_non_empty_credential_scopes() {
+        let repository = flotilla_resources::RepositoryKey("github.com-flotilla-org-flotilla".to_string());
+        let credentials = BTreeSet::from(["github-app".to_string()]);
+        let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository]))]);
+
+        let env = environment_with_credentials(BTreeMap::new(), &credentials, &scopes);
+
+        assert_eq!(
+            serde_json::from_str::<BTreeSet<String>>(&env[flotilla_resources::CREDENTIAL_REFS_ENV]).expect("decode credential refs"),
+            credentials
+        );
+        assert_eq!(
+            serde_json::from_str::<BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>>(
+                &env[flotilla_resources::CREDENTIAL_SCOPES_ENV]
+            )
+            .expect("decode credential scopes"),
+            scopes
         );
     }
 
