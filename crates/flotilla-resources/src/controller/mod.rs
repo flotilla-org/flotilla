@@ -309,6 +309,56 @@ impl<W: Resource, P: Resource> SecondaryWatch for ReplicaLabelMappedWatch<W, P> 
     }
 }
 
+/// Watch federated convoys and enqueue every checkout they currently claim.
+#[derive(Clone)]
+pub struct ReplicaConvoyCheckoutWatch {
+    pub resolver: ReplicaReadResolver<crate::Convoy>,
+}
+
+impl ReplicaConvoyCheckoutWatch {
+    async fn enqueue_checkouts(sender: &mpsc::Sender<String>, convoy: &ResourceObject<crate::Convoy>) -> Result<(), ResourceError> {
+        for checkout_name in crate::expected_checkout_refs(convoy).unwrap_or_default() {
+            sender
+                .send(checkout_name)
+                .await
+                .map_err(|_| ResourceError::other("controller queue closed while forwarding federated convoy checkout event"))?;
+        }
+        Ok(())
+    }
+}
+
+impl SecondaryWatch for ReplicaConvoyCheckoutWatch {
+    type Primary = crate::Checkout;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        sender: mpsc::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            let mut watch = self.resolver.watch().await?;
+            let listed = self.resolver.list().await?;
+            for source in &listed.items {
+                Self::enqueue_checkouts(&sender, &source.object).await?;
+            }
+            while let Some(event) = watch.next().await {
+                let source = match event? {
+                    crate::ReadWatchEvent::Added(source)
+                    | crate::ReadWatchEvent::Modified(source)
+                    | crate::ReadWatchEvent::Deleted(source) => source,
+                };
+                Self::enqueue_checkouts(&sender, &source.object).await?;
+            }
+            Ok(())
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct LabelJoinWatch<W: Resource, P: Resource> {
     pub label_key: &'static str,

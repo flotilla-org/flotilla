@@ -54,7 +54,11 @@ impl CheckoutRuntime for HarnessRuntime {
         Ok(PreparedCheckout { commit: Some("abc123".to_string()), branch_provenance: CheckoutBranchProvenance::CreatedForConvoy })
     }
 
-    async fn inspect_integration(&self, _checkout: &ResourceObject<Checkout>) -> Result<CheckoutIntegrationStatus, String> {
+    async fn inspect_integration(
+        &self,
+        _checkout: &ResourceObject<Checkout>,
+        _convoy: Option<&ResourceObject<Convoy>>,
+    ) -> Result<CheckoutIntegrationStatus, String> {
         self.inspections.fetch_add(1, Ordering::SeqCst);
         if self.fail_inspection {
             return Err("resource says Ready but checkout path is missing".to_string());

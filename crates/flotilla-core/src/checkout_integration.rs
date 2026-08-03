@@ -1,15 +1,25 @@
 use std::{
+    collections::BTreeMap,
     fmt,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use chrono::Utc;
 use flotilla_resources::{
-    ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, CheckoutIntegrationStatus, CheckoutSpec, CheckoutStatus,
-    ConditionValue, IntegrationCondition, LandedEvidence,
+    ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout, CheckoutIntegrationStatus, CheckoutSpec,
+    CheckoutStatus, ConditionValue, Convoy, CrewWorkPhase, IntegrationCondition, LandedEvidence, ResourceObject, CHANGE_REQUEST_ID_LABEL,
 };
 
 use crate::providers::{ChannelLabel, CommandRunner};
+
+/// Maximum age of checkout evidence used to settle or tear down a convoy.
+pub const LANDING_EVIDENCE_TTL: Duration = Duration::from_secs(30);
+const CONVOY_ASSOCIATION_UNAVAILABLE: &str = "no change request exists for the checkout ref, but convoy association was not available";
+
+pub fn checkout_observation_lacks_convoy_association(status: &CheckoutIntegrationStatus) -> bool {
+    status.landed.details.iter().any(|detail| detail == CONVOY_ASSOCIATION_UNAVAILABLE)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 struct EmbeddedRepository {
@@ -54,6 +64,48 @@ pub fn checkout_path_from_status_and_spec<'a>(status: Option<&'a CheckoutStatus>
     status.as_ref().and_then(|status| status.path.as_deref()).or_else(|| spec.target_path()).or(match spec {
         CheckoutSpec::Observed(spec) => Some(spec.path.as_str()),
         _ => None,
+    })
+}
+
+/// Resolve the change request associated with one of a convoy's checkouts.
+///
+/// The checkout authority uses this before probing so a replicated convoy's
+/// completion message can supply the forge identity even when the checkout
+/// itself predates that association.
+pub fn convoy_change_request_id_for_checkout(convoy: &ResourceObject<Convoy>, checkout: &ResourceObject<Checkout>) -> Option<String> {
+    if let Some(id) = checkout.metadata.labels.get(CHANGE_REQUEST_ID_LABEL) {
+        return Some(id.clone());
+    }
+    if let Some(change_request) =
+        convoy.spec.change_request.as_ref().filter(|change_request| change_request.repository_ref == *checkout.spec.repo_ref())
+    {
+        return Some(change_request.id.clone());
+    }
+
+    let repository = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref())?;
+    convoy
+        .status
+        .as_ref()?
+        .crew_work
+        .values()
+        .flat_map(BTreeMap::values)
+        .filter(|work| work.phase == CrewWorkPhase::Done)
+        .filter_map(|work| {
+            let id = change_request_id_from_completion_message(work.message.as_deref()?, &repository.url)?;
+            Some((work.finished_at, id))
+        })
+        .max_by_key(|(finished_at, _)| *finished_at)
+        .map(|(_, id)| id)
+}
+
+pub(crate) fn change_request_id_from_completion_message(message: &str, repository_url: &str) -> Option<String> {
+    let repository_url = repository_url.trim().trim_end_matches('/').trim_end_matches(".git");
+    ["pull", "pulls"].into_iter().find_map(|segment| {
+        let prefix = format!("{repository_url}/{segment}/");
+        message.match_indices(&prefix).find_map(|(start, _)| {
+            let id = message[start + prefix.len()..].chars().take_while(char::is_ascii_digit).collect::<String>();
+            (!id.is_empty()).then_some(id)
+        })
     })
 }
 
@@ -428,7 +480,7 @@ fn landed_without_change_request(
     if !convoy_association_complete {
         return IntegrationCondition::builder()
             .value(ConditionValue::Unknown)
-            .details(vec!["no change request exists for the checkout ref, but convoy association was not available".to_string()])
+            .details(vec![CONVOY_ASSOCIATION_UNAVAILABLE.to_string()])
             .observed_at(observed_at.to_string())
             .build();
     }

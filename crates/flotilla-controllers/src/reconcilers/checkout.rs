@@ -2,10 +2,14 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use flotilla_core::checkout_integration::{
+    checkout_observation_lacks_convoy_association, convoy_change_request_id_for_checkout, LANDING_EVIDENCE_TTL,
+};
 use flotilla_resources::{
-    controller::{ReconcileOutcome, Reconciler},
+    controller::{ReconcileOutcome, Reconciler, ReplicaConvoyCheckoutWatch, SecondaryWatch},
     Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, Clock,
-    Clone, ClonePhase, IntegrationCondition, ResourceBackend, ResourceError, ResourceObject, SystemClock, TypedResolver,
+    Clone, ClonePhase, Convoy, ConvoyPhase, IntegrationCondition, ReplicaReadResolver, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, SystemClock, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
 use tracing::warn;
 
@@ -54,13 +58,19 @@ pub trait CheckoutRuntime: Send + Sync {
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String>;
-    async fn inspect_integration(&self, checkout: &ResourceObject<Checkout>) -> Result<CheckoutIntegrationStatus, String>;
+    async fn inspect_integration(
+        &self,
+        checkout: &ResourceObject<Checkout>,
+        convoy: Option<&ResourceObject<Convoy>>,
+    ) -> Result<CheckoutIntegrationStatus, String>;
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String>;
 }
 
 pub struct CheckoutReconciler<R> {
     runtime: Arc<R>,
     clones: TypedResolver<Clone>,
+    convoys: TypedResolver<Convoy>,
+    federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     clock: Arc<dyn Clock>,
 }
 
@@ -70,8 +80,74 @@ impl<R> CheckoutReconciler<R> {
     }
 
     pub fn with_clock(runtime: Arc<R>, backend: ResourceBackend, namespace: &str, clock: Arc<dyn Clock>) -> Self {
-        Self { runtime, clones: backend.using::<Clone>(namespace), clock }
+        Self {
+            runtime,
+            clones: backend.clone().using::<Clone>(namespace),
+            convoys: backend.using::<Convoy>(namespace),
+            federated_convoys: None,
+            clock,
+        }
     }
+
+    pub fn with_federated_convoys(mut self, backend: &ResourceBackend, namespace: &str) -> Self {
+        self.federated_convoys = Some(backend.including_replicas::<Convoy>(namespace));
+        self
+    }
+
+    pub fn federated_secondary_watches(backend: &ResourceBackend, namespace: &str) -> Vec<Box<dyn SecondaryWatch<Primary = Checkout>>> {
+        vec![Box::new(ReplicaConvoyCheckoutWatch { resolver: backend.including_replicas::<Convoy>(namespace) })]
+    }
+
+    async fn owning_convoy(&self, checkout: &ResourceObject<Checkout>) -> Result<Option<ResourceObject<Convoy>>, ResourceError> {
+        let convoy_ref = checkout.metadata.labels.get(CONVOY_LABEL);
+        let Some(origin) = checkout.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION) else {
+            if let Some(convoy_ref) = convoy_ref {
+                match self.convoys.get(convoy_ref).await {
+                    Ok(convoy) => return Ok(Some(convoy)),
+                    Err(ResourceError::NotFound { .. }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(convoy) =
+                self.convoys.list().await?.items.into_iter().find(|convoy| convoy_claims_checkout(convoy, &checkout.metadata.name))
+            {
+                return Ok(Some(convoy));
+            }
+            return self.any_federated_convoy(convoy_ref.map(String::as_str), &checkout.metadata.name).await;
+        };
+        let Some(federated) = self.federated_convoys.as_ref() else {
+            return Ok(None);
+        };
+        Ok(federated.list().await?.items.into_iter().find_map(|source| {
+            (convoy_ref.map_or_else(
+                || convoy_claims_checkout(&source.object, &checkout.metadata.name),
+                |convoy_ref| source.object.metadata.name == *convoy_ref,
+            ) && matches!(&source.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root.as_str() == origin))
+            .then_some(source.object)
+        }))
+    }
+
+    async fn any_federated_convoy(
+        &self,
+        convoy_ref: Option<&str>,
+        checkout_name: &str,
+    ) -> Result<Option<ResourceObject<Convoy>>, ResourceError> {
+        let Some(federated) = self.federated_convoys.as_ref() else {
+            return Ok(None);
+        };
+        Ok(federated.list().await?.items.into_iter().find_map(|source| {
+            convoy_ref
+                .map_or_else(
+                    || convoy_claims_checkout(&source.object, checkout_name),
+                    |convoy_ref| source.object.metadata.name == convoy_ref,
+                )
+                .then_some(source.object)
+        }))
+    }
+}
+
+fn convoy_claims_checkout(convoy: &ResourceObject<Convoy>, checkout_name: &str) -> bool {
+    flotilla_resources::expected_checkout_refs(convoy).is_ok_and(|expected| expected.contains(checkout_name))
 }
 
 pub enum CheckoutDeps {
@@ -86,7 +162,7 @@ fn integration_observed_at(condition: &IntegrationCondition) -> Option<DateTime<
     DateTime::parse_from_rfc3339(condition.observed_at.as_deref()?).ok().map(|observed_at| observed_at.with_timezone(&Utc))
 }
 
-fn integration_is_fresh(status: &CheckoutStatus, now: DateTime<Utc>) -> bool {
+fn integration_is_fresh(status: &CheckoutStatus, now: DateTime<Utc>, max_age: Duration) -> bool {
     let observed_at = [
         integration_observed_at(&status.integration.clean),
         integration_observed_at(&status.integration.pushed),
@@ -95,7 +171,15 @@ fn integration_is_fresh(status: &CheckoutStatus, now: DateTime<Utc>) -> bool {
     let Some(oldest_observation) = observed_at.into_iter().collect::<Option<Vec<_>>>().and_then(|values| values.into_iter().min()) else {
         return false;
     };
-    now.signed_duration_since(oldest_observation).to_std().is_ok_and(|age| age < CHECKOUT_INTEGRATION_REFRESH_AFTER)
+    now.signed_duration_since(oldest_observation).to_std().is_ok_and(|age| age < max_age)
+}
+
+/// Terminal convoys keep the Landing TTL because teardown consumes the same
+/// fresh evidence and no longer probes a checkout on demand.
+fn convoy_needs_terminal_evidence(convoy: Option<&ResourceObject<Convoy>>) -> bool {
+    convoy.and_then(|convoy| convoy.status.as_ref()).is_some_and(|status| {
+        status.phase == ConvoyPhase::Landing || (status.phase.is_terminal() && status.phase != ConvoyPhase::Abandoned)
+    })
 }
 
 impl<R> Reconciler for CheckoutReconciler<R>
@@ -107,12 +191,19 @@ where
 
     async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) != CheckoutPhase::Pending {
-            if obj
-                .status
-                .as_ref()
-                .is_some_and(|status| status.phase == CheckoutPhase::Ready && !integration_is_fresh(status, self.clock.now()))
-            {
-                return Ok(match self.runtime.inspect_integration(obj).await {
+            let convoy = self.owning_convoy(obj).await?;
+            let terminal_evidence = convoy_needs_terminal_evidence(convoy.as_ref());
+            let refresh_after = if terminal_evidence { LANDING_EVIDENCE_TTL } else { CHECKOUT_INTEGRATION_REFRESH_AFTER };
+            let expected_change_request_id = convoy.as_ref().and_then(|convoy| convoy_change_request_id_for_checkout(convoy, obj));
+            if obj.status.as_ref().is_some_and(|status| {
+                status.phase == CheckoutPhase::Ready
+                    && (!integration_is_fresh(status, self.clock.now(), refresh_after)
+                        || (terminal_evidence && checkout_observation_lacks_convoy_association(&status.integration))
+                        || expected_change_request_id.as_ref().is_some_and(|expected| {
+                            status.integration.change_request.as_ref().is_some_and(|observed| &observed.id != expected)
+                        }))
+            }) {
+                return Ok(match self.runtime.inspect_integration(obj, convoy.as_ref()).await {
                     Ok(status) => CheckoutDeps::Integration { status: Box::new(status) },
                     Err(err) => CheckoutDeps::Failed(err),
                 });

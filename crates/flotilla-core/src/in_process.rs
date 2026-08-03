@@ -41,15 +41,15 @@ use flotilla_resources::{
     watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout,
     CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec,
-    ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase,
-    Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
-    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
-    PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource,
-    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SystemClock, TerminalBrief, TerminalCrewContext,
-    TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent,
-    WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
+    ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, Environment as ResourceEnvironment,
+    Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
+    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
+    ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
+    ResourceObject, ResourceProvenance, SystemClock, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
     HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
@@ -61,7 +61,10 @@ use tracing::{debug, info, warn};
 use crate::{
     agent_adapter::CapabilityTable,
     aggregator_projection::AggregatorProjectionState,
-    checkout_integration::{checkout_path_from_status_and_spec, inspect_checkout_integration, inspect_convoy_checkout_integration},
+    checkout_integration::{
+        checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout, inspect_checkout_integration,
+        inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
+    },
     config::{ConfigStore, RemoteHostConfig, StaticEnvironmentConfig},
     convert::snapshot_to_proto,
     daemon::{DaemonHandle, QuerySubscription},
@@ -1581,10 +1584,6 @@ struct ConvoyAdmission {
 /// recently observed snapshot. Keep this deliberately fixed until an
 /// operational need establishes that it should be configurable.
 const ISSUE_SNAPSHOT_FRESHNESS: ChronoDuration = ChronoDuration::minutes(5);
-/// Maximum age of a checkout's landed observation for the Landing→Landed
-/// decision; older evidence is re-probed at the decision edge (#1163).
-const LANDING_EVIDENCE_TTL: ChronoDuration = ChronoDuration::seconds(30);
-
 fn issue_snapshot_is_fresh(issue: &flotilla_protocol::Issue) -> bool {
     let Some(observed_at) = issue.observed_at else { return false };
     let age = Utc::now().signed_duration_since(observed_at);
@@ -1666,48 +1665,17 @@ fn checkout_path(checkout: &ResourceObject<ResourceCheckout>) -> Option<&str> {
     checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
 }
 
-fn convoy_change_request_id_for_checkout(
-    convoy: &ResourceObject<ResourceConvoy>,
-    checkout: &ResourceObject<ResourceCheckout>,
-) -> Option<String> {
-    if let Some(id) = checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL) {
-        return Some(id.clone());
-    }
-    if let Some(change_request) =
-        convoy.spec.change_request.as_ref().filter(|change_request| change_request.repository_ref == *checkout.spec.repo_ref())
-    {
-        return Some(change_request.id.clone());
-    }
-
-    let repository = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref())?;
-    convoy
-        .status
-        .as_ref()?
-        .crew_work
-        .values()
-        .flat_map(BTreeMap::values)
-        .filter(|work| work.phase == CrewWorkPhase::Done)
-        .filter_map(|work| {
-            let id = change_request_id_from_completion_message(work.message.as_deref()?, &repository.url)?;
-            Some((work.finished_at, id))
-        })
-        .max_by_key(|(finished_at, _)| *finished_at)
-        .map(|(_, id)| id)
-}
-
-fn change_request_id_from_completion_message(message: &str, repository_url: &str) -> Option<String> {
-    let repository_url = repository_url.trim().trim_end_matches('/').trim_end_matches(".git");
-    ["pull", "pulls"].into_iter().find_map(|segment| {
-        let prefix = format!("{repository_url}/{segment}/");
-        message.match_indices(&prefix).find_map(|(start, _)| {
-            let id = message[start + prefix.len()..].chars().take_while(char::is_ascii_digit).collect::<String>();
-            (!id.is_empty()).then_some(id)
-        })
-    })
-}
-
 fn condition_is_true(condition: &IntegrationCondition) -> bool {
     condition.value == ConditionValue::True
+}
+
+fn integration_condition_is_fresh(condition: &IntegrationCondition, now: chrono::DateTime<Utc>) -> bool {
+    condition
+        .observed_at
+        .as_deref()
+        .and_then(|observed_at| chrono::DateTime::parse_from_rfc3339(observed_at).ok())
+        .and_then(|observed_at| now.signed_duration_since(observed_at).to_std().ok())
+        .is_some_and(|age| age < LANDING_EVIDENCE_TTL)
 }
 
 fn condition_problem(label: &str, condition: &IntegrationCondition) -> Option<String> {
@@ -1740,23 +1708,6 @@ fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, int
     } else {
         Some(format!("{} [{}]: {}", checkout.metadata.name, checkout_path(checkout).unwrap_or("<unknown path>"), problems.join("; ")))
     }
-}
-
-fn integration_observation_matches(left: &CheckoutIntegrationStatus, right: &CheckoutIntegrationStatus) -> bool {
-    [(&left.clean, &right.clean), (&left.pushed, &right.pushed), (&left.landed, &right.landed)]
-        .into_iter()
-        .all(|(left, right)| left.value == right.value && left.details == right.details)
-        && left.landed_evidence == right.landed_evidence
-        && match (&left.change_request, &right.change_request) {
-            (Some(left), Some(right)) => {
-                left.id == right.id
-                    && left.state == right.state
-                    && left.mergeability == right.mergeability
-                    && left.target_ref == right.target_ref
-            }
-            (None, None) => true,
-            _ => false,
-        }
 }
 
 fn latch_evidence_backed_integration(existing: &CheckoutIntegrationStatus, observed: &mut CheckoutIntegrationStatus) {
@@ -2438,13 +2389,44 @@ impl InProcessDaemon {
                 continue;
             };
             let runner = self.runner_for_resource_checkout(&checkout).await?;
-            let mut integration = inspect_checkout_integration(
-                &*runner,
-                Path::new(path),
-                &checkout.spec,
-                checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
-            )
-            .await;
+            let convoy_ref = checkout.metadata.labels.get(CONVOY_LABEL).map(String::as_str);
+            let source_root = checkout.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map(String::as_str);
+            let convoy = self
+                .resource_backend
+                .clone()
+                .including_replicas::<ResourceConvoy>(namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+                .into_iter()
+                .find_map(|source| {
+                    let origin_matches = match (source_root, &source.provenance) {
+                        (Some(expected), ResourceProvenance::Replica { origin_root, .. }) => origin_root.as_str() == expected,
+                        (Some(_), ResourceProvenance::Local) => false,
+                        (None, _) => true,
+                    };
+                    let association_matches = convoy_ref.map_or_else(
+                        || {
+                            flotilla_resources::expected_checkout_refs(&source.object)
+                                .is_ok_and(|expected| expected.contains(&checkout.metadata.name))
+                        },
+                        |expected| source.object.metadata.name == expected,
+                    );
+                    (origin_matches && association_matches).then_some(source.object)
+                });
+            let mut integration = if let Some(convoy) = convoy.as_ref() {
+                let change_request_id = convoy_change_request_id_for_checkout(convoy, &checkout);
+                inspect_convoy_checkout_integration(&*runner, Path::new(path), &checkout.spec, change_request_id.as_deref()).await
+            } else {
+                inspect_checkout_integration(
+                    &*runner,
+                    Path::new(path),
+                    &checkout.spec,
+                    checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
+                )
+                .await
+            };
             if let Some(existing) = checkout.status.as_ref() {
                 latch_evidence_backed_integration(&existing.integration, &mut integration);
             }
@@ -6191,28 +6173,14 @@ impl InProcessDaemon {
         self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())
     }
 
-    async fn checkout_environment_is_destroyed(&self, namespace: &str, env_ref: &str) -> Result<bool, String> {
-        let environments = self.resource_backend.clone().using::<ResourceEnvironment>(namespace);
-        match environments.get(env_ref).await {
-            Ok(environment) => {
-                Ok(!environment.status.as_ref().is_some_and(|status| status.ready && status.phase == EnvironmentPhase::Ready))
-            }
-            Err(ResourceError::NotFound { .. }) => Ok(true),
-            Err(error) => Err(error.to_string()),
-        }
-    }
-
     /// Evaluate the Landing→Landed condition on evidence no older than
     /// [`LANDING_EVIDENCE_TTL`]: every managed convoy checkout's landed
-    /// condition must be `True` on a recent observation. Cached conditions may
-    /// predate a just-opened change request (#1163), so anything older is
-    /// re-probed at the decision edge and the fresh observation persisted;
-    /// anything unknown or unprobeable holds Landing — absence of evidence
-    /// never releases the gate. Recent observations are trusted as-is, which
-    /// bounds forge lookups and keeps the persist from re-triggering the
-    /// reconcile in a loop. Adopted checkouts participate because an adopted
-    /// open change request is still outstanding, even though its checkout is
-    /// exempt from deletion.
+    /// condition must be `True` on a recent authority-side observation.
+    /// Missing, stale, or unknown replicated evidence holds Landing; this
+    /// evaluator never probes or writes a checkout because its authority may
+    /// be another host. Adopted checkouts participate because an adopted open
+    /// change request is still outstanding, even though its checkout is exempt
+    /// from deletion.
     pub async fn convoy_change_requests_settled(&self, namespace: &str, name: &str) -> Result<bool, String> {
         let checkout_list = self
             .resource_backend
@@ -6233,48 +6201,26 @@ impl InProcessDaemon {
         checkout_list: &[ResourceObject<ResourceCheckout>],
     ) -> Result<bool, String> {
         let expected = flotilla_resources::expected_checkout_refs(convoy)?;
-        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(&convoy.metadata.namespace);
         for checkout_name in expected {
             let Some(checkout) = checkout_list.iter().find(|checkout| checkout.metadata.name == checkout_name) else {
+                warn!(checkout = %checkout_name, convoy = %convoy.metadata.name, "checkout landing evidence is missing");
                 return Ok(false);
             };
-            if let Some(landed) = checkout.status.as_ref().map(|status| &status.integration.landed) {
-                let recent = landed
-                    .observed_at
-                    .as_deref()
-                    .and_then(|observed_at| chrono::DateTime::parse_from_rfc3339(observed_at).ok())
-                    .is_some_and(|observed_at| self.clock.now().signed_duration_since(observed_at) < LANDING_EVIDENCE_TTL);
-                if recent {
-                    match landed.value {
-                        ConditionValue::True => continue,
-                        ConditionValue::False => return Ok(false),
-                        ConditionValue::Unknown => {}
-                    }
+            let Some(landed) = checkout.status.as_ref().map(|status| &status.integration.landed) else {
+                warn!(checkout = %checkout.metadata.name, convoy = %convoy.metadata.name, "checkout landing evidence is missing");
+                return Ok(false);
+            };
+            if !integration_condition_is_fresh(landed, self.clock.now()) {
+                warn!(checkout = %checkout.metadata.name, convoy = %convoy.metadata.name, "checkout landing evidence is missing or stale");
+                return Ok(false);
+            }
+            match landed.value {
+                ConditionValue::True => continue,
+                ConditionValue::False => return Ok(false),
+                ConditionValue::Unknown => {
+                    warn!(checkout = %checkout.metadata.name, convoy = %convoy.metadata.name, details = ?landed.details, "checkout landing evidence is unknown");
+                    return Ok(false);
                 }
-            }
-            let Some(path) = checkout_path(checkout).map(|path| Path::new(path).to_path_buf()) else {
-                return Ok(false);
-            };
-            let runner = match self.runner_for_resource_checkout(checkout).await {
-                Ok(runner) => runner,
-                Err(_) => return Ok(false),
-            };
-            let change_request_id = convoy_change_request_id_for_checkout(convoy, checkout);
-            let mut integration = inspect_convoy_checkout_integration(&*runner, &path, &checkout.spec, change_request_id.as_deref()).await;
-            if let Some(existing) = checkout.status.as_ref() {
-                latch_evidence_backed_integration(&existing.integration, &mut integration);
-            }
-            if let Err(error) = apply_resource_status_patch(
-                &checkouts,
-                &checkout.metadata.name,
-                &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration.clone()) },
-            )
-            .await
-            {
-                warn!(checkout = %checkout.metadata.name, %error, "failed to persist checkout integration conditions during landing evaluation");
-            }
-            if !condition_is_true(&integration.landed) {
-                return Ok(false);
             }
         }
         Ok(true)
@@ -6329,91 +6275,30 @@ impl InProcessDaemon {
             ));
         }
 
-        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
         let mut refusals = Vec::new();
-        let mut verified = false;
         for checkout in checkout_list.iter().filter(|checkout| expected.contains(&checkout.metadata.name)) {
             let is_adopted = checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted);
-            if let Some(env_ref) = checkout.spec.env_ref() {
-                if self.checkout_environment_is_destroyed(namespace, env_ref).await? {
-                    warn!(
-                        checkout = %checkout.metadata.name,
-                        env_ref,
-                        "checkout environment is gone; allowing corpse cleanup without integration probes"
-                    );
-                    continue;
-                }
-            }
-            let path = match checkout_path(checkout) {
-                Some(path) => Path::new(path).to_path_buf(),
-                None => {
-                    if is_adopted {
-                        warn!(checkout = %checkout.metadata.name, "adopted checkout has no resolved path; releasing without deletion");
-                        continue;
-                    }
-                    refusals.push(format!("{} [<unknown path>]: Clean=Unknown (checkout has no resolved path)", checkout.metadata.name));
-                    continue;
-                }
+            let Some(integration) = checkout.status.as_ref().map(|status| &status.integration) else {
+                refusals.push(format!("{}: integration evidence is missing", checkout.metadata.name));
+                continue;
             };
-            let runner = match self.runner_for_resource_checkout(checkout).await {
-                Ok(runner) => runner,
-                Err(error) => {
-                    if is_adopted {
-                        warn!(checkout = %checkout.metadata.name, %error, "adopted checkout integration could not be probed; releasing without deletion");
-                        continue;
-                    }
-                    refusals.push(format!(
-                        "{} [{}]: Clean=Unknown ({error}); Pushed=Unknown ({error}); Landed=Unknown ({error})",
-                        checkout.metadata.name,
-                        path.display()
-                    ));
-                    continue;
-                }
+            let required = if is_adopted {
+                vec![("Landed", &integration.landed)]
+            } else {
+                vec![("Clean", &integration.clean), ("Pushed", &integration.pushed), ("Landed", &integration.landed)]
             };
-            match runner.path_exists(&path).await {
-                Ok(false) => {
-                    warn!(
-                        checkout = %checkout.metadata.name,
-                        path = %path.display(),
-                        "checkout path is already gone; allowing reclaim to finish"
-                    );
-                    continue;
-                }
-                Ok(true) => {}
-                Err(error) => {
-                    refusals.push(format!(
-                        "{} [{}]: Clean=Unknown (checkout path could not be probed: {error})",
-                        checkout.metadata.name,
-                        path.display()
-                    ));
-                    continue;
-                }
-            }
-            let change_request_id = convoy_change_request_id_for_checkout(convoy, checkout);
-            let mut integration = inspect_convoy_checkout_integration(&*runner, &path, &checkout.spec, change_request_id.as_deref()).await;
-            verified = true;
-            if let Some(existing) = checkout.status.as_ref() {
-                latch_evidence_backed_integration(&existing.integration, &mut integration);
-            }
-            if !checkout.status.as_ref().is_some_and(|status| integration_observation_matches(&status.integration, &integration)) {
-                if let Err(error) = apply_resource_status_patch(
-                    &checkouts,
-                    &checkout.metadata.name,
-                    &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration.clone()) },
-                )
-                .await
-                {
-                    warn!(
-                        checkout = %checkout.metadata.name,
-                        %error,
-                        "failed to persist checkout integration conditions during teardown gate"
-                    );
-                }
+            let stale = required
+                .iter()
+                .filter_map(|(label, condition)| (!integration_condition_is_fresh(condition, self.clock.now())).then_some(*label))
+                .collect::<Vec<_>>();
+            if !stale.is_empty() {
+                refusals.push(format!("{}: {} evidence is missing or stale", checkout.metadata.name, stale.join(", ")));
+                continue;
             }
             if is_adopted {
                 if !condition_is_true(&integration.landed) {
                     refusals.push(
-                        checkout_integration_summary(checkout, &integration)
+                        checkout_integration_summary(checkout, integration)
                             .unwrap_or_else(|| format!("{}: Landed is not verified", checkout.metadata.name)),
                     );
                 }
@@ -6421,14 +6306,12 @@ impl InProcessDaemon {
             }
             if !(condition_is_true(&integration.clean) && condition_is_true(&integration.pushed) && condition_is_true(&integration.landed))
             {
-                if let Some(summary) = checkout_integration_summary(checkout, &integration) {
+                if let Some(summary) = checkout_integration_summary(checkout, integration) {
                     refusals.push(summary);
                 }
             }
         }
-        if !verified {
-            Err(format!("convoy {namespace}/{name} is not safe to delete: no checkout integration evidence"))
-        } else if refusals.is_empty() {
+        if refusals.is_empty() {
             Ok(())
         } else {
             refusals.sort();

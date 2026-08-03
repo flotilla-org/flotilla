@@ -6782,7 +6782,7 @@ async fn two_commands_can_run_concurrently() {
 }
 
 #[tokio::test]
-async fn convoy_landing_reprobes_after_injected_clock_crosses_evidence_ttl() {
+async fn convoy_landing_rejects_evidence_after_injected_clock_crosses_ttl() {
     let temp = tempfile::tempdir().expect("temp dir");
     let backend = flotilla_resources::ResourceBackend::InMemory(Default::default());
     let now = chrono::DateTime::parse_from_rfc3339("2026-07-28T12:00:00Z").expect("timestamp").with_timezone(&chrono::Utc);
@@ -6854,6 +6854,6 @@ async fn convoy_landing_reprobes_after_injected_clock_crosses_evidence_ttl() {
 
     assert!(
         !daemon.convoy_change_requests_settled("flotilla", "convoy-a").await.expect("stale decision"),
-        "stale cached evidence must be re-probed and a missing path must hold Landing"
+        "stale cached evidence must hold Landing until the checkout authority refreshes it"
     );
 }
