@@ -28,6 +28,7 @@ use flotilla_resources::{
     CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use rstest::rstest;
+use tokio::time::{timeout, Duration};
 
 const NAMESPACE: &str = "flotilla";
 const REPO_URL: &str = "https://github.com/flotilla-org/flotilla.git";
@@ -40,6 +41,45 @@ struct AlwaysEligible;
 impl ConvoyTeardownRuntime for AlwaysEligible {
     async fn verify_reclaim(&self, _convoy: &flotilla_resources::ResourceObject<Convoy>) -> Result<(), String> {
         Ok(())
+    }
+}
+
+#[tokio::test]
+async fn secondary_watches_map_checkout_events_by_convoy_only() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_workspace(&backend, NAMESPACE, "workspace-watch", "convoy-watch", "implement", "policy-a", REPO_URL).await;
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let spec = CheckoutSpec::Observed(ObservedCheckoutSpec {
+        r#ref: GIT_REF.to_string(),
+        path: "/tmp/checkout".to_string(),
+        repo_ref: flotilla_resources::RepositoryKey("repo-key".to_string()),
+        host_ref: HOST_REF.to_string(),
+        is_main: false,
+    });
+    checkouts
+        .create(&labeled_meta("convoy-owned", [(CONVOY_LABEL.to_string(), "convoy-watch".to_string())]), &spec)
+        .await
+        .expect("convoy-owned checkout should create");
+    checkouts
+        .create(&labeled_meta("stale-vessel-labeled", [(VESSEL_REF_LABEL.to_string(), "stale-vessel".to_string())]), &spec)
+        .await
+        .expect("stale vessel-labeled checkout should create");
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+    let handles = VesselReconciler::secondary_watches()
+        .into_iter()
+        .map(|watch| tokio::spawn(watch.spawn(backend.clone(), NAMESPACE.to_string(), sender.clone())))
+        .collect::<Vec<_>>();
+    drop(sender);
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), receiver.recv()).await.expect("convoy checkout event should enqueue a vessel"),
+        Some("workspace-watch".to_string())
+    );
+    assert!(timeout(Duration::from_millis(100), receiver.recv()).await.is_err(), "vessel-labeled checkout must not enqueue a vessel");
+
+    for handle in handles {
+        handle.abort();
     }
 }
 
