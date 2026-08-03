@@ -141,7 +141,8 @@ impl LeafSubject for ConvoyLeafSubject<'_> {
 
 /// Spike-only descriptor-backed Convoy subject. The handwritten
 /// [`ConvoyLeafSubject`] remains the active implementation used by core.
-pub struct FacetConvoyLeafSubject<'a>(pub &'a ResourceObject<Convoy>);
+#[allow(dead_code)]
+struct FacetConvoyLeafSubject<'a>(&'a ResourceObject<Convoy>);
 
 impl LeafSubject for FacetConvoyLeafSubject<'_> {
     fn kind(&self) -> LeafKind {
@@ -161,6 +162,7 @@ enum FacetComparableType {
     Text,
 }
 
+#[allow(dead_code)]
 fn facet_value_at_path<'mem, 'facet>(mut value: Peek<'mem, 'facet>, field_path: &str) -> Option<Peek<'mem, 'facet>> {
     for segment in field_path.strip_prefix('.')?.split('.') {
         if let Ok(option) = value.into_option() {
@@ -309,7 +311,7 @@ mod tests {
     #[test]
     fn facet_convoy_subject_matches_the_active_handwritten_subject() {
         let timestamp = "2026-08-03T20:00:00Z".parse().expect("timestamp");
-        let mut object = ResourceObject {
+        let object = ResourceObject {
             metadata: crate::ObjectMeta {
                 name: "demo".to_string(),
                 namespace: "flotilla".to_string(),
@@ -323,9 +325,8 @@ mod tests {
                 merge: None,
             },
             spec: crate::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-            status: None,
+            status: Some(crate::ConvoyStatus { phase: crate::ConvoyPhase::Landing, ..Default::default() }),
         };
-        object.status = Some(crate::ConvoyStatus { phase: crate::ConvoyPhase::Landing, ..Default::default() });
 
         let handwritten = ConvoyLeafSubject(&object);
         let descriptor_backed = FacetConvoyLeafSubject(&object);
