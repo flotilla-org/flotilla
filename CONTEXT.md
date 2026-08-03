@@ -501,10 +501,10 @@ claims.
 _Avoid_: Fact (histories are evidence — ADR 0023), event.
 
 **Condition Leaf**:
-One serializable, three-valued comparison against one stored record:
+One serializable, three-valued comparison against one stored record of
+the machine, a **Settlement Claim**, or an **Observation**:
 `(record address, field path, operator, bound literal)` evaluating to
-True, False, or Unknown — over the machine, **Settlement Claims**, or
-**Observations**. Unknown is structural (absent record, Unknown
+True, False, or Unknown. Unknown is structural (absent record, Unknown
 observation, or staler than the demanded freshness) and triggers nothing.
 Cross-record references (a claim's timestamp for postdating, a prior head
 SHA) are **bound at subscription time** and frozen into the row as
