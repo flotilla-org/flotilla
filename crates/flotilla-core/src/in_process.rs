@@ -36,10 +36,10 @@ use flotilla_protocol::{
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
     apply_status_patch_checked as apply_resource_status_patch_checked, external_patches as convoy_external_patches, get_resource_kind,
-    latch_evidence_backed_integration, list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec,
-    repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
-    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
-    Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec, repository_display_labels,
+    resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from,
+    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout,
+    CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec,
     ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, Environment as ResourceEnvironment,
     Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
@@ -2401,7 +2401,7 @@ impl InProcessDaemon {
                     );
                     (origin_matches && association_matches).then_some(source.object)
                 });
-            let mut integration = if let Some(convoy) = convoy.as_ref() {
+            let integration = if let Some(convoy) = convoy.as_ref() {
                 let change_request_id = convoy_change_request_id_for_checkout(convoy, &checkout);
                 inspect_convoy_checkout_integration(&*runner, Path::new(path), &checkout.spec, change_request_id.as_deref()).await
             } else {
@@ -2413,9 +2413,6 @@ impl InProcessDaemon {
                 )
                 .await
             };
-            if let Some(existing) = checkout.status.as_ref() {
-                latch_evidence_backed_integration(&existing.integration, &mut integration);
-            }
             apply_resource_status_patch(&checkouts, &checkout.metadata.name, &flotilla_resources::CheckoutStatusPatch::UpdateIntegration {
                 integration: Box::new(integration),
             })

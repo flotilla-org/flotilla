@@ -251,6 +251,8 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
                 status.message = Some(message.clone());
             }
             Self::UpdateIntegration { integration } => {
+                // The shared patch is the authority-side latch point for every
+                // integration writer: only Unknown yields to prior evidence.
                 let mut observed = integration.as_ref().clone();
                 latch_evidence_backed_integration(&status.integration, &mut observed);
                 status.integration = observed;
