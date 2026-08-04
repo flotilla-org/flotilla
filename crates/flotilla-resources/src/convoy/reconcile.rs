@@ -77,6 +77,7 @@ pub struct ConvoyReconciler {
     federated_checkouts: Option<ReplicaReadResolver<Checkout>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
     change_request_stale_after: std::time::Duration,
+    landing_evidence_stale_after: std::time::Duration,
     clock: Arc<dyn Clock>,
     prepared_snapshot_gc: Option<PreparedSnapshotGarbageCollector>,
     teardown_runtime: Option<Arc<dyn ConvoyTeardownRuntime>>,
@@ -104,6 +105,7 @@ impl ConvoyReconciler {
             federated_checkouts: None,
             change_requests: None,
             change_request_stale_after: std::time::Duration::from_secs(180),
+            landing_evidence_stale_after: std::time::Duration::from_secs(30),
             clock: Arc::new(SystemClock),
             prepared_snapshot_gc: None,
             teardown_runtime: None,
@@ -148,6 +150,11 @@ impl ConvoyReconciler {
 
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    pub fn with_landing_evidence_stale_after(mut self, stale_after: std::time::Duration) -> Self {
+        self.landing_evidence_stale_after = stale_after;
         self
     }
 
@@ -200,7 +207,8 @@ fn landing_condition_satisfied(
     convoy: &ResourceObject<Convoy>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
-    stale_after: std::time::Duration,
+    change_request_stale_after: std::time::Duration,
+    landing_evidence_stale_after: std::time::Duration,
     now: DateTime<Utc>,
 ) -> bool {
     let Ok(leaves) = expected_change_request_leaves(convoy, checkouts) else {
@@ -212,7 +220,11 @@ fn landing_condition_satisfied(
                 return false;
             };
             let name = crate::change_request_record_name(service, scope, *number);
-            let subject = change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject { change_request, now, stale_after });
+            let subject = change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject {
+                change_request,
+                now,
+                stale_after: change_request_stale_after,
+            });
             crate::evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject), None)
                 .is_ok_and(|evaluation| evaluation.result == ThreeValue::True)
         })
@@ -229,7 +241,17 @@ fn landing_condition_satisfied(
                     checkout.status.as_ref().and_then(|status| status.integration.change_request.as_ref()).is_some()
                         || bound_repository == Some(checkout.spec.repo_ref());
                 has_expected_change_request
-                    || checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)
+                    || checkout.status.as_ref().is_some_and(|status| {
+                        status.integration.landed.value == crate::ConditionValue::True
+                            && status
+                                .integration
+                                .landed
+                                .observed_at
+                                .as_deref()
+                                .and_then(|observed_at| DateTime::parse_from_rfc3339(observed_at).ok())
+                                .and_then(|observed_at| now.signed_duration_since(observed_at).to_std().ok())
+                                .is_some_and(|age| age < landing_evidence_stale_after)
+                    })
             })
         })
     })
@@ -292,7 +314,14 @@ impl Reconciler for ConvoyReconciler {
             None => BTreeMap::new(),
         };
         let no_change_request_outstanding = if obj.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing) {
-            landing_condition_satisfied(obj, &checkouts, &change_requests, self.change_request_stale_after, self.clock.now())
+            landing_condition_satisfied(
+                obj,
+                &checkouts,
+                &change_requests,
+                self.change_request_stale_after,
+                self.landing_evidence_stale_after,
+                self.clock.now(),
+            )
         } else {
             false
         };

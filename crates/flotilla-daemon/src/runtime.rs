@@ -19,7 +19,7 @@ use flotilla_core::{
     aggregator_projection::AggregatorProjectionState,
     checkout_integration::{
         checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout, inspect_checkout_integration,
-        inspect_convoy_checkout_integration,
+        inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
     },
     config::ConfigStore,
     in_process::InProcessDaemon,
@@ -1625,6 +1625,7 @@ fn spawn_controller_loops(
                                     backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
                                     daemon.change_request_stale_after(),
                                 )
+                                .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
                                 .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
                                 .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
                                     backend.clone(),
