@@ -3831,6 +3831,9 @@ async fn reconcile_whole_repository_project_definition(
     existing: ResourceObject<Project>,
     generated: &ProjectSpec,
 ) -> Result<ResourceObject<Project>, String> {
+    if is_declaration_backed_project(&existing) {
+        return Ok(existing);
+    }
     let generator_fields_diverged =
         existing.spec.default_workflow_ref != generated.default_workflow_ref || existing.spec.repositories != generated.repositories;
     let managed_by_generator =
@@ -3855,6 +3858,10 @@ async fn reconcile_whole_repository_project_definition(
         );
     }
     Ok(reconciled)
+}
+
+fn is_declaration_backed_project(project: &ResourceObject<Project>) -> bool {
+    project.metadata.annotations.contains_key(BOOTSTRAP_REPOSITORY_ANNOTATION)
 }
 
 fn is_whole_repository_project(spec: &ProjectSpec, repository_key: &RepositoryKey) -> bool {
@@ -4905,12 +4912,36 @@ impl InProcessDaemon {
                 });
             };
             let key = RepositoryKey(repository.metadata.name.clone());
-            self.repository_keys_by_path
+            let mut paths = self
+                .repository_keys_by_path
                 .read()
                 .await
                 .iter()
-                .find_map(|(path, candidate)| (candidate == &key).then(|| path.clone()))
-                .ok_or_else(|| format!("bootstrap repository `{target}` has no local checkout on this host"))?
+                .filter(|(_, candidate)| *candidate == &key)
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            paths.sort();
+            match paths.as_slice() {
+                [] => return Err(format!("bootstrap repository `{target}` has no local checkout on this host")),
+                [path] => path.clone(),
+                _ => {
+                    let inspector = self.repository_inspector().await?;
+                    let mut main_paths = Vec::new();
+                    for path in paths {
+                        if inspector.inspect_path(&path, None).await?.checkout.is_main {
+                            main_paths.push(path);
+                        }
+                    }
+                    match main_paths.as_slice() {
+                        [path] => path.clone(),
+                        _ => {
+                            return Err(format!(
+                                "bootstrap repository `{target}` has multiple local checkouts; pass the intended checkout path explicitly"
+                            ));
+                        }
+                    }
+                }
+            }
         };
         let inspection = self.repository_inspector().await?.inspect_project_declaration(&path).await?;
         let declaration = parse_project_declaration(&inspection.yaml)?;
@@ -4979,7 +5010,6 @@ impl InProcessDaemon {
         let provenance = BTreeMap::from([
             (BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), bootstrap_key.to_string()),
             (BOOTSTRAP_COMMIT_ANNOTATION.to_string(), inspection.commit.clone()),
-            (BOOTSTRAP_PATH_ANNOTATION.to_string(), bootstrap_path),
             (DECLARATION_FILE_ANNOTATION.to_string(), DECLARATION_FILE.to_string()),
         ]);
         let mut converged = false;
@@ -5032,6 +5062,7 @@ impl InProcessDaemon {
         for (annotation, value) in provenance {
             meta.annotations.insert(annotation, value);
         }
+        meta.annotations.insert(BOOTSTRAP_PATH_ANNOTATION.to_string(), bootstrap_path);
         converged |=
             existing_project.as_ref().is_none_or(|project| project.spec != spec || project.metadata.annotations != meta.annotations);
         projects.apply(&meta, &spec).await.map_err(|error| error.to_string())?;
@@ -5111,6 +5142,9 @@ impl InProcessDaemon {
         let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
         match projects.get(&project_name).await {
             Ok(existing) => {
+                if is_declaration_backed_project(&existing) {
+                    return Err(format!("project {project_name} is managed by a declaration; use project refresh to update it"));
+                }
                 if !is_whole_repository_project(&existing.spec, &key) {
                     return Err(format!("project {project_name} already exists with a different repository definition"));
                 }
@@ -5214,6 +5248,9 @@ impl InProcessDaemon {
         }
         let mut migrated_project_names = BTreeSet::new();
         for project in &mut project_objects {
+            if is_declaration_backed_project(project) {
+                continue;
+            }
             let mut updated = project.spec.clone();
             let mut changed = false;
             for entry in &mut updated.repositories {

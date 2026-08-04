@@ -30,10 +30,12 @@ flotilla project refresh example
 
 Registration creates or updates the Project and member Repository resources.
 It records the bootstrap RepositoryKey, exact commit, declaration filename, and
-local bootstrap path as provenance annotations. Refresh reads `project.yaml`
-from the bootstrap checkout's committed `HEAD` and converges materialized state
-back to the declaration. It does not watch for changes continuously, and it
-does not use uncommitted working-tree contents.
+local bootstrap path as provenance annotations on the Project; member
+Repositories receive only the portable repository, commit, and filename
+provenance. Refresh reads `project.yaml` from the bootstrap checkout's committed
+`HEAD` and converges materialized state back to the declaration. It does not
+watch for changes continuously, and it does not use uncommitted working-tree
+contents.
 
 Aliases preserve each member's RepositoryKey if its URL changes between
 refreshes. This follows the repository identity model: forge renames are served

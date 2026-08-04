@@ -13,7 +13,7 @@ use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
-    project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
+    project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
     providers::discovery::test_support::fake_discovery,
     repository_inspection::{LocalCheckoutInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
 };
@@ -272,7 +272,43 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
     for member in &split.spec.repositories {
         let repository = backend.using::<Repository>("flotilla").get(&member.repo.to_string()).await.expect("member repository");
         assert_eq!(repository.metadata.annotations.get(BOOTSTRAP_COMMIT_ANNOTATION).map(String::as_str), Some("0123456789abcdef"));
+        assert!(!repository.metadata.annotations.contains_key(BOOTSTRAP_PATH_ANNOTATION));
     }
+}
+
+#[tokio::test]
+async fn declaration_adoption_survives_whole_repository_project_reconciliation() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let checkout = tmp.path().join("flotilla");
+    std::fs::create_dir(&checkout).expect("checkout dir");
+    std::fs::write(
+        checkout.join("project.yaml"),
+        "name: flotilla\nmembers:\n  - alias: flotilla\n    url: https://github.com/flotilla-org/flotilla\n    roles: [code, ops, knowledge]\n",
+    )
+    .expect("write declaration");
+    let commit = Arc::new(RwLock::new("declaration-commit".to_string()));
+    daemon
+        .set_repository_inspector(Arc::new(DeclarationInspector {
+            bootstrap: RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("bootstrap spec"),
+            commit,
+        }))
+        .await;
+    daemon.add_repo(&checkout).await.expect("track bootstrap member");
+    let mut rx = daemon.subscribe();
+    assert_eq!(
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: checkout.to_string_lossy().into_owned() },)
+            .await,
+        CommandValue::ProjectRegistered { name: "flotilla".to_string(), members: 1 }
+    );
+    let projects = backend.definitions::<Project>("flotilla");
+    let registered = projects.get("flotilla").await.expect("registered project");
+
+    daemon.materialize_tracked_repo_projects().await.expect("whole-repository reconciliation");
+
+    let reconciled = projects.get("flotilla").await.expect("reconciled project");
+    assert_eq!(reconciled.metadata.resource_version, registered.metadata.resource_version);
+    assert_eq!(reconciled.spec.repositories[0].alias.as_deref(), Some("flotilla"));
+    assert_eq!(reconciled.spec.repositories[0].roles.len(), 3);
 }
 
 #[tokio::test]
