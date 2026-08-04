@@ -1216,6 +1216,28 @@ async fn convoy_explanation_names_each_held_landing_expectation_and_claim_exit()
 }
 
 #[tokio::test]
+async fn convoy_explanation_names_closed_only_exit_waiting_for_a_bound_change_request() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let (daemon, _temp) = explanation_daemon(backend.clone()).await;
+    create_explanation_convoy(&backend, "closed-only", Some("checkout-closed"), Some((ConditionValue::True, Utc::now()))).await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let convoy = convoys.get("closed-only").await.expect("closed-only convoy");
+    let mut status = convoy.status.expect("closed-only status");
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").exit = Some(flotilla_resources::ExitDeclaration::Table(
+        indexmap::IndexMap::from([("closed-without-merge".to_string(), "$cr.state == closed".parse().expect("closed exit template"))]),
+    ));
+    convoys.update_status("closed-only", &convoy.metadata.resource_version, &status).await.expect("pin closed-only exit table");
+
+    let explanation = explain(&daemon, "closed-only").await;
+
+    assert!(!explanation.settlement.satisfied);
+    assert_eq!(explanation.settlement.unmet.len(), 1, "an unsatisfied settlement must explain why it is stuck");
+    assert_eq!(explanation.settlement.unmet[0].reason, "missing_binding");
+    assert_eq!(explanation.settlement.unmet[0].subject, "exit/closed-without-merge");
+    assert_eq!(explanation.settlement.unmet[0].detail, "entry awaits a bound change request for $cr");
+}
+
+#[tokio::test]
 async fn convoy_explanation_names_missing_stale_and_open_bound_change_requests() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let (daemon, _temp) = explanation_daemon(backend.clone()).await;

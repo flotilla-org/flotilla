@@ -367,6 +367,11 @@ fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> Explain
         UnmetSettlementExpectation::InvalidExpectedCheckouts { message } => {
             ExplainedUnmetExpectation { reason: "invalid_expected_checkouts".to_string(), subject: "convoy".to_string(), detail: message }
         }
+        UnmetSettlementExpectation::ExitEntryAwaitingBinding { disposition, subject } => ExplainedUnmetExpectation {
+            reason: "missing_binding".to_string(),
+            subject: format!("exit/{disposition}"),
+            detail: format!("entry awaits a bound change request for {subject}"),
+        },
         UnmetSettlementExpectation::MissingCheckout { checkout } => ExplainedUnmetExpectation {
             reason: "missing_record".to_string(),
             subject: format!("checkout/{checkout}"),
