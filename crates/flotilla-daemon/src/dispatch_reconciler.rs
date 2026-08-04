@@ -141,14 +141,16 @@ impl DispatchReconciler {
                     continue;
                 }
             };
+            let previous = previous_by_issue.get(&issue.reference).copied();
             let mut is_blocked = false;
+            let mut blockers_unknown = false;
             for blocker in blockers {
                 match self.issues.fetch_issue(&blocker).await {
                     Ok(blocker) if blocker.state == IssueState::Closed => {}
                     Ok(_) => is_blocked = true,
                     Err(error) => {
-                        warn!(project = %project.metadata.name, issue = %issue.reference.id, blocker = %blocker.id, %error, "blocker could not be observed; treating issue as blocked");
-                        is_blocked = true;
+                        warn!(project = %project.metadata.name, issue = %issue.reference.id, blocker = %blocker.id, %error, "blocker could not be observed; preserving only a previously verified proposal");
+                        blockers_unknown = true;
                     }
                 }
             }
@@ -156,8 +158,15 @@ impl DispatchReconciler {
                 blocked += 1;
                 continue;
             }
+            if blockers_unknown {
+                if let Some(previous) = previous {
+                    queue.push(previous.clone());
+                } else {
+                    blocked += 1;
+                }
+                continue;
+            }
 
-            let previous = previous_by_issue.get(&issue.reference).copied();
             let ready_observed_at = previous.map_or(now, |entry| entry.ready_observed_at);
             let provenance = previous.map_or_else(
                 || format!("{DISPATCH_RECONCILER_PROVENANCE}, issue #{} ready+unblocked at {}", issue.reference.id, now.to_rfc3339()),
@@ -395,6 +404,7 @@ mod tests {
         by_ref: Mutex<HashMap<IssueRef, Issue>>,
         ready_calls: Mutex<usize>,
         failing_projects: Mutex<std::collections::HashSet<String>>,
+        failing_refs: Mutex<std::collections::HashSet<IssueRef>>,
     }
 
     #[async_trait]
@@ -408,6 +418,9 @@ mod tests {
         }
 
         async fn fetch_issue(&self, reference: &IssueRef) -> Result<Issue, String> {
+            if self.failing_refs.lock().expect("failing refs lock").contains(reference) {
+                return Err("issue fetch unavailable".to_string());
+            }
             self.by_ref.lock().expect("issues lock").get(reference).cloned().ok_or_else(|| "missing issue".to_string())
         }
     }
@@ -460,6 +473,7 @@ mod tests {
             by_ref: Mutex::new(blockers.into_iter().map(|issue| (issue.reference.clone(), issue)).collect()),
             ready_calls: Mutex::new(0),
             failing_projects: Mutex::new(Default::default()),
+            failing_refs: Mutex::new(Default::default()),
         });
         let clock = Arc::new(VirtualClock::new("2026-08-04T12:00:00Z".parse().expect("clock timestamp")));
         let reconciler = DispatchReconciler::new(backend.clone(), NAMESPACE, Arc::clone(&issues) as Arc<dyn DispatchIssueSource>)
@@ -506,6 +520,29 @@ mod tests {
             backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue.len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_transient_blocker_fetch_failure_preserves_a_verified_proposals_ready_time() {
+        let dependent = issue("2", &[READY_ISSUE_LABEL], Some("## Blocked by\n#9"), IssueState::Open);
+        let newcomer = issue("3", &[READY_ISSUE_LABEL], Some("## Blocked by\n#9"), IssueState::Open);
+        let blocker = issue("9", &[], None, IssueState::Closed);
+        let blocker_ref = blocker.reference.clone();
+        let (backend, issues, clock, reconciler) = harness(vec![dependent.clone()], vec![blocker], policy(60)).await;
+        reconciler.reconcile_once().await.expect("verified pass");
+        let original =
+            backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue[0].clone();
+        issues.ready.lock().expect("ready lock").push(newcomer);
+        issues.failing_refs.lock().expect("failing refs lock").insert(blocker_ref);
+        clock.advance(Duration::seconds(60));
+
+        let outcome = reconciler.reconcile_once().await.expect("transient failure pass");
+
+        assert_eq!(outcome.queued, 1);
+        assert_eq!(outcome.blocked, 1, "an unverified new issue remains conservatively excluded");
+        let status = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
+        assert_eq!(status.dispatch_queue, vec![original]);
+        assert_eq!(status.dispatch_queue_attention.expect("stale attention").count, 1);
     }
 
     #[tokio::test]
