@@ -22,21 +22,23 @@ use flotilla_protocol::{
     commands::{AttachMode, RepositoryIdentityChange},
     qualified_path::{HostId, QualifiedPath},
     result_set::{CheckoutRow, ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
-    AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, CorrelationKey, CrewCommandContext, CrewListMember,
-    CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse,
-    FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
-    HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
-    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
-    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo,
-    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor,
-    ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef,
-    StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress,
-    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CorrelationKey, CrewCommandContext,
+    CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId, EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout,
+    ExplainedCondition, ExplainedCrewDelivery, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation,
+    FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement,
+    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse,
+    HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost,
+    PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo,
+    QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse,
+    ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
+    ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo,
+    ToolInventory, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
-    apply_status_patch_checked as apply_resource_status_patch_checked, controller::delete_lifecycle_owned_matching,
-    external_patches as convoy_external_patches, get_resource_kind, list_resource_kind, list_resource_kind_including_replicas,
+    apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name,
+    controller::delete_lifecycle_owned_matching, ensure_repository, evaluate_landing_settlement, expected_change_request_leaves,
+    expected_checkout_refs, external_patches as convoy_external_patches, list_resource_kind, list_resource_kind_including_replicas,
     normalize_project_spec, repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
     watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
     Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
@@ -45,11 +47,11 @@ use flotilla_resources::{
     Environment as ResourceEnvironment, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
     HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
     IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
-    Presentation as ResourcePresentation, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource,
-    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SystemClock, TerminalBrief, TerminalCrewContext,
-    TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent,
-    WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
+    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey,
+    RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock,
+    TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, UnmetSettlementExpectation,
+    Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
@@ -83,10 +85,18 @@ use crate::{
         resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
     },
     host_registry::HostCounts,
-    leaf_engine::LeafSubscriptionTable,
+    leaf_engine::{LeafSubscriptionTable, LeafWatcher},
     model::{provider_names_from_registry, repo_name, RepoModel},
+    ops_entry::{
+        parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
+        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
+    },
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
+    project_declaration::{
+        parse_project_declaration, ProjectDeclaration, BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION,
+        BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE, DECLARATION_FILE_ANNOTATION,
+    },
     providers::{
         ai_utility::{AiUtility, ConvoyNames},
         discovery::{
@@ -100,7 +110,9 @@ use crate::{
     refresh::RefreshSnapshot,
     regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome, DEFAULT_REGARD_DECAY_SECONDS, DEFAULT_REGARD_REFRESH_SECONDS},
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
-    repository_inspection::{GitRepositoryInspector, RepositoryInspection, RepositoryInspector},
+    repository_inspection::{
+        GitRepositoryInspector, OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector,
+    },
     step::{
         run_step_plan_with_remote_executor, RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome, StepResolver,
     },
@@ -315,6 +327,89 @@ fn resource_record(record_type: ResourceRecordType, object: serde_json::Value, l
         _ => ResourceRecordProvenance::Local { node_id: local_node_id.clone() },
     };
     ResourceReadRecord { record_type, provenance, object: Some(object) }
+}
+
+fn explained_provenance(provenance: &ResourceProvenance, local_node_id: &NodeId) -> ResourceRecordProvenance {
+    match provenance {
+        ResourceProvenance::Local => ResourceRecordProvenance::Local { node_id: local_node_id.clone() },
+        ResourceProvenance::Replica { origin_root, last_synced_at } => {
+            ResourceRecordProvenance::Replica { origin_root: origin_root.clone(), last_synced_at: last_synced_at.to_rfc3339() }
+        }
+    }
+}
+
+fn observed_freshness(observed_at: Option<DateTime<Utc>>, now: DateTime<Utc>, ttl: Duration) -> EvidenceFreshness {
+    match observed_at.and_then(|observed_at| now.signed_duration_since(observed_at).to_std().ok()) {
+        Some(age) if age < ttl => EvidenceFreshness::Fresh,
+        Some(_) => EvidenceFreshness::Stale,
+        None => EvidenceFreshness::Missing,
+    }
+}
+
+fn explain_condition(condition: &IntegrationCondition, now: DateTime<Utc>, ttl: Duration) -> ExplainedCondition {
+    let observed_at = condition.observed_at.as_deref().and_then(|value| DateTime::parse_from_rfc3339(value).ok()).map(|at| at.to_utc());
+    ExplainedCondition {
+        value: match condition.value {
+            ConditionValue::True => "true",
+            ConditionValue::False => "false",
+            ConditionValue::Unknown => "unknown",
+        }
+        .to_string(),
+        observed_at: condition.observed_at.clone(),
+        freshness: observed_freshness(observed_at, now, ttl),
+        details: condition.details.clone(),
+    }
+}
+
+fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> ExplainedUnmetExpectation {
+    match expectation {
+        UnmetSettlementExpectation::InvalidExpectedCheckouts { message } => {
+            ExplainedUnmetExpectation { reason: "invalid_expected_checkouts".to_string(), subject: "convoy".to_string(), detail: message }
+        }
+        UnmetSettlementExpectation::MissingCheckout { checkout } => ExplainedUnmetExpectation {
+            reason: "missing_record".to_string(),
+            subject: format!("checkout/{checkout}"),
+            detail: "expected checkout has no federated record".to_string(),
+        },
+        UnmetSettlementExpectation::MissingCheckoutStatus { checkout } => ExplainedUnmetExpectation {
+            reason: "missing_status".to_string(),
+            subject: format!("checkout/{checkout}"),
+            detail: "observed checkout has no status".to_string(),
+        },
+        UnmetSettlementExpectation::CheckoutConditionFalse { checkout, condition } => ExplainedUnmetExpectation {
+            reason: "false_condition".to_string(),
+            subject: format!("checkout/{checkout}.{condition}"),
+            detail: format!("{condition} is false"),
+        },
+        UnmetSettlementExpectation::CheckoutConditionUnknown { checkout, condition } => ExplainedUnmetExpectation {
+            reason: "unknown_condition".to_string(),
+            subject: format!("checkout/{checkout}.{condition}"),
+            detail: format!("{condition} is unknown"),
+        },
+        UnmetSettlementExpectation::StaleCheckoutEvidence { checkout, condition, observed_at } => ExplainedUnmetExpectation {
+            reason: "stale_evidence".to_string(),
+            subject: format!("checkout/{checkout}.{condition}"),
+            detail: observed_at.map_or_else(|| "evidence has no observation time".to_string(), |at| format!("observed at {at}")),
+        },
+        UnmetSettlementExpectation::MissingChangeRequest { record } => ExplainedUnmetExpectation {
+            reason: "missing_record".to_string(),
+            subject: format!("change_request/{record}"),
+            detail: "expected change request has no federated observation".to_string(),
+        },
+        UnmetSettlementExpectation::StaleChangeRequest { record, observed_at } => ExplainedUnmetExpectation {
+            reason: "stale_evidence".to_string(),
+            subject: format!("change_request/{record}.state"),
+            detail: observed_at.map_or_else(|| "state has no observation time".to_string(), |at| format!("observed at {at}")),
+        },
+        UnmetSettlementExpectation::ChangeRequestConditionFalse { record, value } => ExplainedUnmetExpectation {
+            reason: "false_condition".to_string(),
+            subject: format!("change_request/{record}.state"),
+            detail: value.map_or_else(|| "state is unknown".to_string(), |value| format!("state is {value}")),
+        },
+        UnmetSettlementExpectation::InvalidCondition { subject, message } => {
+            ExplainedUnmetExpectation { reason: "invalid_condition".to_string(), subject, detail: message }
+        }
+    }
 }
 
 fn resource_watch_record(event: serde_json::Value, local_node_id: &NodeId) -> Result<Option<ResourceReadRecord>, String> {
@@ -2676,7 +2771,8 @@ impl InProcessDaemon {
         let (namespace, name) = match action {
             flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, .. }
-            | flotilla_protocol::CommandAction::ConvoyResume { namespace, name, .. } => {
+            | flotilla_protocol::CommandAction::ConvoyResume { namespace, name, .. }
+            | flotilla_protocol::CommandAction::QueryExplainConvoy { namespace, name } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), name.as_str())
             }
             flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, .. } => {
@@ -3801,7 +3897,13 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
         display_name,
         default_workflow_ref: "single-agent-trusted".to_string(),
         issue_source: None,
-        repositories: vec![ProjectRepositorySpec { repo: repository_key, subpath: None, default_branch: None }],
+        repositories: vec![ProjectRepositorySpec {
+            repo: repository_key,
+            alias: None,
+            roles: Default::default(),
+            subpath: None,
+            default_branch: None,
+        }],
     })
 }
 
@@ -3821,6 +3923,9 @@ async fn reconcile_whole_repository_project_definition(
     existing: ResourceObject<Project>,
     generated: &ProjectSpec,
 ) -> Result<ResourceObject<Project>, String> {
+    if is_declaration_backed_project(&existing) {
+        return Ok(existing);
+    }
     let generator_fields_diverged =
         existing.spec.default_workflow_ref != generated.default_workflow_ref || existing.spec.repositories != generated.repositories;
     let managed_by_generator =
@@ -3845,6 +3950,10 @@ async fn reconcile_whole_repository_project_definition(
         );
     }
     Ok(reconciled)
+}
+
+fn is_declaration_backed_project(project: &ResourceObject<Project>) -> bool {
+    project.metadata.annotations.contains_key(BOOTSTRAP_REPOSITORY_ANNOTATION)
 }
 
 fn is_whole_repository_project(spec: &ProjectSpec, repository_key: &RepositoryKey) -> bool {
@@ -4814,6 +4923,9 @@ impl InProcessDaemon {
         let mut unresolved = Vec::new();
         let mut snapshots = BTreeMap::<RepositoryKey, (String, RepositorySpec, Option<String>, BTreeSet<String>)>::new();
         for entry in &project.spec.repositories {
+            if !entry.roles.is_empty() && !entry.roles.contains(&ProjectRepositoryRole::Code) {
+                continue;
+            }
             match repositories.get(&entry.repo.to_string()).await {
                 Ok(repository) => {
                     if let Err(error) = repository.spec.verify_key(&entry.repo) {
@@ -4867,6 +4979,456 @@ impl InProcessDaemon {
             .collect::<Vec<_>>();
         repositories.sort_by(|left, right| left.workspace_slug.cmp(&right.workspace_slug).then_with(|| left.repo_ref.cmp(&right.repo_ref)));
         Ok(repositories)
+    }
+
+    async fn project_register(&self, target: &str) -> Result<(String, usize), String> {
+        let namespace = self.provisioning_namespace().await;
+        let path = if Path::new(target).exists() {
+            PathBuf::from(target)
+        } else {
+            let matches = self
+                .resource_backend
+                .clone()
+                .using::<Repository>(&namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+                .into_iter()
+                .filter(|repository| repository_matches_target(repository, target))
+                .collect::<Vec<_>>();
+            let [repository] = matches.as_slice() else {
+                return Err(match matches.len() {
+                    0 => format!("`{target}` is neither a bootstrap repository path nor a repository catalog slug"),
+                    _ => format!("bootstrap repository slug `{target}` is ambiguous"),
+                });
+            };
+            let key = RepositoryKey(repository.metadata.name.clone());
+            let mut paths = self
+                .repository_keys_by_path
+                .read()
+                .await
+                .iter()
+                .filter(|(_, candidate)| *candidate == &key)
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            paths.sort();
+            match paths.as_slice() {
+                [] => return Err(format!("bootstrap repository `{target}` has no local checkout on this host")),
+                [path] => path.clone(),
+                _ => {
+                    let inspector = self.repository_inspector().await?;
+                    let mut main_paths = Vec::new();
+                    for path in paths {
+                        if inspector.inspect_path(&path, None).await?.checkout.is_main {
+                            main_paths.push(path);
+                        }
+                    }
+                    match main_paths.as_slice() {
+                        [path] => path.clone(),
+                        _ => {
+                            return Err(format!(
+                                "bootstrap repository `{target}` has multiple local checkouts; pass the intended checkout path explicitly"
+                            ));
+                        }
+                    }
+                }
+            }
+        };
+        let inspection = self.repository_inspector().await?.inspect_project_declaration(&path).await?;
+        let declaration = parse_project_declaration(&inspection.yaml)?;
+        let name = declaration.name.clone();
+        self.materialize_project_declaration(declaration, inspection).await?;
+        let project =
+            self.resource_backend.clone().definitions::<Project>(&namespace).get(&name).await.map_err(|error| error.to_string())?;
+        Ok((name, project.spec.repositories.len()))
+    }
+
+    async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>), String> {
+        validate_project_name(name)?;
+        let namespace = self.provisioning_namespace().await;
+        let project =
+            self.resource_backend.clone().definitions::<Project>(&namespace).get(name).await.map_err(|error| error.to_string())?;
+        let bootstrap_path = project
+            .metadata
+            .annotations
+            .get(BOOTSTRAP_PATH_ANNOTATION)
+            .ok_or_else(|| format!("project {name} was registered without a declaration"))?;
+        let inspection = self.repository_inspector().await?.inspect_project_declaration(Path::new(bootstrap_path)).await?;
+        let declaration = parse_project_declaration(&inspection.yaml)?;
+        if declaration.name != name {
+            return Err(format!(
+                "{} now declares project `{}` instead of `{name}`",
+                Path::new(bootstrap_path).join(DECLARATION_FILE).display(),
+                declaration.name
+            ));
+        }
+        let changes = self.materialize_project_declaration(declaration, inspection).await?;
+        let members = self
+            .resource_backend
+            .clone()
+            .definitions::<Project>(&namespace)
+            .get(name)
+            .await
+            .map_err(|error| error.to_string())?
+            .spec
+            .repositories
+            .len();
+        Ok((members, !changes.is_empty(), changes))
+    }
+
+    async fn materialize_project_declaration(
+        &self,
+        declaration: ProjectDeclaration,
+        inspection: ProjectDeclarationInspection,
+    ) -> Result<Vec<String>, String> {
+        validate_project_name(&declaration.name)?;
+        let namespace = self.provisioning_namespace().await;
+        let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
+        let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
+        let existing_project = match projects.get(&declaration.name).await {
+            Ok(project) => Some(project),
+            Err(ResourceError::NotFound { .. }) => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        let aliases = existing_project
+            .as_ref()
+            .into_iter()
+            .flat_map(|project| &project.spec.repositories)
+            .filter_map(|member| member.alias.as_ref().map(|alias| (alias.clone(), member.repo.clone())))
+            .collect::<BTreeMap<_, _>>();
+        let bootstrap_key = inspection.repository.key();
+        let bootstrap_path = inspection.repository.checkout.path.to_string_lossy().into_owned();
+        let bootstrap_inspection = inspection.clone();
+        let provenance = BTreeMap::from([
+            (BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), bootstrap_key.to_string()),
+            (BOOTSTRAP_COMMIT_ANNOTATION.to_string(), inspection.commit.clone()),
+            (DECLARATION_FILE_ANNOTATION.to_string(), DECLARATION_FILE.to_string()),
+        ]);
+        let mut converged = false;
+        let mut members = Vec::with_capacity(declaration.members.len());
+        for member in declaration.members {
+            let declared_spec = RepositorySpec::remote(member.url)?;
+            let key = aliases.get(&member.alias).cloned().unwrap_or_else(|| declared_spec.key());
+            let mut repository = if key == declared_spec.key() {
+                ensure_repository(&repositories, &key, &declared_spec).await.map_err(|error| error.to_string())?
+            } else {
+                repositories
+                    .get(&key.to_string())
+                    .await
+                    .map_err(|error| format!("project member alias `{}` refers to unavailable repository {key}: {error}", member.alias))?
+            };
+            let mut repository_meta = InputMeta::from(&repository.metadata);
+            for (annotation, value) in &provenance {
+                if repository_meta.annotations.get(annotation) != Some(value) {
+                    converged = true;
+                    repository_meta.annotations.insert(annotation.clone(), value.clone());
+                }
+            }
+            if repository_meta.annotations != repository.metadata.annotations {
+                repository = repositories
+                    .update(&repository_meta, &repository.metadata.resource_version, &repository.spec)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            repository
+                .spec
+                .verify_key(&key)
+                .map_err(|error| format!("project member alias `{}` resolved to invalid repository {key}: {error}", member.alias))?;
+            members.push(ProjectRepositorySpec {
+                repo: key,
+                alias: Some(member.alias),
+                roles: member.roles,
+                subpath: None,
+                default_branch: None,
+            });
+        }
+        let spec = normalize_project_spec(ProjectSpec {
+            display_name: declaration.name.clone(),
+            default_workflow_ref: "single-agent-trusted".to_string(),
+            issue_source: None,
+            repositories: members,
+        })?;
+        let mut meta = existing_project
+            .as_ref()
+            .map_or_else(|| InputMeta::builder().name(declaration.name.clone()).build(), |project| InputMeta::from(&project.metadata));
+        for (annotation, value) in provenance {
+            meta.annotations.insert(annotation, value);
+        }
+        meta.annotations.insert(BOOTSTRAP_PATH_ANNOTATION.to_string(), bootstrap_path);
+        converged |=
+            existing_project.as_ref().is_none_or(|project| project.spec != spec || project.metadata.annotations != meta.annotations);
+        projects.apply(&meta, &spec).await.map_err(|error| error.to_string())?;
+        let mut changes = if converged { vec![format!("Project/{}", declaration.name)] } else { Vec::new() };
+        changes.extend(self.materialize_project_operational_entries(&declaration.name, &bootstrap_inspection).await?);
+        Ok(changes)
+    }
+
+    async fn materialize_project_operational_entries(
+        &self,
+        project_name: &str,
+        bootstrap: &ProjectDeclarationInspection,
+    ) -> Result<Vec<String>, String> {
+        let namespace = self.provisioning_namespace().await;
+        let project =
+            self.resource_backend.clone().definitions::<Project>(&namespace).get(project_name).await.map_err(|e| e.to_string())?;
+        let aliases = project
+            .spec
+            .repositories
+            .iter()
+            .filter_map(|member| member.alias.as_ref().map(|alias| (alias.clone(), member.repo.clone())))
+            .collect::<BTreeMap<_, _>>();
+        let all_code = project
+            .spec
+            .repositories
+            .iter()
+            .filter(|member| member.roles.contains(&ProjectRepositoryRole::Code))
+            .map(|member| member.repo.clone())
+            .collect::<Vec<_>>();
+        let inspector = self.repository_inspector().await?;
+        let mut sources = Vec::new();
+        let mut unavailable_source = false;
+        for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Ops)) {
+            let path = if member.repo == bootstrap.repository.key() {
+                bootstrap.repository.checkout.path.clone()
+            } else {
+                let mut paths = self
+                    .repository_keys_by_path
+                    .read()
+                    .await
+                    .iter()
+                    .filter(|(_, key)| *key == &member.repo)
+                    .map(|(path, _)| path.clone())
+                    .collect::<Vec<_>>();
+                paths.sort();
+                match paths.as_slice() {
+                    [] => {
+                        unavailable_source = true;
+                        continue;
+                    }
+                    [path] => path.clone(),
+                    _ => {
+                        let mut main_paths = Vec::new();
+                        for path in paths {
+                            if inspector.inspect_path(&path, None).await?.checkout.is_main {
+                                main_paths.push(path);
+                            }
+                        }
+                        match main_paths.as_slice() {
+                            [path] => path.clone(),
+                            _ => {
+                                return Err(format!(
+                                    "ops member {} has multiple local checkouts; its main checkout cannot be selected unambiguously",
+                                    member.alias.as_deref().unwrap_or(&member.repo.0)
+                                ));
+                            }
+                        }
+                    }
+                }
+            };
+            let mut source = inspector.inspect_operational_entries(&path).await?;
+            if member.repo == bootstrap.repository.key() {
+                source.commit.clone_from(&bootstrap.commit);
+                source.repository = bootstrap.repository.clone();
+            }
+            sources.push(source);
+        }
+        // Registration remains possible from a bootstrap repository that does
+        // not host every ops member. Never infer an empty desired set from an
+        // unavailable source: that could erase definitions materialized by a
+        // previous refresh on a host that had the checkout.
+        if unavailable_source {
+            return Ok(Vec::new());
+        }
+
+        let mut workflows = BTreeMap::new();
+        let mut commands = BTreeMap::<RepositoryKey, BTreeMap<String, String>>::new();
+        let mut command_provenance = BTreeMap::<RepositoryKey, Vec<serde_json::Value>>::new();
+        for source in sources {
+            self.collect_operational_entries(
+                project_name,
+                &aliases,
+                &all_code,
+                source,
+                &mut workflows,
+                &mut commands,
+                &mut command_provenance,
+            )?;
+        }
+
+        let templates = self.resource_backend.clone().using::<WorkflowTemplate>(&namespace);
+        let mut changes = Vec::new();
+        for (name, (meta, spec)) in &workflows {
+            let current = match templates.get(name).await {
+                Ok(current) => Some(current),
+                Err(ResourceError::NotFound { .. }) => None,
+                Err(error) => return Err(error.to_string()),
+            };
+            if let Some(current) = &current {
+                match current.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION) {
+                    Some(owner) if owner == project_name => {}
+                    Some(owner) => return Err(format!("WorkflowTemplate `{name}` is materialized by project `{owner}`")),
+                    None => return Err(format!("WorkflowTemplate `{name}` already exists and is not materialized by a project")),
+                }
+            }
+            if current.as_ref().is_none_or(|current| current.spec != *spec || current.metadata.annotations != meta.annotations) {
+                match current {
+                    Some(current) => {
+                        templates.update(meta, &current.metadata.resource_version, spec).await.map_err(|error| error.to_string())?;
+                    }
+                    None => {
+                        templates.create(meta, spec).await.map_err(|error| error.to_string())?;
+                    }
+                }
+                changes.push(format!("WorkflowTemplate/{name}"));
+            }
+        }
+        for stale in templates.list().await.map_err(|error| error.to_string())?.items.into_iter().filter(|template| {
+            template.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
+                && !workflows.contains_key(&template.metadata.name)
+        }) {
+            templates.delete(&stale.metadata.name).await.map_err(|error| error.to_string())?;
+            changes.push(format!("deleted WorkflowTemplate/{}", stale.metadata.name));
+        }
+
+        let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
+        let current_code_members = project
+            .spec
+            .repositories
+            .iter()
+            .filter(|member| member.roles.contains(&ProjectRepositoryRole::Code))
+            .map(|member| member.repo.clone())
+            .collect::<BTreeSet<_>>();
+        for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Code)) {
+            let current = repositories.get(&member.repo.to_string()).await.map_err(|error| error.to_string())?;
+            let desired_commands = commands.remove(&member.repo).unwrap_or_default();
+            let owner = current.metadata.annotations.get(VERIFICATION_PROJECT_ANNOTATION).map(String::as_str);
+            match owner {
+                Some(owner) if owner == project_name => {}
+                Some(owner) if !desired_commands.is_empty() => {
+                    return Err(format!("Repository {} verification commands are materialized by project `{owner}`", member.repo));
+                }
+                None if !desired_commands.is_empty() && !current.spec.verification_commands().is_empty() => {
+                    return Err(format!(
+                        "Repository {} already has verification commands that are not materialized by a project",
+                        member.repo
+                    ));
+                }
+                None if !desired_commands.is_empty() => {}
+                _ => continue,
+            }
+            let desired_spec = current.spec.clone().with_verification_commands(desired_commands);
+            let mut meta = InputMeta::from(&current.metadata);
+            match command_provenance.remove(&member.repo) {
+                Some(provenance) => {
+                    meta.annotations.insert(VERIFICATION_PROJECT_ANNOTATION.to_string(), project_name.to_string());
+                    meta.annotations.insert(
+                        VERIFICATION_PROVENANCE_ANNOTATION.to_string(),
+                        serde_json::to_string(&provenance).expect("JSON provenance values serialize"),
+                    );
+                }
+                None => {
+                    meta.annotations.remove(VERIFICATION_PROJECT_ANNOTATION);
+                    meta.annotations.remove(VERIFICATION_PROVENANCE_ANNOTATION);
+                }
+            }
+            if current.spec != desired_spec || current.metadata.annotations != meta.annotations {
+                repositories.update(&meta, &current.metadata.resource_version, &desired_spec).await.map_err(|error| error.to_string())?;
+                changes.push(format!("Repository/{} verification commands", member.repo));
+            }
+        }
+        for stale in repositories.list().await.map_err(|error| error.to_string())?.items.into_iter().filter(|repository| {
+            repository.metadata.annotations.get(VERIFICATION_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
+                && !current_code_members.contains(&RepositoryKey(repository.metadata.name.clone()))
+        }) {
+            let mut meta = InputMeta::from(&stale.metadata);
+            meta.annotations.remove(VERIFICATION_PROJECT_ANNOTATION);
+            meta.annotations.remove(VERIFICATION_PROVENANCE_ANNOTATION);
+            let spec = stale.spec.clone().with_verification_commands(BTreeMap::new());
+            repositories.update(&meta, &stale.metadata.resource_version, &spec).await.map_err(|error| error.to_string())?;
+            changes.push(format!("Repository/{} verification commands", stale.metadata.name));
+        }
+        changes.sort();
+        Ok(changes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_operational_entries(
+        &self,
+        project_name: &str,
+        aliases: &BTreeMap<String, RepositoryKey>,
+        all_code: &[RepositoryKey],
+        source: OperationalEntriesInspection,
+        workflows: &mut BTreeMap<String, (InputMeta, WorkflowTemplateSpec)>,
+        commands: &mut BTreeMap<RepositoryKey, BTreeMap<String, String>>,
+        command_provenance: &mut BTreeMap<RepositoryKey, Vec<serde_json::Value>>,
+    ) -> Result<(), String> {
+        let source_repository = source.repository.key();
+        for file in source.files {
+            let Some(entry) = parse_operational_entry(&file.contents).map_err(|error| format!("{}: {error}", file.path))? else {
+                continue;
+            };
+            let is_verification_command = matches!(&entry.definition, OperationalEntryDefinition::VerificationCommand { .. });
+            let targets = match entry.repos {
+                Some(repo_aliases) => repo_aliases
+                    .into_iter()
+                    .map(|alias| {
+                        let target = aliases
+                            .get(&alias)
+                            .cloned()
+                            .ok_or_else(|| format!("{} names unknown repository alias `{alias}`", file.path))?;
+                        if is_verification_command && !all_code.contains(&target) {
+                            return Err(format!(
+                                "{} verification command `{}` targets repository alias `{alias}` without the code role",
+                                file.path, entry.name
+                            ));
+                        }
+                        Ok(target)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => all_code.to_vec(),
+            };
+            if targets.is_empty() {
+                return Err(format!("{} has no code-role repositories to target", file.path));
+            }
+            let provenance = serde_json::json!({
+                "sourceRepository": source_repository,
+                "sourceCommit": source.commit,
+                "entryPath": file.path,
+            });
+            match entry.definition {
+                OperationalEntryDefinition::WorkflowTemplate(mut spec) => {
+                    for vessel in &mut spec.vessels {
+                        vessel.repository_refs = Some(targets.clone());
+                    }
+                    flotilla_resources::validate(&spec).map_err(|errors| {
+                        let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+                        format!("{} contains invalid workflow template `{}`: {errors}", file.path, entry.name)
+                    })?;
+                    let meta = InputMeta::builder()
+                        .name(entry.name.clone())
+                        .annotations(BTreeMap::from([
+                            (MATERIALIZED_PROJECT_ANNOTATION.to_string(), project_name.to_string()),
+                            (SOURCE_REPOSITORY_ANNOTATION.to_string(), source_repository.to_string()),
+                            (SOURCE_COMMIT_ANNOTATION.to_string(), source.commit.clone()),
+                            (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), file.path.clone()),
+                        ]))
+                        .build();
+                    if workflows.insert(entry.name.clone(), (meta, spec)).is_some() {
+                        return Err(format!("duplicate materialized WorkflowTemplate `{}`", entry.name));
+                    }
+                }
+                OperationalEntryDefinition::VerificationCommand { command } => {
+                    for target in targets {
+                        if commands.entry(target.clone()).or_default().insert(entry.name.clone(), command.clone()).is_some() {
+                            return Err(format!("duplicate verification command `{}` for repository {target}", entry.name));
+                        }
+                        command_provenance.entry(target).or_default().push(provenance.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn project_add(
@@ -4942,6 +5504,9 @@ impl InProcessDaemon {
         let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
         match projects.get(&project_name).await {
             Ok(existing) => {
+                if is_declaration_backed_project(&existing) {
+                    return Err(format!("project {project_name} is managed by a declaration; use project refresh to update it"));
+                }
                 if !is_whole_repository_project(&existing.spec, &key) {
                     return Err(format!("project {project_name} already exists with a different repository definition"));
                 }
@@ -5045,6 +5610,9 @@ impl InProcessDaemon {
         }
         let mut migrated_project_names = BTreeSet::new();
         for project in &mut project_objects {
+            if is_declaration_backed_project(project) {
+                continue;
+            }
             let mut updated = project.spec.clone();
             let mut changed = false;
             for entry in &mut updated.repositories {
@@ -8005,20 +8573,75 @@ impl InProcessDaemon {
                 Ok(spec) => match normalize_project_spec(spec) {
                     Ok(spec) => {
                         let outcome = match projects.get(name).await {
-                            Ok(existing) => projects.apply(&InputMeta::from(&existing.metadata), &spec).await.map(|_| ()),
-                            Err(ResourceError::NotFound { .. }) => {
-                                projects.apply(&InputMeta::builder().name(name.clone()).build(), &spec).await.map(|_| ())
+                            Ok(existing) if is_declaration_backed_project(&existing) => {
+                                Err(format!("project {name} is managed by a declaration; use project refresh to update it"))
                             }
-                            Err(error) => Err(error),
+                            Ok(existing) => projects
+                                .apply(&InputMeta::from(&existing.metadata), &spec)
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| error.to_string()),
+                            Err(ResourceError::NotFound { .. }) => projects
+                                .apply(&InputMeta::builder().name(name.clone()).build(), &spec)
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| error.to_string()),
+                            Err(error) => Err(error.to_string()),
                         };
                         match outcome {
                             Ok(()) => flotilla_protocol::CommandValue::ProjectApplied { name: name.clone() },
-                            Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                            Err(message) => flotilla_protocol::CommandValue::Error { message },
                         }
                     }
                     Err(message) => flotilla_protocol::CommandValue::Error { message },
                 },
                 Err(err) => flotilla_protocol::CommandValue::Error { message: err },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity,
+                repo: None,
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ProjectRegister { target } = &command.action {
+            let empty_identity = empty_repo_identity();
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: None,
+                description: command.description().to_string(),
+            });
+            let result = match self.project_register(target).await {
+                Ok((name, members)) => CommandValue::ProjectRegistered { name, members },
+                Err(message) => CommandValue::Error { message },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity,
+                repo: None,
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ProjectRefresh { name } = &command.action {
+            let empty_identity = empty_repo_identity();
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: None,
+                description: command.description().to_string(),
+            });
+            let result = match self.project_refresh(name).await {
+                Ok((members, converged, changes)) => CommandValue::ProjectRefreshed { name: name.clone(), members, converged, changes },
+                Err(message) => CommandValue::Error { message },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                 command_id: id,
@@ -8328,6 +8951,174 @@ async fn execute_local_remote_step_batch(
     Ok(outcomes)
 }
 
+impl InProcessDaemon {
+    async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String> {
+        let namespace = requested_namespace.map(ToOwned::to_owned).unwrap_or(self.provisioning_namespace().await);
+        let convoy_sources =
+            self.resource_backend.including_replicas::<ResourceConvoy>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let convoy_source = convoy_sources
+            .items
+            .into_iter()
+            .filter(|source| source.object.metadata.name == name)
+            .max_by_key(|source| matches!(source.provenance, ResourceProvenance::Local))
+            .ok_or_else(|| format!("convoy {namespace}/{name} not found in local or replicated resources"))?;
+        let convoy = convoy_source.object;
+        let now = self.clock.now();
+        let change_request_stale_after = self.change_request_stale_after();
+
+        let checkout_sources =
+            self.resource_backend.including_replicas::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?.items;
+        let selected_checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources);
+        let expected = expected_checkout_refs(&convoy).map_err(|error| format!("derive expected checkouts: {error}"))?;
+        let checkouts = expected
+            .iter()
+            .map(|checkout_name| {
+                let selected = selected_checkouts.get(checkout_name);
+                let provenance = selected.and_then(|object| {
+                    checkout_sources
+                        .iter()
+                        .find(|source| {
+                            source.object.metadata.name == object.metadata.name
+                                && source.object.metadata.resource_version == object.metadata.resource_version
+                        })
+                        .map(|source| explained_provenance(&source.provenance, &self.node_id))
+                });
+                let integration = selected.and_then(|checkout| checkout.status.as_ref()).map(|status| &status.integration);
+                ExplainedCheckout {
+                    name: checkout_name.clone(),
+                    observed: selected.is_some(),
+                    provenance,
+                    clean: integration.map(|status| explain_condition(&status.clean, now, LANDING_EVIDENCE_TTL)),
+                    pushed: integration.map(|status| explain_condition(&status.pushed, now, LANDING_EVIDENCE_TTL)),
+                    landed: integration.map(|status| explain_condition(&status.landed, now, LANDING_EVIDENCE_TTL)),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let change_request_sources = self
+            .resource_backend
+            .including_replicas::<flotilla_resources::ChangeRequest>(&namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items;
+        let mut selected_change_requests = BTreeMap::new();
+        for source in &change_request_sources {
+            let name = source.object.metadata.name.clone();
+            let replace = selected_change_requests.get(&name).is_none_or(
+                |existing: &&flotilla_resources::ReadResourceObject<flotilla_resources::ChangeRequest>| {
+                    !matches!(existing.provenance, ResourceProvenance::Local) && matches!(source.provenance, ResourceProvenance::Local)
+                },
+            );
+            if replace {
+                selected_change_requests.insert(name, source);
+            }
+        }
+        let change_request_objects =
+            selected_change_requests.iter().map(|(name, source)| (name.clone(), source.object.clone())).collect::<BTreeMap<_, _>>();
+        let expected_change_requests = expected_change_request_leaves(&convoy, &selected_checkouts)
+            .map_err(|error| format!("derive expected change requests: {error}"))?
+            .into_iter()
+            .filter_map(|leaf| match leaf.address {
+                flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } => {
+                    Some(flotilla_resources::change_request_record_name(&service, &scope, number))
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let bound_name = bound_change_request_record_name(&convoy).map_err(|error| format!("derive bound change request: {error}"))?;
+        let change_requests = expected_change_requests
+            .iter()
+            .map(|record_name| {
+                let selected = selected_change_requests.get(record_name).copied();
+                let observed_at = selected.and_then(|source| source.object.status.as_ref()).map(|status| status.state.observed_at);
+                ExplainedChangeRequest {
+                    name: record_name.clone(),
+                    bound: bound_name.as_ref() == Some(record_name),
+                    observed: selected.is_some(),
+                    provenance: selected.map(|source| explained_provenance(&source.provenance, &self.node_id)),
+                    fields: selected.and_then(|source| serde_json::to_value(&source.object).ok()),
+                    observed_at: observed_at.map(|at| at.to_rfc3339()),
+                    freshness: observed_freshness(observed_at, now, change_request_stale_after),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let evaluation = evaluate_landing_settlement(
+            &convoy,
+            &selected_checkouts,
+            &change_request_objects,
+            change_request_stale_after,
+            LANDING_EVIDENCE_TTL,
+            now,
+        );
+        let settlement = ExplainedSettlement {
+            mode: match evaluation.mode {
+                SettlementMode::ClaimExit => "claim_exit",
+                SettlementMode::WorldTerminal => "world_terminal",
+            }
+            .to_string(),
+            satisfied: evaluation.satisfied,
+            unmet: evaluation.unmet.into_iter().map(explain_unmet_expectation).collect(),
+        };
+
+        let subscriptions = self
+            .leaf_subscriptions
+            .diagnostics()
+            .await
+            .into_iter()
+            .filter(|(row, _)| matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy } if convoy == name))
+            .map(|(row, firings)| ExplainedSubscription {
+                id: row.id,
+                watcher: match row.watcher {
+                    LeafWatcher::WaitCaller { .. } => "wait_caller",
+                    LeafWatcher::ReconcilerWake { .. } => "reconciler_wake",
+                }
+                .to_string(),
+                leaves: row.leaves,
+                last_leaf_firings: firings
+                    .into_iter()
+                    .map(|firing| ExplainedLeafFiring { leaf: firing.leaf, value: firing.value, fired_at: firing.fired_at.to_rfc3339() })
+                    .collect(),
+            })
+            .collect();
+
+        let mut crew_deliveries = self
+            .resource_backend
+            .including_replicas::<ResourceTerminalSession>(&namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .filter(|source| source.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|convoy| convoy == name))
+            .map(|source| ExplainedCrewDelivery {
+                session: source.object.metadata.name,
+                role: source.object.spec.role,
+                // ADR 0028's delivery ladder has not landed yet. Keep the
+                // field explicit so recorded rungs appear without inventing
+                // one from session liveness or message delivery.
+                last_delivery_rung: None,
+                delivered_message_id: source.object.status.and_then(|status| status.delivered_message_id),
+            })
+            .collect::<Vec<_>>();
+        crew_deliveries.sort_by(|left, right| left.session.cmp(&right.session));
+
+        Ok(ConvoyExplanation {
+            namespace,
+            convoy: name.to_string(),
+            phase: convoy.status.as_ref().map_or_else(|| "Unknown".to_string(), |status| format!("{:?}", status.phase)),
+            evidence_ttl_seconds: LANDING_EVIDENCE_TTL.as_secs(),
+            change_request_stale_after_seconds: change_request_stale_after.as_secs(),
+            checkouts,
+            change_requests,
+            subscriptions,
+            crew_deliveries,
+            settlement,
+        })
+    }
+}
+
 #[async_trait]
 impl DaemonHandle for InProcessDaemon {
     fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
@@ -8455,6 +9246,10 @@ impl DaemonHandle for InProcessDaemon {
                     Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
                 }
             }
+            CommandAction::QueryExplainConvoy { namespace, name } => match self.explain_convoy_internal(namespace.as_deref(), name).await {
+                Ok(explanation) => Ok(CommandValue::ConvoyExplanation(Box::new(explanation))),
+                Err(message) => Ok(CommandValue::Error { message }),
+            },
             CommandAction::QueryResourceList { namespace, kind, include_replicas } => {
                 let listed = if *include_replicas {
                     list_resource_kind_including_replicas(&self.resource_backend, namespace, kind).await
@@ -8487,25 +9282,33 @@ impl DaemonHandle for InProcessDaemon {
                 // Take the collection cursor before reading the object. A
                 // concurrent mutation can then be replayed (at worst as a
                 // duplicate) instead of being hidden behind a newer cursor.
-                let listed = match list_resource_kind(&self.resource_backend, namespace, kind).await {
+                let cursor_list = match list_resource_kind(&self.resource_backend, namespace, kind).await {
                     Ok(listed) => listed,
                     Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
                 };
-                match get_resource_kind(&self.resource_backend, namespace, kind, name).await {
-                    Ok(v) => {
-                        let resource_version = listed.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string();
-                        let generation = listed.value["metadata"]["generation"].as_str().map(ToOwned::to_owned);
-                        let record = resource_record(ResourceRecordType::Current, v.value, &self.node_id);
-                        Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
-                            v.kind,
-                            v.plural,
-                            v.namespace,
-                            ResourceCursor::from_position(resource_version, generation),
-                            vec![record],
-                        ))))
-                    }
-                    Err(error) => Ok(flotilla_protocol::CommandValue::Error { message: error.to_string() }),
-                }
+                let visible = match list_resource_kind_including_replicas(&self.resource_backend, namespace, kind).await {
+                    Ok(listed) => listed,
+                    Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
+                };
+                let object = visible.value["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|object| object["metadata"]["name"].as_str() == Some(name.as_str()))
+                    .cloned();
+                let Some(object) = object else {
+                    return Ok(CommandValue::Error { message: format!("resource {kind}/{namespace}/{name} not found") });
+                };
+                let resource_version = cursor_list.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string();
+                let generation = cursor_list.value["metadata"]["generation"].as_str().map(ToOwned::to_owned);
+                let record = resource_record(ResourceRecordType::Current, object, &self.node_id);
+                Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
+                    visible.kind,
+                    visible.plural,
+                    visible.namespace,
+                    ResourceCursor::from_position(resource_version, generation),
+                    vec![record],
+                ))))
             }
             CommandAction::Attach { reference, host, mode } => {
                 match self.resolve_attach_with_mode_internal(reference, host.as_ref(), false, *mode).await {

@@ -42,6 +42,16 @@ pub enum ProjectVerb {
         #[arg(long = "file", short = 'f')]
         file: PathBuf,
     },
+    /// Register a project from project.yaml in a bootstrap repository
+    Register {
+        /// Local bootstrap repository path or tracked repository catalog slug
+        target: String,
+    },
+    /// Re-read and converge a registered project's declaration
+    Refresh {
+        /// Project resource name
+        name: String,
+    },
 }
 
 impl ProjectNoun {
@@ -53,6 +63,8 @@ impl ProjectNoun {
                 let spec_yaml = std::fs::read_to_string(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
                 CommandAction::ProjectApply { name, spec_yaml }
             }
+            ProjectVerb::Register { target } => CommandAction::ProjectRegister { target },
+            ProjectVerb::Refresh { name } => CommandAction::ProjectRefresh { name },
         };
         Ok(Resolved::NeedsContext {
             command: Command { node_id: None, provisioning_target: None, context_repo: None, action },
@@ -82,6 +94,8 @@ impl std::fmt::Display for ProjectNoun {
             ProjectVerb::Apply { name, file } => {
                 write!(f, " apply {} --file {}", quote_value(name), quote_value(&file.display().to_string()))?;
             }
+            ProjectVerb::Register { target } => write!(f, " register {}", quote_value(target))?,
+            ProjectVerb::Refresh { name } => write!(f, " refresh {}", quote_value(name))?,
         }
         Ok(())
     }
@@ -179,6 +193,8 @@ mod tests {
         ]);
         assert_round_trip::<ProjectNoun>(&["project", "apply", "core", "--file", "/tmp/project.yaml"]);
         assert_round_trip::<ProjectNoun>(&["project", "list"]);
+        assert_round_trip::<ProjectNoun>(&["project", "register", "/src/bootstrap"]);
+        assert_round_trip::<ProjectNoun>(&["project", "refresh", "core"]);
     }
 
     #[test]

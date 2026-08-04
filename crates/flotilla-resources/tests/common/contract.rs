@@ -314,6 +314,8 @@ fn project_spec(display_name: &str, workflow: &str) -> ProjectSpec {
         .default_workflow_ref(workflow.to_string())
         .repositories(vec![ProjectRepositorySpec {
             repo: RepositoryKey("github.com/acme/widgets".to_string()),
+            alias: None,
+            roles: Default::default(),
             subpath: None,
             default_branch: None,
         }])

@@ -194,6 +194,26 @@ rejected UID would have served none.
 Project rename continuity is **deferred with a named dependency**: what would
 need to follow a rename is annotations on the Project or its sub-resources, so
 the decision waits on the annotation-layer design rather than on speculation.
+
+## Project declarations and explicit materialization
+
+A Project may opt into a reviewed `project.yaml` declaration stored in any
+bootstrap repository; that repository need not itself be a member. The schema
+names the Project and lists members by project-scoped alias, canonical URL, and
+a non-empty set of `code`, `ops`, and `knowledge` roles. Multiple roles on one
+repository are first-class.
+
+Registration and operator-requested refresh are the only materialization
+triggers. They project the declaration into the Project and Repository
+resources and stamp the bootstrap RepositoryKey and exact commit as provenance.
+The flow is strictly one-way: edits to materialized state are drift and refresh
+converges them back to the declaration. There is deliberately no continuous
+watch, so merging a declaration change cannot reconfigure the fleet by itself.
+Projects without declarations remain legitimate.
+
+Aliases are the stable join across refreshes. If a member URL changes under the
+same alias, the Project retains its established RepositoryKey and relies on the
+forge redirect semantics above rather than rewriting existing references.
 External forge renames are out of scope; the forge redirects.
 
 ## Consequences

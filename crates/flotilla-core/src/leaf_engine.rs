@@ -40,6 +40,13 @@ pub struct LeafSubscriptionRow {
     pub episode_key: EpisodeKeyFields,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafFiringRecord {
+    pub leaf: Leaf,
+    pub value: String,
+    pub fired_at: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 pub struct LeafSubscriptionTable {
     inner: Arc<LeafSubscriptionTableInner>,
@@ -49,6 +56,7 @@ struct LeafSubscriptionTableInner {
     backend: ResourceBackend,
     event_tx: broadcast::Sender<DaemonEvent>,
     rows: Mutex<HashMap<uuid::Uuid, LeafSubscriptionRow>>,
+    last_firings: Mutex<HashMap<(uuid::Uuid, Leaf), LeafFiringRecord>>,
     tasks: Mutex<HashMap<uuid::Uuid, JoinHandle<()>>>,
     change_requests: ChangeRequestRefresher,
     reconciler_tx: broadcast::Sender<String>,
@@ -62,6 +70,7 @@ impl LeafSubscriptionTable {
                 backend,
                 event_tx,
                 rows: Mutex::new(HashMap::new()),
+                last_firings: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(HashMap::new()),
                 change_requests,
                 reconciler_tx,
@@ -94,6 +103,7 @@ impl LeafSubscriptionTable {
         for subject in row.leaves.iter().filter_map(|leaf| ChangeRequestRef::from_address(&row.namespace, &leaf.address)) {
             if let Err(error) = self.inner.change_requests.demand(id, subject, row.freshness_demand).await {
                 self.inner.rows.lock().await.remove(&id);
+                self.forget_firings(id).await;
                 self.inner.change_requests.release(id).await;
                 return Err(error);
             }
@@ -123,6 +133,7 @@ impl LeafSubscriptionTable {
             .collect::<Vec<_>>();
         for id in ids {
             self.inner.rows.lock().await.remove(&id);
+            self.forget_firings(id).await;
             if let Some(task) = self.inner.tasks.lock().await.remove(&id) {
                 task.abort();
             }
@@ -138,15 +149,33 @@ impl LeafSubscriptionTable {
         self.inner.change_requests.stale_after()
     }
 
-    #[cfg(test)]
     pub async fn rows(&self) -> Vec<LeafSubscriptionRow> {
         self.inner.rows.lock().await.values().cloned().collect()
     }
 
+    pub async fn diagnostics(&self) -> Vec<(LeafSubscriptionRow, Vec<LeafFiringRecord>)> {
+        let mut rows = self.rows().await;
+        rows.sort_by_key(|row| row.created_at);
+        let firings = self.inner.last_firings.lock().await;
+        rows.into_iter()
+            .map(|row| {
+                let mut row_firings =
+                    firings.iter().filter(|((id, _), _)| *id == row.id).map(|(_, firing)| firing.clone()).collect::<Vec<_>>();
+                row_firings.sort_by_key(|firing| firing.fired_at);
+                (row, row_firings)
+            })
+            .collect()
+    }
+
     async fn finish(&self, id: uuid::Uuid) {
         self.inner.rows.lock().await.remove(&id);
+        self.forget_firings(id).await;
         self.inner.tasks.lock().await.remove(&id);
         self.inner.change_requests.release(id).await;
+    }
+
+    async fn forget_firings(&self, id: uuid::Uuid) {
+        self.inner.last_firings.lock().await.retain(|(subscription_id, _), _| *subscription_id != id);
     }
 
     async fn watch_row(&self, row: LeafSubscriptionRow) -> Result<(), String> {
@@ -208,6 +237,11 @@ impl LeafSubscriptionTable {
 
     async fn fire(&self, subscription_id: uuid::Uuid, mut fire: LeafFire) {
         fire.subscription_id = subscription_id;
+        self.inner.last_firings.lock().await.insert((subscription_id, fire.leaf.clone()), LeafFiringRecord {
+            leaf: fire.leaf.clone(),
+            value: fire.value.clone(),
+            fired_at: Utc::now(),
+        });
         let watcher = self.inner.rows.lock().await.get(&subscription_id).map(|row| row.watcher.clone());
         match watcher {
             Some(LeafWatcher::WaitCaller { connection_id }) => {
@@ -338,6 +372,7 @@ impl ReconcilerWake {
                 continue;
             }
             self.subscriptions.inner.rows.lock().await.remove(id);
+            self.subscriptions.forget_firings(*id).await;
             if let Some(task) = self.subscriptions.inner.tasks.lock().await.remove(id) {
                 task.abort();
             }
@@ -362,6 +397,7 @@ impl ReconcilerWake {
             for subject in row.leaves.iter().filter_map(|leaf| ChangeRequestRef::from_address(namespace, &leaf.address)) {
                 if let Err(error) = self.subscriptions.inner.change_requests.demand(id, subject, None).await {
                     self.subscriptions.inner.rows.lock().await.remove(&id);
+                    self.subscriptions.forget_firings(id).await;
                     self.subscriptions.inner.change_requests.release(id).await;
                     tracing::warn!(%convoy, %error, "arm reconciler leaf subscription failed");
                     continue 'desired_rows;
@@ -726,6 +762,44 @@ mod tests {
         .await
         .expect("leaf fire must enqueue reconcile without waiting for hourly resync");
         controller.abort();
+    }
+
+    #[tokio::test]
+    async fn diagnostics_retain_the_last_firing_for_an_armed_reconciler_row() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let (event_tx, _) = broadcast::channel(4);
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "authority".to_string(),
+            Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) }),
+            crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        );
+        let table = LeafSubscriptionTable::new(backend, event_tx, refresher);
+        let id = uuid::Uuid::new_v4();
+        let fired_leaf = leaf(LeafAddress::Convoy { name: "held".to_string() }, ".status.phase", "Landed");
+        table.inner.rows.lock().await.insert(id, LeafSubscriptionRow {
+            id,
+            namespace: "flotilla".to_string(),
+            leaves: vec![fired_leaf.clone()],
+            watcher: LeafWatcher::ReconcilerWake { convoy: "held".to_string() },
+            freshness_demand: None,
+            created_at: Utc::now(),
+            episode_key: EpisodeKeyFields::default(),
+        });
+
+        table
+            .fire(id, LeafFire {
+                subscription_id: uuid::Uuid::nil(),
+                watcher_id: uuid::Uuid::nil(),
+                leaf: fired_leaf,
+                value: "Landed".into(),
+            })
+            .await;
+
+        let diagnostics = table.diagnostics().await;
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].1.len(), 1);
+        assert_eq!(diagnostics[0].1[0].value, "Landed");
     }
 
     #[tokio::test]

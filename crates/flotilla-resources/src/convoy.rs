@@ -11,7 +11,10 @@ use crate::{
 
 mod reconcile;
 
-pub use reconcile::{reconcile, ConvoyEvent, ConvoyReconciler, ConvoyTeardownRuntime, ReconcileOutcome};
+pub use reconcile::{
+    evaluate_landing_settlement, reconcile, ConvoyEvent, ConvoyReconciler, ConvoyTeardownRuntime, ReconcileOutcome, SettlementEvaluation,
+    SettlementMode, UnmetSettlementExpectation,
+};
 
 define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
 
@@ -85,6 +88,21 @@ pub fn expected_checkout_refs(convoy: &crate::ResourceObject<Convoy>) -> Result<
         expected.extend(checkout_refs.into_values());
     }
     Ok(expected)
+}
+
+/// Canonical resource name for a convoy's explicitly bound change request.
+pub fn bound_change_request_record_name(convoy: &crate::ResourceObject<Convoy>) -> Result<Option<String>, String> {
+    let Some(bound) = &convoy.spec.change_request else { return Ok(None) };
+    let repository = convoy
+        .spec
+        .repositories
+        .iter()
+        .find(|repository| repository.repo_ref == bound.repository_ref)
+        .ok_or_else(|| format!("bound change request repository {} is absent from convoy", bound.repository_ref))?;
+    let LeafAddress::ChangeRequest { service, scope, number } = change_request_address(&repository.url, &bound.id)? else {
+        unreachable!("change_request_address always returns a change-request address")
+    };
+    Ok(Some(crate::change_request_record_name(&service, &scope, number)))
 }
 
 /// Select the authoritative child observation for each object name.

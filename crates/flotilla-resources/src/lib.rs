@@ -52,10 +52,11 @@ pub use clock::VirtualClock;
 pub use clock::{Clock, SystemClock};
 pub use clone::{Clone, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use convoy::{
-    controller_patches, expected_change_request_leaves, expected_checkout_refs, external_patches, pinned_placement_ref,
-    pinned_workflow_ref, prepared_snapshot_pending, provisioning_patches, reconcile, select_convoy_children, BoundChangeRequest, Convoy,
-    ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
-    ConvoyTeardownRuntime, CrewWorkPhase, CrewWorkState, InputValue, IssueSnapshot, PlacementStatus, ReconcileOutcome, TargetMismatch,
+    bound_change_request_record_name, controller_patches, evaluate_landing_settlement, expected_change_request_leaves,
+    expected_checkout_refs, external_patches, pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending, provisioning_patches,
+    reconcile, select_convoy_children, BoundChangeRequest, Convoy, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyReconciler,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewWorkPhase, CrewWorkState, InputValue,
+    IssueSnapshot, PlacementStatus, ReconcileOutcome, SettlementEvaluation, SettlementMode, TargetMismatch, UnmetSettlementExpectation,
     WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_PENDING_ANNOTATION,
     WORKFLOW_SNAPSHOT_ANNOTATION,
 };
@@ -104,7 +105,7 @@ pub use principal_attention::{
 };
 pub use project::{
     normalize_project_spec, resolve_project_issue_sources, IssueSource, IssueSourceResolution, IssueSourceUnavailable, Project,
-    ProjectRepositorySpec, ProjectSpec,
+    ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use registry::{

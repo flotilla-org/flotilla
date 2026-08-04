@@ -54,6 +54,10 @@ spec:
                       enum: [fork]
                 allow_reviewless_workflows:
                   type: boolean
+                verification_commands:
+                  type: object
+                  additionalProperties:
+                    type: string
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true

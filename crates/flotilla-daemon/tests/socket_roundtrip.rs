@@ -1,10 +1,53 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+    sync::Arc,
+    time::Duration,
+};
 
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, providers::discovery::test_support::git_process_discovery};
 use flotilla_daemon::server::DaemonServer;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, RepoSelector, StreamKey};
 use flotilla_test_support::TestSocketDir;
 use tokio::time::Instant;
+
+struct LocalGitRepository {
+    _temp: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl LocalGitRepository {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("create temporary git directory");
+        run_git(temp.path(), &["init", "--bare", "--initial-branch=main", "origin.git"]);
+        run_git(temp.path(), &["init", "--initial-branch=main", "repo"]);
+
+        let path = temp.path().join("repo");
+        fs::write(path.join("README.md"), "# socket roundtrip test\n").expect("write test repository fixture");
+        run_git(&path, &["config", "user.name", "Flotilla Tests"]);
+        run_git(&path, &["config", "user.email", "tests@flotilla.invalid"]);
+        run_git(&path, &["config", "core.hooksPath", "/dev/null"]);
+        run_git(&path, &["add", "README.md"]);
+        run_git(&path, &["-c", "commit.gpgSign=false", "commit", "-m", "Initial commit"]);
+
+        let origin = temp.path().join("origin.git");
+        run_git(&path, &["remote", "add", "origin", origin.to_str().expect("temporary path should be UTF-8")]);
+        run_git(&path, &["push", "--set-upstream", "origin", "main"]);
+
+        Self { _temp: temp, path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn run_git(cwd: &Path, args: &[&str]) {
+    let output = ProcessCommand::new("git").current_dir(cwd).args(args).output().expect("run git fixture command");
+    assert!(output.status.success(), "git {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr));
+}
 
 /// Execute a query command via execute_query and return the result directly.
 async fn run_query(daemon: &dyn DaemonHandle, action: CommandAction) -> CommandValue {
@@ -18,10 +61,8 @@ async fn socket_roundtrip() {
     let tmp = TestSocketDir::new();
     let socket_path = tmp.socket_path("test.sock");
 
-    // Use workspace root (a real git repo) as the test repo.
-    // CARGO_MANIFEST_DIR points to crates/flotilla-daemon; go up two levels.
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo = manifest_dir.parent().unwrap().parent().unwrap().to_path_buf();
+    let git_repo = LocalGitRepository::new();
+    let repo = git_repo.path().to_path_buf();
 
     // Start daemon server
     let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
@@ -149,10 +190,8 @@ async fn query_commands_roundtrip() {
     let tmp = TestSocketDir::new();
     let socket_path = tmp.socket_path("test.sock");
 
-    // Use workspace root (a real git repo) as the test repo.
-    // CARGO_MANIFEST_DIR points to crates/flotilla-daemon; go up two levels.
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo = manifest_dir.parent().expect("parent").parent().expect("grandparent").to_path_buf();
+    let git_repo = LocalGitRepository::new();
+    let repo = git_repo.path().to_path_buf();
 
     // Start daemon server
     let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
@@ -282,8 +321,8 @@ async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
     let tmp = TestSocketDir::new();
     let socket_path = tmp.socket_path("test.sock");
 
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo = manifest_dir.parent().expect("parent").parent().expect("grandparent").to_path_buf();
+    let git_repo = LocalGitRepository::new();
+    let repo = git_repo.path().to_path_buf();
 
     let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
     let server = DaemonServer::new(vec![repo.clone()], config, git_process_discovery(false), socket_path.clone(), Duration::from_secs(300))

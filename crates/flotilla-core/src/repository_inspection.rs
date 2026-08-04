@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use flotilla_resources::{RepositoryKey, RepositorySpec};
 
 use crate::{
+    ops_entry::OperationalEntryFile,
     path_context::ExecutionEnvironmentPath,
     providers::{
         vcs::{git_worktree::GitCheckoutManager, CheckoutManager},
@@ -27,6 +28,20 @@ pub struct RepositoryInspection {
     pub spec: RepositorySpec,
     pub checkout: LocalCheckoutInspection,
     pub transport_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDeclarationInspection {
+    pub repository: RepositoryInspection,
+    pub yaml: String,
+    pub commit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationalEntriesInspection {
+    pub repository: RepositoryInspection,
+    pub commit: String,
+    pub files: Vec<OperationalEntryFile>,
 }
 
 impl RepositoryInspection {
@@ -51,6 +66,39 @@ pub trait RepositoryInspector: Send + Sync {
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         RepositorySpec::remote(remote)
     }
+
+    async fn inspect_project_declaration(&self, path: &Path) -> Result<ProjectDeclarationInspection, String> {
+        let repository = self.inspect_path(path, None).await?;
+        let declaration_path = repository.checkout.path.join(crate::project_declaration::DECLARATION_FILE);
+        let yaml = std::fs::read_to_string(&declaration_path).map_err(|error| format!("read {}: {error}", declaration_path.display()))?;
+        Ok(ProjectDeclarationInspection { commit: repository.checkout.git_ref.clone(), repository, yaml })
+    }
+
+    async fn inspect_operational_entries(&self, path: &Path) -> Result<OperationalEntriesInspection, String> {
+        let repository = self.inspect_path(path, None).await?;
+        let mut files = Vec::new();
+        collect_operational_entry_files(&repository.checkout.path, &repository.checkout.path, &mut files)?;
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(OperationalEntriesInspection { commit: repository.checkout.git_ref.clone(), repository, files })
+    }
+}
+
+fn collect_operational_entry_files(root: &Path, directory: &Path, files: &mut Vec<OperationalEntryFile>) -> Result<(), String> {
+    let entries = std::fs::read_dir(directory).map_err(|error| format!("read {}: {error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read {}: {error}", directory.display()))?;
+        let path = entry.path();
+        if path.file_name().is_some_and(|name| name == ".git") {
+            continue;
+        }
+        if path.is_dir() {
+            collect_operational_entry_files(root, &path, files)?;
+        } else if let Ok(contents) = std::fs::read_to_string(&path) {
+            let relative = path.strip_prefix(root).expect("walked paths remain beneath root").to_string_lossy().replace('\\', "/");
+            files.push(OperationalEntryFile { path: relative, contents });
+        }
+    }
+    Ok(())
 }
 
 pub struct GitRepositoryInspector {
@@ -184,6 +232,48 @@ impl RepositoryInspector for GitRepositoryInspector {
             },
             transport_url,
         })
+    }
+
+    async fn inspect_project_declaration(&self, path: &Path) -> Result<ProjectDeclarationInspection, String> {
+        let repository = self.inspect_path(path, None).await?;
+        let commit = self.git(&repository.checkout.path, &["rev-parse", "HEAD"]).await?;
+        let declaration_ref = format!("{commit}:{}", crate::project_declaration::DECLARATION_FILE);
+        let yaml = self.git(&repository.checkout.path, &["show", &declaration_ref]).await.map_err(|error| {
+            format!(
+                "read {} from bootstrap commit {commit}: {error}",
+                repository.checkout.path.join(crate::project_declaration::DECLARATION_FILE).display()
+            )
+        })?;
+        Ok(ProjectDeclarationInspection { repository, yaml, commit })
+    }
+
+    async fn inspect_operational_entries(&self, path: &Path) -> Result<OperationalEntriesInspection, String> {
+        let repository = self.inspect_path(path, None).await?;
+        let commit = self.git(&repository.checkout.path, &["rev-parse", "HEAD"]).await?;
+        // Use one tree-wide grep to find content candidates. Operational entry
+        // kind and scope remain content-authoritative; this only avoids one
+        // `git show` subprocess for every unrelated file in a large ops+code
+        // repository.
+        let grep = self
+            .runner
+            .run_output("git", &["grep", "-Il", "-e", "^kind:[[:space:]]", &commit, "--"], &repository.checkout.path, &ChannelLabel::Noop)
+            .await
+            .map_err(|error| format!("git grep operational entries in {}: {error}", repository.checkout.path.display()))?;
+        let paths = if grep.success || grep.stderr.trim().is_empty() {
+            grep.stdout
+        } else {
+            return Err(format!("git grep operational entries in {}: {}", repository.checkout.path.display(), grep.stderr.trim()));
+        };
+        let prefix = format!("{commit}:");
+        let mut files = Vec::new();
+        for entry_path in paths.lines().filter_map(|path| path.strip_prefix(&prefix)).filter(|path| !path.is_empty()) {
+            let object_ref = format!("{commit}:{entry_path}");
+            let Ok(contents) = self.git(&repository.checkout.path, &["show", &object_ref]).await else {
+                continue;
+            };
+            files.push(OperationalEntryFile { path: entry_path.to_string(), contents });
+        }
+        Ok(OperationalEntriesInspection { repository, commit, files })
     }
 
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {

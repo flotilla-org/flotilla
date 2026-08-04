@@ -269,6 +269,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::CrewList(_)
         | CommandValue::FleetReplicaSnapshot(_)
         | CommandValue::DaemonLogs { .. }
+        | CommandValue::ConvoyExplanation(_)
         | CommandValue::ResourceRead(_)
         | CommandValue::ResourceObject(_)
         | CommandValue::ResourceDeleted(_)
@@ -301,6 +302,15 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         CommandValue::ProjectApplied { name } => {
             info!(%name, "project applied");
             app.set_status_message(Some(format!("Project applied: {name}")));
+        }
+        CommandValue::ProjectRegistered { name, members } => {
+            info!(%name, %members, "project registered from declaration");
+            app.set_status_message(Some(format!("Project registered: {name} ({members} members)")));
+        }
+        CommandValue::ProjectRefreshed { name, members, converged, changes } => {
+            info!(%name, %members, %converged, ?changes, "project declaration refreshed");
+            let outcome = if converged { format!("changed: {}", changes.join(", ")) } else { "already current".to_string() };
+            app.set_status_message(Some(format!("Project refreshed: {name} ({members} members, {outcome})")));
         }
     }
 }

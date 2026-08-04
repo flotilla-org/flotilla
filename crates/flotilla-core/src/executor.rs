@@ -170,6 +170,7 @@ pub async fn build_plan(
     match action {
         CommandAction::QueryResourceList { .. }
         | CommandAction::QueryResourceGet { .. }
+        | CommandAction::QueryExplainConvoy { .. }
         | CommandAction::ResourceApply { .. }
         | CommandAction::ResourceDelete { .. }
         | CommandAction::ResourceWatch { .. } => {
@@ -364,6 +365,8 @@ pub async fn build_plan(
         | CommandAction::WorkflowTemplateApply { .. }
         | CommandAction::ProjectAdd { .. }
         | CommandAction::ProjectApply { .. }
+        | CommandAction::ProjectRegister { .. }
+        | CommandAction::ProjectRefresh { .. }
         | CommandAction::TrackRepoPath { .. }
         | CommandAction::UntrackRepo { .. }
         | CommandAction::Refresh { .. }
