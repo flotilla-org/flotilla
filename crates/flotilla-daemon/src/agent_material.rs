@@ -15,7 +15,10 @@ use flotilla_resources::{api_version, Environment, MaterialPoolSpec, MaterialPoo
 use tokio::fs;
 use tracing::warn;
 
-use crate::material_pool::{MaterialLeaseOutcome, MaterialPoolManager};
+use crate::{
+    material_pool::{MaterialLeaseOutcome, MaterialPoolManager},
+    vessel_config::{agent_environment_fragment, Fragment},
+};
 
 const CODEX_ADAPTER_ID: &str = "codex";
 const CODEX_POOL_REF: &str = "codex-login";
@@ -31,7 +34,7 @@ pub(crate) struct AgentMaterialPreflight {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentMaterialDelivery {
     pub(crate) mount: ProvisionedMount,
-    pub(crate) environment: Vec<(String, String)>,
+    pub(crate) fragment: Box<Fragment>,
     pub(crate) preflight: AgentMaterialPreflight,
 }
 
@@ -47,12 +50,7 @@ trait AgentMaterialAdapter: Send + Sync {
     fn id(&self) -> &'static str;
     fn pool_ref(&self) -> &'static str;
 
-    async fn prepare(
-        &self,
-        holder_ref: &ResourceRef,
-        environment: &BTreeMap<String, String>,
-        credential_adapters: &BTreeSet<String>,
-    ) -> Result<AgentMaterialOutcome, String>;
+    async fn prepare(&self, holder_ref: &ResourceRef, environment: &BTreeMap<String, String>) -> Result<AgentMaterialOutcome, String>;
 }
 
 pub(crate) struct AgentMaterialRegistry {
@@ -79,7 +77,6 @@ impl AgentMaterialRegistry {
         environment_ref: &str,
         required_adapters: &BTreeSet<String>,
         environment: &BTreeMap<String, String>,
-        credential_adapters: &BTreeSet<String>,
     ) -> Result<Vec<AgentMaterialDelivery>, AgentMaterialPrepareError> {
         let holder_ref = self.holder_ref(environment_ref);
         let mut deliveries = Vec::new();
@@ -87,7 +84,7 @@ impl AgentMaterialRegistry {
             let Some(adapter) = self.adapters.get(adapter_id.as_str()) else {
                 continue;
             };
-            match adapter.prepare(&holder_ref, environment, credential_adapters).await {
+            match adapter.prepare(&holder_ref, environment).await {
                 Ok(AgentMaterialOutcome::NotRequired) => {}
                 Ok(AgentMaterialOutcome::Ready(delivery)) => deliveries.push(delivery),
                 Ok(AgentMaterialOutcome::Waiting { pool_ref, message }) => {
@@ -180,13 +177,8 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
         CODEX_POOL_REF
     }
 
-    async fn prepare(
-        &self,
-        holder_ref: &ResourceRef,
-        environment: &BTreeMap<String, String>,
-        credential_adapters: &BTreeSet<String>,
-    ) -> Result<AgentMaterialOutcome, String> {
-        if credential_adapters.contains(CODEX_ADAPTER_ID) || environment.contains_key("CODEX_HOME") {
+    async fn prepare(&self, holder_ref: &ResourceRef, environment: &BTreeMap<String, String>) -> Result<AgentMaterialOutcome, String> {
+        if environment.contains_key("CODEX_HOME") {
             return Ok(AgentMaterialOutcome::NotRequired);
         }
         if !self.supported {
@@ -198,7 +190,11 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
         match self.pools.acquire(CODEX_POOL_REF, holder_ref).await? {
             MaterialLeaseOutcome::Leased { unit, .. } => Ok(AgentMaterialOutcome::Ready(AgentMaterialDelivery {
                 mount: ProvisionedMount::new(PathBuf::from(&unit.directory), CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw),
-                environment: vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())],
+                fragment: Box::new(agent_environment_fragment(
+                    "CODEX_HOME",
+                    CONTAINER_CODEX_HOME,
+                    format!("agent-material/codex {CODEX_POOL_REF}"),
+                )),
                 preflight: AgentMaterialPreflight {
                     command: "codex".to_string(),
                     args: vec!["login".to_string(), "status".to_string()],
@@ -263,14 +259,16 @@ mod tests {
         let slot = write_slot(&temp.path().join(".config/flotilla/credentials/codex-pool"), 0);
         let registry = registry(temp.path());
 
-        let deliveries = registry
-            .prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new(), &BTreeSet::new())
-            .await
-            .expect("prepare");
+        let deliveries =
+            registry.prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new()).await.expect("prepare");
 
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].mount, ProvisionedMount::new(slot, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw));
-        assert_eq!(deliveries[0].environment, vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())]);
+        let composed =
+            crate::vessel_config::compose(crate::vessel_config::TargetId::AgentEnvironment, [deliveries[0].fragment.as_ref().clone()])
+                .expect("compose Codex home");
+        assert_eq!(composed.environment, vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())]);
+        assert!(composed.contents.contains("# fragment: agent-material/codex codex-login"));
     }
 
     #[tokio::test]
@@ -312,14 +310,14 @@ mod tests {
         let registry = registry(temp.path());
         let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
 
-        registry.prepare("env-a", &required, &BTreeMap::new(), &BTreeSet::new()).await.expect("first lease");
+        registry.prepare("env-a", &required, &BTreeMap::new()).await.expect("first lease");
         assert!(matches!(
-            registry.prepare("env-b", &required, &BTreeMap::new(), &BTreeSet::new()).await,
+            registry.prepare("env-b", &required, &BTreeMap::new()).await,
             Err(AgentMaterialPrepareError::Waiting { pool_ref, .. }) if pool_ref == CODEX_POOL_REF
         ));
 
         let second = write_slot(&pool, 1);
-        let delivery = registry.prepare("env-b", &required, &BTreeMap::new(), &BTreeSet::new()).await.expect("lease new unit");
+        let delivery = registry.prepare("env-b", &required, &BTreeMap::new()).await.expect("lease new unit");
         assert_eq!(delivery[0].mount, ProvisionedMount::new(second, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw));
     }
 
@@ -332,24 +330,19 @@ mod tests {
         let registry = registry(temp.path());
 
         assert!(matches!(
-            registry.prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new(), &BTreeSet::new(),).await,
+            registry.prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new()).await,
             Err(AgentMaterialPrepareError::Waiting { .. })
         ));
     }
 
     #[tokio::test]
-    async fn codex_adapter_defers_to_explicit_credentials_or_an_existing_codex_home() {
+    async fn codex_adapter_defers_to_an_existing_codex_home() {
         let temp = tempfile::tempdir().expect("tempdir");
         let registry = registry(temp.path());
         let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
 
         assert!(registry
-            .prepare("env-credential", &required, &BTreeMap::new(), &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]),)
-            .await
-            .expect("explicit credential")
-            .is_empty());
-        assert!(registry
-            .prepare("env-home", &required, &BTreeMap::from([("CODEX_HOME".to_string(), "/image/codex".to_string())]), &BTreeSet::new(),)
+            .prepare("env-home", &required, &BTreeMap::from([("CODEX_HOME".to_string(), "/image/codex".to_string())]))
             .await
             .expect("existing home")
             .is_empty());
