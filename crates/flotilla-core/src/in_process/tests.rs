@@ -20,8 +20,8 @@ use flotilla_protocol::{
     TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    latch_evidence_backed_integration, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
-    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy, ConvoyPhase,
+    controller::Reconciler, latch_evidence_backed_integration, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
+    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy, ConvoyPhase, ConvoyReconciler,
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
     CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
     CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost,
@@ -135,6 +135,14 @@ async fn reopened_change_request_replaces_authority_observation_and_holds_landin
             &empty_input_meta("reopened-convoy"),
             &ConvoySpec::builder()
                 .workflow_ref("review-and-fix".to_string())
+                .repositories(vec![ConvoyRepositorySpec::builder()
+                    .url("https://github.com/flotilla-org/flotilla".to_string())
+                    .repo_ref(repo_ref.clone())
+                    .source_ref("main".to_string())
+                    .target_ref("main".to_string())
+                    .workspace_slug("flotilla".to_string())
+                    .subpaths(Vec::new())
+                    .build()])
                 .adopted_checkout_refs(BTreeMap::from([(repo_ref.clone(), "checkout-reopened".to_string())]))
                 .change_request(
                     BoundChangeRequest::builder()
@@ -150,6 +158,7 @@ async fn reopened_change_request_replaces_authority_observation_and_holds_landin
     convoys
         .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
             phase: ConvoyPhase::Landing,
+            observed_workflow_ref: Some("review-and-fix".to_string()),
             ..Default::default()
         })
         .await
@@ -190,7 +199,10 @@ async fn reopened_change_request_replaces_authority_observation_and_holds_landin
     let integration = reopened.status.expect("checkout status").integration;
     assert_eq!(integration.landed.value, ConditionValue::False, "reopened observation: {integration:?}");
     assert_eq!(integration.landed_evidence, None);
-    assert!(!daemon.convoy_change_requests_settled("flotilla", "reopened-convoy").await.expect("evaluate settlement"));
+    let current = convoys.get("reopened-convoy").await.expect("Landing convoy");
+    let reconciler = ConvoyReconciler::new(daemon.resource_backend().using::<WorkflowTemplate>("flotilla")).with_checkouts(checkouts);
+    let dependencies = reconciler.fetch_dependencies(&current).await.expect("evaluate landing dependencies");
+    assert_eq!(reconciler.reconcile(&current, &dependencies, chrono::Utc::now()).patch, None);
     assert_eq!(convoys.get("reopened-convoy").await.expect("Landing convoy").status.expect("convoy status").phase, ConvoyPhase::Landing);
 }
 
