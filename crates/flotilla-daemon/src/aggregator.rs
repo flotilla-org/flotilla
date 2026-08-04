@@ -850,9 +850,6 @@ impl Aggregator {
             }
         }
         self.rebuild_local_projection().await;
-        if self.rebuild_salience_projection().await && !self.bootstrapping {
-            self.emit_awareness_result_sets().await;
-        }
     }
 
     async fn apply_regard_event(&mut self, event: WatchEvent<Regard>) {
@@ -1218,6 +1215,9 @@ impl Aggregator {
             // changes again.
             materializer.refilter_active_queries();
         }
+        if salience_changed {
+            self.emit_awareness_result_sets().await;
+        }
     }
 
     async fn replace_session_source(&mut self, source: LocalSource, sessions: Vec<ResourceObject<TerminalSession>>) {
@@ -1325,8 +1325,11 @@ impl Aggregator {
     }
 
     async fn rebuild_checkout_rows(&self) -> Result<(), ResourceError> {
-        let convoys =
-            self.effective_convoys().into_values().map(|convoy| (convoy.metadata.namespace, convoy.metadata.name)).collect::<HashSet<_>>();
+        let convoys = self
+            .effective_convoy_reads_including_deleted()
+            .into_values()
+            .map(|convoy| (convoy.object.metadata.namespace, convoy.object.metadata.name))
+            .collect::<HashSet<_>>();
         let rows = self
             .observed_checkouts
             .values()
@@ -2980,21 +2983,34 @@ mod tests {
             row.attention_reason
         );
 
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_object("missing-convoy").await)).await;
+        let convoy = convoy_object("missing-convoy").await;
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
 
         let result = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout result set after convoy appears");
         let row = &result.rows.as_checkouts().expect("checkout rows")[0];
         assert!(!row.needs_attention);
+        assert_eq!(row.attention_reason, None);
+
+        let mut deleting_convoy = convoy;
+        deleting_convoy.metadata.deletion_timestamp = Some(Utc::now());
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(deleting_convoy)).await;
+
+        let result = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout result set during convoy teardown");
+        let row = &result.rows.as_checkouts().expect("checkout rows")[0];
+        assert!(!row.needs_attention, "a checkout is not orphaned while its convoy is soft-deleting");
         assert_eq!(row.attention_reason, None);
     }
 
     #[tokio::test]
     async fn reclaim_refusal_demand_marks_convoy_for_attention_with_reason() {
         let state = AggregatorProjectionState::new();
-        let (event_tx, _) = broadcast::channel(1);
+        let (event_tx, mut event_rx) = broadcast::channel(8);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
         let convoy = convoy_object("stuck-reclaim").await;
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        let awareness_query =
+            QueryId::Awareness { scope: None, grouping: flotilla_protocol::AwarenessGrouping::Convoy, limit: Default::default() };
+        state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: awareness_query.clone(), since: None }]);
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let reason = "checkout checkout-orphan: Pushed=False (1 unpushed commit)";
         let demand = backend
@@ -3014,6 +3030,17 @@ mod tests {
             .expect("create reclaim refusal demand");
 
         aggregator.apply_demand_event(WatchEvent::Added(demand)).await;
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let event = event_rx.recv().await.expect("aggregator event");
+                if matches!(event, DaemonEvent::ResultSet(result_set) if result_set.query() == awareness_query) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("reclaim refusal demand should publish fleet awareness");
 
         let result = state.result_set().await;
         let row = &result.rows.as_convoys().expect("convoy rows")[0];
