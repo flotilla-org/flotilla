@@ -254,8 +254,16 @@ impl RepositoryInspector for GitRepositoryInspector {
         // kind and scope remain content-authoritative; this only avoids one
         // `git show` subprocess for every unrelated file in a large ops+code
         // repository.
-        let paths =
-            self.git(&repository.checkout.path, &["grep", "-Il", "-e", "^kind:[[:space:]]", &commit, "--"]).await.unwrap_or_default();
+        let grep = self
+            .runner
+            .run_output("git", &["grep", "-Il", "-e", "^kind:[[:space:]]", &commit, "--"], &repository.checkout.path, &ChannelLabel::Noop)
+            .await
+            .map_err(|error| format!("git grep operational entries in {}: {error}", repository.checkout.path.display()))?;
+        let paths = if grep.success || grep.stderr.trim().is_empty() {
+            grep.stdout
+        } else {
+            return Err(format!("git grep operational entries in {}: {}", repository.checkout.path.display(), grep.stderr.trim()));
+        };
         let prefix = format!("{commit}:");
         let mut files = Vec::new();
         for entry_path in paths.lines().filter_map(|path| path.strip_prefix(&prefix)).filter(|path| !path.is_empty()) {

@@ -13,7 +13,10 @@ use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
-    ops_entry::{MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION},
+    ops_entry::{
+        MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
+        VERIFICATION_PROJECT_ANNOTATION,
+    },
     project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
     providers::discovery::test_support::fake_discovery,
     repository_inspection::{LocalCheckoutInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
@@ -461,6 +464,22 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
         }
     );
     assert!(matches!(workflows.get("scoped").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+
+    std::fs::remove_file(tmp.path().join("test-command.entry")).expect("remove verification entry");
+    std::fs::write(
+        tmp.path().join("project.yaml"),
+        "name: demo\nmembers:\n  - alias: app\n    url: https://github.com/example/app\n    roles: [knowledge]\n  - alias: docs\n    url: https://github.com/example/docs\n    roles: [code]\n  - alias: operations\n    url: https://github.com/example/project-ops\n    roles: [ops]\n",
+    )
+    .expect("remove app code role");
+    let result = execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await;
+    assert!(
+        matches!(&result, CommandValue::ProjectRefreshed { changes, .. }
+            if changes.iter().any(|change| change == &format!("Repository/{} verification commands", app.repo))),
+        "unexpected command result: {result:?}"
+    );
+    let released = backend.using::<Repository>("flotilla").get(&app.repo.to_string()).await.expect("released repository");
+    assert!(released.spec.verification_commands().is_empty());
+    assert!(!released.metadata.annotations.contains_key(VERIFICATION_PROJECT_ANNOTATION));
 }
 
 #[tokio::test]

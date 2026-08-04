@@ -5206,6 +5206,13 @@ impl InProcessDaemon {
         }
 
         let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
+        let current_code_members = project
+            .spec
+            .repositories
+            .iter()
+            .filter(|member| member.roles.contains(&ProjectRepositoryRole::Code))
+            .map(|member| member.repo.clone())
+            .collect::<BTreeSet<_>>();
         for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Code)) {
             let current = repositories.get(&member.repo.to_string()).await.map_err(|error| error.to_string())?;
             let desired_commands = commands.remove(&member.repo).unwrap_or_default();
@@ -5243,6 +5250,17 @@ impl InProcessDaemon {
                 repositories.update(&meta, &current.metadata.resource_version, &desired_spec).await.map_err(|error| error.to_string())?;
                 changes.push(format!("Repository/{} verification commands", member.repo));
             }
+        }
+        for stale in repositories.list().await.map_err(|error| error.to_string())?.items.into_iter().filter(|repository| {
+            repository.metadata.annotations.get(VERIFICATION_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
+                && !current_code_members.contains(&RepositoryKey(repository.metadata.name.clone()))
+        }) {
+            let mut meta = InputMeta::from(&stale.metadata);
+            meta.annotations.remove(VERIFICATION_PROJECT_ANNOTATION);
+            meta.annotations.remove(VERIFICATION_PROVENANCE_ANNOTATION);
+            let spec = stale.spec.clone().with_verification_commands(BTreeMap::new());
+            repositories.update(&meta, &stale.metadata.resource_version, &spec).await.map_err(|error| error.to_string())?;
+            changes.push(format!("Repository/{} verification commands", stale.metadata.name));
         }
         changes.sort();
         Ok(changes)
