@@ -5647,6 +5647,24 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
         )
         .await
         .expect("owned terminal session should be created");
+    daemon
+        .resource_backend()
+        .using::<ResourceDemand>("custom-ns")
+        .create(
+            &empty_input_meta("reclaim-refusal-completed-convoy"),
+            &flotilla_resources::DemandSpec::for_dispatching_principal(
+                ResourceRef::new(
+                    flotilla_resources::api_version(Convoy::API_PATHS),
+                    Convoy::API_PATHS.kind,
+                    "custom-ns",
+                    "completed-convoy",
+                ),
+                flotilla_resources::DemandKind::HumanGate,
+                created.spec.dispatching_principal_ref.clone(),
+            ),
+        )
+        .await
+        .expect("convoy-targeted demand should be created");
 
     let mut events = daemon.subscribe();
     let command_id = daemon
@@ -5683,6 +5701,7 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
     assert!(daemon.resource_backend().using::<ResourceCheckout>("custom-ns").list().await.expect("list checkouts").items.is_empty());
     assert!(daemon.resource_backend().using::<Vessel>("custom-ns").list().await.expect("list vessels").items.is_empty());
     assert!(daemon.resource_backend().using::<ResourceTerminalSession>("custom-ns").list().await.expect("list sessions").items.is_empty());
+    assert!(daemon.resource_backend().using::<ResourceDemand>("custom-ns").list().await.expect("list demands").items.is_empty());
 }
 
 #[tokio::test]

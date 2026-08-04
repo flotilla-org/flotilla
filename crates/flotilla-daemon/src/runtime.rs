@@ -145,7 +145,8 @@ impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
                 let attempts = {
                     let mut refusals = self.reclaim_refusals.lock().expect("reclaim refusal lock poisoned");
                     match refusals.get_mut(&key) {
-                        Some(refusal) if refusal.error == *error => {
+                        Some(refusal) => {
+                            refusal.error.clone_from(error);
                             refusal.attempts += 1;
                             refusal.attempts
                         }
@@ -3083,7 +3084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_reclaim_refusal_raises_demand_with_checkout_reason() {
+    async fn repeated_reclaim_refusal_with_changing_reason_raises_demand() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
         let daemon = InProcessDaemon::new(vec![], config, git_process_discovery(false), HostName::local()).await;
@@ -3103,21 +3104,23 @@ mod tests {
             .expect("create terminal convoy");
         let runtime = DaemonConvoyTeardownRuntime::new(Arc::clone(&daemon));
 
-        for _ in 0..RECLAIM_REFUSAL_ATTENTION_AFTER - 1 {
-            runtime.verify_reclaim(&convoy, &[]).await.expect_err("missing checkout must refuse reclaim");
-        }
+        runtime.verify_reclaim(&convoy, &[]).await.expect_err("missing checkout must refuse reclaim");
+        let mut changed_reason_convoy = convoy.clone();
+        changed_reason_convoy
+            .spec
+            .adopted_checkout_refs
+            .insert(flotilla_resources::RepositoryKey("repo".to_string()), "checkout-still-orphaned".to_string());
+        runtime.verify_reclaim(&changed_reason_convoy, &[]).await.expect_err("changed missing checkout must still refuse reclaim");
         assert!(daemon.resource_backend().using::<Demand>(NAMESPACE).list().await.expect("list demands").items.is_empty());
 
-        runtime.verify_reclaim(&convoy, &[]).await.expect_err("persistent missing checkout must refuse reclaim");
+        runtime.verify_reclaim(&changed_reason_convoy, &[]).await.expect_err("persistent missing checkout must refuse reclaim");
 
         let demands = daemon.resource_backend().using::<Demand>(NAMESPACE).list().await.expect("list demands").items;
         assert_eq!(demands.len(), 1);
         assert!(
-            demands[0]
-                .metadata
-                .annotations
-                .get(RECLAIM_REFUSAL_REASON_ANNOTATION)
-                .is_some_and(|reason| reason.contains("checkout-orphan") && reason.contains("missing checkout integration evidence")),
+            demands[0].metadata.annotations.get(RECLAIM_REFUSAL_REASON_ANNOTATION).is_some_and(|reason| reason
+                .contains("checkout-still-orphaned")
+                && reason.contains("missing checkout integration evidence")),
             "demand must preserve the checkout-specific refusal: {:?}",
             demands[0].metadata.annotations
         );
