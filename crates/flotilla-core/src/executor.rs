@@ -365,6 +365,8 @@ pub async fn build_plan(
         | CommandAction::WorkflowTemplateApply { .. }
         | CommandAction::ProjectAdd { .. }
         | CommandAction::ProjectApply { .. }
+        | CommandAction::ProjectRegister { .. }
+        | CommandAction::ProjectRefresh { .. }
         | CommandAction::TrackRepoPath { .. }
         | CommandAction::UntrackRepo { .. }
         | CommandAction::Refresh { .. }
