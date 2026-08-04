@@ -9,14 +9,16 @@ use common::{
     workflow_template_meta,
 };
 use flotilla_resources::{
+    change_request_record_name,
     controller::{Actuation, Reconciler},
-    controller_patches, interactive_single_workflow_spec, reconcile, Checkout, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
-    CheckoutStatus, CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatus,
-    ConvoyStatusPatch, ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
-    LandedEvidence, LifecycleAuthority, ObservedCheckoutSpec, OwnerReference, Presentation, PresentationSpec, RepositoryKey,
-    ResourceBackend, StatusPatch, TargetMismatch, TerminalSession, TerminalSessionSource, TerminalSessionSpec, ValidationError, Vessel,
-    VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
-    VESSEL_LABEL,
+    controller_patches, interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest, ChangeRequestReviewObservation,
+    ChangeRequestSpec, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus,
+    CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatus, ConvoyStatusPatch,
+    ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, LandedEvidence,
+    LifecycleAuthority, Observation, ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability,
+    OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, StatusPatch, TargetMismatch, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority,
+    WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
 };
 
 struct AlwaysEligible;
@@ -100,6 +102,16 @@ struct FixedClock(chrono::DateTime<chrono::Utc>);
 impl Clock for FixedClock {
     fn now(&self) -> chrono::DateTime<chrono::Utc> {
         self.0
+    }
+}
+
+fn merged_change_request_status(observed_at: chrono::DateTime<chrono::Utc>) -> ChangeRequestStatus {
+    ChangeRequestStatus {
+        state: Observation::known(ObservedChangeRequestState::Merged, observed_at),
+        head_sha: Observation::known("abc123".to_string(), observed_at),
+        checks: Observation::known(ObservedChecks::Pass, observed_at),
+        review: ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, observed_at) },
+        mergeable: Observation::known(ObservedMergeability::Mergeable, observed_at),
     }
 }
 
@@ -686,6 +698,116 @@ async fn landing_holds_on_stale_vacuous_landed_evidence() {
     let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::True), None, timestamp(9)).await;
 
     assert_eq!(outcome.patch, None);
+}
+
+#[tokio::test]
+async fn terminal_bound_change_request_settles_checkout_without_own_landed_evidence() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let checkouts = backend.clone().using::<Checkout>("flotilla");
+    let change_requests = backend.clone().using::<ChangeRequest>("flotilla");
+    let repo_ref = RepositoryKey("repo-a".to_string());
+
+    let mut status = bootstrapped_convoy_status();
+    status.phase = ConvoyPhase::Landing;
+    for work in status.work.values_mut() {
+        work.phase = WorkPhase::Complete;
+    }
+    for crew in status.crew_work.values_mut() {
+        for member in crew.values_mut() {
+            member.phase = CrewWorkPhase::Done;
+        }
+    }
+    status.work.get_mut("implement").expect("implement work").placement = Some(flotilla_resources::PlacementStatus {
+        fields: BTreeMap::from([(
+            "checkout_refs".to_string(),
+            serde_json::json!(BTreeMap::from([(repo_ref.clone(), "checkout-a".to_string())])),
+        )]),
+    });
+
+    let mut spec = valid_convoy_spec();
+    spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec::builder()
+        .url("https://example.com/repo-a".to_string())
+        .repo_ref(repo_ref.clone())
+        .source_ref("main".to_string())
+        .target_ref("main".to_string())
+        .workspace_slug("repo-a".to_string())
+        .subpaths(Vec::new())
+        .build()];
+    spec.change_request = Some(
+        BoundChangeRequest::builder()
+            .id("42".to_string())
+            .repository_ref(repo_ref.clone())
+            .title("bound terminal change request".to_string())
+            .build(),
+    );
+    let source = convoy_object("convoy-a", spec, Some(status));
+    let created = convoys.create(&convoy_meta("convoy-a"), &source.spec).await.expect("convoy create");
+    convoys
+        .update_status("convoy-a", &created.metadata.resource_version, source.status.as_ref().expect("convoy status"))
+        .await
+        .expect("convoy status update");
+
+    let checkout = checkouts
+        .create(
+            &InputMeta {
+                name: "checkout-a".to_string(),
+                labels: BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]),
+                ..Default::default()
+            },
+            &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "feature/bound-cr".to_string(),
+                path: "/tmp/checkout-a".to_string(),
+                repo_ref: repo_ref.clone(),
+                host_ref: "host-a".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("checkout create");
+    checkouts
+        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Ready,
+            path: Some("/tmp/checkout-a".to_string()),
+            commit: None,
+            branch_provenance: Default::default(),
+            integration: CheckoutIntegrationStatus {
+                landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(timestamp(40).to_rfc3339()).build(),
+                ..Default::default()
+            },
+            message: None,
+        })
+        .await
+        .expect("checkout status update");
+
+    let record_name = change_request_record_name("example.com", "repo-a", 42);
+    let record = change_requests
+        .create(
+            &InputMeta::builder().name(record_name.clone()).build(),
+            &ChangeRequestSpec::builder()
+                .service("example.com".to_string())
+                .scope("repo-a".to_string())
+                .number(42)
+                .observing_authority("host-a".to_string())
+                .build(),
+        )
+        .await
+        .expect("change request create");
+    change_requests
+        .update_status(&record_name, &record.metadata.resource_version, &merged_change_request_status(timestamp(40)))
+        .await
+        .expect("publish terminal change request");
+
+    let current = convoys.get("convoy-a").await.expect("convoy get");
+    let reconciler = ConvoyReconciler::new(templates)
+        .with_checkouts(checkouts)
+        .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), std::time::Duration::from_secs(180))
+        .with_clock(Arc::new(FixedClock(timestamp(40))));
+    let deps = reconciler.fetch_dependencies(&current).await.expect("dependencies");
+    let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
+
+    assert_eq!(outcome.patch, Some(controller_patches::settle(Vec::new(), timestamp(40))));
 }
 
 #[tokio::test]

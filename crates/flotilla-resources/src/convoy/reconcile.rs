@@ -307,13 +307,14 @@ impl Reconciler for ConvoyReconciler {
                 .collect(),
             _ => BTreeMap::new(),
         };
+        let is_landing = obj.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing);
         let change_requests = match &self.change_requests {
-            Some(change_requests) => {
+            Some(change_requests) if is_landing => {
                 change_requests.list().await?.items.into_iter().map(|item| (item.object.metadata.name.clone(), item.object)).collect()
             }
-            None => BTreeMap::new(),
+            _ => BTreeMap::new(),
         };
-        let no_change_request_outstanding = if obj.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing) {
+        let no_change_request_outstanding = if is_landing {
             landing_condition_satisfied(
                 obj,
                 &checkouts,
