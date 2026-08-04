@@ -5282,11 +5282,22 @@ impl InProcessDaemon {
             let Some(entry) = parse_operational_entry(&file.contents).map_err(|error| format!("{}: {error}", file.path))? else {
                 continue;
             };
+            let is_verification_command = matches!(&entry.definition, OperationalEntryDefinition::VerificationCommand { .. });
             let targets = match entry.repos {
                 Some(repo_aliases) => repo_aliases
                     .into_iter()
                     .map(|alias| {
-                        aliases.get(&alias).cloned().ok_or_else(|| format!("{} names unknown repository alias `{alias}`", file.path))
+                        let target = aliases
+                            .get(&alias)
+                            .cloned()
+                            .ok_or_else(|| format!("{} names unknown repository alias `{alias}`", file.path))?;
+                        if is_verification_command && !all_code.contains(&target) {
+                            return Err(format!(
+                                "{} verification command `{}` targets repository alias `{alias}` without the code role",
+                                file.path, entry.name
+                            ));
+                        }
+                        Ok(target)
                     })
                     .collect::<Result<Vec<_>, _>>()?,
                 None => all_code.to_vec(),
