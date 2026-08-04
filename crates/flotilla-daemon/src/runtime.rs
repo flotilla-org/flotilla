@@ -59,6 +59,7 @@ use crate::{
     resource_manifest::ResourceManifestReconciler,
     sleep_inhibitor,
     supervisor::{supervise, ControllerSupervision, RestartBudgetExhausted},
+    vessel_config::{compose, ComposedFile, Fragment, TargetId, AGENT_ENVIRONMENT_PATH},
     Aggregator, AggregatorResolvers,
 };
 
@@ -70,6 +71,14 @@ const MANIFEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 const BUILTIN_MANAGED_BY_VALUE: &str = "builtin";
+
+fn compose_agent_environment(fragments: impl IntoIterator<Item = Fragment>) -> Result<Option<ComposedFile>, String> {
+    let fragments = fragments.into_iter().collect::<Vec<_>>();
+    if fragments.is_empty() {
+        return Ok(None);
+    }
+    compose(TargetId::AgentEnvironment, fragments).map(Some).map_err(|error| format!("compose shared agent environment: {error}"))
+}
 
 struct DaemonConvoyTeardownRuntime {
     daemon: Arc<InProcessDaemon>,
@@ -1745,9 +1754,9 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .filter(|(name, _)| !matches!(name.as_str(), CREDENTIAL_REFS_ENV | CREDENTIAL_SCOPES_ENV))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
-        let credential_adapters = match &self.state.credential_store {
-            Some(store) => match store.consumer_adapters(&credential_refs).await {
-                Ok(adapters) => adapters,
+        let credential_config_fragments = match &self.state.credential_store {
+            Some(store) => match store.vessel_config_fragments(&credential_refs, &spec.env).await {
+                Ok(fragments) => fragments,
                 Err(error) => {
                     return Err(discard_uncreated_environment(
                         self.state.credential_store.as_deref(),
@@ -1759,11 +1768,37 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                     .into())
                 }
             },
-            None if credential_refs.is_empty() => BTreeSet::new(),
+            None if credential_refs.is_empty() => Vec::new(),
             None => return Err("host-local credential store unavailable".to_string().into()),
         };
+        let agent_material_fragments = self
+            .state
+            .agent_material
+            .as_deref()
+            .map(|registry| registry.fragments(&spec.required_agent_adapters, &spec.env))
+            .unwrap_or_default();
+        let agent_environment = match compose_agent_environment(credential_config_fragments.into_iter().chain(agent_material_fragments)) {
+            Ok(composed) => composed,
+            Err(error) => {
+                return Err(discard_uncreated_environment(
+                    self.state.credential_store.as_deref(),
+                    self.state.agent_material.as_deref(),
+                    name,
+                    error,
+                )
+                .await
+                .into())
+            }
+        };
+        if let Some(composed) = &agent_environment {
+            for (name, value) in &composed.environment {
+                if !environment_variables.iter().any(|(existing, _)| existing == name) {
+                    environment_variables.push((name.clone(), value.clone()));
+                }
+            }
+        }
         let material_deliveries = match &self.state.agent_material {
-            Some(registry) => match registry.prepare(name, &spec.required_agent_adapters, &spec.env, &credential_adapters).await {
+            Some(registry) => match registry.prepare(name, &spec.required_agent_adapters, &spec.env).await {
                 Ok(deliveries) => deliveries,
                 Err(AgentMaterialPrepareError::Waiting { pool_ref, message }) => {
                     let message = discard_uncreated_environment(
@@ -1812,7 +1847,6 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         provisioned_mounts.extend(spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount));
         for delivery in &material_deliveries {
             provisioned_mounts.push(delivery.mount.clone());
-            environment_variables.extend(delivery.environment.clone());
         }
         let handle = match provider
             .create(env_id.clone(), &image, CreateOpts {
@@ -1836,6 +1870,19 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             }
         };
         let image_ref = handle.image().as_str().to_string();
+        if let Some(composed) = &agent_environment {
+            if let Err(error) = handle.runner().write_file(Path::new(AGENT_ENVIRONMENT_PATH), &composed.contents).await {
+                return Err(discard_failed_environment(
+                    &handle,
+                    self.state.credential_store.as_deref(),
+                    self.state.agent_material.as_deref(),
+                    name,
+                    format!("stage composed agent environment: {error}"),
+                )
+                .await
+                .into());
+            }
+        }
         let image_digest = match handle.image_digest() {
             Some(digest) => digest.to_string(),
             None => {
@@ -3645,6 +3692,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_credential_and_agent_material_conflict_before_container_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"codex-material-conflict-test\"\n").expect("daemon config");
+        let home = temp.path().join("home");
+        let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
+        fs::create_dir_all(&slot).expect("slot directory");
+        let auth = slot.join("auth.json");
+        fs::write(&auth, "{\"tokens\":\"test\"}").expect("slot auth");
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("protect slot auth");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        daemon
+            .resource_backend()
+            .definitions::<CredentialSpec>(NAMESPACE)
+            .create(&InputMeta::builder().name("openai".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::Codex,
+                source: CredentialSource::Env { name: "TEST_CODEX_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create Codex credential");
+        let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None) });
+        let mut local_registry = ProviderRegistry::new();
+        local_registry.environment_providers.insert(
+            "docker",
+            flotilla_core::providers::discovery::ProviderDescriptor::named(
+                flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+                "docker",
+            ),
+            Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
+        );
+        let env = Arc::new(TestEnvVars::new([("HOME", home.display().to_string()), ("TEST_CODEX_TOKEN", "secret".to_string())]));
+        let credential_store = Arc::new(CredentialStore::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            env.clone(),
+            EnvironmentBag::new(),
+            Arc::new(ProcessCommandRunner),
+            config.state_dir().as_path().to_path_buf(),
+        ));
+        let agent_material = Arc::new(AgentMaterialRegistry::new(daemon.resource_backend(), NAMESPACE, env));
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                daemon,
+                Arc::clone(&config),
+                Arc::new(local_registry),
+                Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+                "host-test".to_string(),
+                None,
+                "host-direct-host-test".to_string(),
+            )
+            .with_environment_tools(fixed_environment_tools(config.state_dir().join("contained-cleat").as_path().to_path_buf()))
+            .with_credential_store(credential_store)
+            .with_agent_material(agent_material),
+        );
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host-test".to_string(),
+            image: "contained-image".to_string(),
+            declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
+            required_agent_adapters: BTreeSet::from(["codex".to_string()]),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: BTreeMap::from([(
+                CREDENTIAL_REFS_ENV.to_string(),
+                serde_json::to_string(&BTreeSet::from(["openai".to_string()])).expect("encode credential refs"),
+            )]),
+        };
+
+        let error = DockerControllerRuntime { state }
+            .provision("contained-work", &spec)
+            .await
+            .expect_err("two Codex-home contributors must conflict")
+            .to_string();
+
+        assert!(error.contains("CODEX_HOME"), "error must name the target key: {error}");
+        assert!(error.contains("agent-material/codex codex-login"), "error must name agent material: {error}");
+        assert!(error.contains("credential/codex openai"), "error must name the credential: {error}");
+        assert!(provider.create_opts.lock().await.is_none(), "conflicting config must fail before creating a container");
+    }
+
+    #[tokio::test]
     async fn material_pool_wait_skips_registry_preflight_and_leaves_no_credential_cache() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3697,7 +3831,7 @@ mod tests {
             Arc::new(TestEnvVars::new([("HOME", home.display().to_string())])),
         ));
         agent_material
-            .prepare("slot-holder", &BTreeSet::from(["codex".to_string()]), &BTreeMap::new(), &BTreeSet::new())
+            .prepare("slot-holder", &BTreeSet::from(["codex".to_string()]), &BTreeMap::new())
             .await
             .expect("occupy only material unit");
         let state = Arc::new(

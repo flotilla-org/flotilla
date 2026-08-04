@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use url::Url;
 
-use crate::vessel_config::{compose, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey};
+use crate::vessel_config::{agent_environment_fragment, compose, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey};
 
 const GIT_CONFIG_PATH: &str = "/run/flotilla/credentials/gitconfig";
 
@@ -157,12 +157,22 @@ impl CredentialStore {
         }
     }
 
-    pub(crate) async fn consumer_adapters(&self, credential_refs: &BTreeSet<String>) -> Result<BTreeSet<String>, String> {
-        let mut adapters = BTreeSet::new();
-        for name in credential_refs {
-            adapters.insert(self.spec(name).await?.consumer.adapter_name().to_string());
+    pub(crate) async fn vessel_config_fragments(
+        &self,
+        credential_refs: &BTreeSet<String>,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<Vec<Fragment>, String> {
+        if environment.contains_key("CODEX_HOME") {
+            return Ok(Vec::new());
         }
-        Ok(adapters)
+        let mut fragments = Vec::new();
+        for name in credential_refs {
+            let spec = self.spec(name).await?;
+            if matches!(spec.consumer, CredentialConsumer::Codex) {
+                fragments.push(codex_home_fragment(name));
+            }
+        }
+        Ok(fragments)
     }
 
     pub(crate) async fn held_credentials(&self) -> Result<BTreeSet<String>, String> {
@@ -666,7 +676,8 @@ impl CredentialStore {
                 env.insert("ANTHROPIC_API_KEY".to_string(), material.to_string());
             }
             CredentialConsumer::Codex => {
-                let codex_home = format!("/run/flotilla/credentials/{}/codex", safe_component(name));
+                let codex_home_fragment = codex_home_fragment(name);
+                let codex_home = codex_home_fragment.value;
                 if !already_prepared {
                     runner
                         .run("mkdir", &["-p", &codex_home], Path::new("/"), &ChannelLabel::Noop)
@@ -713,6 +724,14 @@ fn git_credential_fragment(credential_name: &str, adapter: &str, credential_url:
         .merge(Merge::Append)
         .provenance(Provenance::new(format!("credential/{adapter} {credential_name}")))
         .build()
+}
+
+fn codex_home_fragment(credential_name: &str) -> Fragment {
+    agent_environment_fragment(
+        "CODEX_HOME",
+        format!("/run/flotilla/credentials/{}/codex", safe_component(credential_name)),
+        format!("credential/codex {credential_name}"),
+    )
 }
 
 async fn api_key_preflight(runner: &dyn CommandRunner, url: &str, headers: &[(&str, &str)]) -> Result<(), String> {
@@ -1004,9 +1023,16 @@ interactions:
         let runner = Arc::new(RecordingRunner::default());
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/usr/bin/codex"));
         let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+        let credential_refs = BTreeSet::from(["model-api".to_string()]);
 
-        let delivered =
-            store.prepare("env-a", &BTreeSet::from(["model-api".to_string()]), runner.clone()).await.expect("prepare codex credential");
+        assert_eq!(store.vessel_config_fragments(&credential_refs, &BTreeMap::new()).await.expect("Codex fragment").len(), 1);
+        assert!(store
+            .vessel_config_fragments(&credential_refs, &BTreeMap::from([("CODEX_HOME".to_string(), "/image/codex".to_string())]),)
+            .await
+            .expect("explicit Codex home")
+            .is_empty());
+
+        let delivered = store.prepare("env-a", &credential_refs, runner.clone()).await.expect("prepare codex credential");
 
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0, "CODEX_HOME");

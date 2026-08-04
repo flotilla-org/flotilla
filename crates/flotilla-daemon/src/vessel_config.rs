@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, fmt};
 
+pub const AGENT_ENVIRONMENT_PATH: &str = "/run/flotilla/agent-environment";
+
 pub mod order {
     pub const FIRST: u16 = 0;
     pub const EARLY: u16 = 500;
@@ -16,12 +18,14 @@ pub mod priority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TargetId {
     GitConfig,
+    AgentEnvironment,
 }
 
 impl fmt::Display for TargetId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::GitConfig => formatter.write_str("gitconfig"),
+            Self::AgentEnvironment => formatter.write_str("agent-environment"),
         }
     }
 }
@@ -29,13 +33,36 @@ impl fmt::Display for TargetId {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TargetKey {
     GitConfig(GitConfigKey),
+    AgentEnvironment(AgentEnvironmentKey),
 }
 
 impl fmt::Display for TargetKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::GitConfig(key) => key.fmt(formatter),
+            Self::AgentEnvironment(key) => key.fmt(formatter),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AgentEnvironmentKey(String);
+
+impl AgentEnvironmentKey {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    fn is_valid(&self) -> bool {
+        let mut characters = self.0.chars();
+        characters.next().is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+            && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+    }
+}
+
+impl fmt::Display for AgentEnvironmentKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
@@ -112,10 +139,20 @@ pub struct Fragment {
     pub provenance: Provenance,
 }
 
+pub fn agent_environment_fragment(name: impl Into<String>, value: impl Into<String>, provenance: impl Into<String>) -> Fragment {
+    Fragment::builder()
+        .target(TargetId::AgentEnvironment)
+        .key(TargetKey::AgentEnvironment(AgentEnvironmentKey::new(name)))
+        .value(value)
+        .provenance(Provenance::new(provenance))
+        .build()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposedFile {
     pub target: TargetId,
     pub contents: String,
+    pub environment: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +164,7 @@ pub enum ComposeError {
     SetConflict { key: TargetKey, first: Provenance, second: Provenance },
     MergePolicyConflict { key: TargetKey, first: Provenance, second: Provenance },
     Duplicate { key: TargetKey, first: Provenance, second: Provenance },
+    UnsupportedAppend { key: TargetKey, provenance: Provenance },
 }
 
 impl fmt::Display for ComposeError {
@@ -153,6 +191,9 @@ impl fmt::Display for ComposeError {
             Self::Duplicate { key, first, second } => {
                 write!(formatter, "duplicate fragments from `{first}` and `{second}` are forbidden for key `{key}`")
             }
+            Self::UnsupportedAppend { key, provenance } => {
+                write!(formatter, "fragment from `{provenance}` cannot append single-valued agent environment key `{key}`")
+            }
         }
     }
 }
@@ -168,6 +209,7 @@ pub fn compose(target: TargetId, fragments: impl IntoIterator<Item = Fragment>) 
 
     match target {
         TargetId::GitConfig => compose_gitconfig(fragments),
+        TargetId::AgentEnvironment => compose_agent_environment(fragments),
     }
 }
 
@@ -179,12 +221,66 @@ fn compose_gitconfig(fragments: Vec<Fragment>) -> Result<ComposedFile, ComposeEr
                     return Err(ComposeError::InvalidKey { provenance: fragment.provenance.clone() });
                 }
             }
+            TargetKey::AgentEnvironment(_) => {
+                return Err(ComposeError::TargetKeyMismatch {
+                    target: TargetId::GitConfig,
+                    key: fragment.key.clone(),
+                    provenance: fragment.provenance.clone(),
+                });
+            }
         }
         if fragment.value.contains(['\r', '\n']) {
             return Err(ComposeError::InvalidValue { key: fragment.key.clone(), provenance: fragment.provenance.clone() });
         }
     }
 
+    let rendered = resolve_fragments(&fragments, true)?;
+
+    let contents = rendered.into_iter().map(render_gitconfig_entry).collect::<Vec<_>>().join("\n");
+    Ok(ComposedFile { target: TargetId::GitConfig, contents, environment: Vec::new() })
+}
+
+fn compose_agent_environment(fragments: Vec<Fragment>) -> Result<ComposedFile, ComposeError> {
+    for fragment in &fragments {
+        match &fragment.key {
+            TargetKey::AgentEnvironment(key) if key.is_valid() => {}
+            TargetKey::AgentEnvironment(_) => {
+                return Err(ComposeError::InvalidKey { provenance: fragment.provenance.clone() });
+            }
+            TargetKey::GitConfig(_) => {
+                return Err(ComposeError::TargetKeyMismatch {
+                    target: TargetId::AgentEnvironment,
+                    key: fragment.key.clone(),
+                    provenance: fragment.provenance.clone(),
+                });
+            }
+        }
+        if fragment.value.contains(['\0', '\r', '\n']) {
+            return Err(ComposeError::InvalidValue { key: fragment.key.clone(), provenance: fragment.provenance.clone() });
+        }
+    }
+
+    let rendered = resolve_fragments(&fragments, false)?;
+    let contents = rendered
+        .iter()
+        .map(|entry| {
+            let TargetKey::AgentEnvironment(key) = &entry.fragment.key else { unreachable!("target key validated above") };
+            let comments = entry.provenances.iter().map(|provenance| format!("# fragment: {provenance}\n")).collect::<String>();
+            format!("{comments}export {key}={}\n", shell_quote(&entry.fragment.value))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let environment = rendered
+        .into_iter()
+        .map(|entry| {
+            let TargetKey::AgentEnvironment(key) = &entry.fragment.key else { unreachable!("target key validated above") };
+            (key.0.clone(), entry.fragment.value.clone())
+        })
+        .collect();
+    Ok(ComposedFile { target: TargetId::AgentEnvironment, contents, environment })
+}
+
+fn resolve_fragments(fragments: &[Fragment], append_supported: bool) -> Result<Vec<RenderedEntry<'_>>, ComposeError> {
     let minimum_priorities = fragments.iter().fold(BTreeMap::<TargetKey, u16>::new(), |mut priorities, fragment| {
         priorities
             .entry(fragment.key.clone())
@@ -193,7 +289,7 @@ fn compose_gitconfig(fragments: Vec<Fragment>) -> Result<ComposedFile, ComposeEr
         priorities
     });
     let mut winners = BTreeMap::<TargetKey, Vec<&Fragment>>::new();
-    for fragment in &fragments {
+    for fragment in fragments {
         if minimum_priorities.get(&fragment.key) == Some(&fragment.priority) {
             winners.entry(fragment.key.clone()).or_default().push(fragment);
         }
@@ -218,14 +314,18 @@ fn compose_gitconfig(fragments: Vec<Fragment>) -> Result<ComposedFile, ComposeEr
                         second: other.provenance.clone(),
                     });
                 }
-                rendered.push(RenderedGitConfigEntry {
+                rendered.push(RenderedEntry {
                     fragment: first,
                     provenances: fragments_for_key.iter().map(|fragment| &fragment.provenance).collect(),
                 });
             }
-            Merge::Append => rendered.extend(
-                fragments_for_key.iter().map(|fragment| RenderedGitConfigEntry { fragment, provenances: vec![&fragment.provenance] }),
-            ),
+            Merge::Append if append_supported => {
+                rendered
+                    .extend(fragments_for_key.iter().map(|fragment| RenderedEntry { fragment, provenances: vec![&fragment.provenance] }));
+            }
+            Merge::Append => {
+                return Err(ComposeError::UnsupportedAppend { key: first.key.clone(), provenance: first.provenance.clone() });
+            }
             Merge::ErrorOnDuplicate => {
                 if let Some(other) = fragments_for_key.get(1) {
                     return Err(ComposeError::Duplicate {
@@ -234,24 +334,26 @@ fn compose_gitconfig(fragments: Vec<Fragment>) -> Result<ComposedFile, ComposeEr
                         second: other.provenance.clone(),
                     });
                 }
-                rendered.push(RenderedGitConfigEntry { fragment: first, provenances: vec![&first.provenance] });
+                rendered.push(RenderedEntry { fragment: first, provenances: vec![&first.provenance] });
             }
         }
     }
     rendered
         .sort_by(|left, right| (left.fragment.order, &left.fragment.provenance).cmp(&(right.fragment.order, &right.fragment.provenance)));
-
-    let contents = rendered.into_iter().map(render_gitconfig_entry).collect::<Vec<_>>().join("\n");
-    Ok(ComposedFile { target: TargetId::GitConfig, contents })
+    Ok(rendered)
 }
 
-struct RenderedGitConfigEntry<'a> {
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+struct RenderedEntry<'a> {
     fragment: &'a Fragment,
     provenances: Vec<&'a Provenance>,
 }
 
-fn render_gitconfig_entry(entry: RenderedGitConfigEntry<'_>) -> String {
-    let TargetKey::GitConfig(key) = &entry.fragment.key;
+fn render_gitconfig_entry(entry: RenderedEntry<'_>) -> String {
+    let TargetKey::GitConfig(key) = &entry.fragment.key else { unreachable!("target key validated before rendering") };
     let comments = entry.provenances.into_iter().map(|provenance| format!("# fragment: {provenance}\n")).collect::<String>();
     let section = match &key.subsection {
         Some(subsection) => format!("[{} \"{}\"]", key.section, escape_gitconfig_subsection(subsection)),
@@ -296,6 +398,65 @@ mod tests {
         assert!(error.contains("user.email"), "error must name the key: {error}");
         assert!(error.contains("credential/first"), "error must name the first contributor: {error}");
         assert!(error.contains("credential/second"), "error must name the second contributor: {error}");
+    }
+
+    #[test]
+    fn agent_environment_renders_provenance_and_single_valued_delivery() {
+        let composed = compose(TargetId::AgentEnvironment, [agent_environment_fragment(
+            "CODEX_HOME",
+            "/run/flotilla/codex",
+            "agent-material/codex codex-login",
+        )])
+        .expect("agent environment should compose");
+
+        assert_eq!(composed.contents, "# fragment: agent-material/codex codex-login\nexport CODEX_HOME='/run/flotilla/codex'\n");
+        assert_eq!(composed.environment, [("CODEX_HOME".to_string(), "/run/flotilla/codex".to_string())]);
+    }
+
+    #[test]
+    fn credential_and_agent_material_conflict_names_both_contributors() {
+        let error = compose(TargetId::AgentEnvironment, [
+            agent_environment_fragment("CODEX_HOME", "/run/flotilla/codex", "agent-material/codex codex-login"),
+            agent_environment_fragment("CODEX_HOME", "/run/flotilla/credentials/openai/codex", "credential/codex openai"),
+        ])
+        .expect_err("two Codex homes must conflict")
+        .to_string();
+
+        assert!(error.contains("CODEX_HOME"), "error must name the key: {error}");
+        assert!(error.contains("agent-material/codex codex-login"), "error must name agent material: {error}");
+        assert!(error.contains("credential/codex openai"), "error must name the credential: {error}");
+    }
+
+    #[test]
+    fn agent_environment_rejects_invalid_names_and_values() {
+        let invalid_name =
+            compose(TargetId::AgentEnvironment, [agent_environment_fragment("CODEX-HOME", "/run/flotilla/codex", "agent-material/codex")])
+                .expect_err("environment names must be shell identifiers")
+                .to_string();
+        assert!(invalid_name.contains("agent-material/codex"));
+
+        let invalid_value = compose(TargetId::AgentEnvironment, [agent_environment_fragment(
+            "CODEX_HOME",
+            "/run/flotilla/codex\0injected",
+            "agent-material/codex",
+        )])
+        .expect_err("environment values must not contain NUL")
+        .to_string();
+        assert!(invalid_value.contains("CODEX_HOME"));
+        assert!(invalid_value.contains("agent-material/codex"));
+    }
+
+    #[test]
+    fn agent_environment_rejects_append_for_single_valued_keys() {
+        let mut fragment = agent_environment_fragment("CODEX_HOME", "/run/flotilla/codex", "agent-material/codex");
+        fragment.merge = Merge::Append;
+
+        let error =
+            compose(TargetId::AgentEnvironment, [fragment]).expect_err("agent environment values must stay single-valued").to_string();
+
+        assert!(error.contains("cannot append"));
+        assert!(error.contains("CODEX_HOME"));
+        assert!(error.contains("agent-material/codex"));
     }
 
     #[test]
