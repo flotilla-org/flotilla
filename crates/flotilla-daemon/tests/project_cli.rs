@@ -13,6 +13,10 @@ use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
+    ops_entry::{
+        MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
+        VERIFICATION_PROJECT_ANNOTATION,
+    },
     project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
     providers::discovery::test_support::fake_discovery,
     repository_inspection::{LocalCheckoutInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
@@ -21,7 +25,8 @@ use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{commands::RepositoryIdentityChange, Command, CommandAction, CommandValue, DaemonEvent, HostName, RepoSelector};
 use flotilla_resources::{
     Checkout, CheckoutSpec, Convoy, InMemoryBackend, InputMeta, IssueSource, ObservedCheckoutSpec, Project, ProjectRepositoryRole,
-    ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend, MANAGED_BY_LABEL,
+    ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend, WorkflowTemplate, WorkflowTemplateSpec,
+    MANAGED_BY_LABEL,
 };
 use tracing::instrument::WithSubscriber;
 
@@ -361,7 +366,7 @@ async fn project_refresh_is_one_way_and_keeps_alias_repository_keys_stable_acros
     .expect("update declaration");
     assert_eq!(
         execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,
-        CommandValue::ProjectRefreshed { name: "demo".to_string(), members: 2, converged: true }
+        CommandValue::ProjectRefreshed { name: "demo".to_string(), members: 2, converged: true, changes: vec!["Project/demo".to_string()] }
     );
     let refreshed = projects.get("demo").await.expect("refreshed project");
     assert_eq!(refreshed.spec.display_name, "demo");
@@ -371,7 +376,180 @@ async fn project_refresh_is_one_way_and_keeps_alias_repository_keys_stable_acros
     assert_eq!(refreshed.metadata.annotations.get(BOOTSTRAP_COMMIT_ANNOTATION).map(String::as_str), Some("commit-two"));
     assert_eq!(
         execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,
-        CommandValue::ProjectRefreshed { name: "demo".to_string(), members: 2, converged: false }
+        CommandValue::ProjectRefreshed { name: "demo".to_string(), members: 2, converged: false, changes: Vec::new() }
+    );
+}
+
+#[tokio::test]
+async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_converge_drift() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
+    let commit = Arc::new(RwLock::new("ops-commit".to_string()));
+    daemon.set_repository_inspector(Arc::new(DeclarationInspector { bootstrap: ops_spec.clone(), commit })).await;
+    std::fs::write(
+        tmp.path().join("project.yaml"),
+        "name: demo\nmembers:\n  - alias: app\n    url: https://github.com/example/app\n    roles: [code]\n  - alias: docs\n    url: https://github.com/example/docs\n    roles: [code]\n  - alias: operations\n    url: https://github.com/example/project-ops\n    roles: [ops]\n",
+    )
+    .expect("write declaration");
+    let misleading_directory = tmp.path().join("verification-commands");
+    std::fs::create_dir(&misleading_directory).expect("create misleading directory");
+    std::fs::write(
+        misleading_directory.join("this-is-a-workflow.md"),
+        "---\nkind: workflow_template\nname: scoped\nrepos: [app]\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo test\n",
+    )
+    .expect("write scoped workflow");
+    std::fs::write(
+        tmp.path().join("all-code.entry"),
+        "---\nkind: workflow_template\nname: all-code\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo check\n",
+    )
+    .expect("write default-scoped workflow");
+    std::fs::write(
+        tmp.path().join("test-command.entry"),
+        "---\nkind: verification_command\nname: test\nrepos: [app]\n---\ncommand: cargo test --workspace\n",
+    )
+    .expect("write verification command");
+
+    let mut rx = daemon.subscribe();
+    assert_eq!(
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: tmp.path().to_string_lossy().into_owned() })
+            .await,
+        CommandValue::ProjectRegistered { name: "demo".to_string(), members: 3 }
+    );
+    let project = backend.using::<Project>("flotilla").get("demo").await.expect("project");
+    let app = project.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("app")).expect("app");
+    let docs = project.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("docs")).expect("docs");
+    let workflows = backend.using::<WorkflowTemplate>("flotilla");
+    let scoped = workflows.get("scoped").await.expect("scoped workflow");
+    assert_eq!(scoped.spec.vessels[0].repository_refs.as_deref(), Some(std::slice::from_ref(&app.repo)));
+    assert_eq!(scoped.metadata.annotations.get(SOURCE_REPOSITORY_ANNOTATION), Some(&ops_spec.key().to_string()));
+    assert_eq!(scoped.metadata.annotations.get(SOURCE_COMMIT_ANNOTATION).map(String::as_str), Some("ops-commit"));
+    assert_eq!(
+        scoped.metadata.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).map(String::as_str),
+        Some("verification-commands/this-is-a-workflow.md")
+    );
+    let all_code = workflows.get("all-code").await.expect("default-scoped workflow");
+    assert_eq!(all_code.spec.vessels[0].repository_refs.as_deref(), Some([app.repo.clone(), docs.repo.clone()].as_slice()));
+    let app_repository = backend.using::<Repository>("flotilla").get(&app.repo.to_string()).await.expect("app repository");
+    let docs_repository = backend.using::<Repository>("flotilla").get(&docs.repo.to_string()).await.expect("docs repository");
+    assert_eq!(app_repository.spec.verification_commands().get("test").map(String::as_str), Some("cargo test --workspace"));
+    assert!(docs_repository.spec.verification_commands().is_empty());
+
+    workflows
+        .update(
+            &InputMeta::from(&scoped.metadata),
+            &scoped.metadata.resource_version,
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
+        .await
+        .expect("drift workflow");
+    assert_eq!(
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,
+        CommandValue::ProjectRefreshed {
+            name: "demo".to_string(),
+            members: 3,
+            converged: true,
+            changes: vec!["WorkflowTemplate/scoped".to_string()],
+        }
+    );
+    assert_eq!(workflows.get("scoped").await.expect("converged workflow").spec, scoped.spec);
+
+    std::fs::remove_file(misleading_directory.join("this-is-a-workflow.md")).expect("remove workflow entry");
+    assert_eq!(
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,
+        CommandValue::ProjectRefreshed {
+            name: "demo".to_string(),
+            members: 3,
+            converged: true,
+            changes: vec!["deleted WorkflowTemplate/scoped".to_string()],
+        }
+    );
+    assert!(matches!(workflows.get("scoped").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+
+    std::fs::remove_file(tmp.path().join("test-command.entry")).expect("remove verification entry");
+    std::fs::write(
+        tmp.path().join("project.yaml"),
+        "name: demo\nmembers:\n  - alias: app\n    url: https://github.com/example/app\n    roles: [knowledge]\n  - alias: docs\n    url: https://github.com/example/docs\n    roles: [code]\n  - alias: operations\n    url: https://github.com/example/project-ops\n    roles: [ops]\n",
+    )
+    .expect("remove app code role");
+    let result = execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await;
+    assert!(
+        matches!(&result, CommandValue::ProjectRefreshed { changes, .. }
+            if changes.iter().any(|change| change == &format!("Repository/{} verification commands", app.repo))),
+        "unexpected command result: {result:?}"
+    );
+    let released = backend.using::<Repository>("flotilla").get(&app.repo.to_string()).await.expect("released repository");
+    assert!(released.spec.verification_commands().is_empty());
+    assert!(!released.metadata.annotations.contains_key(VERIFICATION_PROJECT_ANNOTATION));
+}
+
+#[tokio::test]
+async fn ops_entry_rejects_a_hand_applied_workflow_name_collision() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
+    daemon
+        .set_repository_inspector(Arc::new(DeclarationInspector {
+            bootstrap: ops_spec,
+            commit: Arc::new(RwLock::new("ops-commit".to_string())),
+        }))
+        .await;
+    std::fs::write(
+        tmp.path().join("project.yaml"),
+        "name: demo\nmembers:\n  - alias: app\n    url: https://github.com/example/project-ops\n    roles: [code, ops]\n",
+    )
+    .expect("write declaration");
+    std::fs::write(
+        tmp.path().join("collision.entry"),
+        "---\nkind: workflow_template\nname: existing\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo test\n",
+    )
+    .expect("write workflow entry");
+    let hand_applied = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
+    let workflows = backend.using::<WorkflowTemplate>("flotilla");
+    workflows.create(&InputMeta::builder().name("existing".to_string()).build(), &hand_applied).await.expect("hand apply workflow");
+
+    let mut rx = daemon.subscribe();
+    let result =
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: tmp.path().to_string_lossy().into_owned() })
+            .await;
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("already exists") && message.contains("not materialized")),
+        "unexpected command result: {result:?}"
+    );
+    let preserved = workflows.get("existing").await.expect("hand-applied workflow remains");
+    assert_eq!(preserved.spec, hand_applied);
+    assert!(!preserved.metadata.annotations.contains_key(MATERIALIZED_PROJECT_ANNOTATION));
+}
+
+#[tokio::test]
+async fn ops_entry_rejects_a_verification_command_targeting_a_non_code_member() {
+    let (daemon, _backend, _config, _runtime, tmp) = start_daemon().await;
+    let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
+    daemon
+        .set_repository_inspector(Arc::new(DeclarationInspector {
+            bootstrap: ops_spec,
+            commit: Arc::new(RwLock::new("ops-commit".to_string())),
+        }))
+        .await;
+    std::fs::write(
+        tmp.path().join("project.yaml"),
+        "name: demo\nmembers:\n  - alias: app\n    url: https://github.com/example/app\n    roles: [code]\n  - alias: operations\n    url: https://github.com/example/project-ops\n    roles: [ops]\n",
+    )
+    .expect("write declaration");
+    std::fs::write(
+        tmp.path().join("invalid-command.entry"),
+        "---\nkind: verification_command\nname: test\nrepos: [operations]\n---\ncommand: cargo test --workspace\n",
+    )
+    .expect("write verification command");
+
+    let mut rx = daemon.subscribe();
+    let result =
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: tmp.path().to_string_lossy().into_owned() })
+            .await;
+    assert!(
+        matches!(&result, CommandValue::Error { message }
+            if message.contains("invalid-command.entry")
+                && message.contains("repository alias `operations`")
+                && message.contains("without the code role")),
+        "unexpected command result: {result:?}"
     );
 }
 

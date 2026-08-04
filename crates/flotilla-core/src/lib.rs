@@ -23,6 +23,7 @@ pub mod log_file;
 pub mod merge;
 pub mod model;
 pub(crate) mod observed_resources;
+pub mod ops_entry;
 pub mod path_context;
 pub mod path_policy;
 pub mod placement_policy;

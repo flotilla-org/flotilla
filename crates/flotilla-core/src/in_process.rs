@@ -87,6 +87,10 @@ use crate::{
     host_registry::HostCounts,
     leaf_engine::{LeafSubscriptionTable, LeafWatcher},
     model::{provider_names_from_registry, repo_name, RepoModel},
+    ops_entry::{
+        parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
+        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
+    },
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
     project_declaration::{
@@ -106,7 +110,9 @@ use crate::{
     refresh::RefreshSnapshot,
     regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome, DEFAULT_REGARD_DECAY_SECONDS, DEFAULT_REGARD_REFRESH_SECONDS},
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
-    repository_inspection::{GitRepositoryInspector, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
+    repository_inspection::{
+        GitRepositoryInspector, OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector,
+    },
     step::{
         run_step_plan_with_remote_executor, RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome, StepResolver,
     },
@@ -5038,7 +5044,7 @@ impl InProcessDaemon {
         Ok((name, project.spec.repositories.len()))
     }
 
-    async fn project_refresh(&self, name: &str) -> Result<(usize, bool), String> {
+    async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>), String> {
         validate_project_name(name)?;
         let namespace = self.provisioning_namespace().await;
         let project =
@@ -5057,7 +5063,7 @@ impl InProcessDaemon {
                 declaration.name
             ));
         }
-        let converged = self.materialize_project_declaration(declaration, inspection).await?;
+        let changes = self.materialize_project_declaration(declaration, inspection).await?;
         let members = self
             .resource_backend
             .clone()
@@ -5068,14 +5074,14 @@ impl InProcessDaemon {
             .spec
             .repositories
             .len();
-        Ok((members, converged))
+        Ok((members, !changes.is_empty(), changes))
     }
 
     async fn materialize_project_declaration(
         &self,
         declaration: ProjectDeclaration,
         inspection: ProjectDeclarationInspection,
-    ) -> Result<bool, String> {
+    ) -> Result<Vec<String>, String> {
         validate_project_name(&declaration.name)?;
         let namespace = self.provisioning_namespace().await;
         let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
@@ -5093,6 +5099,7 @@ impl InProcessDaemon {
             .collect::<BTreeMap<_, _>>();
         let bootstrap_key = inspection.repository.key();
         let bootstrap_path = inspection.repository.checkout.path.to_string_lossy().into_owned();
+        let bootstrap_inspection = inspection.clone();
         let provenance = BTreeMap::from([
             (BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), bootstrap_key.to_string()),
             (BOOTSTRAP_COMMIT_ANNOTATION.to_string(), inspection.commit.clone()),
@@ -5152,7 +5159,276 @@ impl InProcessDaemon {
         converged |=
             existing_project.as_ref().is_none_or(|project| project.spec != spec || project.metadata.annotations != meta.annotations);
         projects.apply(&meta, &spec).await.map_err(|error| error.to_string())?;
-        Ok(converged)
+        let mut changes = if converged { vec![format!("Project/{}", declaration.name)] } else { Vec::new() };
+        changes.extend(self.materialize_project_operational_entries(&declaration.name, &bootstrap_inspection).await?);
+        Ok(changes)
+    }
+
+    async fn materialize_project_operational_entries(
+        &self,
+        project_name: &str,
+        bootstrap: &ProjectDeclarationInspection,
+    ) -> Result<Vec<String>, String> {
+        let namespace = self.provisioning_namespace().await;
+        let project =
+            self.resource_backend.clone().definitions::<Project>(&namespace).get(project_name).await.map_err(|e| e.to_string())?;
+        let aliases = project
+            .spec
+            .repositories
+            .iter()
+            .filter_map(|member| member.alias.as_ref().map(|alias| (alias.clone(), member.repo.clone())))
+            .collect::<BTreeMap<_, _>>();
+        let all_code = project
+            .spec
+            .repositories
+            .iter()
+            .filter(|member| member.roles.contains(&ProjectRepositoryRole::Code))
+            .map(|member| member.repo.clone())
+            .collect::<Vec<_>>();
+        let inspector = self.repository_inspector().await?;
+        let mut sources = Vec::new();
+        let mut unavailable_source = false;
+        for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Ops)) {
+            let path = if member.repo == bootstrap.repository.key() {
+                bootstrap.repository.checkout.path.clone()
+            } else {
+                let mut paths = self
+                    .repository_keys_by_path
+                    .read()
+                    .await
+                    .iter()
+                    .filter(|(_, key)| *key == &member.repo)
+                    .map(|(path, _)| path.clone())
+                    .collect::<Vec<_>>();
+                paths.sort();
+                match paths.as_slice() {
+                    [] => {
+                        unavailable_source = true;
+                        continue;
+                    }
+                    [path] => path.clone(),
+                    _ => {
+                        let mut main_paths = Vec::new();
+                        for path in paths {
+                            if inspector.inspect_path(&path, None).await?.checkout.is_main {
+                                main_paths.push(path);
+                            }
+                        }
+                        match main_paths.as_slice() {
+                            [path] => path.clone(),
+                            _ => {
+                                return Err(format!(
+                                    "ops member {} has multiple local checkouts; its main checkout cannot be selected unambiguously",
+                                    member.alias.as_deref().unwrap_or(&member.repo.0)
+                                ));
+                            }
+                        }
+                    }
+                }
+            };
+            let mut source = inspector.inspect_operational_entries(&path).await?;
+            if member.repo == bootstrap.repository.key() {
+                source.commit.clone_from(&bootstrap.commit);
+                source.repository = bootstrap.repository.clone();
+            }
+            sources.push(source);
+        }
+        // Registration remains possible from a bootstrap repository that does
+        // not host every ops member. Never infer an empty desired set from an
+        // unavailable source: that could erase definitions materialized by a
+        // previous refresh on a host that had the checkout.
+        if unavailable_source {
+            return Ok(Vec::new());
+        }
+
+        let mut workflows = BTreeMap::new();
+        let mut commands = BTreeMap::<RepositoryKey, BTreeMap<String, String>>::new();
+        let mut command_provenance = BTreeMap::<RepositoryKey, Vec<serde_json::Value>>::new();
+        for source in sources {
+            self.collect_operational_entries(
+                project_name,
+                &aliases,
+                &all_code,
+                source,
+                &mut workflows,
+                &mut commands,
+                &mut command_provenance,
+            )?;
+        }
+
+        let templates = self.resource_backend.clone().using::<WorkflowTemplate>(&namespace);
+        let mut changes = Vec::new();
+        for (name, (meta, spec)) in &workflows {
+            let current = match templates.get(name).await {
+                Ok(current) => Some(current),
+                Err(ResourceError::NotFound { .. }) => None,
+                Err(error) => return Err(error.to_string()),
+            };
+            if let Some(current) = &current {
+                match current.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION) {
+                    Some(owner) if owner == project_name => {}
+                    Some(owner) => return Err(format!("WorkflowTemplate `{name}` is materialized by project `{owner}`")),
+                    None => return Err(format!("WorkflowTemplate `{name}` already exists and is not materialized by a project")),
+                }
+            }
+            if current.as_ref().is_none_or(|current| current.spec != *spec || current.metadata.annotations != meta.annotations) {
+                match current {
+                    Some(current) => {
+                        templates.update(meta, &current.metadata.resource_version, spec).await.map_err(|error| error.to_string())?;
+                    }
+                    None => {
+                        templates.create(meta, spec).await.map_err(|error| error.to_string())?;
+                    }
+                }
+                changes.push(format!("WorkflowTemplate/{name}"));
+            }
+        }
+        for stale in templates.list().await.map_err(|error| error.to_string())?.items.into_iter().filter(|template| {
+            template.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
+                && !workflows.contains_key(&template.metadata.name)
+        }) {
+            templates.delete(&stale.metadata.name).await.map_err(|error| error.to_string())?;
+            changes.push(format!("deleted WorkflowTemplate/{}", stale.metadata.name));
+        }
+
+        let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
+        let current_code_members = project
+            .spec
+            .repositories
+            .iter()
+            .filter(|member| member.roles.contains(&ProjectRepositoryRole::Code))
+            .map(|member| member.repo.clone())
+            .collect::<BTreeSet<_>>();
+        for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Code)) {
+            let current = repositories.get(&member.repo.to_string()).await.map_err(|error| error.to_string())?;
+            let desired_commands = commands.remove(&member.repo).unwrap_or_default();
+            let owner = current.metadata.annotations.get(VERIFICATION_PROJECT_ANNOTATION).map(String::as_str);
+            match owner {
+                Some(owner) if owner == project_name => {}
+                Some(owner) if !desired_commands.is_empty() => {
+                    return Err(format!("Repository {} verification commands are materialized by project `{owner}`", member.repo));
+                }
+                None if !desired_commands.is_empty() && !current.spec.verification_commands().is_empty() => {
+                    return Err(format!(
+                        "Repository {} already has verification commands that are not materialized by a project",
+                        member.repo
+                    ));
+                }
+                None if !desired_commands.is_empty() => {}
+                _ => continue,
+            }
+            let desired_spec = current.spec.clone().with_verification_commands(desired_commands);
+            let mut meta = InputMeta::from(&current.metadata);
+            match command_provenance.remove(&member.repo) {
+                Some(provenance) => {
+                    meta.annotations.insert(VERIFICATION_PROJECT_ANNOTATION.to_string(), project_name.to_string());
+                    meta.annotations.insert(
+                        VERIFICATION_PROVENANCE_ANNOTATION.to_string(),
+                        serde_json::to_string(&provenance).expect("JSON provenance values serialize"),
+                    );
+                }
+                None => {
+                    meta.annotations.remove(VERIFICATION_PROJECT_ANNOTATION);
+                    meta.annotations.remove(VERIFICATION_PROVENANCE_ANNOTATION);
+                }
+            }
+            if current.spec != desired_spec || current.metadata.annotations != meta.annotations {
+                repositories.update(&meta, &current.metadata.resource_version, &desired_spec).await.map_err(|error| error.to_string())?;
+                changes.push(format!("Repository/{} verification commands", member.repo));
+            }
+        }
+        for stale in repositories.list().await.map_err(|error| error.to_string())?.items.into_iter().filter(|repository| {
+            repository.metadata.annotations.get(VERIFICATION_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
+                && !current_code_members.contains(&RepositoryKey(repository.metadata.name.clone()))
+        }) {
+            let mut meta = InputMeta::from(&stale.metadata);
+            meta.annotations.remove(VERIFICATION_PROJECT_ANNOTATION);
+            meta.annotations.remove(VERIFICATION_PROVENANCE_ANNOTATION);
+            let spec = stale.spec.clone().with_verification_commands(BTreeMap::new());
+            repositories.update(&meta, &stale.metadata.resource_version, &spec).await.map_err(|error| error.to_string())?;
+            changes.push(format!("Repository/{} verification commands", stale.metadata.name));
+        }
+        changes.sort();
+        Ok(changes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_operational_entries(
+        &self,
+        project_name: &str,
+        aliases: &BTreeMap<String, RepositoryKey>,
+        all_code: &[RepositoryKey],
+        source: OperationalEntriesInspection,
+        workflows: &mut BTreeMap<String, (InputMeta, WorkflowTemplateSpec)>,
+        commands: &mut BTreeMap<RepositoryKey, BTreeMap<String, String>>,
+        command_provenance: &mut BTreeMap<RepositoryKey, Vec<serde_json::Value>>,
+    ) -> Result<(), String> {
+        let source_repository = source.repository.key();
+        for file in source.files {
+            let Some(entry) = parse_operational_entry(&file.contents).map_err(|error| format!("{}: {error}", file.path))? else {
+                continue;
+            };
+            let is_verification_command = matches!(&entry.definition, OperationalEntryDefinition::VerificationCommand { .. });
+            let targets = match entry.repos {
+                Some(repo_aliases) => repo_aliases
+                    .into_iter()
+                    .map(|alias| {
+                        let target = aliases
+                            .get(&alias)
+                            .cloned()
+                            .ok_or_else(|| format!("{} names unknown repository alias `{alias}`", file.path))?;
+                        if is_verification_command && !all_code.contains(&target) {
+                            return Err(format!(
+                                "{} verification command `{}` targets repository alias `{alias}` without the code role",
+                                file.path, entry.name
+                            ));
+                        }
+                        Ok(target)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => all_code.to_vec(),
+            };
+            if targets.is_empty() {
+                return Err(format!("{} has no code-role repositories to target", file.path));
+            }
+            let provenance = serde_json::json!({
+                "sourceRepository": source_repository,
+                "sourceCommit": source.commit,
+                "entryPath": file.path,
+            });
+            match entry.definition {
+                OperationalEntryDefinition::WorkflowTemplate(mut spec) => {
+                    for vessel in &mut spec.vessels {
+                        vessel.repository_refs = Some(targets.clone());
+                    }
+                    flotilla_resources::validate(&spec).map_err(|errors| {
+                        let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+                        format!("{} contains invalid workflow template `{}`: {errors}", file.path, entry.name)
+                    })?;
+                    let meta = InputMeta::builder()
+                        .name(entry.name.clone())
+                        .annotations(BTreeMap::from([
+                            (MATERIALIZED_PROJECT_ANNOTATION.to_string(), project_name.to_string()),
+                            (SOURCE_REPOSITORY_ANNOTATION.to_string(), source_repository.to_string()),
+                            (SOURCE_COMMIT_ANNOTATION.to_string(), source.commit.clone()),
+                            (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), file.path.clone()),
+                        ]))
+                        .build();
+                    if workflows.insert(entry.name.clone(), (meta, spec)).is_some() {
+                        return Err(format!("duplicate materialized WorkflowTemplate `{}`", entry.name));
+                    }
+                }
+                OperationalEntryDefinition::VerificationCommand { command } => {
+                    for target in targets {
+                        if commands.entry(target.clone()).or_default().insert(entry.name.clone(), command.clone()).is_some() {
+                            return Err(format!("duplicate verification command `{}` for repository {target}", entry.name));
+                        }
+                        command_provenance.entry(target).or_default().push(provenance.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn project_add(
@@ -8330,7 +8606,7 @@ impl InProcessDaemon {
                 description: command.description().to_string(),
             });
             let result = match self.project_refresh(name).await {
-                Ok((members, converged)) => CommandValue::ProjectRefreshed { name: name.clone(), members, converged },
+                Ok((members, converged, changes)) => CommandValue::ProjectRefreshed { name: name.clone(), members, converged, changes },
                 Err(message) => CommandValue::Error { message },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {

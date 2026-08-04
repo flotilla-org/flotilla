@@ -307,9 +307,9 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
             info!(%name, %members, "project registered from declaration");
             app.set_status_message(Some(format!("Project registered: {name} ({members} members)")));
         }
-        CommandValue::ProjectRefreshed { name, members, converged } => {
-            info!(%name, %members, %converged, "project declaration refreshed");
-            let outcome = if converged { "drift converged" } else { "already current" };
+        CommandValue::ProjectRefreshed { name, members, converged, changes } => {
+            info!(%name, %members, %converged, ?changes, "project declaration refreshed");
+            let outcome = if converged { format!("changed: {}", changes.join(", ")) } else { "already current".to_string() };
             app.set_status_message(Some(format!("Project refreshed: {name} ({members} members, {outcome})")));
         }
     }
