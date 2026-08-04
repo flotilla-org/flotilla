@@ -5,6 +5,7 @@ pub const MATERIALIZED_PROJECT_ANNOTATION: &str = "flotilla.work/materialized-pr
 pub const SOURCE_REPOSITORY_ANNOTATION: &str = "flotilla.work/source-repository";
 pub const SOURCE_COMMIT_ANNOTATION: &str = "flotilla.work/source-commit";
 pub const SOURCE_ENTRY_PATH_ANNOTATION: &str = "flotilla.work/source-entry-path";
+pub const VERIFICATION_PROJECT_ANNOTATION: &str = "flotilla.work/verification-command-project";
 pub const VERIFICATION_PROVENANCE_ANNOTATION: &str = "flotilla.work/verification-command-provenance";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -250,9 +250,15 @@ impl RepositoryInspector for GitRepositoryInspector {
     async fn inspect_operational_entries(&self, path: &Path) -> Result<OperationalEntriesInspection, String> {
         let repository = self.inspect_path(path, None).await?;
         let commit = self.git(&repository.checkout.path, &["rev-parse", "HEAD"]).await?;
-        let paths = self.git(&repository.checkout.path, &["ls-tree", "-r", "--name-only", &commit]).await?;
+        // Use one tree-wide grep to find content candidates. Operational entry
+        // kind and scope remain content-authoritative; this only avoids one
+        // `git show` subprocess for every unrelated file in a large ops+code
+        // repository.
+        let paths =
+            self.git(&repository.checkout.path, &["grep", "-Il", "-e", "^kind:[[:space:]]", &commit, "--"]).await.unwrap_or_default();
+        let prefix = format!("{commit}:");
         let mut files = Vec::new();
-        for entry_path in paths.lines().map(str::trim).filter(|path| !path.is_empty()) {
+        for entry_path in paths.lines().filter_map(|path| path.strip_prefix(&prefix)).filter(|path| !path.is_empty()) {
             let object_ref = format!("{commit}:{entry_path}");
             let Ok(contents) = self.git(&repository.checkout.path, &["show", &object_ref]).await else {
                 continue;

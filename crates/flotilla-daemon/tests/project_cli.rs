@@ -13,7 +13,7 @@ use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
-    ops_entry::{SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION},
+    ops_entry::{MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION},
     project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
     providers::discovery::test_support::fake_discovery,
     repository_inspection::{LocalCheckoutInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
@@ -449,6 +449,55 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
         }
     );
     assert_eq!(workflows.get("scoped").await.expect("converged workflow").spec, scoped.spec);
+
+    std::fs::remove_file(misleading_directory.join("this-is-a-workflow.md")).expect("remove workflow entry");
+    assert_eq!(
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,
+        CommandValue::ProjectRefreshed {
+            name: "demo".to_string(),
+            members: 3,
+            converged: true,
+            changes: vec!["deleted WorkflowTemplate/scoped".to_string()],
+        }
+    );
+    assert!(matches!(workflows.get("scoped").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+}
+
+#[tokio::test]
+async fn ops_entry_rejects_a_hand_applied_workflow_name_collision() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
+    daemon
+        .set_repository_inspector(Arc::new(DeclarationInspector {
+            bootstrap: ops_spec,
+            commit: Arc::new(RwLock::new("ops-commit".to_string())),
+        }))
+        .await;
+    std::fs::write(
+        tmp.path().join("project.yaml"),
+        "name: demo\nmembers:\n  - alias: app\n    url: https://github.com/example/project-ops\n    roles: [code, ops]\n",
+    )
+    .expect("write declaration");
+    std::fs::write(
+        tmp.path().join("collision.entry"),
+        "---\nkind: workflow_template\nname: existing\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo test\n",
+    )
+    .expect("write workflow entry");
+    let hand_applied = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
+    let workflows = backend.using::<WorkflowTemplate>("flotilla");
+    workflows.create(&InputMeta::builder().name("existing".to_string()).build(), &hand_applied).await.expect("hand apply workflow");
+
+    let mut rx = daemon.subscribe();
+    let result =
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: tmp.path().to_string_lossy().into_owned() })
+            .await;
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("already exists") && message.contains("not materialized")),
+        "unexpected command result: {result:?}"
+    );
+    let preserved = workflows.get("existing").await.expect("hand-applied workflow remains");
+    assert_eq!(preserved.spec, hand_applied);
+    assert!(!preserved.metadata.annotations.contains_key(MATERIALIZED_PROJECT_ANNOTATION));
 }
 
 #[tokio::test]

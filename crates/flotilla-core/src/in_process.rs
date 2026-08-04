@@ -87,7 +87,7 @@ use crate::{
     model::{provider_names_from_registry, repo_name, RepoModel},
     ops_entry::{
         parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
-        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
+        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
     },
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
@@ -5178,12 +5178,12 @@ impl InProcessDaemon {
                 Err(ResourceError::NotFound { .. }) => None,
                 Err(error) => return Err(error.to_string()),
             };
-            if let Some(owner) = current
-                .as_ref()
-                .and_then(|current| current.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION))
-                .filter(|owner| owner.as_str() != project_name)
-            {
-                return Err(format!("WorkflowTemplate `{name}` is materialized by project `{owner}`"));
+            if let Some(current) = &current {
+                match current.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION) {
+                    Some(owner) if owner == project_name => {}
+                    Some(owner) => return Err(format!("WorkflowTemplate `{name}` is materialized by project `{owner}`")),
+                    None => return Err(format!("WorkflowTemplate `{name}` already exists and is not materialized by a project")),
+                }
             }
             if current.as_ref().is_none_or(|current| current.spec != *spec || current.metadata.annotations != meta.annotations) {
                 match current {
@@ -5209,16 +5209,33 @@ impl InProcessDaemon {
         for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Code)) {
             let current = repositories.get(&member.repo.to_string()).await.map_err(|error| error.to_string())?;
             let desired_commands = commands.remove(&member.repo).unwrap_or_default();
+            let owner = current.metadata.annotations.get(VERIFICATION_PROJECT_ANNOTATION).map(String::as_str);
+            match owner {
+                Some(owner) if owner == project_name => {}
+                Some(owner) if !desired_commands.is_empty() => {
+                    return Err(format!("Repository {} verification commands are materialized by project `{owner}`", member.repo));
+                }
+                None if !desired_commands.is_empty() && !current.spec.verification_commands().is_empty() => {
+                    return Err(format!(
+                        "Repository {} already has verification commands that are not materialized by a project",
+                        member.repo
+                    ));
+                }
+                None if !desired_commands.is_empty() => {}
+                _ => continue,
+            }
             let desired_spec = current.spec.clone().with_verification_commands(desired_commands);
             let mut meta = InputMeta::from(&current.metadata);
             match command_provenance.remove(&member.repo) {
                 Some(provenance) => {
+                    meta.annotations.insert(VERIFICATION_PROJECT_ANNOTATION.to_string(), project_name.to_string());
                     meta.annotations.insert(
                         VERIFICATION_PROVENANCE_ANNOTATION.to_string(),
                         serde_json::to_string(&provenance).expect("JSON provenance values serialize"),
                     );
                 }
                 None => {
+                    meta.annotations.remove(VERIFICATION_PROJECT_ANNOTATION);
                     meta.annotations.remove(VERIFICATION_PROVENANCE_ANNOTATION);
                 }
             }
