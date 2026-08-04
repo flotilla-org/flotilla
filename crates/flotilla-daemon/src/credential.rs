@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use url::Url;
 
+use crate::vessel_config::{compose, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey};
+
 const GIT_CONFIG_PATH: &str = "/run/flotilla/credentials/gitconfig";
 
 #[derive(Serialize)]
@@ -47,7 +49,7 @@ pub(crate) struct CredentialStore {
     state_dir: PathBuf,
     prepared: Mutex<BTreeSet<(String, String)>>,
     materials: Mutex<BTreeMap<(String, String), String>>,
-    git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, GitConfigFragment>>>,
+    git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
 }
 
@@ -58,14 +60,8 @@ struct AdapterDelivery {
 }
 
 struct GitCredentialContribution {
-    fragment: GitConfigFragment,
+    fragment: Fragment,
     preflight: Option<GitCredentialPreflight>,
-}
-
-#[derive(Clone)]
-struct GitConfigFragment {
-    target: String,
-    content: String,
 }
 
 #[derive(bon::Builder)]
@@ -75,14 +71,6 @@ struct PendingGitPreflight {
     material: String,
     cache_key: (String, String),
     preflight: GitCredentialPreflight,
-}
-
-fn render_gitconfig<'a>(fragments: impl IntoIterator<Item = &'a GitConfigFragment>) -> String {
-    fragments
-        .into_iter()
-        .map(|fragment| format!("[credential \"{}\"]\n\thelper = {}\n", fragment.target, fragment.content))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 enum GitCredentialPreflight {
@@ -291,8 +279,15 @@ impl CredentialStore {
             let mut fragments_by_environment = self.git_config_fragments.lock().await;
             let mut composed_fragments = fragments_by_environment.get(environment_ref).cloned().unwrap_or_default();
             composed_fragments.extend(new_git_config_fragments);
-            let gitconfig = render_gitconfig(composed_fragments.values());
-            if let Err(error) = runner.write_file(Path::new(GIT_CONFIG_PATH), &gitconfig).await {
+            let gitconfig = match compose(TargetId::GitConfig, composed_fragments.values().cloned()) {
+                Ok(gitconfig) => gitconfig,
+                Err(error) => {
+                    let (name, adapter, cache_key) = git_config_owner.expect("Git config fragments have an owner");
+                    self.materials.lock().await.remove(&cache_key);
+                    return Err(bounded_adapter_error(&name, &adapter, &format!("compose shared Git config: {error}")));
+                }
+            };
+            if let Err(error) = runner.write_file(Path::new(GIT_CONFIG_PATH), &gitconfig.contents).await {
                 let (name, adapter, cache_key) = git_config_owner.expect("Git config fragments have an owner");
                 self.materials.lock().await.remove(&cache_key);
                 return Err(bounded_adapter_error(&name, &adapter, &format!("write shared Git config: {error}")));
@@ -582,10 +577,7 @@ impl CredentialStore {
                 }
                 env.insert("GH_TOKEN".to_string(), material.to_string());
                 git_credential = Some(GitCredentialContribution {
-                    fragment: GitConfigFragment {
-                        target: "https://github.com".to_string(),
-                        content: "!gh auth git-credential".to_string(),
-                    },
+                    fragment: git_credential_fragment(name, "gh", "https://github.com", "!gh auth git-credential"),
                     preflight: (!already_prepared).then_some(GitCredentialPreflight::Gh),
                 });
             }
@@ -602,10 +594,7 @@ impl CredentialStore {
                     .map_err(|error| format!("installation authentication preflight failed: {error}"))?;
                 env.insert("GH_TOKEN".to_string(), material.to_string());
                 git_credential = Some(GitCredentialContribution {
-                    fragment: GitConfigFragment {
-                        target: "https://github.com".to_string(),
-                        content: "!gh auth git-credential".to_string(),
-                    },
+                    fragment: git_credential_fragment(name, "github-app", "https://github.com", "!gh auth git-credential"),
                     preflight: Some(GitCredentialPreflight::Gh),
                 });
             }
@@ -656,7 +645,7 @@ impl CredentialStore {
                 env.insert("FORGEJO_API_URL".to_string(), format!("{server_url}/api/v1"));
                 env.insert("FORGEJO_USERNAME".to_string(), username.to_string());
                 git_credential = Some(GitCredentialContribution {
-                    fragment: GitConfigFragment { target: credential_url, content: format!("!{helper_path}") },
+                    fragment: git_credential_fragment(name, "forgejo", credential_url, format!("!{helper_path}")),
                     preflight: (!already_prepared).then(|| GitCredentialPreflight::Forgejo {
                         host: match parsed_url.port() {
                             Some(port) => format!("{host}:{port}"),
@@ -718,6 +707,16 @@ impl CredentialStore {
         }
         Ok(AdapterDelivery { env, git_credential })
     }
+}
+
+fn git_credential_fragment(credential_name: &str, adapter: &str, credential_url: impl Into<String>, helper: impl Into<String>) -> Fragment {
+    Fragment::new(
+        TargetId::GitConfig,
+        TargetKey::GitConfig(GitConfigKey::subsection("credential", credential_url, "helper")),
+        helper,
+        Provenance::new(format!("credential/{adapter} {credential_name}")),
+    )
+    .with_merge(Merge::Append)
 }
 
 async fn api_key_preflight(runner: &dyn CommandRunner, url: &str, headers: &[(&str, &str)]) -> Result<(), String> {
@@ -1074,10 +1073,10 @@ interactions:
         for environment_ref in ["env-a", "env-b"] {
             store.git_config_fragments.lock().await.insert(
                 environment_ref.to_string(),
-                BTreeMap::from([("github".to_string(), GitConfigFragment {
-                    target: "https://github.com".to_string(),
-                    content: "!gh auth git-credential".to_string(),
-                })]),
+                BTreeMap::from([(
+                    "github".to_string(),
+                    git_credential_fragment("github", "gh", "https://github.com", "!gh auth git-credential"),
+                )]),
             );
         }
 
@@ -1122,7 +1121,7 @@ interactions:
         let writes = runner.writes.lock().expect("writes lock");
         assert_eq!(writes.as_slice(), &[(
             PathBuf::from("/run/flotilla/credentials/gitconfig"),
-            "[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n".to_string()
+            "# fragment: credential/gh github\n[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n".to_string()
         )]);
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, input)| {
@@ -1168,7 +1167,9 @@ interactions:
 
         assert_eq!(delivered.get("GIT_CONFIG_GLOBAL"), Some(&"/run/flotilla/credentials/gitconfig".to_string()));
         assert_eq!(delivered.get("GIT_TERMINAL_PROMPT"), Some(&"0".to_string()));
-        assert!(!delivered.keys().any(|key| key.starts_with("GIT_CONFIG_KEY_") || key.starts_with("GIT_CONFIG_VALUE_")));
+        assert!(!delivered
+            .keys()
+            .any(|key| key == "GIT_CONFIG_COUNT" || key.starts_with("GIT_CONFIG_KEY_") || key.starts_with("GIT_CONFIG_VALUE_")));
         let writes = runner.writes.lock().expect("writes lock");
         let gitconfig = writes
             .iter()
@@ -1179,6 +1180,8 @@ interactions:
         assert!(gitconfig.contains("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential"));
         assert!(gitconfig
             .contains("[credential \"https://forgejo.lab\"]\n\thelper = !/run/flotilla/credentials/lab-forgejo/git-credential-forgejo"));
+        assert!(gitconfig.contains("# fragment: credential/gh github"));
+        assert!(gitconfig.contains("# fragment: credential/forgejo lab-forgejo"));
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, _)| {
             cmd == "sh"
@@ -1275,8 +1278,7 @@ interactions:
             writes[2],
             (
                 PathBuf::from("/run/flotilla/credentials/gitconfig"),
-                "[credential \"https://forgejo.lab\"]\n\thelper = !/run/flotilla/credentials/lab-forgejo/git-credential-forgejo\n"
-                    .to_string()
+                "# fragment: credential/forgejo lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/run/flotilla/credentials/lab-forgejo/git-credential-forgejo\n".to_string()
             )
         );
         let calls = runner.calls.lock().expect("calls lock");
