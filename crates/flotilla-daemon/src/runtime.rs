@@ -37,11 +37,12 @@ use flotilla_core::{
 };
 use flotilla_protocol::{EnvironmentId, HostSummary, ImageId, NodeId, Rows, TerminalStatus};
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance,
-    CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy, ConvoyReconciler, ConvoyTeardownRuntime, CrewSource, CrewSpec,
-    Demand, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, EnvironmentWaitReason, ForgeIdentity,
-    Host, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
-    InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicationClass, Repository, ResourceBackend,
+    canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, ChangeRequest, ChangeRequestStatus, Checkout,
+    CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy, ConvoyReconciler, ConvoyTeardownRuntime,
+    CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment,
+    EnvironmentSpec, EnvironmentWaitReason, ForgeIdentity, Host, HostCondition, HostDirectEnvironmentSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta,
+    PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, Resource, ResourceBackend,
     ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate,
     WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
     CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS,
@@ -70,6 +71,8 @@ const MANIFEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 const BUILTIN_MANAGED_BY_VALUE: &str = "builtin";
+const RECLAIM_REFUSAL_ATTENTION_AFTER: u64 = 3;
+const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
 
 struct DaemonConvoyTeardownRuntime {
     daemon: Arc<InProcessDaemon>,
@@ -84,6 +87,42 @@ struct ReclaimRefusal {
 impl DaemonConvoyTeardownRuntime {
     fn new(daemon: Arc<InProcessDaemon>) -> Self {
         Self { daemon, reclaim_refusals: StdMutex::new(HashMap::new()) }
+    }
+
+    fn attention_name(convoy: &ResourceObject<Convoy>) -> String {
+        format!("reclaim-refusal-{}", convoy.metadata.name)
+    }
+
+    async fn raise_attention(&self, convoy: &ResourceObject<Convoy>, reason: &str) -> Result<(), String> {
+        let demands = self.daemon.resource_backend().using::<Demand>(&convoy.metadata.namespace);
+        let name = Self::attention_name(convoy);
+        let target = flotilla_protocol::ResourceRef::new(
+            flotilla_resources::api_version(Convoy::API_PATHS),
+            Convoy::API_PATHS.kind,
+            &convoy.metadata.namespace,
+            &convoy.metadata.name,
+        );
+        let meta = InputMeta::builder()
+            .name(name)
+            .annotations(BTreeMap::from([(RECLAIM_REFUSAL_REASON_ANNOTATION.to_string(), reason.to_string())]))
+            .build();
+        let spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, convoy.spec.dispatching_principal_ref.clone());
+        match demands.create(&meta, &spec).await {
+            Ok(_) => Ok(()),
+            Err(ResourceError::Conflict { .. }) => {
+                let current = demands.get(&meta.name).await.map_err(|error| error.to_string())?;
+                demands.update(&meta, &current.metadata.resource_version, &spec).await.map(|_| ()).map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    async fn clear_attention(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
+        let demands = self.daemon.resource_backend().using::<Demand>(&convoy.metadata.namespace);
+        match demands.delete(&Self::attention_name(convoy)).await {
+            Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
     }
 }
 
@@ -116,6 +155,16 @@ impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
                         "automatic convoy reclaim refused"
                     );
                 }
+                if attempts >= RECLAIM_REFUSAL_ATTENTION_AFTER {
+                    if let Err(attention_error) = self.raise_attention(convoy, error).await {
+                        warn!(
+                            namespace = %convoy.metadata.namespace,
+                            convoy = %convoy.metadata.name,
+                            %attention_error,
+                            "could not raise persistent reclaim refusal attention"
+                        );
+                    }
+                }
             }
             Ok(()) => {
                 if let Some(refusal) = self.reclaim_refusals.lock().expect("reclaim refusal lock poisoned").remove(&key) {
@@ -127,6 +176,14 @@ impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
                             "automatic convoy reclaim recovered after repeated refusal"
                         );
                     }
+                }
+                if let Err(attention_error) = self.clear_attention(convoy).await {
+                    warn!(
+                        namespace = %convoy.metadata.namespace,
+                        convoy = %convoy.metadata.name,
+                        %attention_error,
+                        "could not clear recovered reclaim refusal attention"
+                    );
                 }
             }
         }
@@ -1473,7 +1530,10 @@ fn spawn_controller_loops(
                                 &namespace_string,
                             ),
                             reconciler: CheckoutReconciler::new(
-                                Arc::new(CheckoutControllerRuntime { runner }),
+                                Arc::new(CheckoutControllerRuntime {
+                                    runner,
+                                    change_requests: Some(backend.including_replicas::<ChangeRequest>(&namespace_string)),
+                                }),
                                 backend.clone(),
                                 &namespace_string,
                             )
@@ -2150,6 +2210,7 @@ async fn verify_clone_origin(runner: &dyn CommandRunner, repo_url: &str, target_
 
 struct CheckoutControllerRuntime {
     runner: Arc<dyn CommandRunner>,
+    change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
 }
 
 impl CheckoutControllerRuntime {
@@ -2160,6 +2221,32 @@ impl CheckoutControllerRuntime {
     fn checkout_path<'a>(&self, checkout: &'a ResourceObject<Checkout>) -> Result<&'a str, String> {
         checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
             .ok_or_else(|| format!("checkout {} has no resolved path", checkout.metadata.name))
+    }
+
+    async fn observed_change_request(
+        &self,
+        convoy: &ResourceObject<Convoy>,
+        checkout: &ResourceObject<Checkout>,
+        id: &str,
+    ) -> Result<Option<ChangeRequestStatus>, String> {
+        let Some(change_requests) = &self.change_requests else { return Ok(None) };
+        let Some(repository) = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref()) else {
+            return Ok(None);
+        };
+        let Ok(canonical) = canonicalize_repo_url(&repository.url) else { return Ok(None) };
+        let qualified = canonical.split_once("://").map(|(_, qualified)| qualified).unwrap_or(&canonical);
+        let Some((service, scope)) = qualified.split_once('/') else { return Ok(None) };
+        let Ok(number) = id.parse::<u64>() else { return Ok(None) };
+        Ok(change_requests
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .find(|record| {
+                record.object.spec.service == service && record.object.spec.scope == scope && record.object.spec.number == number
+            })
+            .and_then(|record| record.object.status))
     }
 }
 
@@ -2334,7 +2421,18 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         let path = Path::new(self.checkout_path(checkout)?);
         if let Some(convoy) = convoy {
             let change_request_id = convoy_change_request_id_for_checkout(convoy, checkout);
-            return Ok(inspect_convoy_checkout_integration(&*runner, path, &checkout.spec, change_request_id.as_deref()).await);
+            let observed_change_request = match change_request_id.as_deref() {
+                Some(id) => self.observed_change_request(convoy, checkout, id).await?,
+                None => None,
+            };
+            return Ok(inspect_convoy_checkout_integration(
+                &*runner,
+                path,
+                &checkout.spec,
+                change_request_id.as_deref(),
+                observed_change_request.as_ref(),
+            )
+            .await);
         }
         Ok(inspect_checkout_integration(
             &*runner,
@@ -2858,8 +2956,8 @@ mod tests {
         },
     };
     use flotilla_protocol::{
-        Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, ImageId, ImageSource, NodeInfo, PeerConnectionState,
-        PlacementDecision, PlacementTargetHost, ResourceRef,
+        Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, HostName, ImageId, ImageSource, NodeInfo,
+        PeerConnectionState, PlacementDecision, PlacementTargetHost, ResourceRef,
     };
     use flotilla_resources::{
         api_version,
@@ -2935,6 +3033,47 @@ mod tests {
             })
             .await
             .expect("publish merged CR observation");
+    }
+
+    #[tokio::test]
+    async fn repeated_reclaim_refusal_raises_demand_with_checkout_reason() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let daemon = InProcessDaemon::new(vec![], config, git_process_discovery(false), HostName::local()).await;
+        let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
+        let convoy = convoys
+            .create(
+                &InputMeta::builder().name("stuck-reclaim".to_string()).build(),
+                &ConvoySpec::builder()
+                    .workflow_ref("scratch".to_string())
+                    .adopted_checkout_refs(BTreeMap::from([(
+                        flotilla_resources::RepositoryKey("repo".to_string()),
+                        "checkout-orphan".to_string(),
+                    )]))
+                    .build(),
+            )
+            .await
+            .expect("create terminal convoy");
+        let runtime = DaemonConvoyTeardownRuntime::new(Arc::clone(&daemon));
+
+        for _ in 0..RECLAIM_REFUSAL_ATTENTION_AFTER - 1 {
+            runtime.verify_reclaim(&convoy, &[]).await.expect_err("missing checkout must refuse reclaim");
+        }
+        assert!(daemon.resource_backend().using::<Demand>(NAMESPACE).list().await.expect("list demands").items.is_empty());
+
+        runtime.verify_reclaim(&convoy, &[]).await.expect_err("persistent missing checkout must refuse reclaim");
+
+        let demands = daemon.resource_backend().using::<Demand>(NAMESPACE).list().await.expect("list demands").items;
+        assert_eq!(demands.len(), 1);
+        assert!(
+            demands[0]
+                .metadata
+                .annotations
+                .get(RECLAIM_REFUSAL_REASON_ANNOTATION)
+                .is_some_and(|reason| reason.contains("checkout-orphan") && reason.contains("missing checkout integration evidence")),
+            "demand must preserve the checkout-specific refusal: {:?}",
+            demands[0].metadata.annotations
+        );
     }
 
     #[test]
@@ -3895,7 +4034,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_worktree(
@@ -3920,7 +4059,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let first = runtime
             .create_worktree(
@@ -3950,7 +4089,7 @@ mod tests {
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let convoy_dir = temp.path().join("checkout-root/convoy-a");
         let target = convoy_dir.join("flotilla.feature-cleanup");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let prepared = runtime
             .create_worktree(
@@ -4019,7 +4158,10 @@ mod tests {
         let target = temp.path().join("checkout-root/convoy-a/flotilla.feature-prune");
         let stale_target = temp.path().join("checkout-root/stale-convoy/flotilla.feature-stale");
         let commands = Arc::new(StdMutex::new(Vec::new()));
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(RecordingProcessRunner { commands: Arc::clone(&commands) }) };
+        let runtime = CheckoutControllerRuntime {
+            runner: Arc::new(RecordingProcessRunner { commands: Arc::clone(&commands) }),
+            change_requests: None,
+        };
 
         runtime
             .create_worktree(
@@ -4080,7 +4222,7 @@ mod tests {
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let target = temp.path().join("checkout-root/convoy-a/flotilla.feature-cleanup");
         TestGitRepo::init(target.join("embedded")).with_initial_commit();
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
         let removal = CheckoutRemoval::Worktree {
             clone_path: clone.path().to_str().expect("utf-8 clone path").to_string(),
             branch: "feature/cleanup".to_string(),
@@ -4101,7 +4243,7 @@ mod tests {
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let convoy_dir = temp.path().join("checkout-root/convoy-a");
         let target = convoy_dir.join("feature-work/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let prepared = runtime
             .create_worktree(
@@ -4160,7 +4302,7 @@ mod tests {
     async fn checkout_runtime_removes_a_shared_bootstrap_branch_in_either_teardown_order() {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         for reverse_teardown in [false, true] {
             let case = if reverse_teardown { "reverse" } else { "forward" };
@@ -4215,7 +4357,7 @@ mod tests {
             .with_initial_commit()
             .with_origin(missing_origin.to_str().expect("utf-8 origin path"));
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let prepared = runtime
             .create_worktree(
@@ -4276,7 +4418,7 @@ mod tests {
             .expect("git clone should run")
             .success());
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_worktree(
@@ -4321,7 +4463,7 @@ mod tests {
             .expect("git clone should run")
             .success());
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_worktree(
@@ -4371,7 +4513,7 @@ mod tests {
             .success());
 
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
         runtime
             .create_worktree(
                 clone_path.to_str().expect("utf-8 clone path"),
@@ -4395,7 +4537,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_fresh_clone(
@@ -4420,7 +4562,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let first = runtime
             .create_fresh_clone(
@@ -4449,7 +4591,10 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(FailFirstCloneProcessRunner { failed: AtomicBool::new(false) }) };
+        let runtime = CheckoutControllerRuntime {
+            runner: Arc::new(FailFirstCloneProcessRunner { failed: AtomicBool::new(false) }),
+            change_requests: None,
+        };
 
         runtime
             .create_fresh_clone(
@@ -4488,7 +4633,7 @@ mod tests {
         let staging_path = clone_staging_path(target);
         fs::create_dir_all(&staging_path).expect("create partial clone directory");
         fs::write(Path::new(&staging_path).join("partial"), "incomplete clone").expect("write partial clone content");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let outcome = runtime
             .remove_checkout(&CheckoutRemoval::FreshClone { target_path: target.to_string() })
@@ -4503,7 +4648,7 @@ mod tests {
     async fn checkout_runtime_treats_an_already_missing_orphaned_worktree_as_removed() {
         let temp = TempDir::new().expect("tempdir");
         let target = temp.path().join("already-removed-worktree");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let outcome = runtime
             .remove_checkout(&CheckoutRemoval::OrphanedWorktree { target_path: target.to_str().expect("utf-8 target path").to_string() })
@@ -4518,7 +4663,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_fresh_clone(
@@ -4555,7 +4700,7 @@ mod tests {
             .expect("git commit should run")
             .success());
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_fresh_clone(source_path, "feature/existing", Some("main"), target.to_str().expect("utf-8 target path"))
@@ -5493,7 +5638,7 @@ mod tests {
 
         let checkout = checkouts.get("checkout-b").await.expect("get checkout on authority host B");
         let observer = CheckoutReconciler::new(
-            Arc::new(CheckoutControllerRuntime { runner: Arc::new(MergedPrProcessRunner::new(1367)) }),
+            Arc::new(CheckoutControllerRuntime { runner: Arc::new(MergedPrProcessRunner::new(1367)), change_requests: None }),
             checkout_host.clone(),
             NAMESPACE,
         )

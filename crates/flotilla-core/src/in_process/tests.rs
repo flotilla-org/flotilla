@@ -1273,6 +1273,7 @@ async fn observe_checkout_for_convoy(daemon: &InProcessDaemon, namespace: &str, 
         Path::new(path),
         &checkout.spec,
         change_request_id.as_deref(),
+        None,
     )
     .await;
     apply_resource_status_patch(&checkouts, checkout_name, &flotilla_resources::CheckoutStatusPatch::UpdateIntegration {
@@ -5346,6 +5347,33 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
     )
     .await;
     observe_checkout_for_convoy(&daemon, "custom-ns", "completed-convoy", "checkout-missing-push").await;
+    let child_labels = BTreeMap::from([(CONVOY_LABEL.to_string(), "completed-convoy".to_string())]);
+    daemon
+        .resource_backend()
+        .using::<Vessel>("custom-ns")
+        .create(&input_meta_with_labels("completed-convoy-implement", child_labels.clone()), &flotilla_resources::VesselSpec {
+            convoy_ref: "completed-convoy".to_string(),
+            vessel_name: "implement".to_string(),
+            placement_policy_ref: "host-direct".to_string(),
+            adopted_checkout_refs: BTreeMap::new(),
+        })
+        .await
+        .expect("owned vessel should be created");
+    daemon
+        .resource_backend()
+        .using::<ResourceTerminalSession>("custom-ns")
+        .create(
+            &input_meta_with_labels("terminal-completed-convoy-implement", child_labels),
+            &flotilla_resources::TerminalSessionSpec::builder()
+                .env_ref("host-direct".to_string())
+                .role("coder".to_string())
+                .source(flotilla_resources::TerminalSessionSource::Tool { command: "true".to_string() })
+                .cwd("/repo".to_string())
+                .pool("passthrough".to_string())
+                .build(),
+        )
+        .await
+        .expect("owned terminal session should be created");
 
     let mut events = daemon.subscribe();
     let command_id = daemon
@@ -5379,6 +5407,9 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
 
     assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
     assert!(matches!(convoys.get("completed-convoy").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+    assert!(daemon.resource_backend().using::<ResourceCheckout>("custom-ns").list().await.expect("list checkouts").items.is_empty());
+    assert!(daemon.resource_backend().using::<Vessel>("custom-ns").list().await.expect("list vessels").items.is_empty());
+    assert!(daemon.resource_backend().using::<ResourceTerminalSession>("custom-ns").list().await.expect("list sessions").items.is_empty());
 }
 
 #[tokio::test]

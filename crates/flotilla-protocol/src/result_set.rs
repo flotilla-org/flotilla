@@ -642,6 +642,12 @@ pub struct CheckoutRow {
     /// than a standing checkout available for independent use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_convoy: Option<String>,
+    /// The checkout references a convoy record that no longer exists.
+    #[builder(default)]
+    #[serde(default)]
+    pub needs_attention: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_reason: Option<String>,
 }
 
 /// Lifecycle phase of an independent terminal session.
