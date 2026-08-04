@@ -221,10 +221,19 @@ impl DispatchReconciler {
                     Err(ResourceError::NotFound { .. }) => {}
                     Err(error) => return Err(error.to_string()),
                 }
-                let workflow = workflows
-                    .get(pinned_workflow_ref(convoy))
-                    .await
-                    .map_err(|error| format!("observe convoy {} workflow: {error}", convoy.metadata.name))?;
+                let workflow = match workflows.get(pinned_workflow_ref(convoy)).await {
+                    Ok(workflow) => workflow,
+                    Err(error) => {
+                        warn!(
+                            project = %project.metadata.name,
+                            convoy = %convoy.metadata.name,
+                            issue = %issue.reference.id,
+                            %error,
+                            "cannot record dispatch observation without its workflow; continuing queue reconciliation"
+                        );
+                        continue;
+                    }
+                };
                 let stance = workflow.spec.vessels.iter().map(|vessel| vessel.stance).max().unwrap_or_default();
                 let dispatched_at = convoy.metadata.creation_timestamp;
                 let time_from_ready_seconds =
@@ -560,6 +569,51 @@ mod tests {
             observation.time_from_ready_seconds,
             observation.dispatched_at.signed_duration_since(observation.ready_observed_at).num_seconds().max(0) as u64
         );
+    }
+
+    #[tokio::test]
+    async fn a_missing_observation_workflow_does_not_freeze_the_queue_or_staleness_attention() {
+        let dispatched = issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open);
+        let waiting = issue("3", &[READY_ISSUE_LABEL], None, IssueState::Open);
+        let (backend, _, clock, reconciler) = harness(vec![dispatched.clone(), waiting.clone()], vec![], policy(60)).await;
+        reconciler.reconcile_once().await.expect("queue pass");
+        backend
+            .clone()
+            .using::<Convoy>(NAMESPACE)
+            .create(&InputMeta::builder().name("missing-workflow-dispatch".to_string()).build(), &ConvoySpec {
+                workflow_ref: "deleted-workflow".to_string(),
+                dispatching_principal_ref: Default::default(),
+                inputs: BTreeMap::<String, InputValue>::new(),
+                placement_policy: None,
+                repositories: Vec::new(),
+                r#ref: Some("fix-2".to_string()),
+                project_ref: Some("widgets".to_string()),
+                adopted_checkout_refs: Default::default(),
+                issues: vec![ConvoyIssue {
+                    reference: dispatched.reference,
+                    repository_ref: None,
+                    snapshot: IssueSnapshot {
+                        title: dispatched.title,
+                        body: dispatched.body,
+                        state: dispatched.state,
+                        labels: dispatched.labels,
+                        as_of: dispatched.as_of,
+                    },
+                }],
+                change_request: None,
+                instruction: None,
+            })
+            .await
+            .expect("manual convoy");
+        clock.advance(Duration::seconds(60));
+
+        let outcome = reconciler.reconcile_once().await.expect("resilient observation pass");
+
+        assert_eq!(outcome.queued, 1);
+        assert_eq!(outcome.observations_recorded, 0);
+        let status = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
+        assert_eq!(status.dispatch_queue.iter().map(|entry| &entry.issue).collect::<Vec<_>>(), vec![&waiting.reference]);
+        assert_eq!(status.dispatch_queue_attention.expect("stale attention").count, 1);
     }
 
     #[tokio::test]
