@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, fmt::Write as _, path::Path};
 
 use chrono::{DateTime, Utc};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
@@ -509,6 +509,113 @@ fn format_crew_list_human(response: &CrewListResponse) -> String {
     format!("Convoy: {}  Vessel: {} ({})\n{}\n", response.convoy, response.vessel, response.vessel_ref, table)
 }
 
+fn explained_condition_label(condition: Option<&flotilla_protocol::ExplainedCondition>) -> String {
+    condition.map_or_else(
+        || "missing".to_string(),
+        |condition| {
+            format!("{} @ {} ({:?})", condition.value, condition.observed_at.as_deref().unwrap_or("unknown"), condition.freshness)
+                .to_lowercase()
+        },
+    )
+}
+
+fn explanation_provenance_label(provenance: Option<&flotilla_protocol::ResourceRecordProvenance>) -> String {
+    match provenance {
+        Some(flotilla_protocol::ResourceRecordProvenance::Local { node_id }) => format!("local:{node_id}"),
+        Some(flotilla_protocol::ResourceRecordProvenance::Replica { origin_root, .. }) => format!("replica:{origin_root}"),
+        None => "-".to_string(),
+    }
+}
+
+pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::ConvoyExplanation) -> String {
+    let mut output = format!("Convoy: {}/{}\nPhase: {}\n", explanation.namespace, explanation.convoy, explanation.phase);
+    let verdict = if explanation.settlement.satisfied { "SATISFIED" } else { "HOLDING" };
+    let _ = writeln!(output, "Settlement: {verdict} ({})", explanation.settlement.mode);
+    let _ = writeln!(
+        output,
+        "Freshness: checkout evidence < {}s; change requests <= {}s",
+        explanation.evidence_ttl_seconds, explanation.change_request_stale_after_seconds
+    );
+    if !explanation.settlement.unmet.is_empty() {
+        output.push_str("\nUnmet expectations:\n");
+        for unmet in &explanation.settlement.unmet {
+            let _ = writeln!(output, "  - {}: {} — {}", unmet.reason, unmet.subject, unmet.detail);
+        }
+    }
+
+    output.push_str("\nExpected checkouts:\n");
+    if explanation.checkouts.is_empty() {
+        output.push_str("  (none; artifact-less claim exit)\n");
+    } else {
+        let mut table = Table::new();
+        table.load_preset(UTF8_FULL_CONDENSED);
+        table.set_header(vec!["Checkout", "Observed", "Source", "Landed", "Clean", "Pushed"]);
+        for checkout in &explanation.checkouts {
+            table.add_row(vec![
+                Cell::new(&checkout.name),
+                Cell::new(if checkout.observed { "yes" } else { "NO" }),
+                Cell::new(explanation_provenance_label(checkout.provenance.as_ref())),
+                Cell::new(explained_condition_label(checkout.landed.as_ref())),
+                Cell::new(explained_condition_label(checkout.clean.as_ref())),
+                Cell::new(explained_condition_label(checkout.pushed.as_ref())),
+            ]);
+        }
+        let _ = writeln!(output, "{table}");
+    }
+
+    output.push_str("\nChange requests:\n");
+    if explanation.change_requests.is_empty() {
+        output.push_str("  (none)\n");
+    } else {
+        for request in &explanation.change_requests {
+            let fields = request.fields.as_ref().map_or_else(|| "missing".to_string(), serde_json::Value::to_string);
+            let _ = writeln!(
+                output,
+                "  - {} bound={} observed={} source={} observed_at={} freshness={:?}\n    fields={}",
+                request.name,
+                request.bound,
+                request.observed,
+                explanation_provenance_label(request.provenance.as_ref()),
+                request.observed_at.as_deref().unwrap_or("-"),
+                request.freshness,
+                fields
+            );
+        }
+    }
+
+    output.push_str("\nArmed subscriptions:\n");
+    if explanation.subscriptions.is_empty() {
+        output.push_str("  (none recorded on this host)\n");
+    } else {
+        for subscription in &explanation.subscriptions {
+            let _ = writeln!(output, "  - {} watcher={}", subscription.id, subscription.watcher);
+            for leaf in &subscription.leaves {
+                let _ = writeln!(output, "    leaf: {leaf}");
+            }
+            for firing in &subscription.last_leaf_firings {
+                let _ = writeln!(output, "    last firing: {} => {} at {}", firing.leaf, firing.value, firing.fired_at);
+            }
+        }
+    }
+
+    output.push_str("\nCrew delivery:\n");
+    if explanation.crew_deliveries.is_empty() {
+        output.push_str("  (none)\n");
+    } else {
+        for delivery in &explanation.crew_deliveries {
+            let _ = writeln!(
+                output,
+                "  - {} role={} last_rung={} delivered_message={}",
+                delivery.session,
+                delivery.role,
+                delivery.last_delivery_rung.as_deref().unwrap_or("not recorded"),
+                delivery.delivered_message_id.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    output
+}
+
 /// Extract a short display name from a repo path (last path component).
 /// Falls back to the full path display for root or non-UTF-8 paths,
 /// matching `flotilla_core::model::repo_name`.
@@ -586,6 +693,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::CrewList(crew) => format_crew_list_human(crew),
         CommandValue::FleetReplicaSnapshot(_) => "fleet replica snapshot".to_string(),
         CommandValue::DaemonLogs { lines } => lines.join("\n"),
+        CommandValue::ConvoyExplanation(explanation) => format_convoy_explanation_human(explanation),
         CommandValue::ResourceRead(response) => flotilla_protocol::output::json_pretty(response),
         CommandValue::ResourceObject(response) => flotilla_protocol::output::json_pretty(&response.value),
         CommandValue::ResourceDeleted(response) => {

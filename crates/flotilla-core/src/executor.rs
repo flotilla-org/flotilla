@@ -170,6 +170,7 @@ pub async fn build_plan(
     match action {
         CommandAction::QueryResourceList { .. }
         | CommandAction::QueryResourceGet { .. }
+        | CommandAction::QueryExplainConvoy { .. }
         | CommandAction::ResourceApply { .. }
         | CommandAction::ResourceDelete { .. }
         | CommandAction::ResourceWatch { .. } => {

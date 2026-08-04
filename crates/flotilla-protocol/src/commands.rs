@@ -151,6 +151,107 @@ pub struct ResourceReadEnvelope {
     pub records: Vec<ResourceReadRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceFreshness {
+    Fresh,
+    Stale,
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedCondition {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    pub freshness: EvidenceFreshness,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedCheckout {
+    pub name: String,
+    pub observed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ResourceRecordProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clean: Option<ExplainedCondition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushed: Option<ExplainedCondition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed: Option<ExplainedCondition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedChangeRequest {
+    pub name: String,
+    pub bound: bool,
+    pub observed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ResourceRecordProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    pub freshness: EvidenceFreshness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedLeafFiring {
+    pub leaf: crate::Leaf,
+    pub value: String,
+    pub fired_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedSubscription {
+    pub id: uuid::Uuid,
+    pub watcher: String,
+    pub leaves: Vec<crate::Leaf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_leaf_firings: Vec<ExplainedLeafFiring>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedCrewDelivery {
+    pub session: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_delivery_rung: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedUnmetExpectation {
+    pub reason: String,
+    pub subject: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedSettlement {
+    pub mode: String,
+    pub satisfied: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet: Vec<ExplainedUnmetExpectation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvoyExplanation {
+    pub namespace: String,
+    pub convoy: String,
+    pub phase: String,
+    pub evidence_ttl_seconds: u64,
+    pub change_request_stale_after_seconds: u64,
+    pub checkouts: Vec<ExplainedCheckout>,
+    pub change_requests: Vec<ExplainedChangeRequest>,
+    pub subscriptions: Vec<ExplainedSubscription>,
+    pub crew_deliveries: Vec<ExplainedCrewDelivery>,
+    pub settlement: ExplainedSettlement,
+}
+
 /// Filters for reading a daemon's host-local structured log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct DaemonLogQuery {
@@ -556,6 +657,11 @@ pub enum CommandAction {
     QueryDaemonLogs {
         query: DaemonLogQuery,
     },
+    QueryExplainConvoy {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        name: String,
+    },
     QueryResourceList {
         namespace: String,
         kind: String,
@@ -607,6 +713,7 @@ impl CommandAction {
                 | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryFleetReplicaSnapshot {}
                 | CommandAction::QueryDaemonLogs { .. }
+                | CommandAction::QueryExplainConvoy { .. }
                 | CommandAction::QueryResourceList { .. }
                 | CommandAction::QueryResourceGet { .. }
                 | CommandAction::Attach { .. }
@@ -674,6 +781,7 @@ impl Command {
             CommandAction::QueryCrewList { .. } => "query crew list",
             CommandAction::QueryFleetReplicaSnapshot {} => "query fleet replica snapshot",
             CommandAction::QueryDaemonLogs { .. } => "query daemon logs",
+            CommandAction::QueryExplainConvoy { .. } => "explain convoy",
             CommandAction::QueryResourceList { .. } => "query resource list",
             CommandAction::QueryResourceGet { .. } => "query resource get",
             CommandAction::ResourceApply { .. } => "apply resource",
@@ -790,6 +898,7 @@ pub enum CommandValue {
         /// Complete JSON-lines records, oldest first.
         lines: Vec<String>,
     },
+    ConvoyExplanation(Box<ConvoyExplanation>),
     ResourceRead(Box<ResourceReadEnvelope>),
     ResourceObject(Box<ResourceJsonResponse>),
     ResourceDeleted(Box<ResourceJsonResponse>),
@@ -1165,6 +1274,12 @@ mod tests {
                         target: Some("flotilla_daemon::peer".into()),
                     },
                 },
+            },
+            Command {
+                node_id: Some(NodeId::new("feta")),
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: "held-work".into() },
             },
             Command {
                 node_id: Some(NodeId::new("feta")),

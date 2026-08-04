@@ -38,6 +38,46 @@ fn make_work_item(kind: WorkItemKind, branch: Option<&str>, description: &str) -
     }
 }
 
+#[test]
+fn convoy_explanation_human_names_the_holding_expectation() {
+    let explanation = flotilla_protocol::ConvoyExplanation {
+        namespace: "flotilla".to_string(),
+        convoy: "held-work".to_string(),
+        phase: "Landing".to_string(),
+        evidence_ttl_seconds: 30,
+        change_request_stale_after_seconds: 180,
+        checkouts: vec![flotilla_protocol::ExplainedCheckout {
+            name: "checkout-held".to_string(),
+            observed: false,
+            provenance: None,
+            clean: None,
+            pushed: None,
+            landed: None,
+        }],
+        change_requests: Vec::new(),
+        subscriptions: Vec::new(),
+        crew_deliveries: Vec::new(),
+        settlement: flotilla_protocol::ExplainedSettlement {
+            mode: "world_terminal".to_string(),
+            satisfied: false,
+            unmet: vec![flotilla_protocol::ExplainedUnmetExpectation {
+                reason: "missing_record".to_string(),
+                subject: "checkout/checkout-held".to_string(),
+                detail: "expected checkout has no federated record".to_string(),
+            }],
+        },
+    };
+
+    let output = crate::cli::format_convoy_explanation_human(&explanation);
+    assert!(output.contains("Settlement: HOLDING (world_terminal)"));
+    assert!(output.contains("missing_record: checkout/checkout-held"));
+    assert!(output.contains("checkout-held"));
+
+    let json = flotilla_protocol::output::json_pretty(&flotilla_protocol::CommandValue::ConvoyExplanation(Box::new(explanation)));
+    assert!(json.contains("\"convoy\": \"held-work\""));
+    assert!(json.contains("\"reason\": \"missing_record\""));
+}
+
 mod status_human {
     use flotilla_protocol::{
         qualified_path::HostId, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostListEntry, HostListResponse,

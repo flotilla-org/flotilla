@@ -1021,6 +1021,261 @@ fn input_meta_with_labels(name: &str, labels: BTreeMap<String, String>) -> Input
     InputMeta { labels, ..empty_input_meta(name) }
 }
 
+async fn explanation_daemon(backend: ResourceBackend) -> (Arc<InProcessDaemon>, tempfile::TempDir) {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"explanation-test\"\n").expect("write daemon config");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::new(ConfigStore::with_base(config_base)),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend,
+    )
+    .await;
+    (daemon, temp)
+}
+
+async fn create_explanation_convoy(
+    backend: &ResourceBackend,
+    name: &str,
+    checkout_name: Option<&str>,
+    landed: Option<(ConditionValue, DateTime<Utc>)>,
+) {
+    let repo_ref = flotilla_resources::RepositoryKey("repo-a".to_string());
+    let convoys = backend.using::<Convoy>("flotilla");
+    let mut spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).build();
+    spec.repositories = vec![ConvoyRepositorySpec::builder()
+        .url("https://example.com/org/repo".to_string())
+        .repo_ref(repo_ref.clone())
+        .source_ref("main".to_string())
+        .target_ref("main".to_string())
+        .workspace_slug("repo".to_string())
+        .subpaths(Vec::new())
+        .build()];
+    let created = convoys.create(&empty_input_meta(name), &spec).await.expect("create convoy");
+    let mut status = ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() };
+    if let Some(checkout_name) = checkout_name {
+        status.work.insert(
+            "work".to_string(),
+            WorkState::builder()
+                .phase(WorkPhase::Complete)
+                .placement(PlacementStatus {
+                    fields: BTreeMap::from([(
+                        "checkout_refs".to_string(),
+                        serde_json::json!(BTreeMap::from([(repo_ref.clone(), checkout_name.to_string())])),
+                    )]),
+                })
+                .build(),
+        );
+    }
+    convoys.update_status(name, &created.metadata.resource_version, &status).await.expect("update convoy status");
+
+    if let (Some(checkout_name), Some((value, observed_at))) = (checkout_name, landed) {
+        let checkouts = backend.using::<ResourceCheckout>("flotilla");
+        let checkout = checkouts
+            .create(
+                &input_meta_with_labels(checkout_name, BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())])),
+                &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                    r#ref: "feature/explain".to_string(),
+                    path: format!("/tmp/{checkout_name}"),
+                    repo_ref,
+                    host_ref: "host-a".to_string(),
+                    is_main: false,
+                }),
+            )
+            .await
+            .expect("create checkout");
+        checkouts
+            .update_status(checkout_name, &checkout.metadata.resource_version, &ResourceCheckoutStatus {
+                phase: ResourceCheckoutPhase::Ready,
+                integration: CheckoutIntegrationStatus {
+                    landed: IntegrationCondition::builder().value(value).observed_at(observed_at.to_rfc3339()).build(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .expect("update checkout status");
+    }
+}
+
+async fn create_bound_explanation_convoy(
+    backend: &ResourceBackend,
+    name: &str,
+    observation: Option<(flotilla_resources::ObservedChangeRequestState, DateTime<Utc>)>,
+) {
+    let repo_ref = flotilla_resources::RepositoryKey("repo-a".to_string());
+    let mut spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).build();
+    spec.repositories = vec![ConvoyRepositorySpec::builder()
+        .url(format!("https://example.com/org/{name}"))
+        .repo_ref(repo_ref.clone())
+        .source_ref("main".to_string())
+        .target_ref("main".to_string())
+        .workspace_slug("repo".to_string())
+        .subpaths(Vec::new())
+        .build()];
+    spec.change_request = Some(flotilla_resources::BoundChangeRequest {
+        id: "42".to_string(),
+        repository_ref: repo_ref,
+        title: "Bound change request".to_string(),
+    });
+    let convoys = backend.using::<Convoy>("flotilla");
+    let convoy = convoys.create(&empty_input_meta(name), &spec).await.expect("create bound convoy");
+    convoys
+        .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() })
+        .await
+        .expect("update bound convoy status");
+
+    let Some((state, observed_at)) = observation else { return };
+    let scope = format!("org/{name}");
+    let record_name = flotilla_resources::change_request_record_name("example.com", &scope, 42);
+    let change_requests = backend.using::<flotilla_resources::ChangeRequest>("flotilla");
+    let change_request = change_requests
+        .create(&empty_input_meta(&record_name), &flotilla_resources::ChangeRequestSpec {
+            service: "example.com".to_string(),
+            scope,
+            number: 42,
+            observing_authority: "test".to_string(),
+        })
+        .await
+        .expect("create change request");
+    change_requests
+        .update_status(&record_name, &change_request.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+            state: flotilla_resources::Observation::known(state, observed_at),
+            head_sha: flotilla_resources::Observation::known("abc123".to_string(), observed_at),
+            checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
+            review: flotilla_resources::ChangeRequestReviewObservation {
+                actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+            },
+            mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
+        })
+        .await
+        .expect("update change request status");
+}
+
+async fn explain(daemon: &InProcessDaemon, name: &str) -> flotilla_protocol::ConvoyExplanation {
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: name.to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("explain query");
+    let CommandValue::ConvoyExplanation(explanation) = result else { panic!("expected convoy explanation, got {result:?}") };
+    *explanation
+}
+
+#[tokio::test]
+async fn convoy_explanation_names_each_held_landing_expectation_and_claim_exit() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let (daemon, _temp) = explanation_daemon(backend.clone()).await;
+    create_explanation_convoy(&backend, "missing", Some("checkout-missing"), None).await;
+    create_explanation_convoy(
+        &backend,
+        "stale",
+        Some("checkout-stale"),
+        Some((ConditionValue::True, Utc::now() - ChronoDuration::seconds(60))),
+    )
+    .await;
+    create_explanation_convoy(&backend, "false", Some("checkout-false"), Some((ConditionValue::False, Utc::now()))).await;
+    create_explanation_convoy(&backend, "claim-exit", None, None).await;
+
+    let missing = explain(&daemon, "missing").await;
+    assert_eq!(missing.settlement.unmet[0].reason, "missing_record");
+    assert_eq!(missing.settlement.unmet[0].subject, "checkout/checkout-missing");
+    let stale = explain(&daemon, "stale").await;
+    assert_eq!(stale.settlement.unmet[0].reason, "stale_evidence");
+    assert_eq!(stale.settlement.unmet[0].subject, "checkout/checkout-stale.landed");
+    let false_condition = explain(&daemon, "false").await;
+    assert_eq!(false_condition.settlement.unmet[0].reason, "false_condition");
+    assert_eq!(false_condition.settlement.unmet[0].subject, "checkout/checkout-false.landed");
+    let claim_exit = explain(&daemon, "claim-exit").await;
+    assert!(claim_exit.settlement.satisfied);
+    assert_eq!(claim_exit.settlement.mode, "claim_exit");
+}
+
+#[tokio::test]
+async fn convoy_explanation_names_missing_stale_and_open_bound_change_requests() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let (daemon, _temp) = explanation_daemon(backend.clone()).await;
+    create_bound_explanation_convoy(&backend, "bound-missing", None).await;
+    create_bound_explanation_convoy(
+        &backend,
+        "bound-stale",
+        Some((flotilla_resources::ObservedChangeRequestState::Open, Utc::now() - ChronoDuration::hours(1))),
+    )
+    .await;
+    create_bound_explanation_convoy(&backend, "bound-open", Some((flotilla_resources::ObservedChangeRequestState::Open, Utc::now()))).await;
+
+    let missing = explain(&daemon, "bound-missing").await;
+    assert_eq!(missing.settlement.unmet[0].reason, "missing_record");
+    assert_eq!(
+        missing.settlement.unmet[0].subject,
+        format!("change_request/{}", flotilla_resources::change_request_record_name("example.com", "org/bound-missing", 42))
+    );
+    assert!(missing.change_requests[0].bound);
+    assert!(!missing.change_requests[0].observed);
+
+    let stale = explain(&daemon, "bound-stale").await;
+    assert_eq!(stale.settlement.unmet[0].reason, "stale_evidence");
+    assert!(stale.change_requests[0].bound);
+    assert_eq!(stale.change_requests[0].freshness, flotilla_protocol::EvidenceFreshness::Stale);
+
+    let open = explain(&daemon, "bound-open").await;
+    assert_eq!(open.settlement.unmet[0].reason, "false_condition");
+    assert!(open.change_requests[0].bound);
+    assert_eq!(open.change_requests[0].freshness, flotilla_protocol::EvidenceFreshness::Fresh);
+}
+
+#[tokio::test]
+async fn convoy_explanation_and_resource_get_read_remote_replicas() {
+    let authority = ResourceBackend::InMemory(InMemoryBackend::default());
+    create_explanation_convoy(&authority, "remote-held", Some("remote-checkout"), Some((ConditionValue::False, Utc::now()))).await;
+    let local = ResourceBackend::InMemory(InMemoryBackend::default());
+    let remote_node = NodeId::new("remote-authority");
+    local
+        .replica_writer::<Convoy>(remote_node.clone(), "flotilla")
+        .replace(&authority.using::<Convoy>("flotilla").list().await.expect("list authority convoys"), Utc::now())
+        .await
+        .expect("replicate convoy");
+    local
+        .replica_writer::<ResourceCheckout>(remote_node, "flotilla")
+        .replace(&authority.using::<ResourceCheckout>("flotilla").list().await.expect("list authority checkouts"), Utc::now())
+        .await
+        .expect("replicate checkout");
+    let (daemon, _temp) = explanation_daemon(local).await;
+
+    let explanation = explain(&daemon, "remote-held").await;
+    assert_eq!(explanation.settlement.unmet[0].subject, "checkout/remote-checkout.landed");
+    assert!(matches!(explanation.checkouts[0].provenance, Some(flotilla_protocol::ResourceRecordProvenance::Replica { .. })));
+
+    let fetched = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryResourceGet {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: "remote-held".to_string(),
+                },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("resource get");
+    let CommandValue::ResourceRead(fetched) = fetched else { panic!("expected replicated resource read") };
+    assert!(matches!(fetched.records[0].provenance, flotilla_protocol::ResourceRecordProvenance::Replica { .. }));
+}
+
 async fn wait_for_command_result(events: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {

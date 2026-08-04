@@ -21,6 +21,8 @@ pub struct ConvoyNoun {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum ConvoyVerb {
+    /// Explain why this convoy is holding in its current phase
+    Explain,
     /// Manage the work aboard a convoy's vessels
     Work(ConvoyWorkNoun),
     /// Delete a convoy and tear down its managed resources
@@ -169,6 +171,19 @@ pub enum ConvoyWorkVerb {
 impl ConvoyNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         match self.verb {
+            ConvoyVerb::Explain => Ok(Resolved::NeedsContext {
+                command: Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::QueryExplainConvoy {
+                        namespace: None,
+                        name: self.subject.ok_or_else(|| "convoy name is required before `explain`".to_string())?,
+                    },
+                },
+                repo: RepoContext::None,
+                host: HostResolution::Local,
+            }),
             ConvoyVerb::Work(work) => match work.verb {
                 ConvoyWorkVerb::Complete { message: _, force: false } => Err("human work completion requires --force".to_string()),
                 ConvoyWorkVerb::Complete { message, force: true } => Ok(Resolved::NeedsContext {
@@ -357,6 +372,7 @@ impl std::fmt::Display for ConvoyNoun {
             write!(f, " {subject}")?;
         }
         match &self.verb {
+            ConvoyVerb::Explain => write!(f, " explain")?,
             ConvoyVerb::Work(work) => {
                 write!(f, " work {}", work.subject)?;
                 match &work.verb {
@@ -482,6 +498,18 @@ mod tests {
 
     fn parse(args: &[&str]) -> ConvoyNoun {
         ConvoyNoun::try_parse_from(args).expect("should parse")
+    }
+
+    #[test]
+    fn convoy_explain_resolves_as_a_query() {
+        let resolved = parse(&["convoy", "held-work", "explain"]).resolve().expect("resolve");
+        assert!(matches!(resolved, Resolved::NeedsContext { command, .. }
+            if command.action == CommandAction::QueryExplainConvoy { namespace: None, name: "held-work".to_string() }));
+    }
+
+    #[test]
+    fn round_trip_explain() {
+        assert_round_trip::<ConvoyNoun>(&["convoy", "held-work", "explain"]);
     }
 
     #[test]
