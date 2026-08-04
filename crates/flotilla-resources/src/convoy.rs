@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{IssueRef, IssueState, PlacementDecision, PrincipalRef};
+use flotilla_protocol::{IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef};
 use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::StatusPatch, workflow_template::VesselRequirement, ReplicationClass, RepositoryKey};
@@ -82,6 +82,69 @@ pub fn expected_checkout_refs(convoy: &crate::ResourceObject<Convoy>) -> Result<
         expected.extend(checkout_refs.into_values());
     }
     Ok(expected)
+}
+
+/// Hardwired world-terminal leaves armed while a convoy is Landing.
+///
+/// Change-request identity is durable on an explicitly bound convoy, or is
+/// learned from a checkout authority's stored integration observation. The
+/// latter lets the convoy authority derive the same leaves from replicated
+/// checkout evidence after a restart.
+pub fn expected_change_request_leaves(
+    convoy: &crate::ResourceObject<Convoy>,
+    checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
+) -> Result<Vec<Leaf>, String> {
+    let mut subjects = Vec::new();
+    if let Some(bound) = &convoy.spec.change_request {
+        let repository = convoy
+            .spec
+            .repositories
+            .iter()
+            .find(|repository| repository.repo_ref == bound.repository_ref)
+            .ok_or_else(|| format!("bound change request repository {} is absent from convoy", bound.repository_ref))?;
+        let address = change_request_address(&repository.url, &bound.id)?;
+        if !subjects.contains(&address) {
+            subjects.push(address);
+        }
+    }
+    for checkout_name in expected_checkout_refs(convoy)? {
+        let Some(checkout) = checkouts.get(&checkout_name) else { continue };
+        let Some(observed) = checkout.status.as_ref().and_then(|status| status.integration.change_request.as_ref()) else {
+            continue;
+        };
+        let repository =
+            convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref()).ok_or_else(|| {
+                format!("checkout {} repository {} is absent from convoy", checkout.metadata.name, checkout.spec.repo_ref())
+            })?;
+        let address = change_request_address(&repository.url, &observed.id)?;
+        if !subjects.contains(&address) {
+            subjects.push(address);
+        }
+    }
+
+    Ok(subjects
+        .into_iter()
+        .flat_map(|address| {
+            ["merged", "closed"].map(|literal| Leaf {
+                address: address.clone(),
+                field_path: ".state".to_string(),
+                operator: LeafOperator::Equal,
+                literal: literal.to_string(),
+            })
+        })
+        .collect())
+}
+
+fn change_request_address(repository_url: &str, id: &str) -> Result<LeafAddress, String> {
+    let canonical = crate::canonicalize_repo_url(repository_url)?;
+    let without_scheme = canonical
+        .split_once("://")
+        .map(|(_, value)| value)
+        .ok_or_else(|| format!("canonical repository remote has no scheme: {canonical}"))?;
+    let (service, scope) =
+        without_scheme.split_once('/').ok_or_else(|| format!("canonical repository remote has no repository path: {canonical}"))?;
+    let number = id.parse::<u64>().map_err(|_| format!("change request id `{id}` is not a numeric forge number"))?;
+    Ok(LeafAddress::ChangeRequest { service: service.to_string(), scope: scope.to_string(), number })
 }
 
 pub fn pinned_workflow_ref(convoy: &crate::ResourceObject<Convoy>) -> &str {

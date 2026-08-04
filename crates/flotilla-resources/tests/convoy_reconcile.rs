@@ -1,12 +1,6 @@
 mod common;
 
-use std::{
-    collections::BTreeMap,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use common::{
@@ -29,30 +23,6 @@ struct AlwaysEligible;
 
 #[async_trait]
 impl ConvoyTeardownRuntime for AlwaysEligible {
-    async fn verify_reclaim(
-        &self,
-        _convoy: &flotilla_resources::ResourceObject<Convoy>,
-        _checkouts: &[flotilla_resources::ResourceObject<Checkout>],
-    ) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-struct RecordingUnsettledRuntime {
-    checkout_count: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl ConvoyTeardownRuntime for RecordingUnsettledRuntime {
-    async fn no_change_request_outstanding(
-        &self,
-        _convoy: &flotilla_resources::ResourceObject<Convoy>,
-        checkouts: &[flotilla_resources::ResourceObject<Checkout>],
-    ) -> Result<bool, String> {
-        self.checkout_count.store(checkouts.len(), Ordering::SeqCst);
-        Ok(false)
-    }
-
     async fn verify_reclaim(
         &self,
         _convoy: &flotilla_resources::ResourceObject<Convoy>,
@@ -709,27 +679,6 @@ async fn landed_with_reopened_change_request_does_not_write_phase() {
 }
 
 #[tokio::test]
-async fn teardown_runtime_default_accepts_artifactless_convoy() {
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
-
-    assert!(AlwaysEligible.no_change_request_outstanding(&convoy, &[]).await.expect("default settlement condition should evaluate"));
-}
-
-#[tokio::test]
-async fn teardown_runtime_default_rejects_unobserved_expected_checkout() {
-    let mut status = bootstrapped_convoy_status();
-    status.work.get_mut("implement").expect("implement work").placement = Some(flotilla_resources::PlacementStatus {
-        fields: BTreeMap::from([(
-            "checkout_refs".to_string(),
-            serde_json::json!(BTreeMap::from([(RepositoryKey("repo-a".to_string()), "checkout-a".to_string())])),
-        )]),
-    });
-    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
-
-    assert!(!AlwaysEligible.no_change_request_outstanding(&convoy, &[]).await.expect("default settlement condition should evaluate"));
-}
-
-#[tokio::test]
 async fn federated_open_checkout_holds_landing_on_authority_host() {
     let authority = ResourceBackend::InMemory(InMemoryBackend::default());
     let remote = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -794,16 +743,12 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
         .await
         .expect("replicate remote checkout");
 
-    let checkout_count = Arc::new(AtomicUsize::new(0));
-    let runtime = Arc::new(RecordingUnsettledRuntime { checkout_count: checkout_count.clone() });
     let current = convoys.get("cross-host").await.expect("get authority convoy");
     let reconciler = ConvoyReconciler::new(authority.clone().using::<WorkflowTemplate>("flotilla"))
-        .with_federated_checkouts(authority.including_replicas::<Checkout>("flotilla"))
-        .with_teardown_runtime(runtime);
+        .with_federated_checkouts(authority.including_replicas::<Checkout>("flotilla"));
     let deps = reconciler.fetch_dependencies(&current).await.expect("resolve federated dependencies");
     let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
 
-    assert_eq!(checkout_count.load(Ordering::SeqCst), 1, "runtime must receive the federated checkout");
     assert_eq!(outcome.patch, None, "an open remote change request must hold Landing");
 }
 

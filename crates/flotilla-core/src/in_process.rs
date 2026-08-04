@@ -2329,6 +2329,14 @@ impl InProcessDaemon {
         self.leaf_subscriptions.unsubscribe_connection(connection_id).await;
     }
 
+    pub fn reconciler_wake_watch(&self) -> Box<dyn flotilla_resources::controller::SecondaryWatch<Primary = flotilla_resources::Convoy>> {
+        self.leaf_subscriptions.reconciler_wake_watch()
+    }
+
+    pub fn change_request_stale_after(&self) -> Duration {
+        self.leaf_subscriptions.change_request_stale_after()
+    }
+
     pub fn connect_surface(&self, surface_id: uuid::Uuid, declaration: SurfaceDeclaration) {
         self.regard_lifecycle.connect_surface(surface_id, declaration);
     }
