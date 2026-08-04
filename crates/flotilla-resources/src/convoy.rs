@@ -11,7 +11,10 @@ use crate::{
 
 mod reconcile;
 
-pub use reconcile::{reconcile, ConvoyEvent, ConvoyReconciler, ConvoyTeardownRuntime, ReconcileOutcome};
+pub use reconcile::{
+    evaluate_landing_settlement, reconcile, ConvoyEvent, ConvoyReconciler, ConvoyTeardownRuntime, ReconcileOutcome, SettlementEvaluation,
+    SettlementMode, UnmetSettlementExpectation,
+};
 
 define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
 

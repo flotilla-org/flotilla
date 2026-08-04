@@ -22,33 +22,34 @@ use flotilla_protocol::{
     commands::{AttachMode, RepositoryIdentityChange},
     qualified_path::{HostId, QualifiedPath},
     result_set::{CheckoutRow, ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
-    AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, CorrelationKey, CrewCommandContext, CrewListMember,
-    CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse,
-    FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
-    HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
-    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
-    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo,
-    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor,
-    ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef,
-    StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress,
-    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CorrelationKey, CrewCommandContext,
+    CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId, EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout,
+    ExplainedCondition, ExplainedCrewDelivery, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation,
+    FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement,
+    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse,
+    HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost,
+    PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo,
+    QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse,
+    ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
+    ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo,
+    ToolInventory, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
-    apply_status_patch_checked as apply_resource_status_patch_checked, external_patches as convoy_external_patches, get_resource_kind,
-    list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec, repository_display_labels,
-    resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from,
-    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout,
-    CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    apply_status_patch_checked as apply_resource_status_patch_checked, evaluate_landing_settlement, expected_change_request_leaves,
+    expected_checkout_refs, external_patches as convoy_external_patches, list_resource_kind, list_resource_kind_including_replicas,
+    normalize_project_spec, repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
+    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
+    Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec,
     ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, Environment as ResourceEnvironment,
     Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
     InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
     LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
     ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
-    ResourceObject, ResourceProvenance, SystemClock, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
+    TerminalSessionSource, TerminalSessionStatusPatch, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
     WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
     HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
@@ -83,7 +84,7 @@ use crate::{
         resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
     },
     host_registry::HostCounts,
-    leaf_engine::LeafSubscriptionTable,
+    leaf_engine::{LeafSubscriptionTable, LeafWatcher},
     model::{provider_names_from_registry, repo_name, RepoModel},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
@@ -315,6 +316,89 @@ fn resource_record(record_type: ResourceRecordType, object: serde_json::Value, l
         _ => ResourceRecordProvenance::Local { node_id: local_node_id.clone() },
     };
     ResourceReadRecord { record_type, provenance, object: Some(object) }
+}
+
+fn explained_provenance(provenance: &ResourceProvenance, local_node_id: &NodeId) -> ResourceRecordProvenance {
+    match provenance {
+        ResourceProvenance::Local => ResourceRecordProvenance::Local { node_id: local_node_id.clone() },
+        ResourceProvenance::Replica { origin_root, last_synced_at } => {
+            ResourceRecordProvenance::Replica { origin_root: origin_root.clone(), last_synced_at: last_synced_at.to_rfc3339() }
+        }
+    }
+}
+
+fn observed_freshness(observed_at: Option<DateTime<Utc>>, now: DateTime<Utc>, ttl: Duration) -> EvidenceFreshness {
+    match observed_at.and_then(|observed_at| now.signed_duration_since(observed_at).to_std().ok()) {
+        Some(age) if age < ttl => EvidenceFreshness::Fresh,
+        Some(_) => EvidenceFreshness::Stale,
+        None => EvidenceFreshness::Missing,
+    }
+}
+
+fn explain_condition(condition: &IntegrationCondition, now: DateTime<Utc>, ttl: Duration) -> ExplainedCondition {
+    let observed_at = condition.observed_at.as_deref().and_then(|value| DateTime::parse_from_rfc3339(value).ok()).map(|at| at.to_utc());
+    ExplainedCondition {
+        value: match condition.value {
+            ConditionValue::True => "true",
+            ConditionValue::False => "false",
+            ConditionValue::Unknown => "unknown",
+        }
+        .to_string(),
+        observed_at: condition.observed_at.clone(),
+        freshness: observed_freshness(observed_at, now, ttl),
+        details: condition.details.clone(),
+    }
+}
+
+fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> ExplainedUnmetExpectation {
+    match expectation {
+        UnmetSettlementExpectation::InvalidExpectedCheckouts { message } => {
+            ExplainedUnmetExpectation { reason: "invalid_expected_checkouts".to_string(), subject: "convoy".to_string(), detail: message }
+        }
+        UnmetSettlementExpectation::MissingCheckout { checkout } => ExplainedUnmetExpectation {
+            reason: "missing_record".to_string(),
+            subject: format!("checkout/{checkout}"),
+            detail: "expected checkout has no federated record".to_string(),
+        },
+        UnmetSettlementExpectation::MissingCheckoutStatus { checkout } => ExplainedUnmetExpectation {
+            reason: "missing_status".to_string(),
+            subject: format!("checkout/{checkout}"),
+            detail: "observed checkout has no status".to_string(),
+        },
+        UnmetSettlementExpectation::CheckoutConditionFalse { checkout, condition } => ExplainedUnmetExpectation {
+            reason: "false_condition".to_string(),
+            subject: format!("checkout/{checkout}.{condition}"),
+            detail: format!("{condition} is false"),
+        },
+        UnmetSettlementExpectation::CheckoutConditionUnknown { checkout, condition } => ExplainedUnmetExpectation {
+            reason: "unknown_condition".to_string(),
+            subject: format!("checkout/{checkout}.{condition}"),
+            detail: format!("{condition} is unknown"),
+        },
+        UnmetSettlementExpectation::StaleCheckoutEvidence { checkout, condition, observed_at } => ExplainedUnmetExpectation {
+            reason: "stale_evidence".to_string(),
+            subject: format!("checkout/{checkout}.{condition}"),
+            detail: observed_at.map_or_else(|| "evidence has no observation time".to_string(), |at| format!("observed at {at}")),
+        },
+        UnmetSettlementExpectation::MissingChangeRequest { record } => ExplainedUnmetExpectation {
+            reason: "missing_record".to_string(),
+            subject: format!("change_request/{record}"),
+            detail: "expected change request has no federated observation".to_string(),
+        },
+        UnmetSettlementExpectation::StaleChangeRequest { record, observed_at } => ExplainedUnmetExpectation {
+            reason: "stale_evidence".to_string(),
+            subject: format!("change_request/{record}.state"),
+            detail: observed_at.map_or_else(|| "state has no observation time".to_string(), |at| format!("observed at {at}")),
+        },
+        UnmetSettlementExpectation::ChangeRequestConditionFalse { record, value } => ExplainedUnmetExpectation {
+            reason: "false_condition".to_string(),
+            subject: format!("change_request/{record}.state"),
+            detail: value.map_or_else(|| "state is unknown".to_string(), |value| format!("state is {value}")),
+        },
+        UnmetSettlementExpectation::InvalidCondition { subject, message } => {
+            ExplainedUnmetExpectation { reason: "invalid_condition".to_string(), subject, detail: message }
+        }
+    }
 }
 
 fn resource_watch_record(event: serde_json::Value, local_node_id: &NodeId) -> Result<Option<ResourceReadRecord>, String> {
@@ -2676,7 +2760,8 @@ impl InProcessDaemon {
         let (namespace, name) = match action {
             flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, .. }
-            | flotilla_protocol::CommandAction::ConvoyResume { namespace, name, .. } => {
+            | flotilla_protocol::CommandAction::ConvoyResume { namespace, name, .. }
+            | flotilla_protocol::CommandAction::QueryExplainConvoy { namespace, name } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), name.as_str())
             }
             flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, .. } => {
@@ -8360,6 +8445,178 @@ impl DaemonHandle for InProcessDaemon {
         self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false, None).await
     }
 
+    async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String> {
+        let namespace = requested_namespace.map(ToOwned::to_owned).unwrap_or(self.provisioning_namespace().await);
+        let convoy_sources =
+            self.resource_backend.including_replicas::<ResourceConvoy>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let convoy_source = convoy_sources
+            .items
+            .into_iter()
+            .filter(|source| source.object.metadata.name == name)
+            .max_by_key(|source| matches!(source.provenance, ResourceProvenance::Local))
+            .ok_or_else(|| format!("convoy {namespace}/{name} not found in local or replicated resources"))?;
+        let convoy = convoy_source.object;
+        let now = self.clock.now();
+        let change_request_stale_after = self.change_request_stale_after();
+
+        let checkout_sources =
+            self.resource_backend.including_replicas::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?.items;
+        let selected_checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources);
+        let expected = expected_checkout_refs(&convoy).map_err(|error| format!("derive expected checkouts: {error}"))?;
+        let checkouts = expected
+            .iter()
+            .map(|checkout_name| {
+                let selected = selected_checkouts.get(checkout_name);
+                let provenance = selected.and_then(|object| {
+                    checkout_sources
+                        .iter()
+                        .find(|source| {
+                            source.object.metadata.name == object.metadata.name
+                                && source.object.metadata.resource_version == object.metadata.resource_version
+                        })
+                        .map(|source| explained_provenance(&source.provenance, &self.node_id))
+                });
+                let integration = selected.and_then(|checkout| checkout.status.as_ref()).map(|status| &status.integration);
+                ExplainedCheckout {
+                    name: checkout_name.clone(),
+                    observed: selected.is_some(),
+                    provenance,
+                    clean: integration.map(|status| explain_condition(&status.clean, now, LANDING_EVIDENCE_TTL)),
+                    pushed: integration.map(|status| explain_condition(&status.pushed, now, LANDING_EVIDENCE_TTL)),
+                    landed: integration.map(|status| explain_condition(&status.landed, now, LANDING_EVIDENCE_TTL)),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let change_request_sources = self
+            .resource_backend
+            .including_replicas::<flotilla_resources::ChangeRequest>(&namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items;
+        let mut selected_change_requests = BTreeMap::new();
+        for source in &change_request_sources {
+            let name = source.object.metadata.name.clone();
+            let replace = selected_change_requests.get(&name).is_none_or(
+                |existing: &&flotilla_resources::ReadResourceObject<flotilla_resources::ChangeRequest>| {
+                    !matches!(existing.provenance, ResourceProvenance::Local) && matches!(source.provenance, ResourceProvenance::Local)
+                },
+            );
+            if replace {
+                selected_change_requests.insert(name, source);
+            }
+        }
+        let change_request_objects =
+            selected_change_requests.iter().map(|(name, source)| (name.clone(), source.object.clone())).collect::<BTreeMap<_, _>>();
+        let expected_change_requests = expected_change_request_leaves(&convoy, &selected_checkouts)
+            .map_err(|error| format!("derive expected change requests: {error}"))?
+            .into_iter()
+            .filter_map(|leaf| match leaf.address {
+                flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } => {
+                    Some(flotilla_resources::change_request_record_name(&service, &scope, number))
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let bound_name = convoy.spec.change_request.as_ref().and_then(|bound| {
+            let repository = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == bound.repository_ref)?;
+            let leaf = flotilla_resources::expected_change_request_leaves(&convoy, &selected_checkouts).ok()?.into_iter().next()?;
+            let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = leaf.address else { return None };
+            let _ = repository;
+            Some(flotilla_resources::change_request_record_name(&service, &scope, number))
+        });
+        let change_requests = expected_change_requests
+            .iter()
+            .map(|record_name| {
+                let selected = selected_change_requests.get(record_name).copied();
+                let observed_at = selected.and_then(|source| source.object.status.as_ref()).map(|status| status.state.observed_at);
+                ExplainedChangeRequest {
+                    name: record_name.clone(),
+                    bound: bound_name.as_ref() == Some(record_name),
+                    observed: selected.is_some(),
+                    provenance: selected.map(|source| explained_provenance(&source.provenance, &self.node_id)),
+                    fields: selected.and_then(|source| serde_json::to_value(&source.object).ok()),
+                    observed_at: observed_at.map(|at| at.to_rfc3339()),
+                    freshness: observed_freshness(observed_at, now, change_request_stale_after),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let evaluation = evaluate_landing_settlement(
+            &convoy,
+            &selected_checkouts,
+            &change_request_objects,
+            change_request_stale_after,
+            LANDING_EVIDENCE_TTL,
+            now,
+        );
+        let settlement = ExplainedSettlement {
+            mode: match evaluation.mode {
+                SettlementMode::ClaimExit => "claim_exit",
+                SettlementMode::WorldTerminal => "world_terminal",
+            }
+            .to_string(),
+            satisfied: evaluation.satisfied,
+            unmet: evaluation.unmet.into_iter().map(explain_unmet_expectation).collect(),
+        };
+
+        let subscriptions = self
+            .leaf_subscriptions
+            .diagnostics()
+            .await
+            .into_iter()
+            .filter(|(row, _)| matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy } if convoy == name))
+            .map(|(row, firings)| ExplainedSubscription {
+                id: row.id,
+                watcher: match row.watcher {
+                    LeafWatcher::WaitCaller { .. } => "wait_caller",
+                    LeafWatcher::ReconcilerWake { .. } => "reconciler_wake",
+                }
+                .to_string(),
+                leaves: row.leaves,
+                last_leaf_firings: firings
+                    .into_iter()
+                    .map(|firing| ExplainedLeafFiring { leaf: firing.leaf, value: firing.value, fired_at: firing.fired_at.to_rfc3339() })
+                    .collect(),
+            })
+            .collect();
+
+        let mut crew_deliveries = self
+            .resource_backend
+            .including_replicas::<ResourceTerminalSession>(&namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .filter(|source| source.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|convoy| convoy == name))
+            .map(|source| ExplainedCrewDelivery {
+                session: source.object.metadata.name,
+                role: source.object.spec.role,
+                // ADR 0028's delivery ladder has not landed yet. Keep the
+                // field explicit so recorded rungs appear without inventing
+                // one from session liveness or message delivery.
+                last_delivery_rung: None,
+                delivered_message_id: source.object.status.and_then(|status| status.delivered_message_id),
+            })
+            .collect::<Vec<_>>();
+        crew_deliveries.sort_by(|left, right| left.session.cmp(&right.session));
+
+        Ok(ConvoyExplanation {
+            namespace,
+            convoy: name.to_string(),
+            phase: convoy.status.as_ref().map_or_else(|| "Unknown".to_string(), |status| format!("{:?}", status.phase)),
+            evidence_ttl_seconds: LANDING_EVIDENCE_TTL.as_secs(),
+            change_request_stale_after_seconds: change_request_stale_after.as_secs(),
+            checkouts,
+            change_requests,
+            subscriptions,
+            crew_deliveries,
+            settlement,
+        })
+    }
+
     async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
         use flotilla_protocol::CommandAction;
         match &command.action {
@@ -8421,6 +8678,10 @@ impl DaemonHandle for InProcessDaemon {
                     Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
                 }
             }
+            CommandAction::QueryExplainConvoy { namespace, name } => match self.explain_convoy_internal(namespace.as_deref(), name).await {
+                Ok(explanation) => Ok(CommandValue::ConvoyExplanation(Box::new(explanation))),
+                Err(message) => Ok(CommandValue::Error { message }),
+            },
             CommandAction::QueryResourceList { namespace, kind, include_replicas } => {
                 let listed = if *include_replicas {
                     list_resource_kind_including_replicas(&self.resource_backend, namespace, kind).await
@@ -8453,25 +8714,33 @@ impl DaemonHandle for InProcessDaemon {
                 // Take the collection cursor before reading the object. A
                 // concurrent mutation can then be replayed (at worst as a
                 // duplicate) instead of being hidden behind a newer cursor.
-                let listed = match list_resource_kind(&self.resource_backend, namespace, kind).await {
+                let cursor_list = match list_resource_kind(&self.resource_backend, namespace, kind).await {
                     Ok(listed) => listed,
                     Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
                 };
-                match get_resource_kind(&self.resource_backend, namespace, kind, name).await {
-                    Ok(v) => {
-                        let resource_version = listed.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string();
-                        let generation = listed.value["metadata"]["generation"].as_str().map(ToOwned::to_owned);
-                        let record = resource_record(ResourceRecordType::Current, v.value, &self.node_id);
-                        Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
-                            v.kind,
-                            v.plural,
-                            v.namespace,
-                            ResourceCursor::from_position(resource_version, generation),
-                            vec![record],
-                        ))))
-                    }
-                    Err(error) => Ok(flotilla_protocol::CommandValue::Error { message: error.to_string() }),
-                }
+                let visible = match list_resource_kind_including_replicas(&self.resource_backend, namespace, kind).await {
+                    Ok(listed) => listed,
+                    Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
+                };
+                let object = visible.value["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|object| object["metadata"]["name"].as_str() == Some(name.as_str()))
+                    .cloned();
+                let Some(object) = object else {
+                    return Ok(CommandValue::Error { message: format!("resource {kind}/{namespace}/{name} not found") });
+                };
+                let resource_version = cursor_list.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string();
+                let generation = cursor_list.value["metadata"]["generation"].as_str().map(ToOwned::to_owned);
+                let record = resource_record(ResourceRecordType::Current, object, &self.node_id);
+                Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
+                    visible.kind,
+                    visible.plural,
+                    visible.namespace,
+                    ResourceCursor::from_position(resource_version, generation),
+                    vec![record],
+                ))))
             }
             CommandAction::Attach { reference, host, mode } => {
                 match self.resolve_attach_with_mode_internal(reference, host.as_ref(), false, *mode).await {

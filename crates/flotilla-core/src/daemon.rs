@@ -2,8 +2,10 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    arg::Arg, commands::CommandValue, AttachExcursionId, Command, DaemonEvent, QueryCursor, RepoInfo, RepoSelector, RepoSnapshot,
-    StatusResponse, StreamKey, TopologyResponse,
+    arg::Arg,
+    commands::{CommandValue, ConvoyExplanation},
+    AttachExcursionId, Command, DaemonEvent, QueryCursor, RepoInfo, RepoSelector, RepoSnapshot, StatusResponse, StreamKey,
+    TopologyResponse,
 };
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -117,6 +119,11 @@ pub trait DaemonHandle: Send + Sync {
     /// without broadcasting. Only valid for commands where `action.is_query()`.
     /// The `session_id` ties cursor ownership to the calling client session.
     async fn execute_query(&self, command: Command, session_id: Uuid) -> Result<CommandValue, String>;
+
+    #[doc(hidden)]
+    async fn explain_convoy_internal(&self, _namespace: Option<&str>, _name: &str) -> Result<ConvoyExplanation, String> {
+        Err("convoy explanation is unsupported by this daemon".to_string())
+    }
 
     /// High-level status: repos, health, counts.
     async fn get_status(&self) -> Result<StatusResponse, String>;

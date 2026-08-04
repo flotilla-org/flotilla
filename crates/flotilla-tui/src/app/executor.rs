@@ -269,6 +269,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::CrewList(_)
         | CommandValue::FleetReplicaSnapshot(_)
         | CommandValue::DaemonLogs { .. }
+        | CommandValue::ConvoyExplanation(_)
         | CommandValue::ResourceRead(_)
         | CommandValue::ResourceObject(_)
         | CommandValue::ResourceDeleted(_)

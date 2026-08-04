@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
@@ -203,58 +204,155 @@ async fn federated_children<T: Resource + Clone>(
     Ok(select_convoy_children(convoy, &resolver.list().await?.items))
 }
 
-fn landing_condition_satisfied(
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementMode {
+    ClaimExit,
+    WorldTerminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum UnmetSettlementExpectation {
+    InvalidExpectedCheckouts { message: String },
+    MissingCheckout { checkout: String },
+    MissingCheckoutStatus { checkout: String },
+    CheckoutConditionFalse { checkout: String, condition: String },
+    CheckoutConditionUnknown { checkout: String, condition: String },
+    StaleCheckoutEvidence { checkout: String, condition: String, observed_at: Option<String> },
+    MissingChangeRequest { record: String },
+    StaleChangeRequest { record: String, observed_at: Option<DateTime<Utc>> },
+    ChangeRequestConditionFalse { record: String, value: Option<String> },
+    InvalidCondition { subject: String, message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementEvaluation {
+    pub mode: SettlementMode,
+    pub satisfied: bool,
+    pub unmet: Vec<UnmetSettlementExpectation>,
+}
+
+/// Evaluate the exact Landing settlement condition and retain the evidence for
+/// every branch that held it false. Reconciliation and diagnostics share this
+/// function so an explanation cannot drift from the condition writer.
+pub fn evaluate_landing_settlement(
     convoy: &ResourceObject<Convoy>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     change_request_stale_after: std::time::Duration,
     landing_evidence_stale_after: std::time::Duration,
     now: DateTime<Utc>,
-) -> bool {
-    let Ok(leaves) = expected_change_request_leaves(convoy, checkouts) else {
-        return false;
+) -> SettlementEvaluation {
+    let expected = match expected_checkout_refs(convoy) {
+        Ok(expected) => expected,
+        Err(message) => {
+            return SettlementEvaluation {
+                mode: SettlementMode::WorldTerminal,
+                satisfied: false,
+                unmet: vec![UnmetSettlementExpectation::InvalidExpectedCheckouts { message }],
+            };
+        }
     };
-    let all_change_requests_terminal = leaves.chunks_exact(2).all(|terminal_leaves| {
-        terminal_leaves.iter().any(|leaf| {
+    if expected.is_empty() && convoy.spec.change_request.is_none() {
+        return SettlementEvaluation { mode: SettlementMode::ClaimExit, satisfied: true, unmet: Vec::new() };
+    }
+
+    let mut unmet = Vec::new();
+    let leaves = match expected_change_request_leaves(convoy, checkouts) {
+        Ok(leaves) => leaves,
+        Err(message) => {
+            return SettlementEvaluation {
+                mode: SettlementMode::WorldTerminal,
+                satisfied: false,
+                unmet: vec![UnmetSettlementExpectation::InvalidCondition { subject: convoy.metadata.name.clone(), message }],
+            };
+        }
+    };
+    for terminal_leaves in leaves.chunks_exact(2) {
+        let mut record_name = None;
+        let mut observed_at = None;
+        let mut value = None;
+        let mut terminal = false;
+        for leaf in terminal_leaves {
             let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else {
-                return false;
+                continue;
             };
             let name = crate::change_request_record_name(service, scope, *number);
+            record_name = Some(name.clone());
             let subject = change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject {
                 change_request,
                 now,
                 stale_after: change_request_stale_after,
             });
-            crate::evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject), None)
-                .is_ok_and(|evaluation| evaluation.result == ThreeValue::True)
-        })
-    });
-    if !all_change_requests_terminal {
-        return false;
+            observed_at = change_requests.get(&name).and_then(|record| record.status.as_ref()).map(|status| status.state.observed_at);
+            match crate::evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject), None) {
+                Ok(evaluation) => {
+                    value = evaluation.value.map(|value| value.to_string()).or(value);
+                    terminal |= evaluation.result == ThreeValue::True;
+                }
+                Err(message) => unmet.push(UnmetSettlementExpectation::InvalidCondition { subject: name, message }),
+            }
+        }
+        if terminal {
+            continue;
+        }
+        let record = record_name.expect("change request terminal leaf pair has an address");
+        match change_requests.get(&record) {
+            None => unmet.push(UnmetSettlementExpectation::MissingChangeRequest { record }),
+            Some(_)
+                if observed_at
+                    .and_then(|at| now.signed_duration_since(at).to_std().ok())
+                    .is_none_or(|age| age > change_request_stale_after) =>
+            {
+                unmet.push(UnmetSettlementExpectation::StaleChangeRequest { record, observed_at });
+            }
+            Some(_) => unmet.push(UnmetSettlementExpectation::ChangeRequestConditionFalse { record, value }),
+        }
     }
 
     let bound_repository = convoy.spec.change_request.as_ref().map(|bound| &bound.repository_ref);
-    expected_checkout_refs(convoy).is_ok_and(|expected| {
-        expected.iter().all(|name| {
-            checkouts.get(name).is_some_and(|checkout| {
-                let has_expected_change_request =
-                    checkout.status.as_ref().and_then(|status| status.integration.change_request.as_ref()).is_some()
-                        || bound_repository == Some(checkout.spec.repo_ref());
-                has_expected_change_request
-                    || checkout.status.as_ref().is_some_and(|status| {
-                        status.integration.landed.value == crate::ConditionValue::True
-                            && status
-                                .integration
-                                .landed
-                                .observed_at
-                                .as_deref()
-                                .and_then(|observed_at| DateTime::parse_from_rfc3339(observed_at).ok())
-                                .and_then(|observed_at| now.signed_duration_since(observed_at).to_std().ok())
-                                .is_some_and(|age| age < landing_evidence_stale_after)
-                    })
-            })
-        })
-    })
+    for name in expected {
+        let Some(checkout) = checkouts.get(&name) else {
+            unmet.push(UnmetSettlementExpectation::MissingCheckout { checkout: name });
+            continue;
+        };
+        let has_expected_change_request = checkout.status.as_ref().and_then(|status| status.integration.change_request.as_ref()).is_some()
+            || bound_repository == Some(checkout.spec.repo_ref());
+        if has_expected_change_request {
+            continue;
+        }
+        let Some(status) = checkout.status.as_ref() else {
+            unmet.push(UnmetSettlementExpectation::MissingCheckoutStatus { checkout: name });
+            continue;
+        };
+        let condition = &status.integration.landed;
+        match condition.value {
+            crate::ConditionValue::False => {
+                unmet.push(UnmetSettlementExpectation::CheckoutConditionFalse { checkout: name, condition: "landed".to_string() })
+            }
+            crate::ConditionValue::Unknown => {
+                unmet.push(UnmetSettlementExpectation::CheckoutConditionUnknown { checkout: name, condition: "landed".to_string() })
+            }
+            crate::ConditionValue::True => {
+                let fresh = condition
+                    .observed_at
+                    .as_deref()
+                    .and_then(|observed_at| DateTime::parse_from_rfc3339(observed_at).ok())
+                    .and_then(|observed_at| now.signed_duration_since(observed_at).to_std().ok())
+                    .is_some_and(|age| age < landing_evidence_stale_after);
+                if !fresh {
+                    unmet.push(UnmetSettlementExpectation::StaleCheckoutEvidence {
+                        checkout: name,
+                        condition: "landed".to_string(),
+                        observed_at: condition.observed_at.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    SettlementEvaluation { mode: SettlementMode::WorldTerminal, satisfied: unmet.is_empty(), unmet }
 }
 
 impl Reconciler for ConvoyReconciler {
@@ -315,7 +413,7 @@ impl Reconciler for ConvoyReconciler {
             _ => BTreeMap::new(),
         };
         let no_change_request_outstanding = if is_landing {
-            landing_condition_satisfied(
+            evaluate_landing_settlement(
                 obj,
                 &checkouts,
                 &change_requests,
@@ -323,6 +421,7 @@ impl Reconciler for ConvoyReconciler {
                 self.landing_evidence_stale_after,
                 self.clock.now(),
             )
+            .satisfied
         } else {
             false
         };
