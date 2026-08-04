@@ -33,7 +33,7 @@ jobs:
           test ! -e "$HOME/.config/forgejo-runner/.runner"
           test -z "${FLEET_CODESIGN_IDENTITY:-}"
           test -z "${FORGEJO_ADMIN_TOKEN:-}"
-          ! git config --local --get-regexp 'http\..*\.extraheader'
+          ! git --no-pager config --local --get-regexp 'http\..*\.extraheader'
 
       - name: Build binaries
         run: cargo build --locked --bins
