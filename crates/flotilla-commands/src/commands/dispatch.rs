@@ -4,7 +4,7 @@ use flotilla_protocol::{Command, CommandAction};
 use crate::{HostResolution, RepoContext, Resolved};
 
 #[derive(Debug, Parser)]
-#[command(name = "dispatch")]
+#[command(name = "dispatch", about = "Inspect proposed dispatch work")]
 pub struct DispatchNoun {
     #[command(subcommand)]
     pub verb: DispatchVerb,

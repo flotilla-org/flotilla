@@ -29,6 +29,6 @@ expression: output
   env                Manage environments
   checkout           Manage checkouts
   convoy             Manage convoys
-  dispatch
+  dispatch           Inspect proposed dispatch work
   crew               Communicate with crew members
   cr                 Code review

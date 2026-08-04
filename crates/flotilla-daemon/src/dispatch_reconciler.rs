@@ -65,6 +65,7 @@ pub(crate) struct ReconcilePass {
     pub queued: usize,
     pub blocked: usize,
     pub observations_recorded: usize,
+    pub project_errors: usize,
 }
 
 pub(crate) struct DispatchReconciler {
@@ -89,10 +90,17 @@ impl DispatchReconciler {
         let projects = self.backend.clone().using::<Project>(&self.namespace).list().await.map_err(|error| error.to_string())?;
         let mut total = ReconcilePass::default();
         for project in projects.items {
-            let outcome = self.reconcile_project(&project, self.clock.now()).await?;
-            total.queued += outcome.queued;
-            total.blocked += outcome.blocked;
-            total.observations_recorded += outcome.observations_recorded;
+            match self.reconcile_project(&project, self.clock.now()).await {
+                Ok(outcome) => {
+                    total.queued += outcome.queued;
+                    total.blocked += outcome.blocked;
+                    total.observations_recorded += outcome.observations_recorded;
+                }
+                Err(error) => {
+                    warn!(project = %project.metadata.name, %error, "dispatch reconciliation failed for project; continuing pass");
+                    total.project_errors += 1;
+                }
+            }
         }
         Ok(total)
     }
@@ -168,7 +176,7 @@ impl DispatchReconciler {
         let previous_attention = project.status.as_ref().and_then(|status| status.dispatch_queue_attention.as_ref());
         let attention = dispatch_queue_attention(&queue, policy, previous_attention, now);
         self.replace_queue(project, queue.clone(), attention).await?;
-        Ok(ReconcilePass { queued: queue.len(), blocked, observations_recorded })
+        Ok(ReconcilePass { queued: queue.len(), blocked, observations_recorded, ..ReconcilePass::default() })
     }
 
     async fn project_convoys(&self, project: &ResourceObject<Project>) -> Result<Vec<ResourceObject<Convoy>>, String> {
@@ -374,11 +382,15 @@ mod tests {
         ready: Mutex<Vec<Issue>>,
         by_ref: Mutex<HashMap<IssueRef, Issue>>,
         ready_calls: Mutex<usize>,
+        failing_projects: Mutex<std::collections::HashSet<String>>,
     }
 
     #[async_trait]
     impl DispatchIssueSource for FakeIssues {
-        async fn ready_issues(&self, _project: &ResourceObject<Project>) -> Result<Vec<Issue>, String> {
+        async fn ready_issues(&self, project: &ResourceObject<Project>) -> Result<Vec<Issue>, String> {
+            if self.failing_projects.lock().expect("failing projects lock").contains(&project.metadata.name) {
+                return Err("issue source unavailable".to_string());
+            }
             *self.ready_calls.lock().expect("ready calls lock") += 1;
             Ok(self.ready.lock().expect("ready lock").clone())
         }
@@ -435,6 +447,7 @@ mod tests {
             ready: Mutex::new(ready),
             by_ref: Mutex::new(blockers.into_iter().map(|issue| (issue.reference.clone(), issue)).collect()),
             ready_calls: Mutex::new(0),
+            failing_projects: Mutex::new(Default::default()),
         });
         let clock = Arc::new(VirtualClock::new("2026-08-04T12:00:00Z".parse().expect("clock timestamp")));
         let reconciler = DispatchReconciler::new(backend.clone(), NAMESPACE, Arc::clone(&issues) as Arc<dyn DispatchIssueSource>)
@@ -590,6 +603,29 @@ mod tests {
 
         let second = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project");
         assert_eq!(second.metadata.resource_version, first.metadata.resource_version);
+    }
+
+    #[tokio::test]
+    async fn one_broken_project_does_not_starve_a_healthy_projects_queue() {
+        let ready = issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open);
+        let (backend, issues, _, reconciler) = harness(vec![ready], vec![], policy(300)).await;
+        let widgets = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("widgets project");
+        backend
+            .clone()
+            .using::<Project>(NAMESPACE)
+            .create(&InputMeta::builder().name("broken".to_string()).build(), &widgets.spec)
+            .await
+            .expect("broken project");
+        issues.failing_projects.lock().expect("failing projects lock").insert("broken".to_string());
+
+        let outcome = reconciler.reconcile_once().await.expect("isolated pass");
+
+        assert_eq!(outcome.project_errors, 1);
+        assert_eq!(outcome.queued, 1);
+        assert_eq!(
+            backend.using::<Project>(NAMESPACE).get("widgets").await.expect("widgets project").status.expect("status").dispatch_queue.len(),
+            1
+        );
     }
 
     #[tokio::test]
