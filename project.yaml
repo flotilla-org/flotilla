@@ -1,0 +1,5 @@
+name: flotilla
+members:
+  - alias: flotilla
+    url: https://github.com/flotilla-org/flotilla
+    roles: [code, ops, knowledge]

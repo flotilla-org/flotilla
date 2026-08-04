@@ -15,6 +15,8 @@ async fn project_issue_source_override_resolves_without_a_checkout_or_repository
         issue_source: Some(override_source.clone()),
         repositories: vec![ProjectRepositorySpec {
             repo: RepositoryKey("repository-not-present-on-this-host".into()),
+            alias: None,
+            roles: Default::default(),
             subpath: None,
             default_branch: None,
         }],
@@ -39,9 +41,15 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
         default_workflow_ref: "single-agent-contained".into(),
         issue_source: None,
         repositories: vec![
-            ProjectRepositorySpec { repo: first.key(), subpath: None, default_branch: None },
-            ProjectRepositorySpec { repo: second.key(), subpath: None, default_branch: None },
-            ProjectRepositorySpec { repo: first.key(), subpath: Some("duplicate-source".into()), default_branch: None },
+            ProjectRepositorySpec { repo: first.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
+            ProjectRepositorySpec { repo: second.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
+            ProjectRepositorySpec {
+                repo: first.key(),
+                alias: None,
+                roles: Default::default(),
+                subpath: Some("duplicate-source".into()),
+                default_branch: None,
+            },
         ],
     };
 
@@ -63,7 +71,13 @@ async fn project_issue_source_resolution_reports_typed_unavailability() {
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
         issue_source: None,
-        repositories: vec![ProjectRepositorySpec { repo: local.key(), subpath: None, default_branch: None }],
+        repositories: vec![ProjectRepositorySpec {
+            repo: local.key(),
+            alias: None,
+            roles: Default::default(),
+            subpath: None,
+            default_branch: None,
+        }],
     };
     assert_eq!(
         resolve_project_issue_sources(&repositories, &local_only).await,
@@ -72,7 +86,13 @@ async fn project_issue_source_resolution_reports_typed_unavailability() {
 
     let missing = RepositoryKey("missing".into());
     let unresolved = ProjectSpec {
-        repositories: vec![ProjectRepositorySpec { repo: missing.clone(), subpath: None, default_branch: None }],
+        repositories: vec![ProjectRepositorySpec {
+            repo: missing.clone(),
+            alias: None,
+            roles: Default::default(),
+            subpath: None,
+            default_branch: None,
+        }],
         ..local_only
     };
     assert!(matches!(
@@ -209,8 +229,14 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
         default_workflow_ref: " single-agent-contained ".to_string(),
         issue_source: None,
         repositories: vec![
-            ProjectRepositorySpec { repo: repo_b.clone(), subpath: Some("./apps/api".to_string()), default_branch: None },
-            ProjectRepositorySpec { repo: repo_a.clone(), subpath: None, default_branch: None },
+            ProjectRepositorySpec {
+                repo: repo_b.clone(),
+                alias: None,
+                roles: Default::default(),
+                subpath: Some("./apps/api".to_string()),
+                default_branch: None,
+            },
+            ProjectRepositorySpec { repo: repo_a.clone(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
         ],
     })
     .expect("project should normalize");
@@ -225,11 +251,10 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
         display_name: "Example".to_string(),
         default_workflow_ref: "single-agent-contained".to_string(),
         issue_source: None,
-        repositories: vec![ProjectRepositorySpec { repo: repo_b.clone(), subpath: None, default_branch: None }, ProjectRepositorySpec {
-            repo: repo_b,
-            subpath: None,
-            default_branch: None,
-        }],
+        repositories: vec![
+            ProjectRepositorySpec { repo: repo_b.clone(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
+            ProjectRepositorySpec { repo: repo_b, alias: None, roles: Default::default(), subpath: None, default_branch: None },
+        ],
     };
     assert!(normalize_project_spec(duplicate).expect_err("duplicates should fail").contains("duplicate"));
 
@@ -247,6 +272,8 @@ fn project_subpaths_reject_absolute_and_parent_traversal() {
             issue_source: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: RepositoryKey("repo".to_string()),
+                alias: None,
+                roles: Default::default(),
                 subpath: Some(subpath.to_string()),
                 default_branch: None,
             }],

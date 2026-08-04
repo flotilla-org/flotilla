@@ -104,7 +104,7 @@ pub use principal_attention::{
 };
 pub use project::{
     normalize_project_spec, resolve_project_issue_sources, IssueSource, IssueSourceResolution, IssueSourceUnavailable, Project,
-    ProjectRepositorySpec, ProjectSpec,
+    ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use registry::{

@@ -24,9 +24,22 @@ pub struct ProjectSpec {
 pub struct ProjectRepositorySpec {
     pub repo: RepositoryKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[builder(default)]
+    pub roles: BTreeSet<ProjectRepositoryRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subpath: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectRepositoryRole {
+    Code,
+    Ops,
+    Knowledge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +98,14 @@ pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, Stri
         repository.subpath = repository.subpath.take().map(normalize_subpath).transpose()?;
         repository.default_branch =
             repository.default_branch.take().map(|branch| required_value(branch, "repositories[].default_branch")).transpose()?;
+        repository.alias = repository.alias.take().map(|alias| required_value(alias, "repositories[].alias")).transpose()?;
+        if repository.alias.is_some() && repository.roles.is_empty() {
+            return Err("project repository roles cannot be empty when alias is declared".to_string());
+        }
+    }
+    let aliases = spec.repositories.iter().filter_map(|repository| repository.alias.as_deref()).collect::<BTreeSet<_>>();
+    if aliases.len() != spec.repositories.iter().filter(|repository| repository.alias.is_some()).count() {
+        return Err("project contains a duplicate repository alias".to_string());
     }
     spec.repositories.sort_by(|left, right| (&left.repo, &left.subpath).cmp(&(&right.repo, &right.subpath)));
     if spec.repositories.windows(2).any(|pair| pair[0].repo == pair[1].repo && pair[0].subpath == pair[1].subpath) {

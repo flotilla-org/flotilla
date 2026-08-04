@@ -4675,9 +4675,27 @@ async fn convoy_admission_snapshots_every_project_repository() {
             default_workflow_ref: "single-agent-contained".to_string(),
             issue_source: None,
             repositories: vec![
-                ProjectRepositorySpec { repo: flotilla.key(), subpath: Some("crates/flotilla-core".to_string()), default_branch: None },
-                ProjectRepositorySpec { repo: flotilla.key(), subpath: Some("crates/flotilla-tui".to_string()), default_branch: None },
-                ProjectRepositorySpec { repo: cleat.key(), subpath: None, default_branch: Some("stable".to_string()) },
+                ProjectRepositorySpec {
+                    repo: flotilla.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: Some("crates/flotilla-core".to_string()),
+                    default_branch: None,
+                },
+                ProjectRepositorySpec {
+                    repo: flotilla.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: Some("crates/flotilla-tui".to_string()),
+                    default_branch: None,
+                },
+                ProjectRepositorySpec {
+                    repo: cleat.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: Some("stable".to_string()),
+                },
             ],
         })
         .await
