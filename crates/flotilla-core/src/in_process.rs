@@ -1710,20 +1710,6 @@ fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, int
     }
 }
 
-fn latch_evidence_backed_integration(existing: &CheckoutIntegrationStatus, observed: &mut CheckoutIntegrationStatus) {
-    if existing.landed.value != ConditionValue::True || existing.landed_evidence.is_none() {
-        return;
-    }
-    observed.landed.value = ConditionValue::True;
-    if observed.landed_evidence.is_none() {
-        observed.landed_evidence = existing.landed_evidence.clone();
-    }
-    if observed.change_request.is_none() {
-        observed.change_request =
-            existing.change_request.clone().filter(|change_request| change_request.state != flotilla_resources::ChangeRequestState::Open);
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExistingConvoyTarget {
     pub home: HostName,
@@ -2415,7 +2401,7 @@ impl InProcessDaemon {
                     );
                     (origin_matches && association_matches).then_some(source.object)
                 });
-            let mut integration = if let Some(convoy) = convoy.as_ref() {
+            let integration = if let Some(convoy) = convoy.as_ref() {
                 let change_request_id = convoy_change_request_id_for_checkout(convoy, &checkout);
                 inspect_convoy_checkout_integration(&*runner, Path::new(path), &checkout.spec, change_request_id.as_deref()).await
             } else {
@@ -2427,9 +2413,6 @@ impl InProcessDaemon {
                 )
                 .await
             };
-            if let Some(existing) = checkout.status.as_ref() {
-                latch_evidence_backed_integration(&existing.integration, &mut integration);
-            }
             apply_resource_status_patch(&checkouts, &checkout.metadata.name, &flotilla_resources::CheckoutStatusPatch::UpdateIntegration {
                 integration: Box::new(integration),
             })

@@ -20,19 +20,19 @@ use flotilla_protocol::{
     TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
-    CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
-    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase,
-    CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost, HostCondition,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, PlacementStatus,
-    Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus, Selector, Stance,
-    TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
-    Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
-    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, MANAGED_BY_LABEL, ROLE_LABEL,
-    VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    latch_evidence_backed_integration, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
+    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy, ConvoyPhase,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
+    CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
+    CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost,
+    HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
+    InputMeta, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
+    PlacementStatus, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus,
+    Selector, Stance, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
+    TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus,
+    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    CONVOY_LABEL, CREW_ORDINAL_LABEL, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -56,6 +56,143 @@ use crate::{
 };
 
 const TEST_LOCAL_ATTACH_HOST: &str = "local";
+
+#[test]
+fn fresh_false_replaces_premature_latched_landed_evidence() {
+    let existing = CheckoutIntegrationStatus {
+        landed: IntegrationCondition::builder().value(ConditionValue::True).build(),
+        landed_evidence: Some(flotilla_resources::LandedEvidence::builder().change_request_id("1343".to_string()).build()),
+        ..Default::default()
+    };
+    let mut observed =
+        CheckoutIntegrationStatus { landed: IntegrationCondition::builder().value(ConditionValue::False).build(), ..Default::default() };
+
+    latch_evidence_backed_integration(&existing, &mut observed);
+
+    assert_eq!(observed.landed.value, ConditionValue::False);
+    assert_eq!(observed.landed_evidence, None);
+}
+
+#[test]
+fn fresh_unknown_is_absorbed_by_latched_landed_evidence() {
+    let evidence = flotilla_resources::LandedEvidence::builder().change_request_id("1343".to_string()).build();
+    let existing = CheckoutIntegrationStatus {
+        landed: IntegrationCondition::builder().value(ConditionValue::True).build(),
+        landed_evidence: Some(evidence.clone()),
+        ..Default::default()
+    };
+    let mut observed =
+        CheckoutIntegrationStatus { landed: IntegrationCondition::builder().value(ConditionValue::Unknown).build(), ..Default::default() };
+
+    latch_evidence_backed_integration(&existing, &mut observed);
+
+    assert_eq!(observed.landed.value, ConditionValue::True);
+    assert_eq!(observed.landed_evidence, Some(evidence));
+}
+
+#[tokio::test]
+async fn reopened_change_request_replaces_authority_observation_and_holds_landing() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/reopened\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/reopened\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/reopened..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/feature/reopened..HEAD"], Ok("0\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("1\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("1\n".into()))
+        .on_run(
+            "gh",
+            &["pr", "view", "1343", "--json", "number,state,mergedAt,baseRefName,mergeable"],
+            Ok(r#"{"number":1343,"state":"MERGED","mergedAt":"2026-08-03T12:00:00Z","baseRefName":"main"}"#.into()),
+        )
+        .on_run(
+            "gh",
+            &["pr", "view", "1343", "--json", "number,state,mergedAt,baseRefName,mergeable"],
+            Ok(r#"{"number":1343,"state":"OPEN","mergedAt":null,"baseRefName":"main"}"#.into()),
+        )
+        .build();
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(&config_base)),
+        fake_discovery_with_runner(false, Arc::new(runner)),
+        HostName::local(),
+    )
+    .await;
+    let repo_ref = flotilla_resources::RepositoryKey("repo".to_string());
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    let convoy = convoys
+        .create(
+            &empty_input_meta("reopened-convoy"),
+            &ConvoySpec::builder()
+                .workflow_ref("review-and-fix".to_string())
+                .adopted_checkout_refs(BTreeMap::from([(repo_ref.clone(), "checkout-reopened".to_string())]))
+                .change_request(
+                    BoundChangeRequest::builder()
+                        .id("1343".to_string())
+                        .repository_ref(repo_ref.clone())
+                        .title("landed evidence latch".to_string())
+                        .build(),
+                )
+                .build(),
+        )
+        .await
+        .expect("create Landing convoy");
+    convoys
+        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Landing,
+            ..Default::default()
+        })
+        .await
+        .expect("set Landing phase");
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let checkout = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("checkout-reopened".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "reopened-convoy".to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                r#ref: "feature/reopened".to_string(),
+                path: "/repo".to_string(),
+                repo_ref,
+                host_ref: "host-01".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("create authority checkout");
+    checkouts
+        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &ResourceCheckoutStatus {
+            phase: ResourceCheckoutPhase::Ready,
+            path: Some("/repo".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("ready authority checkout");
+
+    daemon.reconcile_adopted_checkouts("flotilla").await.expect("observe merged change request");
+    let merged = checkouts.get("checkout-reopened").await.expect("merged observation");
+    assert_eq!(merged.status.expect("checkout status").integration.landed.value, ConditionValue::True);
+
+    daemon.reconcile_adopted_checkouts("flotilla").await.expect("observe reopened change request");
+    let reopened = checkouts.get("checkout-reopened").await.expect("reopened observation");
+    let integration = reopened.status.expect("checkout status").integration;
+    assert_eq!(integration.landed.value, ConditionValue::False, "reopened observation: {integration:?}");
+    assert_eq!(integration.landed_evidence, None);
+    assert!(!daemon.convoy_change_requests_settled("flotilla", "reopened-convoy").await.expect("evaluate settlement"));
+    assert_eq!(convoys.get("reopened-convoy").await.expect("Landing convoy").status.expect("convoy status").phase, ConvoyPhase::Landing);
+}
 
 #[test]
 fn completion_message_extracts_github_and_forgejo_change_request_urls_from_prose() {

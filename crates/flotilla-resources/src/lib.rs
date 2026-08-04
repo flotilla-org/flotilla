@@ -43,9 +43,9 @@ pub use change_request::{
     ChangeRequestStatusPatch, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
 };
 pub use checkout::{
-    ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus,
-    CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, CheckoutWorktreeSpec, ConditionValue, FreshCloneCheckoutSpec,
-    IntegrationCondition, LandedEvidence, ObservedCheckoutSpec,
+    latch_evidence_backed_integration, ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout,
+    CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch,
+    CheckoutWorktreeSpec, ConditionValue, FreshCloneCheckoutSpec, IntegrationCondition, LandedEvidence, ObservedCheckoutSpec,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use clock::VirtualClock;
