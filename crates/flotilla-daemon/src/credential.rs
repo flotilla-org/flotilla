@@ -281,11 +281,7 @@ impl CredentialStore {
             composed_fragments.extend(new_git_config_fragments);
             let gitconfig = match compose(TargetId::GitConfig, composed_fragments.values().cloned()) {
                 Ok(gitconfig) => gitconfig,
-                Err(error) => {
-                    let (name, adapter, cache_key) = git_config_owner.expect("Git config fragments have an owner");
-                    self.materials.lock().await.remove(&cache_key);
-                    return Err(bounded_adapter_error(&name, &adapter, &format!("compose shared Git config: {error}")));
-                }
+                Err(error) => return Err(format!("compose shared Git config: {error}")),
             };
             if let Err(error) = runner.write_file(Path::new(GIT_CONFIG_PATH), &gitconfig.contents).await {
                 let (name, adapter, cache_key) = git_config_owner.expect("Git config fragments have an owner");
@@ -710,13 +706,13 @@ impl CredentialStore {
 }
 
 fn git_credential_fragment(credential_name: &str, adapter: &str, credential_url: impl Into<String>, helper: impl Into<String>) -> Fragment {
-    Fragment::new(
-        TargetId::GitConfig,
-        TargetKey::GitConfig(GitConfigKey::subsection("credential", credential_url, "helper")),
-        helper,
-        Provenance::new(format!("credential/{adapter} {credential_name}")),
-    )
-    .with_merge(Merge::Append)
+    Fragment::builder()
+        .target(TargetId::GitConfig)
+        .key(TargetKey::GitConfig(GitConfigKey::subsection("credential", credential_url, "helper")))
+        .value(helper)
+        .merge(Merge::Append)
+        .provenance(Provenance::new(format!("credential/{adapter} {credential_name}")))
+        .build()
 }
 
 async fn api_key_preflight(runner: &dyn CommandRunner, url: &str, headers: &[(&str, &str)]) -> Result<(), String> {

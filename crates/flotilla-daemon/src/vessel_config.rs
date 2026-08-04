@@ -79,6 +79,10 @@ impl Provenance {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    fn contains_line_break(&self) -> bool {
+        self.0.contains(['\r', '\n'])
+    }
 }
 
 impl fmt::Display for Provenance {
@@ -102,27 +106,6 @@ pub struct Fragment {
     pub provenance: Provenance,
 }
 
-impl Fragment {
-    pub fn new(target: TargetId, key: TargetKey, value: impl Into<String>, provenance: Provenance) -> Self {
-        Self { target, key, value: value.into(), order: order::DEFAULT, priority: priority::NORMAL, merge: Merge::Set, provenance }
-    }
-
-    pub fn with_order(mut self, order: u16) -> Self {
-        self.order = order;
-        self
-    }
-
-    pub fn with_priority(mut self, priority: u16) -> Self {
-        self.priority = priority;
-        self
-    }
-
-    pub fn with_merge(mut self, merge: Merge) -> Self {
-        self.merge = merge;
-        self
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposedFile {
     pub target: TargetId,
@@ -131,6 +114,7 @@ pub struct ComposedFile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposeError {
+    InvalidProvenance { provenance: Provenance },
     TargetKeyMismatch { target: TargetId, key: TargetKey, provenance: Provenance },
     SetConflict { key: TargetKey, first: Provenance, second: Provenance },
     MergePolicyConflict { key: TargetKey, first: Provenance, second: Provenance },
@@ -140,6 +124,9 @@ pub enum ComposeError {
 impl fmt::Display for ComposeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidProvenance { provenance } => {
+                write!(formatter, "fragment provenance `{provenance}` contains a line break")
+            }
             Self::TargetKeyMismatch { target, key, provenance } => {
                 write!(formatter, "fragment from `{provenance}` uses key `{key}` with incompatible target `{target}`")
             }
@@ -160,6 +147,9 @@ impl std::error::Error for ComposeError {}
 
 pub fn compose(target: TargetId, fragments: impl IntoIterator<Item = Fragment>) -> Result<ComposedFile, ComposeError> {
     let mut fragments = fragments.into_iter().filter(|fragment| fragment.target == target).collect::<Vec<_>>();
+    if let Some(fragment) = fragments.iter().find(|fragment| fragment.provenance.contains_line_break()) {
+        return Err(ComposeError::InvalidProvenance { provenance: fragment.provenance.clone() });
+    }
     fragments.sort_by(|left, right| (left.order, &left.provenance).cmp(&(right.order, &right.provenance)));
 
     match target {
@@ -262,7 +252,12 @@ mod tests {
     use super::*;
 
     fn git_fragment(key: GitConfigKey, value: &str, provenance: &str) -> Fragment {
-        Fragment::new(TargetId::GitConfig, TargetKey::GitConfig(key), value, Provenance::new(provenance))
+        Fragment::builder()
+            .target(TargetId::GitConfig)
+            .key(TargetKey::GitConfig(key))
+            .value(value)
+            .provenance(Provenance::new(provenance))
+            .build()
     }
 
     #[test]
@@ -289,11 +284,11 @@ mod tests {
     #[test]
     fn lower_priority_number_overrides_set_fragments() {
         let key = GitConfigKey::new("user", "email");
-        let composed = compose(TargetId::GitConfig, [
-            git_fragment(key.clone(), "default@example.com", "credential/default").with_priority(priority::DEFAULT),
-            git_fragment(key, "forced@example.com", "credential/forced").with_priority(priority::FORCE),
-        ])
-        .expect("explicit override should compose");
+        let mut default = git_fragment(key.clone(), "default@example.com", "credential/default");
+        default.priority = priority::DEFAULT;
+        let mut forced = git_fragment(key, "forced@example.com", "credential/forced");
+        forced.priority = priority::FORCE;
+        let composed = compose(TargetId::GitConfig, [default, forced]).expect("explicit override should compose");
 
         assert!(composed.contents.contains("forced@example.com"));
         assert!(!composed.contents.contains("default@example.com"));
@@ -302,11 +297,21 @@ mod tests {
     #[test]
     fn append_follows_order_then_provenance_stably() {
         let key = GitConfigKey::subsection("credential", "https://example.com", "helper");
+        let fragment = |key, value, provenance, order| {
+            Fragment::builder()
+                .target(TargetId::GitConfig)
+                .key(TargetKey::GitConfig(key))
+                .value(value)
+                .order(order)
+                .merge(Merge::Append)
+                .provenance(Provenance::new(provenance))
+                .build()
+        };
         let composed = compose(TargetId::GitConfig, [
-            git_fragment(key.clone(), "late", "credential/alpha").with_order(order::LATE).with_merge(Merge::Append),
-            git_fragment(key.clone(), "same-order-z", "credential/zulu").with_order(order::EARLY).with_merge(Merge::Append),
-            git_fragment(key.clone(), "same-order-a-first", "credential/alpha").with_order(order::EARLY).with_merge(Merge::Append),
-            git_fragment(key, "same-order-a-second", "credential/alpha").with_order(order::EARLY).with_merge(Merge::Append),
+            fragment(key.clone(), "late", "credential/alpha", order::LATE),
+            fragment(key.clone(), "same-order-z", "credential/zulu", order::EARLY),
+            fragment(key.clone(), "same-order-a-first", "credential/alpha", order::EARLY),
+            fragment(key, "same-order-a-second", "credential/alpha", order::EARLY),
         ])
         .expect("append fragments should compose");
 
@@ -320,15 +325,42 @@ mod tests {
     #[test]
     fn error_on_duplicate_rejects_a_second_winning_fragment() {
         let key = GitConfigKey::new("core", "hooksPath");
-        let error = compose(TargetId::GitConfig, [
-            git_fragment(key.clone(), "/first", "workspace/first").with_merge(Merge::ErrorOnDuplicate),
-            git_fragment(key, "/second", "workspace/second").with_merge(Merge::ErrorOnDuplicate),
-        ])
-        .expect_err("ErrorOnDuplicate must reject a second contributor")
-        .to_string();
+        let mut first = git_fragment(key.clone(), "/first", "workspace/first");
+        first.merge = Merge::ErrorOnDuplicate;
+        let mut second = git_fragment(key, "/second", "workspace/second");
+        second.merge = Merge::ErrorOnDuplicate;
+        let error =
+            compose(TargetId::GitConfig, [first, second]).expect_err("ErrorOnDuplicate must reject a second contributor").to_string();
 
         assert!(error.contains("core.hooksPath"));
         assert!(error.contains("workspace/first"));
         assert!(error.contains("workspace/second"));
+    }
+
+    #[test]
+    fn different_merge_policies_name_the_key_and_both_contributors() {
+        let key = GitConfigKey::new("user", "email");
+        let first = git_fragment(key.clone(), "first@example.com", "credential/first");
+        let mut second = git_fragment(key, "second@example.com", "credential/second");
+        second.merge = Merge::Append;
+
+        let error = compose(TargetId::GitConfig, [first, second]).expect_err("winning fragments must agree on merge policy").to_string();
+
+        assert!(error.contains("user.email"));
+        assert!(error.contains("credential/first"));
+        assert!(error.contains("credential/second"));
+    }
+
+    #[test]
+    fn provenance_with_a_line_break_is_rejected_before_rendering() {
+        let error = compose(TargetId::GitConfig, [git_fragment(
+            GitConfigKey::new("user", "email"),
+            "crew@example.com",
+            "credential/first\ninjected",
+        )])
+        .expect_err("provenance comments must remain one line")
+        .to_string();
+
+        assert!(error.contains("contains a line break"));
     }
 }
