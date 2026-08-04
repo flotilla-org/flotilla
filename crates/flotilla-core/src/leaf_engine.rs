@@ -1,16 +1,10 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    future::Future,
-    marker::PhantomData,
-    pin::Pin,
-    sync::Arc,
-};
+use std::{collections::HashMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, WaitSubscriptionRequest};
 use flotilla_resources::{
-    admit_leaf, controller::SecondaryWatch, evaluate_leaf, expected_change_request_leaves, ChangeRequest, ChangeRequestLeafSubject,
-    Checkout, Convoy, ConvoyLeafSubject, ConvoyPhase, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, ThreeValue,
+    admit_leaf, controller::SecondaryWatch, evaluate_leaf, expected_change_request_leaves, select_convoy_children, ChangeRequest,
+    ChangeRequestLeafSubject, Checkout, Convoy, ConvoyLeafSubject, ConvoyPhase, ResourceBackend, ResourceError, ResourceObject, ThreeValue,
     Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject,
 };
 use futures::StreamExt;
@@ -264,8 +258,8 @@ impl ReconcilerWake {
         let mut checkout_watch = checkouts.watch().await.map_err(|error| error.to_string())?;
         let mut convoy_objects =
             listed_convoys.items.into_iter().map(|convoy| (convoy.metadata.name.clone(), convoy)).collect::<HashMap<_, _>>();
-        self.sync_rows(&namespace, &convoy_objects).await?;
         let mut wake_rx = self.subscriptions.inner.reconciler_tx.subscribe();
+        self.sync_rows(&namespace, &convoy_objects).await?;
 
         loop {
             tokio::select! {
@@ -314,7 +308,7 @@ impl ReconcilerWake {
         for convoy in convoys.values().filter(|convoy| {
             convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landing | ConvoyPhase::Anchored))
         }) {
-            let checkouts = select_convoy_checkouts(convoy, &checkout_sources);
+            let checkouts = select_convoy_children(convoy, &checkout_sources);
             let leaves = match expected_change_request_leaves(convoy, &checkouts) {
                 Ok(leaves) => leaves,
                 Err(error) => {
@@ -384,38 +378,6 @@ impl ReconcilerWake {
         }
         Ok(())
     }
-}
-
-fn select_convoy_checkouts(
-    convoy: &ResourceObject<Convoy>,
-    sources: &[flotilla_resources::ReadResourceObject<Checkout>],
-) -> BTreeMap<String, ResourceObject<Checkout>> {
-    let target_host_ref = convoy
-        .status
-        .as_ref()
-        .and_then(|status| status.placement_decision.as_ref())
-        .map(|decision| decision.target_host.reference.as_str());
-    let mut selected = BTreeMap::<String, (u8, ResourceObject<Checkout>)>::new();
-    for source in sources {
-        if source.object.metadata.labels.get(flotilla_resources::CONVOY_LABEL) != Some(&convoy.metadata.name) {
-            continue;
-        }
-        let actuator_matches = target_host_ref.is_some_and(|target| {
-            source.object.metadata.annotations.get(flotilla_resources::ACTUATOR_HOST_REF_ANNOTATION).is_some_and(|host| host == target)
-        });
-        let priority = if actuator_matches {
-            2
-        } else if matches!(source.provenance, ResourceProvenance::Local) {
-            1
-        } else {
-            0
-        };
-        let name = source.object.metadata.name.clone();
-        if selected.get(&name).is_none_or(|(current_priority, _)| priority > *current_priority) {
-            selected.insert(name, (priority, source.object.clone()));
-        }
-    }
-    selected.into_iter().map(|(name, (_, checkout))| (name, checkout)).collect()
 }
 
 fn apply_read_event<T: flotilla_resources::Resource>(

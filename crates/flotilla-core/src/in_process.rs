@@ -6164,59 +6164,6 @@ impl InProcessDaemon {
         self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())
     }
 
-    /// Evaluate the Landing→Landed condition on evidence no older than
-    /// [`LANDING_EVIDENCE_TTL`]: every managed convoy checkout's landed
-    /// condition must be `True` on a recent authority-side observation.
-    /// Missing, stale, or unknown replicated evidence holds Landing; this
-    /// evaluator never probes or writes a checkout because its authority may
-    /// be another host. Adopted checkouts participate because an adopted open
-    /// change request is still outstanding, even though its checkout is exempt
-    /// from deletion.
-    pub async fn convoy_change_requests_settled(&self, namespace: &str, name: &str) -> Result<bool, String> {
-        let checkout_list = self
-            .resource_backend
-            .clone()
-            .using::<ResourceCheckout>(namespace)
-            .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]))
-            .await
-            .map_err(|err| err.to_string())?
-            .items;
-        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
-        self.convoy_change_requests_settled_for_checkouts(&convoy, &checkout_list).await
-    }
-
-    pub async fn convoy_change_requests_settled_for_checkouts(
-        &self,
-        convoy: &ResourceObject<ResourceConvoy>,
-        checkout_list: &[ResourceObject<ResourceCheckout>],
-    ) -> Result<bool, String> {
-        let expected = flotilla_resources::expected_checkout_refs(convoy)?;
-        for checkout_name in expected {
-            let Some(checkout) = checkout_list.iter().find(|checkout| checkout.metadata.name == checkout_name) else {
-                warn!(checkout = %checkout_name, convoy = %convoy.metadata.name, "checkout landing evidence is missing");
-                return Ok(false);
-            };
-            let Some(landed) = checkout.status.as_ref().map(|status| &status.integration.landed) else {
-                warn!(checkout = %checkout.metadata.name, convoy = %convoy.metadata.name, "checkout landing evidence is missing");
-                return Ok(false);
-            };
-            if !integration_condition_is_fresh(landed, self.clock.now()) {
-                warn!(checkout = %checkout.metadata.name, convoy = %convoy.metadata.name, "checkout landing evidence is missing or stale");
-                return Ok(false);
-            }
-            match landed.value {
-                ConditionValue::True => continue,
-                ConditionValue::False => return Ok(false),
-                ConditionValue::Unknown => {
-                    warn!(checkout = %checkout.metadata.name, convoy = %convoy.metadata.name, details = ?landed.details, "checkout landing evidence is unknown");
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(true)
-    }
-
     pub async fn verify_convoy_teardown_gate(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         if force {
             return Ok(());

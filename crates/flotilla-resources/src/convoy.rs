@@ -4,7 +4,10 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef};
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, workflow_template::VesselRequirement, ReplicationClass, RepositoryKey};
+use crate::{
+    resource::define_resource, status_patch::StatusPatch, workflow_template::VesselRequirement, ReadResourceObject, ReplicationClass,
+    RepositoryKey, Resource, ResourceObject, ResourceProvenance, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
+};
 
 mod reconcile;
 
@@ -82,6 +85,42 @@ pub fn expected_checkout_refs(convoy: &crate::ResourceObject<Convoy>) -> Result<
         expected.extend(checkout_refs.into_values());
     }
     Ok(expected)
+}
+
+/// Select the authoritative child observation for each object name.
+///
+/// The actuator host wins when placement identifies one, followed by a local
+/// object and then any replica. Keeping this selection shared ensures lifecycle
+/// decisions and their derived wake subscriptions consume identical evidence.
+pub fn select_convoy_children<T: Resource + Clone>(
+    convoy: &ResourceObject<Convoy>,
+    sources: &[ReadResourceObject<T>],
+) -> BTreeMap<String, ResourceObject<T>> {
+    let target_host_ref = convoy
+        .status
+        .as_ref()
+        .and_then(|status| status.placement_decision.as_ref())
+        .map(|decision| decision.target_host.reference.as_str());
+    let mut selected = BTreeMap::<String, (u8, ResourceObject<T>)>::new();
+    for source in sources {
+        if source.object.metadata.labels.get(CONVOY_LABEL) != Some(&convoy.metadata.name) {
+            continue;
+        }
+        let actuator_matches = target_host_ref
+            .is_some_and(|target| source.object.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).is_some_and(|host| host == target));
+        let priority = if actuator_matches {
+            2
+        } else if matches!(source.provenance, ResourceProvenance::Local) {
+            1
+        } else {
+            0
+        };
+        let name = source.object.metadata.name.clone();
+        if selected.get(&name).is_none_or(|(current_priority, _)| priority > *current_priority) {
+            selected.insert(name, (priority, source.object.clone()));
+        }
+    }
+    selected.into_iter().map(|(name, (_, object))| (name, object)).collect()
 }
 
 /// Hardwired world-terminal leaves armed while a convoy is Landing.

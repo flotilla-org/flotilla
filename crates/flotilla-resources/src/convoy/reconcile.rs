@@ -9,8 +9,9 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use super::{
-    controller_patches, expected_change_request_leaves, expected_checkout_refs, provisioning_patches, Convoy, ConvoyPhase,
-    ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    controller_patches, expected_change_request_leaves, expected_checkout_refs, provisioning_patches, select_convoy_children, Convoy,
+    ConvoyPhase, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState,
+    WorkflowSnapshot,
 };
 use crate::{
     checkout::Checkout,
@@ -24,10 +25,10 @@ use crate::{
     resource::ResourceObject,
     status_patch::StatusPatch,
     terminal_session::TerminalSession,
-    vessel::{Vessel, VesselPhase, ACTUATOR_HOST_REF_ANNOTATION},
+    vessel::{Vessel, VesselPhase},
     workflow_template::{validate, visit_template_tokens, CrewSource, CrewSpec, ValidationError, WorkflowTemplate},
-    ChangeRequest, ChangeRequestLeafSubject, InputMeta, InputValue, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector,
-    ReplicaReadResolver, Resource, ResourceError, ResourceProvenance, ThreeValue, TypedResolver,
+    ChangeRequest, ChangeRequestLeafSubject, Clock, InputMeta, InputValue, OwnerReference, PlacementStatus,
+    PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError, SystemClock, ThreeValue, TypedResolver,
 };
 
 #[async_trait]
@@ -76,6 +77,7 @@ pub struct ConvoyReconciler {
     federated_checkouts: Option<ReplicaReadResolver<Checkout>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
     change_request_stale_after: std::time::Duration,
+    clock: Arc<dyn Clock>,
     prepared_snapshot_gc: Option<PreparedSnapshotGarbageCollector>,
     teardown_runtime: Option<Arc<dyn ConvoyTeardownRuntime>>,
 }
@@ -102,6 +104,7 @@ impl ConvoyReconciler {
             federated_checkouts: None,
             change_requests: None,
             change_request_stale_after: std::time::Duration::from_secs(180),
+            clock: Arc::new(SystemClock),
             prepared_snapshot_gc: None,
             teardown_runtime: None,
         }
@@ -143,6 +146,11 @@ impl ConvoyReconciler {
         self
     }
 
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
     pub fn with_prepared_snapshot_gc(mut self, collector: PreparedSnapshotGarbageCollector) -> Self {
         self.prepared_snapshot_gc = Some(collector);
         self
@@ -181,35 +189,11 @@ impl ConvoyReconciler {
     }
 }
 
-async fn federated_children<T: Resource>(
+async fn federated_children<T: Resource + Clone>(
     resolver: &ReplicaReadResolver<T>,
     convoy: &ResourceObject<Convoy>,
 ) -> Result<BTreeMap<String, ResourceObject<T>>, ResourceError> {
-    let target_host_ref = convoy
-        .status
-        .as_ref()
-        .and_then(|status| status.placement_decision.as_ref())
-        .map(|decision| decision.target_host.reference.as_str());
-    let mut selected = BTreeMap::<String, (u8, ResourceObject<T>)>::new();
-    for source in resolver.list().await?.items {
-        if source.object.metadata.labels.get(CONVOY_LABEL) != Some(&convoy.metadata.name) {
-            continue;
-        }
-        let actuator_matches = target_host_ref
-            .is_some_and(|target| source.object.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).is_some_and(|host| host == target));
-        let priority = if actuator_matches {
-            2
-        } else if matches!(source.provenance, ResourceProvenance::Local) {
-            1
-        } else {
-            0
-        };
-        let name = source.object.metadata.name.clone();
-        if selected.get(&name).is_none_or(|(current_priority, _)| priority > *current_priority) {
-            selected.insert(name, (priority, source.object));
-        }
-    }
-    Ok(selected.into_iter().map(|(name, (_, object))| (name, object)).collect())
+    Ok(select_convoy_children(convoy, &resolver.list().await?.items))
 }
 
 fn landing_condition_satisfied(
@@ -217,6 +201,7 @@ fn landing_condition_satisfied(
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     stale_after: std::time::Duration,
+    now: DateTime<Utc>,
 ) -> bool {
     let Ok(leaves) = expected_change_request_leaves(convoy, checkouts) else {
         return false;
@@ -227,8 +212,7 @@ fn landing_condition_satisfied(
                 return false;
             };
             let name = crate::change_request_record_name(service, scope, *number);
-            let subject =
-                change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject { change_request, now: Utc::now(), stale_after });
+            let subject = change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject { change_request, now, stale_after });
             crate::evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject), None)
                 .is_ok_and(|evaluation| evaluation.result == ThreeValue::True)
         })
@@ -308,7 +292,7 @@ impl Reconciler for ConvoyReconciler {
             None => BTreeMap::new(),
         };
         let no_change_request_outstanding = if obj.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing) {
-            landing_condition_satisfied(obj, &checkouts, &change_requests, self.change_request_stale_after)
+            landing_condition_satisfied(obj, &checkouts, &change_requests, self.change_request_stale_after, self.clock.now())
         } else {
             false
         };
