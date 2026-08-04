@@ -949,6 +949,7 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
             issue_source,
+            dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
                 alias: None,
@@ -995,6 +996,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
             display_name: "Zellij".into(),
             default_workflow_ref: "single-agent-contained".into(),
             issue_source: Some(IssueSource { service: "https://forgejo.lab".into(), scope: "fork-issues/zellij".into() }),
+            dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
                 alias: None,
@@ -1095,6 +1097,7 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
             display_name: "Flotilla".to_string(),
             default_workflow_ref: "single-agent-contained".to_string(),
             issue_source: None,
+            dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository_key.clone(),
                 alias: None,
@@ -1269,6 +1272,7 @@ async fn bare_convoy_start_uses_priority_and_records_every_placement_candidate()
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-trusted".into(),
             issue_source: None,
+            dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
                 alias: None,
@@ -1359,6 +1363,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
             issue_source: None,
+            dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
                 alias: None,
@@ -1482,6 +1487,7 @@ async fn convoy_start_accepts_project_list_identifier() {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
             issue_source: None,
+            dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
                 alias: None,
@@ -1622,6 +1628,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
             issue_source: Some(reference.source.clone()),
+            dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
                 alias: None,
@@ -1825,6 +1832,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             display_name: "Explicit workflow".into(),
             default_workflow_ref: "missing-default".into(),
             issue_source: None,
+            dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
                 alias: None,
@@ -1982,6 +1990,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
             issue_source: None,
+            dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
                 alias: None,
@@ -3812,6 +3821,7 @@ async fn whole_repository_materialization_skips_generated_name_occupied_by_multi
             display_name: "repo suite".to_string(),
             default_workflow_ref: "single-agent-contained".to_string(),
             issue_source: None,
+            dispatch_policy: None,
             repositories: vec![
                 ProjectRepositorySpec { repo: tracked.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
                 ProjectRepositorySpec { repo: other.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },

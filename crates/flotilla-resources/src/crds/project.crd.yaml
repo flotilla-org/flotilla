@@ -35,6 +35,23 @@ spec:
                       type: string
                     scope:
                       type: string
+                dispatch_policy:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: true
+                    max_concurrent:
+                      type: integer
+                      minimum: 1
+                      default: 3
+                    placement_policy:
+                      type: string
+                      minLength: 1
+                    stance_preference:
+                      type: string
+                      enum: [trusted, workspace-write, contained]
+                      default: contained
                 repositories:
                   type: array
                   minItems: 1
@@ -57,3 +74,10 @@ spec:
                         type: string
                       default_branch:
                         type: string
+            status:
+              type: object
+              properties:
+                dispatch_attention:
+                  type: object
+                  required: [issue, issue_as_of, policy, reason, observed_at]
+                  x-kubernetes-preserve-unknown-fields: true

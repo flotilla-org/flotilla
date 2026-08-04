@@ -2846,7 +2846,7 @@ impl InProcessDaemon {
         }
         let fallback_principal = PrincipalRef::implicit_for_namespace(&namespace);
         let admission =
-            self.prepare_convoy_admission(&namespace, &intent, dispatching_principal_ref.unwrap_or(&fallback_principal)).await?;
+            self.prepare_convoy_admission(&namespace, &intent, dispatching_principal_ref.unwrap_or(&fallback_principal), None).await?;
         let workflow_value = serde_json::to_value(&admission.workflow).map_err(|error| error.to_string())?;
         let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
         let (placement_policy_name, placement_policy_spec) = match admission.placement_policy {
@@ -3904,6 +3904,7 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
             subpath: None,
             default_branch: None,
         }],
+        dispatch_policy: None,
     })
 }
 
@@ -4429,6 +4430,7 @@ impl InProcessDaemon {
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
         dispatching_principal_ref: &PrincipalRef,
+        stance_preference: Option<flotilla_resources::Stance>,
     ) -> Result<ConvoyAdmission, String> {
         let project_ref = required_admission_value(&intent.project_ref, "project")?;
         let project = self
@@ -4476,7 +4478,7 @@ impl InProcessDaemon {
             None if change_request.is_some() => "single-agent-shepherd".to_string(),
             None => project.spec.default_workflow_ref.clone(),
         };
-        let mut workflow = self
+        let workflow = self
             .resource_backend
             .clone()
             .using::<WorkflowTemplate>(namespace)
@@ -4484,7 +4486,6 @@ impl InProcessDaemon {
             .await
             .map_err(|error| format!("workflow template {workflow_ref}: {error}"))?;
         validate_fork_workflow_admission(&self.resource_backend, namespace, &repositories, &workflow_ref, &workflow.spec).await?;
-        resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), &repositories, &mut workflow.spec).await?;
 
         let fallback_slug = change_request
             .as_ref()
@@ -4529,7 +4530,16 @@ impl InProcessDaemon {
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
-        let placement = self.resolve_and_validate_convoy_placement(namespace, &workflow.spec, intent.placement_policy.as_deref()).await?;
+        let (workflow, placement) = self
+            .resolve_admission_workflow_and_placement(
+                namespace,
+                project_ref,
+                &repositories,
+                workflow.spec,
+                intent.placement_policy.as_deref(),
+                stance_preference,
+            )
+            .await?;
         let placement_policy = placement.selected.as_ref().map(|placement| placement.metadata.name.clone());
         let placement_decision = match placement.selected.as_ref() {
             Some(selected) => Some(PlacementDecision {
@@ -4556,7 +4566,7 @@ impl InProcessDaemon {
         Ok(ConvoyAdmission::builder()
             .name(name)
             .spec(spec)
-            .workflow(workflow.spec)
+            .workflow(workflow)
             .maybe_placement_policy(placement.selected.map(|placement| placement.spec))
             .maybe_placement_decision(placement_decision)
             .build())
@@ -4569,7 +4579,7 @@ impl InProcessDaemon {
         dispatching_principal_ref: &PrincipalRef,
     ) -> Result<String, String> {
         self.check_local_free_space_floor().await?;
-        let admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
+        let admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref, None).await?;
         self.create_convoy_with_workflow_snapshot(
             namespace,
             &admission.name,
@@ -4597,6 +4607,71 @@ impl InProcessDaemon {
         })
         .await
         .map_err(|error| format!("free-space check failed on host `{}`: {error}", self.host_name))?
+    }
+
+    async fn resolve_admission_workflow_and_placement(
+        &self,
+        namespace: &str,
+        project_ref: &str,
+        repositories: &[ConvoyRepositorySpec],
+        workflow: WorkflowTemplateSpec,
+        placement_policy: Option<&str>,
+        stance_preference: Option<flotilla_resources::Stance>,
+    ) -> Result<(WorkflowTemplateSpec, PlacementResolution), String> {
+        if let Some(preference) = stance_preference {
+            let mut preferred = workflow.clone();
+            for vessel in &mut preferred.vessels {
+                vessel.stance = vessel.stance.max(preference);
+            }
+            let preferred_result = async {
+                resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), repositories, &mut preferred).await?;
+                let placement = self.resolve_and_validate_convoy_placement(namespace, &preferred, placement_policy).await?;
+                Ok::<_, String>((preferred, placement))
+            }
+            .await;
+            match preferred_result {
+                Ok(resolved) => return Ok(resolved),
+                Err(error) => {
+                    debug!(%error, %preference, %project_ref, "preferred dispatch stance is unavailable; using workflow stance");
+                }
+            }
+        }
+
+        let mut workflow = workflow;
+        resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), repositories, &mut workflow).await?;
+        let placement = self.resolve_and_validate_convoy_placement(namespace, &workflow, placement_policy).await?;
+        Ok((workflow, placement))
+    }
+
+    /// Admit one daemon-initiated convoy through the same completion and
+    /// validation path used by human dispatch, while recording its durable
+    /// policy provenance and avoiding an implicit human-attention regard.
+    pub async fn admit_dispatch_reconciler_convoy(
+        &self,
+        namespace: &str,
+        intent: &flotilla_protocol::ConvoyStartIntent,
+        stance_preference: flotilla_resources::Stance,
+        provenance: String,
+    ) -> Result<String, String> {
+        self.check_local_free_space_floor().await?;
+        let principal = PrincipalRef { namespace: namespace.to_string(), name: "dispatch-reconciler".to_string() };
+        let admission = self.prepare_convoy_admission(namespace, intent, &principal, Some(stance_preference)).await?;
+        let workflow_value = serde_json::to_value(&admission.workflow).map_err(|error| error.to_string())?;
+        let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
+        ensure_prepared_workflow_snapshot(&self.resource_backend, namespace, &workflow_name, &admission.workflow).await?;
+        self.create_convoy_with_annotations(
+            namespace,
+            &admission.name,
+            &admission.spec,
+            admission.placement_decision,
+            ConvoyDispatchRegard::Suppress,
+            BTreeMap::from([
+                (flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name),
+                (flotilla_resources::DISPATCH_PROVENANCE_ANNOTATION.to_string(), provenance),
+            ]),
+        )
+        .await?;
+        Ok(admission.name)
     }
 
     async fn create_convoy_with_workflow_snapshot(
@@ -5148,6 +5223,7 @@ impl InProcessDaemon {
             default_workflow_ref: "single-agent-trusted".to_string(),
             issue_source: None,
             repositories: members,
+            dispatch_policy: existing_project.as_ref().and_then(|project| project.spec.dispatch_policy.clone()),
         })?;
         let mut meta = existing_project
             .as_ref()

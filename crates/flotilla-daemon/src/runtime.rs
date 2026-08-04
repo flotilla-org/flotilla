@@ -54,6 +54,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     agent_material::{AgentMaterialPrepareError, AgentMaterialRegistry},
     credential::CredentialStore,
+    dispatch_reconciler::{DaemonDispatchAdmission, DaemonDispatchIssueSource, DispatchAdmission, DispatchIssueSource, DispatchReconciler},
     environment_tools::EnvironmentToolProvisioner,
     resource_limits::file_descriptor_pressure_condition,
     resource_manifest::ResourceManifestReconciler,
@@ -442,6 +443,7 @@ impl DaemonRuntime {
         }
 
         if options.start_controllers {
+            tasks.push(spawn_dispatch_reconciler_task(Arc::clone(&daemon), options.namespace.clone(), options.controller_resync_interval));
             let local_repo_root = daemon.tracked_repo_paths().await.into_iter().next().map(ExecutionEnvironmentPath::new);
             let state = Arc::new(
                 ControllerRuntimeState::new(
@@ -1013,6 +1015,20 @@ fn spawn_adopted_checkout_reconciliation_task(daemon: Arc<InProcessDaemon>, name
         async move {
             if let Err(error) = daemon.reconcile_adopted_checkouts(&namespace).await {
                 warn!(%error, "failed to reconcile adopted checkout observations");
+            }
+        }
+    })
+}
+
+fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, namespace: String, interval: Duration) -> JoinHandle<()> {
+    let issues = Arc::new(DaemonDispatchIssueSource::new(Arc::clone(&daemon))) as Arc<dyn DispatchIssueSource>;
+    let admission = Arc::new(DaemonDispatchAdmission::new(Arc::clone(&daemon))) as Arc<dyn DispatchAdmission>;
+    let reconciler = Arc::new(DispatchReconciler::new(daemon.resource_backend(), namespace, issues, admission));
+    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
+        let reconciler = Arc::clone(&reconciler);
+        async move {
+            if let Err(error) = reconciler.reconcile_once().await {
+                warn!(%error, "dispatch reconciliation pass failed");
             }
         }
     })

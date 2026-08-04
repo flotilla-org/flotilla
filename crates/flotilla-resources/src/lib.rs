@@ -57,8 +57,8 @@ pub use convoy::{
     reconcile, select_convoy_children, BoundChangeRequest, Convoy, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyReconciler,
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewWorkPhase, CrewWorkState, InputValue,
     IssueSnapshot, PlacementStatus, ReconcileOutcome, SettlementEvaluation, SettlementMode, TargetMismatch, UnmetSettlementExpectation,
-    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_PENDING_ANNOTATION,
-    WORKFLOW_SNAPSHOT_ANNOTATION,
+    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, DISPATCH_PROVENANCE_ANNOTATION, PLACEMENT_SNAPSHOT_ANNOTATION,
+    PREPARED_SNAPSHOT_PENDING_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use credential::{
     CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
@@ -104,8 +104,9 @@ pub use principal_attention::{
     RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
 };
 pub use project::{
-    normalize_project_spec, resolve_project_issue_sources, IssueSource, IssueSourceResolution, IssueSourceUnavailable, Project,
-    ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
+    normalize_project_spec, resolve_project_issue_sources, DispatchAttention, DispatchPolicy, IssueSource, IssueSourceResolution,
+    IssueSourceUnavailable, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatus, ProjectStatusPatch,
+    DEFAULT_AUTO_DISPATCH_CONCURRENCY,
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use registry::{
