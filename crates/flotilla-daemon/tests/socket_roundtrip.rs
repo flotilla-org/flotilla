@@ -1,4 +1,11 @@
-use std::{collections::HashMap, fs, path::Path, process::Command as ProcessCommand, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+    sync::Arc,
+    time::Duration,
+};
 
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, providers::discovery::test_support::git_process_discovery};
 use flotilla_daemon::server::DaemonServer;
@@ -8,7 +15,7 @@ use tokio::time::Instant;
 
 struct LocalGitRepository {
     _temp: tempfile::TempDir,
-    path: std::path::PathBuf,
+    path: PathBuf,
 }
 
 impl LocalGitRepository {

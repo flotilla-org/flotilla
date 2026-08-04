@@ -11,6 +11,10 @@ permissions:
   contents: read
 
 env:
+  # Format and Clippy remain platform-independent gates in GitHub CI. This
+  # workflow exercises the Darwin build and test surface specifically.
+  # One-job guests are destroyed after each run, so build caches are not
+  # persisted between jobs.
   CARGO_INCREMENTAL: "0"
   GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1"
 
@@ -30,7 +34,7 @@ jobs:
         run: |
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
-          test "$(security find-identity -v -p codesigning | tail -1)" = "     0 valid identities found"
+          security find-identity -v -p codesigning | grep -Eq '^[[:space:]]*0 valid identities found[[:space:]]*$'
           test ! -e "$HOME/.config/forgejo-runner/.runner"
           test -z "${FLEET_CODESIGN_IDENTITY:-}"
           test -z "${FORGEJO_ADMIN_TOKEN:-}"
