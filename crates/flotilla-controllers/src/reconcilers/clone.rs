@@ -78,14 +78,14 @@ where
         &self,
         obj: &ResourceObject<Self::Resource>,
         deps: &Self::Dependencies,
-        _now: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(ClonePhase::Pending);
         let patch = if matches!(phase, ClonePhase::Pending | ClonePhase::Cloning) {
             match deps {
                 CloneDeps::Ready { default_branch } => Some(CloneStatusPatch::MarkReady { default_branch: default_branch.clone() }),
                 CloneDeps::Retrying(message) => Some(CloneStatusPatch::MarkRetrying { message: message.clone() }),
-                CloneDeps::Failed(message) => Some(CloneStatusPatch::MarkFailed { message: message.clone() }),
+                CloneDeps::Failed(message) => Some(CloneStatusPatch::MarkFailed { message: message.clone(), failed_at: now }),
                 CloneDeps::None => None,
             }
         } else {

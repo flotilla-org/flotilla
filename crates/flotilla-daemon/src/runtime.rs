@@ -3323,6 +3323,30 @@ mod tests {
         assert_eq!(default_branch.as_deref(), Some("main"));
     }
 
+    #[tokio::test]
+    async fn clone_runtime_rejects_a_dirty_target_then_recovers_after_it_is_removed() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let target = temp.path().join("clone");
+        fs::create_dir_all(&target).expect("dirty target directory");
+        fs::write(target.join("leftover"), "debris").expect("dirty target contents");
+        let runtime = CloneControllerRuntime { runner: Arc::new(ProcessCommandRunner), flights: Arc::new(CloneFlights::default()) };
+        let repo_url = source.path().to_str().expect("utf-8 source path");
+        let target_path = target.to_str().expect("utf-8 target path");
+
+        let error = runtime.clone_and_inspect(repo_url, target_path).await.expect_err("dirty target should not be overwritten");
+
+        assert!(error.contains("clone target") && error.contains("already exists"), "unexpected dirty-target error: {error}");
+        assert!(target.join("leftover").exists(), "dirty target must remain untouched");
+        assert!(!Path::new(&clone_staging_path(target_path)).exists(), "rejected target must not start a staged clone");
+
+        fs::remove_dir_all(&target).expect("remove transient obstruction");
+        let default_branch =
+            runtime.clone_and_inspect(repo_url, target_path).await.expect("clone should recover after obstruction removal");
+
+        assert_eq!(default_branch.as_deref(), Some("main"));
+    }
+
     struct TestInteriorEnvironmentProvider {
         handle: Mutex<Option<EnvironmentHandle>>,
     }

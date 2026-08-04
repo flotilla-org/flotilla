@@ -152,7 +152,7 @@ async fn clone_failure_retries_once_before_marking_failed() {
 
     assert!(matches!(
         repeated_outcome.patch,
-        Some(flotilla_resources::CloneStatusPatch::MarkFailed { message }) if message == "authentication failed"
+        Some(flotilla_resources::CloneStatusPatch::MarkFailed { message, .. }) if message == "authentication failed"
     ));
     assert!(repeated_outcome.requeue_after.is_none());
 }

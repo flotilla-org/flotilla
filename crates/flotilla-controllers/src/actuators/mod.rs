@@ -9,27 +9,11 @@ use flotilla_core::{
             CONTAINED_DAEMON_REQUIRED_ENV,
         },
         terminal::TerminalPool,
-        vcs::{CloneInspection, CloneProvisioner},
     },
 };
 use flotilla_resources::{
     DockerEnvironmentSpec, EnvironmentMount, EnvironmentMountMode, FreshCloneCheckoutSpec, TerminalSessionSource, TerminalSessionSpec,
 };
-
-pub struct CloneActuator {
-    provisioner: Arc<dyn CloneProvisioner>,
-}
-
-impl CloneActuator {
-    pub fn new(provisioner: Arc<dyn CloneProvisioner>) -> Self {
-        Self { provisioner }
-    }
-
-    pub async fn clone_and_inspect(&self, repo_url: &str, target_path: &ExecutionEnvironmentPath) -> Result<CloneInspection, String> {
-        self.provisioner.clone_repo(repo_url, target_path).await?;
-        self.provisioner.inspect_clone(target_path).await
-    }
-}
 
 pub struct DockerEnvironmentActuator {
     daemon_socket_path: DaemonHostPath,

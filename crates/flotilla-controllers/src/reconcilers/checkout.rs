@@ -6,7 +6,7 @@ use flotilla_core::checkout_integration::{
     checkout_observation_lacks_convoy_association, convoy_change_request_id_for_checkout, LANDING_EVIDENCE_TTL,
 };
 use flotilla_resources::{
-    controller::{ReconcileOutcome, Reconciler, ReplicaConvoyCheckoutWatch, SecondaryWatch},
+    controller::{Actuation, ReconcileOutcome, Reconciler, ReplicaConvoyCheckoutWatch, SecondaryWatch},
     Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, Clock,
     Clone, ClonePhase, Convoy, ConvoyPhase, IntegrationCondition, ReplicaReadResolver, ResourceBackend, ResourceError, ResourceObject,
     ResourceProvenance, SystemClock, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
@@ -154,6 +154,7 @@ pub enum CheckoutDeps {
     None,
     Ready { prepared: PreparedCheckout },
     Integration { status: Box<CheckoutIntegrationStatus> },
+    RetryClone { clone_name: String, failed_at: DateTime<Utc> },
     Waiting,
     Failed(String),
 }
@@ -218,6 +219,22 @@ where
                     Err(ResourceError::NotFound { .. }) => return Ok(CheckoutDeps::Waiting),
                     Err(err) => return Err(err),
                 };
+                if clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
+                    let failed_at = clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
+                    if failed_at <= obj.metadata.creation_timestamp {
+                        return Ok(CheckoutDeps::RetryClone { clone_name: clone.metadata.name, failed_at });
+                    }
+                    let detail = clone
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.message.as_deref())
+                        .map_or(String::new(), |message| format!(": {message}"));
+                    return Ok(CheckoutDeps::Failed(format!(
+                        "clone {} is Failed since {}{detail}",
+                        clone.metadata.name,
+                        failed_at.to_rfc3339()
+                    )));
+                }
                 if clone.status.as_ref().map(|status| status.phase) != Some(ClonePhase::Ready) {
                     return Ok(CheckoutDeps::Waiting);
                 }
@@ -255,6 +272,7 @@ where
                     branch_provenance: prepared.branch_provenance,
                 }),
                 CheckoutDeps::Integration { .. } => None,
+                CheckoutDeps::RetryClone { .. } => None,
                 CheckoutDeps::Failed(message) => Some(CheckoutStatusPatch::MarkFailed { message: message.clone() }),
                 CheckoutDeps::Waiting | CheckoutDeps::None => None,
             }
@@ -284,13 +302,19 @@ where
                         change_request: None,
                     }),
                 }),
-                CheckoutDeps::None | CheckoutDeps::Ready { .. } | CheckoutDeps::Waiting => None,
+                CheckoutDeps::None | CheckoutDeps::Ready { .. } | CheckoutDeps::RetryClone { .. } | CheckoutDeps::Waiting => None,
             }
         } else {
             None
         };
 
-        let mut outcome = ReconcileOutcome::new(patch);
+        let actuations = match deps {
+            CheckoutDeps::RetryClone { clone_name, failed_at } => {
+                vec![Actuation::RetryClone { name: clone_name.clone(), failed_at: *failed_at }]
+            }
+            _ => Vec::new(),
+        };
+        let mut outcome = ReconcileOutcome::with_actuations(patch, actuations);
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) == CheckoutPhase::Pending
             && !matches!(deps, CheckoutDeps::Failed(_))
         {
