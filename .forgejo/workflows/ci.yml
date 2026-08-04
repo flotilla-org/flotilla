@@ -1,0 +1,42 @@
+name: Forgejo CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  darwin:
+    name: Darwin build and test
+    runs-on: darwin-aarch64
+    timeout-minutes: 90
+    steps:
+      - name: Check out the repository
+        uses: https://data.forgejo.org/actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Verify the credential-free worker
+        shell: /bin/sh -e {0}
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          test "$(security find-identity -v -p codesigning | tail -1)" = "     0 valid identities found"
+          test ! -e "$HOME/.config/forgejo-runner/.runner"
+          test -z "${FLEET_CODESIGN_IDENTITY:-}"
+          test -z "${FORGEJO_ADMIN_TOKEN:-}"
+          ! git config --local --get-regexp 'http\..*\.extraheader'
+
+      - name: Build binaries
+        run: cargo build --locked --bins
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
