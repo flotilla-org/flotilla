@@ -54,6 +54,12 @@ impl GitConfigKey {
     pub fn subsection(section: impl Into<String>, subsection: impl Into<String>, name: impl Into<String>) -> Self {
         Self { section: section.into(), subsection: Some(subsection.into()), name: name.into() }
     }
+
+    fn contains_line_break(&self) -> bool {
+        self.section.contains(['\r', '\n'])
+            || self.subsection.as_ref().is_some_and(|subsection| subsection.contains(['\r', '\n']))
+            || self.name.contains(['\r', '\n'])
+    }
 }
 
 impl fmt::Display for GitConfigKey {
@@ -115,6 +121,8 @@ pub struct ComposedFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposeError {
     InvalidProvenance { provenance: Provenance },
+    InvalidKey { provenance: Provenance },
+    InvalidValue { key: TargetKey, provenance: Provenance },
     TargetKeyMismatch { target: TargetId, key: TargetKey, provenance: Provenance },
     SetConflict { key: TargetKey, first: Provenance, second: Provenance },
     MergePolicyConflict { key: TargetKey, first: Provenance, second: Provenance },
@@ -126,6 +134,12 @@ impl fmt::Display for ComposeError {
         match self {
             Self::InvalidProvenance { provenance } => {
                 write!(formatter, "fragment provenance `{provenance}` contains a line break")
+            }
+            Self::InvalidKey { provenance } => {
+                write!(formatter, "fragment from `{provenance}` has a key containing a line break")
+            }
+            Self::InvalidValue { key, provenance } => {
+                write!(formatter, "fragment from `{provenance}` has a value containing a line break for key `{key}`")
             }
             Self::TargetKeyMismatch { target, key, provenance } => {
                 write!(formatter, "fragment from `{provenance}` uses key `{key}` with incompatible target `{target}`")
@@ -159,12 +173,15 @@ pub fn compose(target: TargetId, fragments: impl IntoIterator<Item = Fragment>) 
 
 fn compose_gitconfig(fragments: Vec<Fragment>) -> Result<ComposedFile, ComposeError> {
     for fragment in &fragments {
-        if !matches!(fragment.key, TargetKey::GitConfig(_)) {
-            return Err(ComposeError::TargetKeyMismatch {
-                target: fragment.target,
-                key: fragment.key.clone(),
-                provenance: fragment.provenance.clone(),
-            });
+        match &fragment.key {
+            TargetKey::GitConfig(key) => {
+                if key.contains_line_break() {
+                    return Err(ComposeError::InvalidKey { provenance: fragment.provenance.clone() });
+                }
+            }
+        }
+        if fragment.value.contains(['\r', '\n']) {
+            return Err(ComposeError::InvalidValue { key: fragment.key.clone(), provenance: fragment.provenance.clone() });
         }
     }
 
@@ -362,5 +379,34 @@ mod tests {
         .to_string();
 
         assert!(error.contains("contains a line break"));
+    }
+
+    #[test]
+    fn gitconfig_key_with_a_line_break_is_rejected_before_rendering() {
+        let error = compose(TargetId::GitConfig, [git_fragment(
+            GitConfigKey::new("user\n[injected]", "email"),
+            "crew@example.com",
+            "credential/first",
+        )])
+        .expect_err("gitconfig keys must remain one line")
+        .to_string();
+
+        assert!(error.contains("key containing a line break"));
+        assert!(error.contains("credential/first"));
+    }
+
+    #[test]
+    fn gitconfig_value_with_a_line_break_is_rejected_before_rendering() {
+        let error = compose(TargetId::GitConfig, [git_fragment(
+            GitConfigKey::new("user", "email"),
+            "crew@example.com\n[injected]",
+            "credential/first",
+        )])
+        .expect_err("gitconfig values must remain one line")
+        .to_string();
+
+        assert!(error.contains("value containing a line break"));
+        assert!(error.contains("user.email"));
+        assert!(error.contains("credential/first"));
     }
 }
