@@ -604,6 +604,11 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::WorkflowTemplateApplied { name } => format!("workflow template applied: {name}"),
         CommandValue::ProjectAdded { name } => format!("project added: {name}"),
         CommandValue::ProjectApplied { name } => format!("project applied: {name}"),
+        CommandValue::ProjectRegistered { name, members } => format!("project registered: {name} ({members} members)"),
+        CommandValue::ProjectRefreshed { name, members, converged } => format!(
+            "project refreshed: {name} ({members} members, {})",
+            if *converged { "materialized drift converged" } else { "already current" }
+        ),
     }
 }
 

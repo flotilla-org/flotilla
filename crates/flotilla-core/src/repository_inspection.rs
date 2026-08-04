@@ -29,6 +29,13 @@ pub struct RepositoryInspection {
     pub transport_url: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDeclarationInspection {
+    pub repository: RepositoryInspection,
+    pub yaml: String,
+    pub commit: String,
+}
+
 impl RepositoryInspection {
     pub fn key(&self) -> RepositoryKey {
         self.spec.key()
@@ -50,6 +57,13 @@ pub trait RepositoryInspector: Send + Sync {
 
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         RepositorySpec::remote(remote)
+    }
+
+    async fn inspect_project_declaration(&self, path: &Path) -> Result<ProjectDeclarationInspection, String> {
+        let repository = self.inspect_path(path, None).await?;
+        let declaration_path = repository.checkout.path.join(crate::project_declaration::DECLARATION_FILE);
+        let yaml = std::fs::read_to_string(&declaration_path).map_err(|error| format!("read {}: {error}", declaration_path.display()))?;
+        Ok(ProjectDeclarationInspection { commit: repository.checkout.git_ref.clone(), repository, yaml })
     }
 }
 
@@ -184,6 +198,19 @@ impl RepositoryInspector for GitRepositoryInspector {
             },
             transport_url,
         })
+    }
+
+    async fn inspect_project_declaration(&self, path: &Path) -> Result<ProjectDeclarationInspection, String> {
+        let repository = self.inspect_path(path, None).await?;
+        let commit = self.git(&repository.checkout.path, &["rev-parse", "HEAD"]).await?;
+        let declaration_ref = format!("{commit}:{}", crate::project_declaration::DECLARATION_FILE);
+        let yaml = self.git(&repository.checkout.path, &["show", &declaration_ref]).await.map_err(|error| {
+            format!(
+                "read {} from bootstrap commit {commit}: {error}",
+                repository.checkout.path.join(crate::project_declaration::DECLARATION_FILE).display()
+            )
+        })?;
+        Ok(ProjectDeclarationInspection { repository, yaml, commit })
     }
 
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {

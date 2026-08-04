@@ -495,6 +495,12 @@ pub enum CommandAction {
         name: String,
         spec_yaml: String,
     },
+    ProjectRegister {
+        target: String,
+    },
+    ProjectRefresh {
+        name: String,
+    },
     TeleportSession {
         session_id: String,
         branch: Option<String>,
@@ -647,6 +653,8 @@ impl Command {
             CommandAction::WorkflowTemplateApply { .. } => "Applying workflow template...",
             CommandAction::ProjectAdd { .. } => "Adding project...",
             CommandAction::ProjectApply { .. } => "Applying project...",
+            CommandAction::ProjectRegister { .. } => "Registering project declaration...",
+            CommandAction::ProjectRefresh { .. } => "Refreshing project declaration...",
             CommandAction::TeleportSession { .. } => "Teleporting session...",
             CommandAction::TrackRepoPath { .. } => "Tracking repository...",
             CommandAction::UntrackRepo { .. } => "Untracking repository...",
@@ -811,6 +819,15 @@ pub enum CommandValue {
     },
     ProjectApplied {
         name: String,
+    },
+    ProjectRegistered {
+        name: String,
+        members: usize,
+    },
+    ProjectRefreshed {
+        name: String,
+        members: usize,
+        converged: bool,
     },
 }
 

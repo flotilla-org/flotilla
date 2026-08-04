@@ -44,6 +44,15 @@ spec:
                     properties:
                       repo:
                         type: string
+                      alias:
+                        type: string
+                        minLength: 1
+                      roles:
+                        type: array
+                        uniqueItems: true
+                        items:
+                          type: string
+                          enum: [code, ops, knowledge]
                       subpath:
                         type: string
                       default_branch:
