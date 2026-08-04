@@ -8177,15 +8177,24 @@ impl InProcessDaemon {
                 Ok(spec) => match normalize_project_spec(spec) {
                     Ok(spec) => {
                         let outcome = match projects.get(name).await {
-                            Ok(existing) => projects.apply(&InputMeta::from(&existing.metadata), &spec).await.map(|_| ()),
-                            Err(ResourceError::NotFound { .. }) => {
-                                projects.apply(&InputMeta::builder().name(name.clone()).build(), &spec).await.map(|_| ())
+                            Ok(existing) if is_declaration_backed_project(&existing) => {
+                                Err(format!("project {name} is managed by a declaration; use project refresh to update it"))
                             }
-                            Err(error) => Err(error),
+                            Ok(existing) => projects
+                                .apply(&InputMeta::from(&existing.metadata), &spec)
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| error.to_string()),
+                            Err(ResourceError::NotFound { .. }) => projects
+                                .apply(&InputMeta::builder().name(name.clone()).build(), &spec)
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| error.to_string()),
+                            Err(error) => Err(error.to_string()),
                         };
                         match outcome {
                             Ok(()) => flotilla_protocol::CommandValue::ProjectApplied { name: name.clone() },
-                            Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                            Err(message) => flotilla_protocol::CommandValue::Error { message },
                         }
                     }
                     Err(message) => flotilla_protocol::CommandValue::Error { message },

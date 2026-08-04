@@ -302,6 +302,23 @@ async fn declaration_adoption_survives_whole_repository_project_reconciliation()
     );
     let projects = backend.definitions::<Project>("flotilla");
     let registered = projects.get("flotilla").await.expect("registered project");
+    let registered_repo = &registered.spec.repositories[0].repo;
+
+    for result in [
+        execute_project_add(&daemon, &mut rx, checkout.to_string_lossy().into_owned(), Some("flotilla"), None).await,
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectApply {
+            name: "flotilla".to_string(),
+            spec_yaml: format!(
+                "display_name: overwritten\ndefault_workflow_ref: single-agent-contained\nrepositories:\n  - repo: {registered_repo}\n"
+            ),
+        })
+        .await,
+    ] {
+        assert!(
+            matches!(&result, CommandValue::Error { message } if message.contains("managed by a declaration") && message.contains("project refresh")),
+            "unexpected command result: {result:?}"
+        );
+    }
 
     daemon.materialize_tracked_repo_projects().await.expect("whole-repository reconciliation");
 
