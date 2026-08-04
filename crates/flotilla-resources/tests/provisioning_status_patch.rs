@@ -145,6 +145,30 @@ fn checkout_integration_patch_replaces_conditions_without_latching() {
 }
 
 #[test]
+fn checkout_integration_patch_absorbs_unknown_with_landed_evidence() {
+    let evidence = LandedEvidence::builder().change_request_id("815".to_string()).build();
+    let mut status = CheckoutStatus {
+        integration: CheckoutIntegrationStatus {
+            landed: IntegrationCondition::builder().value(ConditionValue::True).build(),
+            landed_evidence: Some(evidence.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    CheckoutStatusPatch::UpdateIntegration {
+        integration: Box::new(CheckoutIntegrationStatus {
+            landed: IntegrationCondition::builder().value(ConditionValue::Unknown).build(),
+            ..Default::default()
+        }),
+    }
+    .apply(&mut status);
+
+    assert_eq!(status.integration.landed.value, ConditionValue::True);
+    assert_eq!(status.integration.landed_evidence, Some(evidence));
+}
+
+#[test]
 fn terminal_session_status_patch_marks_running_and_stopped() {
     let mut status = TerminalSessionStatus::default();
     let started_at = Utc.timestamp_opt(10, 0).single().expect("timestamp");

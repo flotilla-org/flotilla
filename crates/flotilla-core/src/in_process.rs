@@ -36,10 +36,10 @@ use flotilla_protocol::{
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
     apply_status_patch_checked as apply_resource_status_patch_checked, external_patches as convoy_external_patches, get_resource_kind,
-    list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec, repository_display_labels,
-    resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from,
-    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout,
-    CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    latch_evidence_backed_integration, list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec,
+    repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
+    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
+    Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec,
     ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, Environment as ResourceEnvironment,
     Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
@@ -1707,23 +1707,6 @@ fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, int
         None
     } else {
         Some(format!("{} [{}]: {}", checkout.metadata.name, checkout_path(checkout).unwrap_or("<unknown path>"), problems.join("; ")))
-    }
-}
-
-fn latch_evidence_backed_integration(existing: &CheckoutIntegrationStatus, observed: &mut CheckoutIntegrationStatus) {
-    if existing.landed.value != ConditionValue::True
-        || existing.landed_evidence.is_none()
-        || observed.landed.value != ConditionValue::Unknown
-    {
-        return;
-    }
-    observed.landed.value = ConditionValue::True;
-    if observed.landed_evidence.is_none() {
-        observed.landed_evidence = existing.landed_evidence.clone();
-    }
-    if observed.change_request.is_none() {
-        observed.change_request =
-            existing.change_request.clone().filter(|change_request| change_request.state != flotilla_resources::ChangeRequestState::Open);
     }
 }
 

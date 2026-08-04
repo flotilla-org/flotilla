@@ -213,6 +213,22 @@ pub enum CheckoutStatusPatch {
     UpdateIntegration { integration: Box<CheckoutIntegrationStatus> },
 }
 
+pub fn latch_evidence_backed_integration(existing: &CheckoutIntegrationStatus, observed: &mut CheckoutIntegrationStatus) {
+    if existing.landed.value != ConditionValue::True
+        || existing.landed_evidence.is_none()
+        || observed.landed.value != ConditionValue::Unknown
+    {
+        return;
+    }
+    observed.landed.value = ConditionValue::True;
+    if observed.landed_evidence.is_none() {
+        observed.landed_evidence = existing.landed_evidence.clone();
+    }
+    if observed.change_request.is_none() {
+        observed.change_request = existing.change_request.clone().filter(|change_request| change_request.state != ChangeRequestState::Open);
+    }
+}
+
 impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
     fn apply(&self, status: &mut CheckoutStatus) {
         match self {
@@ -235,7 +251,9 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
                 status.message = Some(message.clone());
             }
             Self::UpdateIntegration { integration } => {
-                status.integration = integration.as_ref().clone();
+                let mut observed = integration.as_ref().clone();
+                latch_evidence_backed_integration(&status.integration, &mut observed);
+                status.integration = observed;
             }
         }
     }
