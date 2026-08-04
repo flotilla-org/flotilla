@@ -2,7 +2,9 @@ mod common;
 
 use common::{valid_workflow_template_spec, valid_workflow_template_yaml};
 use flotilla_resources::{
-    validate, InterpolationField, InterpolationLocation, RepositoryKey, Stance, ValidationError, WorkflowTemplateSpec,
+    implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_contained_workflow_spec,
+    single_agent_shepherd_workflow_spec, single_agent_trusted_workflow_spec, validate, ExitDeclaration, InterpolationField,
+    InterpolationLocation, RepositoryKey, Stance, ValidationError, WorkflowTemplateSpec,
 };
 use serde::Deserialize;
 
@@ -42,7 +44,8 @@ vessels:
           capability: code
 "#,
     );
-    assert_eq!(declared.effective_exit(), undeclared.effective_exit(), "transcribed and implicit defaults must behave identically");
+    assert!(declared.exit.is_some(), "transcribed table must remain declared");
+    assert!(undeclared.exit.is_none(), "an undeclared template must have no exit");
 
     let serialized = serde_yml::to_string(&declared).expect("serialize workflow template spec");
     let merged = serialized.find("merged: $cr.state == merged").expect("merged exit entry");
@@ -65,6 +68,20 @@ vessels:
 
     let serialized = serde_yml::to_string(&parse_spec(yaml)).expect("serialize workflow template spec");
     assert!(serialized.contains("exit: claim"), "claim exit should remain declarable: {serialized}");
+}
+
+#[test]
+fn stock_workflows_transcribe_the_standard_exit_table() {
+    let expected = Some(ExitDeclaration::standard_table());
+    for spec in [
+        single_agent_contained_workflow_spec(),
+        single_agent_shepherd_workflow_spec(),
+        single_agent_trusted_workflow_spec(),
+        interactive_single_workflow_spec(),
+        implement_review_workflow_spec(),
+    ] {
+        assert_eq!(spec.exit, expected);
+    }
 }
 
 #[test]

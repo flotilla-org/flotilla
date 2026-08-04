@@ -6,6 +6,9 @@ metadata:
   name: review-round-trip
   namespace: flotilla
 spec:
+  exit:
+    merged: $cr.state == merged
+    closed-unmerged: $cr.state == closed
   vessels:
     - name: work
       stance: trusted

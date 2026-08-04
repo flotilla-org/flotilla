@@ -732,6 +732,7 @@ mod tests {
         let created = convoys.create(&meta, &spec).await.expect("create Landing convoy before watcher boot");
         let status = ConvoyStatus {
             phase: ConvoyPhase::Landing,
+            workflow_snapshot: Some(WorkflowSnapshot { exit: Some(ExitDeclaration::standard_table()), vessels: Vec::new() }),
             observed_workflow_ref: Some("workflow".to_string()),
             work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
             ..Default::default()
@@ -919,6 +920,7 @@ mod tests {
         convoys
             .update_status("no-cr", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
+                workflow_snapshot: Some(WorkflowSnapshot { exit: Some(ExitDeclaration::standard_table()), vessels: Vec::new() }),
                 observed_workflow_ref: Some("workflow".to_string()),
                 work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
                 ..Default::default()
@@ -983,6 +985,7 @@ mod tests {
         let landing = convoys
             .update_status("adopt-late", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
+                workflow_snapshot: Some(WorkflowSnapshot { exit: Some(ExitDeclaration::standard_table()), vessels: Vec::new() }),
                 observed_workflow_ref: Some("workflow".to_string()),
                 work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
                 ..Default::default()
@@ -1063,6 +1066,7 @@ mod tests {
         convoys
             .update_status("cross-host", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
+                workflow_snapshot: Some(WorkflowSnapshot { exit: Some(ExitDeclaration::standard_table()), vessels: Vec::new() }),
                 observed_workflow_ref: Some("workflow".to_string()),
                 work: BTreeMap::from([("work".to_string(), work)]),
                 ..Default::default()

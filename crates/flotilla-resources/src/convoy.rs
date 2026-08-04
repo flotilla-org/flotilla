@@ -204,6 +204,7 @@ pub struct InstantiatedExitEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstantiatedExit {
+    None,
     Claim,
     Table(Vec<InstantiatedExitEntry>),
 }
@@ -211,17 +212,18 @@ pub enum InstantiatedExit {
 /// Instantiate the convoy's pinned exit declaration over every bound subject.
 ///
 /// A table entry is an implicit universal over its subject role. With no bound
-/// subjects, table declarations collapse to the same claim exit as `exit: claim`.
+/// subjects, a declared table collapses to the same claim exit as `exit: claim`.
+/// An absent declaration stays absent, leaving the convoy standing until an
+/// operator explicitly reaps it.
 pub fn instantiate_exit(
     convoy: &crate::ResourceObject<Convoy>,
     checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
 ) -> Result<InstantiatedExit, String> {
-    let declaration = convoy
-        .status
-        .as_ref()
-        .and_then(|status| status.workflow_snapshot.as_ref())
-        .and_then(|snapshot| snapshot.exit.clone())
-        .unwrap_or_else(ExitDeclaration::default_table);
+    let Some(declaration) =
+        convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).and_then(|snapshot| snapshot.exit.clone())
+    else {
+        return Ok(InstantiatedExit::None);
+    };
     if matches!(declaration, ExitDeclaration::Claim(_)) {
         return Ok(InstantiatedExit::Claim);
     }

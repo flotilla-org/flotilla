@@ -9095,6 +9095,7 @@ impl InProcessDaemon {
         );
         let settlement = ExplainedSettlement {
             mode: match evaluation.mode {
+                SettlementMode::NoExit => "no_exit",
                 SettlementMode::ClaimExit => "claim_exit",
                 SettlementMode::WorldTerminal => "world_terminal",
             }

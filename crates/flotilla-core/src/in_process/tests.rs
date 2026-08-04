@@ -1055,7 +1055,14 @@ async fn create_explanation_convoy(
         .subpaths(Vec::new())
         .build()];
     let created = convoys.create(&empty_input_meta(name), &spec).await.expect("create convoy");
-    let mut status = ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() };
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Landing,
+        workflow_snapshot: Some(WorkflowSnapshot {
+            exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
+            vessels: Vec::new(),
+        }),
+        ..Default::default()
+    };
     if let Some(checkout_name) = checkout_name {
         status.work.insert(
             "work".to_string(),
@@ -1124,7 +1131,14 @@ async fn create_bound_explanation_convoy(
     let convoys = backend.using::<Convoy>("flotilla");
     let convoy = convoys.create(&empty_input_meta(name), &spec).await.expect("create bound convoy");
     convoys
-        .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() })
+        .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Landing,
+            workflow_snapshot: Some(WorkflowSnapshot {
+                exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
+                vessels: Vec::new(),
+            }),
+            ..Default::default()
+        })
         .await
         .expect("update bound convoy status");
 
@@ -6180,7 +6194,7 @@ async fn convoy_delete_refuses_when_destroyed_environment_leaves_no_integration_
 }
 
 #[tokio::test]
-async fn convoy_abandon_command_archives_and_retains_terminal_record() {
+async fn undeclared_exit_landing_convoy_can_be_explicitly_abandoned() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -6201,10 +6215,10 @@ async fn convoy_abandon_command_archives_and_retains_terminal_record() {
     convoys
         .update_status("active-convoy", &created.metadata.resource_version, &ConvoyStatus {
             placement_decision: None,
-            phase: ConvoyPhase::Active,
-            workflow_snapshot: None,
+            phase: ConvoyPhase::Landing,
+            workflow_snapshot: Some(WorkflowSnapshot { exit: None, vessels: Vec::new() }),
             work: BTreeMap::from([("implement".to_string(), WorkState {
-                phase: WorkPhase::Running,
+                phase: WorkPhase::Complete,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: None,
                 started_at: None,

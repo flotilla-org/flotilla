@@ -345,7 +345,7 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
     let outcome = reconcile(&convoy, Some(&template), timestamp(10));
 
     let expected_snapshot = flotilla_resources::WorkflowSnapshot {
-        exit: Some(template.spec.effective_exit()),
+        exit: template.spec.exit.clone(),
         vessels: template
             .spec
             .vessels
@@ -650,6 +650,23 @@ fn reconciler_does_not_write_the_completion_claim_edge() {
     let outcome = reconcile(&convoy, None, timestamp(40));
 
     assert_eq!(outcome.patch, None);
+}
+
+#[test]
+fn landing_convoy_with_no_declared_exit_never_settles() {
+    let mut status = bootstrapped_convoy_status();
+    status.phase = ConvoyPhase::Landing;
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").exit = None;
+    for work in status.work.values_mut() {
+        work.phase = WorkPhase::Complete;
+    }
+    mark_crew_done(&mut status, "implement", "coder");
+    mark_crew_done(&mut status, "review", "reviewer");
+    let convoy = convoy_object("standing", valid_convoy_spec(), Some(status));
+
+    let outcome = reconcile(&convoy, None, timestamp(40));
+
+    assert_eq!(outcome.patch, None, "an absent exit must not synthesize a Landed transition");
 }
 
 #[tokio::test]

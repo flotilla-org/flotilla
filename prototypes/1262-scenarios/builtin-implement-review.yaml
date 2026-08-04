@@ -8,6 +8,9 @@ metadata:
   labels:
     flotilla.work/managed-by: builtin
 spec:
+  exit:
+    merged: $cr.state == merged
+    closed-unmerged: $cr.state == closed
   vessels:
     - name: work
       stance: contained

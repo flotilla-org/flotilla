@@ -61,10 +61,11 @@ What may **not** appear in the table, and where it goes instead:
 
 `exit: claim` remains **declarable** for artifact-less work (probes,
 instruction-only convoys with nothing observable). The pre-0021 conflation
-thereby becomes an explicit degenerate case one opts into. Migration reading:
-every current workflow implicitly declares the hardwired "no change request
-outstanding" condition as its table; flipping that to a declared table is the
-migration, and the hardwired condition is its default value.
+thereby becomes an explicit degenerate case one opts into. An undeclared exit
+means there is no `Landing` → `Landed` transition: the convoy is a standing
+facility until an operator explicitly reaps it. Migration reading: every
+current stock workflow declares the former hardwired "no change request
+outstanding" condition as an explicit table; there is no magic default.
 
 Consequence for the operator surface: **stuck = `Landing` + escalation
 raised** (or past the staleness threshold) — cleanly distinguished from a
@@ -167,7 +168,7 @@ attention flag; `Landed` rows show their disposition name.
 
 | Ruling | What it said | What stands now |
 |--------|--------------|-----------------|
-| ADR 0021 (Landing→Landed writer) | The reconciler evaluates the hardwired "no change request outstanding" condition | Workflow-declared exit tables of world terminals; the hardwired condition is the implicit default table, and `exit: claim` is a declarable degenerate case |
+| ADR 0021 (Landing→Landed writer) | The reconciler evaluates the hardwired "no change request outstanding" condition | Workflow-declared exit tables of world terminals; stock workflows transcribe the former condition explicitly, an undeclared exit makes `Landed` unreachable, and `exit: claim` is a declarable degenerate case |
 | ADR 0021 (vessel warmth) | "The vessel stays warm" during Landing | The vessel is a cache; warmth is the shallowest park depth of a declared spectrum |
 | ADR 0021 (Anchored wiring) | Entry/exit wiring deferred to a shared event-source design | That design is the leaf engine (#1322); Anchored and Landing subscribe to the same table |
 | ADR 0027 (dispositions) | Declared per-brief, recorded on the claim | Unchanged at brief scope; exit tables reuse the same vocabulary at convoy scope, bound to world-terminal leaves |

@@ -752,6 +752,7 @@ fn builtin_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
         (
             "scratch",
             WorkflowTemplateSpec::builder()
+                .exit(flotilla_resources::ExitDeclaration::standard_table())
                 .inputs(vec![InputDefinition { name: "topic".to_string(), description: Some("Short label for this convoy".into()) }])
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
@@ -5067,6 +5068,7 @@ mod tests {
             .create(
                 &empty_meta(workflow_name),
                 &WorkflowTemplateSpec::builder()
+                    .exit(flotilla_resources::ExitDeclaration::standard_table())
                     .inputs(Vec::new())
                     .vessels(vec![VesselRequirement::builder()
                         .name("work".to_string())
@@ -5763,7 +5765,7 @@ mod tests {
             .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    exit: None,
+                    exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
                     vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
                 }),
                 work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build())]),
@@ -6260,6 +6262,7 @@ mod tests {
             .create(
                 &empty_meta("wf-a"),
                 &WorkflowTemplateSpec::builder()
+                    .exit(flotilla_resources::ExitDeclaration::standard_table())
                     .inputs(Vec::new())
                     .vessels(vec![VesselRequirement::builder()
                         .name("implement".to_string())
@@ -7161,6 +7164,7 @@ mod tests {
             .create(
                 &empty_meta("crew-workflow"),
                 &WorkflowTemplateSpec::builder()
+                    .exit(flotilla_resources::ExitDeclaration::standard_table())
                     .inputs(Vec::new())
                     .vessels(vec![VesselRequirement::builder()
                         .name("implement".to_string())
@@ -7557,6 +7561,7 @@ mod tests {
             .create(
                 &empty_meta("unknown-capability"),
                 &WorkflowTemplateSpec::builder()
+                    .exit(flotilla_resources::ExitDeclaration::standard_table())
                     .inputs(Vec::new())
                     .vessels(vec![VesselRequirement::builder()
                         .name("implement".to_string())
@@ -7645,6 +7650,7 @@ mod tests {
             .create(
                 &empty_meta("wf-a"),
                 &WorkflowTemplateSpec::builder()
+                    .exit(flotilla_resources::ExitDeclaration::standard_table())
                     .inputs(Vec::new())
                     .vessels(vec![VesselRequirement::builder()
                         .name("implement".to_string())

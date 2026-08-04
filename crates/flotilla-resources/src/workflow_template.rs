@@ -22,12 +22,6 @@ pub struct WorkflowTemplateSpec {
     pub vessels: Vec<VesselRequirement>,
 }
 
-impl WorkflowTemplateSpec {
-    pub fn effective_exit(&self) -> ExitDeclaration {
-        self.exit.clone().unwrap_or_else(ExitDeclaration::default_table)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ExitDeclaration {
@@ -36,10 +30,10 @@ pub enum ExitDeclaration {
 }
 
 impl ExitDeclaration {
-    pub fn default_table() -> Self {
+    pub fn standard_table() -> Self {
         Self::Table(IndexMap::from([
-            ("merged".to_string(), "$cr.state == merged".parse().expect("valid implicit merged exit")),
-            ("closed-unmerged".to_string(), "$cr.state == closed".parse().expect("valid implicit closed exit")),
+            ("merged".to_string(), "$cr.state == merged".parse().expect("valid standard merged exit")),
+            ("closed-unmerged".to_string(), "$cr.state == closed".parse().expect("valid standard closed exit")),
         ]))
     }
 }
@@ -250,6 +244,7 @@ pub struct Selector {
 
 pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
+        .exit(ExitDeclaration::standard_table())
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Contained)
@@ -267,6 +262,7 @@ pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
 /// contained smoke passes with credentials.
 pub fn single_agent_trusted_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
+        .exit(ExitDeclaration::standard_table())
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Trusted)
@@ -280,6 +276,7 @@ pub fn single_agent_trusted_workflow_spec() -> WorkflowTemplateSpec {
 
 pub fn single_agent_shepherd_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
+        .exit(ExitDeclaration::standard_table())
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Trusted)
@@ -297,6 +294,7 @@ pub fn single_agent_shepherd_workflow_spec() -> WorkflowTemplateSpec {
 
 pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
+        .exit(ExitDeclaration::standard_table())
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Trusted)
@@ -314,6 +312,7 @@ pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
 
 pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
+        .exit(ExitDeclaration::standard_table())
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Contained)
