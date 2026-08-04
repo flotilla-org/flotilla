@@ -12,6 +12,24 @@ use crate::{
 /// "change_request"). Inner key: provider name. Value: healthy.
 pub type ProviderHealthMap = HashMap<String, HashMap<String, bool>>;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchQueueResponse {
+    pub observed_at: DateTime<Utc>,
+    pub entries: Vec<DispatchQueueRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct DispatchQueueRow {
+    pub namespace: String,
+    pub project: String,
+    pub issue: crate::IssueRef,
+    pub title: String,
+    pub ready_observed_at: DateTime<Utc>,
+    pub age_seconds: u64,
+    pub attention: bool,
+    pub provenance: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewCommandContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,6 +218,8 @@ mod project_list_tests {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetHealthResponse {
     pub hosts: Vec<FleetHostRow>,
+    #[serde(default)]
+    pub dispatch_queue: DispatchQueueResponse,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

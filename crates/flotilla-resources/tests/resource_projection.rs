@@ -85,6 +85,22 @@ fn attention_crds_parse_with_expected_names() {
 }
 
 #[test]
+fn dispatch_observation_crd_parses_with_immutable_record_fields() {
+    let observation: serde_json::Value =
+        serde_yml::from_str(include_str!("../src/crds/dispatch_observation.crd.yaml")).expect("DispatchObservation CRD should parse");
+
+    assert_eq!(observation["metadata"]["name"], "dispatchobservations.flotilla.work");
+    assert_eq!(observation["spec"]["names"]["kind"], "DispatchObservation");
+    let required = observation["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["required"]
+        .as_array()
+        .expect("required observation fields");
+    assert!(required.iter().any(|field| field == "workflow_ref"));
+    assert!(!required.iter().any(|field| field == "placement_policy"));
+    assert!(required.iter().any(|field| field == "stance"));
+    assert!(required.iter().any(|field| field == "time_from_ready_seconds"));
+}
+
+#[test]
 fn material_pool_crd_parses_with_expected_name() {
     let pool: serde_json::Value =
         serde_yml::from_str(include_str!("../src/crds/material_pool.crd.yaml")).expect("MaterialPool CRD should parse");

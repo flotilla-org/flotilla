@@ -262,6 +262,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::RepoWork(_)
         | CommandValue::HostList(_)
         | CommandValue::ProjectList(_)
+        | CommandValue::DispatchQueue(_)
         | CommandValue::HostStatus(_)
         | CommandValue::HostProviders(_)
         | CommandValue::FleetHealth(_)

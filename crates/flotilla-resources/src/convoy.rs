@@ -21,7 +21,6 @@ define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
 pub const WORKFLOW_SNAPSHOT_ANNOTATION: &str = "flotilla.work/workflow-snapshot";
 pub const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapshot";
 pub const PREPARED_SNAPSHOT_PENDING_ANNOTATION: &str = "flotilla.work/prepared-snapshot-pending";
-pub const DISPATCH_PROVENANCE_ANNOTATION: &str = "flotilla.work/dispatch-provenance";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoySpec {

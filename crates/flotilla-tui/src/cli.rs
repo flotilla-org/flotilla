@@ -183,68 +183,91 @@ fn format_sleep_inhibition(health: &flotilla_protocol::SleepInhibitionHealth) ->
 }
 
 pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> String {
-    if response.hosts.is_empty() {
-        return "No hosts known.\n".to_string();
-    }
     let now = Utc::now();
+    let mut output = if response.hosts.is_empty() {
+        "No hosts known.\n".to_string()
+    } else {
+        let mut table = Table::new();
+        table.load_preset(UTF8_FULL_CONDENSED);
+        table.set_header(vec![
+            "Host",
+            "Version",
+            "Daemon Gen",
+            "Uptime",
+            "Link",
+            "Last Heartbeat",
+            "Replica Sync",
+            "Replica Gen",
+            "Crew",
+            "Convoys",
+            "Disk Free",
+            "Sleep Inhibition",
+            "Staleness",
+            "Diagnosis",
+        ]);
+        for host in &response.hosts {
+            let name = if host.is_local { format!("{} (local)", host.host) } else { host.host.to_string() };
+            let row = match host.staleness {
+                FleetHostStaleness::Current => "current",
+                FleetHostStaleness::Stale => "STALE",
+                FleetHostStaleness::Unknown => "unknown",
+            };
+            let mut diagnoses = Vec::new();
+            if !host.degraded_conditions.is_empty() {
+                diagnoses.push(format!("⚠ DEGRADED: {}", host.degraded_conditions.join("; ")));
+            }
+            if matches!(&host.sleep_inhibition, flotilla_protocol::SleepInhibitionHealth::Failed { .. }) {
+                diagnoses.push("⚠ SLEEP INHIBITION FAILED".to_string());
+            }
+            if host.observation_agreement == FleetObservationAgreement::Disagree {
+                diagnoses.push("⚠ DISAGREE".to_string());
+            }
+            let diagnosis = if diagnoses.is_empty() {
+                match host.observation_agreement {
+                    FleetObservationAgreement::Unknown => "unknown".to_string(),
+                    FleetObservationAgreement::Agree | FleetObservationAgreement::Disagree => "agree".to_string(),
+                }
+            } else {
+                diagnoses.join("; ")
+            };
+            table.add_row(vec![
+                Cell::new(name),
+                Cell::new(host.daemon_version.as_deref().unwrap_or("-")),
+                Cell::new(host.daemon_generation.as_deref().unwrap_or("-")),
+                Cell::new(host.daemon_uptime_seconds.map_or_else(|| "-".to_string(), |seconds| format!("{seconds}s"))),
+                Cell::new(format_connection_status(&host.link)),
+                Cell::new(format_observation_time(host.heartbeat_at, now)),
+                Cell::new(format_observation_time(host.replica_last_sync, now)),
+                Cell::new(host.replica_generation.as_deref().unwrap_or("-")),
+                Cell::new(host.crew_count),
+                Cell::new(host.convoy_count),
+                Cell::new(format_disk_free(host.disk_free_bytes)),
+                Cell::new(format_sleep_inhibition(&host.sleep_inhibition)),
+                Cell::new(row),
+                Cell::new(diagnosis),
+            ]);
+        }
+        format!("{table}\n")
+    };
+    output.push_str("\nDispatch queue:\n");
+    output.push_str(&format_dispatch_queue_human(&response.dispatch_queue));
+    output
+}
+
+fn format_dispatch_queue_human(response: &flotilla_protocol::DispatchQueueResponse) -> String {
+    if response.entries.is_empty() {
+        return "No dispatchable issues.\n".to_string();
+    }
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec![
-        "Host",
-        "Version",
-        "Daemon Gen",
-        "Uptime",
-        "Link",
-        "Last Heartbeat",
-        "Replica Sync",
-        "Replica Gen",
-        "Crew",
-        "Convoys",
-        "Disk Free",
-        "Sleep Inhibition",
-        "Staleness",
-        "Diagnosis",
-    ]);
-    for host in &response.hosts {
-        let name = if host.is_local { format!("{} (local)", host.host) } else { host.host.to_string() };
-        let row = match host.staleness {
-            FleetHostStaleness::Current => "current",
-            FleetHostStaleness::Stale => "STALE",
-            FleetHostStaleness::Unknown => "unknown",
-        };
-        let mut diagnoses = Vec::new();
-        if !host.degraded_conditions.is_empty() {
-            diagnoses.push(format!("⚠ DEGRADED: {}", host.degraded_conditions.join("; ")));
-        }
-        if matches!(&host.sleep_inhibition, flotilla_protocol::SleepInhibitionHealth::Failed { .. }) {
-            diagnoses.push("⚠ SLEEP INHIBITION FAILED".to_string());
-        }
-        if host.observation_agreement == FleetObservationAgreement::Disagree {
-            diagnoses.push("⚠ DISAGREE".to_string());
-        }
-        let diagnosis = if diagnoses.is_empty() {
-            match host.observation_agreement {
-                FleetObservationAgreement::Unknown => "unknown".to_string(),
-                FleetObservationAgreement::Agree | FleetObservationAgreement::Disagree => "agree".to_string(),
-            }
-        } else {
-            diagnoses.join("; ")
-        };
+    table.set_header(vec!["Project", "Issue", "Ready For", "Attention", "Title"]);
+    for entry in &response.entries {
         table.add_row(vec![
-            Cell::new(name),
-            Cell::new(host.daemon_version.as_deref().unwrap_or("-")),
-            Cell::new(host.daemon_generation.as_deref().unwrap_or("-")),
-            Cell::new(host.daemon_uptime_seconds.map_or_else(|| "-".to_string(), |seconds| format!("{seconds}s"))),
-            Cell::new(format_connection_status(&host.link)),
-            Cell::new(format_observation_time(host.heartbeat_at, now)),
-            Cell::new(format_observation_time(host.replica_last_sync, now)),
-            Cell::new(host.replica_generation.as_deref().unwrap_or("-")),
-            Cell::new(host.crew_count),
-            Cell::new(host.convoy_count),
-            Cell::new(format_disk_free(host.disk_free_bytes)),
-            Cell::new(format_sleep_inhibition(&host.sleep_inhibition)),
-            Cell::new(row),
-            Cell::new(diagnosis),
+            Cell::new(format!("{}/{}", entry.namespace, entry.project)),
+            Cell::new(format!("{}#{}", entry.issue.source.scope, entry.issue.id)),
+            Cell::new(format!("{}s", entry.age_seconds)),
+            Cell::new(if entry.attention { "! stale" } else { "" }),
+            Cell::new(&entry.title),
         ]);
     }
     format!("{table}\n")
@@ -686,6 +709,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         // even though `host list` now presents the richer fleet-health view.
         CommandValue::HostList(hosts) => format_host_list_human(hosts),
         CommandValue::ProjectList(projects) => format_project_list_human(projects),
+        CommandValue::DispatchQueue(queue) => format_dispatch_queue_human(queue),
         CommandValue::HostStatus(status) => format_host_status_human(status),
         CommandValue::HostProviders(providers) => format_host_providers_human(providers),
         CommandValue::FleetHealth(fleet) => format_fleet_health_human(fleet),

@@ -176,6 +176,8 @@ enum SubCommand {
     Checkout(flotilla_commands::commands::checkout::CheckoutNoun),
     /// Manage convoys
     Convoy(flotilla_commands::commands::convoy::ConvoyNoun),
+    /// Inspect proposed dispatch work
+    Dispatch(flotilla_commands::commands::dispatch::DispatchNoun),
     /// Communicate with crew members
     Crew(flotilla_commands::commands::crew::CrewNoun),
     /// Code review (alias on CrNoun itself, not duplicated here)
@@ -435,6 +437,7 @@ async fn main() -> Result<()> {
         Some(SubCommand::Environment(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
         Some(SubCommand::Checkout(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
         Some(SubCommand::Convoy(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
+        Some(SubCommand::Dispatch(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
         Some(SubCommand::Crew(noun)) => {
             let crew_id = std::env::var("FLOTILLA_CREW_ID").ok();
             dispatch(noun.resolve_with_crew_id(crew_id).map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await
@@ -2358,6 +2361,13 @@ mod tests {
         let cli = Cli::try_parse_from(["flotilla", "convoy", "my-convoy", "create", "--template", "scratch", "--input", "topic=hi"])
             .expect("convoy create cli should parse");
         assert!(matches!(cli.command, Some(SubCommand::Convoy(_))));
+    }
+
+    #[test]
+    fn cli_parses_dispatch_queue_with_json() {
+        let cli = Cli::try_parse_from(["flotilla", "--json", "dispatch", "queue"]).expect("dispatch queue should parse");
+        assert!(cli.json);
+        assert!(matches!(cli.command, Some(SubCommand::Dispatch(_))));
     }
 
     #[test]

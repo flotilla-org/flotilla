@@ -628,28 +628,6 @@ fn trusted_codex_workflow() -> WorkflowTemplateSpec {
     workflow
 }
 
-fn trusted_tool_workflow() -> WorkflowTemplateSpec {
-    WorkflowTemplateSpec::builder()
-        .vessels(vec![VesselRequirement::builder()
-            .name("work".to_string())
-            .stance(Stance::Trusted)
-            .crew(vec![CrewSpec::builder().role("tool".to_string()).source(CrewSource::Tool { command: "true".to_string() }).build()])
-            .build()])
-        .build()
-}
-
-#[tokio::test]
-async fn automatic_stance_preference_is_an_admission_floor_not_a_silent_fallback() {
-    let (_temp, daemon) = daemon_for_auto_attach_config(None).await;
-
-    let error = daemon
-        .resolve_admission_workflow_and_placement("flotilla", "widgets", &[], trusted_tool_workflow(), None, Some(Stance::Contained))
-        .await
-        .expect_err("missing contained placement must refuse admission");
-
-    assert_eq!(error, "contained workflow requires an available docker placement policy");
-}
-
 #[tokio::test]
 async fn default_placement_prefers_the_viable_local_host() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());

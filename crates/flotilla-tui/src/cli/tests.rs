@@ -726,6 +726,7 @@ mod command_result_human {
                 .staleness(FleetHostStaleness::Stale)
                 .observation_agreement(FleetObservationAgreement::Disagree)
                 .build()],
+            dispatch_queue: Default::default(),
         }));
 
         let output = format_command_result(&result);
@@ -761,6 +762,7 @@ mod command_result_human {
                 .observation_agreement(FleetObservationAgreement::Agree)
                 .degraded_conditions(vec!["Controller/checkout: checkout controller stopped after 10 consecutive failures".to_string()])
                 .build()],
+            dispatch_queue: Default::default(),
         }));
 
         let output = format_command_result(&result);
@@ -768,6 +770,35 @@ mod command_result_human {
         assert!(output.contains("⚠ DEGRADED"), "expected degraded diagnosis:\n{output}");
         assert!(output.contains("Controller/checkout"), "expected named controller condition:\n{output}");
         assert!(output.contains("10 consecutive failures"), "expected condition detail:\n{output}");
+    }
+
+    #[test]
+    fn dispatch_queue_human_output_surfaces_stale_attention() {
+        let ready_at = Utc::now() - Duration::seconds(90);
+        let result = CommandValue::DispatchQueue(Box::new(flotilla_protocol::DispatchQueueResponse {
+            observed_at: Utc::now(),
+            entries: vec![flotilla_protocol::DispatchQueueRow::builder()
+                .namespace("flotilla".to_string())
+                .project("widgets".to_string())
+                .issue(flotilla_protocol::IssueRef {
+                    source: flotilla_protocol::IssueSource { service: "https://github.com".to_string(), scope: "acme/widgets".to_string() },
+                    id: "42".to_string(),
+                })
+                .title("Fix the queue".to_string())
+                .ready_observed_at(ready_at)
+                .age_seconds(90)
+                .attention(true)
+                .provenance("dispatch-reconciler, issue #42 ready+unblocked at T".to_string())
+                .build()],
+        }));
+
+        let output = format_command_result(&result);
+
+        assert!(output.contains("flotilla/widgets"));
+        assert!(output.contains("acme/widgets#42"));
+        assert!(output.contains("90s"));
+        assert!(output.contains("! stale"));
+        assert!(output.contains("Fix the queue"));
     }
 
     #[test]

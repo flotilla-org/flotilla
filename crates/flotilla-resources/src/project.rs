@@ -4,11 +4,11 @@ use chrono::{DateTime, Utc};
 pub use flotilla_protocol::IssueSource;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, ReplicationClass, Repository, RepositoryKey, Stance, TypedResolver};
+use crate::{resource::define_resource, status_patch::StatusPatch, ReplicationClass, Repository, RepositoryKey, TypedResolver};
 
 define_resource!(Project, "projects", ProjectSpec, ProjectStatus, ProjectStatusPatch, replication = ReplicationClass::Definitions);
 
-pub const DEFAULT_AUTO_DISPATCH_CONCURRENCY: usize = 3;
+pub const DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS: u64 = 3600;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ProjectSpec {
@@ -21,9 +21,9 @@ pub struct ProjectSpec {
     #[builder(default)]
     #[serde(default)]
     pub repositories: Vec<ProjectRepositorySpec>,
-    /// Daemon-side automatic dispatch is opt-in. Removing this field is the
-    /// project-level kill switch; `enabled: false` retains a reviewed policy
-    /// while stopping it immediately.
+    /// Daemon-side dispatch proposing and observation is opt-in. Removing this
+    /// field is the project-level kill switch; `enabled: false` retains a
+    /// reviewed policy while stopping it immediately.
     #[serde(default)]
     pub dispatch_policy: Option<DispatchPolicy>,
 }
@@ -33,42 +33,49 @@ pub struct DispatchPolicy {
     #[builder(default = true)]
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[builder(default = DEFAULT_AUTO_DISPATCH_CONCURRENCY)]
-    #[serde(default = "default_auto_dispatch_concurrency")]
-    pub max_concurrent: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub placement_policy: Option<String>,
-    #[builder(default = Stance::Contained)]
-    #[serde(default = "default_dispatch_stance")]
-    pub stance_preference: Stance,
+    #[builder(default = DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS)]
+    #[serde(default = "default_dispatch_queue_stale_after_seconds")]
+    pub stale_after_seconds: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectStatus {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispatch_queue: Vec<DispatchQueueEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dispatch_attention: Option<DispatchAttention>,
+    pub dispatch_queue_attention: Option<DispatchQueueAttention>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DispatchAttention {
+pub struct DispatchQueueEntry {
     pub issue: flotilla_protocol::IssueRef,
+    pub title: String,
     pub issue_as_of: DateTime<Utc>,
-    pub policy: DispatchPolicy,
-    pub reason: String,
+    pub ready_observed_at: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
+    pub provenance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchQueueAttention {
+    pub count: usize,
+    pub oldest_ready_observed_at: DateTime<Utc>,
+    pub stale_since: DateTime<Utc>,
     pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectStatusPatch {
-    SetDispatchAttention(DispatchAttention),
-    ClearDispatchAttention,
+    ReplaceDispatchQueue { queue: Vec<DispatchQueueEntry>, attention: Option<DispatchQueueAttention> },
 }
 
 impl StatusPatch<ProjectStatus> for ProjectStatusPatch {
     fn apply(&self, status: &mut ProjectStatus) {
         match self {
-            Self::SetDispatchAttention(attention) => status.dispatch_attention = Some(attention.clone()),
-            Self::ClearDispatchAttention => status.dispatch_attention = None,
+            Self::ReplaceDispatchQueue { queue, attention } => {
+                status.dispatch_queue.clone_from(queue);
+                status.dispatch_queue_attention.clone_from(attention);
+            }
         }
     }
 }
@@ -77,12 +84,8 @@ const fn default_true() -> bool {
     true
 }
 
-const fn default_auto_dispatch_concurrency() -> usize {
-    DEFAULT_AUTO_DISPATCH_CONCURRENCY
-}
-
-const fn default_dispatch_stance() -> Stance {
-    Stance::Contained
+const fn default_dispatch_queue_stale_after_seconds() -> u64 {
+    DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -176,12 +179,10 @@ pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, Stri
     if spec.repositories.windows(2).any(|pair| pair[0].repo == pair[1].repo && pair[0].subpath == pair[1].subpath) {
         return Err("project contains a duplicate repository and subpath entry".to_string());
     }
-    if let Some(policy) = &mut spec.dispatch_policy {
-        if policy.max_concurrent == 0 {
-            return Err("dispatch policy max_concurrent must be at least 1".to_string());
+    if let Some(policy) = &spec.dispatch_policy {
+        if policy.stale_after_seconds == 0 {
+            return Err("dispatch policy stale_after_seconds must be at least 1".to_string());
         }
-        policy.placement_policy =
-            policy.placement_policy.take().map(|placement| required_value(placement, "dispatch_policy.placement_policy")).transpose()?;
     }
     Ok(spec)
 }
@@ -224,17 +225,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dispatch_policy_defaults_to_enabled_bounded_containment() {
+    fn dispatch_policy_defaults_to_enabled_with_a_staleness_threshold() {
         let policy: DispatchPolicy = serde_json::from_str("{}").expect("policy defaults");
 
         assert!(policy.enabled);
-        assert_eq!(policy.max_concurrent, DEFAULT_AUTO_DISPATCH_CONCURRENCY);
-        assert_eq!(policy.stance_preference, Stance::Contained);
-        assert_eq!(policy.placement_policy, None);
+        assert_eq!(policy.stale_after_seconds, DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS);
     }
 
     #[test]
-    fn dispatch_policy_rejects_zero_cap() {
+    fn dispatch_policy_rejects_zero_staleness_threshold() {
         let spec = ProjectSpec {
             display_name: "Widgets".to_string(),
             default_workflow_ref: "implement".to_string(),
@@ -246,9 +245,12 @@ mod tests {
                 subpath: None,
                 default_branch: None,
             }],
-            dispatch_policy: Some(DispatchPolicy::builder().max_concurrent(0).build()),
+            dispatch_policy: Some(DispatchPolicy::builder().stale_after_seconds(0).build()),
         };
 
-        assert_eq!(normalize_project_spec(spec).expect_err("zero cap must fail"), "dispatch policy max_concurrent must be at least 1");
+        assert_eq!(
+            normalize_project_spec(spec).expect_err("zero threshold must fail"),
+            "dispatch policy stale_after_seconds must be at least 1"
+        );
     }
 }

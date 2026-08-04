@@ -1,0 +1,63 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: dispatchobservations.flotilla.work
+spec:
+  group: flotilla.work
+  scope: Namespaced
+  names:
+    plural: dispatchobservations
+    singular: dispatchobservation
+    kind: DispatchObservation
+    shortNames: [dispatchobservation]
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required:
+                - project_ref
+                - convoy_ref
+                - issue
+                - workflow_ref
+                - stance
+                - ready_observed_at
+                - dispatched_at
+                - time_from_ready_seconds
+                - observed_at
+                - provenance
+              properties:
+                project_ref:
+                  type: string
+                convoy_ref:
+                  type: string
+                issue:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                workflow_ref:
+                  type: string
+                placement_policy:
+                  type: string
+                stance:
+                  type: string
+                  enum: [trusted, workspace-write, contained]
+                ready_observed_at:
+                  type: string
+                  format: date-time
+                dispatched_at:
+                  type: string
+                  format: date-time
+                time_from_ready_seconds:
+                  type: integer
+                  minimum: 0
+                observed_at:
+                  type: string
+                  format: date-time
+                provenance:
+                  type: string

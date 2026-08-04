@@ -54,7 +54,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     agent_material::{AgentMaterialPrepareError, AgentMaterialRegistry},
     credential::CredentialStore,
-    dispatch_reconciler::{DaemonDispatchAdmission, DaemonDispatchIssueSource, DispatchAdmission, DispatchIssueSource, DispatchReconciler},
+    dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
     environment_tools::EnvironmentToolProvisioner,
     resource_limits::file_descriptor_pressure_condition,
     resource_manifest::ResourceManifestReconciler,
@@ -1022,8 +1022,7 @@ fn spawn_adopted_checkout_reconciliation_task(daemon: Arc<InProcessDaemon>, name
 
 fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, namespace: String, interval: Duration) -> JoinHandle<()> {
     let issues = Arc::new(DaemonDispatchIssueSource::new(Arc::clone(&daemon))) as Arc<dyn DispatchIssueSource>;
-    let admission = Arc::new(DaemonDispatchAdmission::new(Arc::clone(&daemon))) as Arc<dyn DispatchAdmission>;
-    let reconciler = Arc::new(DispatchReconciler::new(daemon.resource_backend(), namespace, issues, admission));
+    let reconciler = Arc::new(DispatchReconciler::new(daemon.resource_backend(), namespace, issues));
     spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
         let reconciler = Arc::clone(&reconciler);
         async move {

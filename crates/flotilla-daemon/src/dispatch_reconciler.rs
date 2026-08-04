@@ -1,17 +1,18 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_protocol::{
     issue_query::{IssueQuery, READY_ISSUE_LABEL},
-    ConvoyAutoAttach, ConvoyStartIntent, Issue, IssueRef, IssueSelector, IssueState, QueryScope,
+    Issue, IssueRef, IssueState, QueryScope,
 };
 use flotilla_resources::{
-    apply_status_patch, Convoy, DispatchAttention, DispatchPolicy, Project, ProjectStatusPatch, ResourceBackend, ResourceObject,
-    DISPATCH_PROVENANCE_ANNOTATION,
+    apply_status_patch, content_hash, pinned_workflow_ref, Clock, Convoy, DispatchObservation, DispatchObservationSpec, DispatchPolicy,
+    DispatchQueueAttention, DispatchQueueEntry, InputMeta, Project, ProjectStatusPatch, ResourceBackend, ResourceError, ResourceObject,
+    SystemClock, WorkflowTemplate, DISPATCH_RECONCILER_PROVENANCE,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 const ISSUE_PAGE_SIZE: usize = 100;
 
@@ -19,17 +20,6 @@ const ISSUE_PAGE_SIZE: usize = 100;
 pub(crate) trait DispatchIssueSource: Send + Sync {
     async fn ready_issues(&self, project: &ResourceObject<Project>) -> Result<Vec<Issue>, String>;
     async fn fetch_issue(&self, reference: &IssueRef) -> Result<Issue, String>;
-}
-
-#[async_trait]
-pub(crate) trait DispatchAdmission: Send + Sync {
-    async fn admit(
-        &self,
-        project: &ResourceObject<Project>,
-        issue: &Issue,
-        policy: &DispatchPolicy,
-        provenance: String,
-    ) -> Result<String, String>;
 }
 
 pub(crate) struct DaemonDispatchIssueSource {
@@ -70,186 +60,229 @@ impl DispatchIssueSource for DaemonDispatchIssueSource {
     }
 }
 
-pub(crate) struct DaemonDispatchAdmission {
-    daemon: Arc<InProcessDaemon>,
-}
-
-impl DaemonDispatchAdmission {
-    pub(crate) fn new(daemon: Arc<InProcessDaemon>) -> Self {
-        Self { daemon }
-    }
-}
-
-#[async_trait]
-impl DispatchAdmission for DaemonDispatchAdmission {
-    async fn admit(
-        &self,
-        project: &ResourceObject<Project>,
-        issue: &Issue,
-        policy: &DispatchPolicy,
-        provenance: String,
-    ) -> Result<String, String> {
-        let intent = ConvoyStartIntent::builder()
-            .namespace(project.metadata.namespace.clone())
-            .project_ref(project.metadata.name.clone())
-            .issues(vec![IssueSelector::Reference(issue.reference.clone())])
-            .maybe_placement_policy(policy.placement_policy.clone())
-            .auto_attach(ConvoyAutoAttach::Never)
-            .build();
-        self.daemon.admit_dispatch_reconciler_convoy(&project.metadata.namespace, &intent, policy.stance_preference, provenance).await
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ReconcilePass {
-    pub admitted: usize,
+    pub queued: usize,
     pub blocked: usize,
-    pub deferred_cap_full: bool,
-    pub refused: bool,
+    pub observations_recorded: usize,
 }
 
 pub(crate) struct DispatchReconciler {
     backend: ResourceBackend,
     namespace: String,
     issues: Arc<dyn DispatchIssueSource>,
-    admission: Arc<dyn DispatchAdmission>,
+    clock: Arc<dyn Clock>,
 }
 
 impl DispatchReconciler {
-    pub(crate) fn new(
-        backend: ResourceBackend,
-        namespace: impl Into<String>,
-        issues: Arc<dyn DispatchIssueSource>,
-        admission: Arc<dyn DispatchAdmission>,
-    ) -> Self {
-        Self { backend, namespace: namespace.into(), issues, admission }
+    pub(crate) fn new(backend: ResourceBackend, namespace: impl Into<String>, issues: Arc<dyn DispatchIssueSource>) -> Self {
+        Self { backend, namespace: namespace.into(), issues, clock: Arc::new(SystemClock) }
+    }
+
+    #[cfg(test)]
+    fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     pub(crate) async fn reconcile_once(&self) -> Result<ReconcilePass, String> {
         let projects = self.backend.clone().using::<Project>(&self.namespace).list().await.map_err(|error| error.to_string())?;
         let mut total = ReconcilePass::default();
         for project in projects.items {
-            let outcome = self.reconcile_project(&project, Utc::now()).await?;
-            total.admitted += outcome.admitted;
+            let outcome = self.reconcile_project(&project, self.clock.now()).await?;
+            total.queued += outcome.queued;
             total.blocked += outcome.blocked;
-            total.deferred_cap_full |= outcome.deferred_cap_full;
-            total.refused |= outcome.refused;
+            total.observations_recorded += outcome.observations_recorded;
         }
         Ok(total)
     }
 
     async fn reconcile_project(&self, project: &ResourceObject<Project>, now: DateTime<Utc>) -> Result<ReconcilePass, String> {
         let Some(policy) = project.spec.dispatch_policy.as_ref().filter(|policy| policy.enabled) else {
+            self.replace_queue(project, Vec::new(), None).await?;
             return Ok(ReconcilePass::default());
         };
-        let convoys = self.backend.clone().using::<Convoy>(&project.metadata.namespace);
-        let existing = convoys.list().await.map_err(|error| error.to_string())?.items;
-        let belongs_to_project = |convoy: &&ResourceObject<Convoy>| convoy.spec.project_ref.as_deref() == Some(&project.metadata.name);
-        let active_auto_admitted = existing
-            .iter()
-            .filter(belongs_to_project)
-            .filter(|convoy| convoy.metadata.annotations.contains_key(DISPATCH_PROVENANCE_ANNOTATION))
-            .filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
-            .count();
-        if active_auto_admitted >= policy.max_concurrent {
-            debug!(project = %project.metadata.name, active_auto_admitted, cap = policy.max_concurrent, "automatic dispatch cap is full");
-            return Ok(ReconcilePass { deferred_cap_full: true, ..ReconcilePass::default() });
-        }
 
+        let existing = self.project_convoys(project).await?;
+        let previous_queue = project.status.as_ref().map(|status| status.dispatch_queue.as_slice()).unwrap_or_default();
+        let observations_recorded = self.observe_dispatches(project, previous_queue, &existing, now).await?;
         let dispatched = existing
             .iter()
-            .filter(belongs_to_project)
             .flat_map(|convoy| convoy.spec.issues.iter().map(|issue| issue.reference.clone()))
-            .collect::<HashSet<_>>();
+            .collect::<std::collections::HashSet<_>>();
+        let previous_by_issue = previous_queue.iter().map(|entry| (entry.issue.clone(), entry)).collect::<BTreeMap<_, _>>();
+
         let mut ready = self.issues.ready_issues(project).await?;
         ready.retain(|issue| issue.state == IssueState::Open && issue.labels.iter().any(|label| label == READY_ISSUE_LABEL));
-        ready.sort_by(|left, right| left.reference.cmp_id_desc(&right.reference).reverse());
+        ready.sort_by(|left, right| left.reference.cmp(&right.reference));
 
-        let mut outcome = ReconcilePass::default();
-        let mut available = policy.max_concurrent - active_auto_admitted;
+        let mut queue = Vec::new();
+        let mut blocked = 0;
         for issue in ready {
-            if available == 0 {
-                outcome.deferred_cap_full = true;
-                break;
-            }
             if dispatched.contains(&issue.reference) {
                 continue;
             }
-            if project.status.as_ref().and_then(|status| status.dispatch_attention.as_ref()).is_some_and(|attention| {
-                attention.issue == issue.reference && attention.issue_as_of == issue.as_of && attention.policy == *policy
-            }) {
-                continue;
-            }
-
             let blockers = match blocked_by_references(&issue) {
                 Ok(blockers) => blockers,
                 Err(error) => {
                     warn!(project = %project.metadata.name, issue = %issue.reference.id, %error, "issue Blocked by section is unparseable; treating issue as blocked");
-                    outcome.blocked += 1;
+                    blocked += 1;
                     continue;
                 }
             };
-            let mut blocked = false;
+            let mut is_blocked = false;
             for blocker in blockers {
                 match self.issues.fetch_issue(&blocker).await {
                     Ok(blocker) if blocker.state == IssueState::Closed => {}
-                    Ok(_) => blocked = true,
+                    Ok(_) => is_blocked = true,
                     Err(error) => {
                         warn!(project = %project.metadata.name, issue = %issue.reference.id, blocker = %blocker.id, %error, "blocker could not be observed; treating issue as blocked");
-                        blocked = true;
+                        is_blocked = true;
                     }
                 }
             }
-            if blocked {
-                outcome.blocked += 1;
+            if is_blocked {
+                blocked += 1;
                 continue;
             }
 
-            let provenance = format!("dispatch-reconciler, issue #{} ready+unblocked at {}", issue.reference.id, now.to_rfc3339());
-            match self.admission.admit(project, &issue, policy, provenance).await {
-                Ok(convoy) => {
-                    info!(project = %project.metadata.name, issue = %issue.reference.id, %convoy, "automatically admitted convoy");
-                    outcome.admitted += 1;
-                    available -= 1;
-                    self.clear_attention(project).await?;
-                }
-                Err(reason) => {
-                    warn!(project = %project.metadata.name, issue = %issue.reference.id, %reason, "automatic convoy admission refused; project needs attention");
-                    let attention = DispatchAttention {
-                        issue: issue.reference.clone(),
-                        issue_as_of: issue.as_of,
-                        policy: policy.clone(),
-                        reason,
-                        observed_at: now,
-                    };
-                    apply_status_patch(
-                        &self.backend.clone().using::<Project>(&project.metadata.namespace),
-                        &project.metadata.name,
-                        &ProjectStatusPatch::SetDispatchAttention(attention),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                    outcome.refused = true;
-                    break;
-                }
-            }
+            let previous = previous_by_issue.get(&issue.reference).copied();
+            let ready_observed_at = previous.map_or(now, |entry| entry.ready_observed_at);
+            let provenance = previous.map_or_else(
+                || format!("{DISPATCH_RECONCILER_PROVENANCE}, issue #{} ready+unblocked at {}", issue.reference.id, now.to_rfc3339()),
+                |entry| entry.provenance.clone(),
+            );
+            let observed_at = previous
+                .filter(|entry| entry.issue_as_of == issue.as_of && entry.title == issue.title)
+                .map_or(now, |entry| entry.observed_at);
+            queue.push(DispatchQueueEntry {
+                issue: issue.reference,
+                title: issue.title,
+                issue_as_of: issue.as_of,
+                ready_observed_at,
+                observed_at,
+                provenance,
+            });
         }
-        Ok(outcome)
+        queue.sort_by(|left, right| left.ready_observed_at.cmp(&right.ready_observed_at).then_with(|| left.issue.cmp(&right.issue)));
+        let previous_attention = project.status.as_ref().and_then(|status| status.dispatch_queue_attention.as_ref());
+        let attention = dispatch_queue_attention(&queue, policy, previous_attention, now);
+        self.replace_queue(project, queue.clone(), attention).await?;
+        Ok(ReconcilePass { queued: queue.len(), blocked, observations_recorded })
     }
 
-    async fn clear_attention(&self, project: &ResourceObject<Project>) -> Result<(), String> {
-        if project.status.as_ref().and_then(|status| status.dispatch_attention.as_ref()).is_none() {
+    async fn project_convoys(&self, project: &ResourceObject<Project>) -> Result<Vec<ResourceObject<Convoy>>, String> {
+        let listed = self
+            .backend
+            .clone()
+            .including_replicas::<Convoy>(&project.metadata.namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut by_name = BTreeMap::new();
+        for convoy in listed.items.into_iter().map(|item| item.object) {
+            if convoy.spec.project_ref.as_deref() == Some(&project.metadata.name) {
+                by_name.entry(convoy.metadata.name.clone()).or_insert(convoy);
+            }
+        }
+        Ok(by_name.into_values().collect())
+    }
+
+    async fn observe_dispatches(
+        &self,
+        project: &ResourceObject<Project>,
+        previous_queue: &[DispatchQueueEntry],
+        convoys: &[ResourceObject<Convoy>],
+        now: DateTime<Utc>,
+    ) -> Result<usize, String> {
+        let queued = previous_queue.iter().map(|entry| (&entry.issue, entry)).collect::<BTreeMap<_, _>>();
+        let observations = self.backend.clone().using::<DispatchObservation>(&project.metadata.namespace);
+        let workflows = self.backend.clone().using::<WorkflowTemplate>(&project.metadata.namespace);
+        let mut recorded = 0;
+        for convoy in convoys {
+            for issue in &convoy.spec.issues {
+                let Some(queue_entry) = queued.get(&issue.reference) else { continue };
+                let identity = serde_json::json!({
+                    "project": project.metadata.name,
+                    "convoy": convoy.metadata.name,
+                    "issue": issue.reference,
+                });
+                let name = format!("dispatch-{}", content_hash(&identity).map_err(|error| error.to_string())?);
+                match observations.get(&name).await {
+                    Ok(_) => continue,
+                    Err(ResourceError::NotFound { .. }) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+                let workflow = workflows
+                    .get(pinned_workflow_ref(convoy))
+                    .await
+                    .map_err(|error| format!("observe convoy {} workflow: {error}", convoy.metadata.name))?;
+                let stance = workflow.spec.vessels.iter().map(|vessel| vessel.stance).max().unwrap_or_default();
+                let dispatched_at = convoy.metadata.creation_timestamp;
+                let time_from_ready_seconds =
+                    dispatched_at.signed_duration_since(queue_entry.ready_observed_at).num_seconds().max(0) as u64;
+                let spec = DispatchObservationSpec::builder()
+                    .project_ref(project.metadata.name.clone())
+                    .convoy_ref(convoy.metadata.name.clone())
+                    .issue(issue.reference.clone())
+                    .workflow_ref(convoy.spec.workflow_ref.clone())
+                    .maybe_placement_policy(convoy.spec.placement_policy.clone())
+                    .stance(stance)
+                    .ready_observed_at(queue_entry.ready_observed_at)
+                    .dispatched_at(dispatched_at)
+                    .time_from_ready_seconds(time_from_ready_seconds)
+                    .observed_at(now)
+                    .provenance(DISPATCH_RECONCILER_PROVENANCE.to_string())
+                    .build();
+                observations
+                    .create(&InputMeta::builder().name(name).build(), &spec)
+                    .await
+                    .map_err(|error| format!("record dispatch observation for convoy {}: {error}", convoy.metadata.name))?;
+                info!(project = %project.metadata.name, convoy = %convoy.metadata.name, issue = %issue.reference.id, "recorded dispatch observation");
+                recorded += 1;
+            }
+        }
+        Ok(recorded)
+    }
+
+    async fn replace_queue(
+        &self,
+        project: &ResourceObject<Project>,
+        queue: Vec<DispatchQueueEntry>,
+        attention: Option<DispatchQueueAttention>,
+    ) -> Result<(), String> {
+        let current = project.status.clone().unwrap_or_default();
+        if current.dispatch_queue == queue && current.dispatch_queue_attention == attention {
             return Ok(());
         }
         apply_status_patch(
             &self.backend.clone().using::<Project>(&project.metadata.namespace),
             &project.metadata.name,
-            &ProjectStatusPatch::ClearDispatchAttention,
+            &ProjectStatusPatch::ReplaceDispatchQueue { queue, attention },
         )
         .await
         .map_err(|error| error.to_string())?;
         Ok(())
     }
+}
+
+fn dispatch_queue_attention(
+    queue: &[DispatchQueueEntry],
+    policy: &DispatchPolicy,
+    previous: Option<&DispatchQueueAttention>,
+    now: DateTime<Utc>,
+) -> Option<DispatchQueueAttention> {
+    let oldest = queue.first()?.ready_observed_at;
+    let threshold = i64::try_from(policy.stale_after_seconds).unwrap_or(i64::MAX);
+    let stale_since = oldest.checked_add_signed(Duration::seconds(threshold)).unwrap_or(DateTime::<Utc>::MAX_UTC);
+    (now >= stale_since).then(|| {
+        let observed_at = previous
+            .filter(|attention| {
+                attention.count == queue.len() && attention.oldest_ready_observed_at == oldest && attention.stale_since == stale_since
+            })
+            .map_or(now, |attention| attention.observed_at);
+        DispatchQueueAttention { count: queue.len(), oldest_ready_observed_at: oldest, stale_since, observed_at }
+    })
 }
 
 fn blocked_by_references(issue: &Issue) -> Result<Vec<IssueRef>, String> {
@@ -329,7 +362,8 @@ mod tests {
 
     use flotilla_protocol::{AssociationKey, IssueSource};
     use flotilla_resources::{
-        ConvoyIssue, ConvoySpec, InputMeta, InputValue, IssueSnapshot, ProjectSpec, RepositoryKey, ResourceBackend, Stance,
+        single_agent_contained_workflow_spec, ConvoyIssue, ConvoySpec, InputValue, IssueSnapshot, ProjectSpec, RepositoryKey, Stance,
+        VirtualClock,
     };
 
     use super::*;
@@ -351,65 +385,6 @@ mod tests {
 
         async fn fetch_issue(&self, reference: &IssueRef) -> Result<Issue, String> {
             self.by_ref.lock().expect("issues lock").get(reference).cloned().ok_or_else(|| "missing issue".to_string())
-        }
-    }
-
-    struct InMemoryAdmission {
-        backend: ResourceBackend,
-        refusal: Mutex<Option<String>>,
-    }
-
-    #[async_trait]
-    impl DispatchAdmission for InMemoryAdmission {
-        async fn admit(
-            &self,
-            project: &ResourceObject<Project>,
-            issue: &Issue,
-            policy: &DispatchPolicy,
-            provenance: String,
-        ) -> Result<String, String> {
-            if let Some(error) = self.refusal.lock().expect("refusal lock").clone() {
-                return Err(error);
-            }
-            let name = format!("issue-{}", issue.reference.id);
-            self.backend
-                .clone()
-                .using::<Convoy>(&project.metadata.namespace)
-                .create(
-                    &InputMeta::builder()
-                        .name(name.clone())
-                        .annotations(std::collections::BTreeMap::from([(DISPATCH_PROVENANCE_ANNOTATION.to_string(), provenance)]))
-                        .build(),
-                    &ConvoySpec {
-                        workflow_ref: project.spec.default_workflow_ref.clone(),
-                        dispatching_principal_ref: flotilla_protocol::PrincipalRef {
-                            namespace: project.metadata.namespace.clone(),
-                            name: "dispatch-reconciler".to_string(),
-                        },
-                        inputs: std::collections::BTreeMap::<String, InputValue>::new(),
-                        placement_policy: policy.placement_policy.clone(),
-                        repositories: Vec::new(),
-                        r#ref: Some(name.clone()),
-                        project_ref: Some(project.metadata.name.clone()),
-                        adopted_checkout_refs: Default::default(),
-                        issues: vec![ConvoyIssue {
-                            reference: issue.reference.clone(),
-                            repository_ref: None,
-                            snapshot: IssueSnapshot {
-                                title: issue.title.clone(),
-                                body: issue.body.clone(),
-                                state: issue.state,
-                                labels: issue.labels.clone(),
-                                as_of: issue.as_of,
-                            },
-                        }],
-                        change_request: None,
-                        instruction: None,
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(name)
         }
     }
 
@@ -436,7 +411,7 @@ mod tests {
         ready: Vec<Issue>,
         blockers: Vec<Issue>,
         policy: DispatchPolicy,
-    ) -> (ResourceBackend, Arc<FakeIssues>, Arc<InMemoryAdmission>, DispatchReconciler) {
+    ) -> (ResourceBackend, Arc<FakeIssues>, Arc<VirtualClock>, DispatchReconciler) {
         let backend = ResourceBackend::InMemory(Default::default());
         backend
             .clone()
@@ -461,49 +436,39 @@ mod tests {
             by_ref: Mutex::new(blockers.into_iter().map(|issue| (issue.reference.clone(), issue)).collect()),
             ready_calls: Mutex::new(0),
         });
-        let admission = Arc::new(InMemoryAdmission { backend: backend.clone(), refusal: Mutex::new(None) });
-        let reconciler = DispatchReconciler::new(
-            backend.clone(),
-            NAMESPACE,
-            Arc::clone(&issues) as Arc<dyn DispatchIssueSource>,
-            Arc::clone(&admission) as Arc<dyn DispatchAdmission>,
-        );
-        (backend, issues, admission, reconciler)
+        let clock = Arc::new(VirtualClock::new("2026-08-04T12:00:00Z".parse().expect("clock timestamp")));
+        let reconciler = DispatchReconciler::new(backend.clone(), NAMESPACE, Arc::clone(&issues) as Arc<dyn DispatchIssueSource>)
+            .with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+        (backend, issues, clock, reconciler)
     }
 
-    fn policy(cap: usize) -> DispatchPolicy {
-        DispatchPolicy::builder().max_concurrent(cap).stance_preference(Stance::Contained).build()
+    fn policy(stale_after_seconds: u64) -> DispatchPolicy {
+        DispatchPolicy::builder().stale_after_seconds(stale_after_seconds).build()
     }
 
     #[tokio::test]
-    async fn ready_unblocked_issue_is_admitted_with_provenance_while_ineligible_issues_are_not() {
+    async fn ready_unblocked_issues_are_proposed_without_creating_any_convoys() {
         let ready = issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open);
         let unlabeled = issue("1", &[], None, IssueState::Open);
         let blocked = issue("3", &[READY_ISSUE_LABEL], Some("## Blocked by\n\n#9"), IssueState::Open);
         let blocker = issue("9", &[], None, IssueState::Open);
-        let (backend, _, _, reconciler) = harness(vec![unlabeled, blocked, ready.clone()], vec![blocker], policy(3)).await;
+        let (backend, _, _, reconciler) = harness(vec![unlabeled, blocked, ready.clone()], vec![blocker], policy(300)).await;
 
         let outcome = reconciler.reconcile_once().await.expect("reconcile");
 
-        assert_eq!(outcome.admitted, 1);
+        assert_eq!(outcome.queued, 1);
         assert_eq!(outcome.blocked, 1);
-        let convoys = backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys");
-        assert_eq!(convoys.items.len(), 1);
-        assert_eq!(convoys.items[0].spec.issues[0].reference, ready.reference);
-        assert!(convoys.items[0]
-            .metadata
-            .annotations
-            .get(DISPATCH_PROVENANCE_ANNOTATION)
-            .expect("provenance")
-            .starts_with("dispatch-reconciler, issue #2 ready+unblocked at "));
+        let project = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project");
+        assert_eq!(project.status.expect("status").dispatch_queue[0].issue, ready.reference);
+        assert!(backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.is_empty(), "proposer must never admit convoys");
     }
 
     #[tokio::test]
-    async fn closing_a_blocker_makes_the_dependent_dispatchable_on_the_next_pass() {
+    async fn closing_a_blocker_adds_the_dependent_to_the_queue_on_the_next_pass() {
         let dependent = issue("2", &[READY_ISSUE_LABEL], Some("## Blocked by\n#9"), IssueState::Open);
         let blocker = issue("9", &[], None, IssueState::Open);
-        let (backend, issues, _, reconciler) = harness(vec![dependent], vec![blocker], policy(3)).await;
-        assert_eq!(reconciler.reconcile_once().await.expect("blocked pass").admitted, 0);
+        let (backend, issues, _, reconciler) = harness(vec![dependent], vec![blocker], policy(300)).await;
+        assert_eq!(reconciler.reconcile_once().await.expect("blocked pass").queued, 0);
 
         issues
             .by_ref
@@ -511,71 +476,142 @@ mod tests {
             .expect("issues lock")
             .insert(IssueRef { source: source(), id: "9".to_string() }, issue("9", &[], None, IssueState::Closed));
 
-        assert_eq!(reconciler.reconcile_once().await.expect("unblocked pass").admitted, 1);
-        assert_eq!(backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.len(), 1);
+        assert_eq!(reconciler.reconcile_once().await.expect("unblocked pass").queued, 1);
+        assert_eq!(
+            backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue.len(),
+            1
+        );
     }
 
     #[tokio::test]
-    async fn full_cap_defers_without_querying_the_issue_source() {
+    async fn manual_dispatch_of_a_queued_issue_records_the_a_decision_and_drops_it_from_the_queue() {
         let ready = issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open);
-        let (backend, issues, admission, reconciler) = harness(vec![ready], vec![], policy(1)).await;
-        let project = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project");
-        admission
-            .admit(
-                &project,
-                &issue("1", &[READY_ISSUE_LABEL], None, IssueState::Open),
-                project.spec.dispatch_policy.as_ref().expect("policy"),
-                "dispatch-reconciler".to_string(),
-            )
+        let (backend, _, clock, reconciler) = harness(vec![ready.clone()], vec![], policy(300)).await;
+        reconciler.reconcile_once().await.expect("queue pass");
+        backend
+            .clone()
+            .using::<WorkflowTemplate>(NAMESPACE)
+            .create(&InputMeta::builder().name("review-and-fix".to_string()).build(), &single_agent_contained_workflow_spec())
             .await
-            .expect("existing convoy");
+            .expect("workflow");
+        backend
+            .clone()
+            .using::<Convoy>(NAMESPACE)
+            .create(&InputMeta::builder().name("human-dispatch".to_string()).build(), &ConvoySpec {
+                workflow_ref: "review-and-fix".to_string(),
+                dispatching_principal_ref: Default::default(),
+                inputs: BTreeMap::<String, InputValue>::new(),
+                placement_policy: Some("docker-local".to_string()),
+                repositories: Vec::new(),
+                r#ref: Some("fix-2".to_string()),
+                project_ref: Some("widgets".to_string()),
+                adopted_checkout_refs: Default::default(),
+                issues: vec![ConvoyIssue {
+                    reference: ready.reference.clone(),
+                    repository_ref: None,
+                    snapshot: IssueSnapshot {
+                        title: ready.title,
+                        body: ready.body,
+                        state: ready.state,
+                        labels: ready.labels,
+                        as_of: ready.as_of,
+                    },
+                }],
+                change_request: None,
+                instruction: None,
+            })
+            .await
+            .expect("manual convoy");
+        clock.advance(Duration::seconds(90));
 
-        let outcome = reconciler.reconcile_once().await.expect("reconcile");
+        let outcome = reconciler.reconcile_once().await.expect("observation pass");
 
-        assert!(outcome.deferred_cap_full);
-        assert_eq!(*issues.ready_calls.lock().expect("ready calls lock"), 0);
-        assert_eq!(backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.len(), 1);
+        assert_eq!(outcome.observations_recorded, 1);
+        assert!(backend
+            .using::<Project>(NAMESPACE)
+            .get("widgets")
+            .await
+            .expect("project")
+            .status
+            .expect("status")
+            .dispatch_queue
+            .is_empty());
+        let observations = backend.using::<DispatchObservation>(NAMESPACE).list().await.expect("observations");
+        assert_eq!(observations.items.len(), 1);
+        let observation = &observations.items[0].spec;
+        assert_eq!(observation.issue, ready.reference);
+        assert_eq!(observation.workflow_ref, "review-and-fix");
+        assert_eq!(observation.placement_policy.as_deref(), Some("docker-local"));
+        assert_eq!(observation.stance, Stance::Contained);
+        assert_eq!(
+            observation.time_from_ready_seconds,
+            observation.dispatched_at.signed_duration_since(observation.ready_observed_at).num_seconds().max(0) as u64
+        );
     }
 
     #[tokio::test]
-    async fn a_limited_pass_admits_the_oldest_ready_issue_first() {
-        let newer = issue("20", &[READY_ISSUE_LABEL], None, IssueState::Open);
-        let older = issue("10", &[READY_ISSUE_LABEL], None, IssueState::Open);
-        let (backend, _, _, reconciler) = harness(vec![newer, older.clone()], vec![], policy(1)).await;
+    async fn a_non_empty_queue_raises_attention_after_the_policy_threshold() {
+        let (backend, _, clock, reconciler) =
+            harness(vec![issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open)], vec![], policy(60)).await;
+        reconciler.reconcile_once().await.expect("fresh pass");
+        assert!(backend
+            .using::<Project>(NAMESPACE)
+            .get("widgets")
+            .await
+            .expect("project")
+            .status
+            .expect("status")
+            .dispatch_queue_attention
+            .is_none());
 
-        let outcome = reconciler.reconcile_once().await.expect("reconcile");
+        clock.advance(Duration::seconds(60));
+        reconciler.reconcile_once().await.expect("stale pass");
 
-        assert_eq!(outcome.admitted, 1);
-        let convoys = backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys");
-        assert_eq!(convoys.items[0].spec.issues[0].reference, older.reference);
+        let attention = backend
+            .using::<Project>(NAMESPACE)
+            .get("widgets")
+            .await
+            .expect("project")
+            .status
+            .expect("status")
+            .dispatch_queue_attention
+            .expect("attention");
+        assert_eq!(attention.count, 1);
     }
 
     #[tokio::test]
-    async fn disabled_policy_is_an_immediate_kill_switch() {
-        let mut disabled = policy(3);
-        disabled.enabled = false;
+    async fn an_unchanged_queue_does_not_rewrite_project_status() {
+        let (backend, _, _, reconciler) =
+            harness(vec![issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open)], vec![], policy(300)).await;
+        reconciler.reconcile_once().await.expect("first pass");
+        let first = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project");
+
+        reconciler.reconcile_once().await.expect("identical pass");
+
+        let second = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project");
+        assert_eq!(second.metadata.resource_version, first.metadata.resource_version);
+    }
+
+    #[tokio::test]
+    async fn disabled_policy_clears_queue_immediately_without_observing_or_querying() {
         let (backend, issues, _, reconciler) =
-            harness(vec![issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open)], vec![], disabled).await;
+            harness(vec![issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open)], vec![], policy(60)).await;
+        reconciler.reconcile_once().await.expect("enabled pass");
+        let project_resolver = backend.clone().using::<Project>(NAMESPACE);
+        let current = project_resolver.get("widgets").await.expect("project");
+        let mut spec = current.spec;
+        spec.dispatch_policy.as_mut().expect("policy").enabled = false;
+        project_resolver
+            .update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec)
+            .await
+            .expect("disable policy");
+        let calls_before = *issues.ready_calls.lock().expect("ready calls lock");
 
-        assert_eq!(reconciler.reconcile_once().await.expect("reconcile"), ReconcilePass::default());
-        assert_eq!(*issues.ready_calls.lock().expect("ready calls lock"), 0);
-        assert!(backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.is_empty());
-    }
-
-    #[tokio::test]
-    async fn refusal_sets_attention_and_identical_snapshot_is_not_retried() {
-        let ready = issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open);
-        let (backend, _, admission, reconciler) = harness(vec![ready.clone()], vec![], policy(3)).await;
-        *admission.refusal.lock().expect("refusal lock") = Some("placement unavailable".to_string());
-
-        assert!(reconciler.reconcile_once().await.expect("first pass").refused);
-        *admission.refusal.lock().expect("refusal lock") = None;
-        assert_eq!(reconciler.reconcile_once().await.expect("second pass").admitted, 0);
-
-        let project = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project");
-        let attention = project.status.expect("status").dispatch_attention.expect("attention");
-        assert_eq!(attention.issue, ready.reference);
-        assert_eq!(attention.reason, "placement unavailable");
+        assert_eq!(reconciler.reconcile_once().await.expect("disabled pass"), ReconcilePass::default());
+        assert_eq!(*issues.ready_calls.lock().expect("ready calls lock"), calls_before);
+        let status = project_resolver.get("widgets").await.expect("project").status.expect("status");
+        assert!(status.dispatch_queue.is_empty());
+        assert!(status.dispatch_queue_attention.is_none());
     }
 
     #[test]
