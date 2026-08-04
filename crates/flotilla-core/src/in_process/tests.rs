@@ -1101,6 +1101,60 @@ async fn create_explanation_convoy(
     }
 }
 
+async fn create_bound_explanation_convoy(
+    backend: &ResourceBackend,
+    name: &str,
+    observation: Option<(flotilla_resources::ObservedChangeRequestState, DateTime<Utc>)>,
+) {
+    let repo_ref = flotilla_resources::RepositoryKey("repo-a".to_string());
+    let mut spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).build();
+    spec.repositories = vec![ConvoyRepositorySpec::builder()
+        .url(format!("https://example.com/org/{name}"))
+        .repo_ref(repo_ref.clone())
+        .source_ref("main".to_string())
+        .target_ref("main".to_string())
+        .workspace_slug("repo".to_string())
+        .subpaths(Vec::new())
+        .build()];
+    spec.change_request = Some(flotilla_resources::BoundChangeRequest {
+        id: "42".to_string(),
+        repository_ref: repo_ref,
+        title: "Bound change request".to_string(),
+    });
+    let convoys = backend.using::<Convoy>("flotilla");
+    let convoy = convoys.create(&empty_input_meta(name), &spec).await.expect("create bound convoy");
+    convoys
+        .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() })
+        .await
+        .expect("update bound convoy status");
+
+    let Some((state, observed_at)) = observation else { return };
+    let scope = format!("org/{name}");
+    let record_name = flotilla_resources::change_request_record_name("example.com", &scope, 42);
+    let change_requests = backend.using::<flotilla_resources::ChangeRequest>("flotilla");
+    let change_request = change_requests
+        .create(&empty_input_meta(&record_name), &flotilla_resources::ChangeRequestSpec {
+            service: "example.com".to_string(),
+            scope,
+            number: 42,
+            observing_authority: "test".to_string(),
+        })
+        .await
+        .expect("create change request");
+    change_requests
+        .update_status(&record_name, &change_request.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+            state: flotilla_resources::Observation::known(state, observed_at),
+            head_sha: flotilla_resources::Observation::known("abc123".to_string(), observed_at),
+            checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
+            review: flotilla_resources::ChangeRequestReviewObservation {
+                actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+            },
+            mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
+        })
+        .await
+        .expect("update change request status");
+}
+
 async fn explain(daemon: &InProcessDaemon, name: &str) -> flotilla_protocol::ConvoyExplanation {
     let result = daemon
         .execute_query(
@@ -1145,6 +1199,39 @@ async fn convoy_explanation_names_each_held_landing_expectation_and_claim_exit()
     let claim_exit = explain(&daemon, "claim-exit").await;
     assert!(claim_exit.settlement.satisfied);
     assert_eq!(claim_exit.settlement.mode, "claim_exit");
+}
+
+#[tokio::test]
+async fn convoy_explanation_names_missing_stale_and_open_bound_change_requests() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let (daemon, _temp) = explanation_daemon(backend.clone()).await;
+    create_bound_explanation_convoy(&backend, "bound-missing", None).await;
+    create_bound_explanation_convoy(
+        &backend,
+        "bound-stale",
+        Some((flotilla_resources::ObservedChangeRequestState::Open, Utc::now() - ChronoDuration::hours(1))),
+    )
+    .await;
+    create_bound_explanation_convoy(&backend, "bound-open", Some((flotilla_resources::ObservedChangeRequestState::Open, Utc::now()))).await;
+
+    let missing = explain(&daemon, "bound-missing").await;
+    assert_eq!(missing.settlement.unmet[0].reason, "missing_record");
+    assert_eq!(
+        missing.settlement.unmet[0].subject,
+        format!("change_request/{}", flotilla_resources::change_request_record_name("example.com", "org/bound-missing", 42))
+    );
+    assert!(missing.change_requests[0].bound);
+    assert!(!missing.change_requests[0].observed);
+
+    let stale = explain(&daemon, "bound-stale").await;
+    assert_eq!(stale.settlement.unmet[0].reason, "stale_evidence");
+    assert!(stale.change_requests[0].bound);
+    assert_eq!(stale.change_requests[0].freshness, flotilla_protocol::EvidenceFreshness::Stale);
+
+    let open = explain(&daemon, "bound-open").await;
+    assert_eq!(open.settlement.unmet[0].reason, "false_condition");
+    assert!(open.change_requests[0].bound);
+    assert_eq!(open.change_requests[0].freshness, flotilla_protocol::EvidenceFreshness::Fresh);
 }
 
 #[tokio::test]

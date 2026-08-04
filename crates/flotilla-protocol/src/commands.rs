@@ -157,7 +157,6 @@ pub enum EvidenceFreshness {
     Fresh,
     Stale,
     Missing,
-    NotApplicable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -36,23 +36,23 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
-    apply_status_patch_checked as apply_resource_status_patch_checked, ensure_repository, evaluate_landing_settlement,
-    expected_change_request_leaves, expected_checkout_refs, external_patches as convoy_external_patches, list_resource_kind,
-    list_resource_kind_including_replicas, normalize_project_spec, repository_display_labels, resolve_project_issue_sources,
-    terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
-    watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
-    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
-    ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialGrant,
-    CredentialSpec, CrewCompletionPending, CrewSource, Environment as ResourceEnvironment, Host as ResourceHost,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta,
-    InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositoryRole,
-    ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
-    ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
-    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatusPatch, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
-    HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name, ensure_repository,
+    evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs, external_patches as convoy_external_patches,
+    list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec, repository_display_labels,
+    resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from,
+    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout,
+    CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec,
+    ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, Environment as ResourceEnvironment,
+    Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
+    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
+    ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend,
+    ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalBrief, TerminalCrewContext,
+    TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, UnmetSettlementExpectation,
+    Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -8641,72 +8641,7 @@ async fn execute_local_remote_step_batch(
     Ok(outcomes)
 }
 
-#[async_trait]
-impl DaemonHandle for InProcessDaemon {
-    fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
-        self.event_tx.subscribe()
-    }
-
-    fn query_subscription(&self, subscriber_id: uuid::Uuid) -> QuerySubscription {
-        let state = self.aggregator_projection_state.clone();
-        let namespace = self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone();
-        self.connect_surface(subscriber_id, SurfaceDeclaration::focal_for_namespace(namespace));
-        let daemon = self.self_weak.clone();
-        QuerySubscription::new(move || {
-            state.remove_subscriber(subscriber_id);
-            if let Some(daemon) = daemon.upgrade() {
-                tokio::spawn(async move {
-                    if let Err(error) = daemon.disconnect_surface(subscriber_id).await {
-                        warn!(%error, "failed to disconnect in-process surface");
-                    }
-                });
-            }
-        })
-    }
-
-    async fn get_state(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoSnapshot, String> {
-        let repo_path = self.resolve_repo_selector(repo).await?;
-        let identity =
-            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
-        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
-        let repos = self.repos.read().await;
-        let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
-        Ok(match state.cached_snapshot() {
-            Some(s) => (**s).clone(),
-            None => build_repo_snapshot_with_peers(
-                state.snapshot_context(&self.node_id, &self.host_name, &self.environment_manager),
-                state.seq(),
-                peer_overlay.as_deref(),
-            ),
-        })
-    }
-
-    async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
-        let repository_keys = self.repository_keys_by_path.read().await;
-        let repos = self.repos.read().await;
-        let order = self.repo_order.read().await;
-        let mut result = Vec::new();
-        for identity in order.iter() {
-            if let Some(state) = repos.get(identity) {
-                result.push(RepoInfo {
-                    identity: state.identity().clone(),
-                    repository_key: repository_keys.get(state.preferred_path()).cloned(),
-                    path: Some(state.preferred_path().to_path_buf()),
-                    name: repo_name(state.preferred_path()),
-                    labels: state.labels().clone(),
-                    provider_names: state.provider_names(),
-                    provider_health: crate::convert::health_to_proto(state.provider_health()),
-                    loading: state.loading(),
-                });
-            }
-        }
-        Ok(result)
-    }
-
-    async fn execute(&self, command: Command) -> Result<u64, String> {
-        self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false, None).await
-    }
-
+impl InProcessDaemon {
     async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String> {
         let namespace = requested_namespace.map(ToOwned::to_owned).unwrap_or(self.provisioning_namespace().await);
         let convoy_sources =
@@ -8781,13 +8716,7 @@ impl DaemonHandle for InProcessDaemon {
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
-        let bound_name = convoy.spec.change_request.as_ref().and_then(|bound| {
-            let repository = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == bound.repository_ref)?;
-            let leaf = flotilla_resources::expected_change_request_leaves(&convoy, &selected_checkouts).ok()?.into_iter().next()?;
-            let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = leaf.address else { return None };
-            let _ = repository;
-            Some(flotilla_resources::change_request_record_name(&service, &scope, number))
-        });
+        let bound_name = bound_change_request_record_name(&convoy).map_err(|error| format!("derive bound change request: {error}"))?;
         let change_requests = expected_change_requests
             .iter()
             .map(|record_name| {
@@ -8877,6 +8806,73 @@ impl DaemonHandle for InProcessDaemon {
             crew_deliveries,
             settlement,
         })
+    }
+}
+
+#[async_trait]
+impl DaemonHandle for InProcessDaemon {
+    fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
+        self.event_tx.subscribe()
+    }
+
+    fn query_subscription(&self, subscriber_id: uuid::Uuid) -> QuerySubscription {
+        let state = self.aggregator_projection_state.clone();
+        let namespace = self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone();
+        self.connect_surface(subscriber_id, SurfaceDeclaration::focal_for_namespace(namespace));
+        let daemon = self.self_weak.clone();
+        QuerySubscription::new(move || {
+            state.remove_subscriber(subscriber_id);
+            if let Some(daemon) = daemon.upgrade() {
+                tokio::spawn(async move {
+                    if let Err(error) = daemon.disconnect_surface(subscriber_id).await {
+                        warn!(%error, "failed to disconnect in-process surface");
+                    }
+                });
+            }
+        })
+    }
+
+    async fn get_state(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoSnapshot, String> {
+        let repo_path = self.resolve_repo_selector(repo).await?;
+        let identity =
+            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
+        let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
+        let repos = self.repos.read().await;
+        let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
+        Ok(match state.cached_snapshot() {
+            Some(s) => (**s).clone(),
+            None => build_repo_snapshot_with_peers(
+                state.snapshot_context(&self.node_id, &self.host_name, &self.environment_manager),
+                state.seq(),
+                peer_overlay.as_deref(),
+            ),
+        })
+    }
+
+    async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
+        let repository_keys = self.repository_keys_by_path.read().await;
+        let repos = self.repos.read().await;
+        let order = self.repo_order.read().await;
+        let mut result = Vec::new();
+        for identity in order.iter() {
+            if let Some(state) = repos.get(identity) {
+                result.push(RepoInfo {
+                    identity: state.identity().clone(),
+                    repository_key: repository_keys.get(state.preferred_path()).cloned(),
+                    path: Some(state.preferred_path().to_path_buf()),
+                    name: repo_name(state.preferred_path()),
+                    labels: state.labels().clone(),
+                    provider_names: state.provider_names(),
+                    provider_health: crate::convert::health_to_proto(state.provider_health()),
+                    loading: state.loading(),
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    async fn execute(&self, command: Command) -> Result<u64, String> {
+        self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false, None).await
     }
 
     async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {

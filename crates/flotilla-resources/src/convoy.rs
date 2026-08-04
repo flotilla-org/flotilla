@@ -90,6 +90,21 @@ pub fn expected_checkout_refs(convoy: &crate::ResourceObject<Convoy>) -> Result<
     Ok(expected)
 }
 
+/// Canonical resource name for a convoy's explicitly bound change request.
+pub fn bound_change_request_record_name(convoy: &crate::ResourceObject<Convoy>) -> Result<Option<String>, String> {
+    let Some(bound) = &convoy.spec.change_request else { return Ok(None) };
+    let repository = convoy
+        .spec
+        .repositories
+        .iter()
+        .find(|repository| repository.repo_ref == bound.repository_ref)
+        .ok_or_else(|| format!("bound change request repository {} is absent from convoy", bound.repository_ref))?;
+    let LeafAddress::ChangeRequest { service, scope, number } = change_request_address(&repository.url, &bound.id)? else {
+        unreachable!("change_request_address always returns a change-request address")
+    };
+    Ok(Some(crate::change_request_record_name(&service, &scope, number)))
+}
+
 /// Select the authoritative child observation for each object name.
 ///
 /// The actuator host wins when placement identifies one, followed by a local
