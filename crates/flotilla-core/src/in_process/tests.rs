@@ -20,8 +20,8 @@ use flotilla_protocol::{
     TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    latch_evidence_backed_integration, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
-    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy, ConvoyPhase,
+    controller::Reconciler, latch_evidence_backed_integration, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
+    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy, ConvoyPhase, ConvoyReconciler,
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
     CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
     CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost,
@@ -135,6 +135,14 @@ async fn reopened_change_request_replaces_authority_observation_and_holds_landin
             &empty_input_meta("reopened-convoy"),
             &ConvoySpec::builder()
                 .workflow_ref("review-and-fix".to_string())
+                .repositories(vec![ConvoyRepositorySpec::builder()
+                    .url("https://github.com/flotilla-org/flotilla".to_string())
+                    .repo_ref(repo_ref.clone())
+                    .source_ref("main".to_string())
+                    .target_ref("main".to_string())
+                    .workspace_slug("flotilla".to_string())
+                    .subpaths(Vec::new())
+                    .build()])
                 .adopted_checkout_refs(BTreeMap::from([(repo_ref.clone(), "checkout-reopened".to_string())]))
                 .change_request(
                     BoundChangeRequest::builder()
@@ -150,6 +158,7 @@ async fn reopened_change_request_replaces_authority_observation_and_holds_landin
     convoys
         .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
             phase: ConvoyPhase::Landing,
+            observed_workflow_ref: Some("review-and-fix".to_string()),
             ..Default::default()
         })
         .await
@@ -190,7 +199,10 @@ async fn reopened_change_request_replaces_authority_observation_and_holds_landin
     let integration = reopened.status.expect("checkout status").integration;
     assert_eq!(integration.landed.value, ConditionValue::False, "reopened observation: {integration:?}");
     assert_eq!(integration.landed_evidence, None);
-    assert!(!daemon.convoy_change_requests_settled("flotilla", "reopened-convoy").await.expect("evaluate settlement"));
+    let current = convoys.get("reopened-convoy").await.expect("Landing convoy");
+    let reconciler = ConvoyReconciler::new(daemon.resource_backend().using::<WorkflowTemplate>("flotilla")).with_checkouts(checkouts);
+    let dependencies = reconciler.fetch_dependencies(&current).await.expect("evaluate landing dependencies");
+    assert_eq!(reconciler.reconcile(&current, &dependencies, chrono::Utc::now()).patch, None);
     assert_eq!(convoys.get("reopened-convoy").await.expect("Landing convoy").status.expect("convoy status").phase, ConvoyPhase::Landing);
 }
 
@@ -5566,152 +5578,6 @@ async fn teardown_gate_does_not_rewrite_a_latched_terminal_change_request() {
 }
 
 #[tokio::test]
-async fn stale_latched_terminal_change_request_cannot_settle_landing() {
-    let temp = tempfile::tempdir().expect("create tempdir");
-    let config_base = temp.path().join("config");
-    std::fs::create_dir_all(&config_base).expect("create config dir");
-    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
-    let runner = DiscoveryMockRunner::builder()
-        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
-        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
-        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
-        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/feature/merged\n".into()))
-        .on_run("git", &["rev-list", "--count", "origin/feature/merged..HEAD"], Ok("0\n".into()))
-        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
-        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("1\n".into()))
-        .on_run(
-            "gh",
-            &[
-                "pr",
-                "list",
-                "--head",
-                "feature/merged",
-                "--state",
-                "all",
-                "--json",
-                "number,state,mergedAt,baseRefName,mergeable",
-                "--limit",
-                "1",
-            ],
-            Ok("[]".into()),
-        )
-        .build();
-    let daemon = InProcessDaemon::new(
-        vec![],
-        Arc::new(ConfigStore::with_base(&config_base)),
-        fake_discovery_with_runner(false, Arc::new(runner)),
-        HostName::local(),
-    )
-    .await;
-    create_ready_observed_checkout_for_convoy(&daemon, "flotilla", "merged-convoy", "checkout-merged", "/repo", "feature/merged").await;
-
-    let observed_at = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
-    let condition = || IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build();
-    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
-    let checkout = checkouts.get("checkout-merged").await.expect("ready checkout");
-    let mut status = checkout.status.expect("ready checkout status");
-    status.integration = CheckoutIntegrationStatus {
-        clean: condition(),
-        pushed: condition(),
-        landed: condition(),
-        landed_evidence: Some(flotilla_resources::LandedEvidence::builder().change_request_id("1162".to_string()).build()),
-        change_request: Some(
-            flotilla_resources::ChangeRequestObservation::builder()
-                .id("1162".to_string())
-                .state(flotilla_resources::ChangeRequestState::Merged)
-                .mergeability(flotilla_resources::ChangeRequestMergeability::Unknown)
-                .observed_at(observed_at)
-                .build(),
-        ),
-    };
-    checkouts.update_status("checkout-merged", &checkout.metadata.resource_version, &status).await.expect("persist landed checkout");
-
-    assert!(
-        !daemon.convoy_change_requests_settled("flotilla", "merged-convoy").await.expect("landing evaluation"),
-        "stale latched landed evidence must hold until the checkout authority publishes a fresh observation"
-    );
-    let stored = checkouts.get("checkout-merged").await.expect("checkout after landing evaluation");
-    assert_eq!(
-        stored.status.expect("checkout status").integration.change_request.unwrap().state,
-        flotilla_resources::ChangeRequestState::Merged
-    );
-}
-
-#[tokio::test]
-async fn completion_pr_from_another_branch_holds_landing_when_checkout_spec_ref_is_at_base() {
-    let temp = tempfile::tempdir().expect("create tempdir");
-    let config_base = temp.path().join("config");
-    std::fs::create_dir_all(&config_base).expect("create config dir");
-    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
-    let runner = DiscoveryMockRunner::builder()
-        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
-        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
-        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
-        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/provisioned-ref\n".into()))
-        .on_run("git", &["rev-list", "--count", "origin/provisioned-ref..HEAD"], Ok("0\n".into()))
-        .on_run("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], Ok("origin/main\n".into()))
-        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("0\n".into()))
-        .on_run(
-            "gh",
-            &["pr", "view", "1338", "--json", "number,state,mergedAt,baseRefName,mergeable"],
-            Ok(r#"{"number":1338,"state":"OPEN","mergedAt":null,"baseRefName":"main"}"#.into()),
-        )
-        .build();
-    let daemon = InProcessDaemon::new(
-        vec![],
-        Arc::new(ConfigStore::with_base(&config_base)),
-        fake_discovery_with_runner(false, Arc::new(runner)),
-        HostName::local(),
-    )
-    .await;
-    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
-    let convoy = convoys
-        .create(
-            &empty_input_meta("different-pr-branch"),
-            &ConvoySpec::builder()
-                .workflow_ref("review-and-fix".to_string())
-                .repositories(vec![ConvoyRepositorySpec::builder()
-                    .url("https://github.com/flotilla-org/flotilla".to_string())
-                    .repo_ref(flotilla_resources::RepositoryKey("repo".to_string()))
-                    .source_ref("main".to_string())
-                    .target_ref("main".to_string())
-                    .workspace_slug("flotilla".to_string())
-                    .subpaths(Vec::new())
-                    .build()])
-                .build(),
-        )
-        .await
-        .expect("create convoy");
-    let finished_at = chrono::Utc::now();
-    let mut status = ConvoyStatus::default();
-    status.crew_work.insert(
-        "work".to_string(),
-        BTreeMap::from([(
-            "coder".to_string(),
-            CrewWorkState::builder()
-                .phase(CrewWorkPhase::Done)
-                .finished_at(finished_at)
-                .message("https://github.com/flotilla-org/flotilla/pull/1338".to_string())
-                .build(),
-        )]),
-    );
-    convoys.update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &status).await.expect("record completion PR");
-    create_ready_observed_checkout_for_convoy(
-        &daemon,
-        "flotilla",
-        "different-pr-branch",
-        "checkout-different-pr-branch",
-        "/repo",
-        "provisioned-ref",
-    )
-    .await;
-    assert!(
-        !daemon.convoy_change_requests_settled("flotilla", "different-pr-branch").await.expect("evaluate settlement"),
-        "the open completion PR must hold Landing even though its head differs from the checkout spec ref"
-    );
-}
-
-#[tokio::test]
 async fn convoy_reclaim_refuses_when_checkout_has_no_fresh_integration_evidence() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
@@ -6687,98 +6553,6 @@ async fn local_convoy_admission_pins_the_grant_resolved_workflow() {
 }
 
 #[tokio::test]
-async fn expected_but_unobserved_checkout_neither_settles_nor_allows_reclaim() {
-    let temp = tempfile::tempdir().expect("create tempdir");
-    let config_base = temp.path().join("config");
-    std::fs::create_dir_all(&config_base).expect("create config dir");
-    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
-    let daemon =
-        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
-    daemon
-        .resource_backend()
-        .using::<Convoy>("flotilla")
-        .create(&empty_input_meta("empty-convoy"), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
-        .await
-        .expect("create convoy");
-    record_expected_checkout_for_convoy(&daemon, "flotilla", "empty-convoy", "missing-checkout").await;
-
-    assert!(!daemon.convoy_change_requests_settled("flotilla", "empty-convoy").await.expect("evaluate settlement"));
-    let refusal = daemon
-        .verify_convoy_teardown_gate("flotilla", "empty-convoy", false)
-        .await
-        .expect_err("empty checkout evidence must refuse reclaim");
-    assert!(refusal.contains("missing checkout integration evidence for missing-checkout"), "unexpected refusal: {refusal}");
-}
-
-#[tokio::test]
-async fn artifactless_convoy_settles_and_allows_reclaim_on_claims() {
-    let temp = tempfile::tempdir().expect("create tempdir");
-    let config_base = temp.path().join("config");
-    std::fs::create_dir_all(&config_base).expect("create config dir");
-    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
-    let daemon =
-        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
-    daemon
-        .resource_backend()
-        .using::<Convoy>("flotilla")
-        .create(&empty_input_meta("artifactless-convoy"), &ConvoySpec::builder().workflow_ref("tool-only".to_string()).build())
-        .await
-        .expect("create artifactless convoy");
-
-    assert!(daemon.convoy_change_requests_settled("flotilla", "artifactless-convoy").await.expect("evaluate settlement"));
-    daemon
-        .verify_convoy_teardown_gate("flotilla", "artifactless-convoy", false)
-        .await
-        .expect("artifactless convoy should pass reclaim gate");
-}
-
-#[tokio::test]
-async fn adopted_checkout_with_open_change_request_holds_settlement() {
-    let temp = tempfile::tempdir().expect("create tempdir");
-    let config_base = temp.path().join("config");
-    std::fs::create_dir_all(&config_base).expect("create config dir");
-    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
-    let daemon =
-        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
-    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
-    let created = checkouts
-        .create(
-            &InputMeta::builder()
-                .name("adopted-open".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "adopted-convoy".to_string())]))
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Adopted),
-            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-                r#ref: "feature/adopted-open".to_string(),
-                path: "/adopted".to_string(),
-                repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
-                host_ref: "host-01".to_string(),
-                is_main: false,
-            }),
-        )
-        .await
-        .expect("create adopted checkout");
-    let observed_at = chrono::Utc::now().to_rfc3339();
-    checkouts
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &ResourceCheckoutStatus {
-            phase: ResourceCheckoutPhase::Ready,
-            path: Some("/adopted".to_string()),
-            commit: None,
-            branch_provenance: Default::default(),
-            integration: CheckoutIntegrationStatus {
-                landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at).build(),
-                ..Default::default()
-            },
-            message: None,
-        })
-        .await
-        .expect("record open adopted change request");
-    record_expected_checkout_for_convoy(&daemon, "flotilla", "adopted-convoy", "adopted-open").await;
-
-    assert!(!daemon.convoy_change_requests_settled("flotilla", "adopted-convoy").await.expect("evaluate adopted settlement"));
-}
-
-#[tokio::test]
 async fn adopted_checkout_with_unlanded_change_request_refuses_reclaim_gate() {
     // Gate-side twin of the settle-condition test above: the reclaim gate's
     // adopted branch must refuse while an Adopted checkout's landed condition
@@ -6862,99 +6636,4 @@ async fn adopted_checkout_with_unlanded_change_request_refuses_reclaim_gate() {
         .expect_err("unlanded adopted checkout must refuse reclaim");
     assert!(error.contains("adopted-gate-open"), "refusal should name the adopted checkout: {error}");
     assert!(error.contains("Landed=False"), "refusal should identify the landed condition: {error}");
-}
-
-#[tokio::test]
-async fn landing_holds_on_stale_vacuous_landed_without_probing() {
-    // #1163 replay: a checkout's landed condition was recorded True while the
-    // branch was untouched ("nothing to land"), the crew then pushed and
-    // opened a change request, and the convoy entered Landing before any
-    // re-observation. The landing decision must hold until the checkout's
-    // authority publishes a fresh observation, without probing or rewriting
-    // the stored checkout itself.
-    let temp = tempfile::tempdir().expect("create tempdir");
-    let config_base = temp.path().join("config");
-    std::fs::create_dir_all(&config_base).expect("create config dir");
-    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
-
-    let runner = DiscoveryMockRunner::builder()
-        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
-        .on_run("git", &["rev-list", "--count", "main..HEAD"], Ok("2".into()))
-        .on_run(
-            "gh",
-            &[
-                "pr",
-                "list",
-                "--head",
-                "feature/split",
-                "--state",
-                "all",
-                "--json",
-                "number,state,mergedAt,baseRefName,mergeable",
-                "--limit",
-                "1",
-            ],
-            Ok(r#"[{"number": 1162, "state": "OPEN", "mergedAt": null, "baseRefName": "main"}]"#.into()),
-        )
-        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
-        .build();
-    let daemon = InProcessDaemon::new(
-        vec![],
-        Arc::new(ConfigStore::with_base(&config_base)),
-        fake_discovery_with_runner(false, Arc::new(runner)),
-        HostName::local(),
-    )
-    .await;
-
-    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
-    let convoy_spec = ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build();
-    convoys.create(&empty_input_meta("split-convoy"), &convoy_spec).await.expect("convoy create should succeed");
-
-    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
-    let checkout = checkouts
-        .create(
-            &input_meta_with_labels("checkout-split", BTreeMap::from([(CONVOY_LABEL.to_string(), "split-convoy".to_string())])),
-            &ResourceCheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
-                repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
-                env_ref: "env".to_string(),
-                r#ref: "feature/split".to_string(),
-                base_ref: Some("main".to_string()),
-                target_path: "/checkout".to_string(),
-                clone_ref: "clone-a".to_string(),
-            }),
-        )
-        .await
-        .expect("checkout create should succeed");
-    let stale_observed_at = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
-    let stale_vacuous = flotilla_resources::IntegrationCondition::builder()
-        .value(flotilla_resources::ConditionValue::True)
-        .details(vec!["no change request exists for branch".to_string()])
-        .observed_at(stale_observed_at.clone())
-        .build();
-    checkouts
-        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &ResourceCheckoutStatus {
-            phase: ResourceCheckoutPhase::Ready,
-            path: Some("/checkout".to_string()),
-            commit: None,
-            branch_provenance: Default::default(),
-            integration: flotilla_resources::CheckoutIntegrationStatus {
-                clean: stale_vacuous.clone(),
-                pushed: stale_vacuous.clone(),
-                landed: stale_vacuous,
-                landed_evidence: None,
-                change_request: None,
-            },
-            message: None,
-        })
-        .await
-        .expect("checkout status should update");
-    record_expected_checkout_for_convoy(&daemon, "flotilla", "split-convoy", "checkout-split").await;
-
-    // The convoy authority consumes only stored evidence. The stale True
-    // cannot release Landing, and evaluating it must not probe or rewrite a
-    // checkout that may be a replica from another host.
-    assert!(!daemon.convoy_change_requests_settled("flotilla", "split-convoy").await.expect("landing evaluation should succeed"));
-    let stored = checkouts.get("checkout-split").await.expect("checkout should exist").status.expect("checkout status");
-    assert_eq!(stored.integration.landed.value, flotilla_resources::ConditionValue::True);
-    assert_eq!(stored.integration.landed.observed_at, Some(stale_observed_at));
 }

@@ -1,14 +1,15 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, WaitSubscriptionRequest};
 use flotilla_resources::{
-    admit_leaf, evaluate_leaf, ChangeRequest, ChangeRequestLeafSubject, Convoy, ConvoyLeafSubject, ResourceBackend, ResourceObject,
-    ThreeValue, Vessel, VesselLeafSubject, WorkLeafSubject,
+    admit_leaf, controller::SecondaryWatch, evaluate_leaf, expected_change_request_leaves, select_convoy_children, ChangeRequest,
+    ChangeRequestLeafSubject, Checkout, Convoy, ConvoyLeafSubject, ConvoyPhase, ResourceBackend, ResourceError, ResourceObject, ThreeValue,
+    Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject,
 };
 use futures::StreamExt;
 use tokio::{
-    sync::{broadcast, Mutex},
+    sync::{broadcast, mpsc, Mutex},
     task::JoinHandle,
 };
 
@@ -17,6 +18,7 @@ use crate::change_request_observer::{ChangeRequestRef, ChangeRequestRefresher};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeafWatcher {
     WaitCaller { connection_id: uuid::Uuid },
+    ReconcilerWake { convoy: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -49,10 +51,12 @@ struct LeafSubscriptionTableInner {
     rows: Mutex<HashMap<uuid::Uuid, LeafSubscriptionRow>>,
     tasks: Mutex<HashMap<uuid::Uuid, JoinHandle<()>>>,
     change_requests: ChangeRequestRefresher,
+    reconciler_tx: broadcast::Sender<String>,
 }
 
 impl LeafSubscriptionTable {
     pub fn new(backend: ResourceBackend, event_tx: broadcast::Sender<DaemonEvent>, change_requests: ChangeRequestRefresher) -> Self {
+        let (reconciler_tx, _) = broadcast::channel(32);
         Self {
             inner: Arc::new(LeafSubscriptionTableInner {
                 backend,
@@ -60,6 +64,7 @@ impl LeafSubscriptionTable {
                 rows: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(HashMap::new()),
                 change_requests,
+                reconciler_tx,
             }),
         }
     }
@@ -123,6 +128,14 @@ impl LeafSubscriptionTable {
             }
             self.inner.change_requests.release(id).await;
         }
+    }
+
+    pub fn reconciler_wake_watch(&self) -> Box<dyn SecondaryWatch<Primary = Convoy>> {
+        Box::new(ReconcilerWake { subscriptions: self.clone(), _marker: PhantomData })
+    }
+
+    pub fn change_request_stale_after(&self) -> std::time::Duration {
+        self.inner.change_requests.stale_after()
     }
 
     #[cfg(test)]
@@ -195,14 +208,175 @@ impl LeafSubscriptionTable {
 
     async fn fire(&self, subscription_id: uuid::Uuid, mut fire: LeafFire) {
         fire.subscription_id = subscription_id;
-        let Some(LeafWatcher::WaitCaller { connection_id }) =
-            self.inner.rows.lock().await.get(&subscription_id).map(|row| row.watcher.clone())
-        else {
-            return;
-        };
-        fire.watcher_id = connection_id;
-        let _ = self.inner.event_tx.send(DaemonEvent::LeafFired(fire));
-        self.finish(subscription_id).await;
+        let watcher = self.inner.rows.lock().await.get(&subscription_id).map(|row| row.watcher.clone());
+        match watcher {
+            Some(LeafWatcher::WaitCaller { connection_id }) => {
+                fire.watcher_id = connection_id;
+                let _ = self.inner.event_tx.send(DaemonEvent::LeafFired(fire));
+                self.finish(subscription_id).await;
+            }
+            Some(LeafWatcher::ReconcilerWake { convoy }) => {
+                // Internal rows remain until convoy phase re-derivation removes
+                // them. This keeps their refresher demands alive and makes one
+                // row per expected CR a naturally idempotent fired latch.
+                let _ = self.inner.reconciler_tx.send(convoy);
+            }
+            None => {}
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ReconcilerWake {
+    subscriptions: LeafSubscriptionTable,
+    _marker: PhantomData<Convoy>,
+}
+
+impl SecondaryWatch for ReconcilerWake {
+    type Primary = Convoy;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        namespace: String,
+        sender: mpsc::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move { self.run(namespace, sender).await.map_err(ResourceError::other) })
+    }
+}
+
+impl ReconcilerWake {
+    async fn run(&self, namespace: String, sender: mpsc::Sender<String>) -> Result<(), String> {
+        let convoys = self.subscriptions.inner.backend.clone().using::<Convoy>(&namespace);
+        let checkouts = self.subscriptions.inner.backend.including_replicas::<Checkout>(&namespace);
+        let listed_convoys = convoys.list().await.map_err(|error| error.to_string())?;
+        let mut convoy_watch = convoys.watch(WatchStart::resuming_from(&listed_convoys)).await.map_err(|error| error.to_string())?;
+        let mut checkout_watch = checkouts.watch().await.map_err(|error| error.to_string())?;
+        let mut convoy_objects =
+            listed_convoys.items.into_iter().map(|convoy| (convoy.metadata.name.clone(), convoy)).collect::<HashMap<_, _>>();
+        let mut wake_rx = self.subscriptions.inner.reconciler_tx.subscribe();
+        self.sync_rows(&namespace, &convoy_objects).await?;
+
+        loop {
+            tokio::select! {
+                event = convoy_watch.next() => {
+                    let event = event.ok_or_else(|| "reconciler wake convoy watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    match event {
+                        WatchEvent::Added(convoy) | WatchEvent::Modified(convoy) => {
+                            convoy_objects.insert(convoy.metadata.name.clone(), convoy);
+                        }
+                        WatchEvent::Deleted(convoy) => {
+                            convoy_objects.remove(&convoy.metadata.name);
+                        }
+                    }
+                    self.sync_rows(&namespace, &convoy_objects).await?;
+                }
+                event = checkout_watch.next() => {
+                    event.ok_or_else(|| "reconciler wake checkout watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    self.sync_rows(&namespace, &convoy_objects).await?;
+                }
+                wake = wake_rx.recv() => match wake {
+                    Ok(convoy) => sender.send(convoy).await.map_err(|_| "convoy controller queue closed".to_string())?,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        for convoy in convoy_objects.values().filter(|convoy| {
+                            convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landing | ConvoyPhase::Anchored))
+                        }) {
+                            sender.send(convoy.metadata.name.clone()).await.map_err(|_| "convoy controller queue closed".to_string())?;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Err("reconciler wake channel closed".to_string()),
+                }
+            }
+        }
+    }
+
+    async fn sync_rows(&self, namespace: &str, convoys: &HashMap<String, ResourceObject<Convoy>>) -> Result<(), String> {
+        let checkout_sources = self
+            .subscriptions
+            .inner
+            .backend
+            .including_replicas::<Checkout>(namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items;
+        let mut desired = Vec::<(String, Vec<Leaf>)>::new();
+        for convoy in convoys.values().filter(|convoy| {
+            convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landing | ConvoyPhase::Anchored))
+        }) {
+            let checkouts = select_convoy_children(convoy, &checkout_sources);
+            let leaves = match expected_change_request_leaves(convoy, &checkouts) {
+                Ok(leaves) => leaves,
+                Err(error) => {
+                    tracing::warn!(convoy = %convoy.metadata.name, %error, "derive reconciler leaf subscriptions failed");
+                    continue;
+                }
+            };
+            for leaves in leaves.chunks_exact(2) {
+                desired.push((convoy.metadata.name.clone(), leaves.to_vec()));
+            }
+        }
+
+        let existing = self
+            .subscriptions
+            .inner
+            .rows
+            .lock()
+            .await
+            .values()
+            .filter_map(|row| match &row.watcher {
+                LeafWatcher::ReconcilerWake { convoy } if row.namespace == namespace => Some((row.id, convoy.clone(), row.leaves.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (id, convoy, leaves) in &existing {
+            if desired.iter().any(|candidate| candidate == &(convoy.clone(), leaves.clone())) {
+                continue;
+            }
+            self.subscriptions.inner.rows.lock().await.remove(id);
+            if let Some(task) = self.subscriptions.inner.tasks.lock().await.remove(id) {
+                task.abort();
+            }
+            self.subscriptions.inner.change_requests.release(*id).await;
+        }
+
+        'desired_rows: for (convoy, leaves) in desired {
+            if existing.iter().any(|(_, existing_convoy, existing_leaves)| *existing_convoy == convoy && *existing_leaves == leaves) {
+                continue;
+            }
+            let id = uuid::Uuid::new_v4();
+            let row = LeafSubscriptionRow {
+                id,
+                namespace: namespace.to_string(),
+                leaves,
+                watcher: LeafWatcher::ReconcilerWake { convoy: convoy.clone() },
+                freshness_demand: None,
+                created_at: Utc::now(),
+                episode_key: EpisodeKeyFields::default(),
+            };
+            self.subscriptions.inner.rows.lock().await.insert(id, row.clone());
+            for subject in row.leaves.iter().filter_map(|leaf| ChangeRequestRef::from_address(namespace, &leaf.address)) {
+                if let Err(error) = self.subscriptions.inner.change_requests.demand(id, subject, None).await {
+                    self.subscriptions.inner.rows.lock().await.remove(&id);
+                    self.subscriptions.inner.change_requests.release(id).await;
+                    tracing::warn!(%convoy, %error, "arm reconciler leaf subscription failed");
+                    continue 'desired_rows;
+                }
+            }
+            let subscriptions = self.subscriptions.clone();
+            let task = tokio::spawn(async move {
+                if let Err(error) = subscriptions.watch_row(row).await {
+                    tracing::warn!(subscription_id = %id, %error, "reconciler leaf subscription watch ended");
+                    subscriptions.finish(id).await;
+                }
+            });
+            self.subscriptions.inner.tasks.lock().await.insert(id, task);
+        }
+        Ok(())
     }
 }
 
@@ -269,15 +443,17 @@ fn evaluate_row(
 mod tests {
     use std::{
         collections::BTreeMap,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         time::Duration,
     };
 
     use async_trait::async_trait;
     use flotilla_protocol::{LeafAddress, LeafOperator};
     use flotilla_resources::{
-        ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InMemoryBackend, InputMeta, SqliteBackend, WorkPhase,
-        WorkState,
+        controller::ControllerLoop, BoundChangeRequest, ChangeRequestObservation, ChangeRequestState, CheckoutIntegrationStatus,
+        CheckoutPhase, CheckoutSpec, CheckoutStatus, ConditionValue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec,
+        ConvoyStatus, CrewWorkPhase, CrewWorkState, InMemoryBackend, InputMeta, IntegrationCondition, LifecycleAuthority,
+        ObservedCheckoutSpec, PlacementStatus, RepositoryKey, SqliteBackend, WorkPhase, WorkState, WorkflowTemplate, CONVOY_LABEL,
     };
 
     use super::*;
@@ -296,6 +472,34 @@ mod tests {
 
     struct CountingChangeRequests {
         calls: Arc<AtomicUsize>,
+    }
+
+    struct ControlledChangeRequests {
+        merged: AtomicBool,
+    }
+
+    #[async_trait]
+    impl crate::change_request_observer::ChangeRequestObservationSource for ControlledChangeRequests {
+        async fn observe(
+            &self,
+            _subject: &crate::change_request_observer::ChangeRequestRef,
+        ) -> Result<flotilla_resources::ChangeRequestStatus, String> {
+            let observed_at = Utc::now();
+            let state = if self.merged.load(Ordering::SeqCst) {
+                flotilla_resources::ObservedChangeRequestState::Merged
+            } else {
+                flotilla_resources::ObservedChangeRequestState::Open
+            };
+            Ok(flotilla_resources::ChangeRequestStatus {
+                state: flotilla_resources::Observation::known(state, observed_at),
+                head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
+                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+                },
+                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
+            })
+        }
     }
 
     #[async_trait]
@@ -446,6 +650,227 @@ mod tests {
     #[tokio::test]
     async fn sqlite_leaf_subscription_contract() {
         assert_leaf_subscription_contract(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("open sqlite"))).await;
+    }
+
+    #[tokio::test]
+    async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let (event_tx, _) = broadcast::channel(16);
+        let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
+        let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
+            state: Duration::from_millis(20),
+            checks_pending: Duration::from_millis(20),
+            freshness_demanded: Duration::from_millis(20),
+            stale_after: Duration::from_secs(60),
+        };
+        let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source.clone(), cadence);
+        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher);
+        let repo_ref = RepositoryKey("repo".to_string());
+        let spec = ConvoySpec::builder()
+            .workflow_ref("workflow".to_string())
+            .repositories(vec![ConvoyRepositorySpec::builder()
+                .url("https://github.com/flotilla-org/flotilla".to_string())
+                .repo_ref(repo_ref.clone())
+                .source_ref("feature/reconciler-wake".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("flotilla".to_string())
+                .subpaths(Vec::new())
+                .build()])
+            .change_request(BoundChangeRequest::builder().id("1364".to_string()).repository_ref(repo_ref).title("wake".to_string()).build())
+            .build();
+        let mut meta = InputMeta::builder().name("wake".to_string()).finalizers(vec!["flotilla.work/convoy-teardown".to_string()]).build();
+        meta.set_lifecycle_authority(LifecycleAuthority::Managed);
+        let convoys = backend.clone().using::<Convoy>("flotilla");
+        let created = convoys.create(&meta, &spec).await.expect("create Landing convoy before watcher boot");
+        let status = ConvoyStatus {
+            phase: ConvoyPhase::Landing,
+            observed_workflow_ref: Some("workflow".to_string()),
+            work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
+            ..Default::default()
+        };
+        convoys.update_status("wake", &created.metadata.resource_version, &status).await.expect("mark Landing");
+
+        let controller = tokio::spawn(
+            ControllerLoop {
+                primary: convoys.clone(),
+                secondaries: vec![table.reconciler_wake_watch()],
+                reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+                    .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
+                resync_interval: Duration::from_secs(3600),
+                backend: backend.clone(),
+            }
+            .run(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if table.rows().await.iter().any(|row| matches!(row.watcher, LeafWatcher::ReconcilerWake { .. })) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("boot must rederive a ReconcilerWake row");
+        assert_eq!(convoys.get("wake").await.expect("open convoy").status.expect("status").phase, ConvoyPhase::Landing);
+
+        source.merged.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if convoys.get("wake").await.expect("convoy").status.expect("status").phase == ConvoyPhase::Landed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("leaf fire must enqueue reconcile without waiting for hourly resync");
+        controller.abort();
+    }
+
+    #[tokio::test]
+    async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request() {
+        let authority = ResourceBackend::InMemory(InMemoryBackend::default());
+        let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+        let repo_ref = RepositoryKey("repo".to_string());
+        let spec = ConvoySpec::builder()
+            .workflow_ref("workflow".to_string())
+            .repositories(vec![ConvoyRepositorySpec::builder()
+                .url("https://github.com/flotilla-org/flotilla".to_string())
+                .repo_ref(repo_ref.clone())
+                .source_ref("feature/reconciler-wake".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("flotilla".to_string())
+                .subpaths(Vec::new())
+                .build()])
+            .build();
+        let mut meta =
+            InputMeta::builder().name("cross-host".to_string()).finalizers(vec!["flotilla.work/convoy-teardown".to_string()]).build();
+        meta.set_lifecycle_authority(LifecycleAuthority::Managed);
+        let convoys = authority.clone().using::<Convoy>("flotilla");
+        let created = convoys.create(&meta, &spec).await.expect("create authority convoy");
+        let work = WorkState::builder()
+            .phase(WorkPhase::Complete)
+            .placement(PlacementStatus {
+                fields: BTreeMap::from([(
+                    "checkout_refs".to_string(),
+                    serde_json::json!(BTreeMap::from([(repo_ref.clone(), "remote-checkout".to_string())])),
+                )]),
+            })
+            .build();
+        convoys
+            .update_status("cross-host", &created.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Landing,
+                observed_workflow_ref: Some("workflow".to_string()),
+                work: BTreeMap::from([("work".to_string(), work)]),
+                ..Default::default()
+            })
+            .await
+            .expect("mark authority convoy Landing");
+
+        let remote_checkouts = remote.clone().using::<Checkout>("flotilla");
+        let checkout = remote_checkouts
+            .create(
+                &InputMeta::builder()
+                    .name("remote-checkout".to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "cross-host".to_string())]))
+                    .build(),
+                &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                    r#ref: "feature/reconciler-wake".to_string(),
+                    path: "/remote/checkout".to_string(),
+                    repo_ref,
+                    host_ref: "remote".to_string(),
+                    is_main: false,
+                }),
+            )
+            .await
+            .expect("create remote checkout");
+        remote_checkouts
+            .update_status("remote-checkout", &checkout.metadata.resource_version, &CheckoutStatus {
+                phase: CheckoutPhase::Ready,
+                integration: CheckoutIntegrationStatus {
+                    landed: IntegrationCondition::builder().value(ConditionValue::False).build(),
+                    change_request: Some(
+                        ChangeRequestObservation::builder()
+                            .id("1364".to_string())
+                            .state(ChangeRequestState::Open)
+                            .mergeability(flotilla_resources::ChangeRequestMergeability::Mergeable)
+                            .observed_at(Utc::now().to_rfc3339())
+                            .build(),
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .expect("record remote checkout CR evidence");
+        authority
+            .replica_writer::<Checkout>(flotilla_protocol::NodeId::new("remote-root"), "flotilla")
+            .replace(&remote_checkouts.list().await.expect("list remote checkout"), Utc::now())
+            .await
+            .expect("replicate checkout evidence");
+
+        let remote_records = remote.using::<ChangeRequest>("flotilla");
+        let record_name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 1364);
+        let record = remote_records
+            .create(
+                &InputMeta::builder().name(record_name).build(),
+                &flotilla_resources::ChangeRequestSpec::builder()
+                    .service("github.com".to_string())
+                    .scope("flotilla-org/flotilla".to_string())
+                    .number(1364)
+                    .observing_authority("remote-root".to_string())
+                    .build(),
+            )
+            .await
+            .expect("create remote CR record");
+        let observed_at = Utc::now();
+        remote_records
+            .update_status(&record.metadata.name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
+                head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
+                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+                },
+                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
+            })
+            .await
+            .expect("publish remote merge");
+        authority
+            .replica_writer::<ChangeRequest>(flotilla_protocol::NodeId::new("remote-root"), "flotilla")
+            .replace(&remote_records.list().await.expect("list remote CR"), Utc::now())
+            .await
+            .expect("replicate CR evidence");
+
+        let (event_tx, _) = broadcast::channel(16);
+        let cadence = crate::change_request_observer::ChangeRequestRefreshCadence::default();
+        let refresher =
+            ChangeRequestRefresher::new(authority.clone(), "authority-root".to_string(), Arc::new(UnavailableChangeRequests), cadence);
+        let table = LeafSubscriptionTable::new(authority.clone(), event_tx, refresher);
+        let controller = tokio::spawn(
+            ControllerLoop {
+                primary: convoys.clone(),
+                secondaries: vec![table.reconciler_wake_watch()],
+                reconciler: ConvoyReconciler::new(authority.clone().using::<WorkflowTemplate>("flotilla"))
+                    .with_federated_checkouts(authority.including_replicas::<Checkout>("flotilla"))
+                    .with_change_requests(authority.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
+                resync_interval: Duration::from_secs(3600),
+                backend: authority,
+            }
+            .run(),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if convoys.get("cross-host").await.expect("convoy").status.expect("status").phase == ConvoyPhase::Landed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authority engine must land from replicated checkout and CR evidence");
+        controller.abort();
     }
 
     #[tokio::test(start_paused = true)]

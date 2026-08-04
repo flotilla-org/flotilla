@@ -19,7 +19,7 @@ use flotilla_core::{
     aggregator_projection::AggregatorProjectionState,
     checkout_integration::{
         checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout, inspect_checkout_integration,
-        inspect_convoy_checkout_integration,
+        inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
     },
     config::ConfigStore,
     in_process::InProcessDaemon,
@@ -89,14 +89,6 @@ impl DaemonConvoyTeardownRuntime {
 
 #[async_trait]
 impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
-    async fn no_change_request_outstanding(
-        &self,
-        convoy: &ResourceObject<Convoy>,
-        checkouts: &[ResourceObject<Checkout>],
-    ) -> Result<bool, String> {
-        self.daemon.convoy_change_requests_settled_for_checkouts(convoy, checkouts).await
-    }
-
     async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, checkouts: &[ResourceObject<Checkout>]) -> Result<(), String> {
         let result = self.daemon.verify_convoy_teardown_gate_for_checkouts(convoy, checkouts, false).await;
         let key = format!("{}/{}", convoy.metadata.namespace, convoy.metadata.name);
@@ -1617,9 +1609,11 @@ fn spawn_controller_loops(
                     let namespace_string = namespace_string.clone();
                     let daemon = Arc::clone(&daemon);
                     async move {
+                        let mut secondaries = ConvoyReconciler::federated_secondary_watches(&backend, &namespace_string);
+                        secondaries.push(daemon.reconciler_wake_watch());
                         ControllerLoop {
                             primary: backend.clone().using::<Convoy>(&namespace_string),
-                            secondaries: ConvoyReconciler::federated_secondary_watches(&backend, &namespace_string),
+                            secondaries,
                             reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
                                 .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                                 .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))
@@ -1627,6 +1621,11 @@ fn spawn_controller_loops(
                                 .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
                                 .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
                                 .with_federated_checkouts(backend.including_replicas::<Checkout>(&namespace_string))
+                                .with_change_requests(
+                                    backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
+                                    daemon.change_request_stale_after(),
+                                )
+                                .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
                                 .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
                                 .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
                                     backend.clone(),
@@ -2899,6 +2898,43 @@ mod tests {
             DaemonHostPath::new("/opt/flotilla/lib/libghostty-vt.so.0"),
             state_root.into(),
         )
+    }
+
+    async fn publish_merged_change_request(backend: &ResourceBackend, number: u64, authority: &str) {
+        let records = backend.clone().using::<flotilla_resources::ChangeRequest>(NAMESPACE);
+        let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", number);
+        let record = match records
+            .create(
+                &InputMeta::builder().name(name).build(),
+                &flotilla_resources::ChangeRequestSpec::builder()
+                    .service("github.com".to_string())
+                    .scope("flotilla-org/flotilla".to_string())
+                    .number(number)
+                    .observing_authority(authority.to_string())
+                    .build(),
+            )
+            .await
+        {
+            Ok(record) => record,
+            Err(ResourceError::Conflict { .. }) => records
+                .get(&flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", number))
+                .await
+                .expect("read concurrently materialized CR observation"),
+            Err(error) => panic!("create merged CR observation: {error}"),
+        };
+        let observed_at = Utc::now();
+        records
+            .update_status(&record.metadata.name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
+                head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
+                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+                },
+                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
+            })
+            .await
+            .expect("publish merged CR observation");
     }
 
     #[test]
@@ -5389,6 +5425,14 @@ mod tests {
                 &flotilla_resources::InputMeta::builder().name("cross-host".to_string()).build(),
                 &ConvoySpec::builder()
                     .workflow_ref("review-and-fix".to_string())
+                    .repositories(vec![ConvoyRepositorySpec::builder()
+                        .url("https://github.com/flotilla-org/flotilla".to_string())
+                        .repo_ref(repository_key.clone())
+                        .source_ref("feature/cross-host".to_string())
+                        .target_ref("main".to_string())
+                        .workspace_slug("flotilla".to_string())
+                        .subpaths(Vec::new())
+                        .build()])
                     .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "checkout-b".to_string())]))
                     .build(),
             )
@@ -5463,15 +5507,32 @@ mod tests {
             ConditionValue::True,
             "checkout authority B must observe the merged change request",
         );
+        publish_merged_change_request(&checkout_host, 1367, "checkout-root").await;
 
         authority
             .replica_writer::<Checkout>(checkout_root, NAMESPACE)
             .replace(&checkouts.list().await.expect("list checkout authority resources"), chrono::Utc::now())
             .await
             .expect("replicate fresh evidence to convoy authority A");
+        authority
+            .replica_writer::<flotilla_resources::ChangeRequest>(flotilla_protocol::NodeId::new("checkout-root"), NAMESPACE)
+            .replace(
+                &checkout_host
+                    .using::<flotilla_resources::ChangeRequest>(NAMESPACE)
+                    .list()
+                    .await
+                    .expect("list checkout authority CR observations"),
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("replicate fresh CR evidence to convoy authority A");
         let current = convoys.get("cross-host").await.expect("get Landing convoy");
         let reconciler = ConvoyReconciler::new(authority.clone().using::<WorkflowTemplate>(NAMESPACE))
             .with_federated_checkouts(authority.including_replicas::<Checkout>(NAMESPACE))
+            .with_change_requests(
+                authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),
+                authority_daemon.change_request_stale_after(),
+            )
             .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(authority_daemon)));
         let dependencies = reconciler.fetch_dependencies(&current).await.expect("consume replicated checkout evidence");
         let outcome = reconciler.reconcile(&current, &dependencies, chrono::Utc::now());
@@ -6007,6 +6068,9 @@ mod tests {
             })
             .await
             .expect("convoy completion command should succeed");
+        if matches!(completion_action, CompletionAction::Delete) {
+            publish_merged_change_request(&backend, 884, "test-host").await;
+        }
 
         wait_until(|| {
             let convoys = convoys.clone();

@@ -9,8 +9,9 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use super::{
-    controller_patches, expected_checkout_refs, provisioning_patches, Convoy, ConvoyPhase, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState,
-    VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    controller_patches, expected_change_request_leaves, expected_checkout_refs, provisioning_patches, select_convoy_children, Convoy,
+    ConvoyPhase, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState,
+    WorkflowSnapshot,
 };
 use crate::{
     checkout::Checkout,
@@ -24,30 +25,14 @@ use crate::{
     resource::ResourceObject,
     status_patch::StatusPatch,
     terminal_session::TerminalSession,
-    vessel::{Vessel, VesselPhase, ACTUATOR_HOST_REF_ANNOTATION},
+    vessel::{Vessel, VesselPhase},
     workflow_template::{validate, visit_template_tokens, CrewSource, CrewSpec, ValidationError, WorkflowTemplate},
-    InputMeta, InputValue, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError,
-    ResourceProvenance, TypedResolver,
+    ChangeRequest, ChangeRequestLeafSubject, Clock, InputMeta, InputValue, OwnerReference, PlacementStatus,
+    PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError, SystemClock, ThreeValue, TypedResolver,
 };
 
 #[async_trait]
 pub trait ConvoyTeardownRuntime: Send + Sync {
-    /// Evaluate the standing Landing condition against current checkout
-    /// integration state. Runtimes may re-probe external change-request state
-    /// before answering; the default keeps in-memory reconcilers deterministic.
-    async fn no_change_request_outstanding(
-        &self,
-        convoy: &ResourceObject<Convoy>,
-        checkouts: &[ResourceObject<Checkout>],
-    ) -> Result<bool, String> {
-        let expected = expected_checkout_refs(convoy)?;
-        Ok(expected.iter().all(|name| {
-            checkouts.iter().find(|checkout| &checkout.metadata.name == name).is_some_and(|checkout| {
-                checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)
-            })
-        }))
-    }
-
     /// Re-verify ADR 0017 teardown eligibility at the execution edge.
     async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, checkouts: &[ResourceObject<Checkout>]) -> Result<(), String>;
 }
@@ -90,6 +75,10 @@ pub struct ConvoyReconciler {
     presentations: Option<TypedResolver<Presentation>>,
     checkouts: Option<TypedResolver<Checkout>>,
     federated_checkouts: Option<ReplicaReadResolver<Checkout>>,
+    change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
+    change_request_stale_after: std::time::Duration,
+    landing_evidence_stale_after: std::time::Duration,
+    clock: Arc<dyn Clock>,
     prepared_snapshot_gc: Option<PreparedSnapshotGarbageCollector>,
     teardown_runtime: Option<Arc<dyn ConvoyTeardownRuntime>>,
 }
@@ -114,6 +103,10 @@ impl ConvoyReconciler {
             presentations: None,
             checkouts: None,
             federated_checkouts: None,
+            change_requests: None,
+            change_request_stale_after: std::time::Duration::from_secs(180),
+            landing_evidence_stale_after: std::time::Duration::from_secs(30),
+            clock: Arc::new(SystemClock),
             prepared_snapshot_gc: None,
             teardown_runtime: None,
         }
@@ -146,6 +139,22 @@ impl ConvoyReconciler {
 
     pub fn with_federated_checkouts(mut self, checkouts: ReplicaReadResolver<Checkout>) -> Self {
         self.federated_checkouts = Some(checkouts);
+        self
+    }
+
+    pub fn with_change_requests(mut self, change_requests: ReplicaReadResolver<ChangeRequest>, stale_after: std::time::Duration) -> Self {
+        self.change_requests = Some(change_requests);
+        self.change_request_stale_after = stale_after;
+        self
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub fn with_landing_evidence_stale_after(mut self, stale_after: std::time::Duration) -> Self {
+        self.landing_evidence_stale_after = stale_after;
         self
     }
 
@@ -187,35 +196,65 @@ impl ConvoyReconciler {
     }
 }
 
-async fn federated_children<T: Resource>(
+async fn federated_children<T: Resource + Clone>(
     resolver: &ReplicaReadResolver<T>,
     convoy: &ResourceObject<Convoy>,
 ) -> Result<BTreeMap<String, ResourceObject<T>>, ResourceError> {
-    let target_host_ref = convoy
-        .status
-        .as_ref()
-        .and_then(|status| status.placement_decision.as_ref())
-        .map(|decision| decision.target_host.reference.as_str());
-    let mut selected = BTreeMap::<String, (u8, ResourceObject<T>)>::new();
-    for source in resolver.list().await?.items {
-        if source.object.metadata.labels.get(CONVOY_LABEL) != Some(&convoy.metadata.name) {
-            continue;
-        }
-        let actuator_matches = target_host_ref
-            .is_some_and(|target| source.object.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).is_some_and(|host| host == target));
-        let priority = if actuator_matches {
-            2
-        } else if matches!(source.provenance, ResourceProvenance::Local) {
-            1
-        } else {
-            0
-        };
-        let name = source.object.metadata.name.clone();
-        if selected.get(&name).is_none_or(|(current_priority, _)| priority > *current_priority) {
-            selected.insert(name, (priority, source.object));
-        }
+    Ok(select_convoy_children(convoy, &resolver.list().await?.items))
+}
+
+fn landing_condition_satisfied(
+    convoy: &ResourceObject<Convoy>,
+    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
+    change_request_stale_after: std::time::Duration,
+    landing_evidence_stale_after: std::time::Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    let Ok(leaves) = expected_change_request_leaves(convoy, checkouts) else {
+        return false;
+    };
+    let all_change_requests_terminal = leaves.chunks_exact(2).all(|terminal_leaves| {
+        terminal_leaves.iter().any(|leaf| {
+            let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else {
+                return false;
+            };
+            let name = crate::change_request_record_name(service, scope, *number);
+            let subject = change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject {
+                change_request,
+                now,
+                stale_after: change_request_stale_after,
+            });
+            crate::evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject), None)
+                .is_ok_and(|evaluation| evaluation.result == ThreeValue::True)
+        })
+    });
+    if !all_change_requests_terminal {
+        return false;
     }
-    Ok(selected.into_iter().map(|(name, (_, object))| (name, object)).collect())
+
+    let bound_repository = convoy.spec.change_request.as_ref().map(|bound| &bound.repository_ref);
+    expected_checkout_refs(convoy).is_ok_and(|expected| {
+        expected.iter().all(|name| {
+            checkouts.get(name).is_some_and(|checkout| {
+                let has_expected_change_request =
+                    checkout.status.as_ref().and_then(|status| status.integration.change_request.as_ref()).is_some()
+                        || bound_repository == Some(checkout.spec.repo_ref());
+                has_expected_change_request
+                    || checkout.status.as_ref().is_some_and(|status| {
+                        status.integration.landed.value == crate::ConditionValue::True
+                            && status
+                                .integration
+                                .landed
+                                .observed_at
+                                .as_deref()
+                                .and_then(|observed_at| DateTime::parse_from_rfc3339(observed_at).ok())
+                                .and_then(|observed_at| now.signed_duration_since(observed_at).to_std().ok())
+                                .is_some_and(|age| age < landing_evidence_stale_after)
+                    })
+            })
+        })
+    })
 }
 
 impl Reconciler for ConvoyReconciler {
@@ -268,20 +307,22 @@ impl Reconciler for ConvoyReconciler {
                 .collect(),
             _ => BTreeMap::new(),
         };
-        let no_change_request_outstanding = if obj.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing) {
-            match &self.teardown_runtime {
-                Some(runtime) => {
-                    let checkout_list = checkouts.values().cloned().collect::<Vec<_>>();
-                    runtime.no_change_request_outstanding(obj, &checkout_list).await.unwrap_or(false)
-                }
-                None => expected_checkout_refs(obj).is_ok_and(|expected| {
-                    expected.iter().all(|name| {
-                        checkouts.get(name).is_some_and(|checkout| {
-                            checkout.status.as_ref().is_some_and(|status| status.integration.landed.value == crate::ConditionValue::True)
-                        })
-                    })
-                }),
+        let is_landing = obj.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing);
+        let change_requests = match &self.change_requests {
+            Some(change_requests) if is_landing => {
+                change_requests.list().await?.items.into_iter().map(|item| (item.object.metadata.name.clone(), item.object)).collect()
             }
+            _ => BTreeMap::new(),
+        };
+        let no_change_request_outstanding = if is_landing {
+            landing_condition_satisfied(
+                obj,
+                &checkouts,
+                &change_requests,
+                self.change_request_stale_after,
+                self.landing_evidence_stale_after,
+                self.clock.now(),
+            )
         } else {
             false
         };

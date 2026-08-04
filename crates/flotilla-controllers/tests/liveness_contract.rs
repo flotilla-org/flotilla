@@ -1,8 +1,11 @@
 mod common;
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use async_trait::async_trait;
@@ -12,15 +15,18 @@ use flotilla_controllers::reconcilers::{
     CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
 use flotilla_resources::{
+    change_request_record_name,
     controller::{Actuation, Reconciler},
     test_support::{
         assert_actuation_drop_recovery, assert_bounded_convergence, assert_degradation_not_wedging, assert_quiescence_at_fixpoint,
         assert_staleness_edges, FixpointPredicate, LivenessEnrollment, LivenessScenario, LivenessStep, ReconcileStep, WorldBuilder,
         WriteCountingBackend,
     },
-    Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, Clock,
-    ConditionValue, Convoy, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch, ConvoyTeardownRuntime, FreshCloneCheckoutSpec, InputMeta,
-    IntegrationCondition, RepositoryKey, ResourceObject, VirtualClock, WorkPhase, CONVOY_LABEL,
+    ChangeRequest, ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestReviewObservation, ChangeRequestSpec,
+    ChangeRequestState, ChangeRequestStatus, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
+    CheckoutStatus, CheckoutStatusPatch, Clock, ConditionValue, Convoy, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch,
+    FreshCloneCheckoutSpec, InputMeta, IntegrationCondition, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
+    PlacementStatus, RepositoryKey, ResourceObject, VirtualClock, WorkPhase, CONVOY_LABEL,
 };
 
 const NAMESPACE: &str = "flotilla";
@@ -251,57 +257,32 @@ async fn checkout_staleness_property_bites_a_rebroken_freshness_latch() {
 }
 
 const LANDING_TTL: Duration = Duration::seconds(30);
-
-struct LandingRuntime {
-    clock: Arc<VirtualClock>,
-    probes: AtomicUsize,
-    contradictory: bool,
-    trust_observation_forever: bool,
-}
-
-#[async_trait]
-impl ConvoyTeardownRuntime for LandingRuntime {
-    async fn no_change_request_outstanding(
-        &self,
-        _convoy: &ResourceObject<Convoy>,
-        checkouts: &[ResourceObject<Checkout>],
-    ) -> Result<bool, String> {
-        let landed =
-            &checkouts.first().ok_or_else(|| "checkout missing".to_string())?.status.as_ref().ok_or("status missing")?.integration.landed;
-        let observed_at = landed
-            .observed_at
-            .as_deref()
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .ok_or_else(|| "landing observation missing".to_string())?;
-        let fresh = self.clock.now().signed_duration_since(observed_at) < LANDING_TTL;
-        if fresh || self.trust_observation_forever {
-            return Ok(landed.value == ConditionValue::True);
-        }
-        self.probes.fetch_add(1, Ordering::SeqCst);
-        Ok(!self.contradictory)
-    }
-
-    async fn verify_reclaim(
-        &self,
-        _convoy: &ResourceObject<Convoy>,
-        _checkouts: &[ResourceObject<flotilla_resources::Checkout>],
-    ) -> Result<(), String> {
-        Err("not terminal".to_string())
-    }
-}
+const CHANGE_REQUEST_NUMBER: u64 = 42;
 
 struct ConvoyWorld {
     backend: WriteCountingBackend,
     current: ResourceObject<Convoy>,
     reconciler: ConvoyReconciler,
-    runtime: Arc<LandingRuntime>,
+    clock: Arc<VirtualClock>,
+    probes: usize,
     contradictory: bool,
+    trust_observation_forever: bool,
     passes: usize,
 }
 
 struct ConvoyWorldBuilder {
     clock: Arc<VirtualClock>,
     trust_observation_forever: bool,
+}
+
+fn change_request_status(state: ObservedChangeRequestState, observed_at: DateTime<Utc>) -> ChangeRequestStatus {
+    ChangeRequestStatus {
+        state: Observation::known(state, observed_at),
+        head_sha: Observation::known("abc123".to_string(), observed_at),
+        checks: Observation::known(ObservedChecks::Pass, observed_at),
+        review: ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, observed_at) },
+        mergeable: Observation::known(ObservedMergeability::Mergeable, observed_at),
+    }
 }
 
 #[async_trait]
@@ -318,7 +299,14 @@ impl WorldBuilder for ConvoyWorldBuilder {
         let mut status = created.status.expect("convoy fixture status");
         status.phase = ConvoyPhase::Landing;
         status.observed_workflow_ref = Some("wf".to_string());
-        status.work.insert("work".to_string(), common::work_state().phase(WorkPhase::Complete).call());
+        let mut work = common::work_state().phase(WorkPhase::Complete).call();
+        work.placement = Some(PlacementStatus {
+            fields: BTreeMap::from([(
+                "checkout_refs".to_string(),
+                serde_json::json!(BTreeMap::from([(created.spec.repositories[0].repo_ref.clone(), "checkout-a".to_string())])),
+            )]),
+        });
+        status.work.insert("work".to_string(), work);
         let current =
             convoys.update_status("convoy-a", &created.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
 
@@ -335,47 +323,74 @@ impl WorldBuilder for ConvoyWorldBuilder {
                     env_ref: "env-a".to_string(),
                     r#ref: "feature/liveness".to_string(),
                     base_ref: Some("main".to_string()),
-                    target_path: "/missing/checkout-a".to_string(),
+                    target_path: "/work/checkout-a".to_string(),
                     url: "https://example.com/repo-a".to_string(),
                 }),
             )
             .await
             .map_err(|error| error.to_string())?;
-        let observation_time = if scenario == LivenessScenario::Contradictory {
-            self.clock.now() - LANDING_TTL - Duration::seconds(1)
-        } else {
-            self.clock.now()
-        };
+        let observed_at = self.clock.now().to_rfc3339();
         checkouts
             .update_status("checkout-a", &checkout.metadata.resource_version, &CheckoutStatus {
                 phase: CheckoutPhase::Ready,
-                path: if scenario == LivenessScenario::Contradictory { None } else { Some("/work/checkout-a".to_string()) },
+                path: Some("/work/checkout-a".to_string()),
                 commit: Some("abc123".to_string()),
                 branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
                 integration: CheckoutIntegrationStatus {
-                    clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observation_time.to_rfc3339()).build(),
-                    pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observation_time.to_rfc3339()).build(),
-                    landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observation_time.to_rfc3339()).build(),
+                    clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                    pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                    landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at.clone()).build(),
                     landed_evidence: None,
-                    change_request: None,
+                    change_request: Some(
+                        ChangeRequestObservation::builder()
+                            .id(CHANGE_REQUEST_NUMBER.to_string())
+                            .state(ChangeRequestState::Open)
+                            .mergeability(ChangeRequestMergeability::Unknown)
+                            .observed_at(observed_at)
+                            .build(),
+                    ),
                 },
                 message: None,
             })
             .await
             .map_err(|error| error.to_string())?;
+
+        let change_requests = backend.using::<ChangeRequest>(NAMESPACE);
+        let record_name = change_request_record_name("example.com", "repo-a", CHANGE_REQUEST_NUMBER);
+        let record = change_requests
+            .create(
+                &InputMeta::builder().name(record_name.clone()).build(),
+                &ChangeRequestSpec::builder()
+                    .service("example.com".to_string())
+                    .scope("repo-a".to_string())
+                    .number(CHANGE_REQUEST_NUMBER)
+                    .observing_authority("test".to_string())
+                    .build(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let cr_state =
+            if scenario == LivenessScenario::Contradictory { ObservedChangeRequestState::Open } else { ObservedChangeRequestState::Merged };
+        change_requests
+            .update_status(&record_name, &record.metadata.resource_version, &change_request_status(cr_state, self.clock.now()))
+            .await
+            .map_err(|error| error.to_string())?;
         backend.reset_writes();
 
-        let contradictory = scenario == LivenessScenario::Contradictory;
-        let runtime = Arc::new(LandingRuntime {
-            clock: Arc::clone(&self.clock),
-            probes: AtomicUsize::new(0),
-            contradictory,
-            trust_observation_forever: self.trust_observation_forever,
-        });
         let reconciler = ConvoyReconciler::new(inner.using(NAMESPACE))
             .with_checkouts(inner.using(NAMESPACE))
-            .with_teardown_runtime(Arc::clone(&runtime) as Arc<dyn ConvoyTeardownRuntime>);
-        Ok(ConvoyWorld { backend, current, reconciler, runtime, contradictory, passes: 0 })
+            .with_change_requests(inner.including_replicas(NAMESPACE), LANDING_TTL.to_std().expect("positive TTL"))
+            .with_clock(self.clock.clone() as Arc<dyn Clock>);
+        Ok(ConvoyWorld {
+            backend,
+            current,
+            reconciler,
+            clock: Arc::clone(&self.clock),
+            probes: 0,
+            contradictory: scenario == LivenessScenario::Contradictory,
+            trust_observation_forever: self.trust_observation_forever,
+            passes: 0,
+        })
     }
 }
 
@@ -387,8 +402,21 @@ impl ReconcileStep<ConvoyWorld> for ConvoyStep {
     type Actuation = Actuation;
 
     async fn reconcile_step(&self, world: &mut ConvoyWorld) -> Result<LivenessStep<Self::Patch, Self::Actuation>, String> {
+        let records = world.backend.using::<ChangeRequest>(NAMESPACE);
+        let record_name = change_request_record_name("example.com", "repo-a", CHANGE_REQUEST_NUMBER);
+        let record = records.get(&record_name).await.map_err(|error| error.to_string())?;
+        let stale =
+            record.status.as_ref().is_some_and(|status| world.clock.now().signed_duration_since(status.state.observed_at) > LANDING_TTL);
+        if stale && !world.trust_observation_forever {
+            world.probes += 1;
+            let state = record.status.as_ref().and_then(|status| status.state.value).unwrap_or(ObservedChangeRequestState::Open);
+            records
+                .update_status(&record_name, &record.metadata.resource_version, &change_request_status(state, world.clock.now()))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         let deps = world.reconciler.fetch_dependencies(&world.current).await.map_err(|error| error.to_string())?;
-        let outcome = world.reconciler.reconcile(&world.current, &deps, world.runtime.clock.now());
+        let outcome = world.reconciler.reconcile(&world.current, &deps, world.clock.now());
         world.passes += 1;
         Ok(LivenessStep::new(outcome.patch, outcome.actuations))
     }
@@ -421,13 +449,11 @@ impl FixpointPredicate<ConvoyWorld> for ConvoyFixpoint {
     }
 
     fn held(&self, world: &ConvoyWorld) -> bool {
-        world.contradictory
-            && world.runtime.probes.load(Ordering::SeqCst) > 0
-            && world.current.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing)
+        world.contradictory && world.passes > 0 && world.current.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing)
     }
 
     fn probe_count(&self, world: &ConvoyWorld) -> usize {
-        world.runtime.probes.load(Ordering::SeqCst)
+        world.probes
     }
 }
 
@@ -444,11 +470,6 @@ async fn convoy_landing_satisfies_supported_liveness_battery() {
     assert_quiescence_at_fixpoint(&enrollment).await;
     assert_staleness_edges(&enrollment).await;
     assert_degradation_not_wedging(&enrollment).await;
-
-    // Landing's integration probe is an imperative runtime effect, not an
-    // Actuation value. Actuation-drop recovery is therefore intentionally not
-    // claimed for this enrollee; value-shaped cleanup actuations are covered
-    // independently by convoy reconcile tests.
 }
 
 #[tokio::test]
