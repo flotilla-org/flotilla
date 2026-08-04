@@ -1771,6 +1771,32 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             None if credential_refs.is_empty() => Vec::new(),
             None => return Err("host-local credential store unavailable".to_string().into()),
         };
+        let agent_material_fragments = self
+            .state
+            .agent_material
+            .as_deref()
+            .map(|registry| registry.fragments(&spec.required_agent_adapters, &spec.env))
+            .unwrap_or_default();
+        let agent_environment = match compose_agent_environment(credential_config_fragments.into_iter().chain(agent_material_fragments)) {
+            Ok(composed) => composed,
+            Err(error) => {
+                return Err(discard_uncreated_environment(
+                    self.state.credential_store.as_deref(),
+                    self.state.agent_material.as_deref(),
+                    name,
+                    error,
+                )
+                .await
+                .into())
+            }
+        };
+        if let Some(composed) = &agent_environment {
+            for (name, value) in &composed.environment {
+                if !environment_variables.iter().any(|(existing, _)| existing == name) {
+                    environment_variables.push((name.clone(), value.clone()));
+                }
+            }
+        }
         let material_deliveries = match &self.state.agent_material {
             Some(registry) => match registry.prepare(name, &spec.required_agent_adapters, &spec.env).await {
                 Ok(deliveries) => deliveries,
@@ -1800,28 +1826,6 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             },
             None => Vec::new(),
         };
-        let agent_environment = match compose_agent_environment(
-            credential_config_fragments.into_iter().chain(material_deliveries.iter().map(|delivery| delivery.fragment.as_ref().clone())),
-        ) {
-            Ok(composed) => composed,
-            Err(error) => {
-                return Err(discard_uncreated_environment(
-                    self.state.credential_store.as_deref(),
-                    self.state.agent_material.as_deref(),
-                    name,
-                    error,
-                )
-                .await
-                .into())
-            }
-        };
-        if let Some(composed) = &agent_environment {
-            for (name, value) in &composed.environment {
-                if !environment_variables.iter().any(|(existing, _)| existing == name) {
-                    environment_variables.push((name.clone(), value.clone()));
-                }
-            }
-        }
         let docker_config_dir = match &self.state.credential_store {
             Some(store) => match store.prepare_registry_pull(name, &credential_refs, &spec.image).await {
                 Ok(config) => config.map(DaemonHostPath::new),

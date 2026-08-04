@@ -266,7 +266,7 @@ fn compose_agent_environment(fragments: Vec<Fragment>) -> Result<ComposedFile, C
         .map(|entry| {
             let TargetKey::AgentEnvironment(key) = &entry.fragment.key else { unreachable!("target key validated above") };
             let comments = entry.provenances.iter().map(|provenance| format!("# fragment: {provenance}\n")).collect::<String>();
-            format!("{comments}{key}={}\n", shell_quote(&entry.fragment.value))
+            format!("{comments}export {key}={}\n", shell_quote(&entry.fragment.value))
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -409,7 +409,7 @@ mod tests {
         )])
         .expect("agent environment should compose");
 
-        assert_eq!(composed.contents, "# fragment: agent-material/codex codex-login\nCODEX_HOME='/run/flotilla/codex'\n");
+        assert_eq!(composed.contents, "# fragment: agent-material/codex codex-login\nexport CODEX_HOME='/run/flotilla/codex'\n");
         assert_eq!(composed.environment, [("CODEX_HOME".to_string(), "/run/flotilla/codex".to_string())]);
     }
 
@@ -425,6 +425,38 @@ mod tests {
         assert!(error.contains("CODEX_HOME"), "error must name the key: {error}");
         assert!(error.contains("agent-material/codex codex-login"), "error must name agent material: {error}");
         assert!(error.contains("credential/codex openai"), "error must name the credential: {error}");
+    }
+
+    #[test]
+    fn agent_environment_rejects_invalid_names_and_values() {
+        let invalid_name =
+            compose(TargetId::AgentEnvironment, [agent_environment_fragment("CODEX-HOME", "/run/flotilla/codex", "agent-material/codex")])
+                .expect_err("environment names must be shell identifiers")
+                .to_string();
+        assert!(invalid_name.contains("agent-material/codex"));
+
+        let invalid_value = compose(TargetId::AgentEnvironment, [agent_environment_fragment(
+            "CODEX_HOME",
+            "/run/flotilla/codex\0injected",
+            "agent-material/codex",
+        )])
+        .expect_err("environment values must not contain NUL")
+        .to_string();
+        assert!(invalid_value.contains("CODEX_HOME"));
+        assert!(invalid_value.contains("agent-material/codex"));
+    }
+
+    #[test]
+    fn agent_environment_rejects_append_for_single_valued_keys() {
+        let mut fragment = agent_environment_fragment("CODEX_HOME", "/run/flotilla/codex", "agent-material/codex");
+        fragment.merge = Merge::Append;
+
+        let error =
+            compose(TargetId::AgentEnvironment, [fragment]).expect_err("agent environment values must stay single-valued").to_string();
+
+        assert!(error.contains("cannot append"));
+        assert!(error.contains("CODEX_HOME"));
+        assert!(error.contains("agent-material/codex"));
     }
 
     #[test]

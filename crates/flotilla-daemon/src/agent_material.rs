@@ -34,7 +34,6 @@ pub(crate) struct AgentMaterialPreflight {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentMaterialDelivery {
     pub(crate) mount: ProvisionedMount,
-    pub(crate) fragment: Box<Fragment>,
     pub(crate) preflight: AgentMaterialPreflight,
 }
 
@@ -49,6 +48,7 @@ pub(crate) enum AgentMaterialOutcome {
 trait AgentMaterialAdapter: Send + Sync {
     fn id(&self) -> &'static str;
     fn pool_ref(&self) -> &'static str;
+    fn fragment(&self, environment: &BTreeMap<String, String>) -> Option<Fragment>;
 
     async fn prepare(&self, holder_ref: &ResourceRef, environment: &BTreeMap<String, String>) -> Result<AgentMaterialOutcome, String>;
 }
@@ -94,6 +94,14 @@ impl AgentMaterialRegistry {
             }
         }
         Ok(deliveries)
+    }
+
+    pub(crate) fn fragments(&self, required_adapters: &BTreeSet<String>, environment: &BTreeMap<String, String>) -> Vec<Fragment> {
+        required_adapters
+            .iter()
+            .filter_map(|adapter_id| self.adapters.get(adapter_id.as_str()))
+            .filter_map(|adapter| adapter.fragment(environment))
+            .collect()
     }
 
     pub(crate) async fn release(&self, environment_ref: &str) -> Result<(), String> {
@@ -177,6 +185,11 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
         CODEX_POOL_REF
     }
 
+    fn fragment(&self, environment: &BTreeMap<String, String>) -> Option<Fragment> {
+        (!environment.contains_key("CODEX_HOME"))
+            .then(|| agent_environment_fragment("CODEX_HOME", CONTAINER_CODEX_HOME, format!("agent-material/codex {CODEX_POOL_REF}")))
+    }
+
     async fn prepare(&self, holder_ref: &ResourceRef, environment: &BTreeMap<String, String>) -> Result<AgentMaterialOutcome, String> {
         if environment.contains_key("CODEX_HOME") {
             return Ok(AgentMaterialOutcome::NotRequired);
@@ -190,11 +203,6 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
         match self.pools.acquire(CODEX_POOL_REF, holder_ref).await? {
             MaterialLeaseOutcome::Leased { unit, .. } => Ok(AgentMaterialOutcome::Ready(AgentMaterialDelivery {
                 mount: ProvisionedMount::new(PathBuf::from(&unit.directory), CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw),
-                fragment: Box::new(agent_environment_fragment(
-                    "CODEX_HOME",
-                    CONTAINER_CODEX_HOME,
-                    format!("agent-material/codex {CODEX_POOL_REF}"),
-                )),
                 preflight: AgentMaterialPreflight {
                     command: "codex".to_string(),
                     args: vec!["login".to_string(), "status".to_string()],
@@ -264,9 +272,11 @@ mod tests {
 
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].mount, ProvisionedMount::new(slot, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw));
-        let composed =
-            crate::vessel_config::compose(crate::vessel_config::TargetId::AgentEnvironment, [deliveries[0].fragment.as_ref().clone()])
-                .expect("compose Codex home");
+        let composed = crate::vessel_config::compose(
+            crate::vessel_config::TargetId::AgentEnvironment,
+            registry.fragments(&BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new()),
+        )
+        .expect("compose Codex home");
         assert_eq!(composed.environment, vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())]);
         assert!(composed.contents.contains("# fragment: agent-material/codex codex-login"));
     }
