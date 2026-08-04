@@ -23,6 +23,7 @@ use flotilla_resources::{
     Checkout, CheckoutSpec, Convoy, InMemoryBackend, InputMeta, IssueSource, ObservedCheckoutSpec, Project, ProjectRepositoryRole,
     ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend, MANAGED_BY_LABEL,
 };
+use tracing::instrument::WithSubscriber;
 
 #[derive(Clone)]
 struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
@@ -391,8 +392,11 @@ async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_cu
             .with_max_level(tracing::Level::WARN)
             .with_writer(move || writer.clone())
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        daemon.materialize_tracked_repo_projects().await.expect("tracked Project reconciliation should succeed");
+        daemon
+            .materialize_tracked_repo_projects()
+            .with_subscriber(subscriber)
+            .await
+            .expect("tracked Project reconciliation should succeed");
     }
 
     let reconciled = projects.get("tracked").await.expect("tracked Project should remain");
