@@ -235,27 +235,7 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
                 status.message = Some(message.clone());
             }
             Self::UpdateIntegration { integration } => {
-                // Only evidence-backed landings latch: a merged change request
-                // does not unmerge, so a later observation may not lower it.
-                // A vacuous True ("nothing to land yet" on an untouched
-                // branch) is not a landing fact and must yield to fresh
-                // evidence — latching it would let a convoy land against an
-                // observation that predates its change request (#1163).
-                let landed_was_latched =
-                    status.integration.landed.value == ConditionValue::True && status.integration.landed_evidence.is_some();
-                let landed_evidence = status.integration.landed_evidence.clone();
-                let terminal_change_request =
-                    status.integration.change_request.clone().filter(|change_request| change_request.state != ChangeRequestState::Open);
                 status.integration = integration.as_ref().clone();
-                if landed_was_latched {
-                    status.integration.landed.value = ConditionValue::True;
-                    if status.integration.landed_evidence.is_none() {
-                        status.integration.landed_evidence = landed_evidence;
-                    }
-                    if status.integration.change_request.is_none() {
-                        status.integration.change_request = terminal_change_request;
-                    }
-                }
             }
         }
     }
@@ -290,22 +270,11 @@ mod tests {
     }
 
     #[test]
-    fn evidence_backed_landed_true_latches_over_later_observations() {
-        // A merged change request does not unmerge: evidence-backed landings
-        // stay landed even if a later probe cannot see the change request.
+    fn evidence_backed_landed_true_yields_to_fresh_false_observation() {
         let evidence = LandedEvidence::builder().change_request_id("1162".to_string()).build();
-        let observation = ChangeRequestObservation::builder()
-            .id("1162".to_string())
-            .state(ChangeRequestState::Merged)
-            .mergeability(ChangeRequestMergeability::Unknown)
-            .observed_at("2026-07-27T00:00:00Z".to_string())
-            .build();
-        let mut initial = integration(ConditionValue::True, Some(evidence.clone()));
-        initial.change_request = Some(observation.clone());
-        let mut status = CheckoutStatus { integration: initial, ..Default::default() };
+        let mut status = CheckoutStatus { integration: integration(ConditionValue::True, Some(evidence)), ..Default::default() };
         CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration(ConditionValue::False, None)) }.apply(&mut status);
-        assert_eq!(status.integration.landed.value, ConditionValue::True);
-        assert_eq!(status.integration.landed_evidence, Some(evidence));
-        assert_eq!(status.integration.change_request, Some(observation));
+        assert_eq!(status.integration.landed.value, ConditionValue::False);
+        assert_eq!(status.integration.landed_evidence, None);
     }
 }

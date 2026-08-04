@@ -125,7 +125,8 @@ async fn reconcile_once_with_resources(
     reconciler.reconcile(&current, &deps, now)
 }
 
-async fn reconcile_landing_with_observed_change_request(
+async fn reconcile_with_observed_change_request(
+    phase: ConvoyPhase,
     condition: Option<ConditionValue>,
     observed_target_ref: Option<&str>,
 ) -> flotilla_resources::controller::ReconcileOutcome<Convoy> {
@@ -134,7 +135,7 @@ async fn reconcile_landing_with_observed_change_request(
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let checkouts = backend.clone().using::<Checkout>("flotilla");
     let mut status = bootstrapped_convoy_status();
-    status.phase = ConvoyPhase::Landing;
+    status.phase = phase;
     for work in status.work.values_mut() {
         work.phase = WorkPhase::Complete;
     }
@@ -659,7 +660,7 @@ fn reconciler_does_not_write_the_completion_claim_edge() {
 
 #[tokio::test]
 async fn landing_with_open_change_request_stays_warm() {
-    let outcome = reconcile_landing_with_observed_change_request(Some(ConditionValue::False), None).await;
+    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::False), None).await;
 
     assert_eq!(outcome.patch, None);
     assert!(!outcome.actuations.iter().any(|actuation| matches!(
@@ -670,14 +671,14 @@ async fn landing_with_open_change_request_stays_warm() {
 
 #[tokio::test]
 async fn landing_with_settled_change_request_becomes_landed() {
-    let outcome = reconcile_landing_with_observed_change_request(Some(ConditionValue::True), Some("main")).await;
+    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::True), Some("main")).await;
 
     assert_eq!(outcome.patch, Some(controller_patches::settle(Vec::new(), timestamp(40))));
 }
 
 #[tokio::test]
 async fn landing_on_a_different_target_records_a_fact_and_still_becomes_landed() {
-    let outcome = reconcile_landing_with_observed_change_request(Some(ConditionValue::True), Some("release")).await;
+    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::True), Some("release")).await;
 
     let expected_mismatch = TargetMismatch::builder()
         .repo_ref(RepositoryKey("repo-a".to_string()))
@@ -694,9 +695,17 @@ async fn landing_on_a_different_target_records_a_fact_and_still_becomes_landed()
 
 #[tokio::test]
 async fn landing_without_checkout_evidence_stays_landing() {
-    let outcome = reconcile_landing_with_observed_change_request(None, None).await;
+    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, None, None).await;
 
     assert_eq!(outcome.patch, None);
+}
+
+#[tokio::test]
+async fn landed_with_reopened_change_request_does_not_write_phase() {
+    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landed, Some(ConditionValue::False), None).await;
+
+    assert_eq!(outcome.patch, None);
+    assert!(outcome.events.is_empty());
 }
 
 #[tokio::test]

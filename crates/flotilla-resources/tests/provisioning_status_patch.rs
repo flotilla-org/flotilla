@@ -108,7 +108,7 @@ fn checkout_status_patch_marks_ready_and_failed() {
 }
 
 #[test]
-fn checkout_integration_patch_updates_conditions_and_latches_landed() {
+fn checkout_integration_patch_replaces_conditions_without_latching() {
     let mut status = CheckoutStatus::default();
 
     CheckoutStatusPatch::UpdateIntegration {
@@ -140,8 +140,8 @@ fn checkout_integration_patch_updates_conditions_and_latches_landed() {
     }
     .apply(&mut status);
 
-    assert_eq!(status.integration.landed.value, ConditionValue::True);
-    assert_eq!(status.integration.landed_evidence.as_ref().map(|evidence| evidence.change_request_id.as_str()), Some("815"));
+    assert_eq!(status.integration.landed.value, ConditionValue::False);
+    assert_eq!(status.integration.landed_evidence, None);
 }
 
 #[test]

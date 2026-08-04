@@ -1711,7 +1711,10 @@ fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, int
 }
 
 fn latch_evidence_backed_integration(existing: &CheckoutIntegrationStatus, observed: &mut CheckoutIntegrationStatus) {
-    if existing.landed.value != ConditionValue::True || existing.landed_evidence.is_none() {
+    if existing.landed.value != ConditionValue::True
+        || existing.landed_evidence.is_none()
+        || observed.landed.value != ConditionValue::Unknown
+    {
         return;
     }
     observed.landed.value = ConditionValue::True;
