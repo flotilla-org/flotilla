@@ -12,6 +12,7 @@ permissions:
 
 env:
   CARGO_INCREMENTAL: "0"
+  GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1"
 
 jobs:
   darwin:
