@@ -157,7 +157,14 @@ impl CredentialStore {
         }
     }
 
-    pub(crate) async fn vessel_config_fragments(&self, credential_refs: &BTreeSet<String>) -> Result<Vec<Fragment>, String> {
+    pub(crate) async fn vessel_config_fragments(
+        &self,
+        credential_refs: &BTreeSet<String>,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<Vec<Fragment>, String> {
+        if environment.contains_key("CODEX_HOME") {
+            return Ok(Vec::new());
+        }
         let mut fragments = Vec::new();
         for name in credential_refs {
             let spec = self.spec(name).await?;
@@ -1016,9 +1023,16 @@ interactions:
         let runner = Arc::new(RecordingRunner::default());
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/usr/bin/codex"));
         let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+        let credential_refs = BTreeSet::from(["model-api".to_string()]);
 
-        let delivered =
-            store.prepare("env-a", &BTreeSet::from(["model-api".to_string()]), runner.clone()).await.expect("prepare codex credential");
+        assert_eq!(store.vessel_config_fragments(&credential_refs, &BTreeMap::new()).await.expect("Codex fragment").len(), 1);
+        assert!(store
+            .vessel_config_fragments(&credential_refs, &BTreeMap::from([("CODEX_HOME".to_string(), "/image/codex".to_string())]),)
+            .await
+            .expect("explicit Codex home")
+            .is_empty());
+
+        let delivered = store.prepare("env-a", &credential_refs, runner.clone()).await.expect("prepare codex credential");
 
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0, "CODEX_HOME");

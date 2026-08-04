@@ -1755,7 +1755,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
         let credential_config_fragments = match &self.state.credential_store {
-            Some(store) => match store.vessel_config_fragments(&credential_refs).await {
+            Some(store) => match store.vessel_config_fragments(&credential_refs, &spec.env).await {
                 Ok(fragments) => fragments,
                 Err(error) => {
                     return Err(discard_uncreated_environment(
