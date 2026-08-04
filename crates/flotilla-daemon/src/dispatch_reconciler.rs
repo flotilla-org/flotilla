@@ -114,6 +114,9 @@ impl DispatchReconciler {
         let existing = self.project_convoys(project).await?;
         let previous_queue = project.status.as_ref().map(|status| status.dispatch_queue.as_slice()).unwrap_or_default();
         let observations_recorded = self.observe_dispatches(project, previous_queue, &existing, now).await?;
+        // Admission itself makes an issue dispatched, regardless of the convoy's later phase. Failed,
+        // cancelled, and abandoned convoys remain durable evidence of that decision; retrying requires
+        // an explicit human/provider re-triage rather than automatic re-proposal from a terminal phase.
         let dispatched = existing
             .iter()
             .flat_map(|convoy| convoy.spec.issues.iter().map(|issue| issue.reference.clone()))
