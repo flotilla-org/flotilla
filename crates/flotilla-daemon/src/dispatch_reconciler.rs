@@ -163,7 +163,7 @@ impl DispatchReconciler {
             .collect::<HashSet<_>>();
         let mut ready = self.issues.ready_issues(project).await?;
         ready.retain(|issue| issue.state == IssueState::Open && issue.labels.iter().any(|label| label == READY_ISSUE_LABEL));
-        ready.sort_by(|left, right| left.reference.cmp_id_desc(&right.reference));
+        ready.sort_by(|left, right| left.reference.cmp_id_desc(&right.reference).reverse());
 
         let mut outcome = ReconcilePass::default();
         let mut available = policy.max_concurrent - active_auto_admitted;
@@ -535,6 +535,19 @@ mod tests {
         assert!(outcome.deferred_cap_full);
         assert_eq!(*issues.ready_calls.lock().expect("ready calls lock"), 0);
         assert_eq!(backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_limited_pass_admits_the_oldest_ready_issue_first() {
+        let newer = issue("20", &[READY_ISSUE_LABEL], None, IssueState::Open);
+        let older = issue("10", &[READY_ISSUE_LABEL], None, IssueState::Open);
+        let (backend, _, _, reconciler) = harness(vec![newer, older.clone()], vec![], policy(1)).await;
+
+        let outcome = reconciler.reconcile_once().await.expect("reconcile");
+
+        assert_eq!(outcome.admitted, 1);
+        let convoys = backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys");
+        assert_eq!(convoys.items[0].spec.issues[0].reference, older.reference);
     }
 
     #[tokio::test]

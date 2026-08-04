@@ -4618,26 +4618,13 @@ impl InProcessDaemon {
         placement_policy: Option<&str>,
         stance_preference: Option<flotilla_resources::Stance>,
     ) -> Result<(WorkflowTemplateSpec, PlacementResolution), String> {
+        let mut workflow = workflow;
         if let Some(preference) = stance_preference {
-            let mut preferred = workflow.clone();
-            for vessel in &mut preferred.vessels {
+            for vessel in &mut workflow.vessels {
                 vessel.stance = vessel.stance.max(preference);
-            }
-            let preferred_result = async {
-                resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), repositories, &mut preferred).await?;
-                let placement = self.resolve_and_validate_convoy_placement(namespace, &preferred, placement_policy).await?;
-                Ok::<_, String>((preferred, placement))
-            }
-            .await;
-            match preferred_result {
-                Ok(resolved) => return Ok(resolved),
-                Err(error) => {
-                    debug!(%error, %preference, %project_ref, "preferred dispatch stance is unavailable; using workflow stance");
-                }
             }
         }
 
-        let mut workflow = workflow;
         resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), repositories, &mut workflow).await?;
         let placement = self.resolve_and_validate_convoy_placement(namespace, &workflow, placement_policy).await?;
         Ok((workflow, placement))
