@@ -4,6 +4,9 @@ metadata:
   name: review-and-fix
   namespace: flotilla
 spec:
+  exit:
+    merged: $cr.state == merged
+    closed-unmerged: $cr.state == closed
   inputs:
     - name: feature
       description: Brief description of the feature to implement

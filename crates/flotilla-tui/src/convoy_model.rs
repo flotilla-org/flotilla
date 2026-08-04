@@ -170,6 +170,7 @@ pub struct ConvoySummary {
     pub phase: ConvoyPhase,
     pub placement_decision: Option<PlacementDecision>,
     pub message: Option<String>,
+    pub disposition: Option<String>,
     pub repo_hint: Option<RepoKey>,
     /// The Project this convoy belongs to (`ConvoySpec.project_ref`).
     pub project_ref: Option<String>,
@@ -197,6 +198,7 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
             phase: row.phase.into(),
             placement_decision: row.placement_decision.clone(),
             message: row.message.clone(),
+            disposition: row.disposition.clone(),
             repo_hint: row.repo.clone(),
             project_ref: row.project_ref.clone(),
             issues: row.issues.clone(),

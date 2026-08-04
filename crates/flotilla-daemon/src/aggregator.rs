@@ -1789,6 +1789,7 @@ impl Aggregator {
                     .and_then(|demand| demand.metadata.annotations.get(RECLAIM_REFUSAL_REASON_ANNOTATION).cloned())
                     .or_else(|| status.and_then(|status| status.message.clone())),
             )
+            .maybe_disposition(status.and_then(|status| status.disposition.clone()))
             .maybe_repo(self.convoy_repo_fact(convoy).map(flotilla_protocol::RepoKey))
             .maybe_started_at(status.and_then(|status| status.started_at))
             .maybe_finished_at(status.and_then(|status| status.finished_at))
@@ -2822,6 +2823,7 @@ mod tests {
         let status = ConvoyStatus {
             phase: ResourceConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
+                exit: None,
                 vessels: vec![VesselRequirement::builder().name("implement".to_string()).crew(Vec::new()).build()],
             }),
             work: BTreeMap::from([("implement".to_string(), WorkState::builder().phase(ResourceWorkPhase::Ready).build())]),
@@ -3389,13 +3391,15 @@ mod tests {
             flotilla_protocol::ChangeRequestStatus::Open
         );
 
-        convoy.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Landed, ..Default::default() });
+        convoy.status =
+            Some(ConvoyStatus { phase: ResourceConvoyPhase::Landed, disposition: Some("shipped".to_string()), ..Default::default() });
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(convoy)).await;
         let DaemonEvent::ResultDelta(phase_delta) = event_rx.recv().await.expect("phase delta") else {
             panic!("expected result delta");
         };
         let phase_row = &phase_delta.changes.as_convoys().expect("convoy changes")[0];
         assert_eq!(phase_row.phase, ConvoyPhase::Landed);
+        assert_eq!(phase_row.disposition.as_deref(), Some("shipped"));
         assert_eq!(phase_row.change_request.as_ref().expect("cached change request").status, flotilla_protocol::ChangeRequestStatus::Open);
 
         apply_next_change_request_resolution(&mut aggregator).await;
@@ -3900,7 +3904,7 @@ mod tests {
             spec: ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
             status: Some(ConvoyStatus {
                 phase: convoy_phase,
-                workflow_snapshot: Some(WorkflowSnapshot { vessels: vec![definition] }),
+                workflow_snapshot: Some(WorkflowSnapshot { exit: None, vessels: vec![definition] }),
                 work,
                 ..Default::default()
             }),

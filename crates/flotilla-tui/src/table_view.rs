@@ -1087,7 +1087,11 @@ fn convoy_phase(row: &ConvoySummary) -> CellValue {
         ConvoyPhase::Cancelled => CellTone::Muted,
         ConvoyPhase::Abandoned => CellTone::Muted,
     };
-    CellValue::toned(row.phase.label(), tone)
+    let label = match (row.phase, row.disposition.as_deref()) {
+        (ConvoyPhase::Landed, Some(disposition)) => format!("landed · {disposition}"),
+        _ => row.phase.label().to_string(),
+    };
+    CellValue::toned(label, tone)
 }
 
 fn convoy_progress(row: &ConvoySummary) -> CellValue {
@@ -1427,6 +1431,7 @@ mod tests {
             dispatching_principal_ref: Default::default(),
             phase: ConvoyPhase::Active,
             message: None,
+            disposition: None,
             repo_hint: None,
             project_ref: Some("flotilla".into()),
             issues: Vec::new(),
@@ -1509,6 +1514,7 @@ mod tests {
     fn terminal_convoy_phases_have_distinct_row_tones() {
         let mut completed = convoy(vec![]);
         completed.phase = ConvoyPhase::Landed;
+        completed.disposition = Some("shipped".to_string());
         let mut failed = convoy(vec![]);
         failed.id = ConvoyId::new("dev", "failed");
         failed.name = "failed".into();
@@ -1516,7 +1522,7 @@ mod tests {
 
         let view = project_convoys("convoys/dev", &[&completed, &failed]).expect("convoy table");
 
-        assert_eq!(view.rows[0].cells[2], CellValue::toned("landed", CellTone::Success));
+        assert_eq!(view.rows[0].cells[2], CellValue::toned("landed · shipped", CellTone::Success));
         assert_eq!(view.rows[1].cells[2], CellValue::toned("failed", CellTone::Error));
     }
 

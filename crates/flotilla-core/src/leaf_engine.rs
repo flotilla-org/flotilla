@@ -3,9 +3,9 @@ use std::{collections::HashMap, future::Future, marker::PhantomData, pin::Pin, s
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, WaitSubscriptionRequest};
 use flotilla_resources::{
-    admit_leaf, controller::SecondaryWatch, evaluate_leaf, expected_change_request_leaves, select_convoy_children, ChangeRequest,
-    ChangeRequestLeafSubject, Checkout, Convoy, ConvoyLeafSubject, ConvoyPhase, ResourceBackend, ResourceError, ResourceObject, ThreeValue,
-    Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject,
+    admit_leaf, controller::SecondaryWatch, evaluate_leaf, instantiate_exit, select_convoy_children, ChangeRequest,
+    ChangeRequestLeafSubject, Checkout, Convoy, ConvoyLeafSubject, ConvoyPhase, InstantiatedExit, ResourceBackend, ResourceError,
+    ResourceObject, ThreeValue, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject,
 };
 use futures::StreamExt;
 use tokio::{
@@ -343,15 +343,19 @@ impl ReconcilerWake {
             convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landing | ConvoyPhase::Anchored))
         }) {
             let checkouts = select_convoy_children(convoy, &checkout_sources);
-            let leaves = match expected_change_request_leaves(convoy, &checkouts) {
-                Ok(leaves) => leaves,
+            let exit = match instantiate_exit(convoy, &checkouts) {
+                Ok(exit) => exit,
                 Err(error) => {
                     tracing::warn!(convoy = %convoy.metadata.name, %error, "derive reconciler leaf subscriptions failed");
                     continue;
                 }
             };
-            for leaves in leaves.chunks_exact(2) {
-                desired.push((convoy.metadata.name.clone(), leaves.to_vec()));
+            if let InstantiatedExit::Table(entries) = exit {
+                for entry in entries {
+                    if !entry.leaves.is_empty() {
+                        desired.push((convoy.metadata.name.clone(), entry.leaves));
+                    }
+                }
             }
         }
 
@@ -437,6 +441,8 @@ fn evaluate_row(
     change_requests: &HashMap<String, ResourceObject<ChangeRequest>>,
     change_request_stale_after: std::time::Duration,
 ) -> Result<Option<LeafFire>, String> {
+    let require_all = matches!(row.watcher, LeafWatcher::ReconcilerWake { .. });
+    let mut matched = None;
     for leaf in &row.leaves {
         let evaluation = match &leaf.address {
             LeafAddress::Convoy { name } => {
@@ -464,15 +470,20 @@ fn evaluate_row(
             }
         };
         if evaluation.result == ThreeValue::True {
-            return Ok(Some(LeafFire {
+            matched = Some(LeafFire {
                 subscription_id: row.id,
                 watcher_id: uuid::Uuid::nil(),
                 leaf: leaf.clone(),
                 value: evaluation.value.expect("true leaf has a value").to_string(),
-            }));
+            });
+            if !require_all {
+                return Ok(matched);
+            }
+        } else if require_all {
+            return Ok(None);
         }
     }
-    Ok(None)
+    Ok(matched)
 }
 
 #[cfg(test)]
@@ -488,8 +499,9 @@ mod tests {
     use flotilla_resources::{
         controller::ControllerLoop, BoundChangeRequest, ChangeRequestObservation, ChangeRequestState, CheckoutIntegrationStatus,
         CheckoutPhase, CheckoutSpec, CheckoutStatus, ConditionValue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec,
-        ConvoyStatus, CrewWorkPhase, CrewWorkState, InMemoryBackend, InputMeta, IntegrationCondition, LifecycleAuthority,
-        ObservedCheckoutSpec, PlacementStatus, RepositoryKey, SqliteBackend, WorkPhase, WorkState, WorkflowTemplate, CONVOY_LABEL,
+        ConvoyStatus, CrewWorkPhase, CrewWorkState, ExitDeclaration, InMemoryBackend, InputMeta, IntegrationCondition, LifecycleAuthority,
+        ObservedCheckoutSpec, PlacementStatus, RepositoryKey, SqliteBackend, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
+        CONVOY_LABEL,
     };
 
     use super::*;
@@ -800,6 +812,222 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].1.len(), 1);
         assert_eq!(diagnostics[0].1[0].value, "Landed");
+    }
+
+    #[tokio::test]
+    async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let (event_tx, _) = broadcast::channel(16);
+        let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
+        let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
+            state: Duration::from_millis(20),
+            checks_pending: Duration::from_millis(20),
+            freshness_demanded: Duration::from_millis(20),
+            stale_after: Duration::from_secs(60),
+        };
+        let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source.clone(), cadence);
+        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher);
+        let repo_ref = RepositoryKey("repo".to_string());
+        let spec = ConvoySpec::builder()
+            .workflow_ref("workflow".to_string())
+            .repositories(vec![ConvoyRepositorySpec::builder()
+                .url("https://github.com/flotilla-org/flotilla".to_string())
+                .repo_ref(repo_ref.clone())
+                .source_ref("feature/custom-disposition".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("flotilla".to_string())
+                .subpaths(Vec::new())
+                .build()])
+            .change_request(
+                BoundChangeRequest::builder().id("1391".to_string()).repository_ref(repo_ref).title("custom".to_string()).build(),
+            )
+            .build();
+        let mut meta =
+            InputMeta::builder().name("custom".to_string()).finalizers(vec!["flotilla.work/convoy-teardown".to_string()]).build();
+        meta.set_lifecycle_authority(LifecycleAuthority::Managed);
+        let convoys = backend.clone().using::<Convoy>("flotilla");
+        let created = convoys.create(&meta, &spec).await.expect("create custom-exit convoy");
+        let status = ConvoyStatus {
+            phase: ConvoyPhase::Landing,
+            observed_workflow_ref: Some("workflow".to_string()),
+            workflow_snapshot: Some(WorkflowSnapshot {
+                exit: Some(ExitDeclaration::Table(indexmap::IndexMap::from([(
+                    "shipped".to_string(),
+                    "$cr.state == merged".parse().expect("custom leaf template"),
+                )]))),
+                vessels: Vec::new(),
+            }),
+            work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
+            ..Default::default()
+        };
+        convoys.update_status("custom", &created.metadata.resource_version, &status).await.expect("mark custom convoy Landing");
+
+        let controller = tokio::spawn(
+            ControllerLoop {
+                primary: convoys.clone(),
+                secondaries: vec![table.reconciler_wake_watch()],
+                reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+                    .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
+                resync_interval: Duration::from_secs(3600),
+                backend: backend.clone(),
+            }
+            .run(),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !table.rows().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("custom exit should instantiate at binding");
+
+        source.merged.store(true, Ordering::SeqCst);
+        let settled = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let convoy = convoys.get("custom").await.expect("convoy");
+                let status = convoy.status.expect("status");
+                if status.phase == ConvoyPhase::Landed {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("custom exit leaf should settle through the engine");
+        assert_eq!(settled.disposition.as_deref(), Some("shipped"));
+        controller.abort();
+    }
+
+    #[tokio::test]
+    async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let (event_tx, _) = broadcast::channel(16);
+        let cadence = crate::change_request_observer::ChangeRequestRefreshCadence::default();
+        let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), Arc::new(UnavailableChangeRequests), cadence);
+        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher);
+        let convoys = backend.clone().using::<Convoy>("flotilla");
+        let created = convoys
+            .create(
+                &InputMeta::builder().name("no-cr".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+            )
+            .await
+            .expect("create zero-subject convoy");
+        convoys
+            .update_status("no-cr", &created.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Landing,
+                observed_workflow_ref: Some("workflow".to_string()),
+                work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
+                ..Default::default()
+            })
+            .await
+            .expect("mark zero-subject convoy Landing");
+        let controller = tokio::spawn(
+            ControllerLoop {
+                primary: convoys.clone(),
+                secondaries: vec![table.reconciler_wake_watch()],
+                reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla")),
+                resync_interval: Duration::from_secs(3600),
+                backend,
+            }
+            .run(),
+        );
+
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = convoys.get("no-cr").await.expect("convoy").status.expect("status");
+                if status.phase == ConvoyPhase::Landed {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("zero-subject convoy should claim-exit");
+        assert_eq!(status.disposition.as_deref(), Some("claim"));
+        assert!(table.rows().await.is_empty(), "claim exit should not arm leaves");
+        controller.abort();
+    }
+
+    #[tokio::test]
+    async fn change_request_bound_after_claims_instantiates_and_settles() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let (event_tx, _) = broadcast::channel(16);
+        let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
+        let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
+            state: Duration::from_millis(20),
+            checks_pending: Duration::from_millis(20),
+            freshness_demanded: Duration::from_millis(20),
+            stale_after: Duration::from_secs(60),
+        };
+        let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source.clone(), cadence);
+        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher);
+        let repo_ref = RepositoryKey("repo".to_string());
+        let mut spec = ConvoySpec::builder()
+            .workflow_ref("workflow".to_string())
+            .repositories(vec![ConvoyRepositorySpec::builder()
+                .url("https://github.com/flotilla-org/flotilla".to_string())
+                .repo_ref(repo_ref.clone())
+                .source_ref("feature/adopt-late".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("flotilla".to_string())
+                .subpaths(Vec::new())
+                .build()])
+            .build();
+        let meta = InputMeta::builder().name("adopt-late".to_string()).build();
+        let convoys = backend.clone().using::<Convoy>("flotilla");
+        let created = convoys.create(&meta, &spec).await.expect("create unbound convoy");
+        let landing = convoys
+            .update_status("adopt-late", &created.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Landing,
+                observed_workflow_ref: Some("workflow".to_string()),
+                work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
+                ..Default::default()
+            })
+            .await
+            .expect("claims enter Landing before binding");
+        spec.change_request =
+            Some(BoundChangeRequest::builder().id("1391".to_string()).repository_ref(repo_ref).title("adopted late".to_string()).build());
+        convoys.update(&meta, &landing.metadata.resource_version, &spec).await.expect("bind CR after claims");
+
+        let controller = tokio::spawn(
+            ControllerLoop {
+                primary: convoys.clone(),
+                secondaries: vec![table.reconciler_wake_watch()],
+                reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+                    .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
+                resync_interval: Duration::from_secs(3600),
+                backend: backend.clone(),
+            }
+            .run(),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !table.rows().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late binding should instantiate exit leaves");
+        source.merged.store(true, Ordering::SeqCst);
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = convoys.get("adopt-late").await.expect("convoy").status.expect("status");
+                if status.phase == ConvoyPhase::Landed {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late-bound CR should settle");
+        assert_eq!(status.disposition.as_deref(), Some("merged"));
+        controller.abort();
     }
 
     #[tokio::test]

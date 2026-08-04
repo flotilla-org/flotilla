@@ -345,6 +345,7 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
     let outcome = reconcile(&convoy, Some(&template), timestamp(10));
 
     let expected_snapshot = flotilla_resources::WorkflowSnapshot {
+        exit: Some(template.spec.effective_exit()),
         vessels: template
             .spec
             .vessels
@@ -498,6 +499,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
     let spec = valid_convoy_spec();
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        exit: None,
         vessels: vec![
             flotilla_resources::VesselRequirement {
                 name: "a".to_string(),
@@ -550,6 +552,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
 fn fan_in_waits_until_all_dependencies_complete() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        exit: None,
         vessels: vec![
             flotilla_resources::VesselRequirement {
                 name: "implement".to_string(),
@@ -665,7 +668,7 @@ async fn landing_with_settled_change_request_becomes_landed() {
     let outcome =
         reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::True), Some("main"), timestamp(40)).await;
 
-    assert_eq!(outcome.patch, Some(controller_patches::settle(Vec::new(), timestamp(40))));
+    assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
 }
 
 #[tokio::test]
@@ -679,7 +682,7 @@ async fn landing_on_a_different_target_records_a_fact_and_still_becomes_landed()
         .declared_target_ref("main".to_string())
         .observed_target_ref("release".to_string())
         .build();
-    assert_eq!(outcome.patch, Some(controller_patches::settle(vec![expected_mismatch.clone()], timestamp(40))));
+    assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), vec![expected_mismatch.clone()], timestamp(40))));
     let mut status = ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() };
     outcome.patch.expect("settlement patch").apply(&mut status);
     assert_eq!(status.phase, ConvoyPhase::Landed);
@@ -807,7 +810,7 @@ async fn terminal_bound_change_request_settles_checkout_without_own_landed_evide
     let deps = reconciler.fetch_dependencies(&current).await.expect("dependencies");
     let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
 
-    assert_eq!(outcome.patch, Some(controller_patches::settle(Vec::new(), timestamp(40))));
+    assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
 }
 
 #[tokio::test]
@@ -946,6 +949,7 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
     let spec = valid_convoy_spec();
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        exit: None,
         vessels: vec![
             flotilla_resources::VesselRequirement {
                 name: "a".to_string(),
@@ -1114,7 +1118,7 @@ fn all_agent_crew_done_rolls_vessel_work_complete() {
 fn interactive_convoy_stays_active_until_crew_reports_complete() {
     let mut status = bootstrapped_convoy_status();
     status.phase = ConvoyPhase::Active;
-    status.workflow_snapshot = Some(WorkflowSnapshot { vessels: interactive_single_workflow_spec().vessels });
+    status.workflow_snapshot = Some(WorkflowSnapshot { exit: None, vessels: interactive_single_workflow_spec().vessels });
     let mut work = status.work.remove("implement").expect("seed work");
     work.phase = WorkPhase::Running;
     status.work = BTreeMap::from([("work".to_string(), work)]);

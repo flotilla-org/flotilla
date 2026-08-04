@@ -206,6 +206,7 @@ fn active_convoy_status() -> ConvoyStatus {
         message: None,
         started_at: Some(ts(10)),
         finished_at: None,
+        disposition: None,
         observed_workflow_ref: None,
         observed_workflows: None,
         target_mismatches: Vec::new(),
@@ -284,7 +285,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 let mut status = active_convoy_status();
                 let before = convoy_timestamps(&status);
                 let patch = ConvoyStatusPatch::Bootstrap {
-                    workflow_snapshot: WorkflowSnapshot { vessels: Vec::new() },
+                    workflow_snapshot: WorkflowSnapshot { exit: None, vessels: Vec::new() },
                     observed_workflow_ref: "workflow-a".to_string(),
                     observed_workflows: BTreeMap::new(),
                     work: status.work.clone(),
@@ -403,7 +404,8 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             exercise: || {
                 let mut status = settled_convoy_status();
                 let before = convoy_timestamps(&status);
-                let patch = ConvoyStatusPatch::Settle { target_mismatches: Vec::new(), finished_at: ts(30) };
+                let patch =
+                    ConvoyStatusPatch::Settle { disposition: "merged".to_string(), target_mismatches: Vec::new(), finished_at: ts(30) };
                 apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
             },
@@ -842,7 +844,8 @@ fn settling_again_after_a_continuation_records_the_new_outcome_time() {
                 let mut status = settled_convoy_status();
                 status.phase = ConvoyPhase::Failed;
                 let before = convoy_timestamps(&status);
-                let patch = ConvoyStatusPatch::Settle { target_mismatches: Vec::new(), finished_at: ts(30) };
+                let patch =
+                    ConvoyStatusPatch::Settle { disposition: "merged".to_string(), target_mismatches: Vec::new(), finished_at: ts(30) };
                 apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
             },

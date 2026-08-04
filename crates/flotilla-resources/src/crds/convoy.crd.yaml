@@ -180,6 +180,13 @@ spec:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
                   properties:
+                    exit:
+                      oneOf:
+                        - type: string
+                          enum: [claim]
+                        - type: object
+                          additionalProperties:
+                            type: string
                     vessels:
                       type: array
                       items:
@@ -230,6 +237,8 @@ spec:
                 finished_at:
                   type: string
                   format: date-time
+                disposition:
+                  type: string
                 work:
                   type: object
                   additionalProperties:

@@ -2256,7 +2256,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
         &convoys,
         "bootstrap-failure",
         &convoy_controller_patches::bootstrap(
-            WorkflowSnapshot { vessels: workflow.vessels },
+            WorkflowSnapshot { exit: None, vessels: workflow.vessels },
             "single-agent-contained".into(),
             BTreeMap::new(),
             BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Pending).build())]),

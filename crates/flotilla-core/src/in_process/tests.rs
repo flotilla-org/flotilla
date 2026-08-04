@@ -1658,6 +1658,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
         .update_status("demo", &convoy.metadata.resource_version, &ConvoyStatus {
             phase: ConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
+                exit: None,
                 vessels: vec![
                     VesselRequirement {
                         name: "prepare".into(),
@@ -4869,6 +4870,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             message: None,
             started_at: None,
             finished_at: None,
+            disposition: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
             target_mismatches: Vec::new(),
@@ -4960,7 +4962,7 @@ async fn convoy_admission_snapshots_every_project_repository() {
     backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .create(&empty_input_meta("single-agent-contained"), &WorkflowTemplateSpec { inputs: Vec::new(), vessels: Vec::new() })
+        .create(&empty_input_meta("single-agent-contained"), &WorkflowTemplateSpec { inputs: Vec::new(), exit: None, vessels: Vec::new() })
         .await
         .expect("workflow create should succeed");
 
@@ -5003,7 +5005,7 @@ async fn create_empty_workflow(backend: &ResourceBackend, name: &str) {
     backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .create(&empty_input_meta(name), &WorkflowTemplateSpec { inputs: Vec::new(), vessels: Vec::new() })
+        .create(&empty_input_meta(name), &WorkflowTemplateSpec { inputs: Vec::new(), exit: None, vessels: Vec::new() })
         .await
         .expect("workflow create should succeed");
 }
@@ -5456,6 +5458,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             message: None,
             started_at: None,
             finished_at: None,
+            disposition: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
             target_mismatches: Vec::new(),
@@ -5605,6 +5608,7 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
             message: None,
             started_at: None,
             finished_at: Some(chrono::Utc::now()),
+            disposition: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
             target_mismatches: Vec::new(),
@@ -6212,6 +6216,7 @@ async fn convoy_abandon_command_archives_and_retains_terminal_record() {
             message: None,
             started_at: None,
             finished_at: None,
+            disposition: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
             target_mismatches: Vec::new(),

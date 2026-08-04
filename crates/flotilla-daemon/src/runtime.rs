@@ -5763,6 +5763,7 @@ mod tests {
             .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    exit: None,
                     vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
                 }),
                 work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build())]),

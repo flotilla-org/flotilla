@@ -14,6 +14,7 @@ fn ts(seconds: i64) -> chrono::DateTime<Utc> {
 
 fn sample_snapshot() -> WorkflowSnapshot {
     WorkflowSnapshot {
+        exit: None,
         vessels: vec![
             VesselRequirement {
                 name: "implement".to_string(),
@@ -117,6 +118,7 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::new()),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 
@@ -160,6 +162,7 @@ fn crew_completion_updates_only_the_calling_agent() {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::new()),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 
@@ -204,6 +207,7 @@ fn final_crew_completion_claim_enters_landing_idempotently() {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::new()),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 
@@ -229,6 +233,7 @@ fn crew_failure_records_terminal_state_and_message() {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::new()),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 
@@ -270,6 +275,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
         finished_at: Some(ts(16)),
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::new()),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 
@@ -314,6 +320,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         finished_at: Some(ts(16)),
         observed_workflow_ref: Some("single-agent-contained".to_string()),
         observed_workflows: Some(BTreeMap::new()),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 
@@ -352,6 +359,7 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::new()),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 
@@ -391,6 +399,7 @@ fn running_vessel_work_leaves_latent_agents_pending() {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::new()),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 
@@ -458,6 +467,7 @@ fn advance_work_to_ready_updates_only_selected_vessels() {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::from([("review-and-fix".to_string(), "42".to_string())])),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 
@@ -502,6 +512,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::from([("review-and-fix".to_string(), "42".to_string())])),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 
@@ -538,6 +549,7 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::from([("review-and-fix".to_string(), "42".to_string())])),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 
@@ -571,6 +583,7 @@ fn forced_work_completion_claim_enters_landing() {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::from([("review-and-fix".to_string(), "42".to_string())])),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 
@@ -612,6 +625,7 @@ fn forced_work_completion_preserves_agent_owned_state() {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::new()),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 
@@ -637,6 +651,7 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::new()),
+        disposition: None,
         target_mismatches: Vec::new(),
     };
 

@@ -815,6 +815,7 @@ mod tests {
             dispatching_principal_ref: Default::default(),
             phase: ConvoyPhase::Active,
             message: None,
+            disposition: None,
             repo_hint: None,
             project_ref: None,
             issues: Vec::new(),

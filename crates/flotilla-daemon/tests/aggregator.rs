@@ -592,6 +592,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
             phase: ResourceConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
+                exit: None,
                 vessels: vec![VesselRequirement::builder().name("coder".to_string()).crew(Vec::new()).build()],
             }),
             work: BTreeMap::from([("coder".to_string(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),

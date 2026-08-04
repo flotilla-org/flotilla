@@ -1769,6 +1769,7 @@ fn wire_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_proto
         .phase(wire_convoy_phase(convoy.phase))
         .initializing(convoy.initializing)
         .maybe_message(convoy.message)
+        .maybe_disposition(convoy.disposition)
         .maybe_repo(convoy.repo_hint)
         .maybe_project_ref(convoy.project_ref)
         .maybe_change_request(convoy.change_request)
@@ -1883,6 +1884,7 @@ fn test_convoy(
         dispatching_principal_ref: Default::default(),
         phase,
         message: None,
+        disposition: None,
         repo_hint: None,
         project_ref: None,
         issues: Vec::new(),
