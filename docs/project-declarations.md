@@ -42,3 +42,47 @@ refreshes. This follows the repository identity model: forge renames are served
 through redirects while resource references retain their established key.
 Projects created with `project add` or `project apply` remain valid and cannot
 be refreshed until they opt in by being registered from a declaration.
+
+## Operational entries
+
+Members with the `ops` role may contain operational entries. Flotilla examines
+the committed files in each locally available ops-member checkout during
+`project register` and `project refresh`; it does not watch the checkout and it
+does not read uncommitted contents. An entry is identified by YAML frontmatter,
+independent of its filename or directory:
+
+```yaml
+---
+kind: workflow_template
+name: implement-review
+repos: [app]
+---
+vessels:
+  - name: work
+    crew:
+      - role: coder
+        selector:
+          capability: code
+```
+
+`repos` names project member aliases and is authoritative. Omitting it targets
+all `code`-role members; an explicit empty list is rejected. Materialization
+resolves aliases to stable `RepositoryKey` values and writes them to each
+workflow vessel's `repository_refs`. The resulting `WorkflowTemplate` follows
+the same admission and snapshot-pinning path as a hand-applied template.
+
+Verification commands use the same frontmatter and materialize into the
+targeted Repository definitions:
+
+```yaml
+---
+kind: verification_command
+name: test
+---
+command: cargo test --workspace --locked
+```
+
+Materialized workflow metadata records the source ops repository, exact commit,
+and entry path. Repository metadata records equivalent provenance for its
+materialized verification-command set. Refresh restores drift, removes stale
+materialized workflows, and reports the definitions it changed.

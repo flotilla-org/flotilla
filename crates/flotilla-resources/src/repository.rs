@@ -38,6 +38,8 @@ pub struct RepositorySpec {
     upstream: Option<RepositoryUpstream>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     allow_reviewless_workflows: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    verification_commands: BTreeMap<String, String>,
 }
 
 impl RepositorySpec {
@@ -53,6 +55,7 @@ impl RepositorySpec {
             forge: Some(forge),
             upstream: None,
             allow_reviewless_workflows: false,
+            verification_commands: BTreeMap::new(),
         })
     }
 
@@ -72,6 +75,7 @@ impl RepositorySpec {
             forge: None,
             upstream: None,
             allow_reviewless_workflows: false,
+            verification_commands: BTreeMap::new(),
         })
     }
 
@@ -104,6 +108,10 @@ impl RepositorySpec {
         self.allow_reviewless_workflows
     }
 
+    pub fn verification_commands(&self) -> &BTreeMap<String, String> {
+        &self.verification_commands
+    }
+
     pub fn with_upstream(mut self, url: impl Into<String>, relation: RepositoryRelation) -> Result<Self, String> {
         let url = crate::canonicalize_repo_url(&url.into())?;
         self.upstream = Some(RepositoryUpstream { url, relation });
@@ -112,6 +120,11 @@ impl RepositorySpec {
 
     pub fn with_allow_reviewless_workflows(mut self, allow: bool) -> Self {
         self.allow_reviewless_workflows = allow;
+        self
+    }
+
+    pub fn with_verification_commands(mut self, commands: BTreeMap<String, String>) -> Self {
+        self.verification_commands = commands;
         self
     }
 
@@ -283,7 +296,7 @@ pub async fn ensure_repository(
         }
         // Identity-only observations are common during provisioning and must not
         // erase provenance supplied by the per-repository config authority.
-        if spec.upstream.is_none() && !spec.allow_reviewless_workflows {
+        if spec.upstream.is_none() && !spec.allow_reviewless_workflows && spec.verification_commands.is_empty() {
             return Ok(repository);
         }
         return repositories.update(&InputMeta::from(&repository.metadata), &repository.metadata.resource_version, spec).await;
@@ -305,6 +318,8 @@ impl<'de> Deserialize<'de> for RepositorySpec {
             upstream: Option<RepositoryUpstream>,
             #[serde(default)]
             allow_reviewless_workflows: bool,
+            #[serde(default)]
+            verification_commands: BTreeMap<String, String>,
         }
 
         let stored = StoredRepositorySpec::deserialize(deserializer)?;
@@ -326,6 +341,7 @@ impl<'de> Deserialize<'de> for RepositorySpec {
             }
         }
         normalized.allow_reviewless_workflows = stored.allow_reviewless_workflows;
+        normalized.verification_commands = stored.verification_commands;
         Ok(normalized)
     }
 }

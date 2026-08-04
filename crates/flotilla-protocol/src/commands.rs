@@ -828,6 +828,8 @@ pub enum CommandValue {
         name: String,
         members: usize,
         converged: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<String>,
     },
 }
 
