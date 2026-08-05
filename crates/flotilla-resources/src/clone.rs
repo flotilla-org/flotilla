@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::StatusPatch, RepositoryKey};
@@ -28,6 +29,8 @@ pub struct CloneStatus {
     pub default_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +38,7 @@ pub enum CloneStatusPatch {
     MarkCloning,
     MarkRetrying { message: String },
     MarkReady { default_branch: Option<String> },
-    MarkFailed { message: String },
+    MarkFailed { message: String, failed_at: DateTime<Utc> },
 }
 
 impl StatusPatch<CloneStatus> for CloneStatusPatch {
@@ -44,19 +47,23 @@ impl StatusPatch<CloneStatus> for CloneStatusPatch {
             Self::MarkCloning => {
                 status.phase = ClonePhase::Cloning;
                 status.message = None;
+                status.failed_at = None;
             }
             Self::MarkRetrying { message } => {
                 status.phase = ClonePhase::Cloning;
                 status.message = Some(message.clone());
+                status.failed_at = None;
             }
             Self::MarkReady { default_branch } => {
                 status.phase = ClonePhase::Ready;
                 status.default_branch = default_branch.clone();
                 status.message = None;
+                status.failed_at = None;
             }
-            Self::MarkFailed { message } => {
+            Self::MarkFailed { message, failed_at } => {
                 status.phase = ClonePhase::Failed;
                 status.message = Some(message.clone());
+                status.failed_at = Some(*failed_at);
             }
         }
     }

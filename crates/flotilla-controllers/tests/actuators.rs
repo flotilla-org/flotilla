@@ -6,30 +6,12 @@ use flotilla_core::{
     providers::{
         environment::{CreateOpts, EnvironmentProvider, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
         terminal::{TerminalEnvVars, TerminalPool, TerminalSession as PoolSession},
-        vcs::CloneProvisioner,
     },
 };
 use flotilla_protocol::{EnvironmentId, ImageId};
 use flotilla_resources::{
     DockerEnvironmentSpec, DockerImagePullPolicy, EnvironmentMount, EnvironmentMountMode, FreshCloneCheckoutSpec, TerminalSessionSpec,
 };
-
-#[derive(Default)]
-struct FakeCloneProvisioner;
-
-#[async_trait]
-impl CloneProvisioner for FakeCloneProvisioner {
-    async fn clone_repo(&self, _repo_url: &str, _target_path: &ExecutionEnvironmentPath) -> Result<(), String> {
-        Ok(())
-    }
-
-    async fn inspect_clone(
-        &self,
-        _target_path: &ExecutionEnvironmentPath,
-    ) -> Result<flotilla_core::providers::vcs::CloneInspection, String> {
-        Ok(flotilla_core::providers::vcs::CloneInspection { default_branch: Some("main".to_string()) })
-    }
-}
 
 #[derive(Default)]
 struct FakeEnvironmentProvider;
@@ -86,17 +68,6 @@ impl TerminalPool for FakeTerminalPool {
     async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
         Ok(())
     }
-}
-
-#[tokio::test]
-async fn clone_actuator_returns_default_branch_from_provisioner() {
-    let actuator = flotilla_controllers::actuators::CloneActuator::new(Arc::new(FakeCloneProvisioner));
-    let outcome = actuator
-        .clone_and_inspect("git@github.com:flotilla-org/flotilla.git", &ExecutionEnvironmentPath::new("/tmp/flotilla"))
-        .await
-        .expect("clone should succeed");
-
-    assert_eq!(outcome.default_branch.as_deref(), Some("main"));
 }
 
 #[tokio::test]

@@ -275,6 +275,7 @@ pub async fn create_ready_clone(
             phase: ClonePhase::Ready,
             default_branch: Some("main".to_string()),
             message: None,
+            failed_at: None,
         })
         .await
         .expect("clone status update should succeed");

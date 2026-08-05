@@ -105,6 +105,7 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
             phase: ClonePhase::Ready,
             default_branch: Some("main".to_string()),
             message: None,
+            failed_at: None,
         })
         .await
         .expect("clone status");

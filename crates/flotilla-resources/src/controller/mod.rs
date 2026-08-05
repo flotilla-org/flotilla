@@ -147,6 +147,7 @@ pub enum Actuation {
     CreateRepository { key: crate::RepositoryKey, spec: crate::RepositorySpec },
     CreateEnvironment { meta: InputMeta, spec: EnvironmentSpec },
     CreateClone { meta: InputMeta, spec: CloneSpec },
+    RetryClone { name: String, failed_at: DateTime<Utc> },
     CreateCheckout { meta: InputMeta, spec: CheckoutSpec },
     CreateTerminalSession { meta: InputMeta, spec: TerminalSessionSpec },
     RestartTerminalSession { name: String },
@@ -457,6 +458,20 @@ impl<R: Reconciler> ControllerLoop<R> {
             Actuation::CreateClone { meta, spec } => {
                 let resolver = backend.using::<crate::Clone>(namespace);
                 Self::create_if_missing(&resolver, meta, spec).await
+            }
+            Actuation::RetryClone { name, failed_at } => {
+                let resolver = backend.using::<crate::Clone>(namespace);
+                let clone = match resolver.get(&name).await {
+                    Ok(clone) => clone,
+                    Err(ResourceError::NotFound { .. }) => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                let current_failed_at =
+                    clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
+                if clone.status.as_ref().map(|status| status.phase) != Some(crate::ClonePhase::Failed) || current_failed_at != failed_at {
+                    return Ok(());
+                }
+                crate::apply_status_patch(&resolver, &name, &crate::CloneStatusPatch::MarkCloning).await.map(|_| ())
             }
             Actuation::CreateCheckout { meta, spec } => {
                 let resolver = backend.using::<crate::Checkout>(namespace);

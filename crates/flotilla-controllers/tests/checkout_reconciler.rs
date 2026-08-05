@@ -16,11 +16,12 @@ use flotilla_controllers::reconcilers::{
 };
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
+    apply_status_patch,
     controller::{ControllerLoop, Reconciler},
-    repo_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, ConditionValue,
-    Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, FreshCloneCheckoutSpec, InMemoryBackend, InputMeta, IntegrationCondition, RepositoryKey,
-    ResourceBackend, ResourceError, ResourceObject, StatusPatch, VirtualClock, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL,
-    CONVOY_LABEL,
+    repo_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clone, CloneSpec,
+    CloneStatusPatch, ConditionValue, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, FreshCloneCheckoutSpec, InMemoryBackend, InputMeta,
+    IntegrationCondition, RepositoryKey, ResourceBackend, ResourceError, ResourceObject, StatusPatch, VirtualClock,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
 };
 use tokio::time::timeout;
 
@@ -120,6 +121,50 @@ async fn finalizer_error_maps_to_failed_checkout_status() {
 
     assert_eq!(status.phase, CheckoutPhase::Failed);
     assert_eq!(status.message.as_deref(), Some("checkout teardown failed: remove worktree: permission denied"));
+}
+
+#[tokio::test]
+async fn clone_failure_from_the_current_checkout_attempt_is_reported_as_a_historical_dependency() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let clones = backend.clone().using::<Clone>(NAMESPACE);
+    clones
+        .create(&meta("clone-a"), &CloneSpec {
+            repo_ref: RepositoryKey(repo_key(REPO_URL)),
+            url: REPO_URL.to_string(),
+            env_ref: "host-direct-a".to_string(),
+            path: "/clones/repo".to_string(),
+        })
+        .await
+        .expect("clone should create");
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let checkout = checkouts
+        .create(
+            &meta("checkout-a"),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-a".to_string(),
+                r#ref: "fix/clone-failed-latch".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/repo.fix-clone-failed-latch".to_string(),
+                clone_ref: "clone-a".to_string(),
+            }),
+        )
+        .await
+        .expect("checkout should create");
+    let failed_at = checkout.metadata.creation_timestamp + chrono::Duration::seconds(1);
+    apply_status_patch(&clones, "clone-a", &CloneStatusPatch::MarkFailed { message: "authentication failed".to_string(), failed_at })
+        .await
+        .expect("clone failure should apply");
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE);
+
+    let deps = reconciler.fetch_dependencies(&checkout).await.expect("dependencies should load");
+    let outcome = reconciler.reconcile(&checkout, &deps, failed_at);
+
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::CheckoutStatusPatch::MarkFailed { message })
+            if message == format!("clone clone-a is Failed since {}: authentication failed", failed_at.to_rfc3339())
+    ));
 }
 
 async fn create_deleting_checkout(backend: &ResourceBackend, name: &str, target_path: &str) {

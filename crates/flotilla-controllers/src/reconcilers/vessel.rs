@@ -15,8 +15,8 @@ use flotilla_resources::{
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
-    repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
-    CrewSource, CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentMount,
+    repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy, CrewSource,
+    CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentMount,
     EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, EnvironmentWaitReason, FreshCloneCheckoutSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
     PlacementPolicySpec, ReplicaReadResolver, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend,
@@ -515,14 +515,6 @@ impl Reconciler for VesselReconciler {
                     Ok(existing) => {
                         if existing.spec.repo_ref != repository_key || existing.spec.env_ref != clone_env_ref {
                             return Ok(VesselDeps::failed(format!("clone {clone_name} does not match expected repo/env tuple")));
-                        }
-                        if existing.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
-                            let message = existing
-                                .status
-                                .as_ref()
-                                .and_then(|status| status.message.clone())
-                                .unwrap_or_else(|| format!("clone {clone_name} failed"));
-                            return Ok(VesselDeps::failed(message));
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {

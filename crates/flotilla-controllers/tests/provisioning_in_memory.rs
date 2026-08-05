@@ -33,10 +33,10 @@ use flotilla_core::{
     HostName,
 };
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key,
+    apply_status_patch, canonicalize_repo_url, clone_key,
     controller::{ControllerLoop, ReconcileOutcome, Reconciler},
-    Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, Environment, EnvironmentMount,
+    Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, CloneStatusPatch,
+    Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, Environment, EnvironmentMount,
     EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, Presentation,
     PresentationPhase, PresentationSpec, Repository, RepositorySpec, ResourceBackend, ResourceError, ResourceObject, Stance, StatusPatch,
     TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_ORDINAL_LABEL,
@@ -497,6 +497,89 @@ async fn clone_controller_marks_clone_ready() {
     let status = clone.status.expect("clone status should be present");
     assert_eq!(status.phase, flotilla_resources::ClonePhase::Ready);
     assert_eq!(status.default_branch.as_deref(), Some("main"));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn new_checkout_demand_redrives_a_previously_failed_clone() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_spec.key(), &repository_spec)
+        .await
+        .expect("repository create should succeed");
+    let clone_name = format!("clone-{}", clone_key("https://github.com/flotilla-org/flotilla", "host-direct-01HXYZ"));
+    let clones = backend.clone().using::<Clone>(NAMESPACE);
+    clones
+        .create(&controller_meta().name(&clone_name).call(), &CloneSpec {
+            repo_ref: repository_spec.key(),
+            url: "git@github.com:flotilla-org/flotilla.git".to_string(),
+            env_ref: "host-direct-01HXYZ".to_string(),
+            path: "/Users/alice/dev/flotilla".to_string(),
+        })
+        .await
+        .expect("clone create should succeed");
+    apply_status_patch(&clones, &clone_name, &CloneStatusPatch::MarkFailed {
+        message: "destination path already exists and is not an empty directory".to_string(),
+        failed_at: Utc::now() - chrono::Duration::minutes(5),
+    })
+    .await
+    .expect("clone failure should apply");
+
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    checkouts
+        .create(
+            &controller_meta().name("checkout-new-demand").call(),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: repository_spec.key(),
+                env_ref: "host-direct-01HXYZ".to_string(),
+                r#ref: "fix/clone-failed-latch".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/Users/alice/dev/flotilla.fix-clone-failed-latch".to_string(),
+                clone_ref: clone_name.clone(),
+            }),
+        )
+        .await
+        .expect("checkout create should succeed");
+
+    let mut harness = ControllerLoopHarness::new(backend.clone());
+    harness.spawn(
+        ControllerLoop {
+            primary: clones.clone(),
+            secondaries: vec![],
+            reconciler: CloneReconciler::new(Arc::new(FakeCloneRuntime), backend.clone().using(NAMESPACE)),
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+    harness.spawn(
+        ControllerLoop {
+            primary: checkouts.clone(),
+            secondaries: vec![],
+            reconciler: CheckoutReconciler::new(Arc::new(FakeCheckoutRuntime), backend.clone(), NAMESPACE),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    harness
+        .wait_until(Duration::from_secs(3), || {
+            let clones = clones.clone();
+            let checkouts = checkouts.clone();
+            let clone_name = clone_name.clone();
+            async move {
+                matches!(
+                    clones.get(&clone_name).await.ok().and_then(|clone| clone.status),
+                    Some(status) if status.phase == ClonePhase::Ready
+                ) && matches!(
+                    checkouts.get("checkout-new-demand").await.ok().and_then(|checkout| checkout.status),
+                    Some(status) if status.phase == CheckoutPhase::Ready
+                )
+            }
+        })
+        .await;
 
     harness.shutdown().await;
 }
