@@ -138,6 +138,11 @@ where
     type Dependencies = TerminalDeps;
 
     async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+        let environment = match self.environments.get(&obj.spec.env_ref).await {
+            Ok(environment) => environment,
+            Err(ResourceError::NotFound { .. }) => return Ok(TerminalDeps::OwnerMissing),
+            Err(err) => return Err(err),
+        };
         if self.session_owner_missing(obj).await? {
             return Ok(TerminalDeps::OwnerMissing);
         }
@@ -175,11 +180,6 @@ where
             return Ok(TerminalDeps::None);
         }
 
-        let environment = match self.environments.get(&obj.spec.env_ref).await {
-            Ok(environment) => environment,
-            Err(ResourceError::NotFound { .. }) => return Ok(TerminalDeps::Waiting),
-            Err(err) => return Err(err),
-        };
         if environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
             return Ok(TerminalDeps::Waiting);
         }

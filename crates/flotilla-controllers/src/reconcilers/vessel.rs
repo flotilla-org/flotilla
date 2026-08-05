@@ -25,6 +25,7 @@ use flotilla_resources::{
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, VESSEL_REF_LABEL,
 };
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -558,12 +559,18 @@ impl Reconciler for VesselReconciler {
                 None
             };
             let checkout_name = adopted_checkout_ref.clone().unwrap_or_else(|| match &strategy {
-                PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
-                    checkout_name(&convoy.metadata.name, &convoy_repository.workspace_slug, multi_repository)
-                }
-                PlacementStrategy::DockerFreshCloneInContainer { .. } => {
-                    checkout_name(&obj.metadata.name, &convoy_repository.workspace_slug, multi_repository)
-                }
+                PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => checkout_name(
+                    &convoy.metadata.name,
+                    &convoy_repository.workspace_slug,
+                    multi_repository,
+                    checkout_placement_scope(&convoy, self.local_host_ref.as_deref()).as_deref(),
+                ),
+                PlacementStrategy::DockerFreshCloneInContainer { .. } => checkout_name(
+                    &obj.metadata.name,
+                    &convoy_repository.workspace_slug,
+                    multi_repository,
+                    checkout_placement_scope(&convoy, self.local_host_ref.as_deref()).as_deref(),
+                ),
             });
             let checkout_target_path = match &strategy {
                 PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
@@ -1205,12 +1212,25 @@ fn environment_name(vessel_name: &str) -> String {
     format!("env-{vessel_name}")
 }
 
-fn checkout_name(vessel_name: &str, workspace_slug: &str, multi_repository: bool) -> String {
-    if multi_repository {
-        format!("checkout-{vessel_name}-{workspace_slug}")
-    } else {
-        format!("checkout-{vessel_name}")
+fn checkout_name(vessel_name: &str, workspace_slug: &str, multi_repository: bool, placement_scope: Option<&str>) -> String {
+    let repository_suffix = if multi_repository { format!("-{workspace_slug}") } else { String::new() };
+    let placement_suffix = placement_scope.map(|scope| format!("-{scope}")).unwrap_or_default();
+    format!("checkout-{vessel_name}{repository_suffix}{placement_suffix}")
+}
+
+fn checkout_placement_scope(convoy: &ResourceObject<Convoy>, host_ref: Option<&str>) -> Option<String> {
+    let host_ref = host_ref?;
+    let mut hash = Sha256::new();
+    hash.update(b"managed-checkout-placement-v1\0");
+    hash.update(host_ref.as_bytes());
+    hash.update([0]);
+    hash.update(convoy.metadata.creation_timestamp.to_rfc3339().as_bytes());
+    hash.update([0]);
+    if let Some(origin_root) = convoy.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION) {
+        hash.update(origin_root.as_bytes());
     }
+    let digest = format!("{:x}", hash.finalize());
+    Some(digest[..12].to_string())
 }
 
 fn checkout_path_component(branch: &str) -> String {
@@ -1341,9 +1361,9 @@ mod tests {
     };
 
     use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
-    use flotilla_resources::ResourceBackend;
+    use flotilla_resources::{Convoy, ConvoySpec, InputMeta, ResourceBackend};
 
-    use super::{environment_with_credentials, legible_waiting_for, VesselReconciler};
+    use super::{checkout_name, checkout_placement_scope, environment_with_credentials, legible_waiting_for, VesselReconciler};
 
     #[derive(Clone)]
     struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
@@ -1357,6 +1377,31 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn managed_checkout_names_are_scoped_by_placement_and_dispatch_attempt() {
+        let backend = ResourceBackend::InMemory(Default::default());
+        let convoy = backend
+            .using::<Convoy>("flotilla")
+            .create(
+                &InputMeta::builder().name("same-name".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+            )
+            .await
+            .expect("create convoy");
+        let mut later_attempt = convoy.clone();
+        later_attempt.metadata.creation_timestamp += chrono::Duration::seconds(1);
+
+        let feta = checkout_placement_scope(&convoy, Some("feta-host")).expect("feta scope");
+        let kiwi = checkout_placement_scope(&convoy, Some("kiwi-host")).expect("kiwi scope");
+        let later_feta = checkout_placement_scope(&later_attempt, Some("feta-host")).expect("later feta scope");
+
+        assert_ne!(checkout_name("same-name", "flotilla", false, Some(&feta)), checkout_name("same-name", "flotilla", false, Some(&kiwi)));
+        assert_ne!(
+            checkout_name("same-name", "flotilla", false, Some(&feta)),
+            checkout_name("same-name", "flotilla", false, Some(&later_feta))
+        );
     }
 
     #[test]

@@ -1312,6 +1312,36 @@ async fn convoy_explanation_and_resource_get_read_remote_replicas() {
     assert!(matches!(fetched.records[0].provenance, flotilla_protocol::ResourceRecordProvenance::Replica { .. }));
 }
 
+#[tokio::test]
+async fn convoy_teardown_gate_reads_checkout_replicas() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    create_explanation_convoy(&backend, "replica-gate", Some("remote-checkout"), Some((ConditionValue::True, Utc::now()))).await;
+    let checkouts = backend.clone().using::<ResourceCheckout>("flotilla");
+    let checkout = checkouts.get("remote-checkout").await.expect("local checkout fixture");
+    let observed_at = Utc::now().to_rfc3339();
+    let condition = || IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build();
+    checkouts
+        .update_status("remote-checkout", &checkout.metadata.resource_version, &ResourceCheckoutStatus {
+            phase: ResourceCheckoutPhase::Ready,
+            integration: CheckoutIntegrationStatus { clean: condition(), pushed: condition(), landed: condition(), ..Default::default() },
+            ..Default::default()
+        })
+        .await
+        .expect("record safe integration evidence");
+    backend
+        .replica_writer::<ResourceCheckout>(NodeId::new("checkout-authority"), "flotilla")
+        .replace(&checkouts.list().await.expect("list checkout authority resources"), Utc::now())
+        .await
+        .expect("replicate checkout");
+    checkouts.delete("remote-checkout").await.expect("remove local fixture so only replica remains");
+    let (daemon, _temp) = explanation_daemon(backend).await;
+
+    daemon
+        .verify_convoy_teardown_gate("flotilla", "replica-gate", false)
+        .await
+        .expect("replica-inclusive gate should accept the checkout authority's evidence");
+}
+
 async fn wait_for_command_result(events: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {

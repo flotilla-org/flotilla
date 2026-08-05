@@ -17,10 +17,10 @@ use flotilla_controllers::reconcilers::{
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
     apply_status_patch,
-    controller::{ControllerLoop, Reconciler},
+    controller::{Actuation, ControllerLoop, Reconciler},
     repo_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clone, CloneSpec,
     CloneStatusPatch, ConditionValue, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, FreshCloneCheckoutSpec, InMemoryBackend, InputMeta,
-    IntegrationCondition, RepositoryKey, ResourceBackend, ResourceError, ResourceObject, StatusPatch, VirtualClock,
+    IntegrationCondition, LifecycleAuthority, RepositoryKey, ResourceBackend, ResourceError, ResourceObject, StatusPatch, VirtualClock,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
 };
 use tokio::time::timeout;
@@ -485,6 +485,65 @@ async fn checkout_authority_observes_when_replicated_convoy_enters_landing() {
 
     assert!(matches!(deps, CheckoutDeps::Integration { .. }), "Landing must shorten the observation TTL to 30 seconds");
     assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 1, "only the checkout authority should probe its checkout");
+}
+
+#[tokio::test]
+async fn checkout_authority_reclaims_managed_checkout_when_replicated_convoy_is_landed() {
+    let authority_root = NodeId::new("convoy-authority");
+    let checkout_host = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("checkout-authority"));
+    let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(authority_root.clone());
+    let convoys = authority.clone().using::<Convoy>(NAMESPACE);
+    let convoy = convoys
+        .create(
+            &InputMeta::builder().name("cross-host".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build(),
+        )
+        .await
+        .expect("create authority convoy");
+    convoys
+        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Landed,
+            ..Default::default()
+        })
+        .await
+        .expect("mark convoy Landed");
+    checkout_host
+        .replica_writer::<Convoy>(authority_root, NAMESPACE)
+        .replace(&convoys.list().await.expect("list authority convoys"), chrono::Utc::now())
+        .await
+        .expect("replicate convoy to checkout host");
+
+    let checkout = checkout_host
+        .clone()
+        .using::<Checkout>(NAMESPACE)
+        .create(
+            &InputMeta::builder()
+                .name("remote-checkout".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "cross-host".to_string())]))
+                .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), "convoy-authority".to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Managed),
+            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-checkout-authority".to_string(),
+                r#ref: "feature/cross-host".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/cross-host".to_string(),
+                url: REPO_URL.to_string(),
+            }),
+        )
+        .await
+        .expect("create managed checkout");
+    let runtime = Arc::new(RecordingCheckoutRuntime::default());
+    let reconciler =
+        CheckoutReconciler::new(Arc::clone(&runtime), checkout_host.clone(), NAMESPACE).with_federated_convoys(&checkout_host, NAMESPACE);
+
+    let deps = reconciler.fetch_dependencies(&checkout).await.expect("resolve replicated Landed convoy");
+    let outcome = reconciler.reconcile(&checkout, &deps, chrono::Utc::now());
+
+    assert!(matches!(deps, CheckoutDeps::OwnerTerminal));
+    assert!(matches!(outcome.actuations.as_slice(), [Actuation::DeleteCheckout { name }] if name == "remote-checkout"));
+    assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 0, "Landed is durable settlement evidence");
 }
 
 #[tokio::test]

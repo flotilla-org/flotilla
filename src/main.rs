@@ -297,9 +297,9 @@ struct ResourceListArgs {
     /// Route the query to a peer host
     #[arg(long)]
     host: Option<String>,
-    /// Include read-only replicas from peer roots
+    /// Show only records authored by the queried host
     #[arg(long)]
-    include_replicas: bool,
+    local_only: bool,
 }
 
 #[derive(clap::Args)]
@@ -1085,7 +1085,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                         .kind(args.kind)
                         .namespace(args.namespace)
                         .maybe_node_id(node_id.clone())
-                        .include_replicas(args.include_replicas)
+                        .include_replicas(!args.local_only)
                         .build(),
                 )
                 .await
@@ -2093,7 +2093,7 @@ mod tests {
         assert!(matches!(
             list.command,
             Some(SubCommand::Resource {
-                command: ResourceSubCommand::List(ResourceListArgs { kind, namespace, host: Some(host), include_replicas: false })
+                command: ResourceSubCommand::List(ResourceListArgs { kind, namespace, host: Some(host), local_only: false })
             }) if kind == "convoys" && namespace == "flotilla" && host == "feta"
         ));
 

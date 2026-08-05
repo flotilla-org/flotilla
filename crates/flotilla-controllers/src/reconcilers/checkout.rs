@@ -8,8 +8,8 @@ use flotilla_core::checkout_integration::{
 use flotilla_resources::{
     controller::{Actuation, ReconcileOutcome, Reconciler, ReplicaConvoyCheckoutWatch, SecondaryWatch},
     Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, Clock,
-    Clone, ClonePhase, Convoy, ConvoyPhase, IntegrationCondition, ReplicaReadResolver, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, SystemClock, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    Clone, ClonePhase, Convoy, ConvoyPhase, IntegrationCondition, LifecycleAuthority, ReplicaReadResolver, Resource, ResourceBackend,
+    ResourceError, ResourceObject, ResourceProvenance, SystemClock, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
 use tracing::warn;
 
@@ -152,6 +152,7 @@ fn convoy_claims_checkout(convoy: &ResourceObject<Convoy>, checkout_name: &str) 
 
 pub enum CheckoutDeps {
     None,
+    OwnerTerminal,
     Ready { prepared: PreparedCheckout },
     Integration { status: Box<CheckoutIntegrationStatus> },
     RetryClone { clone_name: String, failed_at: DateTime<Utc> },
@@ -175,12 +176,13 @@ fn integration_is_fresh(status: &CheckoutStatus, now: DateTime<Utc>, max_age: Du
     now.signed_duration_since(oldest_observation).to_std().is_ok_and(|age| age < max_age)
 }
 
-/// Terminal convoys keep the Landing TTL because teardown consumes the same
-/// fresh evidence and no longer probes a checkout on demand.
 fn convoy_needs_terminal_evidence(convoy: Option<&ResourceObject<Convoy>>) -> bool {
-    convoy.and_then(|convoy| convoy.status.as_ref()).is_some_and(|status| {
-        status.phase == ConvoyPhase::Landing || (status.phase.is_terminal() && status.phase != ConvoyPhase::Abandoned)
-    })
+    convoy.and_then(|convoy| convoy.status.as_ref()).is_some_and(|status| status.phase == ConvoyPhase::Landing)
+}
+
+fn convoy_authorizes_checkout_reclaim(convoy: &ResourceObject<Convoy>) -> bool {
+    convoy.metadata.deletion_timestamp.is_some()
+        || convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landed | ConvoyPhase::Abandoned))
 }
 
 impl<R> Reconciler for CheckoutReconciler<R>
@@ -191,8 +193,18 @@ where
     type Dependencies = CheckoutDeps;
 
     async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+        let lifecycle_authority = obj.metadata.lifecycle_authority()?;
+        let has_convoy_owner = obj.metadata.labels.contains_key(CONVOY_LABEL)
+            || obj.metadata.owner_references.iter().any(|owner| owner.kind == Convoy::API_PATHS.kind);
+        let convoy = self.owning_convoy(obj).await?;
+        if lifecycle_authority == Some(LifecycleAuthority::Managed)
+            && has_convoy_owner
+            && convoy.as_ref().is_some_and(convoy_authorizes_checkout_reclaim)
+        {
+            return Ok(CheckoutDeps::OwnerTerminal);
+        }
+
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) != CheckoutPhase::Pending {
-            let convoy = self.owning_convoy(obj).await?;
             let terminal_evidence = convoy_needs_terminal_evidence(convoy.as_ref());
             let refresh_after = if terminal_evidence { LANDING_EVIDENCE_TTL } else { CHECKOUT_INTEGRATION_REFRESH_AFTER };
             let expected_change_request_id = convoy.as_ref().and_then(|convoy| convoy_change_request_id_for_checkout(convoy, obj));
@@ -271,7 +283,7 @@ where
                     commit: prepared.commit.clone(),
                     branch_provenance: prepared.branch_provenance,
                 }),
-                CheckoutDeps::Integration { .. } => None,
+                CheckoutDeps::Integration { .. } | CheckoutDeps::OwnerTerminal => None,
                 CheckoutDeps::RetryClone { .. } => None,
                 CheckoutDeps::Failed(message) => Some(CheckoutStatusPatch::MarkFailed { message: message.clone() }),
                 CheckoutDeps::Waiting | CheckoutDeps::None => None,
@@ -302,13 +314,18 @@ where
                         change_request: None,
                     }),
                 }),
-                CheckoutDeps::None | CheckoutDeps::Ready { .. } | CheckoutDeps::RetryClone { .. } | CheckoutDeps::Waiting => None,
+                CheckoutDeps::None
+                | CheckoutDeps::OwnerTerminal
+                | CheckoutDeps::Ready { .. }
+                | CheckoutDeps::RetryClone { .. }
+                | CheckoutDeps::Waiting => None,
             }
         } else {
             None
         };
 
         let actuations = match deps {
+            CheckoutDeps::OwnerTerminal => vec![Actuation::DeleteCheckout { name: obj.metadata.name.clone() }],
             CheckoutDeps::RetryClone { clone_name, failed_at } => {
                 vec![Actuation::RetryClone { name: clone_name.clone(), failed_at: *failed_at }]
             }

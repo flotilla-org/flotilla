@@ -6788,12 +6788,9 @@ impl InProcessDaemon {
             return Ok(());
         }
 
-        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
-        let checkout_list = checkouts
-            .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]))
-            .await
-            .map_err(|err| err.to_string())?
-            .items;
+        let checkout_sources =
+            self.resource_backend.including_replicas::<ResourceCheckout>(namespace).list().await.map_err(|err| err.to_string())?;
+        let checkout_list = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items).into_values().collect::<Vec<_>>();
         self.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkout_list, false).await
     }
 
