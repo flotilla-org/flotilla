@@ -305,7 +305,13 @@ pub async fn run_connector(
 /// CLI entry: detect the PM, then keep a connector running against the local
 /// daemon, reconnecting on failure. Catalog facts fade by TTL while the
 /// daemon is away and re-assert on return.
-pub async fn run(socket_path: &Path, config_dir: &Path, require_host_daemon: bool, options: PmConnectOptions) -> Result<(), String> {
+pub async fn run(
+    socket_path: &Path,
+    config_dir: &Path,
+    state_dir: &Path,
+    require_host_daemon: bool,
+    options: PmConnectOptions,
+) -> Result<(), String> {
     // The connector runs headless in a PM pane: structured logs to stderr.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -321,8 +327,7 @@ pub async fn run(socket_path: &Path, config_dir: &Path, require_host_daemon: boo
             if require_host_daemon {
                 crate::socket::connect_required_host_daemon_with_surface(socket_path, surface).await
             } else {
-                let state_dir = flotilla_core::path_policy::PathPolicy::from_process_env().state_dir;
-                crate::socket::connect_or_spawn_with_surface(socket_path, config_dir, state_dir.as_path(), surface).await
+                crate::socket::connect_or_spawn_with_surface(socket_path, config_dir, state_dir, surface).await
             }
             .map(|daemon| daemon as Arc<dyn DaemonHandle>)
         },

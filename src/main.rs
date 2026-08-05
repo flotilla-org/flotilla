@@ -361,13 +361,41 @@ struct ResourceApplyArgs {
 }
 
 impl Cli {
+    fn dirs(&self) -> (PathBuf, PathBuf) {
+        let policy = PathPolicy::from_process_env();
+        client_dirs_from(
+            self.config_dir.as_deref(),
+            policy.config_dir.as_path(),
+            policy.state_dir.as_path(),
+            std::env::var_os("FLOTILLA_DAEMON_SOCKET").as_deref(),
+        )
+    }
+
     fn config_dir(&self) -> PathBuf {
-        self.config_dir.clone().unwrap_or_else(|| PathPolicy::from_process_env().config_dir.into_path_buf())
+        self.dirs().0
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        self.dirs().1
     }
 
     fn socket_path(&self) -> PathBuf {
         socket_path_from(self.socket.as_deref(), &self.config_dir(), std::env::var_os("FLOTILLA_DAEMON_SOCKET").as_deref())
     }
+}
+
+fn client_dirs_from(
+    explicit_config_dir: Option<&Path>,
+    default_config_dir: &Path,
+    default_state_dir: &Path,
+    environment_socket: Option<&std::ffi::OsStr>,
+) -> (PathBuf, PathBuf) {
+    if explicit_config_dir.is_none() {
+        if let Some(dirs) = environment_socket.map(Path::new).and_then(flotilla_core::path_policy::scoped_daemon_dirs) {
+            return dirs;
+        }
+    }
+    (explicit_config_dir.unwrap_or(default_config_dir).to_path_buf(), default_state_dir.to_path_buf())
 }
 
 fn socket_path_from(explicit: Option<&Path>, config_dir: &Path, environment: Option<&std::ffi::OsStr>) -> PathBuf {
@@ -572,11 +600,11 @@ fn default_project_landing(
 /// Run the TUI. With `scoped_view`, run in scoped mode: exactly that View,
 /// no tab shell, no open-view persistence.
 async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) -> Result<()> {
-    let paths = PathPolicy::from_process_env();
-    event_log::init_with_dir(paths.state_dir.as_path());
+    let resolved_state_dir = DaemonHostPath::new(cli.state_dir());
+    event_log::init_with_dir(resolved_state_dir.as_path());
     let startup = std::time::Instant::now();
     let resolved_config_dir = cli.config_dir();
-    let config = Arc::new(ConfigStore::new(DaemonHostPath::new(&resolved_config_dir), paths.state_dir.clone()));
+    let config = Arc::new(ConfigStore::new(DaemonHostPath::new(&resolved_config_dir), resolved_state_dir.clone()));
 
     // Initialize the terminal immediately. Full-app mode shows the splash for
     // fast visual feedback; scoped mode opens directly into its target view.
@@ -594,11 +622,11 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
     // Spawn daemon init on a separate task so full-app startup can run it
     // concurrently with the splash (which uses blocking event polling).
     let daemon_log_path =
-        paths.state_dir.as_path().join(flotilla_core::log_file::DAEMON_LOG_DIRECTORY).join(flotilla_core::log_file::DAEMON_LOG_FILE);
+        resolved_state_dir.as_path().join(flotilla_core::log_file::DAEMON_LOG_DIRECTORY).join(flotilla_core::log_file::DAEMON_LOG_FILE);
     let daemon_panic_log_path = resolved_config_dir.join("daemon-panic.log");
     let initial_socket_path = socket_path.clone();
     let initial_config_dir = resolved_config_dir.clone();
-    let initial_state_dir = paths.state_dir.clone();
+    let initial_state_dir = resolved_state_dir.clone();
     let daemon_task = tokio::spawn(async move {
         connect_cli_socket(&initial_socket_path, &initial_config_dir, initial_state_dir.as_path(), require_host_daemon)
             .await
@@ -685,7 +713,7 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
 
         terminal = ratatui::init();
         let connected = match flotilla_tui::socket::reconnect::connect_with_retry(
-            || connect_cli_socket(&socket_path, &resolved_config_dir, paths.state_dir.as_path(), require_host_daemon),
+            || connect_cli_socket(&socket_path, &resolved_config_dir, resolved_state_dir.as_path(), require_host_daemon),
             |notice| {
                 let (attempt, detail) = match notice {
                     flotilla_tui::socket::reconnect::ReconnectNotice::Attempt { attempt } => (attempt, None),
@@ -702,7 +730,7 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
         {
             Ok(connected) => connected,
             Err(error) => {
-                if let Err(handoff_error) = persist_tui_handoff(&app, paths.state_dir.as_path()) {
+                if let Err(handoff_error) = persist_tui_handoff(&app, resolved_state_dir.as_path()) {
                     tracing::warn!(error = %handoff_error, "failed to persist TUI state for re-exec");
                 }
                 flotilla_tui::terminal::restore_terminal();
@@ -743,10 +771,10 @@ fn restore_tui_handoff(app: &mut app::App) {
 
 async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
     let daemon_binary = resolve_flotillad_binary()?;
-    let paths = PathPolicy::from_process_env();
     let config_dir = cli.config_dir();
+    let state_dir = cli.state_dir();
     let socket_path = cli.socket_path();
-    let (config_dir, state_dir) = flotilla_core::path_policy::daemon_dirs_for_socket(&socket_path, &config_dir, paths.state_dir.as_path())
+    flotilla_core::path_policy::ensure_daemon_socket_belongs_to_config(&socket_path, &config_dir)
         .map_err(|error| color_eyre::eyre::eyre!(error))?;
     let mut command = tokio::process::Command::new(&daemon_binary);
     command.arg("--timeout").arg(timeout_secs.to_string());
@@ -812,9 +840,13 @@ async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<()> {
                 .maybe_wheelhouse_socket(wheelhouse_socket)
                 .flotilla_bin(flotilla_bin)
                 .build();
+            let socket_path = cli.socket_path();
+            let config_dir = cli.config_dir();
+            let state_dir = cli.state_dir();
             flotilla_tui::pm_connect::run(
-                &cli.socket_path(),
-                &cli.config_dir(),
+                &socket_path,
+                &config_dir,
+                &state_dir,
                 host_daemon_socket_required(
                     std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref(),
                 ),
@@ -842,11 +874,11 @@ async fn run_wait(
     reset_sigpipe();
     let socket_path = cli.socket_path();
     let config_dir = cli.config_dir();
-    let paths = PathPolicy::from_process_env();
+    let state_dir = cli.state_dir();
     let daemon = connect_cli_socket(
         &socket_path,
         &config_dir,
-        paths.state_dir.as_path(),
+        &state_dir,
         host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
     )
     .await
@@ -883,11 +915,11 @@ async fn run_wait(
 async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
     let socket_path = cli.socket_path();
     let config_dir = cli.config_dir();
-    let paths = PathPolicy::from_process_env();
+    let state_dir = cli.state_dir();
     let daemon = connect_cli_socket(
         &socket_path,
         &config_dir,
-        paths.state_dir.as_path(),
+        &state_dir,
         host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
     )
     .await
@@ -1838,10 +1870,11 @@ mod tests {
     };
 
     use super::{
-        attach_exit_disposition, confirm_command, default_project_landing, format_human_resource_value, host_daemon_socket_required,
-        provisioning_target_for_environment, replace_host_ids, run_replica_snapshot, select_host_target, select_startup_repo_roots,
-        should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, AttachExitDisposition, Cli, CommandValue,
-        ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
+        attach_exit_disposition, client_dirs_from, confirm_command, default_project_landing, format_human_resource_value,
+        host_daemon_socket_required, provisioning_target_for_environment, replace_host_ids, run_replica_snapshot, select_host_target,
+        select_startup_repo_roots, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, AttachExitDisposition,
+        Cli, CommandValue, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, ResourceWatchArgs,
+        SubCommand,
     };
 
     fn landing_repo(path: &str, name: &str, key: Option<&str>) -> RepoInfo {
@@ -2219,6 +2252,32 @@ mod tests {
     #[test]
     fn default_socket_uses_a_dedicated_runtime_directory() {
         assert_eq!(socket_path_from(None, Path::new("/config"), None), PathBuf::from("/config/run/flotilla.sock"));
+    }
+
+    #[test]
+    fn ambient_scoped_socket_supplies_client_config_and_state_dirs() {
+        assert_eq!(
+            client_dirs_from(
+                None,
+                Path::new("/home/test/.config/flotilla"),
+                Path::new("/home/test/.local/state/flotilla"),
+                Some(std::ffi::OsStr::new("/work/live-session/config/run/flotilla.sock")),
+            ),
+            (PathBuf::from("/work/live-session/config"), PathBuf::from("/work/live-session/state")),
+        );
+    }
+
+    #[test]
+    fn explicit_config_is_not_replaced_by_a_conflicting_scoped_socket() {
+        assert_eq!(
+            client_dirs_from(
+                Some(Path::new("/work/root-b/config")),
+                Path::new("/home/test/.config/flotilla"),
+                Path::new("/home/test/.local/state/flotilla"),
+                Some(std::ffi::OsStr::new("/work/root-a/config/run/flotilla.sock")),
+            ),
+            (PathBuf::from("/work/root-b/config"), PathBuf::from("/home/test/.local/state/flotilla")),
+        );
     }
 
     #[test]

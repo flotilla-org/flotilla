@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::OnceLock};
 
 use clap::Parser;
-use flotilla_core::path_policy::{daemon_dirs_for_socket, daemon_socket_path, PathPolicy};
+use flotilla_core::path_policy::{daemon_socket_path, ensure_daemon_socket_belongs_to_config, PathPolicy};
 
 /// Flotilla daemon
 #[derive(Parser)]
@@ -50,6 +50,6 @@ async fn main() -> Result<(), String> {
     let config_dir = cli.config_dir();
     let state_dir = cli.state_dir();
     let socket_path = cli.socket_path();
-    let (config_dir, state_dir) = daemon_dirs_for_socket(&socket_path, &config_dir, &state_dir)?;
+    ensure_daemon_socket_belongs_to_config(&socket_path, &config_dir)?;
     flotilla_daemon::cli::run(&socket_path, &config_dir, &state_dir, cli.timeout).await
 }
