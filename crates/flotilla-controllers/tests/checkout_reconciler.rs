@@ -412,79 +412,78 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
 }
 
 #[tokio::test]
-async fn checkout_authority_observes_when_replicated_convoy_enters_landing() {
-    let authority_root = NodeId::new("convoy-authority");
-    let checkout_root = NodeId::new("checkout-authority");
-    let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(authority_root.clone());
-    let checkout_host = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(checkout_root);
-    let now = chrono::DateTime::parse_from_rfc3339("2026-08-03T21:45:00Z").expect("timestamp").with_timezone(&chrono::Utc);
-    let clock = Arc::new(VirtualClock::new(now));
+async fn checkout_authority_observes_when_replicated_convoy_needs_terminal_evidence() {
+    for phase in [ConvoyPhase::Landing, ConvoyPhase::Failed, ConvoyPhase::Cancelled] {
+        let authority_root = NodeId::new("convoy-authority");
+        let checkout_root = NodeId::new("checkout-authority");
+        let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(authority_root.clone());
+        let checkout_host = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(checkout_root);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-03T21:45:00Z").expect("timestamp").with_timezone(&chrono::Utc);
+        let clock = Arc::new(VirtualClock::new(now));
 
-    let convoys = authority.clone().using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(
-            &InputMeta::builder().name("cross-host".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build(),
-        )
-        .await
-        .expect("create authority convoy");
-    convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Landing,
-            ..Default::default()
-        })
-        .await
-        .expect("mark convoy Landing");
-    checkout_host
-        .replica_writer::<Convoy>(authority_root, NAMESPACE)
-        .replace(&convoys.list().await.expect("list authority convoys"), now)
-        .await
-        .expect("replicate convoy to checkout host");
+        let convoys = authority.clone().using::<Convoy>(NAMESPACE);
+        let convoy = convoys
+            .create(
+                &InputMeta::builder().name("cross-host".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build(),
+            )
+            .await
+            .expect("create authority convoy");
+        convoys
+            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus { phase, ..Default::default() })
+            .await
+            .expect("mark convoy in evidence-consuming phase");
+        checkout_host
+            .replica_writer::<Convoy>(authority_root, NAMESPACE)
+            .replace(&convoys.list().await.expect("list authority convoys"), now)
+            .await
+            .expect("replicate convoy to checkout host");
 
-    let checkouts = checkout_host.clone().using::<Checkout>(NAMESPACE);
-    let checkout = checkouts
-        .create(
-            &InputMeta::builder()
-                .name("remote-checkout".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "cross-host".to_string())]))
-                .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), "convoy-authority".to_string())]))
-                .build(),
-            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
-                repo_ref: RepositoryKey(repo_key(REPO_URL)),
-                env_ref: "host-direct-checkout-authority".to_string(),
-                r#ref: "feature/cross-host".to_string(),
-                base_ref: Some("main".to_string()),
-                target_path: "/checkouts/cross-host".to_string(),
-                url: REPO_URL.to_string(),
-            }),
-        )
-        .await
-        .expect("create checkout on its authority host");
-    let observed_at = (now - chrono::Duration::seconds(31)).to_rfc3339();
-    checkouts
-        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-            phase: CheckoutPhase::Ready,
-            path: Some("/checkouts/cross-host".to_string()),
-            integration: flotilla_resources::CheckoutIntegrationStatus {
-                clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
-                pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
-                landed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at).build(),
+        let checkouts = checkout_host.clone().using::<Checkout>(NAMESPACE);
+        let checkout = checkouts
+            .create(
+                &InputMeta::builder()
+                    .name("remote-checkout".to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "cross-host".to_string())]))
+                    .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), "convoy-authority".to_string())]))
+                    .build(),
+                &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                    repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                    env_ref: "host-direct-checkout-authority".to_string(),
+                    r#ref: "feature/cross-host".to_string(),
+                    base_ref: Some("main".to_string()),
+                    target_path: "/checkouts/cross-host".to_string(),
+                    url: REPO_URL.to_string(),
+                }),
+            )
+            .await
+            .expect("create checkout on its authority host");
+        let observed_at = (now - chrono::Duration::seconds(31)).to_rfc3339();
+        checkouts
+            .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+                phase: CheckoutPhase::Ready,
+                path: Some("/checkouts/cross-host".to_string()),
+                integration: flotilla_resources::CheckoutIntegrationStatus {
+                    clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                    pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                    landed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at).build(),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        })
-        .await
-        .expect("record pre-Landing evidence");
+            })
+            .await
+            .expect("record pre-Landing evidence");
 
-    let checkout = checkouts.get("remote-checkout").await.expect("get checkout");
-    let runtime = Arc::new(RecordingCheckoutRuntime::default());
-    let reconciler = CheckoutReconciler::with_clock(runtime.clone(), checkout_host.clone(), NAMESPACE, clock)
-        .with_federated_convoys(&checkout_host, NAMESPACE);
+        let checkout = checkouts.get("remote-checkout").await.expect("get checkout");
+        let runtime = Arc::new(RecordingCheckoutRuntime::default());
+        let reconciler = CheckoutReconciler::with_clock(runtime.clone(), checkout_host.clone(), NAMESPACE, clock)
+            .with_federated_convoys(&checkout_host, NAMESPACE);
 
-    let deps = reconciler.fetch_dependencies(&checkout).await.expect("resolve replicated Landing convoy");
+        let deps = reconciler.fetch_dependencies(&checkout).await.expect("resolve replicated evidence-consuming convoy");
 
-    assert!(matches!(deps, CheckoutDeps::Integration { .. }), "Landing must shorten the observation TTL to 30 seconds");
-    assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 1, "only the checkout authority should probe its checkout");
+        assert!(matches!(deps, CheckoutDeps::Integration { .. }), "{phase:?} must shorten the observation TTL to 30 seconds");
+        assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 1, "only the checkout authority should probe its checkout");
+    }
 }
 
 #[tokio::test]
