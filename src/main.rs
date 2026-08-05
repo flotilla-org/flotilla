@@ -361,27 +361,34 @@ struct ResourceApplyArgs {
 }
 
 impl Cli {
-    fn dirs(&self) -> (PathBuf, PathBuf) {
+    fn client_paths(&self) -> CliPaths {
         let policy = PathPolicy::from_process_env();
-        client_dirs_from(
+        let environment_socket = std::env::var_os("FLOTILLA_DAEMON_SOCKET");
+        let (config_dir, state_dir) = client_dirs_from(
             self.config_dir.as_deref(),
             policy.config_dir.as_path(),
             policy.state_dir.as_path(),
-            std::env::var_os("FLOTILLA_DAEMON_SOCKET").as_deref(),
-        )
+            environment_socket.as_deref(),
+        );
+        let socket_path = socket_path_from(self.socket.as_deref(), &config_dir, environment_socket.as_deref());
+        CliPaths { config_dir, state_dir, socket_path }
     }
 
-    fn config_dir(&self) -> PathBuf {
-        self.dirs().0
-    }
-
-    fn state_dir(&self) -> PathBuf {
-        self.dirs().1
+    fn daemon_paths(&self) -> CliPaths {
+        let policy = PathPolicy::from_process_env();
+        daemon_paths_from(self.config_dir.as_deref(), self.socket.as_deref(), policy.config_dir.as_path(), policy.state_dir.as_path())
     }
 
     fn socket_path(&self) -> PathBuf {
-        socket_path_from(self.socket.as_deref(), &self.config_dir(), std::env::var_os("FLOTILLA_DAEMON_SOCKET").as_deref())
+        self.client_paths().socket_path
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CliPaths {
+    config_dir: PathBuf,
+    state_dir: PathBuf,
+    socket_path: PathBuf,
 }
 
 fn client_dirs_from(
@@ -400,6 +407,17 @@ fn client_dirs_from(
 
 fn socket_path_from(explicit: Option<&Path>, config_dir: &Path, environment: Option<&std::ffi::OsStr>) -> PathBuf {
     environment.map(PathBuf::from).or_else(|| explicit.map(PathBuf::from)).unwrap_or_else(|| daemon_socket_path(config_dir))
+}
+
+fn daemon_paths_from(
+    explicit_config_dir: Option<&Path>,
+    explicit_socket: Option<&Path>,
+    default_config_dir: &Path,
+    default_state_dir: &Path,
+) -> CliPaths {
+    let config_dir = explicit_config_dir.unwrap_or(default_config_dir).to_path_buf();
+    let socket_path = explicit_socket.map(PathBuf::from).unwrap_or_else(|| daemon_socket_path(&config_dir));
+    CliPaths { config_dir, state_dir: default_state_dir.to_path_buf(), socket_path }
 }
 
 fn host_daemon_socket_required(contained_marker: Option<&std::ffi::OsStr>) -> bool {
@@ -600,10 +618,11 @@ fn default_project_landing(
 /// Run the TUI. With `scoped_view`, run in scoped mode: exactly that View,
 /// no tab shell, no open-view persistence.
 async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) -> Result<()> {
-    let resolved_state_dir = DaemonHostPath::new(cli.state_dir());
+    let paths = cli.client_paths();
+    let resolved_state_dir = DaemonHostPath::new(paths.state_dir);
     event_log::init_with_dir(resolved_state_dir.as_path());
     let startup = std::time::Instant::now();
-    let resolved_config_dir = cli.config_dir();
+    let resolved_config_dir = paths.config_dir;
     let config = Arc::new(ConfigStore::new(DaemonHostPath::new(&resolved_config_dir), resolved_state_dir.clone()));
 
     // Initialize the terminal immediately. Full-app mode shows the splash for
@@ -615,7 +634,7 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
 
     let startup_repo_roots = startup_repo_roots(&cli.repo_root).await;
     let cli_theme = cli.theme.clone();
-    let socket_path = cli.socket_path();
+    let socket_path = paths.socket_path;
     let require_host_daemon =
         host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref());
 
@@ -771,9 +790,7 @@ fn restore_tui_handoff(app: &mut app::App) {
 
 async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
     let daemon_binary = resolve_flotillad_binary()?;
-    let config_dir = cli.config_dir();
-    let state_dir = cli.state_dir();
-    let socket_path = cli.socket_path();
+    let CliPaths { config_dir, state_dir, socket_path } = cli.daemon_paths();
     flotilla_core::path_policy::ensure_daemon_socket_belongs_to_config(&socket_path, &config_dir)
         .map_err(|error| color_eyre::eyre::eyre!(error))?;
     let mut command = tokio::process::Command::new(&daemon_binary);
@@ -840,9 +857,7 @@ async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<()> {
                 .maybe_wheelhouse_socket(wheelhouse_socket)
                 .flotilla_bin(flotilla_bin)
                 .build();
-            let socket_path = cli.socket_path();
-            let config_dir = cli.config_dir();
-            let state_dir = cli.state_dir();
+            let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths();
             flotilla_tui::pm_connect::run(
                 &socket_path,
                 &config_dir,
@@ -872,9 +887,7 @@ async fn run_wait(
     format: OutputFormat,
 ) -> Result<()> {
     reset_sigpipe();
-    let socket_path = cli.socket_path();
-    let config_dir = cli.config_dir();
-    let state_dir = cli.state_dir();
+    let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths();
     let daemon = connect_cli_socket(
         &socket_path,
         &config_dir,
@@ -913,9 +926,7 @@ async fn run_wait(
 }
 
 async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
-    let socket_path = cli.socket_path();
-    let config_dir = cli.config_dir();
-    let state_dir = cli.state_dir();
+    let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths();
     let daemon = connect_cli_socket(
         &socket_path,
         &config_dir,
@@ -1870,11 +1881,11 @@ mod tests {
     };
 
     use super::{
-        attach_exit_disposition, client_dirs_from, confirm_command, default_project_landing, format_human_resource_value,
-        host_daemon_socket_required, provisioning_target_for_environment, replace_host_ids, run_replica_snapshot, select_host_target,
-        select_startup_repo_roots, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, AttachExitDisposition,
-        Cli, CommandValue, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, ResourceWatchArgs,
-        SubCommand,
+        attach_exit_disposition, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing,
+        format_human_resource_value, host_daemon_socket_required, provisioning_target_for_environment, replace_host_ids,
+        run_replica_snapshot, select_host_target, select_startup_repo_roots, should_reexec_for_incompatible_daemon, show_startup_splash,
+        socket_path_from, AttachExitDisposition, Cli, CliPaths, CommandValue, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs,
+        ResourceListArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
 
     fn landing_repo(path: &str, name: &str, key: Option<&str>) -> RepoInfo {
@@ -2252,6 +2263,18 @@ mod tests {
     #[test]
     fn default_socket_uses_a_dedicated_runtime_directory() {
         assert_eq!(socket_path_from(None, Path::new("/config"), None), PathBuf::from("/config/run/flotilla.sock"));
+    }
+
+    #[test]
+    fn daemon_paths_use_only_explicit_values_and_policy_defaults() {
+        assert_eq!(
+            daemon_paths_from(None, Some(Path::new("/explicit/flotilla.sock")), Path::new("/default/config"), Path::new("/default/state"),),
+            CliPaths {
+                config_dir: PathBuf::from("/default/config"),
+                state_dir: PathBuf::from("/default/state"),
+                socket_path: PathBuf::from("/explicit/flotilla.sock"),
+            },
+        );
     }
 
     #[test]
