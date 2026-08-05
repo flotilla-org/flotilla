@@ -5,8 +5,11 @@ use flotilla_protocol::{IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, P
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    resource::define_resource, status_patch::StatusPatch, workflow_template::VesselRequirement, ReadResourceObject, ReplicationClass,
-    RepositoryKey, Resource, ResourceObject, ResourceProvenance, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
+    resource::define_resource,
+    status_patch::StatusPatch,
+    workflow_template::{ExitDeclaration, SubjectVariable, VesselRequirement},
+    ReadResourceObject, ReplicationClass, RepositoryKey, Resource, ResourceObject, ResourceProvenance, ACTUATOR_HOST_REF_ANNOTATION,
+    CONVOY_LABEL,
 };
 
 mod reconcile;
@@ -192,6 +195,83 @@ pub fn expected_change_request_leaves(
         .collect())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstantiatedExitEntry {
+    pub disposition: String,
+    pub template: crate::LeafTemplate,
+    pub leaves: Vec<Leaf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstantiatedExit {
+    None,
+    Claim,
+    Table(Vec<InstantiatedExitEntry>),
+}
+
+/// Instantiate the convoy's pinned exit declaration over every bound subject.
+///
+/// A table entry is an implicit universal over its subject role. With no bound
+/// subjects, a declared table collapses to the same claim exit as `exit: claim`.
+/// An absent declaration stays absent, leaving the convoy standing until an
+/// operator explicitly reaps it.
+pub fn instantiate_exit(
+    convoy: &crate::ResourceObject<Convoy>,
+    checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
+) -> Result<InstantiatedExit, String> {
+    let Some(declaration) =
+        convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).and_then(|snapshot| snapshot.exit.clone())
+    else {
+        return Ok(InstantiatedExit::None);
+    };
+    if matches!(declaration, ExitDeclaration::Claim(_)) {
+        return Ok(InstantiatedExit::Claim);
+    }
+
+    let subjects = bound_change_request_addresses(convoy, checkouts)?;
+    if subjects.is_empty() && expected_checkout_refs(convoy)?.is_empty() {
+        return Ok(InstantiatedExit::Claim);
+    }
+    let ExitDeclaration::Table(entries) = declaration else {
+        unreachable!("claim declaration returned above");
+    };
+    Ok(InstantiatedExit::Table(
+        entries
+            .into_iter()
+            .map(|(disposition, template)| {
+                let leaves = subjects
+                    .iter()
+                    .map(|address| {
+                        let address = match template.subject {
+                            SubjectVariable::ChangeRequest => address.clone(),
+                        };
+                        Leaf {
+                            address,
+                            field_path: template.field_path.clone(),
+                            operator: template.operator,
+                            literal: template.literal.clone(),
+                        }
+                    })
+                    .collect();
+                InstantiatedExitEntry { disposition, template, leaves }
+            })
+            .collect(),
+    ))
+}
+
+fn bound_change_request_addresses(
+    convoy: &crate::ResourceObject<Convoy>,
+    checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
+) -> Result<Vec<LeafAddress>, String> {
+    let leaves = expected_change_request_leaves(convoy, checkouts)?;
+    Ok(leaves.into_iter().map(|leaf| leaf.address).fold(Vec::new(), |mut addresses, address| {
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+        addresses
+    }))
+}
+
 fn change_request_address(repository_url: &str, id: &str) -> Result<LeafAddress, String> {
     let canonical = crate::canonicalize_repo_url(repository_url)?;
     let without_scheme = canonical
@@ -287,6 +367,8 @@ pub struct ConvoyStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_workflow_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_workflows: Option<BTreeMap<String, String>>,
@@ -307,6 +389,8 @@ pub struct TargetMismatch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<ExitDeclaration>,
     pub vessels: Vec<VesselRequirement>,
 }
 
@@ -449,6 +533,7 @@ pub enum ConvoyStatusPatch {
         finished_at: Option<DateTime<Utc>>,
     },
     Settle {
+        disposition: String,
         target_mismatches: Vec<TargetMismatch>,
         finished_at: DateTime<Utc>,
     },
@@ -598,10 +683,11 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     status.finished_at.get_or_insert(*finished_at);
                 }
             }
-            Self::Settle { target_mismatches, finished_at } => {
+            Self::Settle { disposition, target_mismatches, finished_at } => {
                 let previous_phase = status.phase;
                 status.phase = ConvoyPhase::Landed;
                 status.target_mismatches = target_mismatches.clone();
+                status.disposition = Some(disposition.clone());
                 if previous_phase != ConvoyPhase::Landed {
                     status.finished_at = None;
                 }
@@ -819,8 +905,8 @@ pub mod controller_patches {
         ConvoyStatusPatch::RollUpPhase { phase, started_at, finished_at }
     }
 
-    pub fn settle(target_mismatches: Vec<TargetMismatch>, finished_at: DateTime<Utc>) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::Settle { target_mismatches, finished_at }
+    pub fn settle(disposition: String, target_mismatches: Vec<TargetMismatch>, finished_at: DateTime<Utc>) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::Settle { disposition, target_mismatches, finished_at }
     }
 
     pub fn roll_up_work(work: String, phase: WorkPhase, transitioned_at: DateTime<Utc>, message: Option<String>) -> ConvoyStatusPatch {

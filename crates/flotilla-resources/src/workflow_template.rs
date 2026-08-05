@@ -1,5 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    str::FromStr,
+};
 
+use flotilla_protocol::LeafOperator;
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::NoStatusPatch, RepositoryKey};
@@ -11,7 +17,127 @@ pub struct WorkflowTemplateSpec {
     #[builder(default)]
     #[serde(default)]
     pub inputs: Vec<InputDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<ExitDeclaration>,
     pub vessels: Vec<VesselRequirement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExitDeclaration {
+    Claim(ClaimExit),
+    Table(IndexMap<String, LeafTemplate>),
+}
+
+impl ExitDeclaration {
+    pub fn standard_table() -> Self {
+        Self::Table(IndexMap::from([
+            ("merged".to_string(), "$cr.state == merged".parse().expect("valid standard merged exit")),
+            ("closed-unmerged".to_string(), "$cr.state == closed".parse().expect("valid standard closed exit")),
+        ]))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimExit;
+
+impl Serialize for ClaimExit {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str("claim")
+    }
+}
+
+impl<'de> Deserialize<'de> for ClaimExit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value == "claim" {
+            Ok(Self)
+        } else {
+            Err(serde::de::Error::custom("exit scalar must be `claim`"))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafTemplate {
+    pub subject: SubjectVariable,
+    pub field_path: String,
+    pub operator: LeafOperator,
+    pub literal: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectVariable {
+    ChangeRequest,
+}
+
+impl FromStr for LeafTemplate {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let mut parts = input.split_whitespace();
+        let subject_path = parts.next().ok_or_else(|| leaf_template_syntax_error(input))?;
+        let operator = parts.next().ok_or_else(|| leaf_template_syntax_error(input))?.parse()?;
+        let literal = parts.collect::<Vec<_>>().join(" ");
+        if literal.is_empty() {
+            return Err(leaf_template_syntax_error(input));
+        }
+        let (subject, field_path) = subject_path
+            .split_once('.')
+            .map(|(subject, path)| (subject, format!(".{path}")))
+            .ok_or_else(|| leaf_template_syntax_error(input))?;
+        let subject = match subject {
+            "$cr" => SubjectVariable::ChangeRequest,
+            unknown => return Err(format!("unknown exit leaf subject variable `{unknown}`; admitted variables: $cr")),
+        };
+        if field_path == "." {
+            return Err(leaf_template_syntax_error(input));
+        }
+        let literal = literal
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| literal.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')))
+            .unwrap_or(&literal)
+            .to_string();
+        Ok(Self { subject, field_path, operator, literal })
+    }
+}
+
+fn leaf_template_syntax_error(input: &str) -> String {
+    format!("invalid exit leaf template `{input}`; expected `$cr.<field-path> <operator> <literal>`")
+}
+
+impl fmt::Display for LeafTemplate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let subject = match self.subject {
+            SubjectVariable::ChangeRequest => "$cr",
+        };
+        write!(f, "{subject}{} {} {}", self.field_path, self.operator, self.literal)
+    }
+}
+
+impl Serialize for LeafTemplate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for LeafTemplate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +244,7 @@ pub struct Selector {
 
 pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
+        .exit(ExitDeclaration::standard_table())
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Contained)
@@ -135,6 +262,7 @@ pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
 /// contained smoke passes with credentials.
 pub fn single_agent_trusted_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
+        .exit(ExitDeclaration::standard_table())
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Trusted)
@@ -148,6 +276,7 @@ pub fn single_agent_trusted_workflow_spec() -> WorkflowTemplateSpec {
 
 pub fn single_agent_shepherd_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
+        .exit(ExitDeclaration::standard_table())
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Trusted)
@@ -165,6 +294,7 @@ pub fn single_agent_shepherd_workflow_spec() -> WorkflowTemplateSpec {
 
 pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
+        .exit(ExitDeclaration::standard_table())
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Trusted)
@@ -182,6 +312,7 @@ pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
 
 pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
+        .exit(ExitDeclaration::standard_table())
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Contained)
@@ -205,6 +336,8 @@ pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    EmptyExitTable,
+    InvalidExitLeaf { disposition: String, template: String },
     DuplicateVesselName { name: String },
     EmptyRepositoryScope { vessel: String },
     DuplicateRepositoryRef { vessel: String, repo_ref: RepositoryKey },
@@ -251,6 +384,10 @@ impl std::fmt::Display for InterpolationLocation {
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ValidationError::EmptyExitTable => f.write_str("exit table must declare at least one disposition entry"),
+            ValidationError::InvalidExitLeaf { disposition, template } => {
+                write!(f, "exit disposition `{disposition}` is not a world-terminal leaf: `{template}`")
+            }
             ValidationError::DuplicateVesselName { name } => write!(f, "duplicate vessel name `{name}`"),
             ValidationError::EmptyRepositoryScope { vessel } => write!(f, "vessel `{vessel}` has an empty repository scope"),
             ValidationError::DuplicateRepositoryRef { vessel, repo_ref } => {
@@ -292,6 +429,7 @@ pub(crate) struct TemplateToken<'a> {
 
 pub fn validate(spec: &WorkflowTemplateSpec) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
+    validate_exit(spec, &mut errors);
     let declared_inputs = collect_inputs(spec, &mut errors);
     let vessels_by_name = collect_vessels(spec, &mut errors);
 
@@ -304,6 +442,24 @@ pub fn validate(spec: &WorkflowTemplateSpec) -> Result<(), Vec<ValidationError>>
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+fn validate_exit(spec: &WorkflowTemplateSpec, errors: &mut Vec<ValidationError>) {
+    let Some(ExitDeclaration::Table(entries)) = spec.exit.as_ref() else {
+        return;
+    };
+    if entries.is_empty() {
+        push_error(errors, ValidationError::EmptyExitTable);
+    }
+    for (disposition, template) in entries {
+        let is_world_terminal = template.subject == SubjectVariable::ChangeRequest
+            && template.field_path == ".state"
+            && template.operator == LeafOperator::Equal
+            && matches!(template.literal.as_str(), "merged" | "closed");
+        if !is_world_terminal {
+            push_error(errors, ValidationError::InvalidExitLeaf { disposition: disposition.clone(), template: template.to_string() });
+        }
     }
 }
 

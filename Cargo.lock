@@ -1262,6 +1262,7 @@ dependencies = [
  "flotilla-core",
  "flotilla-protocol",
  "futures",
+ "indexmap",
  "reqwest",
  "rstest",
  "rusqlite",

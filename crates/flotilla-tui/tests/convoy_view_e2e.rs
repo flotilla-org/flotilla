@@ -183,6 +183,7 @@ async fn generated_table_action_completes_work() {
         placement: None,
     });
     let snapshot = WorkflowSnapshot {
+        exit: None,
         vessels: vec![VesselRequirement {
             name: "implement".into(),
             stance: Default::default(),

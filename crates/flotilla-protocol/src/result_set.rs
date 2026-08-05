@@ -801,6 +801,8 @@ pub struct ConvoyRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<RepoKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<Timestamp>,

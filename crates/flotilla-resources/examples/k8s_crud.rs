@@ -128,6 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             message: None,
             started_at: None,
             finished_at: None,
+            disposition: None,
             observed_workflow_ref: None,
             observed_workflows: None,
             target_mismatches: Vec::new(),

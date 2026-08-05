@@ -54,12 +54,12 @@ pub use clock::{Clock, SystemClock};
 pub use clone::{Clone, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use convoy::{
     bound_change_request_record_name, controller_patches, evaluate_landing_settlement, expected_change_request_leaves,
-    expected_checkout_refs, external_patches, pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending, provisioning_patches,
-    reconcile, select_convoy_children, BoundChangeRequest, Convoy, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyReconciler,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewWorkPhase, CrewWorkState, InputValue,
-    IssueSnapshot, PlacementStatus, ReconcileOutcome, SettlementEvaluation, SettlementMode, TargetMismatch, UnmetSettlementExpectation,
-    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_PENDING_ANNOTATION,
-    WORKFLOW_SNAPSHOT_ANNOTATION,
+    expected_checkout_refs, external_patches, instantiate_exit, pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending,
+    provisioning_patches, reconcile, select_convoy_children, BoundChangeRequest, Convoy, ConvoyEvent, ConvoyIssue, ConvoyPhase,
+    ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewWorkPhase,
+    CrewWorkState, InputValue, InstantiatedExit, InstantiatedExitEntry, IssueSnapshot, PlacementStatus, ReconcileOutcome,
+    SettlementEvaluation, SettlementMode, TargetMismatch, UnmetSettlementExpectation, WorkCompletionAuthority, WorkPhase, WorkState,
+    WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_PENDING_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use credential::{
     CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
@@ -171,7 +171,7 @@ macro_rules! for_each_registered_resource {
 }
 pub use workflow_template::{
     implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_contained_workflow_spec,
-    single_agent_shepherd_workflow_spec, single_agent_trusted_workflow_spec, validate, CrewSource, CrewSpec, InputDefinition,
-    InterpolationField, InterpolationLocation, Selector, Stance, ValidationError, VesselRequirement, WorkflowTemplate,
-    WorkflowTemplateSpec,
+    single_agent_shepherd_workflow_spec, single_agent_trusted_workflow_spec, validate, ClaimExit, CrewSource, CrewSpec, ExitDeclaration,
+    InputDefinition, InterpolationField, InterpolationLocation, LeafTemplate, Selector, Stance, SubjectVariable, ValidationError,
+    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };

@@ -7,8 +7,8 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
     ApiPaths, Convoy as RealConvoy, ConvoySpec as RealConvoySpec, ConvoyStatus as RealConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase,
-    CrewWorkState, InputDefinition, InputMeta, ObjectMeta, OwnerReference, Resource, ResourceObject, Selector, StatusPatch,
-    VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
+    CrewWorkState, ExitDeclaration, InputDefinition, InputMeta, ObjectMeta, OwnerReference, Resource, ResourceObject, Selector,
+    StatusPatch, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -105,6 +105,7 @@ pub fn convoy_status(phase: flotilla_resources::ConvoyPhase) -> RealConvoyStatus
         finished_at: None,
         observed_workflow_ref: None,
         observed_workflows: None,
+        disposition: None,
         target_mismatches: Vec::new(),
     }
 }
@@ -119,6 +120,7 @@ pub fn workflow_template_meta(name: &str) -> InputMeta {
 
 pub fn valid_workflow_template_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
+        .exit(ExitDeclaration::standard_table())
         .inputs(vec![
             InputDefinition { name: "feature".to_string(), description: Some("Brief description of the feature to implement".to_string()) },
             InputDefinition { name: "branch".to_string(), description: Some("Target git branch".to_string()) },
@@ -259,6 +261,7 @@ pub fn convoy_object(name: &str, spec: RealConvoySpec, status: Option<RealConvoy
 
 pub fn tool_only_workflow_template_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
+        .exit(ExitDeclaration::standard_table())
         .inputs(vec![
             InputDefinition { name: "feature".to_string(), description: Some("Brief description of the feature to implement".to_string()) },
             InputDefinition { name: "branch".to_string(), description: Some("Target git branch".to_string()) },
@@ -294,7 +297,8 @@ pub fn tool_only_workflow_template_object(name: &str) -> ResourceObject<Workflow
 }
 
 pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
-    let snapshot = flotilla_resources::WorkflowSnapshot { vessels: valid_workflow_template_spec().vessels.into_iter().collect() };
+    let workflow = valid_workflow_template_spec();
+    let snapshot = flotilla_resources::WorkflowSnapshot { exit: workflow.exit, vessels: workflow.vessels };
     let work = [("implement".to_string(), pending_task_state()), ("review".to_string(), pending_task_state())].into_iter().collect();
     let crew_work = BTreeMap::from([
         ("implement".to_string(), BTreeMap::from([("coder".to_string(), pending_crew_work_state())])),
@@ -312,6 +316,7 @@ pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some([("review-and-fix".to_string(), "42".to_string())].into_iter().collect()),
+        disposition: None,
         target_mismatches: Vec::new(),
     }
 }
@@ -376,8 +381,10 @@ where
 }
 
 pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
+    let workflow = tool_only_workflow_template_spec();
     let snapshot = flotilla_resources::WorkflowSnapshot {
-        vessels: tool_only_workflow_template_spec()
+        exit: workflow.exit,
+        vessels: workflow
             .vessels
             .into_iter()
             .map(|task| flotilla_resources::VesselRequirement {
@@ -405,6 +412,7 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
         finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some([("review-and-fix".to_string(), "42".to_string())].into_iter().collect()),
+        disposition: None,
         target_mismatches: Vec::new(),
     }
 }

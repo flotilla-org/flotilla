@@ -1055,7 +1055,14 @@ async fn create_explanation_convoy(
         .subpaths(Vec::new())
         .build()];
     let created = convoys.create(&empty_input_meta(name), &spec).await.expect("create convoy");
-    let mut status = ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() };
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Landing,
+        workflow_snapshot: Some(WorkflowSnapshot {
+            exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
+            vessels: Vec::new(),
+        }),
+        ..Default::default()
+    };
     if let Some(checkout_name) = checkout_name {
         status.work.insert(
             "work".to_string(),
@@ -1124,7 +1131,14 @@ async fn create_bound_explanation_convoy(
     let convoys = backend.using::<Convoy>("flotilla");
     let convoy = convoys.create(&empty_input_meta(name), &spec).await.expect("create bound convoy");
     convoys
-        .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() })
+        .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Landing,
+            workflow_snapshot: Some(WorkflowSnapshot {
+                exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
+                vessels: Vec::new(),
+            }),
+            ..Default::default()
+        })
         .await
         .expect("update bound convoy status");
 
@@ -1199,6 +1213,28 @@ async fn convoy_explanation_names_each_held_landing_expectation_and_claim_exit()
     let claim_exit = explain(&daemon, "claim-exit").await;
     assert!(claim_exit.settlement.satisfied);
     assert_eq!(claim_exit.settlement.mode, "claim_exit");
+}
+
+#[tokio::test]
+async fn convoy_explanation_names_closed_only_exit_waiting_for_a_bound_change_request() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let (daemon, _temp) = explanation_daemon(backend.clone()).await;
+    create_explanation_convoy(&backend, "closed-only", Some("checkout-closed"), Some((ConditionValue::True, Utc::now()))).await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let convoy = convoys.get("closed-only").await.expect("closed-only convoy");
+    let mut status = convoy.status.expect("closed-only status");
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").exit = Some(flotilla_resources::ExitDeclaration::Table(
+        indexmap::IndexMap::from([("closed-without-merge".to_string(), "$cr.state == closed".parse().expect("closed exit template"))]),
+    ));
+    convoys.update_status("closed-only", &convoy.metadata.resource_version, &status).await.expect("pin closed-only exit table");
+
+    let explanation = explain(&daemon, "closed-only").await;
+
+    assert!(!explanation.settlement.satisfied);
+    assert_eq!(explanation.settlement.unmet.len(), 1, "an unsatisfied settlement must explain why it is stuck");
+    assert_eq!(explanation.settlement.unmet[0].reason, "missing_binding");
+    assert_eq!(explanation.settlement.unmet[0].subject, "exit/closed-without-merge");
+    assert_eq!(explanation.settlement.unmet[0].detail, "entry awaits a bound change request for $cr");
 }
 
 #[tokio::test]
@@ -1658,6 +1694,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
         .update_status("demo", &convoy.metadata.resource_version, &ConvoyStatus {
             phase: ConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
+                exit: None,
                 vessels: vec![
                     VesselRequirement {
                         name: "prepare".into(),
@@ -4869,6 +4906,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             message: None,
             started_at: None,
             finished_at: None,
+            disposition: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
             target_mismatches: Vec::new(),
@@ -4960,7 +4998,7 @@ async fn convoy_admission_snapshots_every_project_repository() {
     backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .create(&empty_input_meta("single-agent-contained"), &WorkflowTemplateSpec { inputs: Vec::new(), vessels: Vec::new() })
+        .create(&empty_input_meta("single-agent-contained"), &WorkflowTemplateSpec { inputs: Vec::new(), exit: None, vessels: Vec::new() })
         .await
         .expect("workflow create should succeed");
 
@@ -5003,7 +5041,7 @@ async fn create_empty_workflow(backend: &ResourceBackend, name: &str) {
     backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .create(&empty_input_meta(name), &WorkflowTemplateSpec { inputs: Vec::new(), vessels: Vec::new() })
+        .create(&empty_input_meta(name), &WorkflowTemplateSpec { inputs: Vec::new(), exit: None, vessels: Vec::new() })
         .await
         .expect("workflow create should succeed");
 }
@@ -5456,6 +5494,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             message: None,
             started_at: None,
             finished_at: None,
+            disposition: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
             target_mismatches: Vec::new(),
@@ -5605,6 +5644,7 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
             message: None,
             started_at: None,
             finished_at: Some(chrono::Utc::now()),
+            disposition: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
             target_mismatches: Vec::new(),
@@ -6176,7 +6216,7 @@ async fn convoy_delete_refuses_when_destroyed_environment_leaves_no_integration_
 }
 
 #[tokio::test]
-async fn convoy_abandon_command_archives_and_retains_terminal_record() {
+async fn undeclared_exit_landing_convoy_can_be_explicitly_abandoned() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -6197,10 +6237,10 @@ async fn convoy_abandon_command_archives_and_retains_terminal_record() {
     convoys
         .update_status("active-convoy", &created.metadata.resource_version, &ConvoyStatus {
             placement_decision: None,
-            phase: ConvoyPhase::Active,
-            workflow_snapshot: None,
+            phase: ConvoyPhase::Landing,
+            workflow_snapshot: Some(WorkflowSnapshot { exit: None, vessels: Vec::new() }),
             work: BTreeMap::from([("implement".to_string(), WorkState {
-                phase: WorkPhase::Running,
+                phase: WorkPhase::Complete,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: None,
                 started_at: None,
@@ -6212,6 +6252,7 @@ async fn convoy_abandon_command_archives_and_retains_terminal_record() {
             message: None,
             started_at: None,
             finished_at: None,
+            disposition: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
             target_mismatches: Vec::new(),

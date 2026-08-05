@@ -2,7 +2,9 @@ mod common;
 
 use common::{valid_workflow_template_spec, valid_workflow_template_yaml};
 use flotilla_resources::{
-    validate, InterpolationField, InterpolationLocation, RepositoryKey, Stance, ValidationError, WorkflowTemplateSpec,
+    implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_contained_workflow_spec,
+    single_agent_shepherd_workflow_spec, single_agent_trusted_workflow_spec, validate, ExitDeclaration, InterpolationField,
+    InterpolationLocation, RepositoryKey, Stance, ValidationError, WorkflowTemplateSpec,
 };
 use serde::Deserialize;
 
@@ -13,6 +15,103 @@ struct WorkflowTemplateDocument {
 
 fn parse_spec(yaml: &str) -> WorkflowTemplateSpec {
     serde_yml::from_str(yaml).expect("parse workflow template spec")
+}
+
+#[test]
+fn exit_table_roundtrips_declared_entries_in_order() {
+    let yaml = r#"
+inputs: []
+exit:
+  merged: $cr.state == merged
+  closed-unmerged: $cr.state == closed
+vessels:
+  - name: implement
+    crew:
+      - role: coder
+        selector:
+          capability: code
+"#;
+
+    let declared = parse_spec(yaml);
+    let undeclared = parse_spec(
+        r#"
+inputs: []
+vessels:
+  - name: implement
+    crew:
+      - role: coder
+        selector:
+          capability: code
+"#,
+    );
+    assert!(declared.exit.is_some(), "transcribed table must remain declared");
+    assert!(undeclared.exit.is_none(), "an undeclared template must have no exit");
+
+    let serialized = serde_yml::to_string(&declared).expect("serialize workflow template spec");
+    let merged = serialized.find("merged: $cr.state == merged").expect("merged exit entry");
+    let closed = serialized.find("closed-unmerged: $cr.state == closed").expect("closed exit entry");
+    assert!(merged < closed, "exit entry declaration order should be preserved: {serialized}");
+}
+
+#[test]
+fn claim_exit_roundtrips_as_claim() {
+    let yaml = r#"
+inputs: []
+exit: claim
+vessels:
+  - name: implement
+    crew:
+      - role: coder
+        selector:
+          capability: code
+"#;
+
+    let serialized = serde_yml::to_string(&parse_spec(yaml)).expect("serialize workflow template spec");
+    assert!(serialized.contains("exit: claim"), "claim exit should remain declarable: {serialized}");
+}
+
+#[test]
+fn stock_workflows_transcribe_the_standard_exit_table() {
+    let expected = Some(ExitDeclaration::standard_table());
+    for spec in [
+        single_agent_contained_workflow_spec(),
+        single_agent_shepherd_workflow_spec(),
+        single_agent_trusted_workflow_spec(),
+        interactive_single_workflow_spec(),
+        implement_review_workflow_spec(),
+    ] {
+        assert_eq!(spec.exit, expected);
+    }
+}
+
+#[test]
+fn exit_schema_rejects_branching_and_sequencing_constructs() {
+    for exit in ["exit:\n  sequence:\n    - $cr.state == merged", "exit:\n  merged:\n    then: $cr.state == closed"] {
+        let yaml =
+            format!("inputs: []\n{exit}\nvessels:\n  - name: implement\n    crew:\n      - role: coder\n        command: cargo test\n");
+        assert!(serde_yml::from_str::<WorkflowTemplateSpec>(&yaml).is_err(), "schema extension should be rejected: {yaml}");
+    }
+}
+
+#[test]
+fn validate_rejects_non_terminal_exit_leaf() {
+    let spec = parse_spec(
+        r#"
+inputs: []
+exit:
+  still-working: $cr.state == open
+vessels:
+  - name: implement
+    crew:
+      - role: coder
+        command: cargo test
+"#,
+    );
+
+    let errors = validate(&spec).expect_err("open is not a world terminal");
+    assert!(errors
+        .iter()
+        .any(|error| matches!(error, ValidationError::InvalidExitLeaf { disposition, .. } if disposition == "still-working")));
 }
 
 fn assert_has_error(errors: &[ValidationError], expected: &ValidationError) {
