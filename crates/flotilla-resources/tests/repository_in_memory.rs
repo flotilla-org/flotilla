@@ -13,6 +13,7 @@ async fn project_issue_source_override_resolves_without_a_checkout_or_repository
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
         issue_source: Some(override_source.clone()),
+        dispatch_policy: None,
         repositories: vec![ProjectRepositorySpec {
             repo: RepositoryKey("repository-not-present-on-this-host".into()),
             alias: None,
@@ -40,6 +41,7 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
         issue_source: None,
+        dispatch_policy: None,
         repositories: vec![
             ProjectRepositorySpec { repo: first.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
             ProjectRepositorySpec { repo: second.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
@@ -71,6 +73,7 @@ async fn project_issue_source_resolution_reports_typed_unavailability() {
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
         issue_source: None,
+        dispatch_policy: None,
         repositories: vec![ProjectRepositorySpec {
             repo: local.key(),
             alias: None,
@@ -228,6 +231,7 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
         display_name: " Example ".to_string(),
         default_workflow_ref: " single-agent-contained ".to_string(),
         issue_source: None,
+        dispatch_policy: None,
         repositories: vec![
             ProjectRepositorySpec {
                 repo: repo_b.clone(),
@@ -251,6 +255,7 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
         display_name: "Example".to_string(),
         default_workflow_ref: "single-agent-contained".to_string(),
         issue_source: None,
+        dispatch_policy: None,
         repositories: vec![
             ProjectRepositorySpec { repo: repo_b.clone(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
             ProjectRepositorySpec { repo: repo_b, alias: None, roles: Default::default(), subpath: None, default_branch: None },
@@ -270,6 +275,7 @@ fn project_subpaths_reject_absolute_and_parent_traversal() {
             display_name: "Example".to_string(),
             default_workflow_ref: "single-agent-contained".to_string(),
             issue_source: None,
+            dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: RepositoryKey("repo".to_string()),
                 alias: None,

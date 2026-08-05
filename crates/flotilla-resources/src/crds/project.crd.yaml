@@ -35,6 +35,16 @@ spec:
                       type: string
                     scope:
                       type: string
+                dispatch_policy:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: true
+                    stale_after_seconds:
+                      type: integer
+                      minimum: 1
+                      default: 3600
                 repositories:
                   type: array
                   minItems: 1
@@ -57,3 +67,44 @@ spec:
                         type: string
                       default_branch:
                         type: string
+            status:
+              type: object
+              properties:
+                dispatch_queue:
+                  type: array
+                  items:
+                    type: object
+                    required: [issue, title, issue_as_of, ready_observed_at, observed_at, provenance]
+                    properties:
+                      issue:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      title:
+                        type: string
+                      issue_as_of:
+                        type: string
+                        format: date-time
+                      ready_observed_at:
+                        type: string
+                        format: date-time
+                      observed_at:
+                        type: string
+                        format: date-time
+                      provenance:
+                        type: string
+                dispatch_queue_attention:
+                  type: object
+                  required: [count, oldest_ready_observed_at, stale_since, observed_at]
+                  properties:
+                    count:
+                      type: integer
+                      minimum: 1
+                    oldest_ready_observed_at:
+                      type: string
+                      format: date-time
+                    stale_since:
+                      type: string
+                      format: date-time
+                    observed_at:
+                      type: string
+                      format: date-time

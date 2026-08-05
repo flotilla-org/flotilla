@@ -4953,6 +4953,7 @@ async fn convoy_admission_snapshots_every_project_repository() {
                     default_branch: Some("stable".to_string()),
                 },
             ],
+            dispatch_policy: None,
         })
         .await
         .expect("project create should succeed");

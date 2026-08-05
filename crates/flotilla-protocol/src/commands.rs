@@ -8,8 +8,9 @@ use crate::{
     issue_query::{IssueQuery, IssueResultPage},
     qualified_path::QualifiedPath,
     query::{
-        CrewCommandContext, CrewListResponse, FleetHealthResponse, FleetListResponse, FleetReplicaSnapshot, HostListResponse,
-        HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse,
+        CrewCommandContext, CrewListResponse, DispatchQueueResponse, FleetHealthResponse, FleetListResponse, FleetReplicaSnapshot,
+        HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoDetailResponse, RepoProvidersResponse,
+        RepoWorkResponse,
     },
     AttachableSetId, IssueRef, RepoIdentity,
 };
@@ -642,6 +643,10 @@ pub enum CommandAction {
     },
     QueryHostList {},
     QueryProjectList {},
+    QueryDispatchQueue {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+    },
     QueryHostStatus {
         target_environment_id: crate::EnvironmentId,
     },
@@ -706,6 +711,7 @@ impl CommandAction {
                 | CommandAction::QueryRepoWork { .. }
                 | CommandAction::QueryHostList {}
                 | CommandAction::QueryProjectList {}
+                | CommandAction::QueryDispatchQueue { .. }
                 | CommandAction::QueryHostStatus { .. }
                 | CommandAction::QueryHostProviders { .. }
                 | CommandAction::QueryFleetHealth {}
@@ -774,6 +780,7 @@ impl Command {
             CommandAction::QueryRepoWork { .. } => "query repo work",
             CommandAction::QueryHostList {} => "query host list",
             CommandAction::QueryProjectList {} => "query project list",
+            CommandAction::QueryDispatchQueue { .. } => "query dispatch queue",
             CommandAction::QueryHostStatus { .. } => "query host status",
             CommandAction::QueryHostProviders { .. } => "query host providers",
             CommandAction::QueryFleetHealth {} => "query fleet health",
@@ -888,6 +895,7 @@ pub enum CommandValue {
     RepoWork(Box<RepoWorkResponse>),
     HostList(Box<HostListResponse>),
     ProjectList(Box<ProjectListResponse>),
+    DispatchQueue(Box<DispatchQueueResponse>),
     HostStatus(Box<HostStatusResponse>),
     HostProviders(Box<HostProvidersResponse>),
     FleetHealth(Box<FleetHealthResponse>),
@@ -1255,6 +1263,12 @@ mod tests {
             },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryDispatchQueue { project: Some("widgets".to_string()) },
+            },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetList {} },
             Command {
                 node_id: None,
@@ -1957,5 +1971,47 @@ mod tests {
         assert_eq!(ConvoyDispatchRegard::from(ConvoyAutoAttach::Never), ConvoyDispatchRegard::Suppress);
         assert_eq!(ConvoyDispatchRegard::from(ConvoyAutoAttach::Default), ConvoyDispatchRegard::Emit);
         assert_eq!(ConvoyDispatchRegard::from(ConvoyAutoAttach::Always), ConvoyDispatchRegard::Emit);
+    }
+
+    #[test]
+    fn dispatch_queue_command_value_has_a_stable_json_shape() {
+        let ready_at = "2026-08-04T12:00:00Z".parse().expect("timestamp");
+        let value = CommandValue::DispatchQueue(Box::new(crate::DispatchQueueResponse {
+            observed_at: ready_at,
+            entries: vec![crate::DispatchQueueRow::builder()
+                .namespace("flotilla".to_string())
+                .project("widgets".to_string())
+                .issue(crate::IssueRef {
+                    source: crate::IssueSource { service: "https://github.com".to_string(), scope: "acme/widgets".to_string() },
+                    id: "42".to_string(),
+                })
+                .title("Fix the queue".to_string())
+                .ready_observed_at(ready_at)
+                .age_seconds(90)
+                .attention(true)
+                .provenance("dispatch-reconciler".to_string())
+                .build()],
+        }));
+
+        assert_eq!(
+            serde_json::to_value(value).expect("serialize"),
+            json!({
+                "kind": "dispatch_queue",
+                "observed_at": "2026-08-04T12:00:00Z",
+                "entries": [{
+                    "namespace": "flotilla",
+                    "project": "widgets",
+                    "issue": {
+                        "source": {"service": "https://github.com", "scope": "acme/widgets"},
+                        "id": "42"
+                    },
+                    "title": "Fix the queue",
+                    "ready_observed_at": "2026-08-04T12:00:00Z",
+                    "age_seconds": 90,
+                    "attention": true,
+                    "provenance": "dispatch-reconciler"
+                }]
+            })
+        );
     }
 }

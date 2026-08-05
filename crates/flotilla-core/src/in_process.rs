@@ -23,16 +23,17 @@ use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     result_set::{CheckoutRow, ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
     AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CorrelationKey, CrewCommandContext,
-    CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId, EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout,
-    ExplainedCondition, ExplainedCrewDelivery, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation,
-    FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement,
-    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse,
-    HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost,
-    PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo,
-    QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse,
-    ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
-    ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo,
-    ToolInventory, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry, DispatchQueueResponse, DispatchQueueRow, EnvironmentId, EvidenceFreshness,
+    ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedLeafFiring, ExplainedSettlement,
+    ExplainedSubscription, ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse,
+    FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
+    HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
+    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
+    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo,
+    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor,
+    ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef,
+    StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress,
+    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -3904,6 +3905,7 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
             subpath: None,
             default_branch: None,
         }],
+        dispatch_policy: None,
     })
 }
 
@@ -5148,6 +5150,7 @@ impl InProcessDaemon {
             default_workflow_ref: "single-agent-trusted".to_string(),
             issue_source: None,
             repositories: members,
+            dispatch_policy: existing_project.as_ref().and_then(|project| project.spec.dispatch_policy.clone()),
         })?;
         let mut meta = existing_project
             .as_ref()
@@ -6197,6 +6200,43 @@ impl InProcessDaemon {
         Ok(self.host_registry.list_hosts(&counts).await)
     }
 
+    pub async fn dispatch_queue_internal(&self, project_filter: Option<&str>) -> Result<DispatchQueueResponse, String> {
+        let observed_at = Utc::now();
+        let namespace = self.provisioning_namespace().await;
+        let projects = self.resource_backend.clone().definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let mut entries = Vec::new();
+        for project in projects {
+            if project_filter.is_some_and(|filter| filter != project.metadata.name) {
+                continue;
+            }
+            let Some(status) = project.status else { continue };
+            let attention = status.dispatch_queue_attention.is_some();
+            for entry in status.dispatch_queue {
+                entries.push(
+                    DispatchQueueRow::builder()
+                        .namespace(project.metadata.namespace.clone())
+                        .project(project.metadata.name.clone())
+                        .issue(entry.issue)
+                        .title(entry.title)
+                        .ready_observed_at(entry.ready_observed_at)
+                        .age_seconds(observed_at.signed_duration_since(entry.ready_observed_at).num_seconds().max(0) as u64)
+                        .attention(attention)
+                        .provenance(entry.provenance)
+                        .build(),
+                );
+            }
+        }
+        entries.sort_by(|left, right| {
+            (&left.namespace, &left.project, left.ready_observed_at, &left.issue).cmp(&(
+                &right.namespace,
+                &right.project,
+                right.ready_observed_at,
+                &right.issue,
+            ))
+        });
+        Ok(DispatchQueueResponse { observed_at, entries })
+    }
+
     pub async fn fleet_health_internal(&self) -> Result<FleetHealthResponse, String> {
         let now = Utc::now();
         let namespace = self.provisioning_namespace().await;
@@ -6333,7 +6373,8 @@ impl InProcessDaemon {
             );
         }
         rows.sort_by(|left, right| right.is_local.cmp(&left.is_local).then_with(|| left.host.cmp(&right.host)));
-        Ok(FleetHealthResponse { hosts: rows })
+        let dispatch_queue = self.dispatch_queue_internal(None).await?;
+        Ok(FleetHealthResponse { hosts: rows, dispatch_queue })
     }
 
     pub async fn list_projects_internal(&self) -> Result<ProjectListResponse, String> {
@@ -9206,6 +9247,10 @@ impl DaemonHandle for InProcessDaemon {
             },
             CommandAction::QueryProjectList {} => match self.list_projects_internal().await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::ProjectList(Box::new(v))),
+                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+            },
+            CommandAction::QueryDispatchQueue { project } => match self.dispatch_queue_internal(project.as_deref()).await {
+                Ok(v) => Ok(flotilla_protocol::CommandValue::DispatchQueue(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
             CommandAction::QueryHostStatus { target_environment_id } => match self.get_host_status_internal(target_environment_id).await {

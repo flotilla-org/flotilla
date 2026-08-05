@@ -127,11 +127,11 @@ pub use provider_data::{
     RemoteAccessType, SessionStatus, TerminalStatus, WorkingTreeStatus, Workspace,
 };
 pub use query::{
-    CrewCommandContext, CrewListMember, CrewListResponse, DiscoveryEntry, FleetHealthResponse, FleetHostRow, FleetHostStaleness,
-    FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListEntry,
-    HostListResponse, HostProvidersResponse, HostStatusResponse, PeerReconnectStatus, ProjectListEntry, ProjectListRepository,
-    ProjectListResponse, ProviderHealthMap, ProviderInfo, RepoDetailResponse, RepoProvidersResponse, RepoSummary, RepoWorkResponse,
-    SleepInhibitionHealth, StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
+    CrewCommandContext, CrewListMember, CrewListResponse, DiscoveryEntry, DispatchQueueResponse, DispatchQueueRow, FleetHealthResponse,
+    FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus,
+    FleetStaleness, HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, PeerReconnectStatus, ProjectListEntry,
+    ProjectListRepository, ProjectListResponse, ProviderHealthMap, ProviderInfo, RepoDetailResponse, RepoProvidersResponse, RepoSummary,
+    RepoWorkResponse, SleepInhibitionHealth, StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
 };
 pub use repository::{RepositoryRelation, RepositoryUpstream};
 pub use resource_ref::ResourceRef;

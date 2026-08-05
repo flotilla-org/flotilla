@@ -7,6 +7,7 @@ pub mod controller;
 mod convoy;
 mod credential;
 mod definition;
+mod dispatch_observation;
 mod environment;
 mod error;
 mod field_ownership;
@@ -66,6 +67,7 @@ pub use credential::{
     CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG,
 };
 pub use definition::DefinitionResolver;
+pub use dispatch_observation::{DispatchObservation, DispatchObservationSpec, DISPATCH_RECONCILER_PROVENANCE};
 pub use environment::{
     DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus,
     EnvironmentStatusPatch, EnvironmentWaitReason, HostDirectEnvironmentSpec,
@@ -104,8 +106,9 @@ pub use principal_attention::{
     RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
 };
 pub use project::{
-    normalize_project_spec, resolve_project_issue_sources, IssueSource, IssueSourceResolution, IssueSourceUnavailable, Project,
-    ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
+    normalize_project_spec, resolve_project_issue_sources, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, IssueSource,
+    IssueSourceResolution, IssueSourceUnavailable, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatus,
+    ProjectStatusPatch, DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use registry::{
@@ -152,6 +155,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::CredentialGrant>($($argument),*);
         $callback::<$crate::CredentialSpec>($($argument),*);
         $callback::<$crate::Demand>($($argument),*);
+        $callback::<$crate::DispatchObservation>($($argument),*);
         $callback::<$crate::Environment>($($argument),*);
         $callback::<$crate::Host>($($argument),*);
         $callback::<$crate::MaterialPool>($($argument),*);

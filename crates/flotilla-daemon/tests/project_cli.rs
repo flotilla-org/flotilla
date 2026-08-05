@@ -1179,6 +1179,7 @@ async fn tracking_repo_widens_project_name_without_overwriting_custom_project() 
         display_name: "Shared product".to_string(),
         default_workflow_ref: "custom-workflow".to_string(),
         issue_source: None,
+        dispatch_policy: None,
         repositories: vec![flotilla_resources::ProjectRepositorySpec {
             repo: RepositoryKey("other-repository".to_string()),
             alias: None,
@@ -1205,6 +1206,7 @@ async fn tracking_repo_uses_repository_key_when_slug_candidates_collide() {
                 display_name: name.to_string(),
                 default_workflow_ref: "custom-workflow".to_string(),
                 issue_source: None,
+                dispatch_policy: None,
                 repositories: vec![flotilla_resources::ProjectRepositorySpec {
                     repo: RepositoryKey(repo_ref.to_string()),
                     alias: None,
