@@ -90,8 +90,8 @@ async fn do_client_hello_with_surface(session: &MessageSession, surface: Option<
         Some(Message::Hello { protocol_version, display_name, .. }) if protocol_version != PROTOCOL_VERSION => {
             let daemon_build = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
             Err(format!(
-                "daemon protocol version mismatch: client generation {} uses protocol {PROTOCOL_VERSION}, daemon generation \
-                 {daemon_build} uses protocol {protocol_version} — rebuild or use the daemon's paired CLI",
+                "daemon protocol version mismatch: client built {} speaks proto {PROTOCOL_VERSION}; daemon built {daemon_build} speaks \
+                 proto {protocol_version} — rebuild/reinstall the CLI",
                 BUILD_ID,
             ))
         }
@@ -99,8 +99,8 @@ async fn do_client_hello_with_surface(session: &MessageSession, surface: Option<
             let daemon_generation = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
             if !flotilla_protocol::wire_generations_match(daemon_generation, BUILD_ID) {
                 return Err(format!(
-                    "wire generation mismatch: client generation {}, daemon generation {daemon_generation} — rebuild or use the \
-                     daemon's paired CLI",
+                    "wire generation mismatch: client built {} speaks proto {PROTOCOL_VERSION}; daemon built {daemon_generation} speaks \
+                     proto {PROTOCOL_VERSION} — rebuild/reinstall the CLI",
                     BUILD_ID,
                 ));
             }

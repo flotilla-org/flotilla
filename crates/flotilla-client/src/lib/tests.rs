@@ -291,7 +291,7 @@ async fn client_hello_rejects_daemon_protocol_version_mismatch() {
             .write(Message::Hello {
                 protocol_version: PROTOCOL_VERSION - 1,
                 node_id: NodeId::new("stale-daemon"),
-                display_name: "stale daemon".into(),
+                display_name: flotilla_protocol::hello_display_name("stale daemon", "stale-daemon-build"),
                 session_id: uuid::Uuid::new_v4(),
                 connection_role: Some(ConnectionRole::Client),
                 surface: None,
@@ -302,7 +302,12 @@ async fn client_hello_rejects_daemon_protocol_version_mismatch() {
 
     let error = do_client_hello(&client).await.expect_err("protocol mismatch should reject the daemon");
     assert!(error.contains("protocol version mismatch"), "unexpected error: {error}");
-    assert!(error.contains(&(PROTOCOL_VERSION - 1).to_string()), "error should report the daemon version: {error}");
+    assert!(error.contains(&format!("client built {BUILD_ID} speaks proto {PROTOCOL_VERSION}")), "error should report the client: {error}");
+    assert!(
+        error.contains(&format!("daemon built stale-daemon-build speaks proto {}", PROTOCOL_VERSION - 1)),
+        "error should report the daemon: {error}"
+    );
+    assert!(error.contains("rebuild/reinstall the CLI"), "error should provide an actionable recovery: {error}");
     server_task.await.expect("join server task");
 }
 
@@ -326,9 +331,12 @@ async fn client_hello_rejects_daemon_wire_generation_mismatch() {
     });
 
     let error = do_client_hello(&client).await.expect_err("wire generation mismatch should reject the daemon");
-    assert!(error.contains(&format!("client generation {BUILD_ID}")), "error should report the client generation: {error}");
-    assert!(error.contains("daemon generation stale-daemon-generation"), "error should report the daemon generation: {error}");
-    assert!(error.contains("rebuild or use the daemon's paired CLI"), "error should provide an actionable recovery: {error}");
+    assert!(error.contains(&format!("client built {BUILD_ID} speaks proto {PROTOCOL_VERSION}")), "error should report the client: {error}");
+    assert!(
+        error.contains(&format!("daemon built stale-daemon-generation speaks proto {PROTOCOL_VERSION}")),
+        "error should report the daemon: {error}"
+    );
+    assert!(error.contains("rebuild/reinstall the CLI"), "error should provide an actionable recovery: {error}");
     assert!(!error.contains("failed to parse message"), "error should come from the handshake: {error}");
     server_task.await.expect("join server task");
 }
@@ -371,7 +379,7 @@ async fn assert_connect_rejects_daemon_hello(protocol_version: u32, display_name
         Err(error) => error,
     };
     assert!(error.contains(expected_error), "unexpected error: {error}");
-    assert!(error.contains("rebuild or use the daemon's paired CLI"), "error should provide an actionable recovery: {error}");
+    assert!(error.contains("rebuild/reinstall the CLI"), "error should provide an actionable recovery: {error}");
     assert!(!error.contains("failed to parse message"), "error should come from the handshake: {error}");
     server_task.await.expect("join server task");
 }
