@@ -33,9 +33,7 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            if path.file_name().is_none_or(|name| name != "tests") {
-                collect_files(&path, files)?;
-            }
+            collect_files(&path, files)?;
         } else {
             files.push(path);
         }
@@ -52,6 +50,9 @@ fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
 }
 
 fn source_fingerprint(workspace_root: &Path) -> Result<String, String> {
+    // Deliberately fingerprint the whole compiled workspace rather than a
+    // hand-maintained dependency subset: over-invalidation is safe under the
+    // no-compat policy, while omitting an indirect wire input is not.
     let crates_dir = workspace_root.join("crates");
     let mut inputs = vec![
         workspace_root.join("Cargo.lock"),
