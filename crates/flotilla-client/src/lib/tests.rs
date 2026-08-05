@@ -437,7 +437,7 @@ async fn connect_or_spawn_rejects_existing_daemon_protocol_version_mismatch() {
 async fn root_scoped_client_refuses_to_spawn_on_the_default_fleet_socket() {
     let dir = tempfile::tempdir().expect("tempdir");
     let scoped_config = dir.path().join("live-session/config");
-    let default_socket = dir.path().join("default/config/run/flotilla.sock");
+    let default_socket = dir.path().join("home/.config/flotilla/run/flotilla.sock");
 
     let error = match connect_or_spawn(&default_socket, &scoped_config, &dir.path().join("live-session/state")).await {
         Ok(_) => panic!("a scoped client must not spawn a wrong-root daemon on the default socket"),

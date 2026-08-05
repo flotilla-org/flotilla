@@ -435,7 +435,7 @@ async fn connect_or_spawn_with_optional_surface(
     state_dir: &Path,
     surface: Option<SurfaceDeclaration>,
 ) -> Result<Arc<SocketDaemon>, String> {
-    flotilla_core::path_policy::ensure_daemon_socket_belongs_to_config(socket_path, config_dir)?;
+    let (config_dir, state_dir) = flotilla_core::path_policy::daemon_dirs_for_socket(socket_path, config_dir, state_dir)?;
     // An existing socket must complete the stateful Hello handshake. A
     // handshake failure means a daemon is listening but is incompatible or
     // malformed; surface that error instead of treating the socket as stale
@@ -451,7 +451,7 @@ async fn connect_or_spawn_with_optional_surface(
         return Ok(daemon);
     }
 
-    ensure_no_live_daemon_without_socket(state_dir, socket_path)?;
+    ensure_no_live_daemon_without_socket(&state_dir, socket_path)?;
 
     // Acquire spawn lock (tmux-style flock). The loser blocks until the
     // winner's daemon is ready, then retries connect.
@@ -542,14 +542,14 @@ async fn connect_or_spawn_with_optional_surface(
         }
     }
 
-    ensure_no_live_daemon_without_socket(state_dir, socket_path)?;
+    ensure_no_live_daemon_without_socket(&state_dir, socket_path)?;
 
     {
         // Clean up stale socket
         let _ = std::fs::remove_file(socket_path);
 
         // Spawn daemon process
-        spawn_daemon(socket_path, config_dir, state_dir)?;
+        spawn_daemon(socket_path, &config_dir, &state_dir)?;
     }
 
     // Poll for connection with a 10s deadline (soft: the deadline is checked

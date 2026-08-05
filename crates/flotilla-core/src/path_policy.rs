@@ -33,6 +33,32 @@ pub fn ensure_daemon_socket_belongs_to_config(socket_path: &Path, config_dir: &P
     ))
 }
 
+/// Resolve config and state directories from the requested socket identity.
+///
+/// Managed terminals carry `FLOTILLA_DAEMON_SOCKET` so they can reconnect to
+/// their owning daemon, but an already-running terminal server may not carry
+/// `FLOTILLA_ROOT`. A canonical root-scoped socket supplies that missing root.
+/// The default XDG socket does not end in `config/run/flotilla.sock`, so it
+/// cannot silently redirect a root-scoped client to the fleet root.
+pub fn daemon_dirs_for_socket(socket_path: &Path, config_dir: &Path, state_dir: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let mismatch = match ensure_daemon_socket_belongs_to_config(socket_path, config_dir) {
+        Ok(()) => return Ok((config_dir.to_path_buf(), state_dir.to_path_buf())),
+        Err(error) => error,
+    };
+    let scoped_root = socket_path
+        .file_name()
+        .filter(|name| *name == "flotilla.sock")
+        .and_then(|_| socket_path.parent())
+        .filter(|run_dir| run_dir.file_name().is_some_and(|name| name == "run"))
+        .and_then(Path::parent)
+        .filter(|config_dir| config_dir.file_name().is_some_and(|name| name == "config"))
+        .and_then(Path::parent);
+    if let Some(root) = scoped_root {
+        return Ok((root.join("config"), root.join("state")));
+    }
+    Err(mismatch)
+}
+
 /// Resolved daemon-side directory locations.
 ///
 /// Internal to the daemon and its stores — not exposed to providers.
@@ -157,5 +183,18 @@ mod tests {
 
         assert!(error.contains("does not belong to config root"), "unexpected error: {error}");
         assert!(error.contains("/work/live-session/config/run/flotilla.sock"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn scoped_socket_supplies_the_root_for_a_managed_terminal() {
+        let (config_dir, state_dir) = daemon_dirs_for_socket(
+            Path::new("/work/live-session/config/run/flotilla.sock"),
+            Path::new("/home/test/.config/flotilla"),
+            Path::new("/home/test/.local/state/flotilla"),
+        )
+        .expect("canonical scoped socket should supply its root");
+
+        assert_eq!(config_dir, Path::new("/work/live-session/config"));
+        assert_eq!(state_dir, Path::new("/work/live-session/state"));
     }
 }

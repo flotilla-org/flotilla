@@ -746,12 +746,12 @@ async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
     let paths = PathPolicy::from_process_env();
     let config_dir = cli.config_dir();
     let socket_path = cli.socket_path();
-    flotilla_core::path_policy::ensure_daemon_socket_belongs_to_config(&socket_path, &config_dir)
+    let (config_dir, state_dir) = flotilla_core::path_policy::daemon_dirs_for_socket(&socket_path, &config_dir, paths.state_dir.as_path())
         .map_err(|error| color_eyre::eyre::eyre!(error))?;
     let mut command = tokio::process::Command::new(&daemon_binary);
     command.arg("--timeout").arg(timeout_secs.to_string());
     command.arg("--config-dir").arg(config_dir);
-    command.arg("--state-dir").arg(paths.state_dir.as_path());
+    command.arg("--state-dir").arg(state_dir);
     command.arg("--socket").arg(socket_path);
     let status = command.status().await?;
     if status.success() {
