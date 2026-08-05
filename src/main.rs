@@ -13,7 +13,7 @@ use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
-    path_policy::PathPolicy,
+    path_policy::{daemon_socket_path, PathPolicy},
     providers::{
         vcs::{git::GitVcs, Vcs},
         ProcessCommandRunner,
@@ -371,7 +371,7 @@ impl Cli {
 }
 
 fn socket_path_from(explicit: Option<&Path>, config_dir: &Path, environment: Option<&std::ffi::OsStr>) -> PathBuf {
-    environment.map(PathBuf::from).or_else(|| explicit.map(PathBuf::from)).unwrap_or_else(|| config_dir.join("run/flotilla.sock"))
+    environment.map(PathBuf::from).or_else(|| explicit.map(PathBuf::from)).unwrap_or_else(|| daemon_socket_path(config_dir))
 }
 
 fn host_daemon_socket_required(contained_marker: Option<&std::ffi::OsStr>) -> bool {
@@ -382,14 +382,12 @@ async fn connect_cli_socket(
     socket_path: &Path,
     config_dir: &Path,
     state_dir: &Path,
-    config_dir_override: Option<&Path>,
-    socket_override: Option<&Path>,
     require_host_daemon: bool,
 ) -> Result<Arc<flotilla_tui::socket::SocketDaemon>, String> {
     if require_host_daemon {
         flotilla_tui::socket::connect_required_host_daemon(socket_path).await
     } else {
-        flotilla_tui::socket::connect_or_spawn(socket_path, config_dir, state_dir, config_dir_override, socket_override).await
+        flotilla_tui::socket::connect_or_spawn(socket_path, config_dir, state_dir).await
     }
 }
 
@@ -590,8 +588,6 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
     let startup_repo_roots = startup_repo_roots(&cli.repo_root).await;
     let cli_theme = cli.theme.clone();
     let socket_path = cli.socket_path();
-    let config_dir_override = cli.config_dir.clone();
-    let socket_override = cli.socket.clone();
     let require_host_daemon =
         host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref());
 
@@ -603,19 +599,10 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
     let initial_socket_path = socket_path.clone();
     let initial_config_dir = resolved_config_dir.clone();
     let initial_state_dir = paths.state_dir.clone();
-    let initial_config_override = config_dir_override.clone();
-    let initial_socket_override = socket_override.clone();
     let daemon_task = tokio::spawn(async move {
-        connect_cli_socket(
-            &initial_socket_path,
-            &initial_config_dir,
-            initial_state_dir.as_path(),
-            initial_config_override.as_deref(),
-            initial_socket_override.as_deref(),
-            require_host_daemon,
-        )
-        .await
-        .map(|d| d as Arc<dyn DaemonHandle>)
+        connect_cli_socket(&initial_socket_path, &initial_config_dir, initial_state_dir.as_path(), require_host_daemon)
+            .await
+            .map(|d| d as Arc<dyn DaemonHandle>)
     });
 
     show_startup_splash(scoped_view.as_ref(), || flotilla_tui::splash::show_splash(&mut terminal)).await?;
@@ -698,16 +685,7 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
 
         terminal = ratatui::init();
         let connected = match flotilla_tui::socket::reconnect::connect_with_retry(
-            || {
-                connect_cli_socket(
-                    &socket_path,
-                    &resolved_config_dir,
-                    paths.state_dir.as_path(),
-                    config_dir_override.as_deref(),
-                    socket_override.as_deref(),
-                    require_host_daemon,
-                )
-            },
+            || connect_cli_socket(&socket_path, &resolved_config_dir, paths.state_dir.as_path(), require_host_daemon),
             |notice| {
                 let (attempt, detail) = match notice {
                     flotilla_tui::socket::reconnect::ReconnectNotice::Attempt { attempt } => (attempt, None),
@@ -765,14 +743,16 @@ fn restore_tui_handoff(app: &mut app::App) {
 
 async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
     let daemon_binary = resolve_flotillad_binary()?;
+    let paths = PathPolicy::from_process_env();
+    let config_dir = cli.config_dir();
+    let socket_path = cli.socket_path();
+    flotilla_core::path_policy::ensure_daemon_socket_belongs_to_config(&socket_path, &config_dir)
+        .map_err(|error| color_eyre::eyre::eyre!(error))?;
     let mut command = tokio::process::Command::new(&daemon_binary);
     command.arg("--timeout").arg(timeout_secs.to_string());
-    if let Some(config_dir) = cli.config_dir.as_ref() {
-        command.arg("--config-dir").arg(config_dir);
-    }
-    if let Some(socket) = cli.socket.as_ref() {
-        command.arg("--socket").arg(socket);
-    }
+    command.arg("--config-dir").arg(config_dir);
+    command.arg("--state-dir").arg(paths.state_dir.as_path());
+    command.arg("--socket").arg(socket_path);
     let status = command.status().await?;
     if status.success() {
         Ok(())
@@ -835,8 +815,6 @@ async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<()> {
             flotilla_tui::pm_connect::run(
                 &cli.socket_path(),
                 &cli.config_dir(),
-                cli.config_dir.as_deref(),
-                cli.socket.as_deref(),
                 host_daemon_socket_required(
                     std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref(),
                 ),
@@ -869,8 +847,6 @@ async fn run_wait(
         &socket_path,
         &config_dir,
         paths.state_dir.as_path(),
-        cli.config_dir.as_deref(),
-        cli.socket.as_deref(),
         host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
     )
     .await
@@ -912,8 +888,6 @@ async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
         &socket_path,
         &config_dir,
         paths.state_dir.as_path(),
-        cli.config_dir.as_deref(),
-        cli.socket.as_deref(),
         host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
     )
     .await

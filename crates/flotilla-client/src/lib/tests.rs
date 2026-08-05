@@ -94,6 +94,12 @@ fn session_harness() -> SessionHarness {
     SessionHarness { daemon, session: server }
 }
 
+fn rooted_daemon_socket(dir: &TestSocketDir) -> PathBuf {
+    let socket_path = flotilla_core::path_policy::daemon_socket_path(dir.path());
+    std::fs::create_dir_all(socket_path.parent().expect("daemon socket parent")).expect("create daemon socket parent");
+    socket_path
+}
+
 #[tokio::test]
 async fn stateful_handshake_records_daemon_build_identity() {
     let (client, server) = message_session_pair();
@@ -147,7 +153,7 @@ async fn connect_or_spawn_never_spawns_over_daemon_that_appeared_during_lock_con
     // the spawn lock, binds a stale-version listener only after A's first
     // probe has found nothing, then releases the lock.
     let dir = TestSocketDir::new();
-    let socket_path = dir.socket_path("daemon.sock");
+    let socket_path = rooted_daemon_socket(&dir);
     let lock_path = std::path::PathBuf::from(format!("{}.lock", socket_path.display()));
 
     let lock_file = match acquire_spawn_lock(&lock_path) {
@@ -164,8 +170,7 @@ async fn connect_or_spawn_never_spawns_over_daemon_that_appeared_during_lock_con
 
     let client_socket = socket_path.clone();
     let client_dir = dir.path().to_path_buf();
-    let client_task =
-        tokio::spawn(async move { connect_or_spawn(&client_socket, &client_dir, &client_dir, None, Some(&client_socket)).await });
+    let client_task = tokio::spawn(async move { connect_or_spawn(&client_socket, &client_dir, &client_dir).await });
 
     // Give A time to run its first probe (nothing listening) and block on the lock.
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -234,17 +239,15 @@ async fn connect_or_spawn_reports_live_daemon_with_missing_socket() {
     use std::os::fd::AsRawFd;
 
     let dir = TestSocketDir::new();
-    let socket_path = dir.socket_path("missing-daemon.sock");
+    let socket_path = rooted_daemon_socket(&dir);
     let lifecycle_path = dir.path().join(flotilla_core::DAEMON_LIFECYCLE_LOCK_FILE);
     let lifecycle =
         std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lifecycle_path).expect("open lifecycle lock");
     // SAFETY: the file owns this descriptor for the rest of the test.
     assert_eq!(unsafe { libc::flock(lifecycle.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0, "hold lifecycle lock");
 
-    let error = connect_or_spawn(&socket_path, dir.path(), dir.path(), None, Some(&socket_path))
-        .await
-        .err()
-        .expect("a live daemon with no socket should be diagnosed");
+    let error =
+        connect_or_spawn(&socket_path, dir.path(), dir.path()).await.err().expect("a live daemon with no socket should be diagnosed");
 
     assert!(error.contains("daemon process is alive"), "unexpected error: {error}");
     assert!(error.contains("socket is missing or unreachable"), "unexpected error: {error}");
@@ -254,7 +257,7 @@ async fn connect_or_spawn_reports_live_daemon_with_missing_socket() {
 #[tokio::test]
 async fn connect_or_spawn_reports_wedged_daemon_instead_of_hanging_or_respawning() {
     let dir = TestSocketDir::new();
-    let socket_path = dir.socket_path("daemon.sock");
+    let socket_path = rooted_daemon_socket(&dir);
     let listener = match UnixListener::bind(&socket_path) {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -273,7 +276,7 @@ async fn connect_or_spawn_reports_wedged_daemon_instead_of_hanging_or_respawning
         std::future::pending::<()>().await;
     });
 
-    let error = match connect_or_spawn(&socket_path, dir.path(), dir.path(), None, Some(&socket_path)).await {
+    let error = match connect_or_spawn(&socket_path, dir.path(), dir.path()).await {
         Ok(_) => panic!("a wedged daemon must surface an error, not hang or be replaced"),
         Err(error) => error,
     };
@@ -394,7 +397,7 @@ async fn connect_rejects_daemon_wire_generation_mismatch() {
 #[tokio::test]
 async fn connect_or_spawn_rejects_existing_daemon_protocol_version_mismatch() {
     let dir = TestSocketDir::new();
-    let socket_path = dir.socket_path("daemon.sock");
+    let socket_path = rooted_daemon_socket(&dir);
     let listener = match UnixListener::bind(&socket_path) {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -420,7 +423,7 @@ async fn connect_or_spawn_rejects_existing_daemon_protocol_version_mismatch() {
             .expect("write stale daemon hello");
     });
 
-    let result = connect_or_spawn(&socket_path, dir.path(), dir.path(), None, Some(&socket_path)).await;
+    let result = connect_or_spawn(&socket_path, dir.path(), dir.path()).await;
     server_task.await.expect("join server task");
 
     let error = match result {
@@ -428,6 +431,22 @@ async fn connect_or_spawn_rejects_existing_daemon_protocol_version_mismatch() {
         Err(error) => error,
     };
     assert!(error.contains("protocol version mismatch"), "unexpected error: {error}");
+}
+
+#[tokio::test]
+async fn root_scoped_client_refuses_to_spawn_on_the_default_fleet_socket() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let scoped_config = dir.path().join("live-session/config");
+    let default_socket = dir.path().join("default/config/run/flotilla.sock");
+
+    let error = match connect_or_spawn(&default_socket, &scoped_config, &dir.path().join("live-session/state")).await {
+        Ok(_) => panic!("a scoped client must not spawn a wrong-root daemon on the default socket"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("does not belong to config root"), "unexpected error: {error}");
+    assert!(!default_socket.exists(), "identity validation must run before creating or replacing the socket");
+    assert!(!PathBuf::from(format!("{}.lock", default_socket.display())).exists(), "identity validation must run before locking");
 }
 
 #[tokio::test]

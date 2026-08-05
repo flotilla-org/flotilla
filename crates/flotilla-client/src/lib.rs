@@ -360,15 +360,12 @@ fn resolve_flotillad_binary() -> Result<PathBuf, String> {
         .ok_or_else(|| format!("failed to locate flotillad next to {}", current.display()))
 }
 
-fn spawn_daemon(config_dir: &Path, config_dir_override: Option<&Path>, socket_override: Option<&Path>) -> Result<(), String> {
+fn spawn_daemon(socket_path: &Path, config_dir: &Path, state_dir: &Path) -> Result<(), String> {
     let daemon_binary = resolve_flotillad_binary()?;
     let mut cmd = std::process::Command::new(&daemon_binary);
-    if let Some(dir) = config_dir_override {
-        cmd.arg("--config-dir").arg(dir);
-    }
-    if let Some(socket) = socket_override {
-        cmd.arg("--socket").arg(socket);
-    }
+    cmd.arg("--config-dir").arg(config_dir);
+    cmd.arg("--state-dir").arg(state_dir);
+    cmd.arg("--socket").arg(socket_path);
     // Detach: own session so Ctrl-C doesn't kill daemon with TUI
     use std::os::unix::process::CommandExt;
     unsafe {
@@ -390,25 +387,17 @@ fn spawn_daemon(config_dir: &Path, config_dir_override: Option<&Path>, socket_ov
     Ok(())
 }
 
-pub async fn connect_or_spawn(
-    socket_path: &Path,
-    config_dir: &Path,
-    state_dir: &Path,
-    config_dir_override: Option<&Path>,
-    socket_override: Option<&Path>,
-) -> Result<Arc<SocketDaemon>, String> {
-    connect_or_spawn_with_optional_surface(socket_path, config_dir, state_dir, config_dir_override, socket_override, None).await
+pub async fn connect_or_spawn(socket_path: &Path, config_dir: &Path, state_dir: &Path) -> Result<Arc<SocketDaemon>, String> {
+    connect_or_spawn_with_optional_surface(socket_path, config_dir, state_dir, None).await
 }
 
 pub async fn connect_or_spawn_with_surface(
     socket_path: &Path,
     config_dir: &Path,
     state_dir: &Path,
-    config_dir_override: Option<&Path>,
-    socket_override: Option<&Path>,
     surface: SurfaceDeclaration,
 ) -> Result<Arc<SocketDaemon>, String> {
-    connect_or_spawn_with_optional_surface(socket_path, config_dir, state_dir, config_dir_override, socket_override, Some(surface)).await
+    connect_or_spawn_with_optional_surface(socket_path, config_dir, state_dir, Some(surface)).await
 }
 
 /// Connect to the host daemon exposed inside a contained environment.
@@ -444,10 +433,9 @@ async fn connect_or_spawn_with_optional_surface(
     socket_path: &Path,
     config_dir: &Path,
     state_dir: &Path,
-    config_dir_override: Option<&Path>,
-    socket_override: Option<&Path>,
     surface: Option<SurfaceDeclaration>,
 ) -> Result<Arc<SocketDaemon>, String> {
+    flotilla_core::path_policy::ensure_daemon_socket_belongs_to_config(socket_path, config_dir)?;
     // An existing socket must complete the stateful Hello handshake. A
     // handshake failure means a daemon is listening but is incompatible or
     // malformed; surface that error instead of treating the socket as stale
@@ -561,7 +549,7 @@ async fn connect_or_spawn_with_optional_surface(
         let _ = std::fs::remove_file(socket_path);
 
         // Spawn daemon process
-        spawn_daemon(config_dir, config_dir_override, socket_override)?;
+        spawn_daemon(socket_path, config_dir, state_dir)?;
     }
 
     // Poll for connection with a 10s deadline (soft: the deadline is checked
