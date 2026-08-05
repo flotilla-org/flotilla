@@ -7,8 +7,9 @@ use std::{
 
 use chrono::Utc;
 use flotilla_resources::{
-    ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout, CheckoutIntegrationStatus, CheckoutSpec,
-    CheckoutStatus, ConditionValue, Convoy, CrewWorkPhase, IntegrationCondition, LandedEvidence, ResourceObject, CHANGE_REQUEST_ID_LABEL,
+    ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus,
+    CheckoutSpec, CheckoutStatus, ConditionValue, Convoy, CrewWorkPhase, IntegrationCondition, LandedEvidence, ObservedChangeRequestState,
+    ResourceObject, CHANGE_REQUEST_ID_LABEL,
 };
 
 use crate::providers::{ChannelLabel, CommandRunner};
@@ -117,7 +118,7 @@ pub async fn inspect_checkout_integration(
     spec: &CheckoutSpec,
     change_request_id: Option<&str>,
 ) -> CheckoutIntegrationStatus {
-    inspect_checkout_integration_with_association(runner, checkout_path, spec, change_request_id, change_request_id.is_some()).await
+    inspect_checkout_integration_with_association(runner, checkout_path, spec, change_request_id, None, change_request_id.is_some()).await
 }
 
 /// Inspect a checkout for settlement after the caller has resolved the
@@ -127,8 +128,9 @@ pub async fn inspect_convoy_checkout_integration(
     checkout_path: &Path,
     spec: &CheckoutSpec,
     change_request_id: Option<&str>,
+    observed_change_request: Option<&ChangeRequestStatus>,
 ) -> CheckoutIntegrationStatus {
-    inspect_checkout_integration_with_association(runner, checkout_path, spec, change_request_id, true).await
+    inspect_checkout_integration_with_association(runner, checkout_path, spec, change_request_id, observed_change_request, true).await
 }
 
 async fn inspect_checkout_integration_with_association(
@@ -136,11 +138,12 @@ async fn inspect_checkout_integration_with_association(
     checkout_path: &Path,
     spec: &CheckoutSpec,
     change_request_id: Option<&str>,
+    observed_change_request: Option<&ChangeRequestStatus>,
     convoy_association_complete: bool,
 ) -> CheckoutIntegrationStatus {
     let observed_at = Utc::now().to_rfc3339();
     let clean = inspect_clean(runner, checkout_path, &observed_at).await;
-    let pushed = inspect_pushed(runner, checkout_path, &observed_at).await;
+    let pushed = inspect_pushed(runner, checkout_path, observed_change_request, &observed_at).await;
     let (landed, landed_evidence, change_request) = inspect_landed(
         runner,
         checkout_path,
@@ -265,7 +268,27 @@ async fn inspect_embedded_repository(runner: &dyn CommandRunner, checkout_path: 
         .build()
 }
 
-async fn inspect_pushed(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
+async fn inspect_pushed(
+    runner: &dyn CommandRunner,
+    checkout_path: &Path,
+    observed_change_request: Option<&ChangeRequestStatus>,
+    observed_at: &str,
+) -> IntegrationCondition {
+    if let Some(head_sha) = observed_change_request
+        .filter(|status| status.state.value == Some(ObservedChangeRequestState::Merged))
+        .and_then(|status| status.head_sha.value.as_deref())
+    {
+        let ancestor =
+            runner.run_output("git", &["merge-base", "--is-ancestor", "HEAD", head_sha], checkout_path, &ChannelLabel::Noop).await;
+        if ancestor.is_ok_and(|output| output.success) {
+            return IntegrationCondition::builder()
+                .value(ConditionValue::True)
+                .details(vec![format!("HEAD is preserved by merged change request head {head_sha}")])
+                .observed_at(observed_at.to_string())
+                .build();
+        }
+    }
+
     let upstream = match runner.run_output("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], checkout_path, &ChannelLabel::Noop).await {
         Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
         _ => match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Noop).await {
@@ -516,6 +539,61 @@ fn non_empty_output_or(fallback: &str, output: &str) -> String {
 mod tests {
     use super::*;
     use crate::providers::testing::MockRunner;
+
+    fn merged_change_request(head_sha: &str) -> ChangeRequestStatus {
+        let observed_at = "2026-08-04T12:00:00Z".parse().expect("valid timestamp");
+        ChangeRequestStatus {
+            state: flotilla_resources::Observation::known(ObservedChangeRequestState::Merged, observed_at),
+            head_sha: flotilla_resources::Observation::known(head_sha.to_string(), observed_at),
+            checks: flotilla_resources::Observation::unknown(observed_at),
+            review: flotilla_resources::ChangeRequestReviewObservation {
+                actionable_at_head: flotilla_resources::Observation::unknown(observed_at),
+            },
+            mergeable: flotilla_resources::Observation::unknown(observed_at),
+        }
+    }
+
+    #[tokio::test]
+    async fn squash_merged_head_is_pushed_even_after_remote_branch_deletion() {
+        let runner = MockRunner::new(vec![Ok(String::new())]);
+        let change_request = merged_change_request("merged-head");
+
+        let pushed = inspect_pushed(&runner, Path::new("/checkout"), Some(&change_request), "2026-08-04T12:00:00Z").await;
+
+        assert_eq!(pushed.value, ConditionValue::True);
+        assert_eq!(runner.calls(), vec![("git".to_string(), vec![
+            "merge-base".to_string(),
+            "--is-ancestor".to_string(),
+            "HEAD".to_string(),
+            "merged-head".to_string(),
+        ])]);
+    }
+
+    #[tokio::test]
+    async fn commit_after_squash_merged_head_remains_unpushed() {
+        let runner = MockRunner::new(vec![
+            Err("not an ancestor".into()),
+            Err("upstream branch was deleted".into()),
+            Ok("origin/main\n".into()),
+            Ok("1\n".into()),
+        ]);
+        let change_request = merged_change_request("merged-head");
+
+        let pushed = inspect_pushed(&runner, Path::new("/checkout"), Some(&change_request), "2026-08-04T12:00:00Z").await;
+
+        assert_eq!(pushed.value, ConditionValue::False);
+        assert_eq!(pushed.details, vec!["1 unpushed commit"]);
+    }
+
+    #[tokio::test]
+    async fn checkout_without_change_request_keeps_upstream_pushed_probe() {
+        let runner = MockRunner::new(vec![Ok("origin/feature\n".into()), Ok("0\n".into())]);
+
+        let pushed = inspect_pushed(&runner, Path::new("/checkout"), None, "2026-08-04T12:00:00Z").await;
+
+        assert_eq!(pushed.value, ConditionValue::True);
+        assert_eq!(runner.calls()[0].1, vec!["rev-parse", "--abbrev-ref", "@{upstream}"]);
+    }
 
     async fn landed_with_responses(responses: Vec<Result<String, String>>) -> IntegrationCondition {
         let runner = MockRunner::new(responses);

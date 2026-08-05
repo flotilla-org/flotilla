@@ -1040,7 +1040,7 @@ static CHECKOUT_COLUMNS: [ColumnSpec<CheckoutRow>; 5] = [
         label: "PATH",
         width: WidthHint::Flexible { minimum: 22, weight: 3 },
         alignment: Alignment::Left,
-        extract: |row| CellValue::plain(&row.path),
+        extract: |row| CellValue::plain(if row.needs_attention { format!("⚠ {}", row.path) } else { row.path.clone() }),
     },
     ColumnSpec {
         id: "branch",
@@ -1242,13 +1242,17 @@ fn checkout_id(row: &CheckoutRow) -> RowId {
 }
 
 fn checkout_description(row: &CheckoutRow) -> Vec<DetailField> {
-    vec![
+    let mut details = vec![
         DetailField { label: "Host", value: row.host.to_string() },
         DetailField { label: "Path", value: row.path.clone() },
         DetailField { label: "Branch", value: row.branch.clone() },
         DetailField { label: "Repository", value: row.repo_label.clone() },
         DetailField { label: "Authority", value: row.authority.as_label_value().to_string() },
-    ]
+    ];
+    if let Some(reason) = &row.attention_reason {
+        details.push(DetailField { label: "Attention", value: reason.clone() });
+    }
+    details
 }
 
 fn vessel_id(row: &VesselProjection) -> RowId {

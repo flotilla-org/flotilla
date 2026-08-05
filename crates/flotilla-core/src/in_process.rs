@@ -36,20 +36,20 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
-    apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name, ensure_repository,
-    evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs, external_patches as convoy_external_patches,
-    list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec, repository_display_labels,
-    resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from,
-    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout,
-    CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name,
+    controller::delete_lifecycle_owned_matching, ensure_repository, evaluate_landing_settlement, expected_change_request_leaves,
+    expected_checkout_refs, external_patches as convoy_external_patches, list_resource_kind, list_resource_kind_including_replicas,
+    normalize_project_spec, repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
+    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
+    Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec,
-    ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, Environment as ResourceEnvironment,
-    Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
-    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend,
-    ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalBrief, TerminalCrewContext,
-    TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, Demand as ResourceDemand,
+    Environment as ResourceEnvironment, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
+    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
+    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey,
+    RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock,
+    TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, UnmetSettlementExpectation,
     Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
@@ -2506,7 +2506,7 @@ impl InProcessDaemon {
                 });
             let integration = if let Some(convoy) = convoy.as_ref() {
                 let change_request_id = convoy_change_request_id_for_checkout(convoy, &checkout);
-                inspect_convoy_checkout_integration(&*runner, Path::new(path), &checkout.spec, change_request_id.as_deref()).await
+                inspect_convoy_checkout_integration(&*runner, Path::new(path), &checkout.spec, change_request_id.as_deref(), None).await
             } else {
                 inspect_checkout_integration(
                     &*runner,
@@ -6751,6 +6751,37 @@ impl InProcessDaemon {
         self.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkout_list, false).await
     }
 
+    async fn cascade_convoy_children(&self, namespace: &str, name: &str) -> Result<(), String> {
+        let selector = BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]);
+        delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<ResourcePresentation>(namespace), &selector)
+            .await
+            .map_err(|error| error.to_string())?;
+        delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<Vessel>(namespace), &selector)
+            .await
+            .map_err(|error| error.to_string())?;
+        delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<ResourceTerminalSession>(namespace), &selector)
+            .await
+            .map_err(|error| error.to_string())?;
+        delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<ResourceCheckout>(namespace), &selector)
+            .await
+            .map_err(|error| error.to_string())?;
+        let demands = self.resource_backend.clone().using::<ResourceDemand>(namespace);
+        for demand in demands.list().await.map_err(|error| error.to_string())?.items {
+            let target = &demand.spec.originating_work_ref;
+            if target.api_version == flotilla_resources::api_version(ResourceConvoy::API_PATHS)
+                && target.kind == ResourceConvoy::API_PATHS.kind
+                && target.namespace == namespace
+                && target.name == name
+            {
+                match demands.delete(&demand.metadata.name).await {
+                    Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn verify_convoy_teardown_gate_for_checkouts(
         &self,
         convoy: &ResourceObject<ResourceConvoy>,
@@ -8031,9 +8062,12 @@ impl InProcessDaemon {
             };
             let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
             let result = match self.verify_convoy_teardown_gate(&namespace, name, *force).await {
-                Ok(()) => match convoys.delete(name).await {
-                    Ok(()) => flotilla_protocol::CommandValue::Ok,
-                    Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                Ok(()) => match self.cascade_convoy_children(&namespace, name).await {
+                    Ok(()) => match convoys.delete(name).await {
+                        Ok(()) => flotilla_protocol::CommandValue::Ok,
+                        Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                    },
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
                 },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
