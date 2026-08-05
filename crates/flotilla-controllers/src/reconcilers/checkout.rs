@@ -177,9 +177,9 @@ fn integration_is_fresh(status: &CheckoutStatus, now: DateTime<Utc>, max_age: Du
 }
 
 fn convoy_needs_terminal_evidence(convoy: Option<&ResourceObject<Convoy>>) -> bool {
-    convoy
-        .and_then(|convoy| convoy.status.as_ref())
-        .is_some_and(|status| matches!(status.phase, ConvoyPhase::Landing | ConvoyPhase::Failed | ConvoyPhase::Cancelled))
+    convoy.and_then(|convoy| convoy.status.as_ref()).is_some_and(|status| {
+        matches!(status.phase, ConvoyPhase::Landing | ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Cancelled)
+    })
 }
 
 fn convoy_authorizes_checkout_reclaim(convoy: &ResourceObject<Convoy>) -> bool {

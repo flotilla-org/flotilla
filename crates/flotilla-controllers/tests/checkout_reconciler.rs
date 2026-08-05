@@ -413,7 +413,7 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
 
 #[tokio::test]
 async fn checkout_authority_observes_when_replicated_convoy_needs_terminal_evidence() {
-    for phase in [ConvoyPhase::Landing, ConvoyPhase::Failed, ConvoyPhase::Cancelled] {
+    for phase in [ConvoyPhase::Landing, ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Cancelled] {
         let authority_root = NodeId::new("convoy-authority");
         let checkout_root = NodeId::new("checkout-authority");
         let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(authority_root.clone());
@@ -446,7 +446,8 @@ async fn checkout_authority_observes_when_replicated_convoy_needs_terminal_evide
                     .name("remote-checkout".to_string())
                     .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "cross-host".to_string())]))
                     .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), "convoy-authority".to_string())]))
-                    .build(),
+                    .build()
+                    .with_lifecycle_authority(LifecycleAuthority::Adopted),
                 &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
                     repo_ref: RepositoryKey(repo_key(REPO_URL)),
                     env_ref: "host-direct-checkout-authority".to_string(),
