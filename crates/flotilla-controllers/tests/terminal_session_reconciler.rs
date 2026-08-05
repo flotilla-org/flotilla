@@ -16,14 +16,28 @@ use flotilla_resources::{
         run_transition_sequence, FixpointPredicate, LivenessEnrollment, LivenessScenario, LivenessStep, ReconcileStep, Transition,
         TransitionDriver, TransitionSequence, WorldBuilder,
     },
-    Convoy, ConvoyPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta, ResourceBackend,
-    ResourceError, ResourceObject, StatusPatch, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, VirtualClock, CONVOY_LABEL,
-    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
+    Convoy, ConvoyPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta,
+    LifecycleAuthority, ResourceBackend, ResourceError, ResourceObject, StatusPatch, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
+    VirtualClock, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
 };
 
 mod common;
 use common::{create_convoy_with_single_task, meta};
+
+async fn create_ready_environment(backend: &ResourceBackend, name: &str) {
+    let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
+    let environment = environments
+        .create(&meta(name), &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "01HXYZ".to_string(), repo_default_dir: "/workspace".to_string() }),
+            docker: None,
+        })
+        .await
+        .expect("create environment");
+    let mut status = EnvironmentStatus::default();
+    EnvironmentStatusPatch::MarkReady { docker_container_id: None, image_ref: None, image_digest: None }.apply(&mut status);
+    environments.update_status(name, &environment.metadata.resource_version, &status).await.expect("mark environment ready");
+}
 
 #[tokio::test]
 async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
@@ -87,6 +101,32 @@ impl TerminalRuntime for FailingTerminalRuntime {
     async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn terminal_session_is_reclaimed_when_its_environment_is_gone() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let session = backend
+        .clone()
+        .using::<TerminalSession>("flotilla")
+        .create(&meta("terminal-orphan").with_lifecycle_authority(LifecycleAuthority::Managed), &TerminalSessionSpec {
+            env_ref: "deleted-environment".to_string(),
+            role: "coder".to_string(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+            cwd: "/workspace".to_string(),
+            pool: "cleat".to_string(),
+        })
+        .await
+        .expect("create orphaned terminal session");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(RecordingTerminalRuntime::default()), backend, "flotilla");
+
+    let deps = reconciler.fetch_dependencies(&session).await.expect("missing environment should be lifecycle state");
+    let outcome = reconciler.reconcile(&session, &deps, Utc::now());
+
+    assert!(matches!(
+        outcome.actuations.as_slice(),
+        [Actuation::DeleteTerminalSession { name }] if name == "terminal-orphan"
+    ));
 }
 
 #[tokio::test]
@@ -164,6 +204,7 @@ impl TerminalRuntime for UnavailableRunningRuntime {
 #[tokio::test(start_paused = true)]
 async fn repeated_runtime_probe_failure_becomes_visible_and_stops_retrying() {
     let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
@@ -594,6 +635,7 @@ impl TerminalRuntime for TagRecordingRuntime {
 #[tokio::test]
 async fn a_disappeared_running_session_is_observed_as_stopped() {
     let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "implement", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
@@ -667,6 +709,7 @@ impl TerminalRuntime for MissingTerminalRuntime {
 #[tokio::test]
 async fn a_message_queued_during_startup_is_delivered_before_attention_observation() {
     let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
@@ -839,6 +882,7 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
 #[tokio::test]
 async fn stale_hook_attention_decays_to_unobservable_without_changing_phase() {
     let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
         .create(&meta("term-a"), &TerminalSessionSpec {

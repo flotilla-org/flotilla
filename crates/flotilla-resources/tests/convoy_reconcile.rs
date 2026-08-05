@@ -235,6 +235,55 @@ async fn convoy_finalizer_deletes_orphaned_terminal_sessions() {
     assert!(matches!(sessions.get("terminal-convoy-a-work-coder").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
 }
 
+#[tokio::test]
+async fn convoy_finalizer_waits_for_remote_checkout_authority() {
+    let authority = ResourceBackend::InMemory(InMemoryBackend::default());
+    let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoy =
+        authority.clone().using::<Convoy>("flotilla").create(&convoy_meta("convoy-a"), &valid_convoy_spec()).await.expect("create convoy");
+    let remote_checkouts = remote.clone().using::<Checkout>("flotilla");
+    remote_checkouts
+        .create(
+            &InputMeta::builder()
+                .name("checkout-convoy-a-feta".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Managed),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey("repo-a".to_string()),
+                env_ref: "host-direct-feta".to_string(),
+                r#ref: "feature/a".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/a".to_string(),
+                clone_ref: "clone-a".to_string(),
+            }),
+        )
+        .await
+        .expect("create remote checkout");
+    let remote_root = flotilla_protocol::NodeId::new("feta-root");
+    authority
+        .replica_writer::<Checkout>(remote_root.clone(), "flotilla")
+        .replace(&remote_checkouts.list().await.expect("list remote checkouts"), chrono::Utc::now())
+        .await
+        .expect("replicate checkout");
+    let reconciler = ConvoyReconciler::new(authority.clone().using::<WorkflowTemplate>("flotilla"))
+        .with_checkouts(authority.clone().using::<Checkout>("flotilla"))
+        .with_federated_checkouts(authority.clone().including_replicas::<Checkout>("flotilla"));
+
+    let error = reconciler.run_finalizer(&convoy).await.expect_err("remote checkout should hold convoy finalization");
+    assert!(error.to_string().contains("checkout-convoy-a-feta"));
+
+    authority
+        .replica_writer::<Checkout>(remote_root, "flotilla")
+        .replace(
+            &flotilla_resources::ResourceList { items: Vec::new(), resource_version: "2".to_string(), generation: None },
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("replicate remote checkout deletion");
+    reconciler.run_finalizer(&convoy).await.expect("finalizer should complete after authority cleanup");
+}
+
 fn vessel_meta(name: &str, convoy_name: &str, task: &str) -> InputMeta {
     let repository_key =
         flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository identity").key();

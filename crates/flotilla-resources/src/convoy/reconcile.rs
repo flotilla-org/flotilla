@@ -546,6 +546,20 @@ impl Reconciler for ConvoyReconciler {
         if let Some(checkouts) = &self.checkouts {
             delete_lifecycle_owned_matching(checkouts, &selector).await?;
         }
+        if let Some(checkouts) = &self.federated_checkouts {
+            let remaining = federated_children(checkouts, obj)
+                .await?
+                .into_values()
+                .filter(|checkout| checkout.metadata.lifecycle_authority() == Ok(Some(LifecycleAuthority::Managed)))
+                .map(|checkout| checkout.metadata.name)
+                .collect::<Vec<_>>();
+            if !remaining.is_empty() {
+                return Err(ResourceError::other(format!(
+                    "waiting for checkout authorities to finalize convoy children: {}",
+                    remaining.join(", ")
+                )));
+            }
+        }
         if let Some(collector) = &self.prepared_snapshot_gc {
             collector.collect(Some(&obj.metadata.name)).await?;
         }

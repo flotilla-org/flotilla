@@ -297,8 +297,11 @@ struct ResourceListArgs {
     /// Route the query to a peer host
     #[arg(long)]
     host: Option<String>,
-    /// Include read-only replicas from peer roots
+    /// Show only records authored by the queried host
     #[arg(long)]
+    local_only: bool,
+    /// Include read-only replicas from peer roots (the default)
+    #[arg(long, conflicts_with = "local_only")]
     include_replicas: bool,
 }
 
@@ -1085,7 +1088,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                         .kind(args.kind)
                         .namespace(args.namespace)
                         .maybe_node_id(node_id.clone())
-                        .include_replicas(args.include_replicas)
+                        .include_replicas(args.include_replicas || !args.local_only)
                         .build(),
                 )
                 .await
@@ -2093,8 +2096,29 @@ mod tests {
         assert!(matches!(
             list.command,
             Some(SubCommand::Resource {
-                command: ResourceSubCommand::List(ResourceListArgs { kind, namespace, host: Some(host), include_replicas: false })
+                command: ResourceSubCommand::List(ResourceListArgs {
+                    kind,
+                    namespace,
+                    host: Some(host),
+                    local_only: false,
+                    include_replicas: false,
+                })
             }) if kind == "convoys" && namespace == "flotilla" && host == "feta"
+        ));
+
+        let include_replicas = Cli::try_parse_from(["flotilla", "resource", "list", "hosts", "--include-replicas"])
+            .expect("legacy explicit replica selection should still parse");
+        assert!(matches!(
+            include_replicas.command,
+            Some(SubCommand::Resource {
+                command: ResourceSubCommand::List(ResourceListArgs {
+                    kind,
+                    namespace,
+                    host: None,
+                    local_only: false,
+                    include_replicas: true,
+                })
+            }) if kind == "hosts" && namespace == "flotilla"
         ));
 
         let get = Cli::try_parse_from(["flotilla", "resource", "get", "convoys", "demo", "--namespace", "ops"])
