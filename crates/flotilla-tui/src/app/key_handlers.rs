@@ -505,6 +505,7 @@ impl App {
                         inputs: Vec::new(),
                         instruction,
                         placement_policy: None,
+                        agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
                     }),
                 }));
@@ -525,6 +526,7 @@ impl App {
                             inputs: Vec::new(),
                             instruction: instruction.clone(),
                             placement_policy: None,
+                            agent_overrides: Vec::new(),
                             auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                         }),
                     });
@@ -560,6 +562,7 @@ impl App {
                         inputs: Vec::new(),
                         instruction,
                         placement_policy: None,
+                        agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
                     }),
                 }));

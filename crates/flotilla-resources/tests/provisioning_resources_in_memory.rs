@@ -153,13 +153,17 @@ async fn agent_terminal_session_preserves_structured_launch_and_canonical_brief(
         env_ref: "host-direct-dinghy".into(),
         role: "coder".into(),
         source: TerminalSessionSource::Agent {
-            selector: Selector { capability: "coding".into() },
+            selector: Selector::for_capability("coding"),
             brief: TerminalBrief {
                 path: ".flotilla/briefs/coder.md".into(),
                 content: "You are coder in convoy demo.\n\nImplement the change.".into(),
                 copies: Vec::new(),
             },
-            context: TerminalCrewContext { namespace: "flotilla".into(), convoy: "demo".into(), vessel_ref: "demo-implement".into() },
+            context: Box::new(TerminalCrewContext {
+                namespace: "flotilla".into(),
+                convoy: "demo".into(),
+                vessel_ref: "demo-implement".into(),
+            }),
             message: None,
         },
         cwd: "/workspace".into(),

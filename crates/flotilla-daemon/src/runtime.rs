@@ -2761,7 +2761,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let (command, mut env, crew, initial_message) = match &spec.source {
             TerminalSessionSource::Tool { command } => (command.clone(), Vec::new(), None, None),
             TerminalSessionSource::Agent { selector, brief, context, message } => {
-                let requirement = CapabilityTable::seeded().resolve(&selector.capability)?.clone();
+                let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
                 let adapter = registry
                     .agent_adapters
                     .get(&requirement.adapter)
@@ -2844,7 +2844,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let Some(activity) = session.screen_activity else { return Ok(None) };
         if activity == ScreenActivity::Stable {
             if let TerminalSessionSource::Agent { selector, .. } = &spec.source {
-                let requirement = CapabilityTable::seeded().resolve(&selector.capability)?.clone();
+                let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
                 let registry = self.registry_for_env(&spec.env_ref)?;
                 let adapter = registry
                     .agent_adapters
@@ -2907,7 +2907,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             return Ok(());
         };
         let registry = self.registry_for_env(&spec.env_ref)?;
-        let requirement = CapabilityTable::seeded().resolve(&selector.capability)?.clone();
+        let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
         let adapter = registry
             .agent_adapters
             .get(&requirement.adapter)
@@ -6946,17 +6946,17 @@ mod tests {
             env_ref: profile.host_direct_environment_name(),
             role: "coder".to_string(),
             source: TerminalSessionSource::Agent {
-                selector: Selector { capability: "coding".to_string() },
+                selector: Selector::for_capability("coding"),
                 brief: flotilla_resources::TerminalBrief {
                     path: ".flotilla/briefs/coder.md".to_string(),
                     content: "Implement the issue.".to_string(),
                     copies: vec![durable_checkout.display().to_string()],
                 },
-                context: flotilla_resources::TerminalCrewContext {
+                context: Box::new(flotilla_resources::TerminalCrewContext {
                     namespace: NAMESPACE.to_string(),
                     convoy: "demo".to_string(),
                     vessel_ref: "demo-implement".to_string(),
-                },
+                }),
                 message: None,
             },
             cwd: session_cwd.display().to_string(),
@@ -7060,17 +7060,17 @@ mod tests {
             env_ref: profile.host_direct_environment_name(),
             role: "coder".to_string(),
             source: TerminalSessionSource::Agent {
-                selector: Selector { capability: "coding".to_string() },
+                selector: Selector::for_capability("coding"),
                 brief: flotilla_resources::TerminalBrief {
                     path: ".flotilla/briefs/coder.md".to_string(),
                     content: "Implement the issue.".to_string(),
                     copies: Vec::new(),
                 },
-                context: flotilla_resources::TerminalCrewContext {
+                context: Box::new(flotilla_resources::TerminalCrewContext {
                     namespace: NAMESPACE.to_string(),
                     convoy: "demo".to_string(),
                     vessel_ref: "demo-work".to_string(),
-                },
+                }),
                 message: None,
             },
             cwd: "/workspace".to_string(),
@@ -7172,7 +7172,7 @@ mod tests {
                             CrewSpec::builder()
                                 .role("coder".to_string())
                                 .source(CrewSource::Agent {
-                                    selector: Selector { capability: "coding".to_string() },
+                                    selector: Selector::for_capability("coding"),
                                     prompt: Some(
                                         "Implement issue 668 without leaking this full brief into the launch command.".to_string(),
                                     ),
@@ -7182,7 +7182,7 @@ mod tests {
                             CrewSpec::builder()
                                 .role("reviewer".to_string())
                                 .source(CrewSource::Agent {
-                                    selector: Selector { capability: "review".to_string() },
+                                    selector: Selector::for_capability("review"),
                                     prompt: Some("Review the coder's work.".to_string()),
                                     brief_template: None,
                                 })
@@ -7568,7 +7568,7 @@ mod tests {
                         .crew(vec![CrewSpec::builder()
                             .role("architect".to_string())
                             .source(CrewSource::Agent {
-                                selector: Selector { capability: "architect".to_string() },
+                                selector: Selector::for_capability("architect"),
                                 prompt: None,
                                 brief_template: None,
                             })

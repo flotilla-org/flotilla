@@ -4240,12 +4240,53 @@ async fn validate_workflow_credentials(
     Ok(())
 }
 
+/// Write dispatch-time agent choices into the workflow spec that is about to
+/// be snapshotted, so every downstream consumer — placement validation, the
+/// vessel reconciler, terminal launch — reads the effective requirement from
+/// the selector itself. Loud on anything that cannot take effect: a
+/// capability named twice, or one no agent selector in the workflow carries.
+fn apply_agent_overrides(workflow: &mut WorkflowTemplateSpec, overrides: &[flotilla_protocol::AgentOverride]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for choice in overrides {
+        if !seen.insert(choice.capability.as_str()) {
+            return Err(format!("duplicate --agent override for capability `{}`", choice.capability));
+        }
+        let mut matched = false;
+        for crew in workflow.vessels.iter_mut().flat_map(|vessel| &mut vessel.crew) {
+            if let CrewSource::Agent { selector, .. } = &mut crew.source {
+                if selector.capability == choice.capability {
+                    selector.adapter = Some(choice.adapter.clone());
+                    selector.model = choice.model.clone();
+                    matched = true;
+                }
+            }
+        }
+        if !matched {
+            let available = workflow
+                .vessels
+                .iter()
+                .flat_map(|vessel| &vessel.crew)
+                .filter_map(|crew| match &crew.source {
+                    CrewSource::Agent { selector, .. } => Some(selector.capability.as_str()),
+                    CrewSource::Tool { .. } => None,
+                })
+                .collect::<BTreeSet<_>>();
+            return Err(format!(
+                "--agent override names capability `{}`, but this workflow's agent capabilities are: {}",
+                choice.capability,
+                available.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn required_workflow_agent_adapters(workflow: &WorkflowTemplateSpec) -> Result<BTreeSet<String>, String> {
     let capabilities = CapabilityTable::seeded();
     let mut required_adapters = BTreeSet::new();
     for crew in workflow.vessels.iter().flat_map(|vessel| &vessel.crew) {
         if let CrewSource::Agent { selector, .. } = &crew.source {
-            required_adapters.insert(capabilities.resolve(&selector.capability)?.adapter.clone());
+            required_adapters.insert(capabilities.resolve_selector(selector)?.adapter);
         }
     }
     Ok(required_adapters)
@@ -4490,6 +4531,7 @@ impl InProcessDaemon {
             .get(&workflow_ref)
             .await
             .map_err(|error| format!("workflow template {workflow_ref}: {error}"))?;
+        apply_agent_overrides(&mut workflow.spec, &intent.agent_overrides)?;
         validate_fork_workflow_admission(&self.resource_backend, namespace, &repositories, &workflow_ref, &workflow.spec).await?;
         resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), &repositories, &mut workflow.spec).await?;
 
@@ -7061,11 +7103,11 @@ impl InProcessDaemon {
                         source: TerminalSessionSource::Agent {
                             selector: selector.clone(),
                             brief,
-                            context: TerminalCrewContext {
+                            context: Box::new(TerminalCrewContext {
                                 namespace: context.namespace.clone(),
                                 convoy: context.convoy.clone(),
                                 vessel_ref: context.vessel_ref.clone(),
-                            },
+                            }),
                             message: Some(pending_crew_message(&delivered_message)),
                         },
                         cwd: anchor.spec.cwd,

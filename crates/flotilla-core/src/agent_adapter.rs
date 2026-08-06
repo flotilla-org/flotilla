@@ -346,6 +346,23 @@ impl CapabilityTable {
     pub fn resolve(&self, capability: &str) -> Result<&AgentRequirement, String> {
         self.requirements.get(capability).ok_or_else(|| format!("unknown agent capability `{capability}`"))
     }
+
+    /// Resolve a workflow selector to its effective requirement.
+    ///
+    /// A selector carrying a dispatch-time `adapter` override wins outright —
+    /// its `model` (or none) rides with it, never the table's, since a model
+    /// name only makes sense against the harness it was chosen for. An
+    /// adapter-less `model` override reskins the table's adapter. A selector
+    /// with an explicit adapter does not need its capability in the table:
+    /// the capability is then template vocabulary, and the admitted-vocabulary
+    /// check that matters (adapter availability) happens at placement.
+    pub fn resolve_selector(&self, selector: &flotilla_resources::Selector) -> Result<AgentRequirement, String> {
+        if let Some(adapter) = &selector.adapter {
+            return Ok(AgentRequirement { adapter: adapter.clone(), model: selector.model.clone() });
+        }
+        let seeded = self.resolve(&selector.capability)?;
+        Ok(AgentRequirement { adapter: seeded.adapter.clone(), model: selector.model.clone().or_else(|| seeded.model.clone()) })
+    }
 }
 
 impl Default for CapabilityTable {
@@ -1037,6 +1054,42 @@ mod tests {
         assert_eq!(table.resolve("code-review").expect("example review alias").adapter, "claude-code");
 
         assert_eq!(table.resolve("architect").expect_err("unknown capability must fail"), "unknown agent capability `architect`");
+    }
+
+    #[test]
+    fn selector_resolution_lets_dispatch_overrides_win_over_the_seeded_table() {
+        let table = CapabilityTable::seeded();
+
+        let plain = table.resolve_selector(&flotilla_resources::Selector::for_capability("code")).expect("seeded fallback");
+        assert_eq!((plain.adapter.as_str(), plain.model.as_deref()), ("codex", None));
+
+        let mut overridden = flotilla_resources::Selector::for_capability("code");
+        overridden.adapter = Some("claude-code".to_string());
+        overridden.model = Some("opus".to_string());
+        let requirement = table.resolve_selector(&overridden).expect("adapter override");
+        assert_eq!((requirement.adapter.as_str(), requirement.model.as_deref()), ("claude-code", Some("opus")));
+
+        // An adapter override never inherits the table's model — a model name
+        // only means something against the harness it was chosen for.
+        let mut review = flotilla_resources::Selector::for_capability("review");
+        review.adapter = Some("codex".to_string());
+        let requirement = table.resolve_selector(&review).expect("adapter override without model");
+        assert_eq!((requirement.adapter.as_str(), requirement.model.as_deref()), ("codex", None));
+
+        let mut reskinned = flotilla_resources::Selector::for_capability("review");
+        reskinned.model = Some("sonnet".to_string());
+        let requirement = table.resolve_selector(&reskinned).expect("model-only override");
+        assert_eq!((requirement.adapter.as_str(), requirement.model.as_deref()), ("claude-code", Some("sonnet")));
+
+        // With an explicit adapter the capability is template vocabulary only;
+        // without one, unknown capabilities stay loud.
+        let mut novel = flotilla_resources::Selector::for_capability("architect");
+        novel.adapter = Some("claude-code".to_string());
+        assert!(table.resolve_selector(&novel).is_ok());
+        assert_eq!(
+            table.resolve_selector(&flotilla_resources::Selector::for_capability("architect")).expect_err("unknown must fail"),
+            "unknown agent capability `architect`"
+        );
     }
 
     #[tokio::test]

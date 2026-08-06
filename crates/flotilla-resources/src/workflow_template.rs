@@ -240,6 +240,21 @@ pub enum CrewSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selector {
     pub capability: String,
+    /// Dispatch-time harness override. Templates never set this — it is
+    /// written into the convoy's workflow snapshot at admission from the
+    /// dispatcher's `--agent` choice, so downstream consumers read the
+    /// effective requirement without threading convoy state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+    /// Dispatch-time model override; meaningful with or without `adapter`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl Selector {
+    pub fn for_capability(capability: impl Into<String>) -> Self {
+        Self { capability: capability.into(), adapter: None, model: None }
+    }
 }
 
 pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
@@ -250,7 +265,7 @@ pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
             .stance(Stance::Contained)
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
-                .source(CrewSource::Agent { selector: Selector { capability: "code".to_string() }, prompt: None, brief_template: None })
+                .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
                 .build()])
             .build()])
         .build()
@@ -268,7 +283,7 @@ pub fn single_agent_trusted_workflow_spec() -> WorkflowTemplateSpec {
             .stance(Stance::Trusted)
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
-                .source(CrewSource::Agent { selector: Selector { capability: "code".to_string() }, prompt: None, brief_template: None })
+                .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
                 .build()])
             .build()])
         .build()
@@ -283,7 +298,7 @@ pub fn single_agent_shepherd_workflow_spec() -> WorkflowTemplateSpec {
             .crew(vec![CrewSpec::builder()
                 .role("shepherd".to_string())
                 .source(CrewSource::Agent {
-                    selector: Selector { capability: "code".to_string() },
+                    selector: Selector::for_capability("code"),
                     prompt: None,
                     brief_template: Some("shepherd".to_string()),
                 })
@@ -301,7 +316,7 @@ pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
                 .source(CrewSource::Agent {
-                    selector: Selector { capability: "code".to_string() },
+                    selector: Selector::for_capability("code"),
                     prompt: None,
                     brief_template: Some("interactive-session".to_string()),
                 })
@@ -319,12 +334,12 @@ pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
             .crew(vec![
                 CrewSpec::builder()
                     .role("coder".to_string())
-                    .source(CrewSource::Agent { selector: Selector { capability: "code".to_string() }, prompt: None, brief_template: None })
+                    .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
                     .build(),
                 CrewSpec::builder()
                     .role("reviewer".to_string())
                     .source(CrewSource::Agent {
-                        selector: Selector { capability: "code-review".to_string() },
+                        selector: Selector::for_capability("code-review"),
                         prompt: None,
                         brief_template: Some("diff-review".to_string()),
                     })
@@ -702,7 +717,7 @@ mod tests {
     }
 
     fn agent(capability: &str) -> CrewSource {
-        CrewSource::Agent { selector: Selector { capability: capability.to_string() }, prompt: None, brief_template: None }
+        CrewSource::Agent { selector: Selector::for_capability(capability.to_string()), prompt: None, brief_template: None }
     }
 
     #[test]
@@ -745,7 +760,7 @@ mod tests {
                         CrewSpec::builder()
                             .role("coder".to_string())
                             .source(CrewSource::Agent {
-                                selector: Selector { capability: "code".to_string() },
+                                selector: Selector::for_capability("code"),
                                 prompt: Some("Implement {{inputs.feature}} for {{workflow.name}}".to_string()),
                                 brief_template: None,
                             })
@@ -762,7 +777,7 @@ mod tests {
                     .crew(vec![CrewSpec::builder()
                         .role("reviewer".to_string())
                         .source(CrewSource::Agent {
-                            selector: Selector { capability: "code-review".to_string() },
+                            selector: Selector::for_capability("code-review"),
                             prompt: Some("Review {{workflow.namespace}}".to_string()),
                             brief_template: None,
                         })
@@ -825,7 +840,7 @@ mod tests {
     fn validate_rejects_unknown_input_references() {
         let mut spec = valid_spec();
         spec.vessels[0].crew[0].source = CrewSource::Agent {
-            selector: Selector { capability: "code".to_string() },
+            selector: Selector::for_capability("code"),
             prompt: Some("Implement {{inputs.branch}}".to_string()),
             brief_template: None,
         };
@@ -845,7 +860,7 @@ mod tests {
     fn validate_rejects_unknown_workflow_fields() {
         let mut spec = valid_spec();
         spec.vessels[0].crew[0].source = CrewSource::Agent {
-            selector: Selector { capability: "code".to_string() },
+            selector: Selector::for_capability("code"),
             prompt: Some("Implement {{workflow.uid}}".to_string()),
             brief_template: None,
         };
@@ -865,7 +880,7 @@ mod tests {
     fn validate_rejects_malformed_owned_interpolations() {
         let mut spec = valid_spec();
         spec.vessels[0].crew[0].source = CrewSource::Agent {
-            selector: Selector { capability: "code".to_string() },
+            selector: Selector::for_capability("code"),
             prompt: Some("Implement {{inputs.feature }} and {{workflow.name.extra}}".to_string()),
             brief_template: None,
         };
