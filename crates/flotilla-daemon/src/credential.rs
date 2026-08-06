@@ -162,14 +162,15 @@ impl CredentialStore {
         credential_refs: &BTreeSet<String>,
         environment: &BTreeMap<String, String>,
     ) -> Result<Vec<Fragment>, String> {
-        if environment.contains_key("CODEX_HOME") {
-            return Ok(Vec::new());
-        }
         let mut fragments = Vec::new();
         for name in credential_refs {
             let spec = self.spec(name).await?;
-            if matches!(spec.consumer, CredentialConsumer::Codex) {
-                fragments.push(codex_home_fragment(name));
+            match spec.consumer {
+                CredentialConsumer::Codex if !environment.contains_key("CODEX_HOME") => fragments.push(codex_home_fragment(name)),
+                CredentialConsumer::ClaudeOauth { .. } if !environment.contains_key("CLAUDE_CONFIG_DIR") => {
+                    fragments.push(claude_config_dir_fragment(name))
+                }
+                _ => {}
             }
         }
         Ok(fragments)
@@ -675,6 +676,66 @@ impl CredentialStore {
                 }
                 env.insert("ANTHROPIC_API_KEY".to_string(), material.to_string());
             }
+            // Subscription OAuth material (a `claude setup-token` long-lived
+            // token) is delivered per-process through `CLAUDE_CODE_OAUTH_TOKEN`
+            // — no login transformation exists or is needed, and one mint
+            // serves N crews (ADR 0022 amendment). A per-credential
+            // `CLAUDE_CONFIG_DIR` slot is delivered alongside it even though
+            // the crew adapter's `--settings` overlay already isolates hooks:
+            // the overlay does not isolate the per-config-dir singleton
+            // supervisor (which captures its environment from the first shell
+            // that uses it, so a shared dir would serve crew A's dispatches
+            // with crew B's credentials), the mutable `.claude.json` blob
+            // (lost writes observed in practice), or an ambient `apiKeyHelper`
+            // whose precedence outranks `CLAUDE_CODE_OAUTH_TOKEN` and would
+            // silently override the delivered identity. The slot is keyed by
+            // credential name, so two claude accounts coexist the same way two
+            // codex homes do. See
+            // docs/research/2026-07-28-multi-crew-agent-config-seeding.md.
+            CredentialConsumer::ClaudeOauth { .. } => {
+                if !runner.exists("claude", &["--version"]).await {
+                    return Err("consumer binary is unavailable".to_string());
+                }
+                let config_dir_fragment = claude_config_dir_fragment(name);
+                let config_dir = config_dir_fragment.value;
+                if !already_prepared {
+                    runner
+                        .run("mkdir", &["-p", &config_dir], Path::new("/"), &ChannelLabel::Noop)
+                        .await
+                        .map_err(|error| format!("create writable config directory: {error}"))?;
+                    // Preflight: a trivial `claude -p` request under the token.
+                    // There is no documented headless status command and no
+                    // documented HTTP endpoint that accepts subscription OAuth
+                    // tokens (the `/v1/models` x-api-key probe used for the
+                    // API-key adapter takes API keys, not OAuth bearers), so
+                    // the cheapest reliable probe is the CLI itself on exactly
+                    // the path the crew will use — a dead token fails the
+                    // request loudly in print mode. `ANTHROPIC_AUTH_TOKEN` and
+                    // `ANTHROPIC_API_KEY` are unset and the empty
+                    // per-credential config dir excludes any ambient
+                    // `apiKeyHelper`, since each of those outranks
+                    // `CLAUDE_CODE_OAUTH_TOKEN` and would mask a dead token
+                    // (the stored ambient login ranks below it, so it cannot).
+                    runner
+                        .run_with_input(
+                            "sh",
+                            &[
+                                "-c",
+                                "IFS= read -r token; unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; \
+                                 CLAUDE_CODE_OAUTH_TOKEN=\"$token\" CLAUDE_CONFIG_DIR=\"$1\" claude -p ok",
+                                "flotilla-claude-oauth-preflight",
+                                &config_dir,
+                            ],
+                            Path::new("/"),
+                            &ChannelLabel::Noop,
+                            material.as_bytes(),
+                        )
+                        .await
+                        .map_err(|error| format!("subscription token preflight failed: {error}"))?;
+                }
+                env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), material.to_string());
+                env.insert("CLAUDE_CONFIG_DIR".to_string(), config_dir);
+            }
             CredentialConsumer::Codex => {
                 let codex_home_fragment = codex_home_fragment(name);
                 let codex_home = codex_home_fragment.value;
@@ -731,6 +792,14 @@ fn codex_home_fragment(credential_name: &str) -> Fragment {
         "CODEX_HOME",
         format!("/run/flotilla/credentials/{}/codex", safe_component(credential_name)),
         format!("credential/codex {credential_name}"),
+    )
+}
+
+fn claude_config_dir_fragment(credential_name: &str) -> Fragment {
+    agent_environment_fragment(
+        "CLAUDE_CONFIG_DIR",
+        format!("/run/flotilla/credentials/{}/claude", safe_component(credential_name)),
+        format!("credential/claude-oauth {credential_name}"),
     )
 }
 
@@ -1043,6 +1112,169 @@ interactions:
         }));
         assert!(calls.iter().any(|(cmd, args, _)| cmd == "sh" && args.iter().any(|arg| arg.contains("codex login status"))));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
+    }
+
+    async fn create_claude_oauth_spec(backend: &ResourceBackend, name: &str, account_email: &str, source_env: &str) {
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name(name.to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::ClaudeOauth { account_email: account_email.to_string() },
+                source: CredentialSource::Env { name: source_env.to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create credential declaration");
+    }
+
+    #[tokio::test]
+    async fn claude_oauth_material_is_delivered_as_env_token_with_an_isolated_config_dir() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
+        let secret = "sk-ant-oat01-test-token-never-in-argv";
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_CLAUDE_TOKEN".to_string(), secret.to_string())])));
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+        let credential_refs = BTreeSet::from(["claude-max".to_string()]);
+
+        assert_eq!(store.vessel_config_fragments(&credential_refs, &BTreeMap::new()).await.expect("Claude fragment").len(), 1);
+        assert!(store
+            .vessel_config_fragments(&credential_refs, &BTreeMap::from([("CLAUDE_CONFIG_DIR".to_string(), "/image/claude".to_string())]))
+            .await
+            .expect("explicit Claude config dir")
+            .is_empty());
+
+        let delivered = store.prepare("env-a", &credential_refs, runner.clone()).await.expect("prepare claude-oauth credential");
+
+        assert_eq!(delivered, vec![
+            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), secret.to_string()),
+            ("CLAUDE_CONFIG_DIR".to_string(), "/run/flotilla/credentials/claude-max/claude".to_string()),
+        ]);
+        let calls = runner.calls.lock().expect("calls lock");
+        assert!(calls.iter().any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/run/flotilla/credentials/claude-max/claude"]));
+        assert!(calls.iter().any(|(cmd, args, input)| {
+            cmd == "sh"
+                && args.iter().any(|arg| arg.contains("unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN"))
+                && args.iter().any(|arg| arg.contains("CLAUDE_CODE_OAUTH_TOKEN=\"$token\"") && arg.contains("claude -p"))
+                && args.iter().any(|arg| arg == "/run/flotilla/credentials/claude-max/claude")
+                && input == secret.as_bytes()
+        }));
+        assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
+    }
+
+    #[tokio::test]
+    async fn two_claude_accounts_coexist_across_environments_but_never_share_one() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_claude_oauth_spec(&backend, "claude-alice", "alice@example.com", "TEST_CLAUDE_TOKEN_A").await;
+        create_claude_oauth_spec(&backend, "claude-bob", "bob@example.com", "TEST_CLAUDE_TOKEN_B").await;
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("claude-api".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::Claude,
+                source: CredentialSource::Env { name: "TEST_ANTHROPIC_KEY".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create API-key credential declaration");
+        let env = Arc::new(TestEnv(BTreeMap::from([
+            ("TEST_CLAUDE_TOKEN_A".to_string(), "token-alice".to_string()),
+            ("TEST_CLAUDE_TOKEN_B".to_string(), "token-bob".to_string()),
+            ("TEST_ANTHROPIC_KEY".to_string(), "api-key".to_string()),
+        ])));
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+
+        let alice: BTreeMap<String, String> = store
+            .prepare("env-a", &BTreeSet::from(["claude-alice".to_string()]), runner.clone())
+            .await
+            .expect("prepare alice")
+            .into_iter()
+            .collect();
+        let bob: BTreeMap<String, String> = store
+            .prepare("env-b", &BTreeSet::from(["claude-bob".to_string()]), runner.clone())
+            .await
+            .expect("prepare bob")
+            .into_iter()
+            .collect();
+
+        assert_eq!(alice.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-alice".to_string()));
+        assert_eq!(bob.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-bob".to_string()));
+        assert_ne!(alice.get("CLAUDE_CONFIG_DIR"), bob.get("CLAUDE_CONFIG_DIR"), "accounts must not share supervisor state");
+
+        let error = store
+            .prepare("env-c", &BTreeSet::from(["claude-alice".to_string(), "claude-bob".to_string()]), runner.clone())
+            .await
+            .expect_err("two OAuth credentials in one environment would clobber CLAUDE_CODE_OAUTH_TOKEN");
+        assert!(error.contains("multiple granted credentials use this adapter"), "unexpected error: {error}");
+        let error = store
+            .prepare("env-d", &BTreeSet::from(["claude-alice".to_string(), "claude-api".to_string()]), runner.clone())
+            .await
+            .expect_err("ANTHROPIC_API_KEY outranks CLAUDE_CODE_OAUTH_TOKEN, so mixing them would silently drop the OAuth identity");
+        assert!(error.contains("multiple granted credentials use this adapter"), "unexpected error: {error}");
+    }
+
+    struct DeadTokenRunner {
+        inner: RecordingRunner,
+        secret: String,
+    }
+
+    #[async_trait]
+    impl CommandRunner for DeadTokenRunner {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            self.inner.run(cmd, args, cwd, label).await
+        }
+
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            self.inner.run_output(cmd, args, cwd, label).await
+        }
+
+        async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+            self.inner.run_with_input(cmd, args, cwd, label, input).await?;
+            if args.iter().any(|arg| arg.contains("claude -p")) {
+                return Err(format!("Login expired for {} · Please run /login", self.secret));
+            }
+            Ok(String::new())
+        }
+
+        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+            self.inner.exists(cmd, args).await
+        }
+
+        async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+            self.inner.write_file(path, content).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dead_claude_oauth_token_fails_preparation_loudly_without_leaking_material() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
+        let secret = "sk-ant-oat01-expired-token";
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_CLAUDE_TOKEN".to_string(), secret.to_string())])));
+        let runner = Arc::new(DeadTokenRunner { inner: RecordingRunner::default(), secret: secret.to_string() });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+        let credential_refs = BTreeSet::from(["claude-max".to_string()]);
+
+        let error = store.prepare("env-a", &credential_refs, runner.clone()).await.expect_err("a dead token must fail preparation");
+
+        assert!(error.contains("credential `claude-max` adapter `claude-oauth`"), "unexpected error: {error}");
+        assert!(error.contains("preflight failed"), "unexpected error: {error}");
+        assert!(!error.contains(secret), "material must be redacted: {error}");
+        assert!(error.contains("[redacted]"), "unexpected error: {error}");
+
+        store.prepare("env-a", &credential_refs, runner.clone()).await.expect_err("a dead token must fail again, not be cached");
+        let calls = runner.inner.calls.lock().expect("calls lock");
+        assert_eq!(
+            calls.iter().filter(|(cmd, args, _)| cmd == "sh" && args.iter().any(|arg| arg.contains("claude -p"))).count(),
+            2,
+            "failed preparation must not mark the credential prepared"
+        );
     }
 
     #[tokio::test]
