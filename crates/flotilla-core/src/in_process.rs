@@ -4271,6 +4271,12 @@ fn apply_agent_overrides(workflow: &mut WorkflowTemplateSpec, overrides: &[floti
                     CrewSource::Tool { .. } => None,
                 })
                 .collect::<BTreeSet<_>>();
+            if available.is_empty() {
+                return Err(format!(
+                    "--agent override names capability `{}`, but this workflow has no agent crew to override",
+                    choice.capability
+                ));
+            }
             return Err(format!(
                 "--agent override names capability `{}`, but this workflow's agent capabilities are: {}",
                 choice.capability,
