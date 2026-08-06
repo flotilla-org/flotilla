@@ -7,9 +7,10 @@ use flotilla_core::checkout_integration::{
 };
 use flotilla_resources::{
     controller::{Actuation, ReconcileOutcome, Reconciler, ReplicaConvoyCheckoutWatch, SecondaryWatch},
-    Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, Clock,
-    Clone, ClonePhase, Convoy, ConvoyPhase, IntegrationCondition, LifecycleAuthority, ReplicaReadResolver, Resource, ResourceBackend,
-    ResourceError, ResourceObject, ResourceProvenance, SystemClock, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
+    CheckoutStatus, CheckoutStatusPatch, Clock, Clone, ClonePhase, Convoy, ConvoyPhase, IntegrationCondition, LifecycleAuthority,
+    ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SystemClock, TypedResolver,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
 use tracing::warn;
 
@@ -182,11 +183,6 @@ fn convoy_needs_terminal_evidence(convoy: Option<&ResourceObject<Convoy>>) -> bo
     })
 }
 
-fn convoy_authorizes_checkout_reclaim(convoy: &ResourceObject<Convoy>) -> bool {
-    convoy.metadata.deletion_timestamp.is_some()
-        || convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landed | ConvoyPhase::Abandoned))
-}
-
 impl<R> Reconciler for CheckoutReconciler<R>
 where
     R: CheckoutRuntime + 'static,
@@ -201,7 +197,7 @@ where
         let convoy = self.owning_convoy(obj).await?;
         if lifecycle_authority == Some(LifecycleAuthority::Managed)
             && has_convoy_owner
-            && convoy.as_ref().is_some_and(convoy_authorizes_checkout_reclaim)
+            && convoy.as_ref().is_some_and(convoy_sanctions_checkout_reclaim)
         {
             return Ok(CheckoutDeps::OwnerTerminal);
         }

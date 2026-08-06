@@ -524,11 +524,19 @@ impl Reconciler for ConvoyReconciler {
             LifecycleConditions { exit_disposition: deps.exit_disposition.clone(), reclaim_eligible: deps.reclaim_eligible },
             now,
         );
+        // A refused reclaim must retry on its own schedule: the refusal is
+        // often transient (integration evidence mid-refresh, a checkout
+        // cascade in flight) and no watch event is guaranteed to arrive once
+        // the convoy is terminal. Retry at the evidence-staleness horizon —
+        // the freshness the gate is waiting on.
+        let reclaim_refused = self.teardown_runtime.is_some()
+            && obj.status.as_ref().is_some_and(|status| status.phase.is_terminal())
+            && !deps.reclaim_eligible;
         ControllerReconcileOutcome {
             patch: outcome.patch,
             actuations: outcome.actuations,
             events: outcome.events.into_iter().map(|event| format!("{event:?}")).collect(),
-            requeue_after: None,
+            requeue_after: reclaim_refused.then_some(self.landing_evidence_stale_after),
         }
     }
 

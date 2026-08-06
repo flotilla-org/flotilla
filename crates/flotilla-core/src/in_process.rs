@@ -6907,12 +6907,20 @@ impl InProcessDaemon {
         if expected.is_empty() {
             return Ok(());
         }
+        // Once the convoy sanctions checkout reclaim (Landed, or the convoy is
+        // being deleted), the checkout authority's `OwnerTerminal` cascade may
+        // legitimately collect an expected checkout before this gate runs. An
+        // absent or already-deleting expected checkout under that sanction is
+        // evidence of completed reclaim, not missing evidence — refusing here
+        // would wedge vessel reclaim forever on a deletion the substrate itself
+        // authorized. Outside the sanction, absence stays a hard refusal.
+        let reclaim_sanctioned = flotilla_resources::convoy_sanctions_checkout_reclaim(convoy);
         let missing = expected
             .iter()
             .filter(|checkout_name| !checkout_list.iter().any(|checkout| &checkout.metadata.name == *checkout_name))
             .cloned()
             .collect::<Vec<_>>();
-        if !missing.is_empty() {
+        if !missing.is_empty() && !reclaim_sanctioned {
             return Err(format!(
                 "convoy {namespace}/{name} is not safe to delete: missing checkout integration evidence for {}",
                 missing.join(", ")
@@ -6920,7 +6928,11 @@ impl InProcessDaemon {
         }
 
         let mut refusals = Vec::new();
-        for checkout in checkout_list.iter().filter(|checkout| expected.contains(&checkout.metadata.name)) {
+        for checkout in checkout_list
+            .iter()
+            .filter(|checkout| expected.contains(&checkout.metadata.name))
+            .filter(|checkout| !(reclaim_sanctioned && checkout.metadata.deletion_timestamp.is_some()))
+        {
             let is_adopted = checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted);
             let Some(integration) = checkout.status.as_ref().map(|status| &status.integration) else {
                 refusals.push(format!("{}: integration evidence is missing", checkout.metadata.name));

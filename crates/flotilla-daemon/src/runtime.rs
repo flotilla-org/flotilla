@@ -3025,18 +3025,19 @@ mod tests {
     };
     use flotilla_resources::{
         api_version,
-        controller::Reconciler,
+        controller::{Actuation, Reconciler},
         test_support::{
             run_transition_sequence, FixpointPredicate, LivenessEnrollment, LivenessScenario, LivenessStep, ReconcileStep, Transition,
             TransitionDriver, TransitionSequence, WorldBuilder,
         },
         Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec, CheckoutSpec as ResourceCheckoutSpec,
-        CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer,
-        CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
-        CrewSource, CrewSpec, LifecycleAuthority, MaterialPoolSpec, MaterialPoolUnitSpec,
-        ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec, Resource, Selector, SqliteBackend,
-        TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, VesselStatus, VirtualClock, WorkPhase,
-        WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION,
+        CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
+        CredentialConsumer, CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
+        CredentialSpecSpec, CrewSource, CrewSpec, LifecycleAuthority, MaterialPoolSpec, MaterialPoolUnitSpec,
+        ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementStatus, RepositoryKey, RepositorySpec, Resource,
+        Selector, SqliteBackend, TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, VesselSpec,
+        VesselStatus, VirtualClock, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION,
+        CONVOY_LABEL,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
@@ -3140,6 +3141,140 @@ mod tests {
             "demand must preserve the checkout-specific refusal: {:?}",
             demands[0].metadata.annotations
         );
+    }
+
+    fn landed_status_with_placed_checkout(checkout_name: &str) -> ConvoyStatus {
+        ConvoyStatus {
+            phase: ConvoyPhase::Landed,
+            observed_workflow_ref: Some("wf-a".to_string()),
+            work: BTreeMap::from([(
+                "implement".to_string(),
+                WorkState::builder()
+                    .phase(WorkPhase::Complete)
+                    .placement(PlacementStatus {
+                        fields: BTreeMap::from([(
+                            "checkout_refs".to_string(),
+                            serde_json::json!(BTreeMap::from([(RepositoryKey("repo-a".to_string()), checkout_name.to_string())])),
+                        )]),
+                    })
+                    .build(),
+            )]),
+            ..Default::default()
+        }
+    }
+
+    /// #1413 leg 1: once the convoy is Landed, the checkout authority's
+    /// `OwnerTerminal` cascade may collect the managed checkout before the
+    /// convoy's own reclaim pass runs. That sanctioned absence is evidence of
+    /// completed reclaim, never "missing checkout integration evidence" —
+    /// outside the sanction (Failed) absence must keep refusing.
+    #[tokio::test]
+    async fn landed_convoy_reclaim_accepts_sanctioned_checkout_absence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let daemon = InProcessDaemon::new(vec![], config, git_process_discovery(false), HostName::local()).await;
+        let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
+        let created = convoys
+            .create(
+                &InputMeta::builder().name("raced".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("wf-a".to_string()).build(),
+            )
+            .await
+            .expect("create convoy");
+        convoys
+            .update_status("raced", &created.metadata.resource_version, &landed_status_with_placed_checkout("checkout-raced"))
+            .await
+            .expect("mark convoy Landed");
+        let convoy = convoys.get("raced").await.expect("get convoy");
+        let runtime = DaemonConvoyTeardownRuntime::new(Arc::clone(&daemon));
+
+        runtime.verify_reclaim(&convoy, &[]).await.expect("absence of a collected checkout must pass the Landed reclaim gate");
+
+        let checkouts = daemon.resource_backend().using::<ResourceCheckout>(NAMESPACE);
+        checkouts
+            .create(
+                &InputMeta::builder()
+                    .name("checkout-raced".to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "raced".to_string())]))
+                    .finalizers(vec!["checkout".to_string()])
+                    .build()
+                    .with_lifecycle_authority(LifecycleAuthority::Managed),
+                &ResourceCheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                    repo_ref: RepositoryKey("repo-a".to_string()),
+                    env_ref: "host-direct-test".to_string(),
+                    r#ref: "feature/raced".to_string(),
+                    base_ref: Some("main".to_string()),
+                    target_path: "/checkouts/raced".to_string(),
+                    clone_ref: "clone-a".to_string(),
+                }),
+            )
+            .await
+            .expect("create managed checkout");
+        checkouts.delete("checkout-raced").await.expect("request checkout deletion");
+        let deleting = checkouts.get("checkout-raced").await.expect("deleting checkout persists under its finalizer");
+        assert!(deleting.metadata.deletion_timestamp.is_some(), "finalizer must hold the deleting checkout");
+        runtime.verify_reclaim(&convoy, &[deleting]).await.expect("a checkout already being collected must not refuse reclaim");
+
+        let mut failed = convoy.clone();
+        failed.status.as_mut().expect("status").phase = ConvoyPhase::Failed;
+        let refusal = runtime.verify_reclaim(&failed, &[]).await.expect_err("unsanctioned absence must still refuse reclaim");
+        assert!(refusal.contains("missing checkout integration evidence"), "refusal must keep naming the missing evidence: {refusal}");
+    }
+
+    /// #1413: pins the cross-controller race itself — the checkout is gone
+    /// before the convoy's reclaim pass, and the convoy must still reclaim its
+    /// vessels instead of wedging forever on the deleted evidence.
+    #[tokio::test]
+    async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout_first() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let daemon = InProcessDaemon::new(vec![], config, git_process_discovery(false), HostName::local()).await;
+        let backend = daemon.resource_backend();
+        let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        let vessels = backend.clone().using::<Vessel>(NAMESPACE);
+        let created = convoys
+            .create(
+                &InputMeta::builder().name("raced".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("wf-a".to_string()).build(),
+            )
+            .await
+            .expect("create convoy");
+        convoys
+            .update_status("raced", &created.metadata.resource_version, &landed_status_with_placed_checkout("checkout-raced"))
+            .await
+            .expect("mark convoy Landed");
+        vessels
+            .create(
+                &InputMeta::builder()
+                    .name("raced-implement".to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "raced".to_string())]))
+                    .build(),
+                &VesselSpec {
+                    convoy_ref: "raced".to_string(),
+                    vessel_name: "implement".to_string(),
+                    placement_policy_ref: "host-direct-test".to_string(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
+            .await
+            .expect("create vessel");
+
+        // The checkout authority's `OwnerTerminal` cascade already collected
+        // the managed checkout: no checkout record exists for this pass.
+        let reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(NAMESPACE))
+            .with_vessels(vessels)
+            .with_checkouts(backend.clone().using::<ResourceCheckout>(NAMESPACE))
+            .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(Arc::clone(&daemon))));
+        let convoy = convoys.get("raced").await.expect("get convoy");
+        let deps = reconciler.fetch_dependencies(&convoy).await.expect("fetch dependencies");
+        let outcome = reconciler.reconcile(&convoy, &deps, Utc::now());
+
+        assert!(
+            outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == "raced-implement")),
+            "convoy must still reclaim its vessels after the checkout was collected first: {:?}",
+            outcome.actuations
+        );
+        assert_eq!(outcome.requeue_after, None, "a successful reclaim pass must not keep requeueing");
     }
 
     #[test]

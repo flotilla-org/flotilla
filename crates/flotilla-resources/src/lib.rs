@@ -53,11 +53,11 @@ pub use clock::VirtualClock;
 pub use clock::{Clock, SystemClock};
 pub use clone::{Clone, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use convoy::{
-    bound_change_request_record_name, controller_patches, evaluate_landing_settlement, expected_change_request_leaves,
-    expected_checkout_refs, external_patches, instantiate_exit, pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending,
-    provisioning_patches, reconcile, select_convoy_children, BoundChangeRequest, Convoy, ConvoyEvent, ConvoyIssue, ConvoyPhase,
-    ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewWorkPhase,
-    CrewWorkState, InputValue, InstantiatedExit, InstantiatedExitEntry, IssueSnapshot, PlacementStatus, ReconcileOutcome,
+    bound_change_request_record_name, controller_patches, convoy_sanctions_checkout_reclaim, evaluate_landing_settlement,
+    expected_change_request_leaves, expected_checkout_refs, external_patches, instantiate_exit, pinned_placement_ref, pinned_workflow_ref,
+    prepared_snapshot_pending, provisioning_patches, reconcile, select_convoy_children, BoundChangeRequest, Convoy, ConvoyEvent,
+    ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime,
+    CrewWorkPhase, CrewWorkState, InputValue, InstantiatedExit, InstantiatedExitEntry, IssueSnapshot, PlacementStatus, ReconcileOutcome,
     SettlementEvaluation, SettlementMode, TargetMismatch, UnmetSettlementExpectation, WorkCompletionAuthority, WorkPhase, WorkState,
     WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_PENDING_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
