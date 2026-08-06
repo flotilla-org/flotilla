@@ -100,7 +100,7 @@ pub enum TerminalSessionSource {
     Agent {
         selector: Selector,
         brief: TerminalBrief,
-        context: TerminalCrewContext,
+        context: Box<TerminalCrewContext>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<TerminalCrewMessage>,
     },

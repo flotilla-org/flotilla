@@ -508,6 +508,136 @@ async fn agent_adapter_admission_rejects_a_host_that_does_not_advertise_the_requ
     assert_eq!(error, "workflow requires agent adapter `codex`, which is not available in placement `host-direct-test` (host `host-test`)");
 }
 
+#[test]
+fn dispatch_agent_overrides_rewrite_matching_selectors_and_stay_loud_on_misses() {
+    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
+
+    apply_agent_overrides(&mut workflow, &[flotilla_protocol::AgentOverride {
+        capability: "code".to_string(),
+        adapter: "claude-code".to_string(),
+        model: Some("opus".to_string()),
+    }])
+    .expect("override applies");
+    let flotilla_resources::CrewSource::Agent { selector, .. } = &workflow.vessels[0].crew[0].source else {
+        panic!("stock workflow crew is agent-sourced");
+    };
+    assert_eq!(
+        (selector.capability.as_str(), selector.adapter.as_deref(), selector.model.as_deref()),
+        ("code", Some("claude-code"), Some("opus"))
+    );
+
+    let duplicate = flotilla_protocol::AgentOverride { capability: "code".to_string(), adapter: "codex".to_string(), model: None };
+    assert_eq!(
+        apply_agent_overrides(&mut workflow, &[duplicate.clone(), duplicate]).expect_err("duplicate capability must fail"),
+        "duplicate --agent override for capability `code`"
+    );
+
+    assert_eq!(
+        apply_agent_overrides(&mut workflow, &[flotilla_protocol::AgentOverride {
+            capability: "architect".to_string(),
+            adapter: "claude-code".to_string(),
+            model: None,
+        }])
+        .expect_err("capability absent from the workflow must fail"),
+        "--agent override names capability `architect`, but this workflow's agent capabilities are: code"
+    );
+}
+
+#[test]
+fn dispatch_agent_overrides_reject_shell_metacharacters_at_the_protocol_boundary() {
+    // Overrides arrive from arbitrary protocol clients, not just the CLI's
+    // charset-validated parser, and model names reach the shell-backed launch
+    // line. Admission is the boundary that must hold.
+    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
+
+    assert_eq!(
+        apply_agent_overrides(&mut workflow, &[flotilla_protocol::AgentOverride {
+            capability: "code".to_string(),
+            adapter: "claude-code".to_string(),
+            model: Some("opus'; rm -rf ~; '".to_string()),
+        }])
+        .expect_err("metacharacter model must fail"),
+        "agent model `opus'; rm -rf ~; '` may only contain alphanumerics, `.`, `_`, and `-`"
+    );
+    assert_eq!(
+        apply_agent_overrides(&mut workflow, &[flotilla_protocol::AgentOverride {
+            capability: "code".to_string(),
+            adapter: "claude-code $(whoami)".to_string(),
+            model: None,
+        }])
+        .expect_err("metacharacter adapter must fail"),
+        "agent adapter `claude-code $(whoami)` may only contain alphanumerics, `.`, `_`, and `-`"
+    );
+
+    // The rejected overrides must not have touched the workflow.
+    let flotilla_resources::CrewSource::Agent { selector, .. } = &workflow.vessels[0].crew[0].source else {
+        panic!("stock workflow crew is agent-sourced");
+    };
+    assert_eq!((selector.adapter.as_deref(), selector.model.as_deref()), (None, None));
+}
+
+#[tokio::test]
+async fn agent_adapter_admission_evaluates_the_dispatch_overridden_adapter() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.create(&InputMeta::builder().name("host-test".to_string()).build(), &HostSpec::default()).await.expect("host create");
+    hosts
+        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
+            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["claude-code"]))].into_iter().collect(),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            resource_store: None,
+            ..HostStatus::default()
+        })
+        .await
+        .expect("host status update");
+    let placement = backend
+        .clone()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &InputMeta::builder().name("host-direct-test".to_string()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: host.metadata.name,
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("placement create");
+    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
+    workflow.vessels[0].stance = Stance::Trusted;
+
+    // The stock workflow needs codex, which this host lacks — but the
+    // dispatch override redirects the capability to claude-code, which it has.
+    apply_agent_overrides(&mut workflow, &[flotilla_protocol::AgentOverride {
+        capability: "code".to_string(),
+        adapter: "claude-code".to_string(),
+        model: Some("opus".to_string()),
+    }])
+    .expect("override applies");
+    validate_workflow_agent_adapters(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect("claude-code host admits the overridden workflow");
+
+    // And the reverse: overriding toward an adapter the placement lacks is
+    // refused naming the effective adapter, not the template default.
+    apply_agent_overrides(&mut workflow, &[flotilla_protocol::AgentOverride {
+        capability: "code".to_string(),
+        adapter: "cursor".to_string(),
+        model: None,
+    }])
+    .expect("override applies");
+    let error = validate_workflow_agent_adapters(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect_err("host without the overridden adapter must be rejected");
+    assert_eq!(
+        error,
+        "workflow requires agent adapter `cursor`, which is not available in placement `host-direct-test` (host `host-test`)"
+    );
+}
+
 #[tokio::test]
 async fn agent_adapter_admission_rejects_a_host_with_stale_heartbeat() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -1706,7 +1836,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
         CrewSpec::builder()
             .role("coder".to_string())
             .source(CrewSource::Agent {
-                selector: Selector { capability: "coding".into() },
+                selector: Selector::for_capability("coding"),
                 prompt: Some("Implement the change.".into()),
                 brief_template: None,
             })
@@ -1714,7 +1844,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
         CrewSpec::builder()
             .role("reviewer".to_string())
             .source(CrewSource::Agent {
-                selector: Selector { capability: "review".into() },
+                selector: Selector::for_capability("review"),
                 prompt: Some("Review the change.".into()),
                 brief_template: None,
             })
@@ -1809,13 +1939,13 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
                 env_ref: env_ref.into(),
                 role: "coder".into(),
                 source: TerminalSessionSource::Agent {
-                    selector: Selector { capability: "coding".into() },
+                    selector: Selector::for_capability("coding"),
                     brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "coder brief".into(), copies: Vec::new() },
-                    context: TerminalCrewContext {
+                    context: Box::new(TerminalCrewContext {
                         namespace: "flotilla".into(),
                         convoy: "demo".into(),
                         vessel_ref: "demo-implement".into(),
-                    },
+                    }),
                     message: None,
                 },
                 cwd: "/repo".into(),
@@ -3289,13 +3419,13 @@ async fn attach_query_rejects_a_running_agent_without_a_recorded_launch_command(
                 env_ref,
                 role: "coder".to_string(),
                 source: TerminalSessionSource::Agent {
-                    selector: Selector { capability: "coding".to_string() },
+                    selector: Selector::for_capability("coding"),
                     brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() },
-                    context: TerminalCrewContext {
+                    context: Box::new(TerminalCrewContext {
                         namespace: "flotilla".into(),
                         convoy: "convoy-a".into(),
                         vessel_ref: "convoy-a-implement".into(),
-                    },
+                    }),
                     message: None,
                 },
                 cwd: "/repo".to_string(),

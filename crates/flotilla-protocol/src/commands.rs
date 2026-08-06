@@ -397,9 +397,24 @@ pub struct ConvoyStartIntent {
     pub instruction: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_policy: Option<String>,
+    /// Dispatch-time agent requirement overrides, applied to the workflow
+    /// snapshot's capability selectors at admission (`--agent`).
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_overrides: Vec<AgentOverride>,
     #[builder(default)]
     #[serde(default)]
     pub auto_attach: ConvoyAutoAttach,
+}
+
+/// One dispatch-time agent choice: which harness (and optionally model) the
+/// named capability resolves to for this convoy only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOverride {
+    pub capability: String,
+    pub adapter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// A convoy launch admitted by the presentation host and ready to be

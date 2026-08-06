@@ -304,9 +304,9 @@ impl Reconciler for VesselReconciler {
         let mut required_agent_adapters = BTreeSet::new();
         for process in &requirement.crew {
             if let CrewSource::Agent { selector, .. } = &process.source {
-                match capabilities.resolve(&selector.capability) {
+                match capabilities.resolve_selector(selector) {
                     Ok(agent) => {
-                        required_agent_adapters.insert(agent.adapter.clone());
+                        required_agent_adapters.insert(agent.adapter);
                     }
                     Err(message) => return Ok(VesselDeps::failed(message)),
                 }
@@ -949,7 +949,12 @@ impl Reconciler for VesselReconciler {
                             };
                             append_convoy_work_context(&mut brief.content, &convoy, &repository_refs);
                             brief.copies = brief_copies.clone();
-                            flotilla_resources::TerminalSessionSource::Agent { selector: selector.clone(), brief, context, message: None }
+                            flotilla_resources::TerminalSessionSource::Agent {
+                                selector: selector.clone(),
+                                brief,
+                                context: Box::new(context),
+                                message: None,
+                            }
                         }
                     };
                     let mut terminal_meta = identity.input_meta();

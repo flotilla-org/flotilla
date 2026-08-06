@@ -27,7 +27,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                     CrewSpec {
                         role: "coder".to_string(),
                         source: CrewSource::Agent {
-                            selector: Selector { capability: "code".to_string() },
+                            selector: Selector::for_capability("code"),
                             prompt: Some("Implement {{inputs.feature}}".to_string()),
                             brief_template: None,
                         },
@@ -50,7 +50,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                 crew: vec![CrewSpec {
                     role: "reviewer".to_string(),
                     source: CrewSource::Agent {
-                        selector: Selector { capability: "code-review".to_string() },
+                        selector: Selector::for_capability("code-review"),
                         prompt: Some("Review {{inputs.feature}}".to_string()),
                         brief_template: None,
                     },

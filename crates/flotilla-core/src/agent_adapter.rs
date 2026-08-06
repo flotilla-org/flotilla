@@ -346,6 +346,23 @@ impl CapabilityTable {
     pub fn resolve(&self, capability: &str) -> Result<&AgentRequirement, String> {
         self.requirements.get(capability).ok_or_else(|| format!("unknown agent capability `{capability}`"))
     }
+
+    /// Resolve a workflow selector to its effective requirement.
+    ///
+    /// A selector carrying a dispatch-time `adapter` override wins outright —
+    /// its `model` (or none) rides with it, never the table's, since a model
+    /// name only makes sense against the harness it was chosen for. An
+    /// adapter-less `model` override reskins the table's adapter. A selector
+    /// with an explicit adapter does not need its capability in the table:
+    /// the capability is then template vocabulary, and the admitted-vocabulary
+    /// check that matters (adapter availability) happens at placement.
+    pub fn resolve_selector(&self, selector: &flotilla_resources::Selector) -> Result<AgentRequirement, String> {
+        if let Some(adapter) = &selector.adapter {
+            return Ok(AgentRequirement { adapter: adapter.clone(), model: selector.model.clone() });
+        }
+        let seeded = self.resolve(&selector.capability)?;
+        Ok(AgentRequirement { adapter: seeded.adapter.clone(), model: selector.model.clone().or_else(|| seeded.model.clone()) })
+    }
 }
 
 impl Default for CapabilityTable {
@@ -438,7 +455,7 @@ impl CliAgentAdapter {
             args.extend([Arg::Literal("--settings".into()), Arg::Literal(CLAUDE_MANAGED_SETTINGS_PATH.into())]);
         }
         if let Some(model) = &request.model {
-            args.extend([Arg::Literal("--model".into()), Arg::Literal(model.clone())]);
+            args.extend([Arg::Literal("--model".into()), Arg::Quoted(model.clone())]);
         }
         args.push(Arg::Quoted(self.deliver_brief(&request.brief)));
         flatten(&args, 0)
@@ -1039,6 +1056,42 @@ mod tests {
         assert_eq!(table.resolve("architect").expect_err("unknown capability must fail"), "unknown agent capability `architect`");
     }
 
+    #[test]
+    fn selector_resolution_lets_dispatch_overrides_win_over_the_seeded_table() {
+        let table = CapabilityTable::seeded();
+
+        let plain = table.resolve_selector(&flotilla_resources::Selector::for_capability("code")).expect("seeded fallback");
+        assert_eq!((plain.adapter.as_str(), plain.model.as_deref()), ("codex", None));
+
+        let mut overridden = flotilla_resources::Selector::for_capability("code");
+        overridden.adapter = Some("claude-code".to_string());
+        overridden.model = Some("opus".to_string());
+        let requirement = table.resolve_selector(&overridden).expect("adapter override");
+        assert_eq!((requirement.adapter.as_str(), requirement.model.as_deref()), ("claude-code", Some("opus")));
+
+        // An adapter override never inherits the table's model — a model name
+        // only means something against the harness it was chosen for.
+        let mut review = flotilla_resources::Selector::for_capability("review");
+        review.adapter = Some("codex".to_string());
+        let requirement = table.resolve_selector(&review).expect("adapter override without model");
+        assert_eq!((requirement.adapter.as_str(), requirement.model.as_deref()), ("codex", None));
+
+        let mut reskinned = flotilla_resources::Selector::for_capability("review");
+        reskinned.model = Some("sonnet".to_string());
+        let requirement = table.resolve_selector(&reskinned).expect("model-only override");
+        assert_eq!((requirement.adapter.as_str(), requirement.model.as_deref()), ("claude-code", Some("sonnet")));
+
+        // With an explicit adapter the capability is template vocabulary only;
+        // without one, unknown capabilities stay loud.
+        let mut novel = flotilla_resources::Selector::for_capability("architect");
+        novel.adapter = Some("claude-code".to_string());
+        assert!(table.resolve_selector(&novel).is_ok());
+        assert_eq!(
+            table.resolve_selector(&flotilla_resources::Selector::for_capability("architect")).expect_err("unknown must fail"),
+            "unknown agent capability `architect`"
+        );
+    }
+
     #[tokio::test]
     async fn adapters_prepare_the_canonical_brief_and_launch_with_only_a_short_pointer() {
         let registry = discovered_registry();
@@ -1061,13 +1114,22 @@ mod tests {
         assert_eq!(plan.stance, "trusted-implicit");
 
         let claude = registry.get("claude-code").expect("claude adapter");
-        let plan =
-            claude.launch(&AgentLaunchRequest { role: "reviewer".into(), model: Some("opus".into()), brief }).expect("claude launch plan");
+        let plan = claude
+            .launch(&AgentLaunchRequest { role: "reviewer".into(), model: Some("opus".into()), brief: brief.clone() })
+            .expect("claude launch plan");
         assert_eq!(
             plan.command,
-            "/tools/claude --dangerously-skip-permissions --settings .flotilla/claude-settings.json --model opus 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
+            "/tools/claude --dangerously-skip-permissions --settings .flotilla/claude-settings.json --model 'opus' 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
         );
         assert!(!plan.command.contains("Implement the issue"));
+
+        // Admission rejects metacharacter models before they reach launch;
+        // the sink still shell-quotes so a hostile model can never splice
+        // into the command line even if that boundary regressed.
+        let plan = claude
+            .launch(&AgentLaunchRequest { role: "reviewer".into(), model: Some("opus; touch /tmp/pwned".into()), brief })
+            .expect("claude launch plan");
+        assert!(plan.command.contains("--model 'opus; touch /tmp/pwned'"));
     }
 
     #[tokio::test]

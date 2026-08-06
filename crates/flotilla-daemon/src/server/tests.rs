@@ -1513,13 +1513,13 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
             env_ref: "local".into(),
             role: "coder".into(),
             source: TerminalSessionSource::Agent {
-                selector: Selector { capability: "code".into() },
+                selector: Selector::for_capability("code"),
                 brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: String::new(), copies: vec![] },
-                context: TerminalCrewContext {
+                context: Box::new(TerminalCrewContext {
                     namespace: "flotilla".into(),
                     convoy: "stranded".into(),
                     vessel_ref: "stranded-work".into(),
-                },
+                }),
                 message: None,
             },
             cwd: "/repo".into(),

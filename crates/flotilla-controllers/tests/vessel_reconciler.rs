@@ -502,7 +502,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
                         .source(CrewSource::Agent {
-                            selector: Selector { capability: "coding".to_string() },
+                            selector: Selector::for_capability("coding"),
                             prompt: Some("Work across both repositories.".to_string()),
                             brief_template: None,
                         })
@@ -1582,7 +1582,7 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-recover", "implement", REPO_URL, GIT_REF).await;
     let mut status = convoy.status.expect("convoy status");
     status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0].crew[0].source = CrewSource::Agent {
-        selector: Selector { capability: "coding".to_string() },
+        selector: Selector::for_capability("coding"),
         prompt: Some("Finish the issue.".to_string()),
         brief_template: None,
     };
@@ -1624,17 +1624,17 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
             env_ref: host_direct_env_name(),
             role: "coder".to_string(),
             source: TerminalSessionSource::Agent {
-                selector: Selector { capability: "coding".to_string() },
+                selector: Selector::for_capability("coding"),
                 brief: TerminalBrief {
                     path: ".flotilla/briefs/coder.md".to_string(),
                     content: "Finish the issue.".to_string(),
                     copies: Vec::new(),
                 },
-                context: TerminalCrewContext {
+                context: Box::new(TerminalCrewContext {
                     namespace: NAMESPACE.to_string(),
                     convoy: "convoy-recover".to_string(),
                     vessel_ref: "workspace-recover".to_string(),
-                },
+                }),
                 message: None,
             },
             cwd: checkout_path.to_string(),
@@ -1740,7 +1740,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
         CrewSpec::builder()
             .role("coder".to_string())
             .source(CrewSource::Agent {
-                selector: Selector { capability: "coding".to_string() },
+                selector: Selector::for_capability("coding"),
                 prompt: Some("Implement issue 668.".to_string()),
                 brief_template: None,
             })
@@ -1748,7 +1748,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
         CrewSpec::builder()
             .role("reviewer".to_string())
             .source(CrewSource::Agent {
-                selector: Selector { capability: "review".to_string() },
+                selector: Selector::for_capability("review"),
                 prompt: Some("Review the coder's work.".to_string()),
                 brief_template: None,
             })
@@ -1825,7 +1825,7 @@ async fn repo_level_brief_template_override_changes_one_block_for_that_repo_conv
     let mut status = convoy.status.expect("convoy status");
     status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0].crew = vec![CrewSpec::builder()
         .role("coder".to_string())
-        .source(CrewSource::Agent { selector: Selector { capability: "coding".to_string() }, prompt: None, brief_template: None })
+        .source(CrewSource::Agent { selector: Selector::for_capability("coding"), prompt: None, brief_template: None })
         .build()];
     backend
         .clone()

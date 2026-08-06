@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use flotilla_protocol::{Command, CommandAction, ConvoyAutoAttach, ConvoyStartIntent, IssueRef, IssueSelector, IssueSource};
+use flotilla_protocol::{AgentOverride, Command, CommandAction, ConvoyAutoAttach, ConvoyStartIntent, IssueRef, IssueSelector, IssueSource};
 
 use crate::{
     quote::quote_value,
@@ -94,6 +94,10 @@ pub enum ConvoyVerb {
         /// PlacementPolicy resource to use for vessel provisioning
         #[arg(long = "placement-policy")]
         placement_policy: Option<String>,
+        /// Agent harness override (repeatable): --agent [capability=]adapter[:model].
+        /// Bare form applies to the `code` capability, e.g. --agent claude-code:opus
+        #[arg(long = "agent", value_parser = parse_agent_override)]
+        agent_overrides: Vec<AgentOverride>,
         /// Create the convoy without attaching the caller to its first crew session
         #[arg(long, conflicts_with = "attach")]
         no_attach: bool,
@@ -133,6 +137,25 @@ fn parse_input_kv(raw: &str) -> Result<(String, String), String> {
         return Err(format!("input key cannot be empty: {raw}"));
     }
     Ok((key.to_string(), value.to_string()))
+}
+
+/// `[capability=]adapter[:model]` — bare adapter applies to the `code`
+/// capability, the one every stock coding workflow's crew selects on.
+fn parse_agent_override(raw: &str) -> Result<AgentOverride, String> {
+    let (capability, choice) = match raw.split_once('=') {
+        Some((capability, choice)) => (capability, choice),
+        None => ("code", raw),
+    };
+    let (adapter, model) = match choice.split_once(':') {
+        Some((adapter, model)) => (adapter, Some(model)),
+        None => (choice, None),
+    };
+    let valid_token =
+        |token: &str| !token.is_empty() && token.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
+    if capability.is_empty() || !valid_token(adapter) || model.is_some_and(|model| !valid_token(model)) {
+        return Err(format!("agent override must be [capability=]adapter[:model] using alphanumerics, `.`, `_`, and `-`: {raw}"));
+    }
+    Ok(AgentOverride { capability: capability.to_string(), adapter: adapter.to_string(), model: model.map(str::to_string) })
 }
 
 fn parse_pr_number(raw: &str) -> Result<String, String> {
@@ -264,6 +287,7 @@ impl ConvoyNoun {
                 inputs,
                 instruction,
                 placement_policy,
+                agent_overrides,
                 no_attach,
                 attach,
             } => {
@@ -300,6 +324,7 @@ impl ConvoyNoun {
                                 inputs,
                                 instruction,
                                 placement_policy,
+                                agent_overrides,
                                 auto_attach: match (attach, no_attach) {
                                     (true, false) => ConvoyAutoAttach::Always,
                                     (false, true) => ConvoyAutoAttach::Never,
@@ -333,6 +358,7 @@ impl ConvoyNoun {
                                     inputs,
                                     instruction: None,
                                     placement_policy,
+                                    agent_overrides: Vec::new(),
                                     auto_attach: ConvoyAutoAttach::Never,
                                 }),
                             },
@@ -417,6 +443,7 @@ impl std::fmt::Display for ConvoyNoun {
                 inputs,
                 instruction,
                 placement_policy,
+                agent_overrides,
                 no_attach,
                 attach,
             } => {
@@ -450,6 +477,10 @@ impl std::fmt::Display for ConvoyNoun {
                 }
                 if let Some(placement_policy) = placement_policy {
                     write!(f, " --placement-policy {}", quote_value(placement_policy))?;
+                }
+                for choice in agent_overrides {
+                    let model = choice.model.as_ref().map(|model| format!(":{model}")).unwrap_or_default();
+                    write!(f, " --agent {}", quote_value(&format!("{}={}{model}", choice.capability, choice.adapter)))?;
                 }
                 if *no_attach {
                     write!(f, " --no-attach")?;
@@ -487,7 +518,9 @@ impl std::fmt::Display for ConvoyNoun {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use flotilla_protocol::{Command, CommandAction, ConvoyAutoAttach, ConvoyStartIntent, IssueRef, IssueSelector, IssueSource};
+    use flotilla_protocol::{
+        AgentOverride, Command, CommandAction, ConvoyAutoAttach, ConvoyStartIntent, IssueRef, IssueSelector, IssueSource,
+    };
 
     use super::ConvoyNoun;
     use crate::{
@@ -611,6 +644,30 @@ mod tests {
     }
 
     #[test]
+    fn convoy_start_agent_overrides_parse_in_bare_and_scoped_forms() {
+        let resolved = parse(&["convoy", "start", "--project", "flotilla", "--agent", "claude-code:opus", "--agent", "review=codex"])
+            .resolve()
+            .expect("resolve");
+        let Resolved::NeedsContext { command: Command { action: CommandAction::ConvoyStart { intent }, .. }, .. } = resolved else {
+            panic!("start resolves to a convoy start intent");
+        };
+        assert_eq!(intent.agent_overrides, vec![
+            AgentOverride { capability: "code".into(), adapter: "claude-code".into(), model: Some("opus".into()) },
+            AgentOverride { capability: "review".into(), adapter: "codex".into(), model: None },
+        ]);
+
+        for malformed in ["", ":opus", "code=", "claude-code:", "claude-code:opus; rm -rf ~", "cl$(whoami):opus", "claude code"] {
+            ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--agent", malformed])
+                .expect_err("malformed agent override must fail");
+        }
+    }
+
+    #[test]
+    fn round_trip_start_with_agent_overrides() {
+        assert_round_trip::<ConvoyNoun>(&["convoy", "start", "--project", "flotilla", "--agent", "code=claude-code:sonnet"]);
+    }
+
+    #[test]
     fn round_trip_resume() {
         assert_round_trip::<ConvoyNoun>(&[
             "convoy",
@@ -671,6 +728,7 @@ mod tests {
                         inputs: vec![],
                         instruction: Some("Preserve the public API.".into()),
                         placement_policy: None,
+                        agent_overrides: Vec::new(),
                         auto_attach: ConvoyAutoAttach::Never,
                     }),
                 },
@@ -703,6 +761,7 @@ mod tests {
                         inputs: vec![],
                         instruction: None,
                         placement_policy: None,
+                        agent_overrides: Vec::new(),
                         auto_attach: ConvoyAutoAttach::Default,
                     }),
                 },
@@ -733,6 +792,7 @@ mod tests {
                         inputs: vec![],
                         instruction: None,
                         placement_policy: None,
+                        agent_overrides: Vec::new(),
                         auto_attach: ConvoyAutoAttach::Default,
                     }),
                 },
@@ -764,6 +824,7 @@ mod tests {
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
+                        agent_overrides: Vec::new(),
                         auto_attach: ConvoyAutoAttach::Never,
                     }),
                 },
@@ -892,6 +953,7 @@ mod tests {
                 inputs: Vec::new(),
                 instruction: None,
                 placement_policy: None,
+                agent_overrides: Vec::new(),
                 auto_attach: ConvoyAutoAttach::Never,
             }),
         });

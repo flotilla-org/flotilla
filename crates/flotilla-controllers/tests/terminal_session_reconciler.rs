@@ -342,17 +342,17 @@ impl WorldBuilder for GhostRecoveryWorldBuilder {
                     env_ref: "host-direct-feta".to_string(),
                     role: "coder".to_string(),
                     source: flotilla_resources::TerminalSessionSource::Agent {
-                        selector: flotilla_resources::Selector { capability: "coding".to_string() },
+                        selector: flotilla_resources::Selector::for_capability("coding"),
                         brief: flotilla_resources::TerminalBrief {
                             path: ".flotilla/briefs/coder.md".to_string(),
                             content: "brief".to_string(),
                             copies: Vec::new(),
                         },
-                        context: flotilla_resources::TerminalCrewContext {
+                        context: Box::new(flotilla_resources::TerminalCrewContext {
                             namespace: "flotilla".to_string(),
                             convoy: "deleted-convoy".to_string(),
                             vessel_ref: "deleted-convoy-work".to_string(),
-                        },
+                        }),
                         message: None,
                     },
                     cwd: "/workspace".to_string(),
@@ -643,17 +643,17 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
             env_ref: "env-a".to_string(),
             role: "coder".to_string(),
             source: flotilla_resources::TerminalSessionSource::Agent {
-                selector: flotilla_resources::Selector { capability: "coding".to_string() },
+                selector: flotilla_resources::Selector::for_capability("coding"),
                 brief: flotilla_resources::TerminalBrief {
                     path: ".flotilla/briefs/coder.md".into(),
                     content: "brief".into(),
                     copies: Vec::new(),
                 },
-                context: flotilla_resources::TerminalCrewContext {
+                context: Box::new(flotilla_resources::TerminalCrewContext {
                     namespace: "flotilla".into(),
                     convoy: "demo".into(),
                     vessel_ref: "demo-implement".into(),
-                },
+                }),
                 message: None,
             },
             cwd: "/workspace".to_string(),
@@ -717,17 +717,17 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
             env_ref: "env-a".to_string(),
             role: "reviewer".to_string(),
             source: flotilla_resources::TerminalSessionSource::Agent {
-                selector: flotilla_resources::Selector { capability: "review".to_string() },
+                selector: flotilla_resources::Selector::for_capability("review"),
                 brief: flotilla_resources::TerminalBrief {
                     path: ".flotilla/briefs/reviewer.md".into(),
                     content: "brief".into(),
                     copies: Vec::new(),
                 },
-                context: flotilla_resources::TerminalCrewContext {
+                context: Box::new(flotilla_resources::TerminalCrewContext {
                     namespace: "flotilla".into(),
                     convoy: "demo".into(),
                     vessel_ref: "demo-review".into(),
-                },
+                }),
                 message: Some(flotilla_resources::TerminalCrewMessage {
                     id: "message-new".into(),
                     text: "Review the amended commit".into(),
@@ -781,17 +781,17 @@ async fn terminal_finalizer_cleans_agent_artifacts() {
             env_ref: "env-a".to_string(),
             role: "coder".to_string(),
             source: flotilla_resources::TerminalSessionSource::Agent {
-                selector: flotilla_resources::Selector { capability: "coding".to_string() },
+                selector: flotilla_resources::Selector::for_capability("coding"),
                 brief: flotilla_resources::TerminalBrief {
                     path: ".flotilla/briefs/coder.md".into(),
                     content: "brief".into(),
                     copies: vec!["/workspace/repo-a".into()],
                 },
-                context: flotilla_resources::TerminalCrewContext {
+                context: Box::new(flotilla_resources::TerminalCrewContext {
                     namespace: "flotilla".into(),
                     convoy: "demo".into(),
                     vessel_ref: "demo-implement".into(),
-                },
+                }),
                 message: None,
             },
             cwd: "/workspace".to_string(),
