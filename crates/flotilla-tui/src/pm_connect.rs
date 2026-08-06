@@ -308,8 +308,7 @@ pub async fn run_connector(
 pub async fn run(
     socket_path: &Path,
     config_dir: &Path,
-    config_dir_override: Option<&Path>,
-    socket_override: Option<&Path>,
+    state_dir: &Path,
     require_host_daemon: bool,
     options: PmConnectOptions,
 ) -> Result<(), String> {
@@ -328,16 +327,7 @@ pub async fn run(
             if require_host_daemon {
                 crate::socket::connect_required_host_daemon_with_surface(socket_path, surface).await
             } else {
-                let state_dir = flotilla_core::path_policy::PathPolicy::from_process_env().state_dir;
-                crate::socket::connect_or_spawn_with_surface(
-                    socket_path,
-                    config_dir,
-                    state_dir.as_path(),
-                    config_dir_override,
-                    socket_override,
-                    surface,
-                )
-                .await
+                crate::socket::connect_or_spawn_with_surface(socket_path, config_dir, state_dir, surface).await
             }
             .map(|daemon| daemon as Arc<dyn DaemonHandle>)
         },

@@ -8,9 +8,43 @@
 //! We always use XDG-style paths, even on macOS, to keep a developer tool's
 //! config in predictable dotfile locations rather than `~/Library/...`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::path_context::DaemonHostPath;
+
+pub const DAEMON_SOCKET_RELATIVE_PATH: &str = "run/flotilla.sock";
+
+/// Return the only daemon socket owned by `config_dir`.
+pub fn daemon_socket_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(DAEMON_SOCKET_RELATIVE_PATH)
+}
+
+/// Refuse a root/socket pairing that could expose one root through another root's socket.
+pub fn ensure_daemon_socket_belongs_to_config(socket_path: &Path, config_dir: &Path) -> Result<(), String> {
+    let expected = daemon_socket_path(config_dir);
+    if socket_path == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "daemon socket {} does not belong to config root {}; expected {} — refusing to mix daemon root and socket identities",
+        socket_path.display(),
+        config_dir.display(),
+        expected.display()
+    ))
+}
+
+/// Derive a root's config and state directories from its canonical scoped socket.
+pub fn scoped_daemon_dirs(socket_path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let scoped_root = socket_path
+        .file_name()
+        .filter(|name| *name == "flotilla.sock")
+        .and_then(|_| socket_path.parent())
+        .filter(|run_dir| run_dir.file_name().is_some_and(|name| name == "run"))
+        .and_then(Path::parent)
+        .filter(|config_dir| config_dir.file_name().is_some_and(|name| name == "config"))
+        .and_then(Path::parent);
+    scoped_root.map(|root| (root.join("config"), root.join("state")))
+}
 
 /// Resolved daemon-side directory locations.
 ///
@@ -116,5 +150,39 @@ mod tests {
             _ => None,
         });
         assert_eq!(policy.config_dir.as_path(), std::path::Path::new("/root/config"));
+    }
+
+    #[test]
+    fn scoped_root_rejects_the_default_fleet_socket() {
+        let policy = PathPolicy::from_env(|key| match key {
+            "FLOTILLA_ROOT" => Some("/work/live-session".into()),
+            "HOME" => Some("/home/test".into()),
+            _ => None,
+        });
+        let default_policy = PathPolicy::from_env(|key| match key {
+            "HOME" => Some("/home/test".into()),
+            _ => None,
+        });
+        let default_socket = daemon_socket_path(default_policy.config_dir.as_path());
+
+        let error = ensure_daemon_socket_belongs_to_config(&default_socket, policy.config_dir.as_path())
+            .expect_err("a root-scoped daemon must not bind the default fleet socket");
+
+        assert!(error.contains("does not belong to config root"), "unexpected error: {error}");
+        assert!(error.contains("/work/live-session/config/run/flotilla.sock"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn scoped_socket_supplies_the_root_for_a_managed_terminal() {
+        let (config_dir, state_dir) = scoped_daemon_dirs(Path::new("/work/live-session/config/run/flotilla.sock"))
+            .expect("canonical scoped socket should supply its root");
+
+        assert_eq!(config_dir, Path::new("/work/live-session/config"));
+        assert_eq!(state_dir, Path::new("/work/live-session/state"));
+    }
+
+    #[test]
+    fn default_xdg_socket_does_not_claim_to_encode_a_root() {
+        assert!(scoped_daemon_dirs(Path::new("/home/test/.config/flotilla/run/flotilla.sock")).is_none());
     }
 }
