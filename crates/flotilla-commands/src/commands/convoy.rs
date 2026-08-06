@@ -150,8 +150,10 @@ fn parse_agent_override(raw: &str) -> Result<AgentOverride, String> {
         Some((adapter, model)) => (adapter, Some(model)),
         None => (choice, None),
     };
-    if capability.is_empty() || adapter.is_empty() || model.is_some_and(str::is_empty) {
-        return Err(format!("agent override must be [capability=]adapter[:model]: {raw}"));
+    let valid_token =
+        |token: &str| !token.is_empty() && token.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
+    if capability.is_empty() || !valid_token(adapter) || model.is_some_and(|model| !valid_token(model)) {
+        return Err(format!("agent override must be [capability=]adapter[:model] using alphanumerics, `.`, `_`, and `-`: {raw}"));
     }
     Ok(AgentOverride { capability: capability.to_string(), adapter: adapter.to_string(), model: model.map(str::to_string) })
 }
@@ -654,7 +656,7 @@ mod tests {
             AgentOverride { capability: "review".into(), adapter: "codex".into(), model: None },
         ]);
 
-        for malformed in ["", ":opus", "code=", "claude-code:"] {
+        for malformed in ["", ":opus", "code=", "claude-code:", "claude-code:opus; rm -rf ~", "cl$(whoami):opus", "claude code"] {
             ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--agent", malformed])
                 .expect_err("malformed agent override must fail");
         }

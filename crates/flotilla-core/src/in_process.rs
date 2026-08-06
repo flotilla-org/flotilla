@@ -4245,11 +4245,27 @@ async fn validate_workflow_credentials(
 /// vessel reconciler, terminal launch — reads the effective requirement from
 /// the selector itself. Loud on anything that cannot take effect: a
 /// capability named twice, or one no agent selector in the workflow carries.
+/// Dispatch overrides cross the protocol boundary from arbitrary clients, but
+/// adapter ids and model names land in fields the launch layer treats as
+/// resolver-trusted (`Arg`'s safety invariant). Constrain them to the token
+/// charset real harness and model names use before they enter the snapshot.
+fn valid_agent_override_token(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
 fn apply_agent_overrides(workflow: &mut WorkflowTemplateSpec, overrides: &[flotilla_protocol::AgentOverride]) -> Result<(), String> {
     let mut seen = HashSet::new();
     for choice in overrides {
         if !seen.insert(choice.capability.as_str()) {
             return Err(format!("duplicate --agent override for capability `{}`", choice.capability));
+        }
+        if !valid_agent_override_token(&choice.adapter) {
+            return Err(format!("agent adapter `{}` may only contain alphanumerics, `.`, `_`, and `-`", choice.adapter));
+        }
+        if let Some(model) = &choice.model {
+            if !valid_agent_override_token(model) {
+                return Err(format!("agent model `{model}` may only contain alphanumerics, `.`, `_`, and `-`"));
+            }
         }
         let mut matched = false;
         for crew in workflow.vessels.iter_mut().flat_map(|vessel| &mut vessel.crew) {

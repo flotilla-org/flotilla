@@ -543,6 +543,39 @@ fn dispatch_agent_overrides_rewrite_matching_selectors_and_stay_loud_on_misses()
     );
 }
 
+#[test]
+fn dispatch_agent_overrides_reject_shell_metacharacters_at_the_protocol_boundary() {
+    // Overrides arrive from arbitrary protocol clients, not just the CLI's
+    // charset-validated parser, and model names reach the shell-backed launch
+    // line. Admission is the boundary that must hold.
+    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
+
+    assert_eq!(
+        apply_agent_overrides(&mut workflow, &[flotilla_protocol::AgentOverride {
+            capability: "code".to_string(),
+            adapter: "claude-code".to_string(),
+            model: Some("opus'; rm -rf ~; '".to_string()),
+        }])
+        .expect_err("metacharacter model must fail"),
+        "agent model `opus'; rm -rf ~; '` may only contain alphanumerics, `.`, `_`, and `-`"
+    );
+    assert_eq!(
+        apply_agent_overrides(&mut workflow, &[flotilla_protocol::AgentOverride {
+            capability: "code".to_string(),
+            adapter: "claude-code $(whoami)".to_string(),
+            model: None,
+        }])
+        .expect_err("metacharacter adapter must fail"),
+        "agent adapter `claude-code $(whoami)` may only contain alphanumerics, `.`, `_`, and `-`"
+    );
+
+    // The rejected overrides must not have touched the workflow.
+    let flotilla_resources::CrewSource::Agent { selector, .. } = &workflow.vessels[0].crew[0].source else {
+        panic!("stock workflow crew is agent-sourced");
+    };
+    assert_eq!((selector.adapter.as_deref(), selector.model.as_deref()), (None, None));
+}
+
 #[tokio::test]
 async fn agent_adapter_admission_evaluates_the_dispatch_overridden_adapter() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());

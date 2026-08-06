@@ -455,7 +455,7 @@ impl CliAgentAdapter {
             args.extend([Arg::Literal("--settings".into()), Arg::Literal(CLAUDE_MANAGED_SETTINGS_PATH.into())]);
         }
         if let Some(model) = &request.model {
-            args.extend([Arg::Literal("--model".into()), Arg::Literal(model.clone())]);
+            args.extend([Arg::Literal("--model".into()), Arg::Quoted(model.clone())]);
         }
         args.push(Arg::Quoted(self.deliver_brief(&request.brief)));
         flatten(&args, 0)
@@ -1114,13 +1114,22 @@ mod tests {
         assert_eq!(plan.stance, "trusted-implicit");
 
         let claude = registry.get("claude-code").expect("claude adapter");
-        let plan =
-            claude.launch(&AgentLaunchRequest { role: "reviewer".into(), model: Some("opus".into()), brief }).expect("claude launch plan");
+        let plan = claude
+            .launch(&AgentLaunchRequest { role: "reviewer".into(), model: Some("opus".into()), brief: brief.clone() })
+            .expect("claude launch plan");
         assert_eq!(
             plan.command,
-            "/tools/claude --dangerously-skip-permissions --settings .flotilla/claude-settings.json --model opus 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
+            "/tools/claude --dangerously-skip-permissions --settings .flotilla/claude-settings.json --model 'opus' 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
         );
         assert!(!plan.command.contains("Implement the issue"));
+
+        // Admission rejects metacharacter models before they reach launch;
+        // the sink still shell-quotes so a hostile model can never splice
+        // into the command line even if that boundary regressed.
+        let plan = claude
+            .launch(&AgentLaunchRequest { role: "reviewer".into(), model: Some("opus; touch /tmp/pwned".into()), brief })
+            .expect("claude launch plan");
+        assert!(plan.command.contains("--model 'opus; touch /tmp/pwned'"));
     }
 
     #[tokio::test]
