@@ -1,6 +1,6 @@
 mod common;
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use common::{
@@ -1633,6 +1633,57 @@ async fn terminal_completed_convoy_still_emits_cleanup_actuations() {
         .actuations
         .iter()
         .any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == "convoy-a-implement")));
+}
+
+struct NeverEligible;
+
+#[async_trait]
+impl ConvoyTeardownRuntime for NeverEligible {
+    async fn verify_reclaim(
+        &self,
+        _convoy: &flotilla_resources::ResourceObject<Convoy>,
+        _checkouts: &[flotilla_resources::ResourceObject<Checkout>],
+    ) -> Result<(), String> {
+        Err("integration evidence mid-refresh".to_string())
+    }
+}
+
+/// #1413 leg 2: a refused reclaim must retry on its own schedule instead of
+/// waiting on a watch event that nothing is guaranteed to send once the
+/// convoy is terminal.
+#[tokio::test]
+async fn refused_reclaim_requeues_at_the_evidence_staleness_horizon() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Landed;
+    status.finished_at = Some(timestamp(20));
+    for task in status.work.values_mut() {
+        task.phase = WorkPhase::Complete;
+        task.finished_at = Some(timestamp(19));
+    }
+    let source = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+    let created = convoys.create(&convoy_meta("convoy-a"), &source.spec).await.expect("convoy create");
+    convoys
+        .update_status("convoy-a", &created.metadata.resource_version, source.status.as_ref().expect("convoy status"))
+        .await
+        .expect("convoy status update");
+    let convoy = convoys.get("convoy-a").await.expect("convoy get");
+
+    let refused = ConvoyReconciler::new(templates.clone())
+        .with_teardown_runtime(Arc::new(NeverEligible))
+        .with_landing_evidence_stale_after(Duration::from_secs(7));
+    let deps = refused.fetch_dependencies(&convoy).await.expect("dependencies");
+    let outcome = refused.reconcile(&convoy, &deps, timestamp(21));
+    assert_eq!(outcome.requeue_after, Some(Duration::from_secs(7)), "a refused reclaim must requeue at the staleness horizon");
+
+    let eligible = ConvoyReconciler::new(templates)
+        .with_teardown_runtime(Arc::new(AlwaysEligible))
+        .with_landing_evidence_stale_after(Duration::from_secs(7));
+    let deps = eligible.fetch_dependencies(&convoy).await.expect("dependencies");
+    let outcome = eligible.reconcile(&convoy, &deps, timestamp(21));
+    assert_eq!(outcome.requeue_after, None, "an eligible reclaim pass must not keep requeueing");
 }
 
 #[tokio::test]

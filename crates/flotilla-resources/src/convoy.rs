@@ -93,6 +93,23 @@ pub fn expected_checkout_refs(convoy: &crate::ResourceObject<Convoy>) -> Result<
     Ok(expected)
 }
 
+/// The one sanction for collecting a convoy's managed checkouts.
+///
+/// Two controllers can remove a checkout: the checkout authority's
+/// `OwnerTerminal` cascade and the convoy's own reclaim. Both must derive
+/// their authority from this single predicate — the convoy is being deleted,
+/// or has reached a phase whose reclaim the substrate sanctions (`Landed`:
+/// the world terminal fired; `Abandoned`: an explicit operator override).
+/// The teardown gate consumes the same predicate from the other side: an
+/// expected checkout that is absent while this sanction holds is evidence of
+/// completed reclaim, never missing integration evidence — otherwise the
+/// checkout authority's cascade would destroy the only evidence the gate
+/// accepts and wedge vessel reclaim forever.
+pub fn convoy_sanctions_checkout_reclaim(convoy: &crate::ResourceObject<Convoy>) -> bool {
+    convoy.metadata.deletion_timestamp.is_some()
+        || convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landed | ConvoyPhase::Abandoned))
+}
+
 /// Canonical resource name for a convoy's explicitly bound change request.
 pub fn bound_change_request_record_name(convoy: &crate::ResourceObject<Convoy>) -> Result<Option<String>, String> {
     let Some(bound) = &convoy.spec.change_request else { return Ok(None) };
