@@ -31,6 +31,7 @@ pub enum CredentialConsumer {
     GithubApp { installation_id: u64 },
     Forgejo { api_url: String, username: String },
     Claude,
+    ClaudeOauth { account_email: String },
     Codex,
     DockerRegistry { registry: String, username: String },
 }
@@ -42,6 +43,7 @@ impl CredentialConsumer {
             Self::GithubApp { .. } => "github-app",
             Self::Forgejo { .. } => "forgejo",
             Self::Claude => "claude",
+            Self::ClaudeOauth { .. } => "claude-oauth",
             Self::Codex => "codex",
             Self::DockerRegistry { .. } => "docker-registry",
         }
@@ -50,6 +52,11 @@ impl CredentialConsumer {
     pub fn delivery_slot(&self) -> &'static str {
         match self {
             Self::Gh | Self::GithubApp { .. } => "github",
+            // An API-key credential and a subscription OAuth credential must not
+            // share one environment: `ANTHROPIC_API_KEY` outranks
+            // `CLAUDE_CODE_OAUTH_TOKEN` in Claude's documented precedence, so the
+            // OAuth identity would be silently ignored instead of used.
+            Self::Claude | Self::ClaudeOauth { .. } => "claude",
             _ => self.adapter_name(),
         }
     }
@@ -131,6 +138,15 @@ mod tests {
         assert!(!selector.matches(Stance::Trusted, Some("flotilla"), &BTreeSet::from([repository.clone()])));
         assert!(!selector.matches(Stance::Contained, Some("other"), &BTreeSet::from([repository.clone()])));
         assert!(!selector.matches(Stance::Contained, Some("flotilla"), &BTreeSet::new()));
+    }
+
+    #[test]
+    fn claude_oauth_declares_its_account_identity_and_shares_the_claude_delivery_slot() {
+        let consumer = CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() };
+        let encoded = serde_json::to_string(&consumer).expect("serialize consumer");
+        assert_eq!(encoded, r#"{"adapter":"claude-oauth","account_email":"ops@example.com"}"#);
+        assert_eq!(consumer.adapter_name(), "claude-oauth");
+        assert_eq!(consumer.delivery_slot(), CredentialConsumer::Claude.delivery_slot());
     }
 
     #[test]
