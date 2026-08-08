@@ -595,6 +595,41 @@ async fn ops_entry_rejects_a_verification_command_targeting_a_non_code_member() 
 }
 
 #[tokio::test]
+async fn ops_entry_rejects_an_ensure_whose_workflow_has_an_exit() {
+    let (daemon, _backend, _config, _runtime, tmp) = start_daemon().await;
+    let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
+    daemon
+        .set_repository_inspector(Arc::new(DeclarationInspector {
+            bootstrap: ops_spec,
+            commit: Arc::new(RwLock::new("ops-commit".to_string())),
+        }))
+        .await;
+    std::fs::write(
+        tmp.path().join("project.yaml"),
+        "name: demo\nmembers:\n  - alias: app\n    url: https://github.com/example/project-ops\n    roles: [code, ops]\n",
+    )
+    .expect("write declaration");
+    std::fs::write(
+        tmp.path().join("invalid-ensure.entry"),
+        "---\nkind: ensure\nname: finite-work\nrepos: [app]\n---\nworkflow: single-agent-trusted\n",
+    )
+    .expect("write ensure entry");
+
+    let mut rx = daemon.subscribe();
+    let result =
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: tmp.path().to_string_lossy().into_owned() })
+            .await;
+
+    assert!(
+        matches!(&result, CommandValue::Error { message }
+            if message.contains("invalid-ensure.entry")
+                && message.contains("single-agent-trusted")
+                && message.contains("exit declaration")),
+        "unexpected command result: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn tracking_repo_materializes_whole_repo_project() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let repository_key = track_repository(&daemon, &tmp, "tracked", "https://github.com/org/tracked.git").await;

@@ -49,6 +49,9 @@ spec:
                 restart_count:
                   type: integer
                   minimum: 0
+                running_since:
+                  type: string
+                  format: date-time
                 retry_at:
                   type: string
                   format: date-time

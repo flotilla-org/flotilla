@@ -1898,6 +1898,7 @@ pub struct InProcessDaemon {
 pub const DEFAULT_PROVISIONING_NAMESPACE: &str = "flotilla";
 const FLEET_REPLICA_FRESH_SECS: i64 = 90;
 const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
+const ENSURE_BACKOFF_RESET_AFTER: ChronoDuration = ChronoDuration::minutes(10);
 
 fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
     let exponent = restart_count.min(5);
@@ -4728,9 +4729,16 @@ impl InProcessDaemon {
             if status.convoy_ref.as_deref() != Some(&ensure.metadata.name) || status.retry_at.is_some() || status.last_failure.is_some() {
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
                     convoy_ref: ensure.metadata.name.clone(),
+                    observed_at: now,
                 })
                 .await?;
                 return Ok(Some(format!("ConvoyEnsure/{} observed running", ensure.metadata.name)));
+            }
+            if status.restart_count > 0
+                && status.running_since.is_some_and(|running_since| now - running_since >= ENSURE_BACKOFF_RESET_AFTER)
+            {
+                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
+                return Ok(Some(format!("ConvoyEnsure/{} reset restart backoff", ensure.metadata.name)));
             }
             return Ok(None);
         }
@@ -4751,7 +4759,9 @@ impl InProcessDaemon {
 
         let restart = async {
             if convoy.is_some() {
-                self.reap_ensured_convoy(namespace, &ensure.metadata.name).await?;
+                // A terminal failure cannot self-heal while its checkout gate
+                // remains armed, so restart is the one forced ensure teardown.
+                self.reap_ensured_convoy(namespace, &ensure.metadata.name, true).await?;
             }
             self.start_ensured_convoy(namespace, ensure).await
         }
@@ -4760,6 +4770,7 @@ impl InProcessDaemon {
             Ok(()) => {
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
                     convoy_ref: ensure.metadata.name.clone(),
+                    observed_at: now,
                 })
                 .await?;
                 Ok(Some(format!("started Convoy/{}", ensure.metadata.name)))
@@ -4822,13 +4833,7 @@ impl InProcessDaemon {
             (ENSURED_FROM_ANNOTATION.to_string(), ensure.metadata.name.clone()),
             (ENSURE_PROVENANCE_ANNOTATION.to_string(), provenance),
         ]);
-        for key in [
-            MATERIALIZED_PROJECT_ANNOTATION,
-            SOURCE_REPOSITORY_ANNOTATION,
-            SOURCE_COMMIT_ANNOTATION,
-            SOURCE_ENTRY_PATH_ANNOTATION,
-            PRESENTS_AS_ANNOTATION,
-        ] {
+        for key in [MATERIALIZED_PROJECT_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION] {
             if let Some(value) = ensure.metadata.annotations.get(key) {
                 annotations.insert(key.to_string(), value.clone());
             }
@@ -4851,7 +4856,7 @@ impl InProcessDaemon {
         .await
     }
 
-    async fn reap_ensured_convoy(&self, namespace: &str, name: &str) -> Result<(), String> {
+    async fn reap_ensured_convoy(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = match convoys.get(name).await {
             Ok(convoy) => convoy,
@@ -4861,7 +4866,7 @@ impl InProcessDaemon {
         if convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).map(String::as_str) != Some(name) {
             return Err(format!("refusing to reap Convoy/{name}: it is not owned by ConvoyEnsure/{name}"));
         }
-        self.reap_convoy_internal(namespace, name, true).await
+        self.reap_convoy_internal(namespace, name, force).await
     }
 
     async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
@@ -5584,6 +5589,20 @@ impl InProcessDaemon {
 
         let convoy_ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(&namespace);
         for (name, (meta, spec)) in &ensures {
+            let workflow = templates.get(&spec.workflow_ref).await.map_err(|error| {
+                format!(
+                    "{} ensure `{name}` references workflow template {}: {error}",
+                    meta.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).map(String::as_str).unwrap_or("operational entry"),
+                    spec.workflow_ref
+                )
+            })?;
+            if workflow.spec.exit.is_some() {
+                return Err(format!(
+                    "{} ensure `{name}` references workflow template {} with an exit declaration",
+                    meta.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).map(String::as_str).unwrap_or("operational entry"),
+                    spec.workflow_ref
+                ));
+            }
             let current = match convoy_ensures.get(name).await {
                 Ok(current) => Some(current),
                 Err(ResourceError::NotFound { .. }) => None,
@@ -5605,7 +5624,7 @@ impl InProcessDaemon {
             ensure.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
                 && !ensures.contains_key(&ensure.metadata.name)
         }) {
-            self.reap_ensured_convoy(&namespace, &stale.metadata.name).await?;
+            self.reap_ensured_convoy(&namespace, &stale.metadata.name, false).await?;
             convoy_ensures.delete(&stale.metadata.name).await.map_err(|error| error.to_string())?;
             changes.push(format!("deleted ConvoyEnsure/{}", stale.metadata.name));
         }

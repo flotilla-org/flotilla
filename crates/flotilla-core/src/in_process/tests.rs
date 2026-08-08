@@ -178,9 +178,16 @@ async fn standing_convoy_ensure_starts_restarts_with_backoff_and_recovers_from_r
     let ensure = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure status");
     assert_eq!(ensure.status.expect("ensure status").restart_count, 1);
 
+    clock.advance(ChronoDuration::minutes(10));
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("healthy backoff reset"), vec![
+        "ConvoyEnsure/quartermaster reset restart backoff"
+    ]);
+    let ensure = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("reset ensure status");
+    assert_eq!(ensure.status.expect("reset ensure status").restart_count, 0);
+
     convoys.delete("quartermaster").await.expect("simulate explicit reap");
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("observe reap");
-    clock.advance(ChronoDuration::seconds(60));
+    clock.advance(ChronoDuration::seconds(30));
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart after reap");
     assert!(convoys.get("quartermaster").await.is_ok());
 }
