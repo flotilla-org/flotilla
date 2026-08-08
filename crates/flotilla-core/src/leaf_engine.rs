@@ -379,9 +379,6 @@ impl LeafSubscriptionTable {
             .ok_or_else(|| format!("change-request observation `{record_name}` is absent"))?;
         let cr = record.status.as_ref().ok_or_else(|| format!("change-request observation `{record_name}` has no status"))?;
         let head_sha = cr.head_sha.value.clone().ok_or_else(|| "change-request head SHA is unknown".to_string())?;
-        if let Some(row) = self.inner.rows.lock().await.get_mut(&subscription_id) {
-            row.episode_key.head_sha = Some(head_sha.clone());
-        }
         let evidence_at = match leaf.field_path.as_str() {
             ".checks" => cr.checks.observed_at,
             ".review.actionable-at-head" => cr.review.actionable_at_head.observed_at,
@@ -421,7 +418,7 @@ impl LeafSubscriptionTable {
             external_patches::refuse_turn_delivery(
                 source.to_string(),
                 TurnDeliveryEpisode {
-                    head_sha,
+                    head_sha: head_sha.clone(),
                     evidence_at,
                     judged_claim_at: claim_at,
                     outcome: TurnDeliveryOutcome::Refused { reason: reason.clone(), refused_at: now, hold_executed: true },
@@ -434,7 +431,7 @@ impl LeafSubscriptionTable {
             external_patches::record_turn_delivery(
                 source.to_string(),
                 TurnDeliveryEpisode {
-                    head_sha,
+                    head_sha: head_sha.clone(),
                     evidence_at,
                     judged_claim_at: claim_at,
                     outcome: TurnDeliveryOutcome::Delivered { rung, delivered_at: now },
@@ -447,6 +444,9 @@ impl LeafSubscriptionTable {
         let mut next = status.clone();
         patch.apply(&mut next);
         convoys.update_status(convoy_name, &convoy.metadata.resource_version, &next).await.map_err(|error| error.to_string())?;
+        if let Some(row) = self.inner.rows.lock().await.get_mut(&subscription_id) {
+            row.episode_key.head_sha = Some(head_sha);
+        }
         Ok(())
     }
 }
@@ -1248,6 +1248,21 @@ mod tests {
         });
 
         let mut record_version = record.metadata.resource_version;
+        let stale_status = flotilla_resources::ChangeRequestStatus {
+            state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, base),
+            head_sha: flotilla_resources::Observation::known("stale".to_string(), base),
+            checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Fail, base),
+            review: flotilla_resources::ChangeRequestReviewObservation {
+                actionable_at_head: flotilla_resources::Observation::known(true, base),
+            },
+            mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, base),
+        };
+        let updated = records.update_status(&record.metadata.name, &record_version, &stale_status).await.expect("observe stale head");
+        record_version = updated.metadata.resource_version;
+        table.deliver_turn(subscription_id, "wake-turn", "review", &rule, &leaf).await.expect("ignore stale firing");
+        assert_eq!(table.inner.rows.lock().await[&subscription_id].episode_key.head_sha, None);
+        assert!(convoys.get("wake-turn").await.expect("convoy").status.expect("status").turn_deliveries.is_empty());
+
         for (index, head) in ["aaa", "bbb", "ccc", "ddd"].into_iter().enumerate() {
             let claim_at = base + chrono::Duration::seconds((index * 2) as i64);
             if index > 0 {
