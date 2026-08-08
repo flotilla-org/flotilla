@@ -172,6 +172,7 @@ pub async fn build_plan(
         | CommandAction::QueryResourceGet { .. }
         | CommandAction::QueryExplainConvoy { .. }
         | CommandAction::ResourceApply { .. }
+        | CommandAction::UsageObserve { .. }
         | CommandAction::ResourceDelete { .. }
         | CommandAction::ResourceWatch { .. } => {
             Err(CommandValue::Error { message: "resource commands should be handled by the daemon resource dispatcher".to_string() })

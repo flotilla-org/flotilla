@@ -157,4 +157,34 @@ mod tests {
             }) if workflow == "quartermaster" && placement == "feta" && presents_as == "fleet"
         ));
     }
+
+    #[test]
+    fn checked_in_usage_observer_is_a_standing_tool_workflow_ensured_on_kiwi() {
+        let workflow = parse_operational_entry(include_str!("../../../ops/usage-observer.md"))
+            .expect("parse usage observer workflow")
+            .expect("usage observer workflow entry");
+        let OperationalEntryDefinition::WorkflowTemplate(workflow) = workflow.definition else {
+            panic!("usage observer should be a workflow template");
+        };
+        assert!(workflow.exit.is_none(), "standing workflow must omit exit");
+        assert!(matches!(
+            &workflow.vessels[0].crew[0].source,
+            flotilla_resources::CrewSource::Tool { command } if command == "scripts/usage-observer"
+        ));
+
+        let ensure = parse_operational_entry(include_str!("../../../ops/usage-observer.ensure.md"))
+            .expect("parse usage observer ensure")
+            .expect("usage observer ensure entry");
+        assert!(matches!(
+            ensure.definition,
+            OperationalEntryDefinition::Ensure(super::EnsureEntry {
+                workflow,
+                placement: Some(placement),
+                stance: Some(flotilla_resources::Stance::Trusted),
+                presents_as: Some(presents_as),
+            }) if workflow == "usage-observer"
+                && placement == "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+                && presents_as == "fleet"
+        ));
+    }
 }

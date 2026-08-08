@@ -8436,6 +8436,32 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
+        if let flotilla_protocol::CommandAction::UsageObserve { namespace, account, status } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let result = match serde_json::from_value::<flotilla_resources::UsageStatus>(status.clone()) {
+                Ok(status) => {
+                    let observation = crate::usage_observer::UsageObservation { account: account.clone(), status };
+                    match crate::usage_observer::publish_usage_observation(&self.resource_backend, namespace, &observation).await {
+                        Ok(object) => match serde_json::to_value(object) {
+                            Ok(value) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
+                                kind: "Usage".to_string(),
+                                plural: "usages".to_string(),
+                                namespace: namespace.clone(),
+                                value,
+                            })),
+                            Err(error) => {
+                                flotilla_protocol::CommandValue::Error { message: format!("encode published Usage observation: {error}") }
+                            }
+                        },
+                        Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                    }
+                }
+                Err(error) => flotilla_protocol::CommandValue::Error { message: format!("decode Usage observation status: {error}") },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
         if let flotilla_protocol::CommandAction::ResourceDelete { namespace, kind, name, replica_origin } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let deleted = if let Some(origin_root) = replica_origin {
