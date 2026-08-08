@@ -49,6 +49,53 @@ To override the default for every convoy start that omits those flags, set
 auto_attach = false
 ```
 
+## Dispatch-time agent selection
+
+Workflow templates name *capabilities* (`code`, `code-review`), never
+harnesses. `flotilla convoy start` can bind a capability to a specific agent
+harness for that one dispatch:
+
+```sh
+flotilla convoy start --project flotilla --issue 1234 \
+    --agent claude-code:opus --no-attach
+
+flotilla convoy start --project flotilla --issue 1234 \
+    --agent claude-code:sonnet --agent review=codex --no-attach
+```
+
+The flag is `--agent [capability=]adapter[:model]` and is repeatable, once per
+capability. The bare form applies to the `code` capability — the one every
+stock coding workflow's crew selects on — so `--agent claude-code:opus` is
+shorthand for `--agent code=claude-code:opus`. Without an override, a
+capability resolves through the seeded table: `code` and `coding` to `codex`,
+`review` and `code-review` to `claude-code` on `opus`.
+
+Semantics worth knowing:
+
+- The override is written into the convoy's workflow snapshot at admission, not
+  carried alongside it. Placement validation, the vessel reconciler, and
+  terminal launch all read the same effective requirement from the snapshot's
+  selector; the template itself stays capability-only.
+- An adapter override does not inherit the seeded capability table's model. The
+  seeded `review` capability pairs `claude-code` with `opus`, but
+  `--agent review=codex` launches codex with no model, because a model name
+  only means something against the harness it was chosen for. Name the model
+  explicitly when you want one.
+- Placement admission checks the *effective* adapter. Dispatching to a host
+  that does not have it is refused, and the refusal names the adapter:
+  "workflow requires agent adapter `claude-code`, which is not available in
+  placement `lab-feta`".
+- Overriding a capability that no agent crew in the workflow selects is
+  refused, and the refusal lists the capabilities the workflow does carry.
+- Adapter and model tokens are restricted to alphanumerics, `.`, `_`, and `-`.
+
+Reach for it when coding work should run on a different harness than the
+default — most often when one subscription's weekly budget is spent and the
+work should move to another (the budget direction in
+[#1394](https://github.com/flotilla-org/flotilla/issues/1394)). Harness and
+model are separate axes: `--agent claude-code:opus` and
+`--agent claude-code:sonnet` pick the same harness at different cost.
+
 ## Convoy placement admission
 
 Each host refuses new convoy placement when the volume containing its Flotilla

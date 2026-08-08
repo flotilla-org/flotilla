@@ -76,7 +76,24 @@ routing remains part of the federation work tracked in #1188.
    cloud agents next, metered last; reserve scarce platform capacity
    (mac/GUI/Windows) for work that genuinely names it. Check the target host
    has the agent adapters the workflow needs.
-3. Crews are briefed automatically (assignment, delivery contract, crew
+3. Pick the harness when the default is wrong. Workflows name capabilities,
+   not harnesses; `--agent [capability=]adapter[:model]` binds one for this
+   dispatch and is repeatable, with the bare form applying to `code`:
+   ```sh
+   flotilla convoy start --project <proj> --issue <N> \
+       --placement-policy <policy> --agent claude-code:opus --no-attach
+
+   flotilla convoy start --project <proj> --issue <N> \
+       --placement-policy <policy> --agent claude-code:sonnet \
+       --agent review=codex --no-attach
+   ```
+   This is the budget lever: when one subscription's weekly window is spent,
+   route coding work to a harness that still has headroom, and drop from opus
+   to sonnet where the work does not need the bigger model. An adapter
+   override does not inherit the seeded model, and placement admission checks
+   the *effective* adapter — a host without it refuses the dispatch by name.
+   See [configuration](../configuration.md#dispatch-time-agent-selection).
+4. Crews are briefed automatically (assignment, delivery contract, crew
    verbs). Delivery is part of the assignment: implement, push, PR,
    shepherd until checks pass, then `flotilla crew complete` — crews do not
    merge.
