@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
@@ -30,25 +30,61 @@ pub struct CommandDetector {
     command: &'static str,
     args: &'static [&'static str],
     version_parser: VersionParser,
+    path_mode: BinaryPathMode,
+}
+
+enum BinaryPathMode {
+    CommandName,
+    ResolveAbsolute,
 }
 
 impl CommandDetector {
     pub fn new(command: &'static str, args: &'static [&'static str], version_parser: VersionParser) -> Self {
-        Self { command, args, version_parser }
+        Self { command, args, version_parser, path_mode: BinaryPathMode::CommandName }
+    }
+
+    pub fn with_resolved_path(mut self) -> Self {
+        self.path_mode = BinaryPathMode::ResolveAbsolute;
+        self
     }
 }
 
 #[async_trait]
 impl HostDetector for CommandDetector {
     async fn detect(&self, runner: &dyn CommandRunner, _env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
-        run!(runner, self.command, self.args, Path::new("."))
-            .ok()
-            .map(|output| match (self.version_parser)(&output) {
-                Some(version) => vec![EnvironmentAssertion::versioned_binary(self.command, self.command, version)],
-                None => vec![EnvironmentAssertion::binary(self.command, self.command)],
-            })
-            .unwrap_or_default()
+        let Ok(output) = run!(runner, self.command, self.args, Path::new(".")) else {
+            return Vec::new();
+        };
+        let path = match self.path_mode {
+            BinaryPathMode::CommandName => PathBuf::from(self.command),
+            BinaryPathMode::ResolveAbsolute => {
+                let Some(path) = resolve_binary_path(runner, self.command).await else {
+                    return Vec::new();
+                };
+                path
+            }
+        };
+        match (self.version_parser)(&output) {
+            Some(version) => vec![EnvironmentAssertion::versioned_binary(self.command, path, version)],
+            None => vec![EnvironmentAssertion::binary(self.command, path)],
+        }
     }
+}
+
+pub(super) async fn resolve_binary_path(runner: &dyn CommandRunner, command: &str) -> Option<PathBuf> {
+    // Resolve inside the runner's environment: provisioned and remote runners
+    // intentionally do not share the daemon process's PATH.
+    let output = runner
+        .run(
+            "sh",
+            &["-lc", "command -v \"$1\"", "flotilla-binary-discovery", command],
+            Path::new("."),
+            &crate::providers::ChannelLabel::Noop,
+        )
+        .await
+        .ok()?;
+    let path = PathBuf::from(output.trim());
+    path.is_absolute().then_some(path)
 }
 
 pub fn parse_first_dotted_version(output: &str) -> Option<String> {

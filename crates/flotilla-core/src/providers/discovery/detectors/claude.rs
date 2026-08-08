@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 
 use crate::providers::{
-    discovery::{detectors::generic::parse_first_dotted_version, EnvVars, EnvironmentAssertion, HostDetector},
+    discovery::{
+        detectors::generic::{parse_first_dotted_version, resolve_binary_path},
+        EnvVars, EnvironmentAssertion, HostDetector,
+    },
     run, CommandRunner,
 };
 
@@ -15,14 +18,14 @@ pub struct ClaudeDetector;
 #[async_trait]
 impl HostDetector for ClaudeDetector {
     async fn detect(&self, runner: &dyn CommandRunner, env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
-        // 1. Check PATH — single call proves existence and captures version
+        // 1. Check PATH, then retain the exact executable that satisfied the probe.
         if let Ok(output) = run!(runner, "claude", &["--version"], Path::new(".")) {
-            return match parse_first_dotted_version(&output) {
-                Some(version) => {
-                    vec![EnvironmentAssertion::versioned_binary("claude", "claude", version)]
-                }
-                None => vec![EnvironmentAssertion::binary("claude", "claude")],
-            };
+            if let Some(path) = resolve_binary_path(runner, "claude").await {
+                return match parse_first_dotted_version(&output) {
+                    Some(version) => vec![EnvironmentAssertion::versioned_binary("claude", path, version)],
+                    None => vec![EnvironmentAssertion::binary("claude", path)],
+                };
+            }
         }
 
         // 2. Check known installation location via runner (not local filesystem)
@@ -53,13 +56,16 @@ mod tests {
 
     #[tokio::test]
     async fn claude_detector_found_on_path() {
-        let runner = DiscoveryMockRunner::builder().on_run("claude", &["--version"], Ok("1.0.20 (Claude Code)\n".into())).build();
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("claude", &["--version"], Ok("1.0.20 (Claude Code)\n".into()))
+            .on_run("sh", &["-lc", "command -v \"$1\"", "flotilla-binary-discovery", "claude"], Ok("/x/y/claude\n".into()))
+            .build();
         let assertions = ClaudeDetector.detect(&runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::BinaryAvailable { name, path, version } => {
                 assert_eq!(name, "claude");
-                assert_eq!(*path, ExecutionEnvironmentPath::new("claude"));
+                assert_eq!(*path, ExecutionEnvironmentPath::new("/x/y/claude"));
                 assert_eq!(version.as_deref(), Some("1.0.20"));
             }
             other => panic!("expected BinaryAvailable, got {other:?}"),
