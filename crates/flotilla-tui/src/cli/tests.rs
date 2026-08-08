@@ -91,7 +91,7 @@ fn convoy_explanation_human_calls_no_exit_convoys_standing() {
         subscriptions: Vec::new(),
         crew_deliveries: Vec::new(),
         settlement: flotilla_protocol::ExplainedSettlement {
-            mode: "standing (no exit table)".to_string(),
+            mode: flotilla_protocol::commands::SETTLEMENT_MODE_STANDING.to_string(),
             satisfied: false,
             unmet: Vec::new(),
         },

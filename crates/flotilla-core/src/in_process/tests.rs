@@ -1495,7 +1495,7 @@ async fn convoy_explanation_names_an_absent_exit_as_standing() {
     let explanation = explain(&daemon, "quartermaster").await;
 
     assert_eq!(explanation.phase, "Active");
-    assert_eq!(explanation.settlement.mode, "standing (no exit table)");
+    assert_eq!(explanation.settlement.mode, flotilla_protocol::commands::SETTLEMENT_MODE_STANDING);
     assert!(!explanation.settlement.satisfied);
     assert!(explanation.settlement.unmet.is_empty(), "a standing convoy is not stuck on an unmet expectation");
 }

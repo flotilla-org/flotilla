@@ -4705,8 +4705,10 @@ impl InProcessDaemon {
         }
         if errors.is_empty() {
             Ok(changes)
-        } else {
+        } else if changes.is_empty() {
             Err(errors.join("; "))
+        } else {
+            Err(format!("{}; successful changes: {}", errors.join("; "), changes.join(", ")))
         }
     }
 
@@ -9459,7 +9461,7 @@ impl InProcessDaemon {
         );
         let settlement = ExplainedSettlement {
             mode: match evaluation.mode {
-                SettlementMode::NoExit => "standing (no exit table)",
+                SettlementMode::NoExit => flotilla_protocol::commands::SETTLEMENT_MODE_STANDING,
                 SettlementMode::ClaimExit => "claim_exit",
                 SettlementMode::WorldTerminal => "world_terminal",
             }
