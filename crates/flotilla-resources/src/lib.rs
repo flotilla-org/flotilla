@@ -34,6 +34,7 @@ mod terminal_session;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod tls;
+mod usage;
 mod vessel;
 mod watch;
 mod workflow_template;
@@ -87,7 +88,7 @@ pub use labels::{
 };
 pub use leaf::{
     admit_leaf, evaluate_leaf, ChangeRequestLeafSubject, ConvoyLeafSubject, LeafEvaluation, LeafSubject, LeafValue, ThreeValue,
-    VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
+    UsageLeafSubject, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
 };
 pub use material_pool::{
     MaterialPool, MaterialPoolLease, MaterialPoolSpec, MaterialPoolStatus, MaterialPoolStatusPatch, MaterialPoolUnitSpec,
@@ -139,6 +140,7 @@ pub use terminal_session::{
     TerminalSessionAttachTarget, TerminalSessionDegradedCondition, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource,
     TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTag,
 };
+pub use usage::{usage_record_name, Usage, UsagePace, UsageProviderCost, UsageSpec, UsageStatus, UsageStatusPatch, UsageWindow};
 pub use vessel::{
     Vessel, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
