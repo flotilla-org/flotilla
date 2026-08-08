@@ -82,6 +82,37 @@ name: test
 command: cargo test --workspace --locked
 ```
 
+A standing convoy is declared with an `ensure` entry. Its workflow must omit
+`exit`, which is the standing marker: the convoy remains live until the entry
+is removed and the project is refreshed.
+
+```yaml
+---
+kind: ensure
+name: quartermaster
+repos: [app]
+---
+workflow: quartermaster
+placement: host-direct-feta
+stance: trusted
+presents-as: fleet
+```
+
+`placement`, `stance`, and `presents-as` are optional. A stance preference
+overrides every vessel in the pinned workflow snapshot. `presents-as` is only
+a presentation annotation; `fleet` has no special scope semantics. Fleet-level
+independents are declared by convention in the fleet project.
+
+The ensure loop starts a missing convoy and restarts a failed or explicitly
+reaped convoy with exponential backoff. Convoy metadata records the entry name,
+source commit, repository, and path. Removing the entry and running `project
+refresh` reaps the convoy through the normal explicit teardown path before
+removing its `ConvoyEnsure` declaration. Declaration removal retains the normal
+checkout safety gate and fails refresh rather than discarding unsafe work. A
+failed convoy's automatic self-healing restart is deliberately forced: otherwise
+the failed convoy's landing gate could permanently prevent the ensure loop from
+restoring the declared service.
+
 Materialized workflow metadata records the source ops repository, exact commit,
 and entry path. Repository metadata records equivalent provenance for its
 materialized verification-command set. Refresh restores drift, removes stale

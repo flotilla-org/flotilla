@@ -5,6 +5,7 @@ mod clock;
 mod clone;
 pub mod controller;
 mod convoy;
+mod convoy_ensure;
 mod credential;
 mod definition;
 mod dispatch_observation;
@@ -62,6 +63,7 @@ pub use convoy::{
     SettlementEvaluation, SettlementMode, TargetMismatch, UnmetSettlementExpectation, WorkCompletionAuthority, WorkPhase, WorkState,
     WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_PENDING_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
+pub use convoy_ensure::{ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch};
 pub use credential::{
     CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
@@ -154,6 +156,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::ChangeRequest>($($argument),*);
         $callback::<$crate::Clone>($($argument),*);
         $callback::<$crate::Convoy>($($argument),*);
+        $callback::<$crate::ConvoyEnsure>($($argument),*);
         $callback::<$crate::CredentialGrant>($($argument),*);
         $callback::<$crate::CredentialSpec>($($argument),*);
         $callback::<$crate::Demand>($($argument),*);

@@ -231,6 +231,8 @@ pub struct ExplainedUnmetExpectation {
     pub detail: String,
 }
 
+pub const SETTLEMENT_MODE_STANDING: &str = "standing";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainedSettlement {
     pub mode: String,

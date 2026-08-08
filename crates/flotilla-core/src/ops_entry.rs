@@ -1,4 +1,4 @@
-use flotilla_resources::WorkflowTemplateSpec;
+use flotilla_resources::{Stance, WorkflowTemplateSpec};
 use serde::Deserialize;
 
 pub const MATERIALIZED_PROJECT_ANNOTATION: &str = "flotilla.work/materialized-project";
@@ -7,6 +7,9 @@ pub const SOURCE_COMMIT_ANNOTATION: &str = "flotilla.work/source-commit";
 pub const SOURCE_ENTRY_PATH_ANNOTATION: &str = "flotilla.work/source-entry-path";
 pub const VERIFICATION_PROJECT_ANNOTATION: &str = "flotilla.work/verification-command-project";
 pub const VERIFICATION_PROVENANCE_ANNOTATION: &str = "flotilla.work/verification-command-provenance";
+pub const ENSURED_FROM_ANNOTATION: &str = "flotilla.work/ensured-from";
+pub const ENSURE_PROVENANCE_ANNOTATION: &str = "flotilla.work/ensure-provenance";
+pub const PRESENTS_AS_ANNOTATION: &str = "flotilla.work/presents-as";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationalEntryFile {
@@ -25,6 +28,19 @@ pub struct OperationalEntry {
 pub enum OperationalEntryDefinition {
     WorkflowTemplate(WorkflowTemplateSpec),
     VerificationCommand { command: String },
+    Ensure(EnsureEntry),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnsureEntry {
+    pub workflow: String,
+    #[serde(default)]
+    pub placement: Option<String>,
+    #[serde(default)]
+    pub stance: Option<Stance>,
+    #[serde(default, alias = "presents-as")]
+    pub presents_as: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -40,6 +56,7 @@ struct EntryFrontmatter {
 enum EntryKind {
     WorkflowTemplate,
     VerificationCommand,
+    Ensure,
 }
 
 #[derive(Deserialize)]
@@ -79,6 +96,13 @@ pub fn parse_operational_entry(contents: &str) -> Result<Option<OperationalEntry
                 serde_yml::from_str(body).map_err(|error| format!("invalid verification command `{name}`: {error}"))?;
             OperationalEntryDefinition::VerificationCommand { command: required(body.command, "command")? }
         }
+        EntryKind::Ensure => {
+            let mut body: EnsureEntry = serde_yml::from_str(body).map_err(|error| format!("invalid ensure entry `{name}`: {error}"))?;
+            body.workflow = required(body.workflow, "workflow")?;
+            body.placement = body.placement.map(|value| required(value, "placement")).transpose()?;
+            body.presents_as = body.presents_as.map(|value| required(value, "presents_as")).transpose()?;
+            OperationalEntryDefinition::Ensure(body)
+        }
     };
     Ok(Some(OperationalEntry { name, repos, definition }))
 }
@@ -113,5 +137,24 @@ mod tests {
         assert!(parse_operational_entry("---\nkind: verification_command\nname: test\nrepos: []\n---\ncommand: cargo test\n")
             .expect_err("empty scope")
             .contains("omit repos"));
+    }
+
+    #[test]
+    fn parses_standing_convoy_ensure_preferences() {
+        let entry = parse_operational_entry(
+            "---\nkind: ensure\nname: quartermaster\nrepos: [project-map]\n---\nworkflow: quartermaster\nplacement: feta\nstance: trusted\npresents-as: fleet\n",
+        )
+        .expect("parse")
+        .expect("entry");
+
+        assert!(matches!(
+            entry.definition,
+            OperationalEntryDefinition::Ensure(super::EnsureEntry {
+                workflow,
+                placement: Some(placement),
+                stance: Some(flotilla_resources::Stance::Trusted),
+                presents_as: Some(presents_as),
+            }) if workflow == "quartermaster" && placement == "feta" && presents_as == "fleet"
+        ));
     }
 }

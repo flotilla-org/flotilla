@@ -86,6 +86,21 @@ fn attention_crds_parse_with_expected_names() {
 }
 
 #[test]
+fn convoy_ensure_crd_parses_with_expected_shape() {
+    let ensure: serde_json::Value =
+        serde_yml::from_str(include_str!("../src/crds/convoy_ensure.crd.yaml")).expect("ConvoyEnsure CRD should parse");
+
+    assert_eq!(ensure["metadata"]["name"], "convoyensures.flotilla.work");
+    assert_eq!(ensure["spec"]["names"]["kind"], "ConvoyEnsure");
+    let required = ensure["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["required"]
+        .as_array()
+        .expect("required ensure fields");
+    assert!(required.iter().any(|field| field == "project_ref"));
+    assert!(required.iter().any(|field| field == "workflow_ref"));
+    assert!(required.iter().any(|field| field == "repositories"));
+}
+
+#[test]
 fn dispatch_observation_crd_parses_with_immutable_record_fields() {
     let observation: serde_json::Value =
         serde_yml::from_str(include_str!("../src/crds/dispatch_observation.crd.yaml")).expect("DispatchObservation CRD should parse");

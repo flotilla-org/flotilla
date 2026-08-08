@@ -502,6 +502,11 @@ impl DaemonRuntime {
 
         if options.start_controllers {
             tasks.push(spawn_dispatch_reconciler_task(Arc::clone(&daemon), options.namespace.clone(), options.controller_resync_interval));
+            tasks.push(spawn_convoy_ensure_reconciler_task(
+                Arc::clone(&daemon),
+                options.namespace.clone(),
+                options.controller_resync_interval,
+            ));
             let local_repo_root = daemon.tracked_repo_paths().await.into_iter().next().map(ExecutionEnvironmentPath::new);
             let state = Arc::new(
                 ControllerRuntimeState::new(
@@ -1087,6 +1092,18 @@ fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, namespace: Strin
         async move {
             if let Err(error) = reconciler.reconcile_once().await {
                 warn!(%error, "dispatch reconciliation pass failed");
+            }
+        }
+    })
+}
+
+fn spawn_convoy_ensure_reconciler_task(daemon: Arc<InProcessDaemon>, namespace: String, interval: Duration) -> JoinHandle<()> {
+    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
+        let daemon = Arc::clone(&daemon);
+        let namespace = namespace.clone();
+        async move {
+            if let Err(error) = daemon.reconcile_convoy_ensures_once(&namespace).await {
+                warn!(%error, "standing convoy ensure reconciliation pass failed");
             }
         }
     })

@@ -43,14 +43,15 @@ use flotilla_resources::{
     normalize_project_spec, repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
     watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
     Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec,
-    ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, Demand as ResourceDemand,
-    Environment as ResourceEnvironment, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
-    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
-    IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
-    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey,
-    RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock,
-    TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec,
+    ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialGrant,
+    CredentialSpec, CrewCompletionPending, CrewSource, Demand as ResourceDemand, Environment as ResourceEnvironment, Host as ResourceHost,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta,
+    InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation,
+    Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource,
+    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalBrief, TerminalCrewContext,
+    TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, UnmetSettlementExpectation,
     Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
@@ -89,8 +90,9 @@ use crate::{
     leaf_engine::{LeafSubscriptionTable, LeafWatcher},
     model::{provider_names_from_registry, repo_name, RepoModel},
     ops_entry::{
-        parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
-        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
+        parse_operational_entry, OperationalEntryDefinition, ENSURED_FROM_ANNOTATION, ENSURE_PROVENANCE_ANNOTATION,
+        MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
+        SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
     },
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
@@ -1896,6 +1898,12 @@ pub struct InProcessDaemon {
 pub const DEFAULT_PROVISIONING_NAMESPACE: &str = "flotilla";
 const FLEET_REPLICA_FRESH_SECS: i64 = 90;
 const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
+const ENSURE_BACKOFF_RESET_AFTER: ChronoDuration = ChronoDuration::minutes(10);
+
+fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
+    let exponent = restart_count.min(5);
+    ChronoDuration::seconds((30_i64.saturating_mul(1_i64 << exponent)).min(15 * 60))
+}
 
 impl InProcessDaemon {
     async fn fresh_cached_issue(&self, reference: &flotilla_protocol::IssueRef) -> Option<flotilla_protocol::Issue> {
@@ -4500,6 +4508,17 @@ impl InProcessDaemon {
         intent: &flotilla_protocol::ConvoyStartIntent,
         dispatching_principal_ref: &PrincipalRef,
     ) -> Result<ConvoyAdmission, String> {
+        self.prepare_convoy_admission_with_preferences(namespace, intent, dispatching_principal_ref, None, None).await
+    }
+
+    async fn prepare_convoy_admission_with_preferences(
+        &self,
+        namespace: &str,
+        intent: &flotilla_protocol::ConvoyStartIntent,
+        dispatching_principal_ref: &PrincipalRef,
+        repositories: Option<&[RepositoryKey]>,
+        stance: Option<flotilla_resources::Stance>,
+    ) -> Result<ConvoyAdmission, String> {
         let project_ref = required_admission_value(&intent.project_ref, "project")?;
         let project = self
             .resource_backend
@@ -4508,7 +4527,17 @@ impl InProcessDaemon {
             .get(project_ref)
             .await
             .map_err(|error| project_not_ready_error(namespace, project_ref, error))?;
-        let mut repositories = self.snapshot_project_repositories(namespace, project_ref).await?;
+        let mut repositories_snapshot = self.snapshot_project_repositories(namespace, project_ref).await?;
+        if let Some(selected) = repositories {
+            let available = repositories_snapshot.iter().map(|repository| &repository.repo_ref).collect::<BTreeSet<_>>();
+            if let Some(missing) = selected.iter().find(|repository| !available.contains(repository)) {
+                return Err(format!("standing convoy selects repository {missing} outside project {project_ref}"));
+            }
+            repositories_snapshot.retain(|repository| selected.contains(&repository.repo_ref));
+            if repositories_snapshot.is_empty() {
+                return Err("standing convoy must select at least one project repository".to_string());
+            }
+        }
         if intent.change_request.is_some() && intent.branch.is_some() {
             return Err("change request adoption derives the branch from --pr; do not also provide a branch".to_string());
         }
@@ -4520,11 +4549,11 @@ impl InProcessDaemon {
                 let id = required_admission_value(id, "change request")?;
                 let resolved = self
                     .resolve_convoy_change_request_admission(
-                        &repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>(),
+                        &repositories_snapshot.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>(),
                         id,
                     )
                     .await?;
-                let repository = repositories
+                let repository = repositories_snapshot
                     .iter_mut()
                     .find(|repository| repository.repo_ref == resolved.binding.repository_ref)
                     .expect("admission resolution only returns project repositories");
@@ -4553,9 +4582,15 @@ impl InProcessDaemon {
             .get(&workflow_ref)
             .await
             .map_err(|error| format!("workflow template {workflow_ref}: {error}"))?;
+        if let Some(stance) = stance {
+            for vessel in &mut workflow.spec.vessels {
+                vessel.stance = stance;
+            }
+        }
         apply_agent_overrides(&mut workflow.spec, &intent.agent_overrides)?;
-        validate_fork_workflow_admission(&self.resource_backend, namespace, &repositories, &workflow_ref, &workflow.spec).await?;
-        resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), &repositories, &mut workflow.spec).await?;
+        validate_fork_workflow_admission(&self.resource_backend, namespace, &repositories_snapshot, &workflow_ref, &workflow.spec).await?;
+        resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), &repositories_snapshot, &mut workflow.spec)
+            .await?;
 
         let fallback_slug = change_request
             .as_ref()
@@ -4616,7 +4651,7 @@ impl InProcessDaemon {
             dispatching_principal_ref: dispatching_principal_ref.clone(),
             inputs: intent.inputs.iter().map(|(key, value)| (key.clone(), InputValue::String(value.clone()))).collect(),
             placement_policy,
-            repositories,
+            repositories: repositories_snapshot,
             r#ref: Some(branch),
             project_ref: Some(project_ref.to_string()),
             adopted_checkout_refs: BTreeMap::new(),
@@ -4651,6 +4686,195 @@ impl InProcessDaemon {
         )
         .await?;
         Ok(admission.name)
+    }
+
+    /// Drive one deterministic pass of the standing-convoy ensure loop.
+    ///
+    /// Tests call this directly with an in-memory backend and virtual clock;
+    /// the daemon runtime invokes the same pass on its resync cadence.
+    pub async fn reconcile_convoy_ensures_once(&self, namespace: &str) -> Result<Vec<String>, String> {
+        let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace).list().await.map_err(|e| e.to_string())?;
+        let mut changes = Vec::new();
+        let mut errors = Vec::new();
+        for ensure in ensures {
+            match self.reconcile_convoy_ensure(namespace, &ensure).await {
+                Ok(Some(change)) => changes.push(change),
+                Ok(None) => {}
+                Err(error) => errors.push(format!("ConvoyEnsure/{}: {error}", ensure.metadata.name)),
+            }
+        }
+        if errors.is_empty() {
+            Ok(changes)
+        } else if changes.is_empty() {
+            Err(errors.join("; "))
+        } else {
+            Err(format!("{}; successful changes: {}", errors.join("; "), changes.join(", ")))
+        }
+    }
+
+    async fn reconcile_convoy_ensure(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<Option<String>, String> {
+        let now = self.clock.now();
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = match convoys.get(&ensure.metadata.name).await {
+            Ok(convoy) if convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name) => Some(convoy),
+            Ok(_) => return Err(format!("convoy {} already exists without this ensure's provenance", ensure.metadata.name)),
+            Err(ResourceError::NotFound { .. }) => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        let status = ensure.status.clone().unwrap_or_default();
+        let dead = convoy
+            .as_ref()
+            .and_then(|convoy| convoy.status.as_ref())
+            .is_some_and(|status| matches!(status.phase, ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned));
+
+        if convoy.is_some() && !dead {
+            if status.convoy_ref.as_deref() != Some(&ensure.metadata.name) || status.retry_at.is_some() || status.last_failure.is_some() {
+                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
+                    convoy_ref: ensure.metadata.name.clone(),
+                    observed_at: now,
+                })
+                .await?;
+                return Ok(Some(format!("ConvoyEnsure/{} observed running", ensure.metadata.name)));
+            }
+            if status.restart_count > 0
+                && status.running_since.is_some_and(|running_since| now - running_since >= ENSURE_BACKOFF_RESET_AFTER)
+            {
+                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
+                return Ok(Some(format!("ConvoyEnsure/{} reset restart backoff", ensure.metadata.name)));
+            }
+            return Ok(None);
+        }
+
+        if status.retry_at.is_none() && (dead || status.convoy_ref.is_some()) {
+            let failure = if dead { "ensured convoy entered a terminal failure phase" } else { "ensured convoy was reaped" };
+            let retry_at = now + ensure_retry_delay(status.restart_count);
+            self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::BackingOff {
+                retry_at,
+                failure: failure.to_string(),
+            })
+            .await?;
+            return Ok(Some(format!("ConvoyEnsure/{} backing off until {retry_at}", ensure.metadata.name)));
+        }
+        if status.retry_at.is_some_and(|retry_at| retry_at > now) {
+            return Ok(None);
+        }
+
+        let restart = async {
+            if convoy.is_some() {
+                // A terminal failure cannot self-heal while its checkout gate
+                // remains armed, so restart is the one forced ensure teardown.
+                self.reap_ensured_convoy(namespace, &ensure.metadata.name, true).await?;
+            }
+            self.start_ensured_convoy(namespace, ensure).await
+        }
+        .await;
+        match restart {
+            Ok(()) => {
+                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
+                    convoy_ref: ensure.metadata.name.clone(),
+                    observed_at: now,
+                })
+                .await?;
+                Ok(Some(format!("started Convoy/{}", ensure.metadata.name)))
+            }
+            Err(error) => {
+                let latest = self.resource_backend.clone().using::<ConvoyEnsure>(namespace).get(&ensure.metadata.name).await.ok();
+                let restart_count =
+                    latest.as_ref().and_then(|value| value.status.as_ref()).map_or(status.restart_count, |s| s.restart_count);
+                let retry_at = now + ensure_retry_delay(restart_count);
+                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::BackingOff {
+                    retry_at,
+                    failure: error.clone(),
+                })
+                .await?;
+                Err(format!("start failed; retry at {retry_at}: {error}"))
+            }
+        }
+    }
+
+    async fn patch_convoy_ensure(&self, namespace: &str, name: &str, patch: ConvoyEnsureStatusPatch) -> Result<(), String> {
+        apply_resource_status_patch(&self.resource_backend.clone().using::<ConvoyEnsure>(namespace), name, &patch)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn start_ensured_convoy(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<(), String> {
+        let intent = flotilla_protocol::ConvoyStartIntent::builder()
+            .namespace(namespace.to_string())
+            .project_ref(ensure.spec.project_ref.clone())
+            .name(ensure.metadata.name.clone())
+            .branch(ensure.metadata.name.clone())
+            .workflow_ref(ensure.spec.workflow_ref.clone())
+            .maybe_placement_policy(ensure.spec.placement_policy.clone())
+            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+            .build();
+        let admission = self
+            .prepare_convoy_admission_with_preferences(
+                namespace,
+                &intent,
+                &PrincipalRef::implicit_for_namespace(namespace),
+                Some(&ensure.spec.repositories),
+                ensure.spec.stance,
+            )
+            .await?;
+        if admission.workflow.exit.is_some() {
+            return Err(format!(
+                "workflow template {} declares an exit table; standing convoys require no exit declaration",
+                ensure.spec.workflow_ref
+            ));
+        }
+        let commit = ensure
+            .metadata
+            .annotations
+            .get(SOURCE_COMMIT_ANNOTATION)
+            .cloned()
+            .ok_or_else(|| "materialized ensure has no source commit provenance".to_string())?;
+        let provenance = format!("ensured from {} @ {commit}", ensure.metadata.name);
+        let mut annotations = BTreeMap::from([
+            (ENSURED_FROM_ANNOTATION.to_string(), ensure.metadata.name.clone()),
+            (ENSURE_PROVENANCE_ANNOTATION.to_string(), provenance),
+        ]);
+        for key in [MATERIALIZED_PROJECT_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION] {
+            if let Some(value) = ensure.metadata.annotations.get(key) {
+                annotations.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(presents_as) = &ensure.spec.presents_as {
+            annotations.insert(PRESENTS_AS_ANNOTATION.to_string(), presents_as.clone());
+        }
+        let workflow_value = serde_json::to_value(&admission.workflow).map_err(|error| error.to_string())?;
+        let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
+        ensure_prepared_workflow_snapshot(&self.resource_backend, namespace, &workflow_name, &admission.workflow).await?;
+        annotations.insert(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name);
+        self.create_convoy_with_annotations(
+            namespace,
+            &admission.name,
+            &admission.spec,
+            admission.placement_decision,
+            ConvoyDispatchRegard::Suppress,
+            annotations,
+        )
+        .await
+    }
+
+    async fn reap_ensured_convoy(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = match convoys.get(name).await {
+            Ok(convoy) => convoy,
+            Err(ResourceError::NotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        if convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).map(String::as_str) != Some(name) {
+            return Err(format!("refusing to reap Convoy/{name}: it is not owned by ConvoyEnsure/{name}"));
+        }
+        self.reap_convoy_internal(namespace, name, force).await
+    }
+
+    async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
+        self.verify_convoy_teardown_gate(namespace, name, force).await?;
+        self.cascade_convoy_children(namespace, name).await?;
+        self.resource_backend.clone().using::<ResourceConvoy>(namespace).delete(name).await.map_err(|error| error.to_string())
     }
 
     async fn check_local_free_space_floor(&self) -> Result<(), String> {
@@ -5314,6 +5538,7 @@ impl InProcessDaemon {
         }
 
         let mut workflows = BTreeMap::new();
+        let mut ensures = BTreeMap::new();
         let mut commands = BTreeMap::<RepositoryKey, BTreeMap<String, String>>::new();
         let mut command_provenance = BTreeMap::<RepositoryKey, Vec<serde_json::Value>>::new();
         for source in sources {
@@ -5323,6 +5548,7 @@ impl InProcessDaemon {
                 &all_code,
                 source,
                 &mut workflows,
+                &mut ensures,
                 &mut commands,
                 &mut command_provenance,
             )?;
@@ -5361,6 +5587,48 @@ impl InProcessDaemon {
         }) {
             templates.delete(&stale.metadata.name).await.map_err(|error| error.to_string())?;
             changes.push(format!("deleted WorkflowTemplate/{}", stale.metadata.name));
+        }
+
+        let convoy_ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(&namespace);
+        for (name, (meta, spec)) in &ensures {
+            let workflow = templates.get(&spec.workflow_ref).await.map_err(|error| {
+                format!(
+                    "{} ensure `{name}` references workflow template {}: {error}",
+                    meta.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).map(String::as_str).unwrap_or("operational entry"),
+                    spec.workflow_ref
+                )
+            })?;
+            if workflow.spec.exit.is_some() {
+                return Err(format!(
+                    "{} ensure `{name}` references workflow template {} with an exit declaration",
+                    meta.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).map(String::as_str).unwrap_or("operational entry"),
+                    spec.workflow_ref
+                ));
+            }
+            let current = match convoy_ensures.get(name).await {
+                Ok(current) => Some(current),
+                Err(ResourceError::NotFound { .. }) => None,
+                Err(error) => return Err(error.to_string()),
+            };
+            if let Some(current) = &current {
+                match current.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION) {
+                    Some(owner) if owner == project_name => {}
+                    Some(owner) => return Err(format!("ConvoyEnsure `{name}` is materialized by project `{owner}`")),
+                    None => return Err(format!("ConvoyEnsure `{name}` already exists and is not materialized by a project")),
+                }
+            }
+            if current.as_ref().is_none_or(|current| current.spec != *spec || current.metadata.annotations != meta.annotations) {
+                convoy_ensures.apply(meta, spec).await.map_err(|error| error.to_string())?;
+                changes.push(format!("ConvoyEnsure/{name}"));
+            }
+        }
+        for stale in convoy_ensures.list().await.map_err(|error| error.to_string())?.into_iter().filter(|ensure| {
+            ensure.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
+                && !ensures.contains_key(&ensure.metadata.name)
+        }) {
+            self.reap_ensured_convoy(&namespace, &stale.metadata.name, false).await?;
+            convoy_ensures.delete(&stale.metadata.name).await.map_err(|error| error.to_string())?;
+            changes.push(format!("deleted ConvoyEnsure/{}", stale.metadata.name));
         }
 
         let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
@@ -5432,6 +5700,7 @@ impl InProcessDaemon {
         all_code: &[RepositoryKey],
         source: OperationalEntriesInspection,
         workflows: &mut BTreeMap<String, (InputMeta, WorkflowTemplateSpec)>,
+        ensures: &mut BTreeMap<String, (InputMeta, ConvoyEnsureSpec)>,
         commands: &mut BTreeMap<RepositoryKey, BTreeMap<String, String>>,
         command_provenance: &mut BTreeMap<RepositoryKey, Vec<serde_json::Value>>,
     ) -> Result<(), String> {
@@ -5440,7 +5709,8 @@ impl InProcessDaemon {
             let Some(entry) = parse_operational_entry(&file.contents).map_err(|error| format!("{}: {error}", file.path))? else {
                 continue;
             };
-            let is_verification_command = matches!(&entry.definition, OperationalEntryDefinition::VerificationCommand { .. });
+            let requires_code_role =
+                matches!(&entry.definition, OperationalEntryDefinition::VerificationCommand { .. } | OperationalEntryDefinition::Ensure(_));
             let targets = match entry.repos {
                 Some(repo_aliases) => repo_aliases
                     .into_iter()
@@ -5449,9 +5719,9 @@ impl InProcessDaemon {
                             .get(&alias)
                             .cloned()
                             .ok_or_else(|| format!("{} names unknown repository alias `{alias}`", file.path))?;
-                        if is_verification_command && !all_code.contains(&target) {
+                        if requires_code_role && !all_code.contains(&target) {
                             return Err(format!(
-                                "{} verification command `{}` targets repository alias `{alias}` without the code role",
+                                "{} operational entry `{}` targets repository alias `{alias}` without the code role",
                                 file.path, entry.name
                             ));
                         }
@@ -5496,6 +5766,31 @@ impl InProcessDaemon {
                             return Err(format!("duplicate verification command `{}` for repository {target}", entry.name));
                         }
                         command_provenance.entry(target).or_default().push(provenance.clone());
+                    }
+                }
+                OperationalEntryDefinition::Ensure(ensure) => {
+                    let mut meta = InputMeta::builder()
+                        .name(entry.name.clone())
+                        .annotations(BTreeMap::from([
+                            (MATERIALIZED_PROJECT_ANNOTATION.to_string(), project_name.to_string()),
+                            (SOURCE_REPOSITORY_ANNOTATION.to_string(), source_repository.to_string()),
+                            (SOURCE_COMMIT_ANNOTATION.to_string(), source.commit.clone()),
+                            (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), file.path.clone()),
+                        ]))
+                        .build();
+                    if let Some(presents_as) = &ensure.presents_as {
+                        meta.annotations.insert(PRESENTS_AS_ANNOTATION.to_string(), presents_as.clone());
+                    }
+                    let spec = ConvoyEnsureSpec {
+                        project_ref: project_name.to_string(),
+                        workflow_ref: ensure.workflow,
+                        placement_policy: ensure.placement,
+                        stance: ensure.stance,
+                        repositories: targets,
+                        presents_as: ensure.presents_as,
+                    };
+                    if ensures.insert(entry.name.clone(), (meta, spec)).is_some() {
+                        return Err(format!("duplicate materialized ConvoyEnsure `{}`", entry.name));
                     }
                 }
             }
@@ -8179,15 +8474,8 @@ impl InProcessDaemon {
                 Some(namespace) => namespace.clone(),
                 None => self.provisioning_namespace().await,
             };
-            let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
-            let result = match self.verify_convoy_teardown_gate(&namespace, name, *force).await {
-                Ok(()) => match self.cascade_convoy_children(&namespace, name).await {
-                    Ok(()) => match convoys.delete(name).await {
-                        Ok(()) => flotilla_protocol::CommandValue::Ok,
-                        Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
-                    },
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                },
+            let result = match self.reap_convoy_internal(&namespace, name, *force).await {
+                Ok(()) => flotilla_protocol::CommandValue::Ok,
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             self.finish_context_free_command(id, empty_identity, result);
@@ -9173,7 +9461,7 @@ impl InProcessDaemon {
         );
         let settlement = ExplainedSettlement {
             mode: match evaluation.mode {
-                SettlementMode::NoExit => "no_exit",
+                SettlementMode::NoExit => flotilla_protocol::commands::SETTLEMENT_MODE_STANDING,
                 SettlementMode::ClaimExit => "claim_exit",
                 SettlementMode::WorldTerminal => "world_terminal",
             }
