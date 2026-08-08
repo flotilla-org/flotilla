@@ -1097,7 +1097,10 @@ mod orchestrator_tests {
 
     #[tokio::test]
     async fn provisioned_host_detection_preserves_all_env_vars_and_adds_binary_assertions() {
-        let runner = DiscoveryMockRunner::builder().on_run("codex", &["--version"], Ok("codex-cli 1.2.3".to_string())).build();
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("codex", &["--version"], Ok("codex-cli 1.2.3".to_string()))
+            .on_run("sh", &["-c", "command -v \"$1\"", "flotilla-binary-discovery", "codex"], Ok("/usr/local/bin/codex\n".to_string()))
+            .build();
         let env_vars = HashMap::from([
             ("HOME".to_string(), "/home/crew".to_string()),
             ("FLOTILLA_ENVIRONMENT_ID".to_string(), "contained-work".to_string()),

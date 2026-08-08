@@ -1132,6 +1132,23 @@ mod tests {
         assert!(plan.command.contains("--model 'opus; touch /tmp/pwned'"));
     }
 
+    #[test]
+    fn launch_plan_uses_the_discovered_absolute_binary_path() {
+        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/x/y/claude"));
+        let registry = AgentAdapterRegistry::discover(&env, Arc::new(MockRunner::new(Vec::new())));
+        let brief =
+            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: String::new(), copies: Vec::new() };
+
+        let plan = registry
+            .get("claude-code")
+            .expect("claude adapter")
+            .launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief })
+            .expect("launch plan");
+
+        assert!(plan.command.starts_with("/x/y/claude "));
+        assert!(!plan.command.starts_with("claude "));
+    }
+
     #[tokio::test]
     async fn claude_prepare_writes_a_settings_overlay_the_launch_command_loads() {
         let temp = tempfile::tempdir().expect("tempdir");
