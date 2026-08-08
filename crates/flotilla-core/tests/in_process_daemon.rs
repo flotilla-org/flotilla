@@ -773,6 +773,41 @@ async fn resource_list_and_get_queries_return_wire_json() {
 }
 
 #[tokio::test]
+async fn usage_observe_command_creates_the_account_record_and_publishes_status() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let mut events = daemon.subscribe();
+    let observed_at = "2026-08-08T18:00:00Z".parse().expect("timestamp");
+    let status = flotilla_resources::UsageStatus::builder()
+        .provider("codex")
+        .windows(vec![flotilla_resources::UsageWindow::builder().name("weekly").used_percent(100.0).build()])
+        .observed_at(observed_at)
+        .build();
+
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::UsageObserve {
+                namespace: "flotilla".to_string(),
+                account: "Ada@Example.com".to_string(),
+                status: serde_json::to_value(&status).expect("encode usage status"),
+            },
+        })
+        .await
+        .expect("publish usage command");
+
+    let result = recv_command_finished(&mut events, command_id).await;
+    assert!(matches!(result, CommandValue::ResourceObject(response) if response.kind == "Usage"));
+    let name = flotilla_resources::usage_record_name("ada@example.com");
+    let stored = daemon.resource_backend().using::<flotilla_resources::Usage>("flotilla").get(&name).await.expect("stored usage");
+    assert_eq!(stored.spec.account, "Ada@Example.com");
+    assert_eq!(stored.status, Some(status));
+}
+
+#[tokio::test]
 async fn resource_watch_streams_current_update_and_resumed_delete_without_loss() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon =

@@ -699,6 +699,11 @@ pub enum CommandAction {
         namespace: String,
         document: serde_json::Value,
     },
+    UsageObserve {
+        namespace: String,
+        account: String,
+        status: serde_json::Value,
+    },
     ResourceDelete {
         namespace: String,
         kind: String,
@@ -809,6 +814,7 @@ impl Command {
             CommandAction::QueryResourceList { .. } => "query resource list",
             CommandAction::QueryResourceGet { .. } => "query resource get",
             CommandAction::ResourceApply { .. } => "apply resource",
+            CommandAction::UsageObserve { .. } => "publish usage observation",
             CommandAction::ResourceDelete { .. } => "delete resource",
             CommandAction::ResourceWatch { .. } => "watch resources",
         }
