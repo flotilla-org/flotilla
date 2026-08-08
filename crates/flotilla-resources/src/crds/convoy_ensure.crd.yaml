@@ -1,0 +1,56 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: convoyensures.flotilla.work
+spec:
+  group: flotilla.work
+  scope: Namespaced
+  names:
+    plural: convoyensures
+    singular: convoyensure
+    kind: ConvoyEnsure
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [project_ref, workflow_ref, repositories]
+              properties:
+                project_ref:
+                  type: string
+                  minLength: 1
+                workflow_ref:
+                  type: string
+                  minLength: 1
+                placement_policy:
+                  type: string
+                  minLength: 1
+                stance:
+                  type: string
+                  enum: [trusted, workspace-write, contained]
+                repositories:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                presents_as:
+                  type: string
+                  minLength: 1
+            status:
+              type: object
+              properties:
+                convoy_ref:
+                  type: string
+                restart_count:
+                  type: integer
+                  minimum: 0
+                retry_at:
+                  type: string
+                  format: date-time
+                last_failure:
+                  type: string

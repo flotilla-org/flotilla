@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use bon::builder;
+use chrono::TimeZone;
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     result_set::{
@@ -21,18 +22,19 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     controller::Reconciler, latch_evidence_backed_integration, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
-    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy, ConvoyPhase, ConvoyReconciler,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
-    CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
-    CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost,
-    HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
-    InputMeta, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
-    PlacementStatus, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus,
-    Selector, Stance, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
-    TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus,
-    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
-    CONVOY_LABEL, CREW_ORDINAL_LABEL, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy, ConvoyEnsure, ConvoyEnsureSpec,
+    ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
+    CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
+    CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment,
+    EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost, HostCondition, HostDirectEnvironmentSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, LifecycleAuthority,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, PlacementStatus, Project,
+    ProjectRepositorySpec, ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus, Selector, Stance,
+    TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
+    Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, VirtualClock, WorkCompletionAuthority, WorkPhase, WorkState,
+    WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL,
+    MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -56,6 +58,132 @@ use crate::{
 };
 
 const TEST_LOCAL_ATTACH_HOST: &str = "local";
+
+#[tokio::test]
+async fn standing_convoy_ensure_starts_restarts_with_backoff_and_recovers_from_reaping() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"standing-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let now = Utc.with_ymd_and_hms(2026, 8, 8, 12, 0, 0).single().expect("timestamp");
+    let clock = Arc::new(VirtualClock::new(now));
+    let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::local(),
+        backend.clone(),
+        clock.clone(),
+    )
+    .await;
+    let repository_spec = RepositorySpec::remote("https://github.com/acme/standing").expect("repository spec");
+    let repository_key = repository_spec.key();
+    backend
+        .using::<Repository>("flotilla")
+        .create(&empty_input_meta(&repository_key.to_string()), &repository_spec)
+        .await
+        .expect("repository");
+    backend
+        .definitions::<Project>("flotilla")
+        .create(
+            &empty_input_meta("standing-project"),
+            &ProjectSpec::builder()
+                .display_name("Standing Project".to_string())
+                .default_workflow_ref("quartermaster".to_string())
+                .repositories(vec![ProjectRepositorySpec {
+                    repo: repository_key.clone(),
+                    alias: Some("app".to_string()),
+                    roles: BTreeSet::from([ProjectRepositoryRole::Code]),
+                    subpath: None,
+                    default_branch: Some("main".to_string()),
+                }])
+                .build(),
+        )
+        .await
+        .expect("project");
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &empty_input_meta("quartermaster"),
+            &WorkflowTemplateSpec::builder()
+                .vessels(vec![VesselRequirement::builder()
+                    .name("work".to_string())
+                    .stance(Stance::Trusted)
+                    .repository_refs(vec![repository_key.clone()])
+                    .crew(Vec::new())
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("standing workflow");
+    backend
+        .definitions::<ConvoyEnsure>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("quartermaster".to_string())
+                .annotations(BTreeMap::from([
+                    (MATERIALIZED_PROJECT_ANNOTATION.to_string(), "standing-project".to_string()),
+                    (SOURCE_REPOSITORY_ANNOTATION.to_string(), repository_key.to_string()),
+                    (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
+                    (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), "ops/quartermaster.md".to_string()),
+                ]))
+                .build(),
+            &ConvoyEnsureSpec {
+                project_ref: "standing-project".to_string(),
+                workflow_ref: "quartermaster".to_string(),
+                placement_policy: None,
+                stance: Some(Stance::Trusted),
+                repositories: vec![repository_key],
+                presents_as: Some("fleet".to_string()),
+            },
+        )
+        .await
+        .expect("ensure declaration");
+
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure"), vec!["started Convoy/quartermaster"]);
+    let convoys = backend.using::<Convoy>("flotilla");
+    let first = convoys.get("quartermaster").await.expect("standing convoy");
+    assert_eq!(first.metadata.annotations[ENSURED_FROM_ANNOTATION], "quartermaster");
+    assert_eq!(first.metadata.annotations[ENSURE_PROVENANCE_ANNOTATION], "ensured from quartermaster @ abc123");
+    let snapshot_name = &first.metadata.annotations[flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION];
+    assert!(backend.using::<WorkflowTemplate>("flotilla").get(snapshot_name).await.expect("snapshot").spec.exit.is_none());
+
+    convoys
+        .update_status("quartermaster", &first.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Failed,
+            placement_decision: None,
+            workflow_snapshot: None,
+            work: BTreeMap::new(),
+            crew_work: BTreeMap::new(),
+            message: Some("agent died".to_string()),
+            started_at: Some(now),
+            finished_at: Some(now),
+            disposition: None,
+            observed_workflow_ref: Some("quartermaster".to_string()),
+            observed_workflows: None,
+            target_mismatches: Vec::new(),
+        })
+        .await
+        .expect("fail convoy");
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("record failure");
+    clock.advance(ChronoDuration::seconds(29));
+    assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("within backoff").is_empty());
+    assert_eq!(
+        convoys.get("quartermaster").await.expect("failed convoy remains during backoff").status.expect("status").phase,
+        ConvoyPhase::Failed
+    );
+
+    clock.advance(ChronoDuration::seconds(1));
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart"), vec!["started Convoy/quartermaster"]);
+    assert_ne!(convoys.get("quartermaster").await.expect("replacement").metadata.resource_version, first.metadata.resource_version);
+    let ensure = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure status");
+    assert_eq!(ensure.status.expect("ensure status").restart_count, 1);
+
+    convoys.delete("quartermaster").await.expect("simulate explicit reap");
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("observe reap");
+    clock.advance(ChronoDuration::seconds(60));
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart after reap");
+    assert!(convoys.get("quartermaster").await.is_ok());
+}
 
 #[test]
 fn fresh_false_replaces_premature_latched_landed_evidence() {
@@ -1343,6 +1471,26 @@ async fn convoy_explanation_names_each_held_landing_expectation_and_claim_exit()
     let claim_exit = explain(&daemon, "claim-exit").await;
     assert!(claim_exit.settlement.satisfied);
     assert_eq!(claim_exit.settlement.mode, "claim_exit");
+}
+
+#[tokio::test]
+async fn convoy_explanation_names_an_absent_exit_as_standing() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let (daemon, _temp) = explanation_daemon(backend.clone()).await;
+    create_explanation_convoy(&backend, "quartermaster", None, None).await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let convoy = convoys.get("quartermaster").await.expect("standing convoy");
+    let mut status = convoy.status.expect("standing status");
+    status.phase = ConvoyPhase::Active;
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").exit = None;
+    convoys.update_status("quartermaster", &convoy.metadata.resource_version, &status).await.expect("make standing");
+
+    let explanation = explain(&daemon, "quartermaster").await;
+
+    assert_eq!(explanation.phase, "Active");
+    assert_eq!(explanation.settlement.mode, "standing (no exit table)");
+    assert!(!explanation.settlement.satisfied);
+    assert!(explanation.settlement.unmet.is_empty(), "a standing convoy is not stuck on an unmet expectation");
 }
 
 #[tokio::test]

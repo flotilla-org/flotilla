@@ -78,6 +78,31 @@ fn convoy_explanation_human_names_the_holding_expectation() {
     assert!(json.contains("\"reason\": \"missing_record\""));
 }
 
+#[test]
+fn convoy_explanation_human_calls_no_exit_convoys_standing() {
+    let explanation = flotilla_protocol::ConvoyExplanation {
+        namespace: "flotilla".to_string(),
+        convoy: "quartermaster".to_string(),
+        phase: "Active".to_string(),
+        evidence_ttl_seconds: 30,
+        change_request_stale_after_seconds: 180,
+        checkouts: Vec::new(),
+        change_requests: Vec::new(),
+        subscriptions: Vec::new(),
+        crew_deliveries: Vec::new(),
+        settlement: flotilla_protocol::ExplainedSettlement {
+            mode: "standing (no exit table)".to_string(),
+            satisfied: false,
+            unmet: Vec::new(),
+        },
+    };
+
+    let output = crate::cli::format_convoy_explanation_human(&explanation);
+
+    assert!(output.contains("Settlement: STANDING (no exit table)"));
+    assert!(!output.contains("HOLDING"));
+}
+
 mod status_human {
     use flotilla_protocol::{
         qualified_path::HostId, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostListEntry, HostListResponse,
