@@ -13,7 +13,8 @@ use crate::{
     ChangeRequest, Checkout, Clone as CloneResource, Convoy, CredentialGrant, CredentialSpec, Demand, DispatchObservation, Environment,
     FieldOwnedResource, Host, InputMeta, MaterialPool, ObjectMeta, OwnerReference, PlacementPolicy, Presentation, Project,
     ReadResourceList, ReadWatchEvent, Regard, ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError,
-    ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
+    ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Usage, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
+    WriterIdentity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +45,7 @@ enum RegisteredResource {
     Regard,
     Repository,
     TerminalSession,
+    Usage,
     Vessel,
     WorkflowTemplate,
 }
@@ -129,6 +131,7 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
         "terminal-session",
         "terminal-sessions",
     ]),
+    kind::<Usage>(RegisteredResource::Usage, &[]),
     kind::<Vessel>(RegisteredResource::Vessel, &[]),
     kind::<WorkflowTemplate>(RegisteredResource::WorkflowTemplate, &[
         "workflowtemplate",
@@ -169,6 +172,7 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::Regard => $body::<Regard>($($arg),*).await,
             RegisteredResource::Repository => $body::<Repository>($($arg),*).await,
             RegisteredResource::TerminalSession => $body::<TerminalSession>($($arg),*).await,
+            RegisteredResource::Usage => $body::<Usage>($($arg),*).await,
             RegisteredResource::Vessel => $body::<Vessel>($($arg),*).await,
             RegisteredResource::WorkflowTemplate => $body::<WorkflowTemplate>($($arg),*).await,
         }
@@ -192,6 +196,7 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::Regard => $body::<Regard>(),
             RegisteredResource::Repository => $body::<Repository>(),
             RegisteredResource::TerminalSession => $body::<TerminalSession>(),
+            RegisteredResource::Usage => $body::<Usage>(),
             RegisteredResource::Vessel => $body::<Vessel>(),
             RegisteredResource::WorkflowTemplate => $body::<WorkflowTemplate>(),
         }
@@ -215,6 +220,7 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::Regard => $body::<Regard>($($arg),*),
             RegisteredResource::Repository => $body::<Repository>($($arg),*),
             RegisteredResource::TerminalSession => $body::<TerminalSession>($($arg),*),
+            RegisteredResource::Usage => $body::<Usage>($($arg),*),
             RegisteredResource::Vessel => $body::<Vessel>($($arg),*),
             RegisteredResource::WorkflowTemplate => $body::<WorkflowTemplate>($($arg),*),
         }

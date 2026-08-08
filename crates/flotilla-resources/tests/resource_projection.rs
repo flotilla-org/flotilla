@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use common::{convoy_object, convoy_spec, convoy_status, timestamp};
 use flotilla_resources::{
     Checkout, CheckoutSpec, CheckoutWorktreeSpec, Convoy, ConvoyPhase, ConvoyRepositorySpec, InputMeta, K8sResourceObject,
-    LifecycleAuthority, ObservedCheckoutSpec, RepositoryKey, ResourceError, ResourceObject, AUTHORITY_LABEL,
+    LifecycleAuthority, ObservedCheckoutSpec, RepositoryKey, ResourceError, ResourceObject, Usage, UsageSpec, UsageStatus, UsageWindow,
+    AUTHORITY_LABEL,
 };
 
 #[test]
@@ -98,6 +99,57 @@ fn dispatch_observation_crd_parses_with_immutable_record_fields() {
     assert!(!required.iter().any(|field| field == "placement_policy"));
     assert!(required.iter().any(|field| field == "stance"));
     assert!(required.iter().any(|field| field == "time_from_ready_seconds"));
+}
+
+#[test]
+fn usage_resource_roundtrips_account_subject_and_window_set() {
+    let observed_at = "2026-08-06T10:39:55Z".parse().expect("valid timestamp");
+    let object = ResourceObject::<Usage> {
+        metadata: common::object_meta("usage-example", "flotilla", "3"),
+        spec: UsageSpec { account: "user@example.com".to_string() },
+        status: Some(UsageStatus {
+            provider: "codex".to_string(),
+            plan: Some("plus".to_string()),
+            organization: Some("example-org".to_string()),
+            windows: vec![
+                UsageWindow::builder().name("session").used_percent(8.0).window_minutes(300_u64).resets_at(observed_at).build(),
+                UsageWindow::builder().name("weekly").used_percent(100.0).window_minutes(10_080_u64).resets_at(observed_at).build(),
+            ],
+            pace: Vec::new(),
+            provider_cost: None,
+            reset_credits_available: Some(2),
+            observed_at,
+        }),
+    };
+
+    let json = serde_json::to_value(object.to_k8s_object()).expect("usage projection should serialize");
+    assert_eq!(json["spec"]["account"], "user@example.com");
+    assert_eq!(json["status"]["windows"][0]["name"], "session");
+    assert_eq!(json["status"]["windows"][1]["used_percent"], 100.0);
+    assert_eq!(json["status"]["observed_at"], "2026-08-06T10:39:55Z");
+
+    let roundtripped = ResourceObject::<Usage>::from_k8s_object(serde_json::from_value(json).expect("deserialize usage"))
+        .expect("usage projection should roundtrip");
+    assert_eq!(roundtripped.metadata.name, object.metadata.name);
+    assert_eq!(roundtripped.spec, object.spec);
+    assert_eq!(roundtripped.status, object.status);
+}
+
+#[test]
+fn usage_crd_requires_account_windows_and_observation_time() {
+    let usage: serde_json::Value = serde_yml::from_str(include_str!("../src/crds/usage.crd.yaml")).expect("Usage CRD should parse");
+
+    assert_eq!(usage["metadata"]["name"], "usages.flotilla.work");
+    assert_eq!(usage["spec"]["names"]["kind"], "Usage");
+    let spec_required = usage["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["required"]
+        .as_array()
+        .expect("required usage spec fields");
+    assert!(spec_required.iter().any(|field| field == "account"));
+    let status_required = usage["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]["required"]
+        .as_array()
+        .expect("required usage status fields");
+    assert!(status_required.iter().any(|field| field == "windows"));
+    assert!(status_required.iter().any(|field| field == "observed_at"));
 }
 
 #[test]

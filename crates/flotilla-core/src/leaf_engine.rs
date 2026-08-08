@@ -5,7 +5,7 @@ use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, WaitSubscripti
 use flotilla_resources::{
     admit_leaf, controller::SecondaryWatch, evaluate_leaf, instantiate_exit, select_convoy_children, ChangeRequest,
     ChangeRequestLeafSubject, Checkout, Convoy, ConvoyLeafSubject, ConvoyPhase, InstantiatedExit, ResourceBackend, ResourceError,
-    ResourceObject, ThreeValue, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject,
+    ResourceObject, ThreeValue, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject,
 };
 use futures::StreamExt;
 use tokio::{
@@ -182,15 +182,18 @@ impl LeafSubscriptionTable {
         let convoys = self.inner.backend.including_replicas::<Convoy>(&row.namespace);
         let vessels = self.inner.backend.including_replicas::<Vessel>(&row.namespace);
         let change_requests = self.inner.backend.including_replicas::<ChangeRequest>(&row.namespace);
+        let usages = self.inner.backend.including_replicas::<Usage>(&row.namespace);
         // Open watches before taking the level-triggered snapshots. Writes
         // racing the lists are then buffered by the streams and replayed by
         // the loop instead of falling through a list-then-watch gap.
         let mut convoy_watch = convoys.watch().await.map_err(|error| error.to_string())?;
         let mut vessel_watch = vessels.watch().await.map_err(|error| error.to_string())?;
         let mut change_request_watch = change_requests.watch().await.map_err(|error| error.to_string())?;
+        let mut usage_watch = usages.watch().await.map_err(|error| error.to_string())?;
         let convoy_list = convoys.list().await.map_err(|error| error.to_string())?;
         let vessel_list = vessels.list().await.map_err(|error| error.to_string())?;
         let change_request_list = change_requests.list().await.map_err(|error| error.to_string())?;
+        let usage_list = usages.list().await.map_err(|error| error.to_string())?;
         let mut convoy_objects = convoy_list.items.into_iter().fold(HashMap::new(), |mut objects, item| {
             objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
             objects
@@ -203,10 +206,19 @@ impl LeafSubscriptionTable {
             objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
             objects
         });
+        let mut usage_objects = usage_list.items.into_iter().fold(HashMap::new(), |mut objects, item| {
+            objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
+            objects
+        });
 
-        if let Some(fire) =
-            evaluate_row(&row, &convoy_objects, &vessel_objects, &change_request_objects, self.inner.change_requests.stale_after())?
-        {
+        if let Some(fire) = evaluate_row(
+            &row,
+            &convoy_objects,
+            &vessel_objects,
+            &change_request_objects,
+            &usage_objects,
+            self.inner.change_requests.stale_after(),
+        )? {
             self.fire(row.id, fire).await;
             return Ok(());
         }
@@ -225,10 +237,19 @@ impl LeafSubscriptionTable {
                     let event = event.ok_or_else(|| "change request resource watch closed".to_string())?.map_err(|error| error.to_string())?;
                     apply_read_event(event, &mut change_request_objects);
                 }
+                event = usage_watch.next() => {
+                    let event = event.ok_or_else(|| "usage resource watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    apply_read_event(event, &mut usage_objects);
+                }
             }
-            if let Some(fire) =
-                evaluate_row(&row, &convoy_objects, &vessel_objects, &change_request_objects, self.inner.change_requests.stale_after())?
-            {
+            if let Some(fire) = evaluate_row(
+                &row,
+                &convoy_objects,
+                &vessel_objects,
+                &change_request_objects,
+                &usage_objects,
+                self.inner.change_requests.stale_after(),
+            )? {
                 self.fire(row.id, fire).await;
                 return Ok(());
             }
@@ -439,6 +460,7 @@ fn evaluate_row(
     convoys: &HashMap<String, ResourceObject<Convoy>>,
     vessels: &HashMap<String, ResourceObject<Vessel>>,
     change_requests: &HashMap<String, ResourceObject<ChangeRequest>>,
+    usages: &HashMap<String, ResourceObject<Usage>>,
     change_request_stale_after: std::time::Duration,
 ) -> Result<Option<LeafFire>, String> {
     let require_all = matches!(row.watcher, LeafWatcher::ReconcilerWake { .. });
@@ -466,6 +488,11 @@ fn evaluate_row(
                     now: Utc::now(),
                     stale_after: change_request_stale_after,
                 });
+                evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
+            }
+            LeafAddress::Usage { account } => {
+                let name = flotilla_resources::usage_record_name(account);
+                let subject = usages.get(&name).map(UsageLeafSubject);
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
             }
         };
@@ -698,6 +725,56 @@ mod tests {
     #[tokio::test]
     async fn sqlite_leaf_subscription_contract() {
         assert_leaf_subscription_contract(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("open sqlite"))).await;
+    }
+
+    #[tokio::test]
+    async fn usage_leaf_fires_from_the_named_window_in_the_replicated_resource_path() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let account = "user@example.com";
+        let records = backend.using::<Usage>("flotilla");
+        let created = records
+            .create(&InputMeta::builder().name(flotilla_resources::usage_record_name(account)).build(), &flotilla_resources::UsageSpec {
+                account: account.to_string(),
+            })
+            .await
+            .expect("create usage record");
+        records
+            .update_status(
+                &created.metadata.name,
+                &created.metadata.resource_version,
+                &flotilla_resources::UsageStatus::builder()
+                    .provider("codex")
+                    .windows(vec![
+                        flotilla_resources::UsageWindow::builder().name("session").used_percent(8.0).build(),
+                        flotilla_resources::UsageWindow::builder().name("weekly").used_percent(100.0).build(),
+                    ])
+                    .observed_at(Utc::now())
+                    .build(),
+            )
+            .await
+            .expect("publish usage status");
+
+        let (event_tx, _) = broadcast::channel(16);
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "test-host".to_string(),
+            Arc::new(UnavailableChangeRequests),
+            crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        );
+        let table = LeafSubscriptionTable::new(backend, event_tx.clone(), refresher);
+        let mut events = event_tx.subscribe();
+        let mut usage_leaf = leaf(LeafAddress::Usage { account: account.to_string() }, ".windows.weekly.used-percent", "90");
+        usage_leaf.operator = LeafOperator::GreaterThan;
+        let subscription_id = table
+            .subscribe_wait(uuid::Uuid::new_v4(), WaitSubscriptionRequest {
+                namespace: "flotilla".to_string(),
+                leaves: vec![usage_leaf],
+                freshness_demand: None,
+            })
+            .await
+            .expect("subscribe usage leaf");
+
+        assert_eq!(receive_fire(&mut events, subscription_id).await.value, "100");
     }
 
     #[tokio::test]
