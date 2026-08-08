@@ -998,7 +998,7 @@ mod tests {
                     .on_run("codex", &["--version"], Ok("codex-cli 1.2.3".to_string()))
                     .on_run(
                         "sh",
-                        &["-lc", "command -v \"$1\"", "flotilla-binary-discovery", "codex"],
+                        &["-c", "command -v \"$1\"", "flotilla-binary-discovery", "codex"],
                         Ok("/usr/local/bin/codex\n".to_string()),
                     )
                     .build(),

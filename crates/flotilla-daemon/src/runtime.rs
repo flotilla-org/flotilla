@@ -5375,10 +5375,10 @@ mod tests {
             DiscoveryMockRunner::builder()
                 .on_run("codex", &["--version"], Ok("codex-cli 1.2.3".to_string()))
                 .on_run("claude", &["--version"], Ok("1.0.0 (Claude Code)".to_string()))
-                .on_run("sh", &["-lc", "command -v \"$1\"", "flotilla-binary-discovery", "codex"], Ok("/usr/local/bin/codex\n".to_string()))
+                .on_run("sh", &["-c", "command -v \"$1\"", "flotilla-binary-discovery", "codex"], Ok("/usr/local/bin/codex\n".to_string()))
                 .on_run(
                     "sh",
-                    &["-lc", "command -v \"$1\"", "flotilla-binary-discovery", "claude"],
+                    &["-c", "command -v \"$1\"", "flotilla-binary-discovery", "claude"],
                     Ok("/usr/local/bin/claude\n".to_string()),
                 )
                 .build(),

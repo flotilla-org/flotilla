@@ -58,7 +58,7 @@ mod tests {
     async fn claude_detector_found_on_path() {
         let runner = DiscoveryMockRunner::builder()
             .on_run("claude", &["--version"], Ok("1.0.20 (Claude Code)\n".into()))
-            .on_run("sh", &["-lc", "command -v \"$1\"", "flotilla-binary-discovery", "claude"], Ok("/x/y/claude\n".into()))
+            .on_run("sh", &["-c", "command -v \"$1\"", "flotilla-binary-discovery", "claude"], Ok("/x/y/claude\n".into()))
             .build();
         let assertions = ClaudeDetector.detect(&runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
