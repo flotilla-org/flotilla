@@ -1558,6 +1558,28 @@ struct DaemonTurnDeliveryActuator {
     daemon: Weak<InProcessDaemon>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnDeliverySessionPlan {
+    QueueWarm,
+    QueueFresh,
+    RestartFresh,
+}
+
+fn turn_delivery_session_plan(
+    phase: Option<ResourceTerminalSessionPhase>,
+    vessel: &str,
+    role: &str,
+) -> Result<TurnDeliverySessionPlan, String> {
+    match phase {
+        Some(ResourceTerminalSessionPhase::Running) => Ok(TurnDeliverySessionPlan::QueueWarm),
+        Some(ResourceTerminalSessionPhase::Starting) | None => Ok(TurnDeliverySessionPlan::QueueFresh),
+        Some(ResourceTerminalSessionPhase::Stopped) => Ok(TurnDeliverySessionPlan::RestartFresh),
+        Some(ResourceTerminalSessionPhase::Failed) => {
+            Err(format!("turn-delivery target {vessel}/{role} failed provisioning and cannot be restarted"))
+        }
+    }
+}
+
 #[async_trait]
 impl crate::leaf_engine::TurnDeliveryActuator for DaemonTurnDeliveryActuator {
     async fn deliver(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
@@ -7586,24 +7608,30 @@ impl InProcessDaemon {
         };
         let delivery_message =
             TerminalCrewMessage { id: format!("turn-delivery:{}:{}", request.source, request.head_sha), text: request.brief.clone() };
-        let running = session.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Running);
-        if running {
-            *message = Some(delivery_message);
-        } else {
-            brief.content = request.brief.clone();
-            *message = None;
+        let plan = turn_delivery_session_plan(session.status.as_ref().map(|status| status.phase), &request.vessel, &request.role)?;
+        match plan {
+            TurnDeliverySessionPlan::QueueWarm | TurnDeliverySessionPlan::QueueFresh => {
+                *message = Some(delivery_message);
+            }
+            TurnDeliverySessionPlan::RestartFresh => {
+                brief.content = request.brief.clone();
+                *message = None;
+            }
         }
         sessions
             .update(&input_meta_from_resource(&session), &session.metadata.resource_version, &spec)
             .await
             .map_err(|error| error.to_string())?;
-        if running {
-            return Ok(TurnDeliveryRung::WarmSession);
+        match plan {
+            TurnDeliverySessionPlan::QueueWarm => Ok(TurnDeliveryRung::WarmSession),
+            TurnDeliverySessionPlan::RestartFresh => {
+                apply_resource_status_patch(&sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(TurnDeliveryRung::FreshAgent)
+            }
+            TurnDeliverySessionPlan::QueueFresh => Ok(TurnDeliveryRung::FreshAgent),
         }
-        apply_resource_status_patch(&sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(TurnDeliveryRung::FreshAgent)
     }
 
     async fn execute_turn_delivery_hold(

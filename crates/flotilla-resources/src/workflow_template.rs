@@ -526,7 +526,8 @@ fn validate_turn_delivery(
 ) {
     for (source, rule) in &spec.turn_delivery {
         let admitted = rule.on.subject == SubjectVariable::ChangeRequest
-            && matches!(rule.on.field_path.as_str(), ".checks" | ".review.actionable-at-head" | ".mergeable");
+            && matches!(rule.on.field_path.as_str(), ".checks" | ".review.actionable-at-head" | ".mergeable")
+            && matches!(rule.on.operator, LeafOperator::Equal | LeafOperator::NotEqual);
         if !admitted {
             push_error(errors, ValidationError::InvalidTurnDeliveryLeaf { source: source.clone(), template: rule.on.to_string() });
         }

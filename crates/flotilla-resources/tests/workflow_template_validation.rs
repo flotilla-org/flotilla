@@ -119,6 +119,36 @@ vessels:
 }
 
 #[test]
+fn validate_rejects_unsupported_turn_delivery_operator() {
+    let spec = parse_spec(
+        r#"
+inputs: []
+turn_delivery:
+  actionable-review:
+    on: $cr.review.actionable-at-head < true
+    to:
+      vessel: implement
+      role: coder
+    brief: Address the actionable review.
+    hold:
+      kind: change-request-comment
+      body: Automatic delivery paused.
+vessels:
+  - name: implement
+    crew:
+      - role: coder
+        selector:
+          capability: code
+"#,
+    );
+
+    let errors = validate(&spec).expect_err("ordering operators are not admitted for turn delivery");
+    assert!(errors
+        .iter()
+        .any(|error| matches!(error, ValidationError::InvalidTurnDeliveryLeaf { source, .. } if source == "actionable-review")));
+}
+
+#[test]
 fn stock_workflows_transcribe_the_standard_exit_table() {
     let expected = Some(ExitDeclaration::standard_table());
     for spec in [

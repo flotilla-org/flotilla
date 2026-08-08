@@ -57,6 +57,23 @@ use crate::{
     },
 };
 
+#[test]
+fn turn_delivery_session_plans_preserve_terminal_lifecycle_invariants() {
+    assert_eq!(
+        turn_delivery_session_plan(Some(ResourceTerminalSessionPhase::Running), "work", "coder").expect("running session"),
+        TurnDeliverySessionPlan::QueueWarm
+    );
+    assert_eq!(
+        turn_delivery_session_plan(Some(ResourceTerminalSessionPhase::Starting), "work", "coder").expect("starting session"),
+        TurnDeliverySessionPlan::QueueFresh
+    );
+    assert_eq!(
+        turn_delivery_session_plan(Some(ResourceTerminalSessionPhase::Stopped), "work", "coder").expect("stopped session"),
+        TurnDeliverySessionPlan::RestartFresh
+    );
+    assert!(turn_delivery_session_plan(Some(ResourceTerminalSessionPhase::Failed), "work", "coder").is_err());
+}
+
 const TEST_LOCAL_ATTACH_HOST: &str = "local";
 
 #[tokio::test]
