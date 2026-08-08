@@ -7,6 +7,16 @@ spec:
   exit:
     merged: $cr.state == merged
     closed-unmerged: $cr.state == closed
+  turn_delivery:
+    actionable-review:
+      on: $cr.review.actionable-at-head == true
+      to:
+        vessel: implement
+        role: coder
+      brief: Address the actionable review at the bound head, push the durable fix, and file a fresh settlement claim.
+      hold:
+        kind: change-request-comment
+        body: Flotilla paused automatic turn delivery after repeated actionable-review episodes; human attention is required.
   inputs:
     - name: feature
       description: Brief description of the feature to implement

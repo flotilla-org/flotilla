@@ -395,6 +395,7 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
 
     let expected_snapshot = flotilla_resources::WorkflowSnapshot {
         exit: template.spec.exit.clone(),
+        turn_delivery: template.spec.turn_delivery.clone(),
         vessels: template
             .spec
             .vessels
@@ -549,6 +550,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
         exit: None,
+        turn_delivery: Default::default(),
         vessels: vec![
             flotilla_resources::VesselRequirement {
                 name: "a".to_string(),
@@ -602,6 +604,7 @@ fn fan_in_waits_until_all_dependencies_complete() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
         exit: None,
+        turn_delivery: Default::default(),
         vessels: vec![
             flotilla_resources::VesselRequirement {
                 name: "implement".to_string(),
@@ -1016,6 +1019,7 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
         exit: None,
+        turn_delivery: Default::default(),
         vessels: vec![
             flotilla_resources::VesselRequirement {
                 name: "a".to_string(),
@@ -1184,7 +1188,8 @@ fn all_agent_crew_done_rolls_vessel_work_complete() {
 fn interactive_convoy_stays_active_until_crew_reports_complete() {
     let mut status = bootstrapped_convoy_status();
     status.phase = ConvoyPhase::Active;
-    status.workflow_snapshot = Some(WorkflowSnapshot { exit: None, vessels: interactive_single_workflow_spec().vessels });
+    status.workflow_snapshot =
+        Some(WorkflowSnapshot { exit: None, turn_delivery: Default::default(), vessels: interactive_single_workflow_spec().vessels });
     let mut work = status.work.remove("implement").expect("seed work");
     work.phase = WorkPhase::Running;
     status.work = BTreeMap::from([("work".to_string(), work)]);

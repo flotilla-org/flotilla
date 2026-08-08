@@ -176,6 +176,22 @@ spec:
                       observed_target_ref:
                         type: string
                         minLength: 1
+                turn_deliveries:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                attention:
+                  type: object
+                  required: [source, reason, raised_at]
+                  properties:
+                    source:
+                      type: string
+                    reason:
+                      type: string
+                    raised_at:
+                      type: string
+                      format: date-time
                 workflow_snapshot:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
@@ -187,6 +203,11 @@ spec:
                         - type: object
                           additionalProperties:
                             type: string
+                    turn_delivery:
+                      type: object
+                      additionalProperties:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
                     vessels:
                       type: array
                       items:

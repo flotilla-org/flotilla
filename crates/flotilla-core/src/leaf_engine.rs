@@ -1,11 +1,14 @@
 use std::{collections::HashMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, WaitSubscriptionRequest};
 use flotilla_resources::{
-    admit_leaf, controller::SecondaryWatch, evaluate_leaf, instantiate_exit, select_convoy_children, ChangeRequest,
-    ChangeRequestLeafSubject, Checkout, Convoy, ConvoyLeafSubject, ConvoyPhase, InstantiatedExit, ResourceBackend, ResourceError,
-    ResourceObject, ThreeValue, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject,
+    admit_leaf, controller::SecondaryWatch, evaluate_leaf, external_patches, instantiate_exit, instantiate_turn_delivery,
+    select_convoy_children, ChangeRequest, ChangeRequestLeafSubject, Checkout, Convoy, ConvoyAttention, ConvoyLeafSubject, ConvoyPhase,
+    HoldAct, InstantiatedExit, ResourceBackend, ResourceError, ResourceObject, StatusPatch, ThreeValue, TurnDeliveryEpisode,
+    TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart,
+    WorkLeafSubject,
 };
 use futures::StreamExt;
 use tokio::{
@@ -19,6 +22,7 @@ use crate::change_request_observer::{ChangeRequestRef, ChangeRequestRefresher};
 pub enum LeafWatcher {
     WaitCaller { connection_id: uuid::Uuid },
     ReconcilerWake { convoy: String },
+    TurnDelivery { convoy: String, source: String, rule: TurnDeliveryRule },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -27,6 +31,37 @@ pub struct EpisodeKeyFields {
     pub convoy: Option<String>,
     pub vessel: Option<String>,
     pub role: Option<String>,
+    pub head_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+pub struct TurnDeliveryRequest {
+    pub namespace: String,
+    pub convoy: String,
+    pub source: String,
+    pub vessel: String,
+    pub role: String,
+    pub brief: String,
+    pub head_sha: String,
+}
+
+#[async_trait]
+pub trait TurnDeliveryActuator: Send + Sync {
+    async fn deliver(&self, request: &TurnDeliveryRequest) -> Result<TurnDeliveryRung, String>;
+    async fn hold(&self, request: &TurnDeliveryRequest, act: &HoldAct, reason: &str) -> Result<(), String>;
+}
+
+struct UnavailableTurnDeliveryActuator;
+
+#[async_trait]
+impl TurnDeliveryActuator for UnavailableTurnDeliveryActuator {
+    async fn deliver(&self, _request: &TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+        Err("turn-delivery actuator unavailable".to_string())
+    }
+
+    async fn hold(&self, _request: &TurnDeliveryRequest, _act: &HoldAct, _reason: &str) -> Result<(), String> {
+        Err("turn-delivery hold actuator unavailable".to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,10 +95,21 @@ struct LeafSubscriptionTableInner {
     tasks: Mutex<HashMap<uuid::Uuid, JoinHandle<()>>>,
     change_requests: ChangeRequestRefresher,
     reconciler_tx: broadcast::Sender<String>,
+    turn_delivery: Mutex<Arc<dyn TurnDeliveryActuator>>,
+    episode_limit: u32,
 }
 
 impl LeafSubscriptionTable {
     pub fn new(backend: ResourceBackend, event_tx: broadcast::Sender<DaemonEvent>, change_requests: ChangeRequestRefresher) -> Self {
+        Self::with_episode_limit(backend, event_tx, change_requests, 3)
+    }
+
+    pub fn with_episode_limit(
+        backend: ResourceBackend,
+        event_tx: broadcast::Sender<DaemonEvent>,
+        change_requests: ChangeRequestRefresher,
+        episode_limit: u32,
+    ) -> Self {
         let (reconciler_tx, _) = broadcast::channel(32);
         Self {
             inner: Arc::new(LeafSubscriptionTableInner {
@@ -74,8 +120,14 @@ impl LeafSubscriptionTable {
                 tasks: Mutex::new(HashMap::new()),
                 change_requests,
                 reconciler_tx,
+                turn_delivery: Mutex::new(Arc::new(UnavailableTurnDeliveryActuator)),
+                episode_limit,
             }),
         }
+    }
+
+    pub async fn set_turn_delivery_actuator(&self, actuator: Arc<dyn TurnDeliveryActuator>) {
+        *self.inner.turn_delivery.lock().await = actuator;
     }
 
     pub async fn subscribe_wait(&self, connection_id: uuid::Uuid, request: WaitSubscriptionRequest) -> Result<uuid::Uuid, String> {
@@ -220,7 +272,9 @@ impl LeafSubscriptionTable {
             self.inner.change_requests.stale_after(),
         )? {
             self.fire(row.id, fire).await;
-            return Ok(());
+            if !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }) {
+                return Ok(());
+            }
         }
 
         loop {
@@ -251,7 +305,9 @@ impl LeafSubscriptionTable {
                 self.inner.change_requests.stale_after(),
             )? {
                 self.fire(row.id, fire).await;
-                return Ok(());
+                if !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }) {
+                    return Ok(());
+                }
             }
         }
     }
@@ -276,9 +332,154 @@ impl LeafSubscriptionTable {
                 // row per expected CR a naturally idempotent fired latch.
                 let _ = self.inner.reconciler_tx.send(convoy);
             }
+            Some(LeafWatcher::TurnDelivery { convoy, source, rule }) => {
+                if let Err(error) = self.deliver_turn(subscription_id, &convoy, &source, &rule, &fire.leaf).await {
+                    tracing::warn!(%convoy, %source, %error, "turn delivery failed");
+                }
+                let _ = self.inner.reconciler_tx.send(convoy);
+            }
             None => {}
         }
     }
+
+    async fn deliver_turn(
+        &self,
+        subscription_id: uuid::Uuid,
+        convoy_name: &str,
+        source: &str,
+        rule: &TurnDeliveryRule,
+        leaf: &Leaf,
+    ) -> Result<(), String> {
+        let namespace = self
+            .inner
+            .rows
+            .lock()
+            .await
+            .get(&subscription_id)
+            .map(|row| row.namespace.clone())
+            .ok_or_else(|| "turn-delivery subscription disappeared".to_string())?;
+        let convoys = self.inner.backend.clone().using::<Convoy>(&namespace);
+        let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+        let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{convoy_name}` has no status"))?;
+        let LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else {
+            return Err("turn-delivery leaf is not change-request addressed".to_string());
+        };
+        let record_name = flotilla_resources::change_request_record_name(service, scope, *number);
+        let record = self
+            .inner
+            .backend
+            .including_replicas::<ChangeRequest>(&namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .find(|item| item.object.metadata.name == record_name)
+            .map(|item| item.object)
+            .ok_or_else(|| format!("change-request observation `{record_name}` is absent"))?;
+        let cr = record.status.as_ref().ok_or_else(|| format!("change-request observation `{record_name}` has no status"))?;
+        let head_sha = cr.head_sha.value.clone().ok_or_else(|| "change-request head SHA is unknown".to_string())?;
+        if let Some(row) = self.inner.rows.lock().await.get_mut(&subscription_id) {
+            row.episode_key.head_sha = Some(head_sha.clone());
+        }
+        let evidence_at = match leaf.field_path.as_str() {
+            ".checks" => cr.checks.observed_at,
+            ".review.actionable-at-head" => cr.review.actionable_at_head.observed_at,
+            ".mergeable" => cr.mergeable.observed_at,
+            _ => return Err(format!("turn-delivery leaf path `{}` has no firing evidence timestamp", leaf.field_path)),
+        };
+        if status.turn_deliveries.get(source).is_some_and(|delivery| delivery.episodes.iter().any(|episode| episode.head_sha == head_sha)) {
+            return Ok(());
+        }
+        let claim_at = status
+            .crew_work
+            .get(&rule.to.vessel)
+            .and_then(|crew| crew.get(&rule.to.role))
+            .and_then(|work| work.finished_at)
+            .ok_or_else(|| format!("turn-delivery target {}/{} has no settlement claim", rule.to.vessel, rule.to.role))?;
+        if evidence_at <= claim_at || cr.head_sha.observed_at <= claim_at {
+            return Ok(());
+        }
+
+        let brief = compose_turn_brief(&convoy, source, rule, leaf, cr, claim_at);
+        let request = TurnDeliveryRequest::builder()
+            .namespace(namespace.clone())
+            .convoy(convoy_name.to_string())
+            .source(source.to_string())
+            .vessel(rule.to.vessel.clone())
+            .role(rule.to.role.clone())
+            .brief(brief)
+            .head_sha(head_sha.clone())
+            .build();
+        let prior_episodes = status.turn_deliveries.get(source).map_or(0, |delivery| delivery.episodes.len()) as u32;
+        let now = Utc::now();
+        let patch = if prior_episodes >= self.inner.episode_limit {
+            let reason =
+                format!("turn delivery refused after {} consecutive episodes for condition source `{source}`", self.inner.episode_limit);
+            let actuator = self.inner.turn_delivery.lock().await.clone();
+            actuator.hold(&request, &rule.hold, &reason).await?;
+            external_patches::refuse_turn_delivery(
+                source.to_string(),
+                TurnDeliveryEpisode {
+                    head_sha,
+                    evidence_at,
+                    judged_claim_at: claim_at,
+                    outcome: TurnDeliveryOutcome::Refused { reason: reason.clone(), refused_at: now, hold_executed: true },
+                },
+                ConvoyAttention { source: source.to_string(), reason, raised_at: now },
+            )
+        } else {
+            let actuator = self.inner.turn_delivery.lock().await.clone();
+            let rung = actuator.deliver(&request).await?;
+            external_patches::record_turn_delivery(
+                source.to_string(),
+                TurnDeliveryEpisode {
+                    head_sha,
+                    evidence_at,
+                    judged_claim_at: claim_at,
+                    outcome: TurnDeliveryOutcome::Delivered { rung, delivered_at: now },
+                },
+                rule.to.vessel.clone(),
+                rule.to.role.clone(),
+                request.brief.clone(),
+            )
+        };
+        let mut next = status.clone();
+        patch.apply(&mut next);
+        convoys.update_status(convoy_name, &convoy.metadata.resource_version, &next).await.map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+fn compose_turn_brief(
+    convoy: &ResourceObject<Convoy>,
+    source: &str,
+    rule: &TurnDeliveryRule,
+    leaf: &Leaf,
+    cr: &flotilla_resources::ChangeRequestStatus,
+    claim_at: DateTime<Utc>,
+) -> String {
+    let repositories = convoy
+        .spec
+        .repositories
+        .iter()
+        .map(|repo| format!("- {}: branch `{}` → `{}`", repo.url, repo.source_ref, repo.target_ref))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\n\n## Turn firing context\n\n- Condition source: `{source}`\n- Fired leaf: `{leaf:?}`\n- Head SHA: `{}`\n- Review actionable at head: {:?}\n- Checks: {:?}\n- Mergeability: {:?}\n- Claim durability fence: `{}`\n- Durable convoy record: `{}/{}`\n- Target crew: `{}/{}`\n\n## Change request and branches\n\n{}\n",
+        rule.brief.trim(),
+        cr.head_sha.value.as_deref().unwrap_or("unknown"),
+        cr.review.actionable_at_head.value,
+        cr.checks.value,
+        cr.mergeable.value,
+        claim_at.to_rfc3339(),
+        convoy.metadata.namespace,
+        convoy.metadata.name,
+        rule.to.vessel,
+        rule.to.role,
+        repositories,
+    )
 }
 
 #[derive(Clone)]
@@ -359,7 +560,7 @@ impl ReconcilerWake {
             .await
             .map_err(|error| error.to_string())?
             .items;
-        let mut desired = Vec::<(String, Vec<Leaf>)>::new();
+        let mut desired = Vec::<LeafSubscriptionRow>::new();
         for convoy in convoys.values().filter(|convoy| {
             convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landing | ConvoyPhase::Anchored))
         }) {
@@ -374,9 +575,51 @@ impl ReconcilerWake {
             if let InstantiatedExit::Table(entries) = exit {
                 for entry in entries {
                     if !entry.leaves.is_empty() {
-                        desired.push((convoy.metadata.name.clone(), entry.leaves));
+                        desired.push(LeafSubscriptionRow {
+                            id: uuid::Uuid::nil(),
+                            namespace: namespace.to_string(),
+                            leaves: entry.leaves,
+                            watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
+                            freshness_demand: None,
+                            created_at: Utc::now(),
+                            episode_key: EpisodeKeyFields::default(),
+                        });
                     }
                 }
+            }
+            let status = convoy.status.as_ref().expect("parked convoy has status");
+            for delivery in instantiate_turn_delivery(convoy, &checkouts)? {
+                let Some(claim_at) = status
+                    .crew_work
+                    .get(&delivery.rule.to.vessel)
+                    .and_then(|crew| crew.get(&delivery.rule.to.role))
+                    .and_then(|work| work.finished_at)
+                else {
+                    continue;
+                };
+                desired.push(LeafSubscriptionRow {
+                    id: uuid::Uuid::nil(),
+                    namespace: namespace.to_string(),
+                    leaves: vec![delivery.leaf],
+                    watcher: LeafWatcher::TurnDelivery {
+                        convoy: convoy.metadata.name.clone(),
+                        source: delivery.source.clone(),
+                        rule: delivery.rule.clone(),
+                    },
+                    freshness_demand: Some(claim_at),
+                    created_at: Utc::now(),
+                    episode_key: EpisodeKeyFields {
+                        source: Some(delivery.source.clone()),
+                        convoy: Some(convoy.metadata.name.clone()),
+                        vessel: Some(delivery.rule.to.vessel),
+                        role: Some(delivery.rule.to.role),
+                        head_sha: status
+                            .turn_deliveries
+                            .get(&delivery.source)
+                            .and_then(|state| state.episodes.last())
+                            .map(|episode| episode.head_sha.clone()),
+                    },
+                });
             }
         }
 
@@ -387,44 +630,36 @@ impl ReconcilerWake {
             .lock()
             .await
             .values()
-            .filter_map(|row| match &row.watcher {
-                LeafWatcher::ReconcilerWake { convoy } if row.namespace == namespace => Some((row.id, convoy.clone(), row.leaves.clone())),
-                _ => None,
+            .filter(|row| {
+                row.namespace == namespace && matches!(row.watcher, LeafWatcher::ReconcilerWake { .. } | LeafWatcher::TurnDelivery { .. })
             })
+            .cloned()
             .collect::<Vec<_>>();
-        for (id, convoy, leaves) in &existing {
-            if desired.iter().any(|candidate| candidate == &(convoy.clone(), leaves.clone())) {
+        for row in &existing {
+            if desired.iter().any(|candidate| same_standing_row(candidate, row)) {
                 continue;
             }
-            self.subscriptions.inner.rows.lock().await.remove(id);
-            self.subscriptions.forget_firings(*id).await;
-            if let Some(task) = self.subscriptions.inner.tasks.lock().await.remove(id) {
+            self.subscriptions.inner.rows.lock().await.remove(&row.id);
+            self.subscriptions.forget_firings(row.id).await;
+            if let Some(task) = self.subscriptions.inner.tasks.lock().await.remove(&row.id) {
                 task.abort();
             }
-            self.subscriptions.inner.change_requests.release(*id).await;
+            self.subscriptions.inner.change_requests.release(row.id).await;
         }
 
-        'desired_rows: for (convoy, leaves) in desired {
-            if existing.iter().any(|(_, existing_convoy, existing_leaves)| *existing_convoy == convoy && *existing_leaves == leaves) {
+        'desired_rows: for mut row in desired {
+            if existing.iter().any(|existing| same_standing_row(&row, existing)) {
                 continue;
             }
             let id = uuid::Uuid::new_v4();
-            let row = LeafSubscriptionRow {
-                id,
-                namespace: namespace.to_string(),
-                leaves,
-                watcher: LeafWatcher::ReconcilerWake { convoy: convoy.clone() },
-                freshness_demand: None,
-                created_at: Utc::now(),
-                episode_key: EpisodeKeyFields::default(),
-            };
+            row.id = id;
             self.subscriptions.inner.rows.lock().await.insert(id, row.clone());
             for subject in row.leaves.iter().filter_map(|leaf| ChangeRequestRef::from_address(namespace, &leaf.address)) {
                 if let Err(error) = self.subscriptions.inner.change_requests.demand(id, subject, None).await {
                     self.subscriptions.inner.rows.lock().await.remove(&id);
                     self.subscriptions.forget_firings(id).await;
                     self.subscriptions.inner.change_requests.release(id).await;
-                    tracing::warn!(%convoy, %error, "arm reconciler leaf subscription failed");
+                    tracing::warn!(watcher = ?row.watcher, %error, "arm standing leaf subscription failed");
                     continue 'desired_rows;
                 }
             }
@@ -439,6 +674,14 @@ impl ReconcilerWake {
         }
         Ok(())
     }
+}
+
+fn same_standing_row(left: &LeafSubscriptionRow, right: &LeafSubscriptionRow) -> bool {
+    left.namespace == right.namespace
+        && left.leaves == right.leaves
+        && left.watcher == right.watcher
+        && left.freshness_demand == right.freshness_demand
+        && left.episode_key == right.episode_key
 }
 
 fn apply_read_event<T: flotilla_resources::Resource>(
@@ -551,6 +794,27 @@ mod tests {
 
     struct ControlledChangeRequests {
         merged: AtomicBool,
+    }
+
+    #[derive(Default)]
+    struct RecordingTurnDelivery {
+        requests: std::sync::Mutex<Vec<TurnDeliveryRequest>>,
+        holds: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TurnDeliveryActuator for RecordingTurnDelivery {
+        async fn deliver(&self, request: &TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+            let mut requests = self.requests.lock().expect("record turn-delivery request");
+            let rung = if requests.is_empty() { TurnDeliveryRung::WarmSession } else { TurnDeliveryRung::FreshAgent };
+            requests.push(request.clone());
+            Ok(rung)
+        }
+
+        async fn hold(&self, _request: &TurnDeliveryRequest, _act: &HoldAct, _reason: &str) -> Result<(), String> {
+            self.holds.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -809,7 +1073,11 @@ mod tests {
         let created = convoys.create(&meta, &spec).await.expect("create Landing convoy before watcher boot");
         let status = ConvoyStatus {
             phase: ConvoyPhase::Landing,
-            workflow_snapshot: Some(WorkflowSnapshot { exit: Some(ExitDeclaration::standard_table()), vessels: Vec::new() }),
+            workflow_snapshot: Some(WorkflowSnapshot {
+                exit: Some(ExitDeclaration::standard_table()),
+                turn_delivery: Default::default(),
+                vessels: Vec::new(),
+            }),
             observed_workflow_ref: Some("workflow".to_string()),
             work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
             ..Default::default()
@@ -893,6 +1161,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turn_delivery_enforces_head_identity_records_rungs_and_escalates() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let (event_tx, _) = broadcast::channel(4);
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "authority".to_string(),
+            Arc::new(UnavailableChangeRequests),
+            crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        );
+        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher);
+        let actuator = Arc::new(RecordingTurnDelivery::default());
+        table.set_turn_delivery_actuator(actuator.clone()).await;
+        let rule = TurnDeliveryRule::builder()
+            .on("$cr.review.actionable-at-head == true".parse().expect("wake leaf"))
+            .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".to_string()).role("coder".to_string()).build())
+            .brief("Address the actionable review and push the fix.".to_string())
+            .hold(HoldAct::ChangeRequestComment { body: "Automatic delivery paused.".to_string() })
+            .build();
+        let repo_ref = RepositoryKey("repo".to_string());
+        let convoy_spec = ConvoySpec::builder()
+            .workflow_ref("workflow".to_string())
+            .repositories(vec![ConvoyRepositorySpec::builder()
+                .url("https://github.com/flotilla-org/flotilla".to_string())
+                .repo_ref(repo_ref.clone())
+                .source_ref("feature/wake".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("flotilla".to_string())
+                .subpaths(Vec::new())
+                .build()])
+            .change_request(BoundChangeRequest::builder().id("1392".to_string()).repository_ref(repo_ref).title("wake".to_string()).build())
+            .build();
+        let convoys = backend.clone().using::<Convoy>("flotilla");
+        let created = convoys.create(&InputMeta::builder().name("wake-turn".to_string()).build(), &convoy_spec).await.expect("convoy");
+        let base = Utc::now();
+        convoys
+            .update_status("wake-turn", &created.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Landing,
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    exit: Some(ExitDeclaration::standard_table()),
+                    turn_delivery: indexmap::IndexMap::from([("review".to_string(), rule.clone())]),
+                    vessels: Vec::new(),
+                }),
+                work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
+                crew_work: BTreeMap::from([(
+                    "work".to_string(),
+                    BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Done).finished_at(base).build())]),
+                )]),
+                ..Default::default()
+            })
+            .await
+            .expect("landing status");
+        let cr_name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 1392);
+        let records = backend.clone().using::<ChangeRequest>("flotilla");
+        let record = records
+            .create(
+                &InputMeta::builder().name(cr_name).build(),
+                &flotilla_resources::ChangeRequestSpec::builder()
+                    .service("github.com".to_string())
+                    .scope("flotilla-org/flotilla".to_string())
+                    .number(1392)
+                    .observing_authority("authority".to_string())
+                    .build(),
+            )
+            .await
+            .expect("change request");
+        let leaf = Leaf {
+            address: LeafAddress::ChangeRequest {
+                service: "github.com".to_string(),
+                scope: "flotilla-org/flotilla".to_string(),
+                number: 1392,
+            },
+            field_path: ".review.actionable-at-head".to_string(),
+            operator: LeafOperator::Equal,
+            literal: "true".to_string(),
+        };
+        let subscription_id = uuid::Uuid::new_v4();
+        table.inner.rows.lock().await.insert(subscription_id, LeafSubscriptionRow {
+            id: subscription_id,
+            namespace: "flotilla".to_string(),
+            leaves: vec![leaf.clone()],
+            watcher: LeafWatcher::TurnDelivery { convoy: "wake-turn".to_string(), source: "review".to_string(), rule: rule.clone() },
+            freshness_demand: Some(base),
+            created_at: base,
+            episode_key: EpisodeKeyFields::default(),
+        });
+
+        let mut record_version = record.metadata.resource_version;
+        for (index, head) in ["aaa", "bbb", "ccc", "ddd"].into_iter().enumerate() {
+            let claim_at = base + chrono::Duration::seconds((index * 2) as i64);
+            if index > 0 {
+                let current = convoys.get("wake-turn").await.expect("convoy");
+                let mut status = current.status.expect("status");
+                let coder = status.crew_work.get_mut("work").expect("work crew").get_mut("coder").expect("coder");
+                coder.phase = CrewWorkPhase::Done;
+                coder.finished_at = Some(claim_at);
+                status.work.get_mut("work").expect("work").phase = WorkPhase::Complete;
+                status.phase = ConvoyPhase::Landing;
+                convoys.update_status("wake-turn", &current.metadata.resource_version, &status).await.expect("new claim");
+            }
+            let observed_at = claim_at + chrono::Duration::seconds(1);
+            let cr_status = flotilla_resources::ChangeRequestStatus {
+                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, observed_at),
+                head_sha: flotilla_resources::Observation::known(head.to_string(), observed_at),
+                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Fail, observed_at),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::known(true, observed_at),
+                },
+                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
+            };
+            let updated = records.update_status(&record.metadata.name, &record_version, &cr_status).await.expect("observe head");
+            record_version = updated.metadata.resource_version;
+            table.deliver_turn(subscription_id, "wake-turn", "review", &rule, &leaf).await.expect("process firing");
+            if index == 0 {
+                table.deliver_turn(subscription_id, "wake-turn", "review", &rule, &leaf).await.expect("same head is a no-op");
+            }
+        }
+
+        let status = convoys.get("wake-turn").await.expect("convoy").status.expect("status");
+        let episodes = &status.turn_deliveries["review"].episodes;
+        assert_eq!(episodes.len(), 4, "same-head redelivery must not create an episode");
+        assert!(matches!(episodes[0].outcome, TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, .. }));
+        assert!(matches!(episodes[1].outcome, TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::FreshAgent, .. }));
+        assert!(matches!(episodes[3].outcome, TurnDeliveryOutcome::Refused { hold_executed: true, .. }));
+        assert_eq!(actuator.requests.lock().expect("requests").len(), 3);
+        assert_eq!(actuator.holds.load(Ordering::SeqCst), 1);
+        assert!(status.attention.is_some());
+        let first_brief = &actuator.requests.lock().expect("requests")[0].brief;
+        assert!(first_brief.contains("Head SHA: `aaa`"));
+        assert!(first_brief.contains("feature/wake"));
+        assert!(first_brief.contains("Durable convoy record: `flotilla/wake-turn`"));
+    }
+
+    #[tokio::test]
     async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let (event_tx, _) = broadcast::channel(16);
@@ -933,6 +1334,7 @@ mod tests {
                     "shipped".to_string(),
                     "$cr.state == merged".parse().expect("custom leaf template"),
                 )]))),
+                turn_delivery: Default::default(),
                 vessels: Vec::new(),
             }),
             work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
@@ -997,7 +1399,11 @@ mod tests {
         convoys
             .update_status("no-cr", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
-                workflow_snapshot: Some(WorkflowSnapshot { exit: Some(ExitDeclaration::standard_table()), vessels: Vec::new() }),
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    exit: Some(ExitDeclaration::standard_table()),
+                    turn_delivery: Default::default(),
+                    vessels: Vec::new(),
+                }),
                 observed_workflow_ref: Some("workflow".to_string()),
                 work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
                 ..Default::default()
@@ -1062,7 +1468,11 @@ mod tests {
         let landing = convoys
             .update_status("adopt-late", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
-                workflow_snapshot: Some(WorkflowSnapshot { exit: Some(ExitDeclaration::standard_table()), vessels: Vec::new() }),
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    exit: Some(ExitDeclaration::standard_table()),
+                    turn_delivery: Default::default(),
+                    vessels: Vec::new(),
+                }),
                 observed_workflow_ref: Some("workflow".to_string()),
                 work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
                 ..Default::default()
@@ -1143,7 +1553,11 @@ mod tests {
         convoys
             .update_status("cross-host", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
-                workflow_snapshot: Some(WorkflowSnapshot { exit: Some(ExitDeclaration::standard_table()), vessels: Vec::new() }),
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    exit: Some(ExitDeclaration::standard_table()),
+                    turn_delivery: Default::default(),
+                    vessels: Vec::new(),
+                }),
                 observed_workflow_ref: Some("workflow".to_string()),
                 work: BTreeMap::from([("work".to_string(), work)]),
                 ..Default::default()

@@ -5924,6 +5924,7 @@ mod tests {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                     exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
+                    turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
                 }),
                 work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build())]),

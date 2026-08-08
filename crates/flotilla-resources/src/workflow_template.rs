@@ -19,7 +19,30 @@ pub struct WorkflowTemplateSpec {
     pub inputs: Vec<InputDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<ExitDeclaration>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub turn_delivery: IndexMap<String, TurnDeliveryRule>,
     pub vessels: Vec<VesselRequirement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct TurnDeliveryRule {
+    pub on: LeafTemplate,
+    pub to: TurnDeliveryTarget,
+    pub brief: String,
+    pub hold: HoldAct,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct TurnDeliveryTarget {
+    pub vessel: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum HoldAct {
+    ChangeRequestComment { body: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,6 +283,7 @@ impl Selector {
 pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
         .exit(ExitDeclaration::standard_table())
+        .turn_delivery(standard_review_turn_delivery("work", "coder"))
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Contained)
@@ -278,6 +302,7 @@ pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
 pub fn single_agent_trusted_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
         .exit(ExitDeclaration::standard_table())
+        .turn_delivery(standard_review_turn_delivery("work", "coder"))
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Trusted)
@@ -292,6 +317,7 @@ pub fn single_agent_trusted_workflow_spec() -> WorkflowTemplateSpec {
 pub fn single_agent_shepherd_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
         .exit(ExitDeclaration::standard_table())
+        .turn_delivery(standard_review_turn_delivery("work", "shepherd"))
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Trusted)
@@ -328,6 +354,7 @@ pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
 pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
         .exit(ExitDeclaration::standard_table())
+        .turn_delivery(standard_review_turn_delivery("work", "coder"))
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .stance(Stance::Contained)
@@ -349,10 +376,29 @@ pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
         .build()
 }
 
+fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, TurnDeliveryRule> {
+    IndexMap::from([(
+        "actionable-review".to_string(),
+        TurnDeliveryRule::builder()
+            .on("$cr.review.actionable-at-head == true".parse().expect("valid stock review leaf"))
+            .to(TurnDeliveryTarget::builder().vessel(vessel.to_string()).role(role.to_string()).build())
+            .brief("Address the actionable review at the bound head, push the durable fix, and file a fresh settlement claim.".to_string())
+            .hold(HoldAct::ChangeRequestComment {
+                body: "Flotilla paused automatic turn delivery after repeated actionable-review episodes; human attention is required."
+                    .to_string(),
+            })
+            .build(),
+    )])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     EmptyExitTable,
     InvalidExitLeaf { disposition: String, template: String },
+    InvalidTurnDeliveryLeaf { source: String, template: String },
+    EmptyTurnDeliveryBrief { source: String },
+    UnknownTurnDeliveryVessel { source: String, vessel: String },
+    UnknownTurnDeliveryRole { source: String, vessel: String, role: String },
     DuplicateVesselName { name: String },
     EmptyRepositoryScope { vessel: String },
     DuplicateRepositoryRef { vessel: String, repo_ref: RepositoryKey },
@@ -403,6 +449,18 @@ impl std::fmt::Display for ValidationError {
             ValidationError::InvalidExitLeaf { disposition, template } => {
                 write!(f, "exit disposition `{disposition}` is not a world-terminal leaf: `{template}`")
             }
+            ValidationError::InvalidTurnDeliveryLeaf { source, template } => {
+                write!(f, "turn-delivery source `{source}` is not an admitted change-request leaf: `{template}`")
+            }
+            ValidationError::EmptyTurnDeliveryBrief { source } => {
+                write!(f, "turn-delivery source `{source}` must declare a non-empty brief")
+            }
+            ValidationError::UnknownTurnDeliveryVessel { source, vessel } => {
+                write!(f, "turn-delivery source `{source}` targets unknown vessel `{vessel}`")
+            }
+            ValidationError::UnknownTurnDeliveryRole { source, vessel, role } => {
+                write!(f, "turn-delivery source `{source}` targets unknown agent role `{role}` on vessel `{vessel}`")
+            }
             ValidationError::DuplicateVesselName { name } => write!(f, "duplicate vessel name `{name}`"),
             ValidationError::EmptyRepositoryScope { vessel } => write!(f, "vessel `{vessel}` has an empty repository scope"),
             ValidationError::DuplicateRepositoryRef { vessel, repo_ref } => {
@@ -447,6 +505,7 @@ pub fn validate(spec: &WorkflowTemplateSpec) -> Result<(), Vec<ValidationError>>
     validate_exit(spec, &mut errors);
     let declared_inputs = collect_inputs(spec, &mut errors);
     let vessels_by_name = collect_vessels(spec, &mut errors);
+    validate_turn_delivery(spec, &vessels_by_name, &mut errors);
 
     for vessel in &spec.vessels {
         validate_vessel(vessel, &declared_inputs, &vessels_by_name, &mut errors);
@@ -457,6 +516,35 @@ pub fn validate(spec: &WorkflowTemplateSpec) -> Result<(), Vec<ValidationError>>
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+fn validate_turn_delivery(
+    spec: &WorkflowTemplateSpec,
+    vessels_by_name: &BTreeMap<String, &VesselRequirement>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for (source, rule) in &spec.turn_delivery {
+        let admitted = rule.on.subject == SubjectVariable::ChangeRequest
+            && matches!(rule.on.field_path.as_str(), ".checks" | ".review.actionable-at-head" | ".mergeable");
+        if !admitted {
+            push_error(errors, ValidationError::InvalidTurnDeliveryLeaf { source: source.clone(), template: rule.on.to_string() });
+        }
+        if rule.brief.trim().is_empty() {
+            push_error(errors, ValidationError::EmptyTurnDeliveryBrief { source: source.clone() });
+        }
+        let Some(vessel) = vessels_by_name.get(&rule.to.vessel) else {
+            push_error(errors, ValidationError::UnknownTurnDeliveryVessel { source: source.clone(), vessel: rule.to.vessel.clone() });
+            continue;
+        };
+        let agent = vessel.crew.iter().any(|member| member.role == rule.to.role && matches!(member.source, CrewSource::Agent { .. }));
+        if !agent {
+            push_error(errors, ValidationError::UnknownTurnDeliveryRole {
+                source: source.clone(),
+                vessel: rule.to.vessel.clone(),
+                role: rule.to.role.clone(),
+            });
+        }
     }
 }
 
