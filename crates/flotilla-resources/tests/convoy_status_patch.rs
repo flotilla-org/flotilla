@@ -15,6 +15,7 @@ fn ts(seconds: i64) -> chrono::DateTime<Utc> {
 fn sample_snapshot() -> WorkflowSnapshot {
     WorkflowSnapshot {
         exit: None,
+        turn_delivery: Default::default(),
         vessels: vec![
             VesselRequirement {
                 name: "implement".to_string(),
@@ -120,6 +121,8 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
         observed_workflows: Some(BTreeMap::new()),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     external_patches::mark_convoy_abandoned(ts(50), WorkCompletionAuthority::HumanOverride, "superseded by operator".to_string())
@@ -164,6 +167,8 @@ fn crew_completion_updates_only_the_calling_agent() {
         observed_workflows: Some(BTreeMap::new()),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     external_patches::mark_crew_completed(
@@ -209,6 +214,8 @@ fn final_crew_completion_claim_enters_landing_idempotently() {
         observed_workflows: Some(BTreeMap::new()),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     let patch =
@@ -235,6 +242,8 @@ fn crew_failure_records_terminal_state_and_message() {
         observed_workflows: Some(BTreeMap::new()),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     external_patches::mark_crew_completed("implement".to_string(), "coder".to_string(), ts(15), Some("initially done".to_string()), None)
@@ -277,6 +286,8 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
         observed_workflows: Some(BTreeMap::new()),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     external_patches::handoff_crew_work(
@@ -322,6 +333,8 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         observed_workflows: Some(BTreeMap::new()),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     external_patches::resume_crew_work("implement".to_string(), "coder".to_string(), ts(20), "Rebase onto main".to_string())
@@ -361,6 +374,8 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
         observed_workflows: Some(BTreeMap::new()),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     provisioning_patches::work_running("implement".to_string(), ts(12), BTreeSet::from(["coder".to_string()])).apply(&mut status);
@@ -401,6 +416,8 @@ fn running_vessel_work_leaves_latent_agents_pending() {
         observed_workflows: Some(BTreeMap::new()),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     // The vessel launches only the first agent; `reviewer` has no session until
@@ -469,6 +486,8 @@ fn advance_work_to_ready_updates_only_selected_vessels() {
         observed_workflows: Some(BTreeMap::from([("review-and-fix".to_string(), "42".to_string())])),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     let patch = controller_patches::advance_work_to_ready(BTreeMap::from([("implement".to_string(), ts(10))]));
@@ -514,6 +533,8 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
         observed_workflows: Some(BTreeMap::from([("review-and-fix".to_string(), "42".to_string())])),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     let patch = controller_patches::fail_convoy(BTreeMap::from([("review".to_string(), ts(30))]), ts(30), Some("work failed".to_string()));
@@ -551,6 +572,8 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
         observed_workflows: Some(BTreeMap::from([("review-and-fix".to_string(), "42".to_string())])),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     let patch = controller_patches::roll_up_phase(ConvoyPhase::Landed, None, Some(ts(40)));
@@ -585,6 +608,8 @@ fn forced_work_completion_claim_enters_landing() {
         observed_workflows: Some(BTreeMap::from([("review-and-fix".to_string(), "42".to_string())])),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     let patch =
@@ -627,6 +652,8 @@ fn forced_work_completion_preserves_agent_owned_state() {
         observed_workflows: Some(BTreeMap::new()),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     external_patches::force_work_completed("implement".to_string(), ts(50), Some("human override".to_string())).apply(&mut status);
@@ -653,6 +680,8 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
         observed_workflows: Some(BTreeMap::new()),
         disposition: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     };
 
     ConvoyStatusPatch::AdvanceWorkToReady { ready: BTreeMap::from([("implement".to_string(), ts(10))]) }.apply(&mut status);

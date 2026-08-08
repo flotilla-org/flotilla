@@ -729,6 +729,7 @@ fn bootstrap_outcome(
 
     let workflow_snapshot = WorkflowSnapshot {
         exit: template.spec.exit.clone(),
+        turn_delivery: template.spec.turn_delivery.clone(),
         vessels: template
             .spec
             .vessels

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     resource::define_resource,
     status_patch::StatusPatch,
-    workflow_template::{ExitDeclaration, SubjectVariable, VesselRequirement},
+    workflow_template::{ExitDeclaration, SubjectVariable, TurnDeliveryRule, VesselRequirement},
     ReadResourceObject, ReplicationClass, RepositoryKey, Resource, ResourceObject, ResourceProvenance, ACTUATOR_HOST_REF_ANNOTATION,
     CONVOY_LABEL,
 };
@@ -226,6 +226,39 @@ pub enum InstantiatedExit {
     Table(Vec<InstantiatedExitEntry>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstantiatedTurnDelivery {
+    pub source: String,
+    pub leaf: Leaf,
+    pub rule: TurnDeliveryRule,
+}
+
+pub fn instantiate_turn_delivery(
+    convoy: &crate::ResourceObject<Convoy>,
+    checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
+) -> Result<Vec<InstantiatedTurnDelivery>, String> {
+    let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) else {
+        return Ok(Vec::new());
+    };
+    let subjects = bound_change_request_addresses(convoy, checkouts)?;
+    Ok(snapshot
+        .turn_delivery
+        .iter()
+        .flat_map(|(source, rule)| {
+            subjects.iter().map(move |address| InstantiatedTurnDelivery {
+                source: source.clone(),
+                leaf: Leaf {
+                    address: address.clone(),
+                    field_path: rule.on.field_path.clone(),
+                    operator: rule.on.operator,
+                    literal: rule.on.literal.clone(),
+                },
+                rule: rule.clone(),
+            })
+        })
+        .collect())
+}
+
 /// Instantiate the convoy's pinned exit declaration over every bound subject.
 ///
 /// A table entry is an implicit universal over its subject role. With no bound
@@ -394,6 +427,10 @@ pub struct ConvoyStatus {
     /// landing still wins and the convoy becomes Landed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_mismatches: Vec<TargetMismatch>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub turn_deliveries: BTreeMap<String, TurnDeliveryStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<ConvoyAttention>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -408,7 +445,44 @@ pub struct TargetMismatch {
 pub struct WorkflowSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<ExitDeclaration>,
+    #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
+    pub turn_delivery: indexmap::IndexMap<String, TurnDeliveryRule>,
     pub vessels: Vec<VesselRequirement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TurnDeliveryStatus {
+    #[serde(default)]
+    pub episodes: Vec<TurnDeliveryEpisode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct TurnDeliveryEpisode {
+    pub head_sha: String,
+    pub evidence_at: DateTime<Utc>,
+    pub judged_claim_at: DateTime<Utc>,
+    pub outcome: TurnDeliveryOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum TurnDeliveryOutcome {
+    Delivered { rung: TurnDeliveryRung, delivered_at: DateTime<Utc> },
+    Refused { reason: String, refused_at: DateTime<Utc>, hold_executed: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TurnDeliveryRung {
+    WarmSession,
+    FreshAgent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ConvoyAttention {
+    pub source: String,
+    pub reason: String,
+    pub raised_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -615,6 +689,18 @@ pub enum ConvoyStatusPatch {
         role: String,
         resumed_at: DateTime<Utc>,
         prompt: String,
+    },
+    RecordTurnDelivery {
+        source: String,
+        episode: TurnDeliveryEpisode,
+        vessel: String,
+        role: String,
+        prompt: String,
+    },
+    RefuseTurnDelivery {
+        source: String,
+        episode: TurnDeliveryEpisode,
+        attention: ConvoyAttention,
     },
     RollUpWork {
         work: String,
@@ -856,6 +942,32 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.message = Some(prompt.clone());
                 }
             }
+            Self::RecordTurnDelivery { source, episode, vessel, role, prompt } => {
+                let delivery = status.turn_deliveries.entry(source.clone()).or_default();
+                if !delivery.episodes.iter().any(|existing| existing.head_sha == episode.head_sha) {
+                    delivery.episodes.push(episode.clone());
+                }
+                status.attention = None;
+                if let Some(work) = status.work.get_mut(vessel) {
+                    work.phase = WorkPhase::Running;
+                    work.finished_at = None;
+                    work.completion_authority = WorkCompletionAuthority::CrewRollup;
+                }
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.phase = CrewWorkPhase::Working;
+                    state.finished_at = None;
+                    state.message = Some(prompt.clone());
+                }
+                status.phase = ConvoyPhase::Active;
+                status.finished_at = None;
+            }
+            Self::RefuseTurnDelivery { source, episode, attention } => {
+                let delivery = status.turn_deliveries.entry(source.clone()).or_default();
+                if !delivery.episodes.iter().any(|existing| existing.head_sha == episode.head_sha) {
+                    delivery.episodes.push(episode.clone());
+                }
+                status.attention = Some(attention.clone());
+            }
             Self::RollUpWork { work, phase, transitioned_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
                     // Work roll-up reports the same process across continuation and re-settlement.
@@ -1010,5 +1122,19 @@ pub mod external_patches {
 
     pub fn resume_crew_work(vessel: String, role: String, resumed_at: DateTime<Utc>, prompt: String) -> ConvoyStatusPatch {
         ConvoyStatusPatch::ResumeCrewWork { vessel, role, resumed_at, prompt }
+    }
+
+    pub fn record_turn_delivery(
+        source: String,
+        episode: TurnDeliveryEpisode,
+        vessel: String,
+        role: String,
+        prompt: String,
+    ) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::RecordTurnDelivery { source, episode, vessel, role, prompt }
+    }
+
+    pub fn refuse_turn_delivery(source: String, episode: TurnDeliveryEpisode, attention: ConvoyAttention) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::RefuseTurnDelivery { source, episode, attention }
     }
 }

@@ -45,6 +45,46 @@ spec:
                       additionalProperties:
                         type: string
                         pattern: '^\$cr\.[^ ]+ (==|!=|<|<=|>|>=) .+$'
+                turn_delivery:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    required:
+                      - on
+                      - to
+                      - brief
+                      - hold
+                    properties:
+                      on:
+                        type: string
+                        pattern: '^\$cr\.(checks|review\.actionable-at-head|mergeable) (==|!=) .+$'
+                      to:
+                        type: object
+                        required:
+                          - vessel
+                          - role
+                        properties:
+                          vessel:
+                            type: string
+                            minLength: 1
+                          role:
+                            type: string
+                            minLength: 1
+                      brief:
+                        type: string
+                        minLength: 1
+                      hold:
+                        type: object
+                        required:
+                          - kind
+                          - body
+                        properties:
+                          kind:
+                            type: string
+                            enum: [change-request-comment]
+                          body:
+                            type: string
+                            minLength: 1
                 vessels:
                   type: array
                   minItems: 1

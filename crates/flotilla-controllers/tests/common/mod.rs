@@ -102,6 +102,7 @@ pub async fn create_convoy_with_single_task(
         .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
                 exit: None,
+                turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: task.to_string(),
                     stance: Default::default(),

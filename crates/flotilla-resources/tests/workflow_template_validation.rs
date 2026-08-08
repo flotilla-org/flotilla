@@ -71,6 +71,84 @@ vessels:
 }
 
 #[test]
+fn turn_delivery_rules_roundtrip_as_named_independent_rules() {
+    let yaml = r#"
+inputs: []
+turn_delivery:
+  actionable-review:
+    on: $cr.review.actionable-at-head == true
+    to:
+      vessel: implement
+      role: coder
+    brief: Address the actionable review, push the fix, and claim again.
+    hold:
+      kind: change-request-comment
+      body: Automatic delivery paused; human attention is required.
+vessels:
+  - name: implement
+    crew:
+      - role: coder
+        selector:
+          capability: code
+"#;
+
+    let spec = parse_spec(yaml);
+    validate(&spec).expect("valid turn-delivery rule");
+    let serialized = serde_yml::to_string(&spec).expect("serialize rule");
+    assert!(serialized.contains("actionable-review:"));
+    assert!(serialized.contains("$cr.review.actionable-at-head == true"));
+    assert!(!serialized.contains("round"));
+}
+
+#[test]
+fn turn_delivery_schema_rejects_control_flow_extensions() {
+    let yaml = r#"
+inputs: []
+turn_delivery:
+  actionable-review:
+    sequence:
+      - on: $cr.review.actionable-at-head == true
+vessels:
+  - name: implement
+    crew:
+      - role: coder
+        selector:
+          capability: code
+"#;
+    assert!(serde_yml::from_str::<WorkflowTemplateSpec>(yaml).is_err());
+}
+
+#[test]
+fn validate_rejects_unsupported_turn_delivery_operator() {
+    let spec = parse_spec(
+        r#"
+inputs: []
+turn_delivery:
+  actionable-review:
+    on: $cr.review.actionable-at-head < true
+    to:
+      vessel: implement
+      role: coder
+    brief: Address the actionable review.
+    hold:
+      kind: change-request-comment
+      body: Automatic delivery paused.
+vessels:
+  - name: implement
+    crew:
+      - role: coder
+        selector:
+          capability: code
+"#,
+    );
+
+    let errors = validate(&spec).expect_err("ordering operators are not admitted for turn delivery");
+    assert!(errors
+        .iter()
+        .any(|error| matches!(error, ValidationError::InvalidTurnDeliveryLeaf { source, .. } if source == "actionable-review")));
+}
+
+#[test]
 fn stock_workflows_transcribe_the_standard_exit_table() {
     let expected = Some(ExitDeclaration::standard_table());
     for spec in [

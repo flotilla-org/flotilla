@@ -132,6 +132,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             observed_workflow_ref: None,
             observed_workflows: None,
             target_mismatches: Vec::new(),
+            turn_deliveries: Default::default(),
+            attention: None,
         })
         .await?;
     println!("updated convoy rv={}", updated_convoy.metadata.resource_version);

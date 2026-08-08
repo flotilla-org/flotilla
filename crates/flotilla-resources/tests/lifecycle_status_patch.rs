@@ -7,8 +7,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
     ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InnerCommandStatus, PlacementStatus, PresentationPhase,
     PresentationStatus, PresentationStatusPatch, Stance, StatusPatch, TerminalSessionPhase, TerminalSessionStatus,
-    TerminalSessionStatusPatch, VesselPhase, VesselStatus, VesselStatusPatch, WorkCompletionAuthority, WorkPhase, WorkState,
-    WorkflowSnapshot,
+    TerminalSessionStatusPatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung, VesselPhase, VesselStatus, VesselStatusPatch,
+    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +67,8 @@ define_patch_kinds! {
     ConvoyMarkCrewFailed => DUPLICATE_RESETTLEMENT,
     ConvoyHandoffCrewWork => CONTINUATION,
     ConvoyResumeCrewWork => CONTINUATION,
+    ConvoyRecordTurnDelivery => CONTINUATION,
+    ConvoyRefuseTurnDelivery => NONE,
     ConvoyRollUpWork => DUPLICATE_CONTINUATION_RESETTLEMENT,
     TerminalMarkStarting => NEW_ATTEMPT,
     TerminalMarkRunning => DUPLICATE,
@@ -108,6 +110,8 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::MarkCrewFailed { .. } => PatchKind::ConvoyMarkCrewFailed,
         ConvoyStatusPatch::HandoffCrewWork { .. } => PatchKind::ConvoyHandoffCrewWork,
         ConvoyStatusPatch::ResumeCrewWork { .. } => PatchKind::ConvoyResumeCrewWork,
+        ConvoyStatusPatch::RecordTurnDelivery { .. } => PatchKind::ConvoyRecordTurnDelivery,
+        ConvoyStatusPatch::RefuseTurnDelivery { .. } => PatchKind::ConvoyRefuseTurnDelivery,
         ConvoyStatusPatch::RollUpWork { .. } => PatchKind::ConvoyRollUpWork,
     }
 }
@@ -210,6 +214,8 @@ fn active_convoy_status() -> ConvoyStatus {
         observed_workflow_ref: None,
         observed_workflows: None,
         target_mismatches: Vec::new(),
+        turn_deliveries: BTreeMap::new(),
+        attention: None,
     }
 }
 
@@ -285,7 +291,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 let mut status = active_convoy_status();
                 let before = convoy_timestamps(&status);
                 let patch = ConvoyStatusPatch::Bootstrap {
-                    workflow_snapshot: WorkflowSnapshot { exit: None, vessels: Vec::new() },
+                    workflow_snapshot: WorkflowSnapshot { exit: None, turn_delivery: Default::default(), vessels: Vec::new() },
                     observed_workflow_ref: "workflow-a".to_string(),
                     observed_workflows: BTreeMap::new(),
                     work: status.work.clone(),
@@ -754,6 +760,28 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, crew_timestamps(&status))
+            },
+        },
+        LifecycleCase {
+            name: "turn delivery reopens convoy",
+            kind: PatchKind::ConvoyRecordTurnDelivery,
+            exercise: || {
+                let mut status = settled_convoy_status();
+                let before = convoy_timestamps(&status);
+                let patch = ConvoyStatusPatch::RecordTurnDelivery {
+                    source: "review".to_string(),
+                    episode: TurnDeliveryEpisode {
+                        head_sha: "abc123".to_string(),
+                        evidence_at: ts(30),
+                        judged_claim_at: ts(20),
+                        outcome: TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, delivered_at: ts(30) },
+                    },
+                    vessel: "implement".to_string(),
+                    role: "coder".to_string(),
+                    prompt: "address review".to_string(),
+                };
+                apply_and_replay(&mut status, &patch);
+                (before, convoy_timestamps(&status))
             },
         },
     ];

@@ -403,6 +403,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
         .update_status("convoy-multi", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                 exit: None,
+                turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: "implement".to_string(),
                     stance: Stance::Trusted,

@@ -45,16 +45,17 @@ use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec,
     ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialGrant,
-    CredentialSpec, CrewCompletionPending, CrewSource, Demand as ResourceDemand, Environment as ResourceEnvironment, Host as ResourceHost,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta,
-    InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation,
-    Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource,
-    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalBrief, TerminalCrewContext,
-    TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, UnmetSettlementExpectation,
-    Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    CredentialSpec, CrewCompletionPending, CrewSource, Demand as ResourceDemand, Environment as ResourceEnvironment, HoldAct,
+    Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
+    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
+    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey,
+    RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock,
+    TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung,
+    UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
+    WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -1553,6 +1554,47 @@ struct ResolvedCrewContext {
     caller_session: Option<flotilla_resources::ResourceObject<ResourceTerminalSession>>,
 }
 
+struct DaemonTurnDeliveryActuator {
+    daemon: Weak<InProcessDaemon>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnDeliverySessionPlan {
+    QueueWarm,
+    QueueFresh,
+    RestartFresh,
+}
+
+fn turn_delivery_session_plan(
+    phase: Option<ResourceTerminalSessionPhase>,
+    vessel: &str,
+    role: &str,
+) -> Result<TurnDeliverySessionPlan, String> {
+    match phase {
+        Some(ResourceTerminalSessionPhase::Running) => Ok(TurnDeliverySessionPlan::QueueWarm),
+        Some(ResourceTerminalSessionPhase::Starting) | None => Ok(TurnDeliverySessionPlan::QueueFresh),
+        Some(ResourceTerminalSessionPhase::Stopped) => Ok(TurnDeliverySessionPlan::RestartFresh),
+        Some(ResourceTerminalSessionPhase::Failed) => {
+            Err(format!("turn-delivery target {vessel}/{role} failed provisioning and cannot be restarted"))
+        }
+    }
+}
+
+#[async_trait]
+impl crate::leaf_engine::TurnDeliveryActuator for DaemonTurnDeliveryActuator {
+    async fn deliver(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+        self.daemon.upgrade().ok_or_else(|| "daemon stopped before turn delivery".to_string())?.deliver_standing_turn(request).await
+    }
+
+    async fn hold(&self, request: &crate::leaf_engine::TurnDeliveryRequest, act: &HoldAct, reason: &str) -> Result<(), String> {
+        self.daemon
+            .upgrade()
+            .ok_or_else(|| "daemon stopped before turn-delivery hold".to_string())?
+            .execute_turn_delivery_hold(request, act, reason)
+            .await
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrewRoutingContext {
     pub command_context: CrewCommandContext,
@@ -2110,6 +2152,7 @@ impl InProcessDaemon {
             local_placement_provider_statuses: RwLock::new(Vec::new()),
             leaf_subscriptions: leaf_subscriptions.clone(),
         });
+        leaf_subscriptions.set_turn_delivery_actuator(Arc::new(DaemonTurnDeliveryActuator { daemon: Arc::downgrade(&daemon) })).await;
 
         // Spawn self-driving poll loop with a Weak reference.
         // The loop exits naturally when all external Arc owners drop.
@@ -7545,6 +7588,82 @@ impl InProcessDaemon {
         .map_err(|err| err.to_string())
     }
 
+    async fn deliver_standing_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+        let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&request.namespace);
+        let session = sessions
+            .list_matching_labels(&BTreeMap::from([
+                (CONVOY_LABEL.to_string(), request.convoy.clone()),
+                (VESSEL_LABEL.to_string(), request.vessel.clone()),
+                (ROLE_LABEL.to_string(), request.role.clone()),
+            ]))
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("turn-delivery target {}/{} has no durable terminal-session record", request.vessel, request.role))?;
+        let mut spec = session.spec.clone();
+        let TerminalSessionSource::Agent { brief, message, .. } = &mut spec.source else {
+            return Err(format!("turn-delivery target {}/{} is not an agent", request.vessel, request.role));
+        };
+        let delivery_message =
+            TerminalCrewMessage { id: format!("turn-delivery:{}:{}", request.source, request.head_sha), text: request.brief.clone() };
+        let plan = turn_delivery_session_plan(session.status.as_ref().map(|status| status.phase), &request.vessel, &request.role)?;
+        match plan {
+            TurnDeliverySessionPlan::QueueWarm | TurnDeliverySessionPlan::QueueFresh => {
+                *message = Some(delivery_message);
+            }
+            TurnDeliverySessionPlan::RestartFresh => {
+                brief.content = request.brief.clone();
+                *message = None;
+            }
+        }
+        sessions
+            .update(&input_meta_from_resource(&session), &session.metadata.resource_version, &spec)
+            .await
+            .map_err(|error| error.to_string())?;
+        match plan {
+            TurnDeliverySessionPlan::QueueWarm => Ok(TurnDeliveryRung::WarmSession),
+            TurnDeliverySessionPlan::RestartFresh => {
+                apply_resource_status_patch(&sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(TurnDeliveryRung::FreshAgent)
+            }
+            TurnDeliverySessionPlan::QueueFresh => Ok(TurnDeliveryRung::FreshAgent),
+        }
+    }
+
+    async fn execute_turn_delivery_hold(
+        &self,
+        request: &crate::leaf_engine::TurnDeliveryRequest,
+        act: &HoldAct,
+        reason: &str,
+    ) -> Result<(), String> {
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace);
+        let convoy = convoys.get(&request.convoy).await.map_err(|error| error.to_string())?;
+        let bound = convoy.spec.change_request.as_ref().ok_or_else(|| "turn-delivery convoy has no bound change request".to_string())?;
+        let repository = convoy
+            .spec
+            .repositories
+            .iter()
+            .find(|repository| repository.repo_ref == bound.repository_ref)
+            .ok_or_else(|| format!("bound repository {} is absent", bound.repository_ref))?;
+        let canonical = flotilla_resources::canonicalize_repo_url(&repository.url)?;
+        let repository_name = canonical
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once('/').map(|(_, scope)| scope))
+            .ok_or_else(|| format!("cannot derive repository scope from {}", repository.url))?;
+        let HoldAct::ChangeRequestComment { body } = act;
+        let comment = format!("{}\n\n{}", body.trim(), reason);
+        let runner = self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
+        runner
+            .run("gh", &["pr", "comment", &bound.id, "-R", repository_name, "--body", &comment], Path::new("/"), &ChannelLabel::Noop)
+            .await
+            .map(|_| ())
+    }
+
     async fn deliver_to_crew_session(
         &self,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
@@ -9475,12 +9594,13 @@ impl InProcessDaemon {
             .diagnostics()
             .await
             .into_iter()
-            .filter(|(row, _)| matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy } if convoy == name))
+            .filter(|(row, _)| matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy } | LeafWatcher::TurnDelivery { convoy, .. } if convoy == name))
             .map(|(row, firings)| ExplainedSubscription {
                 id: row.id,
                 watcher: match row.watcher {
                     LeafWatcher::WaitCaller { .. } => "wait_caller",
                     LeafWatcher::ReconcilerWake { .. } => "reconciler_wake",
+                    LeafWatcher::TurnDelivery { .. } => "turn_delivery",
                 }
                 .to_string(),
                 leaves: row.leaves,

@@ -57,6 +57,23 @@ use crate::{
     },
 };
 
+#[test]
+fn turn_delivery_session_plans_preserve_terminal_lifecycle_invariants() {
+    assert_eq!(
+        turn_delivery_session_plan(Some(ResourceTerminalSessionPhase::Running), "work", "coder").expect("running session"),
+        TurnDeliverySessionPlan::QueueWarm
+    );
+    assert_eq!(
+        turn_delivery_session_plan(Some(ResourceTerminalSessionPhase::Starting), "work", "coder").expect("starting session"),
+        TurnDeliverySessionPlan::QueueFresh
+    );
+    assert_eq!(
+        turn_delivery_session_plan(Some(ResourceTerminalSessionPhase::Stopped), "work", "coder").expect("stopped session"),
+        TurnDeliverySessionPlan::RestartFresh
+    );
+    assert!(turn_delivery_session_plan(Some(ResourceTerminalSessionPhase::Failed), "work", "coder").is_err());
+}
+
 const TEST_LOCAL_ATTACH_HOST: &str = "local";
 
 #[tokio::test]
@@ -161,6 +178,8 @@ async fn standing_convoy_ensure_starts_restarts_with_backoff_and_recovers_from_r
             observed_workflow_ref: Some("quartermaster".to_string()),
             observed_workflows: None,
             target_mismatches: Vec::new(),
+            turn_deliveries: BTreeMap::new(),
+            attention: None,
         })
         .await
         .expect("fail convoy");
@@ -1324,6 +1343,7 @@ async fn create_explanation_convoy(
         phase: ConvoyPhase::Landing,
         workflow_snapshot: Some(WorkflowSnapshot {
             exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
+            turn_delivery: Default::default(),
             vessels: Vec::new(),
         }),
         ..Default::default()
@@ -1400,6 +1420,7 @@ async fn create_bound_explanation_convoy(
             phase: ConvoyPhase::Landing,
             workflow_snapshot: Some(WorkflowSnapshot {
                 exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
+                turn_delivery: Default::default(),
                 vessels: Vec::new(),
             }),
             ..Default::default()
@@ -2010,6 +2031,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
             phase: ConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
                 exit: None,
+                turn_delivery: Default::default(),
                 vessels: vec![
                     VesselRequirement {
                         name: "prepare".into(),
@@ -5225,6 +5247,8 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
             target_mismatches: Vec::new(),
+            turn_deliveries: BTreeMap::new(),
+            attention: None,
         })
         .await
         .expect("convoy status update should succeed");
@@ -5313,7 +5337,12 @@ async fn convoy_admission_snapshots_every_project_repository() {
     backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .create(&empty_input_meta("single-agent-contained"), &WorkflowTemplateSpec { inputs: Vec::new(), exit: None, vessels: Vec::new() })
+        .create(&empty_input_meta("single-agent-contained"), &WorkflowTemplateSpec {
+            inputs: Vec::new(),
+            exit: None,
+            turn_delivery: Default::default(),
+            vessels: Vec::new(),
+        })
         .await
         .expect("workflow create should succeed");
 
@@ -5356,7 +5385,12 @@ async fn create_empty_workflow(backend: &ResourceBackend, name: &str) {
     backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .create(&empty_input_meta(name), &WorkflowTemplateSpec { inputs: Vec::new(), exit: None, vessels: Vec::new() })
+        .create(&empty_input_meta(name), &WorkflowTemplateSpec {
+            inputs: Vec::new(),
+            exit: None,
+            turn_delivery: Default::default(),
+            vessels: Vec::new(),
+        })
         .await
         .expect("workflow create should succeed");
 }
@@ -5812,6 +5846,8 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             disposition: None,
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
+            turn_deliveries: BTreeMap::new(),
+            attention: None,
             target_mismatches: Vec::new(),
         })
         .await
@@ -5963,6 +5999,8 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
             target_mismatches: Vec::new(),
+            turn_deliveries: BTreeMap::new(),
+            attention: None,
         })
         .await
         .expect("convoy status should update");
@@ -6553,7 +6591,7 @@ async fn undeclared_exit_landing_convoy_can_be_explicitly_abandoned() {
         .update_status("active-convoy", &created.metadata.resource_version, &ConvoyStatus {
             placement_decision: None,
             phase: ConvoyPhase::Landing,
-            workflow_snapshot: Some(WorkflowSnapshot { exit: None, vessels: Vec::new() }),
+            workflow_snapshot: Some(WorkflowSnapshot { exit: None, turn_delivery: Default::default(), vessels: Vec::new() }),
             work: BTreeMap::from([("implement".to_string(), WorkState {
                 phase: WorkPhase::Complete,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
@@ -6571,6 +6609,8 @@ async fn undeclared_exit_landing_convoy_can_be_explicitly_abandoned() {
             observed_workflow_ref: Some("review-and-fix".to_string()),
             observed_workflows: None,
             target_mismatches: Vec::new(),
+            turn_deliveries: BTreeMap::new(),
+            attention: None,
         })
         .await
         .expect("convoy status should update");

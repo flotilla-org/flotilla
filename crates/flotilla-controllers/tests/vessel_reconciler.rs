@@ -115,6 +115,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
         .update_status("convoy-scratch", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
                 exit: None,
+                turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: "work".to_string(),
                     stance: Stance::Trusted,
@@ -492,6 +493,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         .update_status("convoy-multi", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
                 exit: None,
+                turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: "implement".to_string(),
                     stance: Stance::Trusted,
@@ -672,6 +674,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         .update_status("convoy-multi-docker", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
                 exit: None,
+                turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: "implement".to_string(),
                     stance: Stance::Contained,
@@ -847,6 +850,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
         .update_status("convoy-multi-fresh", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
                 exit: None,
+                turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: "implement".to_string(),
                     stance: Stance::Contained,
@@ -975,6 +979,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .update_status("convoy-scoped", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
                 exit: None,
+                turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: "implement".to_string(),
                     stance: Stance::Trusted,
@@ -1917,7 +1922,11 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
         .clone()
         .using::<Convoy>(NAMESPACE)
         .update_status("convoy-issue-brief", &convoy.metadata.resource_version, &ConvoyStatus {
-            workflow_snapshot: Some(WorkflowSnapshot { exit: None, vessels: interactive_single_workflow_spec().vessels }),
+            workflow_snapshot: Some(WorkflowSnapshot {
+                exit: None,
+                turn_delivery: Default::default(),
+                vessels: interactive_single_workflow_spec().vessels,
+            }),
             ..Default::default()
         })
         .await
@@ -2320,6 +2329,7 @@ async fn create_convoy_with_labeled_processes(
         .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
                 exit: None,
+                turn_delivery: Default::default(),
                 vessels: vec![
                     VesselRequirement {
                         name: "implement".to_string(),

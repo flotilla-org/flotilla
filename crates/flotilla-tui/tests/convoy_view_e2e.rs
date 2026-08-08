@@ -184,6 +184,7 @@ async fn generated_table_action_completes_work() {
     });
     let snapshot = WorkflowSnapshot {
         exit: None,
+        turn_delivery: Default::default(),
         vessels: vec![VesselRequirement {
             name: "implement".into(),
             stance: Default::default(),
