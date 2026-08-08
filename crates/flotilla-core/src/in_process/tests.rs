@@ -178,6 +178,8 @@ async fn standing_convoy_ensure_starts_restarts_with_backoff_and_recovers_from_r
             observed_workflow_ref: Some("quartermaster".to_string()),
             observed_workflows: None,
             target_mismatches: Vec::new(),
+            turn_deliveries: BTreeMap::new(),
+            attention: None,
         })
         .await
         .expect("fail convoy");
