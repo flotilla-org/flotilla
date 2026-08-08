@@ -33,30 +33,18 @@ type SeqMap = std::sync::RwLock<HashMap<StreamKey, u64>>;
 /// connection's subscription.
 type QuerySet = std::sync::RwLock<HashSet<QueryId>>;
 
-/// RAII guard that removes a lock file when dropped.
+/// RAII guard that holds the daemon spawn flock.
 ///
-/// Holds the open file handle (which keeps the OS flock) and removes the
-/// lock file on drop.  The flock is released *before* the path is unlinked
-/// so that concurrent clients racing on the same path always contend on the
-/// same inode — unlinking first would let them create a new file and flock
-/// a different inode, breaking mutual exclusion.
+/// The lock file remains on disk after release so every contender opens the
+/// same inode. Unlinking it during a handoff would let a new client create and
+/// lock a replacement inode while an already-queued client owns the old one.
 struct SpawnLockGuard {
-    file: Option<std::fs::File>,
-    path: PathBuf,
+    _file: std::fs::File,
 }
 
 impl SpawnLockGuard {
-    fn new(file: std::fs::File, path: PathBuf) -> Self {
-        Self { file: Some(file), path }
-    }
-}
-
-impl Drop for SpawnLockGuard {
-    fn drop(&mut self) {
-        // Release the flock before unlinking, preserving the
-        // mutual-exclusion contract during the handoff window.
-        drop(self.file.take());
-        let _ = std::fs::remove_file(&self.path);
+    fn new(file: std::fs::File) -> Self {
+        Self { _file: file }
     }
 }
 
@@ -435,7 +423,18 @@ async fn connect_or_spawn_with_optional_surface(
     state_dir: &Path,
     surface: Option<SurfaceDeclaration>,
 ) -> Result<Arc<SocketDaemon>, String> {
-    flotilla_core::path_policy::ensure_daemon_socket_belongs_to_config(socket_path, config_dir)?;
+    connect_or_spawn_with_optional_surface_using(socket_path, config_dir, state_dir, surface, &spawn_daemon).await
+}
+
+type DaemonSpawner = dyn Fn(&Path, &Path, &Path) -> Result<(), String> + Send + Sync;
+
+async fn connect_or_spawn_with_optional_surface_using(
+    socket_path: &Path,
+    config_dir: &Path,
+    state_dir: &Path,
+    surface: Option<SurfaceDeclaration>,
+    spawner: &DaemonSpawner,
+) -> Result<Arc<SocketDaemon>, String> {
     // An existing socket must complete the stateful Hello handshake. A
     // handshake failure means a daemon is listening but is incompatible or
     // malformed; surface that error instead of treating the socket as stale
@@ -450,6 +449,12 @@ async fn connect_or_spawn_with_optional_surface(
     if let Some(daemon) = connect_existing_stateful(socket_path, surface.as_ref()).await? {
         return Ok(daemon);
     }
+
+    // Config identity constrains daemon creation, not client connectivity. A
+    // client may deliberately inspect or drive an existing daemon through a
+    // socket owned by another root, but it must never create that daemon with
+    // its own mismatched config and state directories.
+    flotilla_core::path_policy::ensure_daemon_socket_belongs_to_config(socket_path, config_dir)?;
 
     ensure_no_live_daemon_without_socket(state_dir, socket_path)?;
 
@@ -466,7 +471,7 @@ async fn connect_or_spawn_with_optional_surface(
             tokio::task::spawn_blocking(move || acquire_spawn_lock(&lock_path_clone)).await.map_err(|e| format!("spawn_blocking: {e}"))?;
         match lock_result {
             Ok(Some(file)) => {
-                _lock_guard = Some(SpawnLockGuard::new(file, lock_path.clone()));
+                _lock_guard = Some(SpawnLockGuard::new(file));
                 break;
             }
             Ok(None) => {
@@ -505,7 +510,7 @@ async fn connect_or_spawn_with_optional_surface(
                     .map_err(|e| format!("spawn_blocking: {e}"))?;
                 match final_lock {
                     Ok(Some(file)) => {
-                        _lock_guard = Some(SpawnLockGuard::new(file, lock_path.clone()));
+                        _lock_guard = Some(SpawnLockGuard::new(file));
                         break;
                     }
                     Ok(None) => {
@@ -549,7 +554,7 @@ async fn connect_or_spawn_with_optional_surface(
         let _ = std::fs::remove_file(socket_path);
 
         // Spawn daemon process
-        spawn_daemon(socket_path, config_dir, state_dir)?;
+        spawner(socket_path, config_dir, state_dir)?;
     }
 
     // Poll for connection with a 10s deadline (soft: the deadline is checked
@@ -1217,15 +1222,15 @@ mod spawn_lock_tests {
     use super::*;
 
     #[test]
-    fn spawn_lock_guard_removes_file_on_drop() {
+    fn spawn_lock_guard_keeps_stable_lock_file_on_drop() {
         let dir = tempfile::tempdir().expect("tempdir");
         let lock_path = dir.path().join("test.lock");
         fs::write(&lock_path, "").expect("create lock file");
         let file = fs::File::open(&lock_path).expect("open lock file");
         {
-            let _guard = SpawnLockGuard::new(file, lock_path.clone());
+            let _guard = SpawnLockGuard::new(file);
             assert!(lock_path.exists(), "lock file should exist while guard is held");
         }
-        assert!(!lock_path.exists(), "lock file should be removed after guard drops");
+        assert!(lock_path.exists(), "lock file inode must remain stable across owners");
     }
 }

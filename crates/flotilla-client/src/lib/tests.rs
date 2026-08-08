@@ -442,6 +442,136 @@ async fn connect_or_spawn_rejects_existing_daemon_protocol_version_mismatch() {
 }
 
 #[tokio::test]
+async fn client_with_different_config_identity_connects_to_existing_daemon() {
+    let dir = TestSocketDir::new();
+    let socket_path = rooted_daemon_socket(&dir);
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping client_with_different_config_identity_connects_to_existing_daemon: unix socket bind not permitted: {err}");
+            return;
+        }
+        Err(err) => panic!("bind listener: {err}"),
+    };
+
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept client");
+        let session = unix_message_session(stream);
+        let hello = session.read().await.expect("read client hello").expect("client hello");
+        assert!(matches!(hello, Message::Hello { protocol_version: PROTOCOL_VERSION, .. }));
+        session
+            .write(Message::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                node_id: NodeId::new("daemon"),
+                display_name: flotilla_protocol::hello_display_name("daemon", BUILD_ID),
+                session_id: uuid::Uuid::new_v4(),
+                connection_role: Some(ConnectionRole::Client),
+                surface: None,
+            })
+            .await
+            .expect("write daemon hello");
+    });
+
+    let client_config = dir.path().join("another-root/config");
+    let daemon = connect_or_spawn(&socket_path, &client_config, &dir.path().join("another-root/state"))
+        .await
+        .expect("an existing daemon may be used through another config identity");
+
+    assert_eq!(daemon.build_id(), Some(BUILD_ID));
+    server_task.await.expect("join server task");
+}
+
+#[tokio::test]
+async fn ambient_root_client_racing_clean_clients_cannot_squat_on_default_socket() {
+    use std::sync::atomic::AtomicUsize;
+
+    const CLEAN_CLIENTS: usize = 4;
+
+    let dir = TestSocketDir::new();
+    let socket_path = rooted_daemon_socket(&dir);
+    let probe = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!(
+                "skipping ambient_root_client_racing_clean_clients_cannot_squat_on_default_socket: unix socket bind not permitted: {err}"
+            );
+            return;
+        }
+        Err(err) => panic!("bind listener probe: {err}"),
+    };
+    drop(probe);
+    std::fs::remove_file(&socket_path).expect("remove probe socket");
+
+    let spawn_count = Arc::new(AtomicUsize::new(0));
+    let (spawn_tx, mut spawn_rx) = tokio::sync::mpsc::unbounded_channel();
+    let observed_spawn_count = Arc::clone(&spawn_count);
+    let spawner: Arc<DaemonSpawner> = Arc::new(move |_socket_path, config_dir, _state_dir| {
+        observed_spawn_count.fetch_add(1, Ordering::SeqCst);
+        spawn_tx.send(config_dir.to_path_buf()).map_err(|_| "test daemon receiver dropped".to_string())
+    });
+
+    let expected_config = dir.path().to_path_buf();
+    let server_socket = socket_path.clone();
+    let server_task = tokio::spawn(async move {
+        let spawning_config = spawn_rx.recv().await.expect("one client should request a daemon spawn");
+        assert_eq!(spawning_config, expected_config, "the socket-owning default identity must win the spawn race");
+        let listener = UnixListener::bind(&server_socket).expect("bind spawned daemon listener");
+        for _ in 0..CLEAN_CLIENTS {
+            let (stream, _) = listener.accept().await.expect("accept clean client");
+            let session = unix_message_session(stream);
+            let hello = session.read().await.expect("read client hello").expect("client hello");
+            assert!(matches!(hello, Message::Hello { protocol_version: PROTOCOL_VERSION, .. }));
+            session
+                .write(Message::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    node_id: NodeId::new("default-root-daemon"),
+                    display_name: flotilla_protocol::hello_display_name("daemon", BUILD_ID),
+                    session_id: uuid::Uuid::new_v4(),
+                    connection_role: Some(ConnectionRole::Client),
+                    surface: None,
+                })
+                .await
+                .expect("write daemon hello");
+        }
+    });
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(CLEAN_CLIENTS + 1));
+    let mut clean_tasks = Vec::new();
+    for _ in 0..CLEAN_CLIENTS {
+        let task_socket = socket_path.clone();
+        let task_config = dir.path().to_path_buf();
+        let task_state = dir.path().join("state");
+        let task_barrier = Arc::clone(&barrier);
+        let task_spawner = Arc::clone(&spawner);
+        clean_tasks.push(tokio::spawn(async move {
+            task_barrier.wait().await;
+            connect_or_spawn_with_optional_surface_using(&task_socket, &task_config, &task_state, None, task_spawner.as_ref()).await
+        }));
+    }
+
+    let wrong_socket = socket_path.clone();
+    let wrong_config = dir.path().join("ambient-flotilla-root/config");
+    let wrong_state = dir.path().join("ambient-flotilla-root/state");
+    let wrong_barrier = Arc::clone(&barrier);
+    let wrong_spawner = Arc::clone(&spawner);
+    let wrong_task = tokio::spawn(async move {
+        wrong_barrier.wait().await;
+        connect_or_spawn_with_optional_surface_using(&wrong_socket, &wrong_config, &wrong_state, None, wrong_spawner.as_ref()).await
+    });
+
+    let wrong_error = match wrong_task.await.expect("join wrong-root client") {
+        Ok(_) => panic!("wrong-root client must never spawn on the default socket"),
+        Err(error) => error,
+    };
+    assert!(wrong_error.contains("does not belong to config root"), "unexpected error: {wrong_error}");
+    for task in clean_tasks {
+        task.await.expect("join clean client").expect("clean client connects to the winning daemon");
+    }
+    server_task.await.expect("join spawned daemon");
+    assert_eq!(spawn_count.load(Ordering::SeqCst), 1, "concurrent clean clients must single-flight daemon creation");
+}
+
+#[tokio::test]
 async fn root_scoped_client_refuses_to_spawn_on_the_default_fleet_socket() {
     let dir = tempfile::tempdir().expect("tempdir");
     let scoped_config = dir.path().join("live-session/config");
@@ -799,6 +929,41 @@ fn acquire_spawn_lock_waiter_blocks_then_returns_none() {
     let waiter_result = waiter.join().expect("join waiter");
     assert!(waiter_result.is_none(), "waiter should return None after spawner releases lock");
     let _ = std::fs::remove_file(&lock_path);
+}
+
+#[test]
+fn spawn_lock_path_stays_contended_during_waiter_handoff() {
+    use std::os::fd::AsRawFd;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lock_path = dir.path().join("daemon.sock.lock");
+    let holder = acquire_spawn_lock(&lock_path).expect("acquire first lock").expect("first call should become spawner");
+    let holder = SpawnLockGuard::new(holder);
+
+    // Open the same inode while the first holder still owns it, then wait for
+    // the handoff. This models a second client already queued in flock when
+    // the spawning client finishes.
+    let waiter_file = std::fs::OpenOptions::new().write(true).open(&lock_path).expect("open waiter lock file");
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        // SAFETY: waiter_file owns this descriptor for the thread's lifetime.
+        assert_eq!(unsafe { libc::flock(waiter_file.as_raw_fd(), libc::LOCK_EX) }, 0, "waiter acquires lock");
+        acquired_tx.send(()).expect("report waiter acquisition");
+        release_rx.recv().expect("wait for release");
+    });
+
+    drop(holder);
+    acquired_rx.recv_timeout(Duration::from_secs(1)).expect("waiter should receive the lock handoff");
+
+    let contender =
+        std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&lock_path).expect("open contender lock file");
+    // SAFETY: contender owns this descriptor for the duration of the probe.
+    let result = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_ne!(result, 0, "a third client must contend on the waiter-held inode rather than lock a replacement file");
+
+    release_tx.send(()).expect("release waiter");
+    waiter.join().expect("join waiter");
 }
 
 // --- Gap detection: delta for unknown repo triggers recovery ---
