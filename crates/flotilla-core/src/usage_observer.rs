@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use flotilla_resources::{
     usage_record_name, InputMeta, ResourceBackend, ResourceError, ResourceObject, Usage, UsagePace, UsageProviderCost, UsageSpec,
     UsageStatus, UsageWindow,
@@ -12,6 +12,8 @@ use crate::providers::{ChannelLabel, CommandRunner};
 pub const CODEXBAR_CLI: &str = "/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI";
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 pub const PROVIDERS: [&str; 2] = ["codex", "claude"];
+const HEARTBEAT_INTERVAL: TimeDelta = TimeDelta::hours(1);
+const USED_PERCENT_WRITE_THRESHOLD: f64 = 1.0;
 
 pub struct CodexBarUsagePoller {
     runner: Arc<dyn CommandRunner>,
@@ -284,6 +286,23 @@ fn push_pace(pace: &mut Vec<UsagePace>, window: &str, projection: Option<PacePro
     Ok(())
 }
 
+fn observation_is_material(current: &UsageStatus, next: &UsageStatus) -> bool {
+    current.plan != next.plan
+        || current.provider_cost != next.provider_cost
+        || current.reset_credits_available != next.reset_credits_available
+        || windows_changed(&current.windows, &next.windows)
+        || next.observed_at.signed_duration_since(current.observed_at) >= HEARTBEAT_INTERVAL
+}
+
+fn windows_changed(current: &[UsageWindow], next: &[UsageWindow]) -> bool {
+    current.len() != next.len()
+        || current.iter().any(|current_window| {
+            let Some(next_window) = next.iter().find(|next_window| next_window.name == current_window.name) else { return true };
+            current_window.resets_at != next_window.resets_at
+                || (current_window.used_percent - next_window.used_percent).abs() >= USED_PERCENT_WRITE_THRESHOLD
+        })
+}
+
 pub async fn publish_usage_observation(
     backend: &ResourceBackend,
     namespace: &str,
@@ -307,6 +326,9 @@ pub async fn publish_usage_observation(
     }
     for _ in 0..3 {
         let current = records.get(&name).await?;
+        if current.status.as_ref().is_some_and(|status| !observation_is_material(status, &observation.status)) {
+            return Ok(current);
+        }
         match records.update_status(&name, &current.metadata.resource_version, &observation.status).await {
             Ok(updated) => return Ok(updated),
             Err(ResourceError::Conflict { .. }) => continue,
@@ -403,5 +425,82 @@ mod tests {
         assert_eq!(<Usage as Resource>::REPLICATION_CLASS, ReplicationClass::Observations);
         assert_eq!(backend.using::<Usage>("flotilla").list().await.expect("list usage").items.len(), 1);
         assert_eq!(updated.metadata.labels, BTreeMap::new());
+    }
+
+    #[tokio::test]
+    async fn unchanged_observation_does_not_create_a_new_resource_version() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let first = UsageObservation {
+            account: "ada@example.com".to_string(),
+            status: UsageStatus::builder()
+                .provider("codex")
+                .plan("plus")
+                .windows(vec![UsageWindow::builder()
+                    .name("weekly")
+                    .used_percent(8.0)
+                    .resets_at("2026-08-14T00:00:00Z".parse().expect("reset timestamp"))
+                    .build()])
+                .observed_at("2026-08-08T18:00:00Z".parse().expect("observation timestamp"))
+                .build(),
+        };
+        let written = publish_usage_observation(&backend, "flotilla", &first).await.expect("publish first observation");
+        let mut unchanged = first.clone();
+        unchanged.status.observed_at = "2026-08-08T18:05:00Z".parse().expect("next poll timestamp");
+
+        let skipped = publish_usage_observation(&backend, "flotilla", &unchanged).await.expect("skip unchanged observation");
+        let stored = backend.using::<Usage>("flotilla").get(&usage_record_name(&first.account)).await.expect("read stored observation");
+
+        assert_eq!(skipped.metadata.resource_version, written.metadata.resource_version);
+        assert_eq!(stored.metadata.resource_version, written.metadata.resource_version);
+        assert_eq!(stored.status.expect("stored status").observed_at, first.status.observed_at);
+    }
+
+    #[test]
+    fn material_change_covers_threshold_structure_and_heartbeat() {
+        let current = UsageStatus::builder()
+            .provider("codex")
+            .plan("plus")
+            .windows(vec![UsageWindow::builder()
+                .name("weekly")
+                .used_percent(8.0)
+                .resets_at("2026-08-14T00:00:00Z".parse().expect("reset timestamp"))
+                .build()])
+            .provider_cost(UsageProviderCost::builder().used(12.5).limit(50.0).currency_code("USD").balance(37.5).build())
+            .reset_credits_available(2_u64)
+            .observed_at("2026-08-08T18:00:00Z".parse().expect("observation timestamp"))
+            .build();
+
+        let mut sub_threshold = current.clone();
+        sub_threshold.windows[0].used_percent = 8.999;
+        sub_threshold.observed_at += TimeDelta::minutes(59);
+        assert!(!observation_is_material(&current, &sub_threshold));
+
+        let mut threshold = current.clone();
+        threshold.windows[0].used_percent = 9.0;
+        assert!(observation_is_material(&current, &threshold));
+
+        let mut window_set = current.clone();
+        window_set.windows.push(UsageWindow::builder().name("session").used_percent(1.0).build());
+        assert!(observation_is_material(&current, &window_set));
+
+        let mut reset = current.clone();
+        reset.windows[0].resets_at = Some("2026-08-15T00:00:00Z".parse().expect("changed reset timestamp"));
+        assert!(observation_is_material(&current, &reset));
+
+        let mut plan = current.clone();
+        plan.plan = Some("team".to_string());
+        assert!(observation_is_material(&current, &plan));
+
+        let mut provider_cost = current.clone();
+        provider_cost.provider_cost.as_mut().expect("provider cost").balance = Some(36.5);
+        assert!(observation_is_material(&current, &provider_cost));
+
+        let mut reset_credits = current.clone();
+        reset_credits.reset_credits_available = Some(1);
+        assert!(observation_is_material(&current, &reset_credits));
+
+        let mut heartbeat = current.clone();
+        heartbeat.observed_at += HEARTBEAT_INTERVAL;
+        assert!(observation_is_material(&current, &heartbeat));
     }
 }
