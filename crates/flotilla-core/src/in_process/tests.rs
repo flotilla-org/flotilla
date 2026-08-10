@@ -149,7 +149,7 @@ async fn standing_convoy_ensure_starts_restarts_with_backoff_and_recovers_from_r
                 workflow_ref: "quartermaster".to_string(),
                 placement_policy: None,
                 stance: Some(Stance::Trusted),
-                repositories: vec![repository_key],
+                repositories: vec![repository_key.clone()],
                 presents_as: Some("fleet".to_string()),
             },
         )
@@ -209,6 +209,56 @@ async fn standing_convoy_ensure_starts_restarts_with_backoff_and_recovers_from_r
     clock.advance(ChronoDuration::seconds(30));
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart after reap");
     assert!(convoys.get("quartermaster").await.is_ok());
+
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let remote_host = hosts
+        .create(&empty_input_meta("remote-capacity-unknown"), &HostSpec { display_name: "remote-capacity-unknown".to_string() })
+        .await
+        .expect("remote host");
+    hosts
+        .update_status("remote-capacity-unknown", &remote_host.metadata.resource_version, &HostStatus {
+            ready: true,
+            heartbeat_at: Some(now),
+            ..HostStatus::default()
+        })
+        .await
+        .expect("remote host ready without capacity");
+    backend
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &empty_input_meta("remote-capacity-unknown"),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: "remote-capacity-unknown".to_string(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("remote placement");
+    backend
+        .definitions::<ConvoyEnsure>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("capacity-starved".to_string())
+                .annotations(BTreeMap::from([(SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string())]))
+                .build(),
+            &ConvoyEnsureSpec {
+                project_ref: "standing-project".to_string(),
+                workflow_ref: "quartermaster".to_string(),
+                placement_policy: Some("remote-capacity-unknown".to_string()),
+                stance: Some(Stance::Trusted),
+                repositories: vec![repository_key],
+                presents_as: None,
+            },
+        )
+        .await
+        .expect("capacity-starved ensure declaration");
+
+    let error = daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("missing remote capacity must refuse ensure");
+    assert!(error.contains("admission free-space floor is unavailable"), "{error}");
+    assert!(matches!(convoys.get("capacity-starved").await, Err(ResourceError::NotFound { .. })));
 }
 
 #[test]

@@ -4824,6 +4824,8 @@ impl InProcessDaemon {
                 ensure.spec.stance,
             )
             .await?;
+        self.check_local_free_space_floor().await?;
+        self.check_remote_placement_free_space_floor(namespace, admission.placement_decision.as_ref()).await?;
         if admission.workflow.exit.is_some() {
             return Err(format!(
                 "workflow template {} declares an exit table; standing convoys require no exit declaration",
