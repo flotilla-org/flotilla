@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use chrono::Utc;
 use flotilla_protocol::NodeId;
 use futures::{stream::BoxStream, StreamExt};
 use serde::Deserialize;
@@ -324,6 +325,26 @@ pub async fn delete_resource_kind(
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, delete_typed(backend, namespace, name).await)
 }
 
+/// Deliberately collect one cached replica while preserving its read-only
+/// authority boundary.
+///
+/// The stored delete is timestamped and relayed like an ordinary replica
+/// tombstone, so stale copies from other peers cannot immediately resurrect
+/// the object. A later update from the original authority remains newer and
+/// can recreate it.
+pub async fn collect_resource_replica_kind(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    name: &str,
+    origin_root: &NodeId,
+) -> Result<DynamicResourceObject, ResourceError> {
+    dispatch_resource_kind!(
+        lookup_resource_kind(requested_kind)?.resource,
+        collect_replica_typed(backend, namespace, name, origin_root).await
+    )
+}
+
 pub async fn watch_resource_kind(
     backend: &ResourceBackend,
     namespace: &str,
@@ -547,6 +568,33 @@ async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, n
         plural: T::API_PATHS.plural.to_string(),
         namespace: namespace.to_string(),
         value: object_value(&object)?,
+    })
+}
+
+async fn collect_replica_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    name: &str,
+    origin_root: &NodeId,
+) -> Result<DynamicResourceObject, ResourceError> {
+    let replica = backend
+        .including_replicas::<T>(namespace)
+        .list_sources()
+        .await?
+        .items
+        .into_iter()
+        .find(|source| {
+            source.object.metadata.name == name
+                && matches!(&source.provenance, ResourceProvenance::Replica { origin_root: source_origin, .. } if source_origin == origin_root)
+        })
+        .ok_or_else(|| ResourceError::not_found(name))?;
+    let value = read_object_value(&replica)?;
+    backend.replica_writer::<T>(origin_root.clone(), namespace).apply(WatchEvent::Deleted(replica.object), Utc::now()).await?;
+    Ok(DynamicResourceObject {
+        kind: T::API_PATHS.kind.to_string(),
+        plural: T::API_PATHS.plural.to_string(),
+        namespace: namespace.to_string(),
+        value,
     })
 }
 

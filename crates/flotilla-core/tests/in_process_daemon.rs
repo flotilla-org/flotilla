@@ -773,6 +773,85 @@ async fn resource_list_and_get_queries_return_wire_json() {
 }
 
 #[tokio::test]
+async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let authority_node = test_node("retired-authority");
+    let origin = authority_node.node_id.clone();
+    daemon.set_configured_peers(vec![authority_node.clone()]).await;
+
+    let local = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
+    local
+        .create(
+            &InputMeta::builder().name("orphaned-convoy".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        )
+        .await
+        .expect("create authority record");
+    let authority_snapshot = local.list().await.expect("list authority record");
+    local.delete("orphaned-convoy").await.expect("authority store vanishes");
+    daemon
+        .resource_backend()
+        .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
+        .replace(&authority_snapshot, chrono::Utc::now())
+        .await
+        .expect("retain stale replica after authority disappears");
+
+    let mut events = daemon.subscribe();
+    InProcessDaemon::publish_peer_connection_status(daemon.as_ref(), &authority_node, PeerConnectionState::Connected).await;
+    let refused_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ResourceDelete {
+                namespace: "flotilla".to_string(),
+                kind: "convoys".to_string(),
+                name: "orphaned-convoy".to_string(),
+                replica_origin: Some(origin.clone()),
+            },
+        })
+        .await
+        .expect("request collection while authority is connected");
+    let refused = recv_command_finished(&mut events, refused_id).await;
+    assert!(
+        matches!(refused, CommandValue::Error { ref message } if message.contains("is connected")),
+        "live authorities must retain their deletion authority: {refused:?}"
+    );
+
+    InProcessDaemon::publish_peer_connection_status(daemon.as_ref(), &authority_node, PeerConnectionState::Disconnected).await;
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ResourceDelete {
+                namespace: "flotilla".to_string(),
+                kind: "convoys".to_string(),
+                name: "orphaned-convoy".to_string(),
+                replica_origin: Some(origin),
+            },
+        })
+        .await
+        .expect("collect orphaned replica");
+
+    let result = recv_command_finished(&mut events, command_id).await;
+    assert!(matches!(result, CommandValue::ResourceDeleted(_)), "unexpected collection result: {result:?}");
+    assert!(
+        daemon
+            .resource_backend()
+            .including_replicas::<ResourceConvoy>("flotilla")
+            .list()
+            .await
+            .expect("list after collection")
+            .items
+            .is_empty(),
+        "the stale authority projection must be collectable"
+    );
+}
+
+#[tokio::test]
 async fn resource_watch_streams_current_update_and_resumed_delete_without_loss() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon =

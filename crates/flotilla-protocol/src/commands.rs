@@ -703,6 +703,8 @@ pub enum CommandAction {
         namespace: String,
         kind: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replica_origin: Option<crate::NodeId>,
     },
     ResourceWatch {
         namespace: String,
