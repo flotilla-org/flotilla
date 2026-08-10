@@ -28,8 +28,6 @@ use flotilla_resources::{
     ProjectRepositoryRole, ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend, Stance,
     WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
 };
-use tracing::instrument::WithSubscriber;
-
 #[derive(Clone)]
 struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -647,7 +645,7 @@ async fn tracking_repo_materializes_whole_repo_project() {
     }]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_custom_fields() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
@@ -667,6 +665,19 @@ async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_cu
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
 
     let projects = backend.definitions::<Project>("flotilla");
+    let log_output = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogCaptureWriter(Arc::clone(&log_output));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    // Capture from before drift is introduced: the daemon's background poll may
+    // reconcile it before the explicit call below. The current-thread runtime
+    // keeps this thread-local subscriber active across each await.
+    let log_guard = tracing::subscriber::set_default(subscriber);
     projects
         .create(
             &InputMeta::builder()
@@ -689,22 +700,8 @@ async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_cu
         .await
         .expect("stale whole-repository Project should be created");
 
-    let log_output = Arc::new(Mutex::new(Vec::new()));
-    {
-        let writer = LogCaptureWriter(Arc::clone(&log_output));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-        daemon
-            .materialize_tracked_repo_projects()
-            .with_subscriber(subscriber)
-            .await
-            .expect("tracked Project reconciliation should succeed");
-    }
+    daemon.materialize_tracked_repo_projects().await.expect("tracked Project reconciliation should succeed");
+    drop(log_guard);
 
     let reconciled = projects.get("tracked").await.expect("tracked Project should remain");
     assert_eq!(reconciled.spec.display_name, "My Tracked Repository");
