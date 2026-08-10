@@ -722,7 +722,8 @@ impl CredentialStore {
                             &[
                                 "-c",
                                 "IFS= read -r token; unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; \
-                                 CLAUDE_CODE_OAUTH_TOKEN=\"$token\" CLAUDE_CONFIG_DIR=\"$1\" claude -p ok",
+                                 output=$(CLAUDE_CODE_OAUTH_TOKEN=\"$token\" CLAUDE_CONFIG_DIR=\"$1\" claude -p ok 2>&1) || \
+                                 { status=$?; printf '%s\\n' \"$output\" >&2; exit \"$status\"; }; printf '%s' \"$output\"",
                                 "flotilla-claude-oauth-preflight",
                                 &config_dir,
                             ],
@@ -731,7 +732,18 @@ impl CredentialStore {
                             material.as_bytes(),
                         )
                         .await
-                        .map_err(|error| format!("subscription token preflight failed: {error}"))?;
+                        .or_else(|error| {
+                            if claude_headless_credit_pool_is_exhausted(&error) {
+                                tracing::warn!(
+                                    credential = %name,
+                                    detail = %bounded_adapter_error(name, "claude-oauth", &error.replace(material, "[redacted]")),
+                                    "Claude OAuth preflight exhausted headless credits; continuing because interactive crews use subscription limits"
+                                );
+                                Ok(String::new())
+                            } else {
+                                Err(format!("subscription token preflight failed: {error}"))
+                            }
+                        })?;
                 }
                 env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), material.to_string());
                 env.insert("CLAUDE_CONFIG_DIR".to_string(), config_dir);
@@ -834,6 +846,11 @@ fn safe_component(name: &str) -> String {
 
 fn image_registry_matches(image: &str, registry: &str) -> bool {
     image == registry || image.strip_prefix(registry).is_some_and(|remainder| remainder.starts_with('/'))
+}
+
+fn claude_headless_credit_pool_is_exhausted(output: &str) -> bool {
+    let output = output.to_ascii_lowercase();
+    ["credit", "quota", "billing"].iter().any(|indicator| output.contains(indicator))
 }
 
 fn bounded_adapter_error(name: &str, adapter: &str, detail: &str) -> String {
@@ -1158,6 +1175,7 @@ interactions:
             cmd == "sh"
                 && args.iter().any(|arg| arg.contains("unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN"))
                 && args.iter().any(|arg| arg.contains("CLAUDE_CODE_OAUTH_TOKEN=\"$token\"") && arg.contains("claude -p"))
+                && args.iter().any(|arg| arg.contains("claude -p ok 2>&1") && arg.contains("printf '%s\\n' \"$output\" >&2"))
                 && args.iter().any(|arg| arg == "/run/flotilla/credentials/claude-max/claude")
                 && input == secret.as_bytes()
         }));
@@ -1274,6 +1292,66 @@ interactions:
             calls.iter().filter(|(cmd, args, _)| cmd == "sh" && args.iter().any(|arg| arg.contains("claude -p"))).count(),
             2,
             "failed preparation must not mark the credential prepared"
+        );
+    }
+
+    struct ExhaustedHeadlessCreditsRunner {
+        inner: RecordingRunner,
+    }
+
+    #[async_trait]
+    impl CommandRunner for ExhaustedHeadlessCreditsRunner {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            self.inner.run(cmd, args, cwd, label).await
+        }
+
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            self.inner.run_output(cmd, args, cwd, label).await
+        }
+
+        async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+            self.inner.run_with_input(cmd, args, cwd, label, input).await?;
+            if args.iter().any(|arg| arg.contains("claude -p")) {
+                return Err(
+                    "You've reached your monthly Agent SDK credit quota. Add billing credits to continue using Claude Code headlessly."
+                        .to_string(),
+                );
+            }
+            Ok(String::new())
+        }
+
+        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+            self.inner.exists(cmd, args).await
+        }
+
+        async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+            self.inner.write_file(path, content).await
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_headless_credits_do_not_reject_a_valid_claude_oauth_token() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
+        let secret = "sk-ant-oat01-valid-token";
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_CLAUDE_TOKEN".to_string(), secret.to_string())])));
+        let runner = Arc::new(ExhaustedHeadlessCreditsRunner { inner: RecordingRunner::default() });
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+        let credential_refs = BTreeSet::from(["claude-max".to_string()]);
+
+        let delivered = store
+            .prepare("env-a", &credential_refs, runner.clone())
+            .await
+            .expect("headless credit exhaustion does not invalidate the token used by interactive crews");
+
+        assert!(delivered.contains(&("CLAUDE_CODE_OAUTH_TOKEN".to_string(), secret.to_string())));
+        store.prepare("env-a", &credential_refs, runner.clone()).await.expect("successful preparation is cached");
+        let calls = runner.inner.calls.lock().expect("calls lock");
+        assert_eq!(
+            calls.iter().filter(|(cmd, args, _)| cmd == "sh" && args.iter().any(|arg| arg.contains("claude -p"))).count(),
+            1,
+            "accepted credit exhaustion should mark the credential prepared"
         );
     }
 
