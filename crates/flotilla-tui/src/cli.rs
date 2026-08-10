@@ -728,7 +728,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::ResourceDeleted(response) => {
             let name = response.value["metadata"]["name"].as_str().unwrap_or("<unknown>");
             let api_version = response.value["apiVersion"].as_str().unwrap_or("<unknown>");
-            if let Some(origin_root) = response.value["metadata"]["annotations"]["flotilla.work/origin-root"].as_str() {
+            if let Some(origin_root) = &response.replica_origin {
                 format!(
                     "collected replica {api_version}/{}/{}/{name} from {origin_root}\nA newer update from the authority may recreate it.",
                     response.kind, response.namespace,

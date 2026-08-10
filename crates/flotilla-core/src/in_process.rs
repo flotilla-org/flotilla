@@ -8428,6 +8428,7 @@ impl InProcessDaemon {
                     plural: applied.plural,
                     namespace: applied.namespace,
                     value: applied.value,
+                    replica_origin: None,
                 })),
                 Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
             };
@@ -8454,6 +8455,7 @@ impl InProcessDaemon {
                     plural: deleted.plural,
                     namespace: deleted.namespace,
                     value: deleted.value,
+                    replica_origin: replica_origin.clone(),
                 })),
                 Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
             };

@@ -53,6 +53,8 @@ pub struct ResourceJsonResponse {
     pub plural: String,
     pub namespace: String,
     pub value: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "replicaOrigin")]
+    pub replica_origin: Option<crate::NodeId>,
 }
 
 /// Opaque position in one resource kind's ordered mutation stream.
@@ -1617,6 +1619,7 @@ mod tests {
                     "metadata": { "name": "demo" },
                     "spec": {}
                 }),
+                replica_origin: None,
             })),
             CommandValue::ResourceWatchEvent(Box::new(ResourceReadEnvelope {
                 api_version: "flotilla.work/v1".into(),

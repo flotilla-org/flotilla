@@ -686,9 +686,10 @@ mod command_result_human {
                 "apiVersion": "flotilla.work/v1",
                 "metadata": {
                     "name": "orphaned-convoy",
-                    "annotations": {"flotilla.work/origin-root": "retired-root"}
+                    "annotations": {}
                 }
             }),
+            replica_origin: Some(NodeId::new("retired-root")),
         };
 
         assert_eq!(
@@ -705,8 +706,12 @@ mod command_result_human {
             namespace: "flotilla".to_string(),
             value: serde_json::json!({
                 "apiVersion": "flotilla.work/v1",
-                "metadata": {"name": "local-convoy", "annotations": {}}
+                "metadata": {
+                    "name": "local-convoy",
+                    "annotations": {"flotilla.work/origin-root": "spoofed-root"}
+                }
             }),
+            replica_origin: None,
         };
 
         assert_eq!(
