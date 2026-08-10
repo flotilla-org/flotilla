@@ -1,4 +1,235 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env python3
+"""Poll CodexBar and publish coalesced Usage status through flotilla."""
 
-exec flotilla usage-observer
+import datetime as dt
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+
+CODEXBAR_CLI = "/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI"
+FLOTILLA = os.environ.get("FLOTILLA_BIN", "flotilla")
+NAMESPACE = "flotilla"
+POLL_SECONDS = 300
+PROVIDERS = ("codex", "claude")
+
+
+def record_name(account):
+    """Keep this byte-for-byte aligned with usage_record_name in usage.rs."""
+    normalized = account.strip().lower()
+    digest = hashlib.sha256(b"usage-account-v1\0" + normalized.encode()).hexdigest()
+    return "usage-" + digest[:54]
+
+
+def first_nonempty(*values):
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def translate_window(name, raw, label=None):
+    if not raw or raw.get("isSyntheticPlaceholder"):
+        return None
+    window = {"name": name, "used_percent": raw["usedPercent"]}
+    if label is not None:
+        window["label"] = label
+    if raw.get("resetsAt") is not None:
+        window["resets_at"] = raw["resetsAt"]
+    if raw.get("windowMinutes") is not None:
+        window["window_minutes"] = raw["windowMinutes"]
+    return window
+
+
+def translate_pace(window, raw):
+    if not raw:
+        return None
+    pace = {
+        "window": window,
+        "stage": raw["stage"],
+        "delta_percent": raw["deltaPercent"],
+        "expected_used_percent": raw["expectedUsedPercent"],
+        "will_last_to_reset": raw["willLastToReset"],
+    }
+    if raw.get("etaSeconds") is not None:
+        pace["eta_seconds"] = round(raw["etaSeconds"])
+    if raw.get("runOutProbability") is not None:
+        pace["run_out_probability"] = raw["runOutProbability"]
+    return pace
+
+
+def translate_payload(expected_provider, payload):
+    if payload.get("provider") != expected_provider:
+        raise ValueError(f"returned provider {payload.get('provider')!r} while polling {expected_provider!r}")
+    usage = payload.get("usage")
+    if usage is None:
+        detail = (payload.get("error") or {}).get("message") or "usage payload is absent"
+        raise ValueError(f"{expected_provider} observation unavailable: {detail}")
+
+    identity = usage.get("identity") or {}
+    account = first_nonempty(identity.get("accountEmail"), usage.get("accountEmail"), payload.get("account"))
+    if account is None:
+        raise ValueError(f"{expected_provider} payload has no account identity")
+
+    windows = []
+    for name, raw in (
+        ("session", usage.get("primary")),
+        ("weekly", usage.get("secondary")),
+        ("tertiary", usage.get("tertiary")),
+    ):
+        window = translate_window(name, raw)
+        if window is not None:
+            windows.append(window)
+    for extra in usage.get("extraRateWindows") or []:
+        if extra.get("usageKnown", True):
+            window = translate_window(extra["id"], extra.get("window"), extra.get("title"))
+            if window is not None:
+                windows.append(window)
+
+    pace = []
+    raw_pace = payload.get("pace") or {}
+    for name, raw in (
+        ("session", raw_pace.get("primary")),
+        ("weekly", raw_pace.get("secondary")),
+        ("tertiary", raw_pace.get("tertiary")),
+    ):
+        projection = translate_pace(name, raw)
+        if projection is not None:
+            pace.append(projection)
+
+    raw_cost = usage.get("providerCost")
+    provider_cost = None
+    if raw_cost is not None:
+        provider_cost = {
+            "used": raw_cost["used"],
+            "limit": raw_cost["limit"],
+            "currency_code": raw_cost["currencyCode"],
+        }
+        for source, target in (("period", "period"), ("resetsAt", "resets_at"), ("balance", "balance")):
+            if raw_cost.get(source) is not None:
+                provider_cost[target] = raw_cost[source]
+
+    reset_credits = usage.get("codexResetCredits")
+    status = {
+        "provider": expected_provider,
+        "plan": first_nonempty(identity.get("loginMethod"), usage.get("loginMethod")),
+        "organization": first_nonempty(identity.get("accountOrganization"), usage.get("accountOrganization")),
+        "windows": windows,
+        "pace": pace,
+        "provider_cost": provider_cost,
+        "reset_credits_available": reset_credits.get("availableCount") if reset_credits else None,
+        "observed_at": usage["updatedAt"],
+    }
+    return account, status
+
+
+def parse_timestamp(value):
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def material_change(current, next_status):
+    if current is None:
+        return True
+    for field in ("plan", "provider_cost", "reset_credits_available"):
+        if current.get(field) != next_status.get(field):
+            return True
+
+    current_windows = {window["name"]: window for window in current.get("windows", [])}
+    next_windows = {window["name"]: window for window in next_status.get("windows", [])}
+    if current_windows.keys() != next_windows.keys():
+        return True
+    for name, current_window in current_windows.items():
+        next_window = next_windows[name]
+        if current_window.get("resets_at") != next_window.get("resets_at"):
+            return True
+        if abs(float(current_window["used_percent"]) - float(next_window["used_percent"])) >= 1.0:
+            return True
+
+    return parse_timestamp(next_status["observed_at"]) - parse_timestamp(current["observed_at"]) >= dt.timedelta(hours=1)
+
+
+def flotilla_command(arguments):
+    return subprocess.run([FLOTILLA, "--json", *arguments], text=True, capture_output=True, check=False)
+
+
+def command_with_document(arguments, document):
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(document, handle, separators=(",", ":"))
+            path = handle.name
+        return flotilla_command([*arguments, "-f", path])
+    finally:
+        if path is not None:
+            os.unlink(path)
+
+
+def ensure_usage(name, account):
+    result = flotilla_command(["resource", "get", "usages", name, "--namespace", NAMESPACE])
+    if result.returncode == 0:
+        envelope = json.loads(result.stdout)
+        records = envelope.get("records") or []
+        return (records[0].get("object") or {}).get("status") if records else None
+
+    document = {"kind": "Usage", "metadata": {"name": name}, "spec": {"account": account}}
+    result = command_with_document(["resource", "apply", "--namespace", NAMESPACE], document)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "resource apply failed")
+    return None
+
+
+def patch_status(name, status):
+    result = command_with_document(["resource", "patch-status", "usages", name, "--namespace", NAMESPACE], status)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "resource patch-status failed")
+
+
+def poll(provider):
+    result = subprocess.run(
+        [CODEXBAR_CLI, "usage", "--format", "json", "--provider", provider],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"CodexBar {provider} usage failed")
+    payloads = json.loads(result.stdout)
+    if isinstance(payloads, dict):
+        payloads = [payloads]
+    if not payloads:
+        raise ValueError(f"CodexBar returned no {provider} usage payloads")
+    return [translate_payload(provider, payload) for payload in payloads]
+
+
+def run_cycle(last_written):
+    for provider in PROVIDERS:
+        try:
+            observations = poll(provider)
+        except Exception as error:  # keep the standing observer alive per provider
+            print(f"usage observer: {error}", file=sys.stderr)
+            continue
+        for account, status in observations:
+            name = record_name(account)
+            try:
+                if name not in last_written:
+                    last_written[name] = ensure_usage(name, account)
+                if material_change(last_written[name], status):
+                    patch_status(name, status)
+                    last_written[name] = status
+            except Exception as error:  # one account must not suppress the other provider
+                print(f"usage observer: could not publish {provider} account {account}: {error}", file=sys.stderr)
+
+
+def main():
+    last_written = {}
+    while True:
+        run_cycle(last_written)
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()

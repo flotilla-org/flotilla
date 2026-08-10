@@ -41,7 +41,6 @@ mod scoped_store;
 pub mod step;
 pub mod template;
 pub mod terminal_manager;
-pub mod usage_observer;
 
 pub const DAEMON_LIFECYCLE_LOCK_FILE: &str = "flotillad-lifecycle.lock";
 

@@ -118,6 +118,8 @@ fn required(value: String, field: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::{parse_operational_entry, OperationalEntryDefinition};
 
     #[test]
@@ -186,5 +188,76 @@ mod tests {
                 && placement == "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
                 && presents_as == "fleet"
         ));
+    }
+
+    #[test]
+    fn checked_in_usage_observer_script_preserves_translation_and_coalescing_rules() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/usage-observer");
+        let expected_name = flotilla_resources::usage_record_name("Ada@Example.com");
+        let program = r#"
+import copy
+import runpy
+import sys
+
+observer = runpy.run_path(sys.argv[1], run_name="usage_observer_test")
+assert observer["record_name"](" Ada@Example.com ") == sys.argv[2]
+
+payload = {
+    "provider": "codex",
+    "usage": {
+        "primary": {"usedPercent": 8.0, "resetsAt": "2026-08-10T12:00:00Z"},
+        "secondary": {"usedPercent": 35.0},
+        "extraRateWindows": [{
+            "id": "codex-spark",
+            "title": "Codex Spark",
+            "window": {"usedPercent": 73.0},
+        }],
+        "providerCost": {"used": 12.5, "limit": 50.0, "currencyCode": "USD", "balance": 37.5},
+        "codexResetCredits": {"availableCount": 2},
+        "updatedAt": "2026-08-10T10:00:00Z",
+        "identity": {"accountEmail": "Ada@Example.com", "loginMethod": "plus"},
+    },
+    "pace": None,
+}
+account, current = observer["translate_payload"]("codex", payload)
+assert account == "Ada@Example.com"
+assert [(window["name"], window["used_percent"]) for window in current["windows"]] == [
+    ("session", 8.0), ("weekly", 35.0), ("codex-spark", 73.0)
+]
+assert current["provider_cost"]["balance"] == 37.5
+assert current["reset_credits_available"] == 2
+
+sub_threshold = copy.deepcopy(current)
+sub_threshold["windows"][0]["used_percent"] = 8.999
+sub_threshold["observed_at"] = "2026-08-10T10:59:00Z"
+assert not observer["material_change"](current, sub_threshold)
+
+threshold = copy.deepcopy(current)
+threshold["windows"][0]["used_percent"] = 9.0
+assert observer["material_change"](current, threshold)
+
+structural = copy.deepcopy(current)
+structural["windows"][0]["resets_at"] = "2026-08-10T13:00:00Z"
+assert observer["material_change"](current, structural)
+
+heartbeat = copy.deepcopy(current)
+heartbeat["observed_at"] = "2026-08-10T11:00:00Z"
+assert observer["material_change"](current, heartbeat)
+
+patches = []
+runtime = observer["run_cycle"].__globals__
+runtime["poll"] = lambda provider: [(account, current)] if provider == "codex" else []
+runtime["ensure_usage"] = lambda name, account: None
+runtime["patch_status"] = lambda name, status: patches.append((name, status))
+last_written = {}
+observer["run_cycle"](last_written)
+observer["run_cycle"](last_written)
+assert len(patches) == 1
+"#;
+        let output = Command::new("python3")
+            .args(["-c", program, script, &expected_name])
+            .output()
+            .expect("run usage observer Python contract test");
+        assert!(output.status.success(), "usage observer Python contract failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 }
