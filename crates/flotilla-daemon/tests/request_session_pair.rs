@@ -171,6 +171,8 @@ async fn convoy_creation_attributes_provenance_and_regard_to_the_surface_princip
         .await
         .expect("create workflow");
     let follower = empty_daemon_named("follower").await;
+    seed_host_capacity(&follower, 2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024).await;
+    let follower_host_id = follower.local_host_id().expect("follower host identity").to_string();
     let principal_ref = PrincipalRef { namespace: "flotilla".to_string(), name: "alice".to_string() };
     let topology = spawn_in_memory_request_topology_stateful_with_surface(Arc::clone(&leader), follower, SurfaceDeclaration {
         principal_ref: principal_ref.clone(),
@@ -178,6 +180,7 @@ async fn convoy_creation_attributes_provenance_and_regard_to_the_surface_princip
     })
     .await
     .expect("spawn named focal client topology");
+    await_host_capacity(&leader, &follower_host_id).await;
     let mut events = leader.subscribe();
 
     let command_id = topology
@@ -736,6 +739,37 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
     assert!(
         matches!(daemon.resource_backend().using::<Convoy>(namespace).get("remote-docker-work").await, Err(ResourceError::NotFound { .. })),
         "missing remote Docker capacity must fail before convoy persistence"
+    );
+
+    let legacy_command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "legacy-remote-docker-work".to_string(),
+                workflow_ref: "remote-workflow".to_string(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: Some("remote-docker".to_string()),
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("dispatch legacy remote Docker admission");
+    let legacy_result = await_command_result(&mut events, legacy_command_id).await;
+    let CommandValue::Error { message } = legacy_result else {
+        panic!("expected legacy missing-capacity refusal, got {legacy_result:?}");
+    };
+    assert_eq!(message, "placement refused on host `remote-docker`: admission free-space floor is unavailable");
+    assert!(
+        matches!(
+            daemon.resource_backend().using::<Convoy>(namespace).get("legacy-remote-docker-work").await,
+            Err(ResourceError::NotFound { .. })
+        ),
+        "legacy missing remote Docker capacity must fail before convoy persistence"
     );
 }
 

@@ -2800,16 +2800,16 @@ impl InProcessDaemon {
 
     pub async fn remote_host_direct_placement_host(
         &self,
-        intent: &flotilla_protocol::ConvoyStartIntent,
+        namespace: &str,
+        policy_name: Option<&str>,
     ) -> Result<Option<flotilla_protocol::qualified_path::HostId>, String> {
-        let Some(policy_name) = intent.placement_policy.as_deref() else {
+        let Some(policy_name) = policy_name else {
             return Ok(None);
         };
-        let namespace = intent.namespace.clone().unwrap_or(self.provisioning_namespace().await);
         let policy = self
             .resource_backend
             .clone()
-            .using::<PlacementPolicy>(&namespace)
+            .using::<PlacementPolicy>(namespace)
             .get(policy_name)
             .await
             .map_err(|error| format!("placement policy {policy_name}: {error}"))?;
@@ -8856,6 +8856,16 @@ impl InProcessDaemon {
                 },
                 None => None,
             };
+            if let Err(message) = self.check_remote_placement_free_space_floor(&namespace, placement_decision.as_ref()).await {
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    node_id: self.node_id.clone(),
+                    repo_identity: empty_identity,
+                    repo: None,
+                    result: flotilla_protocol::CommandValue::Error { message },
+                });
+                return Ok(id);
+            }
             let placement_policy = placement.selected.as_ref().map(|placement| placement.metadata.name.clone());
             let spec = ConvoySpec {
                 workflow_ref: workflow_ref.clone(),
