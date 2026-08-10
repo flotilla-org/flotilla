@@ -4925,14 +4925,14 @@ impl InProcessDaemon {
         let matching_sources =
             sources.items.into_iter().filter(|source| source.object.metadata.name == target_host.reference).collect::<Vec<_>>();
         let has_replica = matching_sources.iter().any(|source| matches!(source.provenance, ResourceProvenance::Replica { .. }));
-        let is_remote_host_direct = self
+        let is_host_targeted_placement = self
             .resource_backend
             .clone()
             .using::<PlacementPolicy>(namespace)
             .get(&placement.policy_name)
             .await
-            .is_ok_and(|policy| policy.spec.host_direct.is_some());
-        if !has_replica && !is_remote_host_direct {
+            .is_ok_and(|policy| placement_host_ref(&policy).is_some());
+        if !has_replica && !is_host_targeted_placement {
             return Ok(());
         }
 

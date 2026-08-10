@@ -7172,6 +7172,8 @@ async fn local_convoy_admission_pins_the_grant_resolved_workflow() {
             ready: true,
             heartbeat_at: Some(Utc::now()),
             capabilities: BTreeMap::from([(flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["model-api"]))]),
+            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
             resource_store: None,
             ..HostStatus::default()
         })

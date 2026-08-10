@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::Utc;
 use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
@@ -25,8 +26,9 @@ use flotilla_protocol::{
     PeerConnectionState, PrincipalRef, RepoSelector, ResourceRef, SurfaceCharacter, SurfaceDeclaration,
 };
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Host, HostSpec, HostStatus, InputMeta,
-    PlacementPolicy, Regard, Resource, ResourceError, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
+    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, DockerCheckoutStrategy,
+    DockerPerVesselPlacementPolicySpec, Host, HostSpec, HostStatus, InputMeta, PlacementPolicy, PlacementPolicySpec, Regard, Resource,
+    ResourceError, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
 };
 
 fn test_config_store(config_dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -659,6 +661,81 @@ async fn remote_convoy_start_enforces_target_capacity_without_moving_authority()
             Err(ResourceError::NotFound { .. })
         ),
         "refused admission must not create a convoy on the placement host"
+    );
+}
+
+#[tokio::test]
+async fn remote_docker_admission_fails_closed_without_target_capacity() {
+    let daemon = empty_daemon_named_with_floor("leader", Some(0)).await;
+    let namespace = "flotilla";
+    seed_trusted_remote_convoy_project(&daemon, namespace).await;
+
+    let hosts = daemon.resource_backend().using::<Host>(namespace);
+    let host = hosts
+        .create(&InputMeta::builder().name("remote-docker-host".to_string()).build(), &HostSpec {
+            display_name: "remote-docker".to_string(),
+        })
+        .await
+        .expect("create remote Docker host");
+    hosts
+        .update_status("remote-docker-host", &host.metadata.resource_version, &HostStatus {
+            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            ..HostStatus::default()
+        })
+        .await
+        .expect("mark remote Docker host ready without capacity");
+    daemon
+        .resource_backend()
+        .using::<PlacementPolicy>(namespace)
+        .create(
+            &InputMeta::builder().name("remote-docker".to_string()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("cleat".to_string())
+                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    host_ref: "remote-docker-host".to_string(),
+                    image: "crew:latest".to_string(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::from(["codex".to_string()]),
+                    default_cwd: None,
+                    env: BTreeMap::new(),
+                    checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                })
+                .build(),
+        )
+        .await
+        .expect("create remote Docker placement");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(
+                    ConvoyStartIntent::builder()
+                        .project_ref("flotilla".to_string())
+                        .name("remote-docker-work".to_string())
+                        .branch("fix/remote-docker-work".to_string())
+                        .placement_policy("remote-docker".to_string())
+                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                        .build(),
+                ),
+            },
+        })
+        .await
+        .expect("dispatch remote Docker admission");
+
+    let result = await_command_result(&mut events, command_id).await;
+    let CommandValue::Error { message } = result else {
+        panic!("expected missing-capacity refusal, got {result:?}");
+    };
+    assert_eq!(message, "placement refused on host `remote-docker`: admission free-space floor is unavailable");
+    assert!(
+        matches!(daemon.resource_backend().using::<Convoy>(namespace).get("remote-docker-work").await, Err(ResourceError::NotFound { .. })),
+        "missing remote Docker capacity must fail before convoy persistence"
     );
 }
 
