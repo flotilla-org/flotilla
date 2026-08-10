@@ -530,7 +530,7 @@ mod command_result_human {
 
     use chrono::{Duration, Utc};
     use flotilla_protocol::{
-        commands::{CheckoutStatus, CommandValue, RepositoryIdentityChange},
+        commands::{CheckoutStatus, CommandValue, RepositoryIdentityChange, ResourceJsonResponse},
         qualified_path::{HostId, QualifiedPath},
         CrewListMember, CrewListResponse, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow,
         FleetObservationAgreement, FleetReplicaStatus, FleetStaleness, HostName, NodeId, PeerConnectionState, PreparedWorkspace,
@@ -674,6 +674,45 @@ mod command_result_human {
     #[test]
     fn cancelled() {
         assert_eq!(format_command_result(&CommandValue::Cancelled), "cancelled");
+    }
+
+    #[test]
+    fn resource_deleted_distinguishes_replica_collection() {
+        let response = ResourceJsonResponse {
+            kind: "Convoy".to_string(),
+            plural: "convoys".to_string(),
+            namespace: "flotilla".to_string(),
+            value: serde_json::json!({
+                "apiVersion": "flotilla.work/v1",
+                "metadata": {
+                    "name": "orphaned-convoy",
+                    "annotations": {"flotilla.work/origin-root": "retired-root"}
+                }
+            }),
+        };
+
+        assert_eq!(
+            format_command_result(&CommandValue::ResourceDeleted(Box::new(response))),
+            "collected replica flotilla.work/v1/Convoy/flotilla/orphaned-convoy from retired-root\nA newer update from the authority may recreate it."
+        );
+    }
+
+    #[test]
+    fn resource_deleted_preserves_authoritative_deletion_wording() {
+        let response = ResourceJsonResponse {
+            kind: "Convoy".to_string(),
+            plural: "convoys".to_string(),
+            namespace: "flotilla".to_string(),
+            value: serde_json::json!({
+                "apiVersion": "flotilla.work/v1",
+                "metadata": {"name": "local-convoy", "annotations": {}}
+            }),
+        };
+
+        assert_eq!(
+            format_command_result(&CommandValue::ResourceDeleted(Box::new(response))),
+            "deleted flotilla.work/v1/Convoy/flotilla/local-convoy\nControllers may recreate code-owned objects."
+        );
     }
 
     #[test]
