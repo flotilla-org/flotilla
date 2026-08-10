@@ -1060,13 +1060,6 @@ async fn peer_summary_registration_preserves_operator_fields_and_corrects_owned_
         .await
         .expect("peer host capabilities should admit the workflow");
 
-    let intent =
-        ConvoyStartIntent::builder().project_ref("flotilla".to_string()).placement_policy("host-direct-feta-host".to_string()).build();
-    assert_eq!(
-        daemon.resolve_convoy_start_target(&intent).await.expect("placement should resolve"),
-        Some(ConvoyStartTarget { policy_name: "host-direct-feta-host".to_string(), host_id: HostId::new("feta-host") })
-    );
-
     let policies = daemon.resource_backend().using::<PlacementPolicy>("flotilla");
     let registered = policies.get("host-direct-feta-host").await.expect("peer placement policy");
     policies
@@ -1122,8 +1115,6 @@ async fn peer_summary_registration_preserves_operator_fields_and_corrects_owned_
         )
         .await
         .expect("local placement policy create");
-    let local_intent = ConvoyStartIntent::builder().project_ref("flotilla".to_string()).placement_policy("local-pool".to_string()).build();
-    assert_eq!(daemon.resolve_convoy_start_target(&local_intent).await.expect("non-host-direct placement should remain local"), None);
 }
 
 #[tokio::test]

@@ -459,7 +459,7 @@ async fn hostless_convoy_delete_uses_live_peer_route_when_connection_status_is_s
 }
 
 #[tokio::test]
-async fn convoy_start_uses_live_peer_route_when_presentation_membership_is_stale() {
+async fn convoy_start_stays_on_admitting_store_when_placement_membership_is_stale() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named("follower").await;
     follower.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
@@ -523,7 +523,7 @@ async fn convoy_start_uses_live_peer_route_when_presentation_membership_is_stale
             },
         })
         .await
-        .expect("live peer route should admit remote placement despite stale presentation membership");
+        .expect("admitting store should accept remote placement despite stale presentation membership");
 
     assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted {
         name: "remote-work".to_string(),
@@ -531,16 +531,23 @@ async fn convoy_start_uses_live_peer_route_when_presentation_membership_is_stale
         binding: None
     });
     topology
-        .follower
+        .leader
         .resource_backend()
         .using::<Convoy>(namespace)
         .get("remote-work")
         .await
-        .expect("convoy should be created on live placement host");
+        .expect("convoy should remain on the admitting store");
+    assert!(
+        matches!(
+            topology.follower.resource_backend().using::<Convoy>(namespace).get("remote-work").await,
+            Err(ResourceError::NotFound { .. })
+        ),
+        "placement host must not become the convoy authority"
+    );
 }
 
 #[tokio::test]
-async fn remote_convoy_start_enforces_target_free_space_floor_without_leaving_prepared_state() {
+async fn remote_convoy_start_does_not_move_admission_to_target_capacity_authority() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named_with_floor("follower", Some(1_000_000)).await;
     follower.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
@@ -560,28 +567,6 @@ async fn remote_convoy_start_enforces_target_free_space_floor_without_leaving_pr
     .await
     .expect("peer host summary should materialize placement policy");
     seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
-
-    let follower_backend = topology.follower.resource_backend();
-    let workflows_before = follower_backend
-        .clone()
-        .using::<WorkflowTemplate>(namespace)
-        .list()
-        .await
-        .expect("list target workflows before dispatch")
-        .items
-        .into_iter()
-        .map(|resource| resource.metadata.name)
-        .collect::<BTreeSet<_>>();
-    let policies_before = follower_backend
-        .clone()
-        .using::<PlacementPolicy>(namespace)
-        .list()
-        .await
-        .expect("list target policies before dispatch")
-        .items
-        .into_iter()
-        .map(|resource| resource.metadata.name)
-        .collect::<BTreeSet<_>>();
 
     let mut events = topology.leader.subscribe();
     let command_id = topology
@@ -603,48 +588,26 @@ async fn remote_convoy_start_enforces_target_free_space_floor_without_leaving_pr
             },
         })
         .await
-        .expect("remote convoy dispatch should be routed");
+        .expect("admitting store should accept the convoy");
 
-    let result = await_command_result(&mut events, command_id).await;
-    let CommandValue::Error { message } = result else {
-        panic!("expected target free-space refusal, got {result:?}");
-    };
-    assert!(message.contains("host `follower`"), "{message}");
-    assert!(message.contains("free is below the 1000000.0 GiB floor"), "{message}");
-    assert!(message.contains("reap settled convoys"), "{message}");
-    assert!(message.contains("scripts/prune-target.sh"), "{message}");
-    assert!(message.contains("pick another host"), "{message}");
-
+    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted {
+        name: "remote-disk-hungry".to_string(),
+        attach_plan: None,
+        binding: None
+    });
+    topology
+        .leader
+        .resource_backend()
+        .using::<Convoy>(namespace)
+        .get("remote-disk-hungry")
+        .await
+        .expect("admitting store should own the convoy");
     assert!(
-        matches!(follower_backend.using::<Convoy>(namespace).get("remote-disk-hungry").await, Err(ResourceError::NotFound { .. })),
-        "refused remote dispatch must not create a Convoy"
-    );
-    assert_eq!(
-        follower_backend
-            .clone()
-            .using::<WorkflowTemplate>(namespace)
-            .list()
-            .await
-            .expect("list target workflows after dispatch")
-            .items
-            .into_iter()
-            .map(|resource| resource.metadata.name)
-            .collect::<BTreeSet<_>>(),
-        workflows_before,
-        "refused remote dispatch must not persist a prepared workflow snapshot"
-    );
-    assert_eq!(
-        follower_backend
-            .using::<PlacementPolicy>(namespace)
-            .list()
-            .await
-            .expect("list target policies after dispatch")
-            .items
-            .into_iter()
-            .map(|resource| resource.metadata.name)
-            .collect::<BTreeSet<_>>(),
-        policies_before,
-        "refused remote dispatch must not persist a prepared placement snapshot"
+        matches!(
+            topology.follower.resource_backend().using::<Convoy>(namespace).get("remote-disk-hungry").await,
+            Err(ResourceError::NotFound { .. })
+        ),
+        "target capacity policy must not transfer convoy ownership"
     );
 }
 

@@ -4,8 +4,8 @@ use chrono::Utc;
 use flotilla_controllers::reconcilers::VesselPlacementProjector;
 use flotilla_protocol::{NodeId, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
-    Convoy, ConvoySpec, ConvoyStatus, InMemoryBackend, InputMeta, ResourceBackend, Vessel, VesselSpec, ACTUATOR_HOST_REF_ANNOTATION,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    Convoy, ConvoySpec, ConvoyStatus, InMemoryBackend, InputMeta, ResourceBackend, ResourceError, Vessel, VesselSpec,
+    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
 
 const NAMESPACE: &str = "flotilla";
@@ -57,7 +57,7 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
         .replace(&convoys.list().await.expect("list Convoys"), Utc::now())
         .await
         .expect("replicate Convoy");
-    feta.replica_writer::<Vessel>(kiwi_root, NAMESPACE)
+    feta.replica_writer::<Vessel>(kiwi_root.clone(), NAMESPACE)
         .replace(&kiwi.using::<Vessel>(NAMESPACE).list().await.expect("list Vessels"), Utc::now())
         .await
         .expect("replicate Vessel");
@@ -81,5 +81,26 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
             .annotations
             .contains_key(ACTUATOR_SOURCE_ROOT_ANNOTATION),
         "projection must not transfer ownership of the admitting object"
+    );
+
+    kiwi.using::<Vessel>(NAMESPACE).delete("remote-placement-work").await.expect("owner requests Vessel deletion");
+    assert_eq!(
+        projector.sync_once().await.expect("reconcile from last-known replica"),
+        Default::default(),
+        "unreplicated owner deletion must freeze destructive actuation"
+    );
+    feta.using::<Vessel>(NAMESPACE)
+        .get("remote-placement-work")
+        .await
+        .expect("actuator Vessel must survive while its owner is unreachable");
+
+    feta.replica_writer::<Vessel>(kiwi_root, NAMESPACE)
+        .replace(&kiwi.using::<Vessel>(NAMESPACE).list().await.expect("list deleted owner Vessels"), Utc::now())
+        .await
+        .expect("replicate owner deletion");
+    assert_eq!(projector.sync_once().await.expect("apply observed deletion").deleted, 1);
+    assert!(
+        matches!(feta.using::<Vessel>(NAMESPACE).get("remote-placement-work").await, Err(ResourceError::NotFound { .. })),
+        "actuator teardown may proceed after owner deletion intent is observed"
     );
 }

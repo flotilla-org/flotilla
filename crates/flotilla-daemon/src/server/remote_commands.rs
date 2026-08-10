@@ -11,12 +11,12 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::{
     daemon::DaemonHandle,
-    in_process::{ConvoyStartTarget, InProcessDaemon},
+    in_process::InProcessDaemon,
     step::{RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, RemoteStepProgressUpdate, StepOutcome},
 };
 use flotilla_protocol::{
-    Command, CommandAction, CommandPeerEvent, CommandValue, CrewCommandContext, DaemonEvent, EnvironmentId, HostName, NodeId,
-    PeerWireMessage, RepoIdentity, RepoSelector, RoutedPeerMessage, Step, StepStatus,
+    Command, CommandAction, CommandPeerEvent, CommandValue, CrewCommandContext, DaemonEvent, HostName, NodeId, PeerWireMessage,
+    RepoIdentity, RepoSelector, RoutedPeerMessage, Step, StepStatus,
 };
 use flotilla_resources::CrewCompletionPending;
 use tokio::sync::{oneshot, Mutex, Notify};
@@ -124,13 +124,6 @@ pub(super) struct RemoteCommandRouter {
     retrying_crew_completions: Arc<StdMutex<HashMap<String, CrewCompletionRetryState>>>,
 }
 
-#[derive(bon::Builder)]
-struct PlacementRoute {
-    host_name: HostName,
-    node_id: NodeId,
-    sender: Arc<dyn PeerSender>,
-}
-
 impl RemoteCommandRouter {
     pub(super) fn new(
         daemon: Arc<InProcessDaemon>,
@@ -165,9 +158,6 @@ impl RemoteCommandRouter {
         mut command: Command,
         dispatching_principal_ref: Option<flotilla_protocol::PrincipalRef>,
     ) -> Result<u64, String> {
-        if matches!(command.action, CommandAction::ConvoyStartPrepared { .. }) {
-            return Err("prepared convoy starts are reserved for authenticated peer forwarding".to_string());
-        }
         let mut crew_completion = self.resolve_crew_command_routing(&mut command.action).await?;
         let existing_convoy_target = self.daemon.resolve_existing_convoy_target(&command.action).await?;
         if let (Some(completion), Some(target)) = (&mut crew_completion, &existing_convoy_target) {
@@ -185,25 +175,6 @@ impl RemoteCommandRouter {
         if let Some(target) = existing_convoy_target.as_ref() {
             command.node_id = Some(target.node_id.clone());
         }
-        let placement_route = if let CommandAction::ConvoyStart { intent } = &command.action {
-            let placement_target = self.daemon.resolve_convoy_start_target(intent).await?;
-            let placement_route = match placement_target {
-                Some(target) => Some(self.resolve_placement_route(target).await?),
-                None => None,
-            };
-            let intended_target = placement_route.as_ref().map(|route| &route.node_id).unwrap_or_else(|| self.daemon.node_id());
-            if command.node_id.as_ref().is_some_and(|target| target != intended_target) {
-                return Err("convoy command target does not match its host-direct placement policy".to_string());
-            }
-            if intended_target != self.daemon.node_id() {
-                command.node_id = Some(intended_target.clone());
-                let prepared = self.daemon.prepare_remote_convoy_start(intent, dispatching_principal_ref.as_ref()).await?;
-                command.action = CommandAction::ConvoyStartPrepared { start: Box::new(prepared) };
-            }
-            placement_route
-        } else {
-            None
-        };
         let target_node_id = command.node_id.clone().unwrap_or_else(|| self.daemon.node_id().clone());
         let local = self.daemon.node_id();
         let desc = command.description();
@@ -212,8 +183,7 @@ impl RemoteCommandRouter {
             if command.action.is_query()
                 || matches!(
                     command.action,
-                    CommandAction::ConvoyStartPrepared { .. }
-                        | CommandAction::ConvoyDelete { .. }
+                    CommandAction::ConvoyDelete { .. }
                         | CommandAction::ConvoyAbandon { .. }
                         | CommandAction::ConvoyResume { .. }
                         | CommandAction::ConvoyWorkForceComplete { .. }
@@ -257,14 +227,7 @@ impl RemoteCommandRouter {
                 };
                 let send_result = match &existing_convoy_target {
                     Some(target) => self.send_routed_to_convoy_home(&target.home, &target.node_id, routed).await,
-                    None => match &placement_route {
-                        Some(route) => route
-                            .sender
-                            .send(PeerWireMessage::Routed(routed))
-                            .await
-                            .map_err(|cause| format!("peer host {} is not connected: {cause}", route.host_name)),
-                        None => self.send_routed_to(&target_node_id, routed).await,
-                    },
+                    None => self.send_routed_to(&target_node_id, routed).await,
                 };
 
                 match send_result {
@@ -1081,18 +1044,6 @@ impl RemoteCommandRouter {
                 authority: Some(HostName::new(pending.authority)),
             });
         }
-    }
-
-    async fn resolve_placement_route(&self, target: ConvoyStartTarget) -> Result<PlacementRoute, String> {
-        let environment_id = EnvironmentId::host(target.host_id.clone());
-        let (host_name, node_id, sender) = {
-            let pm = self.peer_manager.lock().await;
-            let (node_id, host_name) =
-                pm.node_for_host_environment(&environment_id).map_err(|_| format!("peer host {} is not connected", target.host_id))?;
-            let sender = pm.resolve_sender(&node_id).map_err(|_| format!("peer host {host_name} is not connected"))?;
-            (host_name, node_id, sender)
-        };
-        Ok(PlacementRoute::builder().host_name(host_name).node_id(node_id).sender(sender).build())
     }
 
     async fn send_routed_to_convoy_home(
