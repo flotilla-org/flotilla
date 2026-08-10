@@ -31,11 +31,11 @@ use flotilla_protocol::{
     AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus,
-    HttpBackend, InMemoryBackend, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, ResourceBackend,
-    ResourceError, ResourceList, ResourceProvenance, Selector, SqliteBackend, Stance, StatusPatch, TerminalAttentionState, TerminalBrief,
-    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
-    WatchEvent, WatchStart, WorkflowTemplate,
+    list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus, Host,
+    HostSpec, HostStatus, HttpBackend, InMemoryBackend, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
+    ResourceBackend, ResourceError, ResourceList, ResourceProvenance, Selector, SqliteBackend, Stance, StatusPatch, TerminalAttentionState,
+    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+    TerminalSessionStatusPatch, WatchEvent, WatchStart, WorkflowTemplate,
 };
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
@@ -1687,6 +1687,26 @@ async fn dispatch_execute_keeps_remote_placement_convoy_on_the_admitting_store()
     let (_tmp, daemon) = empty_daemon().await;
     let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
     let remote_host_id = remote_daemon.local_host_id().expect("remote host identity").to_string();
+    let remote_hosts = remote_daemon.resource_backend().using::<Host>("flotilla");
+    let remote_host = remote_hosts
+        .create(&InputMeta::builder().name(remote_host_id.clone()).build(), &HostSpec::default())
+        .await
+        .expect("create remote host resource");
+    remote_hosts
+        .update_status(&remote_host_id, &remote_host.metadata.resource_version, &HostStatus {
+            ready: true,
+            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
+            ..HostStatus::default()
+        })
+        .await
+        .expect("publish remote host capacity");
+    daemon
+        .resource_backend()
+        .replica_writer::<Host>(remote_daemon.node_id().clone(), "flotilla")
+        .replace(&remote_hosts.list().await.expect("list remote host resources"), chrono::Utc::now())
+        .await
+        .expect("replicate remote host capacity");
     let remote_policy_name = format!("host-direct-{remote_host_id}");
     let remote_summary = HostSummary::builder()
         .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(&remote_host_id)))

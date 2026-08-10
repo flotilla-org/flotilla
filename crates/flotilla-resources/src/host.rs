@@ -45,6 +45,8 @@ pub struct HostStatus {
     pub daemon_started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_free_space_floor_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub conditions: Vec<HostCondition>,
@@ -100,6 +102,7 @@ pub enum HostStatusPatch {
         daemon_version: Option<String>,
         daemon_started_at: Option<DateTime<Utc>>,
         disk_free_bytes: Option<u64>,
+        admission_free_space_floor_bytes: Option<u64>,
     },
     SleepInhibition {
         health: SleepInhibitionHealth,
@@ -118,6 +121,7 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 daemon_version,
                 daemon_started_at,
                 disk_free_bytes,
+                admission_free_space_floor_bytes,
             } => {
                 status.capabilities = capabilities.clone();
                 status.heartbeat_at = Some(*heartbeat_at);
@@ -126,6 +130,7 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 status.daemon_version.clone_from(daemon_version);
                 status.daemon_started_at = *daemon_started_at;
                 status.disk_free_bytes = *disk_free_bytes;
+                status.admission_free_space_floor_bytes = *admission_free_space_floor_bytes;
             }
             Self::SleepInhibition { health, observed_at } => {
                 status.sleep_inhibition.clone_from(health);

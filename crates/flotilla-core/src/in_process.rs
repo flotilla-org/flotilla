@@ -4654,6 +4654,7 @@ impl InProcessDaemon {
     ) -> Result<String, String> {
         self.check_local_free_space_floor().await?;
         let admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
+        self.check_remote_placement_free_space_floor(namespace, admission.placement_decision.as_ref()).await?;
         self.create_convoy_with_workflow_snapshot(
             namespace,
             &admission.name,
@@ -4879,6 +4880,51 @@ impl InProcessDaemon {
         })
         .await
         .map_err(|error| format!("free-space check failed on host `{}`: {error}", self.host_name))?
+    }
+
+    pub fn admission_free_space_floor_bytes(&self) -> Result<u64, String> {
+        let floor_gib = self.config.load_daemon_config()?.admission.free_space_floor_gib;
+        crate::admission::free_space_floor_bytes(floor_gib)
+    }
+
+    async fn check_remote_placement_free_space_floor(&self, namespace: &str, placement: Option<&PlacementDecision>) -> Result<(), String> {
+        let Some(placement) = placement else {
+            return Ok(());
+        };
+        let target_host = &placement.target_host;
+        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == target_host.reference) {
+            return Ok(());
+        }
+
+        let sources =
+            self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
+        let matching_sources =
+            sources.items.into_iter().filter(|source| source.object.metadata.name == target_host.reference).collect::<Vec<_>>();
+        let has_replica = matching_sources.iter().any(|source| matches!(source.provenance, ResourceProvenance::Replica { .. }));
+        let is_remote_host_direct = self
+            .resource_backend
+            .clone()
+            .using::<PlacementPolicy>(namespace)
+            .get(&placement.policy_name)
+            .await
+            .is_ok_and(|policy| policy.spec.host_direct.is_some());
+        if !has_replica && !is_remote_host_direct {
+            return Ok(());
+        }
+
+        let capacity = matching_sources
+            .into_iter()
+            .filter_map(|source| source.object.status)
+            .find_map(|status| status.admission_free_space_floor_bytes.map(|floor| (floor, status.disk_free_bytes)));
+        let Some((floor_bytes, free_bytes)) = capacity else {
+            return Err(format!("placement refused on host `{}`: admission free-space floor is unavailable", target_host.display_name));
+        };
+        if floor_bytes == 0 {
+            return Ok(());
+        }
+        let free_bytes =
+            free_bytes.ok_or_else(|| format!("placement refused on host `{}`: free space is unavailable", target_host.display_name))?;
+        crate::admission::check_measured_free_space(&target_host.display_name, free_bytes, floor_bytes)
     }
 
     async fn create_convoy_with_workflow_snapshot(

@@ -1245,6 +1245,7 @@ async fn apply_host_heartbeat_with_credentials(
     let disk_free_bytes = tokio::task::spawn_blocking(move || measure_available_space(&repo_default_dir))
         .await
         .map_err(|error| format!("measure available disk space: {error}"))?;
+    let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
     let mut conditions = runtime_health.conditions().await;
     conditions.extend(file_descriptor_pressure_condition());
     if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
@@ -1273,6 +1274,7 @@ async fn apply_host_heartbeat_with_credentials(
         daemon_version: Some(health.version.clone()),
         daemon_started_at: Some(health.started_at),
         disk_free_bytes,
+        admission_free_space_floor_bytes: Some(admission_free_space_floor_bytes),
         conditions,
         sleep_inhibition: host.status.as_ref().map(|status| status.sleep_inhibition.clone()).unwrap_or_default(),
     };

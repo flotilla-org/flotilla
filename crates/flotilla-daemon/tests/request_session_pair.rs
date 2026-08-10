@@ -25,8 +25,8 @@ use flotilla_protocol::{
     PeerConnectionState, PrincipalRef, RepoSelector, ResourceRef, SurfaceCharacter, SurfaceDeclaration,
 };
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta, PlacementPolicy, Regard, Resource,
-    ResourceError, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
+    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Host, HostSpec, HostStatus, InputMeta,
+    PlacementPolicy, Regard, Resource, ResourceError, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
 };
 
 fn test_config_store(config_dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -48,6 +48,49 @@ async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Op
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store_with_floor(tmp.keep(), free_space_floor_gib);
     InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::new(host_name)).await
+}
+
+async fn seed_host_capacity(daemon: &Arc<InProcessDaemon>, free_bytes: u64, floor_bytes: u64) {
+    let host_id = daemon.local_host_id().expect("host identity").to_string();
+    let hosts = daemon.resource_backend().using::<Host>("flotilla");
+    let host = hosts
+        .create(&InputMeta::builder().name(host_id.clone()).build(), &HostSpec::default())
+        .await
+        .expect("create host capacity resource");
+    hosts
+        .update_status(&host_id, &host.metadata.resource_version, &HostStatus {
+            ready: true,
+            disk_free_bytes: Some(free_bytes),
+            admission_free_space_floor_bytes: Some(floor_bytes),
+            ..HostStatus::default()
+        })
+        .await
+        .expect("publish host capacity");
+}
+
+async fn await_host_capacity(daemon: &Arc<InProcessDaemon>, host_id: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let capacity_available = daemon
+                .resource_backend()
+                .including_replicas::<Host>("flotilla")
+                .list()
+                .await
+                .expect("list federated hosts")
+                .items
+                .into_iter()
+                .any(|source| {
+                    source.object.metadata.name == host_id
+                        && source.object.status.is_some_and(|status| status.admission_free_space_floor_bytes.is_some())
+                });
+            if capacity_available {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("host capacity should replicate");
 }
 
 fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
@@ -462,6 +505,7 @@ async fn hostless_convoy_delete_uses_live_peer_route_when_connection_status_is_s
 async fn convoy_start_stays_on_admitting_store_when_placement_membership_is_stale() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named("follower").await;
+    seed_host_capacity(&follower, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
     follower.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
     let namespace = "flotilla";
@@ -478,6 +522,7 @@ async fn convoy_start_stays_on_admitting_store_when_placement_membership_is_stal
     })
     .await
     .expect("peer host summary should materialize placement policy");
+    await_host_capacity(&topology.leader, &remote_host_id).await;
 
     seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
 
@@ -547,9 +592,10 @@ async fn convoy_start_stays_on_admitting_store_when_placement_membership_is_stal
 }
 
 #[tokio::test]
-async fn remote_convoy_start_does_not_move_admission_to_target_capacity_authority() {
+async fn remote_convoy_start_enforces_target_capacity_without_moving_authority() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named_with_floor("follower", Some(1_000_000)).await;
+    seed_host_capacity(&follower, 0, 1_000_000 * 1024 * 1024 * 1024).await;
     follower.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
     let namespace = "flotilla";
@@ -566,6 +612,7 @@ async fn remote_convoy_start_does_not_move_admission_to_target_capacity_authorit
     })
     .await
     .expect("peer host summary should materialize placement policy");
+    await_host_capacity(&topology.leader, &remote_host_id).await;
     seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
 
     let mut events = topology.leader.subscribe();
@@ -588,26 +635,30 @@ async fn remote_convoy_start_does_not_move_admission_to_target_capacity_authorit
             },
         })
         .await
-        .expect("admitting store should accept the convoy");
+        .expect("admitting store should evaluate the convoy");
 
-    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted {
-        name: "remote-disk-hungry".to_string(),
-        attach_plan: None,
-        binding: None
-    });
-    topology
-        .leader
-        .resource_backend()
-        .using::<Convoy>(namespace)
-        .get("remote-disk-hungry")
-        .await
-        .expect("admitting store should own the convoy");
+    let result = await_command_result(&mut events, command_id).await;
+    let CommandValue::Error { message } = result else {
+        panic!("expected target free-space refusal, got {result:?}");
+    };
+    assert!(message.contains("host `follower`"), "{message}");
+    assert!(message.contains("free is below the 1000000.0 GiB floor"), "{message}");
+    assert!(message.contains("reap settled convoys"), "{message}");
+    assert!(message.contains("scripts/prune-target.sh"), "{message}");
+    assert!(message.contains("pick another host"), "{message}");
+    assert!(
+        matches!(
+            topology.leader.resource_backend().using::<Convoy>(namespace).get("remote-disk-hungry").await,
+            Err(ResourceError::NotFound { .. })
+        ),
+        "refused admission must not create a convoy on the admitting store"
+    );
     assert!(
         matches!(
             topology.follower.resource_backend().using::<Convoy>(namespace).get("remote-disk-hungry").await,
             Err(ResourceError::NotFound { .. })
         ),
-        "target capacity policy must not transfer convoy ownership"
+        "refused admission must not create a convoy on the placement host"
     );
 }
 

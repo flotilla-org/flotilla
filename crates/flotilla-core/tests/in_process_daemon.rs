@@ -1219,6 +1219,8 @@ async fn create_test_host_direct_policy(
             capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),
             heartbeat_at: Some(chrono::Utc::now()),
             ready: true,
+            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
             resource_store: None,
             ..HostStatus::default()
         })
