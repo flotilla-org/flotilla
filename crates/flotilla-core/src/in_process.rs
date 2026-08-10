@@ -2798,6 +2798,30 @@ impl InProcessDaemon {
         reconcile_registered_policy(&self.resource_backend, &namespace, &policy_name, &desired).await
     }
 
+    pub async fn remote_host_direct_placement_host(
+        &self,
+        intent: &flotilla_protocol::ConvoyStartIntent,
+    ) -> Result<Option<flotilla_protocol::qualified_path::HostId>, String> {
+        let Some(policy_name) = intent.placement_policy.as_deref() else {
+            return Ok(None);
+        };
+        let namespace = intent.namespace.clone().unwrap_or(self.provisioning_namespace().await);
+        let policy = self
+            .resource_backend
+            .clone()
+            .using::<PlacementPolicy>(&namespace)
+            .get(policy_name)
+            .await
+            .map_err(|error| format!("placement policy {policy_name}: {error}"))?;
+        let Some(host_direct) = policy.spec.host_direct else {
+            return Ok(None);
+        };
+        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == host_direct.host_ref) {
+            return Ok(None);
+        }
+        Ok(Some(flotilla_protocol::qualified_path::HostId::new(host_direct.host_ref)))
+    }
+
     pub async fn resolve_existing_convoy_target(
         &self,
         action: &flotilla_protocol::CommandAction,

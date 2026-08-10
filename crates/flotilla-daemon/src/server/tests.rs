@@ -1725,7 +1725,11 @@ async fn dispatch_execute_keeps_remote_placement_convoy_on_the_admitting_store()
     let forwarded_commands = Arc::new(Mutex::new(HashMap::new()));
     let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
-    peer_manager.lock().await.store_host_summary(remote_summary);
+    let sent = Arc::new(StdMutex::new(Vec::new()));
+    let mut peer_manager_guard = peer_manager.lock().await;
+    peer_manager_guard.store_host_summary(remote_summary);
+    peer_manager_guard.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
+    drop(peer_manager_guard);
     let remote_command_router = make_remote_command_router(
         &daemon,
         &peer_manager,
@@ -1756,6 +1760,7 @@ async fn dispatch_execute_keeps_remote_placement_convoy_on_the_admitting_store()
         binding: None
     });
     assert!(pending_remote_commands.lock().await.is_empty(), "placement must not create a routed command");
+    assert!(sent.lock().expect("sent messages").is_empty(), "placement availability preflight must not route the admission command");
 
     let admitting_backend = daemon.resource_backend();
     let convoy =

@@ -15,8 +15,8 @@ use flotilla_core::{
     step::{RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, RemoteStepProgressUpdate, StepOutcome},
 };
 use flotilla_protocol::{
-    Command, CommandAction, CommandPeerEvent, CommandValue, CrewCommandContext, DaemonEvent, HostName, NodeId, PeerWireMessage,
-    RepoIdentity, RepoSelector, RoutedPeerMessage, Step, StepStatus,
+    Command, CommandAction, CommandPeerEvent, CommandValue, CrewCommandContext, DaemonEvent, EnvironmentId, HostName, NodeId,
+    PeerWireMessage, RepoIdentity, RepoSelector, RoutedPeerMessage, Step, StepStatus,
 };
 use flotilla_resources::CrewCompletionPending;
 use tokio::sync::{oneshot, Mutex, Notify};
@@ -174,6 +174,15 @@ impl RemoteCommandRouter {
         }
         if let Some(target) = existing_convoy_target.as_ref() {
             command.node_id = Some(target.node_id.clone());
+        }
+        if let CommandAction::ConvoyStart { intent } = &command.action {
+            if let Some(host_id) = self.daemon.remote_host_direct_placement_host(intent).await? {
+                let peer_manager = self.peer_manager.lock().await;
+                let environment_id = EnvironmentId::host(host_id.clone());
+                let (node_id, host_name) =
+                    peer_manager.node_for_host_environment(&environment_id).map_err(|_| format!("peer host {host_id} is not connected"))?;
+                peer_manager.resolve_sender(&node_id).map_err(|_| format!("peer host {host_name} is not connected"))?;
+            }
         }
         let target_node_id = command.node_id.clone().unwrap_or_else(|| self.daemon.node_id().clone());
         let local = self.daemon.node_id();
