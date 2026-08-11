@@ -117,13 +117,12 @@ fn dispatch_observation_crd_parses_with_immutable_record_fields() {
 }
 
 #[test]
-fn usage_resource_roundtrips_account_subject_and_window_set() {
+fn usage_resource_roundtrips_provider_account_subject_and_window_set() {
     let observed_at = "2026-08-06T10:39:55Z".parse().expect("valid timestamp");
     let object = ResourceObject::<Usage> {
         metadata: common::object_meta("usage-example", "flotilla", "3"),
-        spec: UsageSpec { account: "user@example.com".to_string() },
+        spec: UsageSpec { provider: "codex".to_string(), account: "user@example.com".to_string() },
         status: Some(UsageStatus {
-            provider: "codex".to_string(),
             plan: Some("plus".to_string()),
             organization: Some("example-org".to_string()),
             windows: vec![
@@ -138,6 +137,7 @@ fn usage_resource_roundtrips_account_subject_and_window_set() {
     };
 
     let json = serde_json::to_value(object.to_k8s_object()).expect("usage projection should serialize");
+    assert_eq!(json["spec"]["provider"], "codex");
     assert_eq!(json["spec"]["account"], "user@example.com");
     assert_eq!(json["status"]["windows"][0]["name"], "session");
     assert_eq!(json["status"]["windows"][1]["used_percent"], 100.0);

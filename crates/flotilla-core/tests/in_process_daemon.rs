@@ -971,7 +971,7 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
     let daemon =
         InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
     let mut events = daemon.subscribe();
-    let name = flotilla_resources::usage_record_name("ada@example.com");
+    let name = flotilla_resources::usage_record_name("codex", "ada@example.com");
     let create_id = daemon
         .execute(Command {
             node_id: None,
@@ -982,7 +982,7 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
                 document: serde_json::json!({
                     "kind": "Usage",
                     "metadata": {"name": name},
-                    "spec": {"account": "Ada@Example.com"},
+                    "spec": {"provider": "codex", "account": "Ada@Example.com"},
                 }),
             },
         })
@@ -993,7 +993,6 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
 
     let observed_at = "2026-08-08T18:00:00Z".parse().expect("timestamp");
     let status = flotilla_resources::UsageStatus::builder()
-        .provider("codex")
         .windows(vec![flotilla_resources::UsageWindow::builder().name("weekly").used_percent(100.0).build()])
         .observed_at(observed_at)
         .build();
@@ -1025,7 +1024,7 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
                 namespace: "flotilla".to_string(),
                 kind: "usages".to_string(),
                 name: name.clone(),
-                status: serde_json::json!({"provider": "codex"}),
+                status: serde_json::json!({"windows": []}),
             },
         })
         .await
@@ -1034,6 +1033,7 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
     assert!(matches!(malformed_result, CommandValue::Error { message } if message.contains("decode Usage status")));
 
     let stored = daemon.resource_backend().using::<flotilla_resources::Usage>("flotilla").get(&name).await.expect("stored usage");
+    assert_eq!(stored.spec.provider, "codex");
     assert_eq!(stored.spec.account, "Ada@Example.com");
     assert_eq!(stored.status, Some(status));
 }

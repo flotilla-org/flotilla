@@ -193,14 +193,18 @@ mod tests {
     #[test]
     fn checked_in_usage_observer_script_preserves_translation_and_coalescing_rules() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/usage-observer");
-        let expected_name = flotilla_resources::usage_record_name("Ada@Example.com");
+        let expected_codex_name = flotilla_resources::usage_record_name("codex", "Ada@Example.com");
+        let expected_claude_name = flotilla_resources::usage_record_name("claude", "Ada@Example.com");
         let program = r#"
 import copy
 import runpy
 import sys
+from types import SimpleNamespace
 
 observer = runpy.run_path(sys.argv[1], run_name="usage_observer_test")
-assert observer["record_name"](" Ada@Example.com ") == sys.argv[2]
+assert observer["record_name"](" CODEX ", " Ada@Example.com ") == sys.argv[2]
+assert observer["record_name"]("claude", "Ada@Example.com") == sys.argv[3]
+assert sys.argv[2] != sys.argv[3]
 
 payload = {
     "provider": "codex",
@@ -226,6 +230,18 @@ assert [(window["name"], window["used_percent"]) for window in current["windows"
 ]
 assert current["provider_cost"]["balance"] == 37.5
 assert current["reset_credits_available"] == 2
+assert "provider" not in current
+
+runtime = observer["ensure_usage"].__globals__
+documents = []
+runtime["flotilla_command"] = lambda arguments: SimpleNamespace(returncode=1, stdout="", stderr="not found")
+runtime["command_with_document"] = lambda arguments, document: documents.append(document) or SimpleNamespace(returncode=0, stdout="", stderr="")
+observer["ensure_usage"](sys.argv[2], "codex", account)
+assert documents == [{
+    "kind": "Usage",
+    "metadata": {"name": sys.argv[2]},
+    "spec": {"provider": "codex", "account": "Ada@Example.com"},
+}]
 
 sub_threshold = copy.deepcopy(current)
 sub_threshold["windows"][0]["used_percent"] = 8.999
@@ -247,7 +263,7 @@ assert observer["material_change"](current, heartbeat)
 patches = []
 runtime = observer["run_cycle"].__globals__
 runtime["poll"] = lambda provider: [(account, current)] if provider == "codex" else []
-runtime["ensure_usage"] = lambda name, account: None
+runtime["ensure_usage"] = lambda name, provider, account: None
 runtime["patch_status"] = lambda name, status: patches.append((name, status))
 last_written = {}
 observer["run_cycle"](last_written)
@@ -255,7 +271,7 @@ observer["run_cycle"](last_written)
 assert len(patches) == 1
 "#;
         let output = Command::new("python3")
-            .args(["-c", program, script, &expected_name])
+            .args(["-c", program, script, &expected_codex_name, &expected_claude_name])
             .output()
             .expect("run usage observer Python contract test");
         assert!(output.status.success(), "usage observer Python contract failed: {}", String::from_utf8_lossy(&output.stderr));
