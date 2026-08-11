@@ -51,8 +51,8 @@ use flotilla_resources::{
     CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase, DockerCheckoutStrategy,
     DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
     HostStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
-    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryRelation, RepositorySpec, ResourceError, Stance,
-    TypedResolver, WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY,
+    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryRelation, RepositorySpec, ResourceBackend, ResourceError,
+    Stance, TypedResolver, WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY,
     REPO_KEY_LABEL, REPO_LABEL,
 };
 use futures::StreamExt;
@@ -854,7 +854,7 @@ async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
 }
 
 #[tokio::test]
-async fn deleting_a_missing_authoritative_resource_tombstones_connected_peer_replicas() {
+async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_cycles() {
     let authority_temp = tempfile::tempdir().expect("create authority tempdir");
     let authority = InProcessDaemon::new(
         vec![],
@@ -863,69 +863,49 @@ async fn deleting_a_missing_authoritative_resource_tombstones_connected_peer_rep
         HostName::new("authority"),
     )
     .await;
-    let peer_temp = tempfile::tempdir().expect("create peer tempdir");
-    let peer =
-        InProcessDaemon::new(vec![], test_config_store(peer_temp.path().join("config")), fake_discovery(false), HostName::new("peer"))
-            .await;
+    let peer_one_temp = tempfile::tempdir().expect("create first peer tempdir");
+    let peer_one = InProcessDaemon::new(
+        vec![],
+        test_config_store(peer_one_temp.path().join("config")),
+        fake_discovery(false),
+        HostName::new("peer-one"),
+    )
+    .await;
+    let peer_two_temp = tempfile::tempdir().expect("create second peer tempdir");
+    let peer_two = InProcessDaemon::new(
+        vec![],
+        test_config_store(peer_two_temp.path().join("config")),
+        fake_discovery(false),
+        HostName::new("peer-two"),
+    )
+    .await;
     let origin = authority.node_id().clone();
-    let authority_node = NodeInfo::new(origin.clone(), "authority");
-    peer.set_configured_peers(vec![authority_node.clone()]).await;
-
-    let peer_local = peer.resource_backend().using::<ResourceConvoy>("flotilla");
-    peer_local
+    let fixture_backend = ResourceBackend::InMemory(Default::default());
+    let fixture = fixture_backend.using::<ResourceConvoy>("flotilla");
+    fixture
         .create(
             &InputMeta::builder().name("lost-at-authority".to_string()).build(),
             &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
         )
         .await
         .expect("create stale source object");
-    let stale_snapshot = peer_local.list().await.expect("snapshot stale source object");
-    peer_local.delete("lost-at-authority").await.expect("remove local source object");
-    peer.resource_backend()
-        .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
-        .replace(&stale_snapshot, chrono::Utc::now())
-        .await
-        .expect("seed stale peer replica");
+    let stale_snapshot = fixture.list().await.expect("snapshot stale source object");
+    let stale_object = stale_snapshot.items[0].clone();
+    let stale_synced_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+    for daemon in [&authority, &peer_one, &peer_two] {
+        daemon
+            .resource_backend()
+            .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
+            .replace(&stale_snapshot, stale_synced_at)
+            .await
+            .expect("seed stale replica");
+    }
 
     let authority_convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
-    authority_convoys
-        .create(
-            &InputMeta::builder().name("held-at-authority".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
-        )
-        .await
-        .expect("create held authority object");
-    let authority_snapshot = authority_convoys.list().await.expect("snapshot held authority object");
-    peer.resource_backend()
-        .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
-        .apply(WatchEvent::Added(authority_snapshot.items[0].clone()), chrono::Utc::now())
-        .await
-        .expect("seed held peer replica");
-
-    let mut peer_events = peer.subscribe();
-    InProcessDaemon::publish_peer_connection_status(peer.as_ref(), &authority_node, PeerConnectionState::Connected).await;
-    let refused_id = peer
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceDelete {
-                namespace: "flotilla".to_string(),
-                kind: "convoys".to_string(),
-                name: "held-at-authority".to_string(),
-                replica_origin: Some(origin.clone()),
-            },
-        })
-        .await
-        .expect("request collection of held resource");
-    let refused = recv_command_finished(&mut peer_events, refused_id).await;
-    assert!(
-        matches!(refused, CommandValue::Error { ref message } if message.contains("is connected")),
-        "a connected authority that holds the record must retain deletion authority: {refused:?}"
-    );
-
     let listed = authority_convoys.list().await.expect("list before authority tombstone");
     let mut authority_watch = authority_convoys.watch(WatchStart::resuming_from(&listed)).await.expect("watch authority tombstones");
+    let mut peer_one_relay =
+        peer_one.resource_backend().including_replicas::<ResourceConvoy>("flotilla").watch().await.expect("watch first peer replicas");
     let mut authority_events = authority.subscribe();
     let delete_id = authority
         .execute(Command {
@@ -953,16 +933,69 @@ async fn deleting_a_missing_authoritative_resource_tombstones_connected_peer_rep
         matches!(&tombstone_event, WatchEvent::DeletedByName(tombstone) if tombstone.name == "lost-at-authority"),
         "missing authority delete must emit a name tombstone: {tombstone_event:?}"
     );
-    peer.resource_backend()
-        .replica_writer::<ResourceConvoy>(origin, "flotilla")
-        .apply(tombstone_event, chrono::Utc::now())
-        .await
-        .expect("relay authority tombstone to peer");
+    let tombstone_synced_at = chrono::Utc::now();
+    for peer in [&peer_one, &peer_two] {
+        peer.resource_backend()
+            .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
+            .apply(tombstone_event.clone(), tombstone_synced_at)
+            .await
+            .expect("relay authority tombstone to peer");
+    }
 
-    let remaining =
-        peer.resource_backend().including_replicas::<ResourceConvoy>("flotilla").list().await.expect("list converged peer replicas");
-    assert_eq!(remaining.items.len(), 1);
-    assert_eq!(remaining.items[0].object.metadata.name, "held-at-authority");
+    let relayed = tokio::time::timeout(Duration::from_secs(1), peer_one_relay.next())
+        .await
+        .expect("peer relay tombstone timeout")
+        .expect("peer relay watch ended")
+        .expect("peer relay watch failed");
+    let flotilla_resources::ReadWatchEvent::DeletedByName { tombstone, provenance } = relayed else {
+        panic!("expected relayed name tombstone");
+    };
+    let flotilla_resources::ResourceProvenance::Replica { last_synced_at, .. } = provenance else {
+        panic!("expected replica provenance");
+    };
+    peer_two
+        .resource_backend()
+        .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
+        .apply(WatchEvent::DeletedByName(tombstone), last_synced_at)
+        .await
+        .expect("apply peer relay tombstone");
+
+    for daemon in [&authority, &peer_one, &peer_two] {
+        daemon
+            .resource_backend()
+            .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
+            .apply(WatchEvent::Added(stale_object.clone()), stale_synced_at)
+            .await
+            .expect("exercise a stale relay cycle after deletion");
+        assert!(
+            daemon
+                .resource_backend()
+                .including_replicas::<ResourceConvoy>("flotilla")
+                .list()
+                .await
+                .expect("list converged replicas")
+                .items
+                .is_empty(),
+            "authority and both peers must remain absent after stale relay cycles"
+        );
+    }
+
+    let repeated_id = authority
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ResourceDelete {
+                namespace: "flotilla".to_string(),
+                kind: "convoys".to_string(),
+                name: "lost-at-authority".to_string(),
+                replica_origin: None,
+            },
+        })
+        .await
+        .expect("repeat delete missing authority resource");
+    let repeated = recv_command_finished(&mut authority_events, repeated_id).await;
+    assert!(matches!(repeated, CommandValue::ResourceAlreadyDeleted(_)), "repeat delete must be explicit: {repeated:?}");
 }
 
 #[tokio::test]

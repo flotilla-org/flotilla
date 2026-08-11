@@ -229,6 +229,11 @@ async fn missing_authority_delete_tombstones_replica() {
 }
 
 #[tokio::test]
+async fn watch_rejects_version_ahead_of_stream() {
+    common::contract::assert_watch_rejects_version_ahead_of_stream_with_backend(backend()).await;
+}
+
+#[tokio::test]
 async fn project_definition_edit_converges() {
     assert_project_definition_edit_converges_with_backend(backend()).await;
 }
@@ -348,6 +353,31 @@ async fn replica_delete_tombstone_survives_backend_restart() {
         reopened.including_replicas::<Convoy>("flotilla").list().await.expect("list replicas after restart").items.is_empty(),
         "the persisted delete tombstone must prevent stale resurrection after restart"
     );
+}
+
+#[tokio::test]
+async fn authoritative_name_tombstone_survives_backend_restart() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("resources.sqlite");
+    let origin = flotilla_protocol::NodeId::new("feta-root");
+
+    {
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("open sqlite backend")).with_local_root(origin.clone());
+        let deleted = flotilla_resources::delete_resource_kind(&backend, "flotilla", "convoys", "lost-at-authority")
+            .await
+            .expect("write authoritative name tombstone");
+        assert!(!deleted.already_deleted);
+    }
+
+    let reopened = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("reopen sqlite backend")).with_local_root(origin);
+    let listed = reopened.using::<Convoy>("flotilla").list().await.expect("list reopened authority stream");
+    let mut watch =
+        reopened.using::<Convoy>("flotilla").watch(WatchStart::resuming_from(&listed)).await.expect("watch reopened authority stream");
+    let repeated = flotilla_resources::delete_resource_kind(&reopened, "flotilla", "convoys", "lost-at-authority")
+        .await
+        .expect("repeat authoritative delete after restart");
+    assert!(repeated.already_deleted);
+    assert!(timeout(Duration::from_millis(100), watch.next()).await.is_err(), "repeat delete must not emit a fresh tombstone");
 }
 
 #[tokio::test]

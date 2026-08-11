@@ -287,6 +287,16 @@ impl SqliteBackend {
                     last_synced_at TEXT NOT NULL,
                     PRIMARY KEY (origin_root, group_name, version, kind, namespace, name)
                 );
+
+                CREATE TABLE IF NOT EXISTS resource_tombstones (
+                    group_name TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    body_json TEXT NOT NULL,
+                    PRIMARY KEY (group_name, version, kind, namespace, name)
+                );
                 "#,
             )
             .map_err(|err| ResourceError::other(format!("initialize sqlite resource store: {err}")))?;
@@ -564,7 +574,15 @@ impl SqliteBackend {
     }
 
     fn allocate_version(tx: &rusqlite::Transaction<'_>, key: &StoreKey) -> Result<u64, ResourceError> {
-        let next = tx
+        Self::allocate_version_after(tx, key, None)
+    }
+
+    fn allocate_version_after(
+        tx: &rusqlite::Transaction<'_>,
+        key: &StoreKey,
+        minimum_resource_version: Option<u64>,
+    ) -> Result<u64, ResourceError> {
+        let stored_next = tx
             .query_row(
                 "SELECT next_version FROM resource_sequences WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4",
                 params![key.0, key.1, key.2, key.3],
@@ -573,6 +591,7 @@ impl SqliteBackend {
             .optional()
             .map_err(|err| Self::map_sqlite(err, "read sqlite resource sequence"))?
             .unwrap_or(1);
+        let next = minimum_resource_version.map_or(stored_next, |minimum| stored_next.max(minimum.saturating_add(1)));
         tx.execute(
             r#"
             INSERT INTO resource_sequences (group_name, version, kind, namespace, next_version)
@@ -1302,6 +1321,14 @@ impl SqliteBackend {
             let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
             tx.execute(
                 r#"
+                DELETE FROM resource_tombstones
+                WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
+                "#,
+                params![key.0, key.1, key.2, key.3, meta.name],
+            )
+            .map_err(|err| Self::map_sqlite(err, "clear sqlite resource tombstone"))?;
+            tx.execute(
+                r#"
                 INSERT INTO resource_objects (group_name, version, kind, namespace, name, resource_version, body_json)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 "#,
@@ -1489,18 +1516,47 @@ impl SqliteBackend {
         .await
     }
 
-    pub(crate) async fn tombstone_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ResourceTombstone, ResourceError> {
+    pub(crate) async fn tombstone_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        name: &str,
+        minimum_resource_version: Option<&str>,
+    ) -> Result<crate::watch::TombstoneWrite, ResourceError> {
         let key = Self::store_key::<T>(namespace);
         let namespace = namespace.to_string();
         let name = name.to_string();
         let watchers = Arc::clone(&self.watchers);
         let event_retention = self.event_retention;
+        let minimum_resource_version = minimum_resource_version
+            .map(|version| {
+                version.parse::<u64>().map_err(|error| {
+                    ResourceError::invalid(format!("invalid replica cursor resourceVersion '{version}' while tombstoning: {error}"))
+                })
+            })
+            .transpose()?;
         self.call(move |connection| {
             let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource tombstone"))?;
             if Self::select_existing::<T>(&tx, &key, &name)?.is_some() {
                 return Err(ResourceError::conflict(&name, "cannot tombstone an existing resource by name"));
             }
-            let version = Self::allocate_version(&tx, &key)?;
+            let existing = tx
+                .query_row(
+                    r#"
+                    SELECT body_json FROM resource_tombstones
+                    WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
+                    "#,
+                    params![key.0, key.1, key.2, key.3, name],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|err| Self::map_sqlite(err, "read sqlite resource tombstone"))?;
+            if let Some(body) = existing {
+                let value = serde_json::from_str(&body)
+                    .map_err(|err| ResourceError::decode(format!("decode stored resource tombstone JSON: {err}")))?;
+                let tombstone = Self::decode_tombstone(value)?;
+                return Ok(crate::watch::TombstoneWrite { tombstone, created: false });
+            }
+            let version = Self::allocate_version_after(&tx, &key, minimum_resource_version)?;
             let tombstone = ResourceTombstone {
                 name: name.clone(),
                 namespace: namespace.clone(),
@@ -1510,10 +1566,18 @@ impl SqliteBackend {
             let encoded = Self::encode_tombstone::<T>(&tombstone);
             let body_json =
                 serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode tombstone JSON: {err}")))?;
+            tx.execute(
+                r#"
+                INSERT INTO resource_tombstones (group_name, version, kind, namespace, name, body_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![key.0, key.1, key.2, key.3, name, body_json],
+            )
+            .map_err(|err| Self::map_sqlite(err, "write sqlite resource tombstone"))?;
             Self::insert_event(&tx, &key, version, StoredEventKind::Deleted, &body_json, event_retention, T::REPLICATION_CLASS)?;
             tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource tombstone"))?;
             Self::notify_watchers(&watchers, &key, StoredEvent { kind: StoredEventKind::Deleted, object: encoded });
-            Ok(tombstone)
+            Ok(crate::watch::TombstoneWrite { tombstone, created: true })
         })
         .await
     }
@@ -1638,6 +1702,10 @@ impl SqliteBackend {
                 requested_version: replay_from.to_string(),
                 compacted_through: Some(compacted_through.to_string()),
             });
+        }
+        let current_version = Self::current_version(conn, key)?;
+        if replay_from > current_version {
+            return Err(ResourceError::invalid(format!("resourceVersion {replay_from} is ahead of current version {current_version}")));
         }
         let mut statement = conn
             .prepare(

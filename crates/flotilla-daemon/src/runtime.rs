@@ -5595,7 +5595,7 @@ mod tests {
         let deleted = flotilla_resources::delete_resource_kind(&backend, NAMESPACE, "workflowtemplates", "single-agent-contained")
             .await
             .expect("raw delete should remove builtin");
-        assert_eq!(deleted.value["metadata"]["name"], "single-agent-contained");
+        assert_eq!(deleted.object.value["metadata"]["name"], "single-agent-contained");
         assert!(matches!(
             backend.using::<WorkflowTemplate>(NAMESPACE).get("single-agent-contained").await,
             Err(ResourceError::NotFound { .. })

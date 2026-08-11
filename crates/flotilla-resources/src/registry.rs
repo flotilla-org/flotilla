@@ -68,6 +68,12 @@ pub struct DynamicResourceObject {
     pub value: Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct DynamicResourceDelete {
+    pub object: DynamicResourceObject,
+    pub already_deleted: bool,
+}
+
 #[derive(bon::Builder)]
 pub struct DynamicResourceWatch {
     pub kind: String,
@@ -321,7 +327,7 @@ pub async fn delete_resource_kind(
     namespace: &str,
     requested_kind: &str,
     name: &str,
-) -> Result<DynamicResourceObject, ResourceError> {
+) -> Result<DynamicResourceDelete, ResourceError> {
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, delete_typed(backend, namespace, name).await)
 }
 
@@ -569,24 +575,33 @@ async fn get_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name
     })
 }
 
-async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceObject, ResourceError> {
+async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceDelete, ResourceError> {
     let resolver = backend.using::<T>(namespace);
-    let value = match resolver.get(name).await {
+    let (value, already_deleted) = match resolver.get(name).await {
         Ok(object) => {
             resolver.delete(name).await?;
-            object_value(&object)?
+            (object_value(&object)?, false)
         }
         Err(ResourceError::NotFound { .. }) if T::REPLICATION_CLASS != crate::ReplicationClass::None => {
-            let tombstone = resolver.tombstone(name).await?;
-            tombstone_value::<T>(&tombstone)
+            let write = resolver.tombstone(name).await?;
+            if write.created {
+                backend
+                    .replica_writer::<T>(backend.local_root()?, namespace)
+                    .apply(WatchEvent::DeletedByName(write.tombstone.clone()), Utc::now())
+                    .await?;
+            }
+            (tombstone_value::<T>(&write.tombstone), !write.created)
         }
         Err(error) => return Err(error),
     };
-    Ok(DynamicResourceObject {
-        kind: T::API_PATHS.kind.to_string(),
-        plural: T::API_PATHS.plural.to_string(),
-        namespace: namespace.to_string(),
-        value,
+    Ok(DynamicResourceDelete {
+        object: DynamicResourceObject {
+            kind: T::API_PATHS.kind.to_string(),
+            plural: T::API_PATHS.plural.to_string(),
+            namespace: namespace.to_string(),
+            value,
+        },
+        already_deleted,
     })
 }
 
@@ -1020,7 +1035,7 @@ mod tests {
         let mut watch = convoys.watch(WatchStart::resuming_from(&listed)).await.expect("watch source");
 
         let deleted = delete_resource_kind(&source, "flotilla", "convoys", "ghost").await.expect("delete exact convoy");
-        assert_eq!(deleted.value["metadata"]["name"], "ghost");
+        assert_eq!(deleted.object.value["metadata"]["name"], "ghost");
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), watch.next())
             .await
             .expect("delete watch event timeout")

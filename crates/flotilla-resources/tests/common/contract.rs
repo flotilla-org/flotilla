@@ -311,6 +311,7 @@ pub async fn assert_replica_events_ignore_stale_writes_and_deletes_with_backend(
 
 pub async fn assert_missing_authority_delete_tombstones_replica_with_backend(backend: ResourceBackend) {
     let origin = flotilla_protocol::NodeId::new("authority-root");
+    let backend = backend.with_local_root(origin.clone());
     let source = ResourceBackend::InMemory(InMemoryBackend::default());
     source
         .using::<Convoy>("flotilla")
@@ -323,18 +324,33 @@ pub async fn assert_missing_authority_delete_tombstones_replica_with_backend(bac
     let local = backend.using::<Convoy>("flotilla");
     let listed = local.list().await.expect("list empty authority store");
     let mut watch = local.watch(WatchStart::resuming_from(&listed)).await.expect("watch authority store");
-    delete_resource_kind(&backend, "flotilla", "convoys", "lost-at-authority").await.expect("delete missing authority object");
+    let deleted =
+        delete_resource_kind(&backend, "flotilla", "convoys", "lost-at-authority").await.expect("delete missing authority object");
+    assert!(!deleted.already_deleted);
     let event = timeout(Duration::from_secs(1), watch.next())
         .await
         .expect("authority tombstone timeout")
         .expect("authority watch ended")
         .expect("authority watch failed");
     assert!(matches!(&event, WatchEvent::DeletedByName(tombstone) if tombstone.name == "lost-at-authority"));
-    backend.replica_writer::<Convoy>(origin, "flotilla").apply(event, Utc::now()).await.expect("apply authority tombstone to replica");
     assert!(
         backend.including_replicas::<Convoy>("flotilla").list().await.expect("list converged replica view").items.is_empty(),
         "the name tombstone must remove the stale replica"
     );
+
+    let repeated =
+        delete_resource_kind(&backend, "flotilla", "convoys", "lost-at-authority").await.expect("repeat missing authority delete");
+    assert!(repeated.already_deleted, "a retained name tombstone must make repeat deletion idempotent");
+    assert!(timeout(Duration::from_millis(100), watch.next()).await.is_err(), "repeat deletion must not emit a fresh tombstone event");
+}
+
+pub async fn assert_watch_rejects_version_ahead_of_stream_with_backend(backend: ResourceBackend) {
+    let resolver = backend.using::<Convoy>("flotilla");
+    let error = resolver
+        .watch(WatchStart::FromVersion("1".to_string()))
+        .await
+        .expect_err("a cursor ahead of an empty authority stream must be rejected");
+    assert!(error.to_string().contains("ahead of current version"), "unexpected error: {error}");
 }
 
 fn project_spec(display_name: &str, workflow: &str) -> ProjectSpec {

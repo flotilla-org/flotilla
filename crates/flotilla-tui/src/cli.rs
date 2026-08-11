@@ -740,6 +740,11 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
                 )
             }
         }
+        CommandValue::ResourceAlreadyDeleted(response) => {
+            let name = response.value["metadata"]["name"].as_str().unwrap_or("<unknown>");
+            let api_version = response.value["apiVersion"].as_str().unwrap_or("<unknown>");
+            format!("already deleted {api_version}/{}/{}/{name}", response.kind, response.namespace)
+        }
         CommandValue::ResourceWatchEvent(response) => flotilla_protocol::output::json_pretty(response),
         CommandValue::EnvironmentSpecRead { .. } => "environment spec read".to_string(),
         CommandValue::IssuePage(page) => format!("issue page: {} items, has_more={}", page.items.len(), page.has_more),

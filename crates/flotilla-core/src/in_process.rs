@@ -8347,26 +8347,42 @@ impl InProcessDaemon {
 
         if let flotilla_protocol::CommandAction::ResourceDelete { namespace, kind, name, replica_origin } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let deleted = if let Some(origin_root) = replica_origin {
-                if self.peer_connection_status(origin_root).await == PeerConnectionState::Connected {
+            let result = if let Some(origin_root) = replica_origin {
+                let deleted = if self.peer_connection_status(origin_root).await == PeerConnectionState::Connected {
                     Err(ResourceError::invalid(format!(
                         "replica origin {origin_root} is connected; delete the authoritative resource instead"
                     )))
                 } else {
                     flotilla_resources::collect_resource_replica_kind(&self.resource_backend, namespace, kind, name, origin_root).await
+                };
+                match deleted {
+                    Ok(deleted) => flotilla_protocol::CommandValue::ResourceDeleted(Box::new(ResourceJsonResponse {
+                        kind: deleted.kind,
+                        plural: deleted.plural,
+                        namespace: deleted.namespace,
+                        value: deleted.value,
+                        replica_origin: replica_origin.clone(),
+                    })),
+                    Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
                 }
             } else {
-                flotilla_resources::delete_resource_kind(&self.resource_backend, namespace, kind, name).await
-            };
-            let result = match deleted {
-                Ok(deleted) => flotilla_protocol::CommandValue::ResourceDeleted(Box::new(ResourceJsonResponse {
-                    kind: deleted.kind,
-                    plural: deleted.plural,
-                    namespace: deleted.namespace,
-                    value: deleted.value,
-                    replica_origin: replica_origin.clone(),
-                })),
-                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                match flotilla_resources::delete_resource_kind(&self.resource_backend, namespace, kind, name).await {
+                    Ok(deleted) => {
+                        let response = Box::new(ResourceJsonResponse {
+                            kind: deleted.object.kind,
+                            plural: deleted.object.plural,
+                            namespace: deleted.object.namespace,
+                            value: deleted.object.value,
+                            replica_origin: None,
+                        });
+                        if deleted.already_deleted {
+                            flotilla_protocol::CommandValue::ResourceAlreadyDeleted(response)
+                        } else {
+                            flotilla_protocol::CommandValue::ResourceDeleted(response)
+                        }
+                    }
+                    Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                }
             };
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);

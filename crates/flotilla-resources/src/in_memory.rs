@@ -51,6 +51,7 @@ struct ReplicaPartition {
 #[derive(Debug)]
 struct ResourceStore {
     objects: HashMap<String, Value>,
+    tombstones: HashMap<String, ResourceTombstone>,
     next_version: u64,
     watchers: Vec<mpsc::UnboundedSender<StoredEvent>>,
     event_log: Vec<StoredEvent>,
@@ -97,7 +98,14 @@ impl ResourceStore {
 
 impl Default for ResourceStore {
     fn default() -> Self {
-        Self { objects: HashMap::new(), next_version: 1, watchers: Vec::new(), event_log: Vec::new(), compacted_through: 0 }
+        Self {
+            objects: HashMap::new(),
+            tombstones: HashMap::new(),
+            next_version: 1,
+            watchers: Vec::new(),
+            event_log: Vec::new(),
+            compacted_through: 0,
+        }
     }
 }
 
@@ -574,6 +582,7 @@ impl InMemoryBackend {
             };
 
             let encoded = Self::encode_object(&object)?;
+            store.tombstones.remove(&meta.name);
             store.objects.insert(meta.name.clone(), encoded.clone());
             store.push_event(
                 StoredEvent { version, kind: StoredEventKind::Added, object: encoded },
@@ -723,10 +732,28 @@ impl InMemoryBackend {
         .await
     }
 
-    pub(crate) async fn tombstone_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ResourceTombstone, ResourceError> {
+    pub(crate) async fn tombstone_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        name: &str,
+        minimum_resource_version: Option<&str>,
+    ) -> Result<crate::watch::TombstoneWrite, ResourceError> {
+        let minimum_resource_version = minimum_resource_version
+            .map(|version| {
+                version.parse::<u64>().map_err(|error| {
+                    ResourceError::invalid(format!("invalid replica cursor resourceVersion '{version}' while tombstoning: {error}"))
+                })
+            })
+            .transpose()?;
         self.with_store_mut::<T, _>(namespace, |store| {
             if store.objects.contains_key(name) {
                 return Err(ResourceError::conflict(name, "cannot tombstone an existing resource by name"));
+            }
+            if let Some(tombstone) = store.tombstones.get(name) {
+                return Ok(crate::watch::TombstoneWrite { tombstone: tombstone.clone(), created: false });
+            }
+            if let Some(minimum_resource_version) = minimum_resource_version {
+                store.next_version = store.next_version.max(minimum_resource_version.saturating_add(1));
             }
             let version = store.allocate_version();
             let tombstone = ResourceTombstone {
@@ -739,7 +766,8 @@ impl InMemoryBackend {
                 StoredEvent { version, kind: StoredEventKind::Deleted, object: Self::encode_tombstone::<T>(&tombstone) },
                 T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
             );
-            Ok(tombstone)
+            store.tombstones.insert(name.to_string(), tombstone.clone());
+            Ok(crate::watch::TombstoneWrite { tombstone, created: true })
         })
         .await
     }
@@ -782,6 +810,13 @@ impl InMemoryBackend {
                     requested_version: replay_from.expect("checked replay version").to_string(),
                     compacted_through: Some(store.compacted_through.to_string()),
                 });
+            }
+            if replay_from.is_some_and(|version| version > store.current_version()) {
+                return Err(ResourceError::invalid(format!(
+                    "resourceVersion {} is ahead of current version {}",
+                    replay_from.expect("checked replay version"),
+                    store.current_version()
+                )));
             }
             let replay = match replay_from {
                 Some(version) => store.event_log.iter().filter(|event| event.version > version).cloned().collect(),

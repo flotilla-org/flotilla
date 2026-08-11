@@ -239,7 +239,12 @@ impl HttpBackend {
         Self::expect_success(response, Some(name)).await
     }
 
-    pub(crate) async fn tombstone_typed<T: Resource>(&self, _namespace: &str, _name: &str) -> Result<ResourceTombstone, ResourceError> {
+    pub(crate) async fn tombstone_typed<T: Resource>(
+        &self,
+        _namespace: &str,
+        _name: &str,
+        _minimum_resource_version: Option<&str>,
+    ) -> Result<crate::watch::TombstoneWrite, ResourceError> {
         Err(ResourceError::invalid(format!("HTTP backends cannot author {} tombstones", T::API_PATHS.kind)))
     }
 
