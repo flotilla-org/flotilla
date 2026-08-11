@@ -234,9 +234,11 @@ impl LeafSubject for UsageLeafSubject<'_> {
     }
 
     fn value(&self, field_path: &str) -> Option<LeafValue> {
+        if field_path == ".provider" {
+            return Some(LeafValue::Text(self.0.spec.provider.clone()));
+        }
         let status = self.0.status.as_ref()?;
         match field_path {
-            ".provider" => Some(LeafValue::Text(status.provider.clone())),
             ".plan" => status.plan.clone().map(LeafValue::Text),
             ".organization" => status.organization.clone().map(LeafValue::Text),
             path => {
@@ -447,10 +449,9 @@ mod tests {
                 creation_timestamp: observed_at,
                 merge: None,
             },
-            spec: crate::UsageSpec { account: "user@example.com".to_string() },
+            spec: crate::UsageSpec { provider: "codex".to_string(), account: "user@example.com".to_string() },
             status: Some(
                 crate::UsageStatus::builder()
-                    .provider("codex")
                     .windows(vec![
                         crate::UsageWindow::builder().name("session").used_percent(8.0).build(),
                         crate::UsageWindow::builder().name("weekly").used_percent(100.0).build(),
@@ -461,7 +462,7 @@ mod tests {
         };
         let subject = UsageLeafSubject(&object);
         let leaf = Leaf {
-            address: LeafAddress::Usage { account: "user@example.com".to_string() },
+            address: LeafAddress::Usage { provider: "codex".to_string(), account: "user@example.com".to_string() },
             field_path: ".windows.weekly.used-percent".to_string(),
             operator: LeafOperator::GreaterThan,
             literal: "90".to_string(),

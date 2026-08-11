@@ -18,10 +18,11 @@ POLL_SECONDS = 300
 PROVIDERS = ("codex", "claude")
 
 
-def record_name(account):
+def record_name(provider, account):
     """Keep this byte-for-byte aligned with usage_record_name in usage.rs."""
-    normalized = account.strip().lower()
-    digest = hashlib.sha256(b"usage-account-v1\0" + normalized.encode()).hexdigest()
+    normalized_provider = provider.strip().lower()
+    normalized_account = account.strip().lower()
+    digest = hashlib.sha256(b"usage-account-v2\0" + normalized_provider.encode() + b"\0" + normalized_account.encode()).hexdigest()
     return "usage-" + digest[:54]
 
 
@@ -115,7 +116,6 @@ def translate_payload(expected_provider, payload):
 
     reset_credits = usage.get("codexResetCredits")
     status = {
-        "provider": expected_provider,
         "plan": first_nonempty(identity.get("loginMethod"), usage.get("loginMethod")),
         "organization": first_nonempty(identity.get("accountOrganization"), usage.get("accountOrganization")),
         "windows": windows,
@@ -168,14 +168,14 @@ def command_with_document(arguments, document):
             os.unlink(path)
 
 
-def ensure_usage(name, account):
+def ensure_usage(name, provider, account):
     result = flotilla_command(["resource", "get", "usages", name, "--namespace", NAMESPACE])
     if result.returncode == 0:
         envelope = json.loads(result.stdout)
         records = envelope.get("records") or []
         return (records[0].get("object") or {}).get("status") if records else None
 
-    document = {"kind": "Usage", "metadata": {"name": name}, "spec": {"account": account}}
+    document = {"kind": "Usage", "metadata": {"name": name}, "spec": {"provider": provider, "account": account}}
     result = command_with_document(["resource", "apply", "--namespace", NAMESPACE], document)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "resource apply failed")
@@ -213,10 +213,10 @@ def run_cycle(last_written):
             print(f"usage observer: {error}", file=sys.stderr)
             continue
         for account, status in observations:
-            name = record_name(account)
+            name = record_name(provider, account)
             try:
                 if name not in last_written:
-                    last_written[name] = ensure_usage(name, account)
+                    last_written[name] = ensure_usage(name, provider, account)
                 if material_change(last_written[name], status):
                     patch_status(name, status)
                     last_written[name] = status

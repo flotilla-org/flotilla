@@ -49,7 +49,7 @@ pub enum LeafAddress {
     Vessel { name: String },
     Work { convoy: String, work: String },
     ChangeRequest { service: String, scope: String, number: u64 },
-    Usage { account: String },
+    Usage { provider: String, account: String },
 }
 
 impl LeafAddress {
@@ -79,9 +79,11 @@ impl FromStr for LeafAddress {
                 let number = number.parse().map_err(|_| format!("invalid change request number `{number}` in leaf address `{value}`"))?;
                 Ok(Self::ChangeRequest { service: (*service).to_string(), scope: scope.join("/"), number })
             }
-            ["usage", account] if !account.is_empty() => Ok(Self::Usage { account: (*account).to_string() }),
+            ["usage", provider, account] if !provider.is_empty() && !account.is_empty() => {
+                Ok(Self::Usage { provider: (*provider).to_string(), account: (*account).to_string() })
+            }
             _ => Err(format!(
-                "invalid leaf address `{value}`; expected convoy/<name>, vessel/<name>, work/<convoy>/<work>, cr/<service>/<scope>/<number>, or usage/<account>"
+                "invalid leaf address `{value}`; expected convoy/<name>, vessel/<name>, work/<convoy>/<work>, cr/<service>/<scope>/<number>, or usage/<provider>/<account>"
             )),
         }
     }
@@ -94,7 +96,7 @@ impl fmt::Display for LeafAddress {
             Self::Vessel { name } => write!(f, "vessel/{name}"),
             Self::Work { convoy, work } => write!(f, "work/{convoy}/{work}"),
             Self::ChangeRequest { service, scope, number } => write!(f, "cr/{service}/{scope}/{number}"),
-            Self::Usage { account } => write!(f, "usage/{account}"),
+            Self::Usage { provider, account } => write!(f, "usage/{provider}/{account}"),
         }
     }
 }
@@ -229,8 +231,8 @@ mod tests {
 
     #[test]
     fn parses_subject_keyed_usage_address() {
-        let leaf: Leaf = "usage/user@example.com .windows.weekly.used-percent > 90".parse().expect("parse usage leaf");
-        assert_eq!(leaf.address, LeafAddress::Usage { account: "user@example.com".to_string() });
-        assert_eq!(leaf.to_string(), "usage/user@example.com .windows.weekly.used-percent > 90");
+        let leaf: Leaf = "usage/codex/user@example.com .windows.weekly.used-percent > 90".parse().expect("parse usage leaf");
+        assert_eq!(leaf.address, LeafAddress::Usage { provider: "codex".to_string(), account: "user@example.com".to_string() });
+        assert_eq!(leaf.to_string(), "usage/codex/user@example.com .windows.weekly.used-percent > 90");
     }
 }

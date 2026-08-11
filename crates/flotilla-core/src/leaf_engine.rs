@@ -733,8 +733,8 @@ fn evaluate_row(
                 });
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
             }
-            LeafAddress::Usage { account } => {
-                let name = flotilla_resources::usage_record_name(account);
+            LeafAddress::Usage { provider, account } => {
+                let name = flotilla_resources::usage_record_name(provider, account);
                 let subject = usages.get(&name).map(UsageLeafSubject);
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
             }
@@ -994,12 +994,14 @@ mod tests {
     #[tokio::test]
     async fn usage_leaf_fires_from_the_named_window_in_the_replicated_resource_path() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let provider = "codex";
         let account = "user@example.com";
         let records = backend.using::<Usage>("flotilla");
         let created = records
-            .create(&InputMeta::builder().name(flotilla_resources::usage_record_name(account)).build(), &flotilla_resources::UsageSpec {
-                account: account.to_string(),
-            })
+            .create(
+                &InputMeta::builder().name(flotilla_resources::usage_record_name(provider, account)).build(),
+                &flotilla_resources::UsageSpec { provider: provider.to_string(), account: account.to_string() },
+            )
             .await
             .expect("create usage record");
         records
@@ -1007,7 +1009,6 @@ mod tests {
                 &created.metadata.name,
                 &created.metadata.resource_version,
                 &flotilla_resources::UsageStatus::builder()
-                    .provider("codex")
                     .windows(vec![
                         flotilla_resources::UsageWindow::builder().name("session").used_percent(8.0).build(),
                         flotilla_resources::UsageWindow::builder().name("weekly").used_percent(100.0).build(),
@@ -1027,7 +1028,8 @@ mod tests {
         );
         let table = LeafSubscriptionTable::new(backend, event_tx.clone(), refresher);
         let mut events = event_tx.subscribe();
-        let mut usage_leaf = leaf(LeafAddress::Usage { account: account.to_string() }, ".windows.weekly.used-percent", "90");
+        let mut usage_leaf =
+            leaf(LeafAddress::Usage { provider: provider.to_string(), account: account.to_string() }, ".windows.weekly.used-percent", "90");
         usage_leaf.operator = LeafOperator::GreaterThan;
         let subscription_id = table
             .subscribe_wait(uuid::Uuid::new_v4(), WaitSubscriptionRequest {

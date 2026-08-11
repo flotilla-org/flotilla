@@ -19,15 +19,16 @@ impl Resource for Usage {
         if current == requested {
             Ok(())
         } else {
-            Err(ResourceError::invalid("Usage account subject is immutable"))
+            Err(ResourceError::invalid("Usage subject is immutable"))
         }
     }
 }
 
-/// The account is the stable subject. Provider, plan, organization, and quota
-/// data are observations because each can change independently over time.
+/// An account at a provider is the stable subject. Plan, organization, and
+/// quota data are observations because each can change independently over time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageSpec {
+    pub provider: String,
     pub account: String,
 }
 
@@ -78,7 +79,6 @@ pub struct UsageProviderCost {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct UsageStatus {
-    pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,12 +111,15 @@ impl StatusPatch<UsageStatus> for UsageStatusPatch {
     }
 }
 
-/// Produce a DNS-safe, fixed-size resource name for a raw account subject.
-pub fn usage_record_name(account: &str) -> String {
-    let normalized = account.trim().to_lowercase();
+/// Produce a DNS-safe, fixed-size resource name for a provider/account subject.
+pub fn usage_record_name(provider: &str, account: &str) -> String {
+    let normalized_provider = provider.trim().to_lowercase();
+    let normalized_account = account.trim().to_lowercase();
     let mut hash = Sha256::new();
-    hash.update(b"usage-account-v1\0");
-    hash.update(normalized.as_bytes());
+    hash.update(b"usage-account-v2\0");
+    hash.update(normalized_provider.as_bytes());
+    hash.update(b"\0");
+    hash.update(normalized_account.as_bytes());
     let digest = format!("{:x}", hash.finalize());
     format!("usage-{}", &digest[..54])
 }
@@ -128,7 +131,6 @@ mod tests {
 
     fn status(used_percent: f64, observed_at: DateTime<Utc>) -> UsageStatus {
         UsageStatus::builder()
-            .provider("codex")
             .windows(vec![UsageWindow::builder().name("weekly").used_percent(used_percent).build()])
             .observed_at(observed_at)
             .build()
@@ -137,7 +139,10 @@ mod tests {
     async fn assert_observation_history_is_thin(backend: ResourceBackend) {
         let records = backend.using::<Usage>("flotilla");
         let created = records
-            .create(&InputMeta::builder().name("usage-account".to_string()).build(), &UsageSpec { account: "user@example.com".to_string() })
+            .create(&InputMeta::builder().name("usage-account".to_string()).build(), &UsageSpec {
+                provider: "codex".to_string(),
+                account: "user@example.com".to_string(),
+            })
             .await
             .expect("create usage observation");
         let first = records
@@ -154,11 +159,24 @@ mod tests {
     }
 
     #[test]
-    fn account_record_names_are_stable_case_insensitive_and_bounded() {
-        let lower = usage_record_name("user@example.com");
-        assert_eq!(lower, usage_record_name(" User@Example.COM "));
+    fn provider_account_record_names_are_stable_case_insensitive_and_bounded() {
+        let lower = usage_record_name("codex", "user@example.com");
+        assert_eq!(lower, usage_record_name(" CODEX ", " User@Example.COM "));
         assert!(lower.starts_with("usage-"));
         assert_eq!(lower.len(), 60);
+    }
+
+    #[test]
+    fn same_account_at_different_providers_has_distinct_record_names() {
+        assert_ne!(usage_record_name("codex", "user@example.com"), usage_record_name("claude", "user@example.com"));
+    }
+
+    #[test]
+    fn provider_and_account_are_one_immutable_subject() {
+        let current = UsageSpec { provider: "codex".to_string(), account: "user@example.com".to_string() };
+        assert!(Usage::validate_spec_update(&current, &current).is_ok());
+        assert!(Usage::validate_spec_update(&current, &UsageSpec { provider: "claude".to_string(), ..current.clone() }).is_err());
+        assert!(Usage::validate_spec_update(&current, &UsageSpec { account: "other@example.com".to_string(), ..current.clone() }).is_err());
     }
 
     #[tokio::test]

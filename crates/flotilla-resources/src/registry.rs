@@ -945,6 +945,7 @@ mod tests {
         backend
             .using::<Usage>("flotilla")
             .create(&InputMeta::builder().name("usage-account".to_string()).build(), &crate::UsageSpec {
+                provider: "codex".to_string(),
                 account: "ada@example.com".to_string(),
             })
             .await
@@ -956,7 +957,6 @@ mod tests {
             "usages",
             "usage-account",
             serde_json::json!({
-                "provider": "codex",
                 "windows": [{"name": "weekly", "used_percent": 42.0}],
                 "observed_at": "2026-08-10T10:00:00Z",
             }),
@@ -967,7 +967,7 @@ mod tests {
         assert_eq!(patched.kind, "Usage");
         assert_eq!(patched.value["status"]["windows"][0]["used_percent"], 42.0);
 
-        let error = patch_resource_status(&backend, "flotilla", "usages", "usage-account", serde_json::json!({"provider": "codex"}))
+        let error = patch_resource_status(&backend, "flotilla", "usages", "usage-account", serde_json::json!({"windows": []}))
             .await
             .expect_err("malformed status should fail typed decoding");
         assert!(error.to_string().contains("decode Usage status"));
