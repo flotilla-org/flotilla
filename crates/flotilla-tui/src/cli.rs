@@ -728,7 +728,17 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::ResourceDeleted(response) => {
             let name = response.value["metadata"]["name"].as_str().unwrap_or("<unknown>");
             let api_version = response.value["apiVersion"].as_str().unwrap_or("<unknown>");
-            format!("deleted {api_version}/{}/{}/{name}\nControllers may recreate code-owned objects.", response.kind, response.namespace,)
+            if let Some(origin_root) = &response.replica_origin {
+                format!(
+                    "collected replica {api_version}/{}/{}/{name} from {origin_root}\nA newer update from the authority may recreate it.",
+                    response.kind, response.namespace,
+                )
+            } else {
+                format!(
+                    "deleted {api_version}/{}/{}/{name}\nControllers may recreate code-owned objects.",
+                    response.kind, response.namespace,
+                )
+            }
         }
         CommandValue::ResourceWatchEvent(response) => flotilla_protocol::output::json_pretty(response),
         CommandValue::EnvironmentSpecRead { .. } => "environment spec read".to_string(),

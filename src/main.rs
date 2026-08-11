@@ -348,6 +348,12 @@ struct ResourceDeleteArgs {
     /// Resource namespace
     #[arg(long, default_value = "flotilla")]
     namespace: String,
+    /// Collect a read-only replica from this origin root
+    #[arg(long, value_name = "ORIGIN_ROOT")]
+    replica: Option<String>,
+    /// Route the deletion to a peer host
+    #[arg(long)]
+    host: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -1147,13 +1153,19 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
             .await
         }
         ResourceSubCommand::Delete(args) => {
+            let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
             run_control_command(
                 cli,
                 Command {
-                    node_id: None,
+                    node_id,
                     provisioning_target: None,
                     context_repo: None,
-                    action: CommandAction::ResourceDelete { namespace: args.namespace, kind: args.kind, name: args.name },
+                    action: CommandAction::ResourceDelete {
+                        namespace: args.namespace,
+                        kind: args.kind,
+                        name: args.name,
+                        replica_origin: args.replica.map(flotilla_protocol::NodeId::new),
+                    },
                 },
                 format,
             )
@@ -2153,8 +2165,22 @@ mod tests {
         assert!(matches!(
             delete.command,
             Some(SubCommand::Resource {
-                command: ResourceSubCommand::Delete(ResourceDeleteArgs { kind, name, namespace })
+                command: ResourceSubCommand::Delete(ResourceDeleteArgs { kind, name, namespace, replica: None, host: None })
             }) if kind == "workflowtemplates" && name == "scratch" && namespace == "ops"
+        ));
+
+        let collect =
+            Cli::try_parse_from(["flotilla", "resource", "delete", "convoys", "orphan", "--replica", "retired-root", "--host", "feta"])
+                .expect("replica collection should parse");
+        assert!(matches!(
+            collect.command,
+            Some(SubCommand::Resource {
+                command: ResourceSubCommand::Delete(ResourceDeleteArgs {
+                    replica: Some(origin),
+                    host: Some(host),
+                    ..
+                })
+            }) if origin == "retired-root" && host == "feta"
         ));
 
         let apply = Cli::try_parse_from(["flotilla", "resource", "apply", "-f", "demand.yaml", "--namespace", "ops"])
