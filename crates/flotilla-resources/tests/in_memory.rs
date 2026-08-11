@@ -6,8 +6,8 @@ use common::{
     contract::{
         assert_consumer_relists_after_expired_watch_and_converges_with_backend, assert_create_get_list_roundtrip,
         assert_delete_emits_event, assert_identical_status_update_is_noop_with_backend, assert_identical_update_is_noop_with_backend,
-        assert_metadata_roundtrip, assert_namespace_isolation, assert_project_definition_causal_merge_with_backend,
-        assert_project_definition_delete_conflicts_with_concurrent_edit_with_backend,
+        assert_metadata_roundtrip, assert_missing_authority_delete_tombstones_replica_with_backend, assert_namespace_isolation,
+        assert_project_definition_causal_merge_with_backend, assert_project_definition_delete_conflicts_with_concurrent_edit_with_backend,
         assert_project_definition_edit_converges_with_backend, assert_project_definition_edit_preserves_unrelated_conflict_with_backend,
         assert_project_definition_metadata_edit_converges_with_backend,
         assert_project_definition_optional_field_can_be_cleared_with_backend,
@@ -129,6 +129,11 @@ async fn replica_read_view_contract() {
 #[tokio::test]
 async fn replica_events_ignore_stale_writes_and_deletes() {
     assert_replica_events_ignore_stale_writes_and_deletes_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}
+
+#[tokio::test]
+async fn missing_authority_delete_tombstones_replica() {
+    assert_missing_authority_delete_tombstones_replica_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await;
 }
 
 #[tokio::test]

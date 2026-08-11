@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::NodeId;
 use serde::{Deserialize, Serialize};
 
-use crate::{Resource, ResourceObject, WatchEvent};
+use crate::{Resource, ResourceObject, ResourceTombstone, WatchEvent};
 
 pub(crate) const ORIGIN_ROOT_ANNOTATION: &str = "flotilla.work/origin-root";
 pub(crate) const LAST_SYNCED_AT_ANNOTATION: &str = "flotilla.work/last-synced-at";
@@ -54,6 +54,7 @@ pub enum ReadWatchEvent<T: Resource> {
     Added(ReadResourceObject<T>),
     Modified(ReadResourceObject<T>),
     Deleted(ReadResourceObject<T>),
+    DeletedByName { tombstone: ResourceTombstone, provenance: ResourceProvenance },
 }
 
 impl<T: Resource> ReadWatchEvent<T> {
@@ -62,6 +63,7 @@ impl<T: Resource> ReadWatchEvent<T> {
             WatchEvent::Added(object) => Self::Added(ReadResourceObject { object, provenance: ResourceProvenance::Local }),
             WatchEvent::Modified(object) => Self::Modified(ReadResourceObject { object, provenance: ResourceProvenance::Local }),
             WatchEvent::Deleted(object) => Self::Deleted(ReadResourceObject { object, provenance: ResourceProvenance::Local }),
+            WatchEvent::DeletedByName(tombstone) => Self::DeletedByName { tombstone, provenance: ResourceProvenance::Local },
         }
     }
 }

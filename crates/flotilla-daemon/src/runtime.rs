@@ -7614,7 +7614,7 @@ mod tests {
                 .expect("convoy watch event");
             let convoy = match event {
                 flotilla_resources::WatchEvent::Added(convoy) | flotilla_resources::WatchEvent::Modified(convoy) => convoy,
-                flotilla_resources::WatchEvent::Deleted(_) => continue,
+                flotilla_resources::WatchEvent::Deleted(_) | flotilla_resources::WatchEvent::DeletedByName(_) => continue,
             };
             let Some(status) = convoy.status else { continue };
             saw_interrupted_work |= status.work.get("implement").is_some_and(|work| work.phase == WorkPhase::Interrupted);

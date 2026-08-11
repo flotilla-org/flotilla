@@ -20,7 +20,7 @@ use crate::{
     retention::{
         EventRetention, ResourceDecodeQuarantine, ResourceEventDecodeQuarantine, ResourceStoreDiagnostics, MAX_FIELD_OWNERSHIP_VIOLATIONS,
     },
-    watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
+    watch::{ResourceList, ResourceTombstone, WatchEvent, WatchStart, WatchStream},
     FieldOwnershipViolation,
 };
 
@@ -29,6 +29,15 @@ type WatchSender = mpsc::UnboundedSender<StoredEvent>;
 type WatchersByStore = HashMap<StoreKey, Vec<WatchSender>>;
 type ReplicaWatchSender = mpsc::UnboundedSender<StoredReplicaEvent>;
 type ReplicaWatchersByStore = HashMap<StoreKey, Vec<ReplicaWatchSender>>;
+
+#[derive(bon::Builder)]
+struct ReplicaMutation {
+    kind: StoredReplicaEventKind,
+    name: String,
+    resource_version: String,
+    value: Value,
+    synced_at: DateTime<Utc>,
+}
 
 #[derive(Debug, Clone, bon::Builder)]
 #[builder(builder_type(vis = "pub(in crate::sqlite)"))]
@@ -489,13 +498,51 @@ impl SqliteBackend {
         serde_json::to_value(object.to_k8s_object()).map_err(|err| ResourceError::decode(format!("encode object: {err}")))
     }
 
-    fn decode_event<T: Resource>(event: StoredEvent) -> Result<WatchEvent<T>, ResourceError> {
-        let object = Self::decode_object::<T>(event.object)?;
-        Ok(match event.kind {
-            StoredEventKind::Added => WatchEvent::Added(object),
-            StoredEventKind::Modified => WatchEvent::Modified(object),
-            StoredEventKind::Deleted => WatchEvent::Deleted(object),
+    fn encode_tombstone<T: Resource>(tombstone: &ResourceTombstone) -> Value {
+        serde_json::json!({
+            "apiVersion": format!("{}/{}", T::API_PATHS.group, T::API_PATHS.version),
+            "kind": T::API_PATHS.kind,
+            "metadata": {
+                "name": tombstone.name,
+                "namespace": tombstone.namespace,
+                "resourceVersion": tombstone.resource_version,
+                "annotations": tombstone.annotations,
+            },
         })
+    }
+
+    fn decode_tombstone(value: Value) -> Result<ResourceTombstone, ResourceError> {
+        let metadata = value.get("metadata").ok_or_else(|| ResourceError::decode("decode tombstone: missing metadata"))?;
+        let name = metadata
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ResourceError::decode("decode tombstone: missing name"))?
+            .to_string();
+        let resource_version = metadata
+            .get("resourceVersion")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ResourceError::decode("decode tombstone: missing resourceVersion"))?
+            .to_string();
+        let namespace = metadata.get("namespace").and_then(Value::as_str).unwrap_or_default().to_string();
+        let annotations = metadata
+            .get("annotations")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| ResourceError::decode(format!("decode tombstone annotations: {error}")))?
+            .unwrap_or_default();
+        Ok(ResourceTombstone { name, namespace, resource_version, annotations })
+    }
+
+    fn decode_event<T: Resource>(event: StoredEvent) -> Result<WatchEvent<T>, ResourceError> {
+        match event.kind {
+            StoredEventKind::Added => Self::decode_object::<T>(event.object).map(WatchEvent::Added),
+            StoredEventKind::Modified => Self::decode_object::<T>(event.object).map(WatchEvent::Modified),
+            StoredEventKind::Deleted => match Self::decode_object::<T>(event.object.clone()) {
+                Ok(object) => Ok(WatchEvent::Deleted(object)),
+                Err(_) => Self::decode_tombstone(event.object).map(WatchEvent::DeletedByName),
+            },
+        }
     }
 
     fn map_sqlite(err: rusqlite::Error, action: &str) -> ResourceError {
@@ -733,17 +780,22 @@ impl SqliteBackend {
             .push(tx);
         Ok(stream::unfold(rx, |mut rx| async {
             let event = rx.recv().await?;
-            let decoded = Self::decode_object::<T>(event.object).map(|object| {
-                let object = ReadResourceObject {
-                    object,
-                    provenance: ResourceProvenance::Replica { origin_root: event.origin_root, last_synced_at: event.synced_at },
-                };
-                match event.kind {
-                    StoredReplicaEventKind::Added => ReadWatchEvent::Added(object),
-                    StoredReplicaEventKind::Modified => ReadWatchEvent::Modified(object),
-                    StoredReplicaEventKind::Deleted => ReadWatchEvent::Deleted(object),
+            let provenance = ResourceProvenance::Replica { origin_root: event.origin_root, last_synced_at: event.synced_at };
+            let decoded = if matches!(event.kind, StoredReplicaEventKind::Deleted) {
+                match Self::decode_object::<T>(event.object.clone()) {
+                    Ok(object) => Ok(ReadWatchEvent::Deleted(ReadResourceObject { object, provenance })),
+                    Err(_) => Self::decode_tombstone(event.object).map(|tombstone| ReadWatchEvent::DeletedByName { tombstone, provenance }),
                 }
-            });
+            } else {
+                Self::decode_object::<T>(event.object).map(|object| {
+                    let object = ReadResourceObject { object, provenance };
+                    match event.kind {
+                        StoredReplicaEventKind::Added => ReadWatchEvent::Added(object),
+                        StoredReplicaEventKind::Modified => ReadWatchEvent::Modified(object),
+                        StoredReplicaEventKind::Deleted => unreachable!("deleted replica events handled above"),
+                    }
+                })
+            };
             Some((decoded, rx))
         })
         .boxed())
@@ -876,12 +928,48 @@ impl SqliteBackend {
         object: &ResourceObject<T>,
         synced_at: DateTime<Utc>,
     ) -> Result<(), ResourceError> {
-        let key = Self::store_key::<T>(namespace);
-        let operation_key = key.clone();
-        let origin = origin_root.to_string();
         let name = object.metadata.name.clone();
         let resource_version = object.metadata.resource_version.clone();
         let value = Self::encode_object(object)?;
+        self.apply_replica_value::<T>(
+            origin_root,
+            namespace,
+            ReplicaMutation::builder().kind(kind).name(name).resource_version(resource_version).value(value).synced_at(synced_at).build(),
+        )
+        .await
+    }
+
+    pub(crate) async fn apply_replica_tombstone_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+        tombstone: &ResourceTombstone,
+        synced_at: DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        self.apply_replica_value::<T>(
+            origin_root,
+            namespace,
+            ReplicaMutation::builder()
+                .kind(StoredReplicaEventKind::Deleted)
+                .name(tombstone.name.clone())
+                .resource_version(tombstone.resource_version.clone())
+                .value(Self::encode_tombstone::<T>(tombstone))
+                .synced_at(synced_at)
+                .build(),
+        )
+        .await
+    }
+
+    async fn apply_replica_value<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+        mutation: ReplicaMutation,
+    ) -> Result<(), ResourceError> {
+        let ReplicaMutation { kind, name, resource_version, value, synced_at } = mutation;
+        let key = Self::store_key::<T>(namespace);
+        let operation_key = key.clone();
+        let origin = origin_root.to_string();
         let body =
             serde_json::to_string(&value).map_err(|err| ResourceError::decode(format!("encode sqlite replica event JSON: {err}")))?;
         let synced = synced_at.to_rfc3339();
@@ -1392,6 +1480,35 @@ impl SqliteBackend {
             tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource delete"))?;
             Self::notify_watchers(&watchers, &key, StoredEvent { kind: event_kind, object: encoded });
             Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn tombstone_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ResourceTombstone, ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        let namespace = namespace.to_string();
+        let name = name.to_string();
+        let watchers = Arc::clone(&self.watchers);
+        let event_retention = self.event_retention;
+        self.call(move |connection| {
+            let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource tombstone"))?;
+            if Self::select_existing::<T>(&tx, &key, &name)?.is_some() {
+                return Err(ResourceError::conflict(&name, "cannot tombstone an existing resource by name"));
+            }
+            let version = Self::allocate_version(&tx, &key)?;
+            let tombstone = ResourceTombstone {
+                name: name.clone(),
+                namespace: namespace.clone(),
+                resource_version: version.to_string(),
+                annotations: BTreeMap::new(),
+            };
+            let encoded = Self::encode_tombstone::<T>(&tombstone);
+            let body_json =
+                serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode tombstone JSON: {err}")))?;
+            Self::insert_event(&tx, &key, version, StoredEventKind::Deleted, &body_json, event_retention, T::REPLICATION_CLASS)?;
+            tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource tombstone"))?;
+            Self::notify_watchers(&watchers, &key, StoredEvent { kind: StoredEventKind::Deleted, object: encoded });
+            Ok(tombstone)
         })
         .await
     }

@@ -75,6 +75,16 @@ pub enum WatchEvent<T: Resource> {
     Added(ResourceObject<T>),
     Modified(ResourceObject<T>),
     Deleted(ResourceObject<T>),
+    DeletedByName(ResourceTombstone),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceTombstone {
+    pub name: String,
+    pub namespace: String,
+    pub resource_version: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub annotations: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

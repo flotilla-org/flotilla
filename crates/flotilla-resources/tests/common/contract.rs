@@ -3,9 +3,10 @@ use std::{collections::BTreeSet, time::Duration};
 use chrono::Utc;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    Convoy, Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, InMemoryBackend, InputMeta, IssueSource, OwnerReference,
-    PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RepositoryKey,
-    Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TypedResolver, WatchEvent, WatchStart, WorkflowTemplate,
+    delete_resource_kind, Convoy, Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, InMemoryBackend, InputMeta, IssueSource,
+    OwnerReference, PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, RegardSpec,
+    RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TypedResolver, WatchEvent, WatchStart,
+    WorkflowTemplate,
 };
 use futures::StreamExt;
 use tokio::time::timeout;
@@ -305,6 +306,34 @@ pub async fn assert_replica_events_ignore_stale_writes_and_deletes_with_backend(
         backend.including_replicas::<Convoy>("flotilla").list().await.expect("list recreated replica").items.len(),
         1,
         "a write newer than the delete tombstone should recreate the replica"
+    );
+}
+
+pub async fn assert_missing_authority_delete_tombstones_replica_with_backend(backend: ResourceBackend) {
+    let origin = flotilla_protocol::NodeId::new("authority-root");
+    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    source
+        .using::<Convoy>("flotilla")
+        .create(&convoy_meta("lost-at-authority"), &convoy_spec("template"))
+        .await
+        .expect("create stale source object");
+    let stale = source.using::<Convoy>("flotilla").list().await.expect("list stale source object");
+    backend.replica_writer::<Convoy>(origin.clone(), "flotilla").replace(&stale, Utc::now()).await.expect("seed stale replica");
+
+    let local = backend.using::<Convoy>("flotilla");
+    let listed = local.list().await.expect("list empty authority store");
+    let mut watch = local.watch(WatchStart::resuming_from(&listed)).await.expect("watch authority store");
+    delete_resource_kind(&backend, "flotilla", "convoys", "lost-at-authority").await.expect("delete missing authority object");
+    let event = timeout(Duration::from_secs(1), watch.next())
+        .await
+        .expect("authority tombstone timeout")
+        .expect("authority watch ended")
+        .expect("authority watch failed");
+    assert!(matches!(&event, WatchEvent::DeletedByName(tombstone) if tombstone.name == "lost-at-authority"));
+    backend.replica_writer::<Convoy>(origin, "flotilla").apply(event, Utc::now()).await.expect("apply authority tombstone to replica");
+    assert!(
+        backend.including_replicas::<Convoy>("flotilla").list().await.expect("list converged replica view").items.is_empty(),
+        "the name tombstone must remove the stale replica"
     );
 }
 

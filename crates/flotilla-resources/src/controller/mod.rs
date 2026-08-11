@@ -226,6 +226,7 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelMappedWatch<W, P> {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
                         Self::enqueue_from_object(self.label_key, &sender, &object).await?;
                     }
+                    WatchEvent::DeletedByName(_) => {}
                 }
             }
             Ok(())
@@ -264,6 +265,7 @@ impl<W: Resource, P: Resource> SecondaryWatch for ResolverLabelMappedWatch<W, P>
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
                         LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, &object).await?;
                     }
+                    WatchEvent::DeletedByName(_) => {}
                 }
             }
             Ok(())
@@ -302,6 +304,7 @@ impl<W: Resource, P: Resource> SecondaryWatch for ReplicaLabelMappedWatch<W, P> 
                     crate::ReadWatchEvent::Added(source)
                     | crate::ReadWatchEvent::Modified(source)
                     | crate::ReadWatchEvent::Deleted(source) => source,
+                    crate::ReadWatchEvent::DeletedByName { .. } => continue,
                 };
                 LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, &source.object).await?;
             }
@@ -352,6 +355,7 @@ impl SecondaryWatch for ReplicaConvoyCheckoutWatch {
                     crate::ReadWatchEvent::Added(source)
                     | crate::ReadWatchEvent::Modified(source)
                     | crate::ReadWatchEvent::Deleted(source) => source,
+                    crate::ReadWatchEvent::DeletedByName { .. } => continue,
                 };
                 Self::enqueue_checkouts(&sender, &source.object).await?;
             }
@@ -415,6 +419,7 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelJoinWatch<W, P> {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
                         Self::enqueue_matching_primaries(self.label_key, &sender, &object, &primaries).await?;
                     }
+                    WatchEvent::DeletedByName(_) => {}
                 }
             }
             Ok(())
@@ -562,6 +567,12 @@ impl<R: Reconciler> ControllerLoop<R> {
                                 .send(object.metadata.name)
                                 .await
                                 .map_err(|_| ResourceError::other("controller queue closed while forwarding primary watch event"))?;
+                        }
+                        WatchEvent::DeletedByName(tombstone) => {
+                            sender
+                                .send(tombstone.name)
+                                .await
+                                .map_err(|_| ResourceError::other("controller queue closed while forwarding primary tombstone"))?;
                         }
                     }
                 }

@@ -18,7 +18,7 @@ use crate::{
         ApiPaths, InputMeta, K8sInputResourceObject, K8sResourceList, K8sResourceObject, K8sStatusResourceObject, K8sWatchEvent, Resource,
         ResourceObject,
     },
-    watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
+    watch::{ResourceList, ResourceTombstone, WatchEvent, WatchStart, WatchStream},
 };
 
 #[derive(Debug, Clone)]
@@ -239,6 +239,10 @@ impl HttpBackend {
         Self::expect_success(response, Some(name)).await
     }
 
+    pub(crate) async fn tombstone_typed<T: Resource>(&self, _namespace: &str, _name: &str) -> Result<ResourceTombstone, ResourceError> {
+        Err(ResourceError::invalid(format!("HTTP backends cannot author {} tombstones", T::API_PATHS.kind)))
+    }
+
     pub(crate) async fn watch_typed<T: Resource>(&self, namespace: &str, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
         let mut query = vec![("watch", Cow::Borrowed("true"))];
@@ -357,6 +361,21 @@ fn read_watch_event<T: Resource>(event: WatchEvent<T>) -> Result<ReadWatchEvent<
         WatchEvent::Added(object) => read_resource_object(object).map(ReadWatchEvent::Added),
         WatchEvent::Modified(object) => read_resource_object(object).map(ReadWatchEvent::Modified),
         WatchEvent::Deleted(object) => read_resource_object(object).map(ReadWatchEvent::Deleted),
+        WatchEvent::DeletedByName(tombstone) => {
+            let origin = tombstone.annotations.get(ORIGIN_ROOT_ANNOTATION);
+            let synced_at = tombstone.annotations.get(LAST_SYNCED_AT_ANNOTATION);
+            let provenance = match (origin, synced_at) {
+                (None, None) => ResourceProvenance::Local,
+                (Some(origin), Some(synced_at)) => ResourceProvenance::Replica {
+                    origin_root: flotilla_protocol::NodeId::new(origin.clone()),
+                    last_synced_at: chrono::DateTime::parse_from_rfc3339(synced_at)
+                        .map_err(|error| ResourceError::decode(format!("decode replica tombstone sync timestamp: {error}")))?
+                        .with_timezone(&chrono::Utc),
+                },
+                _ => return Err(ResourceError::decode("replica tombstone provenance annotations are incomplete")),
+            };
+            Ok(ReadWatchEvent::DeletedByName { tombstone, provenance })
+        }
     }
 }
 
@@ -393,7 +412,29 @@ fn map_status_error(status: StatusCode, bytes: &[u8], resource_name: Option<&str
 }
 
 fn parse_watch_line<T: Resource>(line: &[u8]) -> Result<WatchEvent<T>, ResourceError> {
-    let event =
-        serde_json::from_slice::<K8sWatchEvent<T>>(line).map_err(|err| ResourceError::decode(format!("decode watch event: {err}")))?;
-    event.into_watch_event()
+    match serde_json::from_slice::<K8sWatchEvent<T>>(line) {
+        Ok(event) => event.into_watch_event(),
+        Err(typed_error) => {
+            let value: serde_json::Value =
+                serde_json::from_slice(line).map_err(|_| ResourceError::decode(format!("decode watch event: {typed_error}")))?;
+            if value["type"].as_str() != Some("DELETED") {
+                return Err(ResourceError::decode(format!("decode watch event: {typed_error}")));
+            }
+            let metadata = &value["object"]["metadata"];
+            let name =
+                metadata["name"].as_str().ok_or_else(|| ResourceError::decode("decode tombstone watch event: missing name"))?.to_string();
+            let resource_version = metadata["resourceVersion"]
+                .as_str()
+                .ok_or_else(|| ResourceError::decode("decode tombstone watch event: missing resourceVersion"))?
+                .to_string();
+            let namespace = metadata["namespace"].as_str().unwrap_or_default().to_string();
+            let annotations = metadata["annotations"]
+                .as_object()
+                .map(|annotations| {
+                    annotations.iter().filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string()))).collect()
+                })
+                .unwrap_or_default();
+            Ok(WatchEvent::DeletedByName(ResourceTombstone { name, namespace, resource_version, annotations }))
+        }
+    }
 }
