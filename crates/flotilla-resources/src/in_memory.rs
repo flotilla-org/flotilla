@@ -15,7 +15,7 @@ use crate::{
     replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, K8sResourceObject, MergeMetadata, ObjectMeta, Resource, ResourceObject},
     retention::{EventRetention, ResourceStoreDiagnostics, MAX_FIELD_OWNERSHIP_VIOLATIONS},
-    watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
+    watch::{ResourceList, ResourceTombstone, WatchEvent, WatchStart, WatchStream},
 };
 
 type StoreKey = (String, String, String, String);
@@ -257,17 +257,25 @@ impl InMemoryBackend {
         self.replicas.lock().await.watchers.entry(key).or_default().push(tx);
         Ok(stream::unfold(rx, |mut rx| async {
             let event = rx.recv().await?;
-            let decoded = Self::decode_object::<T>(event.object).map(|object| {
-                let object = ReadResourceObject {
-                    object,
-                    provenance: ResourceProvenance::Replica { origin_root: event.origin_root, last_synced_at: event.synced_at },
-                };
-                match event.kind {
-                    StoredReplicaEventKind::Added => ReadWatchEvent::Added(object),
-                    StoredReplicaEventKind::Modified => ReadWatchEvent::Modified(object),
-                    StoredReplicaEventKind::Deleted => ReadWatchEvent::Deleted(object),
+            let provenance = ResourceProvenance::Replica { origin_root: event.origin_root, last_synced_at: event.synced_at };
+            let decoded = if matches!(event.kind, StoredReplicaEventKind::Deleted) {
+                // Name-only tombstones deliberately omit `spec`; a present but
+                // malformed spec is a corrupt object and must remain an error.
+                if event.object.get("spec").is_some() {
+                    Self::decode_object::<T>(event.object).map(|object| ReadWatchEvent::Deleted(ReadResourceObject { object, provenance }))
+                } else {
+                    Self::decode_tombstone(event.object).map(|tombstone| ReadWatchEvent::DeletedByName { tombstone, provenance })
                 }
-            });
+            } else {
+                Self::decode_object::<T>(event.object).map(|object| {
+                    let object = ReadResourceObject { object, provenance };
+                    match event.kind {
+                        StoredReplicaEventKind::Added => ReadWatchEvent::Added(object),
+                        StoredReplicaEventKind::Modified => ReadWatchEvent::Modified(object),
+                        StoredReplicaEventKind::Deleted => unreachable!("deleted replica events handled above"),
+                    }
+                })
+            };
             Some((decoded, rx))
         })
         .boxed())
@@ -379,6 +387,41 @@ impl InMemoryBackend {
         Ok(())
     }
 
+    pub(crate) async fn apply_replica_tombstone_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+        tombstone: &ResourceTombstone,
+        synced_at: chrono::DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        let store_key = Self::store_key::<T>(namespace);
+        let replica_key = (origin_root.clone(), store_key.clone());
+        let encoded = Self::encode_tombstone::<T>(tombstone);
+        let mut state = self.replicas.lock().await;
+        let partition = state.partitions.entry(replica_key).or_default();
+        let unchanged = match partition.synced_at_by_name.get(&tombstone.name) {
+            Some(existing_synced_at) if existing_synced_at > &synced_at => true,
+            Some(existing_synced_at) if existing_synced_at == &synced_at => !partition.objects.contains_key(&tombstone.name),
+            _ => false,
+        };
+        if unchanged {
+            return Ok(());
+        }
+        partition.objects.remove(&tombstone.name);
+        partition.synced_at_by_name.insert(tombstone.name.clone(), synced_at);
+        partition.cursor = Some(ReplicaCursor {
+            resource_version: tombstone.resource_version.clone(),
+            generation: partition.cursor.as_ref().and_then(|cursor| cursor.generation.clone()),
+        });
+        Self::notify_replica_watchers(&mut state, &store_key, StoredReplicaEvent {
+            origin_root: origin_root.clone(),
+            synced_at,
+            kind: StoredReplicaEventKind::Deleted,
+            object: encoded,
+        });
+        Ok(())
+    }
+
     pub(crate) async fn replica_cursor_typed<T: Resource>(
         &self,
         origin_root: &NodeId,
@@ -389,11 +432,51 @@ impl InMemoryBackend {
     }
 
     fn decode_event<T: Resource>(event: StoredEvent) -> Result<WatchEvent<T>, ResourceError> {
-        let object = Self::decode_object::<T>(event.object)?;
-        Ok(match event.kind {
-            StoredEventKind::Added => WatchEvent::Added(object),
-            StoredEventKind::Modified => WatchEvent::Modified(object),
-            StoredEventKind::Deleted => WatchEvent::Deleted(object),
+        match event.kind {
+            StoredEventKind::Added => Self::decode_object::<T>(event.object).map(WatchEvent::Added),
+            StoredEventKind::Modified => Self::decode_object::<T>(event.object).map(WatchEvent::Modified),
+            // Name-only tombstones deliberately omit `spec`; a present but
+            // malformed spec is a corrupt object and must remain an error.
+            StoredEventKind::Deleted if event.object.get("spec").is_none() => {
+                Self::decode_tombstone(event.object).map(WatchEvent::DeletedByName)
+            }
+            StoredEventKind::Deleted => Self::decode_object::<T>(event.object).map(WatchEvent::Deleted),
+        }
+    }
+
+    fn decode_tombstone(value: Value) -> Result<ResourceTombstone, ResourceError> {
+        let metadata = value.get("metadata").ok_or_else(|| ResourceError::decode("decode tombstone: missing metadata"))?;
+        let name = metadata
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ResourceError::decode("decode tombstone: missing name"))?
+            .to_string();
+        let resource_version = metadata
+            .get("resourceVersion")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ResourceError::decode("decode tombstone: missing resourceVersion"))?
+            .to_string();
+        let namespace = metadata.get("namespace").and_then(Value::as_str).unwrap_or_default().to_string();
+        let annotations = metadata
+            .get("annotations")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| ResourceError::decode(format!("decode tombstone annotations: {error}")))?
+            .unwrap_or_default();
+        Ok(ResourceTombstone { name, namespace, resource_version, annotations })
+    }
+
+    fn encode_tombstone<T: Resource>(tombstone: &ResourceTombstone) -> Value {
+        serde_json::json!({
+            "apiVersion": format!("{}/{}", T::API_PATHS.group, T::API_PATHS.version),
+            "kind": T::API_PATHS.kind,
+            "metadata": {
+                "name": tombstone.name,
+                "namespace": tombstone.namespace,
+                "resourceVersion": tombstone.resource_version,
+                "annotations": tombstone.annotations,
+            },
         })
     }
 
@@ -636,6 +719,27 @@ impl InMemoryBackend {
                 T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
             );
             Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn tombstone_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ResourceTombstone, ResourceError> {
+        self.with_store_mut::<T, _>(namespace, |store| {
+            if store.objects.contains_key(name) {
+                return Err(ResourceError::conflict(name, "cannot tombstone an existing resource by name"));
+            }
+            let version = store.allocate_version();
+            let tombstone = ResourceTombstone {
+                name: name.to_string(),
+                namespace: namespace.to_string(),
+                resource_version: version.to_string(),
+                annotations: BTreeMap::new(),
+            };
+            store.push_event(
+                StoredEvent { version, kind: StoredEventKind::Deleted, object: Self::encode_tombstone::<T>(&tombstone) },
+                T::REPLICATION_CLASS.event_retention(self.event_retention.max_events_per_resource_stream()),
+            );
+            Ok(tombstone)
         })
         .await
     }

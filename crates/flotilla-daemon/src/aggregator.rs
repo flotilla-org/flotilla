@@ -834,6 +834,10 @@ impl Aggregator {
                 let reference = self.presentation_ref(&presentation.metadata.namespace, &presentation.metadata.name);
                 self.presentations_by_source.entry(source).or_default().remove(&reference);
             }
+            WatchEvent::DeletedByName(tombstone) => {
+                let reference = self.presentation_ref(&tombstone.namespace, &tombstone.name);
+                self.presentations_by_source.entry(source).or_default().remove(&reference);
+            }
         }
         self.rebuild_local_projection().await;
     }
@@ -848,6 +852,10 @@ impl Aggregator {
                 let reference = self.demand_ref(&demand.metadata.namespace, &demand.metadata.name);
                 self.demands.remove(&reference);
             }
+            WatchEvent::DeletedByName(tombstone) => {
+                let reference = self.demand_ref(&tombstone.namespace, &tombstone.name);
+                self.demands.remove(&reference);
+            }
         }
         self.rebuild_local_projection().await;
     }
@@ -860,6 +868,10 @@ impl Aggregator {
             }
             WatchEvent::Deleted(regard) => {
                 let reference = self.regard_ref(&regard.metadata.namespace, &regard.metadata.name);
+                self.regards.remove(&reference);
+            }
+            WatchEvent::DeletedByName(tombstone) => {
+                let reference = self.regard_ref(&tombstone.namespace, &tombstone.name);
                 self.regards.remove(&reference);
             }
         }
@@ -877,16 +889,16 @@ impl Aggregator {
     }
 
     async fn apply_convoy_read_event_from(&mut self, source: LocalSource, event: ReadWatchEvent<Convoy>) {
-        let convoy = match &event {
-            ReadWatchEvent::Added(convoy) | ReadWatchEvent::Modified(convoy) | ReadWatchEvent::Deleted(convoy) => convoy,
+        let key = match &event {
+            ReadWatchEvent::Added(convoy) | ReadWatchEvent::Modified(convoy) | ReadWatchEvent::Deleted(convoy) => convoy_key(convoy),
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => tombstone_key(tombstone, provenance),
         };
-        let key = convoy_key(convoy);
         let previous = self.effective_convoys();
         match event {
             ReadWatchEvent::Added(convoy) | ReadWatchEvent::Modified(convoy) => {
                 self.convoys_by_source.entry(source).or_default().insert(key, convoy);
             }
-            ReadWatchEvent::Deleted(_) => {
+            ReadWatchEvent::Deleted(_) | ReadWatchEvent::DeletedByName { .. } => {
                 self.convoys_by_source.entry(source).or_default().remove(&key);
             }
         }
@@ -1255,6 +1267,9 @@ impl Aggregator {
             ReadWatchEvent::Deleted(session) => {
                 self.sessions_by_source.entry(source).or_default().remove(&session_key(&session));
             }
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => {
+                self.sessions_by_source.entry(source).or_default().remove(&tombstone_key(&tombstone, &provenance));
+            }
         }
         self.rebuild_independents_projection().await;
         self.rebuild_local_projection().await;
@@ -1275,6 +1290,9 @@ impl Aggregator {
                 let project = project.object;
                 self.projects.remove(&(project.metadata.namespace, project.metadata.name));
             }
+            ReadWatchEvent::DeletedByName { tombstone, .. } => {
+                self.projects.remove(&(tombstone.namespace, tombstone.name));
+            }
         }
         self.rebuild_store_catalog().await;
     }
@@ -1286,6 +1304,9 @@ impl Aggregator {
             }
             WatchEvent::Deleted(repository) => {
                 self.repositories.remove(&repository.spec.key());
+            }
+            WatchEvent::DeletedByName(tombstone) => {
+                self.repositories.retain(|_, repository| repository.metadata.name != tombstone.name);
             }
         }
         self.rebuild_store_catalog().await;
@@ -1299,6 +1320,10 @@ impl Aggregator {
             }
             WatchEvent::Deleted(checkout) => {
                 let reference = self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name);
+                self.observed_checkouts.remove(&reference);
+            }
+            WatchEvent::DeletedByName(tombstone) => {
+                let reference = self.checkout_ref(&tombstone.namespace, &tombstone.name);
                 self.observed_checkouts.remove(&reference);
             }
         }
@@ -1924,6 +1949,7 @@ fn local_read_event<T: Resource>(event: WatchEvent<T>) -> ReadWatchEvent<T> {
         WatchEvent::Added(object) => ReadWatchEvent::Added(local(object)),
         WatchEvent::Modified(object) => ReadWatchEvent::Modified(local(object)),
         WatchEvent::Deleted(object) => ReadWatchEvent::Deleted(local(object)),
+        WatchEvent::DeletedByName(tombstone) => ReadWatchEvent::DeletedByName { tombstone, provenance: ResourceProvenance::Local },
     }
 }
 
@@ -1933,6 +1959,17 @@ fn convoy_key(convoy: &ReadResourceObject<Convoy>) -> ConvoyKey {
         ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
     };
     (convoy.object.metadata.namespace.clone(), convoy.object.metadata.name.clone(), origin)
+}
+
+fn tombstone_key(
+    tombstone: &flotilla_resources::ResourceTombstone,
+    provenance: &ResourceProvenance,
+) -> (String, String, Option<flotilla_protocol::NodeId>) {
+    let origin = match provenance {
+        ResourceProvenance::Local => None,
+        ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
+    };
+    (tombstone.namespace.clone(), tombstone.name.clone(), origin)
 }
 
 fn session_key(session: &ReadResourceObject<TerminalSession>) -> SessionKey {

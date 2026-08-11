@@ -301,10 +301,28 @@ async fn replicate_relay_over_http<T: Resource>(http: HttpBackend, daemon: &Arc<
     let mut watch = http.watch_replica_sources_typed::<T>(REPLICATION_NAMESPACE).await.map_err(|error| error.to_string())?;
     while let Some(event) = watch.next().await {
         let event = event.map_err(|error| error.to_string())?;
+        if let ReadWatchEvent::DeletedByName { mut tombstone, provenance } = event {
+            let ResourceProvenance::Replica { origin_root, last_synced_at } = provenance else {
+                continue;
+            };
+            if &origin_root == daemon.node_id() || &origin_root == peer {
+                continue;
+            }
+            tombstone.annotations.remove("flotilla.work/origin-root");
+            tombstone.annotations.remove("flotilla.work/last-synced-at");
+            daemon
+                .resource_backend()
+                .replica_writer::<T>(origin_root, REPLICATION_NAMESPACE)
+                .apply(WatchEvent::DeletedByName(tombstone), last_synced_at)
+                .await
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
         let (kind, mut source) = match event {
             ReadWatchEvent::Added(source) => (StoredRelayEventKind::Added, source),
             ReadWatchEvent::Modified(source) => (StoredRelayEventKind::Modified, source),
             ReadWatchEvent::Deleted(source) => (StoredRelayEventKind::Deleted, source),
+            ReadWatchEvent::DeletedByName { .. } => unreachable!("handled above"),
         };
         let ResourceProvenance::Replica { origin_root, last_synced_at } = source.provenance else {
             continue;
@@ -589,8 +607,34 @@ async fn apply_relay_response<T: Resource>(
         let Some(event) = record_watch_event::<T>(record)? else {
             continue;
         };
+        if let WatchEvent::DeletedByName(mut tombstone) = event {
+            let Some(origin) = tombstone.annotations.remove("flotilla.work/origin-root") else {
+                continue;
+            };
+            let origin = NodeId::new(origin);
+            if &origin == daemon.node_id() || &origin == peer {
+                continue;
+            }
+            let synced_at = tombstone
+                .annotations
+                .remove("flotilla.work/last-synced-at")
+                .ok_or_else(|| "relayed tombstone is missing last-synced-at".to_string())
+                .and_then(|value| {
+                    chrono::DateTime::parse_from_rfc3339(&value)
+                        .map(|value| value.with_timezone(&Utc))
+                        .map_err(|error| format!("decode relayed tombstone sync timestamp: {error}"))
+                })?;
+            daemon
+                .resource_backend()
+                .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
+                .apply(WatchEvent::DeletedByName(tombstone), synced_at)
+                .await
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
         let object = match &event {
             WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => object,
+            WatchEvent::DeletedByName(_) => unreachable!("handled above"),
         };
         let Some(origin) = object.metadata.annotations.get("flotilla.work/origin-root") else {
             continue;
@@ -618,6 +662,7 @@ async fn apply_relay_response<T: Resource>(
             WatchEvent::Added(object) => WatchEvent::Added(strip(object)),
             WatchEvent::Modified(object) => WatchEvent::Modified(strip(object)),
             WatchEvent::Deleted(object) => WatchEvent::Deleted(strip(object)),
+            WatchEvent::DeletedByName(_) => unreachable!("handled above"),
         };
         daemon
             .resource_backend()
@@ -677,9 +722,30 @@ fn record_watch_event<T: Resource>(record: ResourceReadRecord) -> Result<Option<
         ResourceRecordType::Bookmark => return Ok(None),
     };
     let object = record.object.ok_or_else(|| format!("{event_type} resource record is missing object"))?;
-    let event: K8sWatchEvent<T> = serde_json::from_value(serde_json::json!({ "type": event_type, "object": object }))
-        .map_err(|error| format!("decode replicated {} event: {error}", T::API_PATHS.kind))?;
-    event.into_watch_event().map(Some).map_err(|error| error.to_string())
+    let encoded = serde_json::json!({ "type": event_type, "object": object.clone() });
+    match serde_json::from_value::<K8sWatchEvent<T>>(encoded) {
+        Ok(event) => event.into_watch_event().map(Some).map_err(|error| error.to_string()),
+        Err(_) if event_type == "DELETED" => {
+            let metadata = &object["metadata"];
+            let name = metadata["name"]
+                .as_str()
+                .ok_or_else(|| format!("decode replicated {} tombstone: missing name", T::API_PATHS.kind))?
+                .to_string();
+            let namespace = metadata["namespace"].as_str().unwrap_or_default().to_string();
+            let resource_version = metadata["resourceVersion"]
+                .as_str()
+                .ok_or_else(|| format!("decode replicated {} tombstone: missing resourceVersion", T::API_PATHS.kind))?
+                .to_string();
+            let annotations = metadata["annotations"]
+                .as_object()
+                .map(|annotations| {
+                    annotations.iter().filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string()))).collect()
+                })
+                .unwrap_or_default();
+            Ok(Some(WatchEvent::DeletedByName(flotilla_resources::ResourceTombstone { name, namespace, resource_version, annotations })))
+        }
+        Err(error) => Err(format!("decode replicated {} event: {error}", T::API_PATHS.kind)),
+    }
 }
 
 #[cfg(test)]
@@ -693,6 +759,37 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn routed_replication_decodes_name_tombstones() {
+        let event = record_watch_event::<Convoy>(ResourceReadRecord {
+            record_type: ResourceRecordType::Deleted,
+            provenance: flotilla_protocol::ResourceRecordProvenance::Local { node_id: NodeId::new("authority") },
+            object: Some(json!({
+                "apiVersion": "flotilla.work/v1",
+                "kind": "Convoy",
+                "metadata": {
+                    "name": "lost-at-authority",
+                    "namespace": "flotilla",
+                    "resourceVersion": "9",
+                    "annotations": {
+                        "flotilla.work/origin-root": "authority",
+                        "flotilla.work/last-synced-at": "2026-08-11T20:00:00Z",
+                    },
+                },
+            })),
+        })
+        .expect("decode routed tombstone")
+        .expect("deleted record produces an event");
+
+        assert!(matches!(
+            event,
+            WatchEvent::DeletedByName(tombstone)
+                if tombstone.name == "lost-at-authority"
+                    && tombstone.namespace == "flotilla"
+                    && tombstone.annotations["flotilla.work/origin-root"] == "authority"
+        ));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn socket_path_source_changes_are_resolved_between_retries() {

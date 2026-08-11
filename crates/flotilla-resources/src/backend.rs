@@ -181,8 +181,18 @@ impl<T: Resource> ReplicaReadResolver<T> {
                 let namespace = namespace.clone();
                 async move {
                     let event = event?;
+                    if let ReadWatchEvent::DeletedByName { tombstone, provenance } = event {
+                        return match backend.definitions::<T>(&namespace).get(&tombstone.name).await {
+                            Ok(object) => {
+                                Ok(ReadWatchEvent::Modified(ReadResourceObject { object, provenance: ResourceProvenance::Local }))
+                            }
+                            Err(ResourceError::NotFound { .. }) => Ok(ReadWatchEvent::DeletedByName { tombstone, provenance }),
+                            Err(error) => Err(error),
+                        };
+                    }
                     let fallback = match event {
                         ReadWatchEvent::Added(object) | ReadWatchEvent::Modified(object) | ReadWatchEvent::Deleted(object) => object,
+                        ReadWatchEvent::DeletedByName { .. } => unreachable!("handled above"),
                     };
                     match backend.definitions::<T>(&namespace).get(&fallback.object.metadata.name).await {
                         Ok(object) => Ok(ReadWatchEvent::Modified(ReadResourceObject { object, provenance: ResourceProvenance::Local })),
@@ -239,6 +249,17 @@ impl<T: Resource> ReplicaWriter<T> {
             crate::WatchEvent::Added(object) => (StoredReplicaEventKind::Added, object),
             crate::WatchEvent::Modified(object) => (StoredReplicaEventKind::Modified, object),
             crate::WatchEvent::Deleted(object) => (StoredReplicaEventKind::Deleted, object),
+            crate::WatchEvent::DeletedByName(tombstone) => {
+                return match &self.backend {
+                    ResourceBackend::InMemory(backend) => {
+                        backend.apply_replica_tombstone_typed::<T>(&self.origin_root, &self.namespace, &tombstone, synced_at).await
+                    }
+                    ResourceBackend::Sqlite(backend) => {
+                        backend.apply_replica_tombstone_typed::<T>(&self.origin_root, &self.namespace, &tombstone, synced_at).await
+                    }
+                    ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
+                };
+            }
         };
         match &self.backend {
             ResourceBackend::InMemory(backend) => {
@@ -324,6 +345,11 @@ impl<T: Resource> TypedResolver<T> {
             return self.backend.definitions::<T>(&self.namespace).delete(name).await;
         }
         dispatch_backend!(self, delete_typed, name)
+    }
+
+    pub(crate) async fn tombstone(&self, name: &str) -> Result<crate::ResourceTombstone, ResourceError> {
+        ensure_replication_enabled::<T>()?;
+        dispatch_backend!(self, tombstone_typed, name)
     }
 
     pub async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {

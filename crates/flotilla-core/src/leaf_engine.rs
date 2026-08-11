@@ -528,6 +528,9 @@ impl ReconcilerWake {
                         WatchEvent::Deleted(convoy) => {
                             convoy_objects.remove(&convoy.metadata.name);
                         }
+                        WatchEvent::DeletedByName(tombstone) => {
+                            convoy_objects.remove(&tombstone.name);
+                        }
                     }
                     self.sync_rows(&namespace, &convoy_objects).await?;
                 }
@@ -694,6 +697,9 @@ fn apply_read_event<T: flotilla_resources::Resource>(
         }
         flotilla_resources::ReadWatchEvent::Deleted(item) => {
             objects.remove(&item.object.metadata.name);
+        }
+        flotilla_resources::ReadWatchEvent::DeletedByName { tombstone, .. } => {
+            objects.remove(&tombstone.name);
         }
     }
 }

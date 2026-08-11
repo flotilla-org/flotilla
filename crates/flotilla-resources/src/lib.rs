@@ -148,7 +148,7 @@ pub use usage::{usage_record_name, Usage, UsagePace, UsageProviderCost, UsageSpe
 pub use vessel::{
     Vessel, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
-pub use watch::{ResourceList, WatchEvent, WatchStart, WatchStream};
+pub use watch::{ResourceList, ResourceTombstone, WatchEvent, WatchStart, WatchStream};
 
 #[doc(hidden)]
 #[macro_export]

@@ -181,8 +181,9 @@ impl VesselPlacementProjector {
 
 fn replica_changed<T: Resource>(event: Option<Result<ReadWatchEvent<T>, ResourceError>>, kind: &str) -> Result<bool, ResourceError> {
     let event = event.ok_or_else(|| ResourceError::invalid(format!("{kind} replica watch ended")))?;
-    let source = match event? {
-        ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => source,
+    let provenance = match event? {
+        ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => source.provenance,
+        ReadWatchEvent::DeletedByName { provenance, .. } => provenance,
     };
-    Ok(matches!(source.provenance, ResourceProvenance::Replica { .. }))
+    Ok(matches!(provenance, ResourceProvenance::Replica { .. }))
 }

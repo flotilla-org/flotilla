@@ -571,13 +571,22 @@ async fn get_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name
 
 async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceObject, ResourceError> {
     let resolver = backend.using::<T>(namespace);
-    let object = resolver.get(name).await?;
-    resolver.delete(name).await?;
+    let value = match resolver.get(name).await {
+        Ok(object) => {
+            resolver.delete(name).await?;
+            object_value(&object)?
+        }
+        Err(ResourceError::NotFound { .. }) if T::REPLICATION_CLASS != crate::ReplicationClass::None => {
+            let tombstone = resolver.tombstone(name).await?;
+            tombstone_value::<T>(&tombstone)
+        }
+        Err(error) => return Err(error),
+    };
     Ok(DynamicResourceObject {
         kind: T::API_PATHS.kind.to_string(),
         plural: T::API_PATHS.plural.to_string(),
         namespace: namespace.to_string(),
-        value: object_value(&object)?,
+        value,
     })
 }
 
@@ -864,6 +873,14 @@ fn read_watch_event_value<T: Resource>(event: &ReadWatchEvent<T>) -> Result<Valu
         ReadWatchEvent::Added(object) => ("ADDED", object),
         ReadWatchEvent::Modified(object) => ("MODIFIED", object),
         ReadWatchEvent::Deleted(object) => ("DELETED", object),
+        ReadWatchEvent::DeletedByName { tombstone, provenance } => {
+            let mut tombstone = tombstone.clone();
+            if let ResourceProvenance::Replica { origin_root, last_synced_at } = provenance {
+                tombstone.annotations.insert(ORIGIN_ROOT_ANNOTATION.to_string(), origin_root.to_string());
+                tombstone.annotations.insert(LAST_SYNCED_AT_ANNOTATION.to_string(), last_synced_at.to_rfc3339());
+            }
+            return Ok(json!({"type": "DELETED", "object": tombstone_value::<T>(&tombstone)}));
+        }
     };
     Ok(json!({"type": event_type, "object": read_object_value(object)?}))
 }
@@ -873,7 +890,21 @@ fn typed_watch_event_value<T: Resource>(event: &WatchEvent<T>) -> Result<Value, 
         WatchEvent::Added(object) => watch_event_value("ADDED", object),
         WatchEvent::Modified(object) => watch_event_value("MODIFIED", object),
         WatchEvent::Deleted(object) => watch_event_value("DELETED", object),
+        WatchEvent::DeletedByName(tombstone) => Ok(json!({"type": "DELETED", "object": tombstone_value::<T>(tombstone)})),
     }
+}
+
+fn tombstone_value<T: Resource>(tombstone: &crate::ResourceTombstone) -> Value {
+    json!({
+        "apiVersion": api_version(T::API_PATHS),
+        "kind": T::API_PATHS.kind,
+        "metadata": {
+            "name": tombstone.name,
+            "namespace": tombstone.namespace,
+            "resourceVersion": tombstone.resource_version,
+            "annotations": tombstone.annotations,
+        },
+    })
 }
 
 fn watch_event_value<T: Resource>(event_type: &str, object: &ResourceObject<T>) -> Result<Value, ResourceError> {

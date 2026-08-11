@@ -146,6 +146,9 @@ impl ActiveVessels {
             WatchEvent::Deleted(vessel) => {
                 self.names.remove(&vessel.metadata.name);
             }
+            WatchEvent::DeletedByName(tombstone) => {
+                self.names.remove(&tombstone.name);
+            }
         }
     }
 
@@ -267,6 +270,13 @@ impl ActiveConvoys {
             }
             ReadWatchEvent::Deleted(convoy) => {
                 self.keys.remove(&convoy_key(&convoy));
+            }
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => {
+                let origin = match provenance {
+                    ResourceProvenance::Local => None,
+                    ResourceProvenance::Replica { origin_root, .. } => Some(origin_root),
+                };
+                self.keys.remove(&(origin, tombstone.name));
             }
         }
     }

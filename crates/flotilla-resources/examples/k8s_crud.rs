@@ -143,7 +143,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             WatchEvent::Modified(object) => {
                 println!("watch saw modified resource rv={}", object.metadata.resource_version);
             }
-            WatchEvent::Added(_) | WatchEvent::Deleted(_) => println!("watch saw non-modified event"),
+            WatchEvent::Added(_) | WatchEvent::Deleted(_) | WatchEvent::DeletedByName(_) => {
+                println!("watch saw non-modified event")
+            }
         }
     }
 
@@ -152,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(event) = watch.next().await {
         match event? {
             WatchEvent::Deleted(object) => println!("watch saw deleted resource rv={}", object.metadata.resource_version),
+            WatchEvent::DeletedByName(tombstone) => println!("watch saw name tombstone for {}", tombstone.name),
             WatchEvent::Added(_) | WatchEvent::Modified(_) => println!("watch saw non-deleted event"),
         }
     }
