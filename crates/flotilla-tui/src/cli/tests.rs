@@ -721,6 +721,25 @@ mod command_result_human {
     }
 
     #[test]
+    fn resource_already_deleted_is_explicit() {
+        let response = ResourceJsonResponse {
+            kind: "Convoy".to_string(),
+            plural: "convoys".to_string(),
+            namespace: "flotilla".to_string(),
+            value: serde_json::json!({
+                "apiVersion": "flotilla.work/v1",
+                "metadata": {"name": "lost-at-authority"}
+            }),
+            replica_origin: None,
+        };
+
+        assert_eq!(
+            format_command_result(&CommandValue::ResourceAlreadyDeleted(Box::new(response))),
+            "already deleted flotilla.work/v1/Convoy/flotilla/lost-at-authority"
+        );
+    }
+
+    #[test]
     fn fleet_list() {
         let result = CommandValue::FleetList(Box::new(FleetListResponse {
             rows: vec![FleetListRow::builder()

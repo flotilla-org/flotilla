@@ -274,6 +274,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::ResourceRead(_)
         | CommandValue::ResourceObject(_)
         | CommandValue::ResourceDeleted(_)
+        | CommandValue::ResourceAlreadyDeleted(_)
         | CommandValue::ResourceWatchEvent(_) => {
             tracing::warn!("query result reached TUI handler — should be handled by CLI");
         }

@@ -137,6 +137,12 @@ async fn missing_authority_delete_tombstones_replica() {
 }
 
 #[tokio::test]
+async fn watch_rejects_version_ahead_of_stream() {
+    common::contract::assert_watch_rejects_version_ahead_of_stream_with_backend(ResourceBackend::InMemory(InMemoryBackend::default()))
+        .await;
+}
+
+#[tokio::test]
 async fn project_definition_edit_converges() {
     assert_project_definition_edit_converges_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await;
 }

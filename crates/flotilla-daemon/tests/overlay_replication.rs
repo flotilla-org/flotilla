@@ -258,6 +258,93 @@ async fn connected_daemons_replicate_home_bound_runtime_kinds_and_deletes() {
 }
 
 #[tokio::test]
+async fn lost_authority_record_tombstone_converges_through_two_peers() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
+    let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    let gouda = daemon(temp.path().join("gouda"), "gouda-root", "gouda").await;
+    let origin = kiwi.node_id().clone();
+
+    let fixture_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let fixture = fixture_backend.using::<TerminalSession>("flotilla");
+    fixture
+        .create(
+            &InputMeta::builder().name("lost-at-authority".to_string()).build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("env".to_string())
+                .role("coder".to_string())
+                .source(TerminalSessionSource::Tool { command: "true".to_string() })
+                .cwd("/tmp".to_string())
+                .pool("passthrough".to_string())
+                .build(),
+        )
+        .await
+        .expect("create stale session fixture");
+    let stale = fixture.list().await.expect("list stale session fixture");
+    let stale_synced_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+    for daemon in [&kiwi, &feta, &gouda] {
+        daemon
+            .resource_backend()
+            .replica_writer::<TerminalSession>(origin.clone(), "flotilla")
+            .replace(&stale, stale_synced_at)
+            .await
+            .expect("seed stale origin replica");
+    }
+
+    let deleted = flotilla_resources::delete_resource_kind(&kiwi.resource_backend(), "flotilla", "terminalsessions", "lost-at-authority")
+        .await
+        .expect("tombstone lost authority record");
+    assert!(!deleted.already_deleted);
+    assert_eq!(deleted.object.value["metadata"]["resourceVersion"], "2", "the tombstone must advance beyond the recovered replica cursor");
+
+    let kiwi_feta = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect authority to first peer");
+    let feta_gouda = spawn_in_memory_request_topology(Arc::clone(&feta), Arc::clone(&gouda)).await.expect("connect relay to second peer");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut converged = true;
+            for daemon in [&kiwi, &feta, &gouda] {
+                converged &= daemon
+                    .resource_backend()
+                    .including_replicas::<TerminalSession>("flotilla")
+                    .list()
+                    .await
+                    .expect("list converging session replicas")
+                    .items
+                    .is_empty();
+            }
+            if converged {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("authority tombstone did not converge through both peers");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for daemon in [&kiwi, &feta, &gouda] {
+        assert!(
+            daemon
+                .resource_backend()
+                .including_replicas::<TerminalSession>("flotilla")
+                .list()
+                .await
+                .expect("list settled session replicas")
+                .items
+                .is_empty(),
+            "the stale replica must not resurrect after relay cycles"
+        );
+    }
+
+    let repeated = flotilla_resources::delete_resource_kind(&kiwi.resource_backend(), "flotilla", "terminalsessions", "lost-at-authority")
+        .await
+        .expect("repeat lost authority delete");
+    assert!(repeated.already_deleted);
+    drop(feta_gouda);
+    drop(kiwi_feta);
+}
+
+#[tokio::test]
 async fn connected_in_process_daemons_replicate_checkout_settlement_evidence() {
     let temp = tempfile::tempdir().expect("tempdir");
     let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;

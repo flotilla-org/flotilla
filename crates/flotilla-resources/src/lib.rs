@@ -121,7 +121,8 @@ pub use registry::{
     list_resource_kind, list_resource_kind_including_replicas, list_resource_kind_replica_sources, patch_resource_status,
     quarantine_undecodable_stored_objects, replica_cursor_for_resource_kind, resource_document_spec_hash, resource_list_api_version,
     watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources,
-    DynamicResourceList, DynamicResourceObject, DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
+    DynamicResourceDelete, DynamicResourceList, DynamicResourceObject, DynamicResourceWatch, RegisteredResourceKind,
+    REGISTERED_RESOURCE_KINDS,
 };
 pub use replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass, ResourceProvenance};
 pub use repository::{

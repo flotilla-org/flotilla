@@ -87,6 +87,12 @@ pub struct ResourceTombstone {
     pub annotations: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct TombstoneWrite {
+    pub tombstone: ResourceTombstone,
+    pub created: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "T::Spec: Serialize, T::Status: Serialize",

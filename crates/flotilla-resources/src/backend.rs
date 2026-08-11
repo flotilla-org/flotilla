@@ -347,9 +347,12 @@ impl<T: Resource> TypedResolver<T> {
         dispatch_backend!(self, delete_typed, name)
     }
 
-    pub(crate) async fn tombstone(&self, name: &str) -> Result<crate::ResourceTombstone, ResourceError> {
+    pub(crate) async fn tombstone(&self, name: &str) -> Result<crate::watch::TombstoneWrite, ResourceError> {
         ensure_replication_enabled::<T>()?;
-        dispatch_backend!(self, tombstone_typed, name)
+        let origin_root = self.backend.local_root()?;
+        let replica_cursor = self.backend.replica_writer::<T>(origin_root, &self.namespace).cursor().await?;
+        let minimum_resource_version = replica_cursor.as_ref().map(|cursor| cursor.resource_version.as_str());
+        dispatch_backend!(self, tombstone_typed, name, minimum_resource_version)
     }
 
     pub async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {

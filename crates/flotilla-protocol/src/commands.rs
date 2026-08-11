@@ -908,6 +908,7 @@ pub enum CommandValue {
     ResourceRead(Box<ResourceReadEnvelope>),
     ResourceObject(Box<ResourceJsonResponse>),
     ResourceDeleted(Box<ResourceJsonResponse>),
+    ResourceAlreadyDeleted(Box<ResourceJsonResponse>),
     ResourceWatchEvent(Box<ResourceReadEnvelope>),
     EnvironmentSpecRead {
         spec: crate::EnvironmentSpec,
