@@ -438,3 +438,47 @@ fn parse_watch_line<T: Resource>(line: &[u8]) -> Result<WatchEvent<T>, ResourceE
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+    use crate::Usage;
+
+    #[test]
+    fn decodes_replica_name_tombstone_from_http_watch_line() {
+        let line = br#"{
+            "type":"DELETED",
+            "object":{
+                "apiVersion":"flotilla.work/v1",
+                "kind":"Usage",
+                "metadata":{
+                    "name":"lost-account",
+                    "namespace":"default",
+                    "resourceVersion":"42",
+                    "annotations":{
+                        "flotilla.work/origin-root":"origin-a",
+                        "flotilla.work/last-synced-at":"2026-08-11T20:00:00Z"
+                    }
+                }
+            }
+        }"#;
+
+        let event = parse_watch_line::<Usage>(line).expect("decode HTTP tombstone");
+        let event = read_watch_event(event).expect("decode tombstone provenance");
+
+        match event {
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => {
+                assert_eq!(tombstone.name, "lost-account");
+                assert_eq!(tombstone.namespace, "default");
+                assert_eq!(tombstone.resource_version, "42");
+                assert_eq!(provenance, ResourceProvenance::Replica {
+                    origin_root: flotilla_protocol::NodeId::new("origin-a"),
+                    last_synced_at: Utc.with_ymd_and_hms(2026, 8, 11, 20, 0, 0).unwrap(),
+                });
+            }
+            other => panic!("expected name tombstone, got {other:?}"),
+        }
+    }
+}

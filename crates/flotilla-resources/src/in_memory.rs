@@ -259,9 +259,12 @@ impl InMemoryBackend {
             let event = rx.recv().await?;
             let provenance = ResourceProvenance::Replica { origin_root: event.origin_root, last_synced_at: event.synced_at };
             let decoded = if matches!(event.kind, StoredReplicaEventKind::Deleted) {
-                match Self::decode_object::<T>(event.object.clone()) {
-                    Ok(object) => Ok(ReadWatchEvent::Deleted(ReadResourceObject { object, provenance })),
-                    Err(_) => Self::decode_tombstone(event.object).map(|tombstone| ReadWatchEvent::DeletedByName { tombstone, provenance }),
+                // Name-only tombstones deliberately omit `spec`; a present but
+                // malformed spec is a corrupt object and must remain an error.
+                if event.object.get("spec").is_some() {
+                    Self::decode_object::<T>(event.object).map(|object| ReadWatchEvent::Deleted(ReadResourceObject { object, provenance }))
+                } else {
+                    Self::decode_tombstone(event.object).map(|tombstone| ReadWatchEvent::DeletedByName { tombstone, provenance })
                 }
             } else {
                 Self::decode_object::<T>(event.object).map(|object| {
@@ -432,10 +435,12 @@ impl InMemoryBackend {
         match event.kind {
             StoredEventKind::Added => Self::decode_object::<T>(event.object).map(WatchEvent::Added),
             StoredEventKind::Modified => Self::decode_object::<T>(event.object).map(WatchEvent::Modified),
-            StoredEventKind::Deleted => match Self::decode_object::<T>(event.object.clone()) {
-                Ok(object) => Ok(WatchEvent::Deleted(object)),
-                Err(_) => Self::decode_tombstone(event.object).map(WatchEvent::DeletedByName),
-            },
+            // Name-only tombstones deliberately omit `spec`; a present but
+            // malformed spec is a corrupt object and must remain an error.
+            StoredEventKind::Deleted if event.object.get("spec").is_none() => {
+                Self::decode_tombstone(event.object).map(WatchEvent::DeletedByName)
+            }
+            StoredEventKind::Deleted => Self::decode_object::<T>(event.object).map(WatchEvent::Deleted),
         }
     }
 
