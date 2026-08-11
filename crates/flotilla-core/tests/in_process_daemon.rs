@@ -852,6 +852,79 @@ async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
 }
 
 #[tokio::test]
+async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let mut events = daemon.subscribe();
+    let name = flotilla_resources::usage_record_name("ada@example.com");
+    let create_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ResourceApply {
+                namespace: "flotilla".to_string(),
+                document: serde_json::json!({
+                    "kind": "Usage",
+                    "metadata": {"name": name},
+                    "spec": {"account": "Ada@Example.com"},
+                }),
+            },
+        })
+        .await
+        .expect("create usage command");
+    let create_result = recv_command_finished(&mut events, create_id).await;
+    assert!(matches!(create_result, CommandValue::ResourceObject(response) if response.kind == "Usage"));
+
+    let observed_at = "2026-08-08T18:00:00Z".parse().expect("timestamp");
+    let status = flotilla_resources::UsageStatus::builder()
+        .provider("codex")
+        .windows(vec![flotilla_resources::UsageWindow::builder().name("weekly").used_percent(100.0).build()])
+        .observed_at(observed_at)
+        .build();
+
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ResourceStatusPatch {
+                namespace: "flotilla".to_string(),
+                kind: "usages".to_string(),
+                name: name.clone(),
+                status: serde_json::to_value(&status).expect("encode usage status"),
+            },
+        })
+        .await
+        .expect("patch usage status command");
+
+    let result = recv_command_finished(&mut events, command_id).await;
+    assert!(matches!(result, CommandValue::ResourceObject(response) if response.kind == "Usage"));
+
+    let malformed_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ResourceStatusPatch {
+                namespace: "flotilla".to_string(),
+                kind: "usages".to_string(),
+                name: name.clone(),
+                status: serde_json::json!({"provider": "codex"}),
+            },
+        })
+        .await
+        .expect("malformed status patch command");
+    let malformed_result = recv_command_finished(&mut events, malformed_id).await;
+    assert!(matches!(malformed_result, CommandValue::Error { message } if message.contains("decode Usage status")));
+
+    let stored = daemon.resource_backend().using::<flotilla_resources::Usage>("flotilla").get(&name).await.expect("stored usage");
+    assert_eq!(stored.spec.account, "Ada@Example.com");
+    assert_eq!(stored.status, Some(status));
+}
+
+#[tokio::test]
 async fn resource_watch_streams_current_update_and_resumed_delete_without_loss() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon =

@@ -672,6 +672,12 @@ pub enum CommandAction {
         namespace: String,
         document: serde_json::Value,
     },
+    ResourceStatusPatch {
+        namespace: String,
+        kind: String,
+        name: String,
+        status: serde_json::Value,
+    },
     ResourceDelete {
         namespace: String,
         kind: String,
@@ -783,6 +789,7 @@ impl Command {
             CommandAction::QueryResourceList { .. } => "query resource list",
             CommandAction::QueryResourceGet { .. } => "query resource get",
             CommandAction::ResourceApply { .. } => "apply resource",
+            CommandAction::ResourceStatusPatch { .. } => "patch resource status",
             CommandAction::ResourceDelete { .. } => "delete resource",
             CommandAction::ResourceWatch { .. } => "watch resources",
         }
@@ -1302,6 +1309,17 @@ mod tests {
                     namespace: "flotilla".into(),
                     kind: "convoys".into(),
                     name: "resource-demo".into(),
+                },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ResourceStatusPatch {
+                    namespace: "flotilla".into(),
+                    kind: "usages".into(),
+                    name: "usage-account".into(),
+                    status: serde_json::json!({"provider": "codex", "observed_at": "2026-08-08T18:00:00Z"}),
                 },
             },
             Command {

@@ -345,6 +345,16 @@ pub async fn collect_resource_replica_kind(
     )
 }
 
+pub async fn patch_resource_status(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    name: &str,
+    status: Value,
+) -> Result<DynamicResourceObject, ResourceError> {
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, patch_status_typed(backend, namespace, name, status).await)
+}
+
 pub async fn watch_resource_kind(
     backend: &ResourceBackend,
     namespace: &str,
@@ -596,6 +606,33 @@ async fn collect_replica_typed<T: Resource>(
         namespace: namespace.to_string(),
         value,
     })
+}
+
+async fn patch_status_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    name: &str,
+    status: Value,
+) -> Result<DynamicResourceObject, ResourceError> {
+    let status = serde_json::from_value::<T::Status>(status)
+        .map_err(|error| ResourceError::decode(format!("decode {} status: {error}", T::API_PATHS.kind)))?;
+    let resolver = backend.using::<T>(namespace);
+    for _ in 0..3 {
+        let current = resolver.get(name).await?;
+        match resolver.update_status(name, &current.metadata.resource_version, &status).await {
+            Ok(object) => {
+                return Ok(DynamicResourceObject {
+                    kind: T::API_PATHS.kind.to_string(),
+                    plural: T::API_PATHS.plural.to_string(),
+                    namespace: namespace.to_string(),
+                    value: object_value(&object)?,
+                });
+            }
+            Err(ResourceError::Conflict { .. }) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(ResourceError::conflict(name, "status patch retry budget exhausted"))
 }
 
 async fn watch_typed<T: Resource>(
@@ -900,6 +937,40 @@ mod tests {
         assert_eq!(listed.value["items"][0]["apiVersion"], "flotilla.work/v1");
         assert_eq!(listed.value["items"][0]["kind"], "Convoy");
         assert_eq!(listed.value["items"][0]["metadata"]["name"], "demo");
+    }
+
+    #[tokio::test]
+    async fn patch_resource_status_decodes_the_registered_kind() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        backend
+            .using::<Usage>("flotilla")
+            .create(&InputMeta::builder().name("usage-account".to_string()).build(), &crate::UsageSpec {
+                account: "ada@example.com".to_string(),
+            })
+            .await
+            .expect("create usage");
+
+        let patched = patch_resource_status(
+            &backend,
+            "flotilla",
+            "usages",
+            "usage-account",
+            serde_json::json!({
+                "provider": "codex",
+                "windows": [{"name": "weekly", "used_percent": 42.0}],
+                "observed_at": "2026-08-10T10:00:00Z",
+            }),
+        )
+        .await
+        .expect("patch typed Usage status");
+
+        assert_eq!(patched.kind, "Usage");
+        assert_eq!(patched.value["status"]["windows"][0]["used_percent"], 42.0);
+
+        let error = patch_resource_status(&backend, "flotilla", "usages", "usage-account", serde_json::json!({"provider": "codex"}))
+            .await
+            .expect_err("malformed status should fail typed decoding");
+        assert!(error.to_string().contains("decode Usage status"));
     }
 
     #[tokio::test]

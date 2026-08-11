@@ -8328,6 +8328,23 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
+        if let flotilla_protocol::CommandAction::ResourceStatusPatch { namespace, kind, name, status } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let result =
+                match flotilla_resources::patch_resource_status(&self.resource_backend, namespace, kind, name, status.clone()).await {
+                    Ok(patched) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
+                        kind: patched.kind,
+                        plural: patched.plural,
+                        namespace: patched.namespace,
+                        value: patched.value,
+                        replica_origin: None,
+                    })),
+                    Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
         if let flotilla_protocol::CommandAction::ResourceDelete { namespace, kind, name, replica_origin } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let deleted = if let Some(origin_root) = replica_origin {
