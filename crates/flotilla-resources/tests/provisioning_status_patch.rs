@@ -19,6 +19,7 @@ fn host_status_patch_updates_heartbeat_snapshot() {
         daemon_version: None,
         daemon_started_at: None,
         disk_free_bytes: None,
+        admission_free_space_floor_bytes: None,
     }
     .apply(&mut status);
 

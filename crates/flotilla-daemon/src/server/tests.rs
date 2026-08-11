@@ -31,11 +31,11 @@ use flotilla_protocol::{
     AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus,
-    HttpBackend, InMemoryBackend, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, ResourceBackend,
-    ResourceError, ResourceList, ResourceProvenance, Selector, SqliteBackend, Stance, StatusPatch, TerminalAttentionState, TerminalBrief,
-    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
-    WatchEvent, WatchStart, WorkflowTemplate,
+    list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus, Host,
+    HostSpec, HostStatus, HttpBackend, InMemoryBackend, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
+    ResourceBackend, ResourceError, ResourceList, ResourceProvenance, Selector, SqliteBackend, Stance, StatusPatch, TerminalAttentionState,
+    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+    TerminalSessionStatusPatch, WatchEvent, WatchStart, WorkflowTemplate,
 };
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
@@ -1683,10 +1683,30 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
 }
 
 #[tokio::test]
-async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command() {
+async fn dispatch_execute_keeps_remote_placement_convoy_on_the_admitting_store() {
     let (_tmp, daemon) = empty_daemon().await;
     let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
     let remote_host_id = remote_daemon.local_host_id().expect("remote host identity").to_string();
+    let remote_hosts = remote_daemon.resource_backend().using::<Host>("flotilla");
+    let remote_host = remote_hosts
+        .create(&InputMeta::builder().name(remote_host_id.clone()).build(), &HostSpec::default())
+        .await
+        .expect("create remote host resource");
+    remote_hosts
+        .update_status(&remote_host_id, &remote_host.metadata.resource_version, &HostStatus {
+            ready: true,
+            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
+            ..HostStatus::default()
+        })
+        .await
+        .expect("publish remote host capacity");
+    daemon
+        .resource_backend()
+        .replica_writer::<Host>(remote_daemon.node_id().clone(), "flotilla")
+        .replace(&remote_hosts.list().await.expect("list remote host resources"), chrono::Utc::now())
+        .await
+        .expect("replicate remote host capacity");
     let remote_policy_name = format!("host-direct-{remote_host_id}");
     let remote_summary = HostSummary::builder()
         .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(&remote_host_id)))
@@ -1706,7 +1726,10 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
     let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
-    peer_manager.lock().await.store_host_summary(remote_summary);
+    let mut peer_manager_guard = peer_manager.lock().await;
+    peer_manager_guard.store_host_summary(remote_summary);
+    peer_manager_guard.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
+    drop(peer_manager_guard);
     let remote_command_router = make_remote_command_router(
         &daemon,
         &peer_manager,
@@ -1729,108 +1752,46 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
         })
         .build();
 
-    assert_eq!(
-        remote_command_router.dispatch_execute(command.clone()).await.expect_err("missing live route must reject remote placement"),
-        "peer host feta is not connected"
-    );
-
-    peer_manager.lock().await.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
-
-    let mut mismatched = command.clone();
-    mismatched.node_id = Some(daemon.node_id().clone());
-    assert_eq!(
-        remote_command_router.dispatch_execute(mismatched).await.expect_err("explicit local target must not override remote placement"),
-        "convoy command target does not match its host-direct placement policy"
-    );
-
-    remote_command_router.dispatch_execute(command.clone()).await.expect("remote convoy start should dispatch");
-
-    assert_eq!(pending_remote_commands.lock().await.len(), 1);
-    let (routed, workflow_snapshot_name, placement_snapshot_name) = {
-        let sent = sent.lock().expect("lock sent messages");
-        let [PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { target_node_id, command: routed, .. })] = sent.as_slice() else {
-            panic!("expected one routed command request");
-        };
-        assert_eq!(*target_node_id, node("feta"));
-        assert_eq!(routed.node_id.as_ref(), Some(&node("feta")));
-        let CommandAction::ConvoyStartPrepared { start } = &routed.action else {
-            panic!("remote launch must carry an admitted convoy snapshot");
-        };
-        assert!(start.workflow_name.starts_with("workflow-snapshot-"));
-        let placement_snapshot_name = start.placement_policy_name.clone().expect("prepared placement snapshot name");
-        assert!(placement_snapshot_name.starts_with("placement-snapshot-"));
-        let mut delivered = routed.as_ref().clone();
-        delivered.node_id = None;
-        (delivered, start.workflow_name.clone(), placement_snapshot_name)
-    };
-
-    assert_eq!(
-        remote_command_router.dispatch_execute(routed.clone()).await.expect_err("client-submitted prepared start must be rejected"),
-        "prepared convoy starts are reserved for authenticated peer forwarding"
-    );
-
-    let mut remote_events = remote_daemon.subscribe();
-    let remote_command_id = remote_daemon.execute(routed.clone()).await.expect("prepared command should be accepted by remote daemon");
-    let remote_result = wait_for_command_result(&mut remote_events, remote_command_id, StdDuration::from_secs(5)).await;
-    assert_eq!(remote_result, CommandValue::ConvoyStarted { name: "remote-work".to_string(), attach_plan: None, binding: None });
-    let remote_backend = remote_daemon.resource_backend();
-    let convoy = remote_backend.clone().using::<Convoy>("flotilla").get("remote-work").await.expect("remote daemon should persist convoy");
-    assert_eq!(convoy.spec.workflow_ref, "remote-workflow");
-    assert_eq!(convoy.spec.placement_policy.as_deref(), Some(remote_policy_name.as_str()));
-    let remote_workflow = remote_backend
-        .clone()
-        .using::<WorkflowTemplate>("flotilla")
-        .get(&workflow_snapshot_name)
-        .await
-        .expect("remote daemon should persist workflow snapshot");
-    assert_eq!(remote_workflow.spec.vessels[0].stance, Stance::Trusted);
-    let remote_policy = remote_backend
-        .clone()
-        .using::<PlacementPolicy>("flotilla")
-        .get(&placement_snapshot_name)
-        .await
-        .expect("remote daemon should persist placement snapshot");
-    assert_eq!(remote_policy.spec.host_direct.expect("host-direct snapshot").host_ref, remote_host_id);
-
-    let mut repeated = match &routed.action {
-        CommandAction::ConvoyStartPrepared { start } => start.as_ref().clone(),
-        _ => panic!("routed command must remain a prepared convoy start"),
-    };
-    repeated.name = "remote-work-again".to_string();
-    let mut repeated_spec: serde_json::Value = repeated.convoy_spec.clone();
-    repeated_spec["ref"] = serde_json::Value::String("feat/remote-work-again".to_string());
-    repeated.convoy_spec = repeated_spec;
-    let mut repeated_events = remote_daemon.subscribe();
-    let repeated_id = remote_daemon
-        .execute(Command::builder().action(CommandAction::ConvoyStartPrepared { start: Box::new(repeated) }).build())
-        .await
-        .expect("repeated prepared command should be accepted");
-    assert_eq!(wait_for_command_result(&mut repeated_events, repeated_id, StdDuration::from_secs(5)).await, CommandValue::ConvoyStarted {
-        name: "remote-work-again".to_string(),
+    let mut events = daemon.subscribe();
+    let command_id = remote_command_router.dispatch_execute(command).await.expect("admitting daemon should accept remote placement");
+    assert_eq!(wait_for_command_result(&mut events, command_id, StdDuration::from_secs(5)).await, CommandValue::ConvoyStarted {
+        name: "remote-work".to_string(),
         attach_plan: None,
         binding: None
     });
-    let prepared_workflows = remote_backend
+    assert!(pending_remote_commands.lock().await.is_empty(), "placement must not create a routed command");
+    assert!(sent.lock().expect("sent messages").is_empty(), "placement availability preflight must not route the admission command");
+
+    let admitting_backend = daemon.resource_backend();
+    let convoy =
+        admitting_backend.clone().using::<Convoy>("flotilla").get("remote-work").await.expect("admitting daemon should own the convoy");
+    assert_eq!(convoy.spec.workflow_ref, "remote-workflow");
+    assert_eq!(convoy.spec.placement_policy.as_deref(), Some(remote_policy_name.as_str()));
+    let workflow_snapshot_name =
+        convoy.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).expect("pinned workflow annotation");
+    let placement_snapshot_name =
+        convoy.metadata.annotations.get(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION).expect("pinned placement annotation");
+    let admitting_workflow = admitting_backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .list()
+        .get(workflow_snapshot_name)
         .await
-        .expect("list workflow snapshots")
-        .items
-        .into_iter()
-        .filter(|workflow| workflow.metadata.name == workflow_snapshot_name)
-        .count();
-    let prepared_placements = remote_backend
+        .expect("admitting daemon should retain the pinned workflow");
+    assert_eq!(admitting_workflow.spec.vessels[0].stance, Stance::Trusted);
+    let admitting_placement = admitting_backend
+        .clone()
         .using::<PlacementPolicy>("flotilla")
-        .list()
+        .get(placement_snapshot_name)
         .await
-        .expect("list placement snapshots")
-        .items
-        .into_iter()
-        .filter(|policy| policy.metadata.name == placement_snapshot_name)
-        .count();
-    assert_eq!(prepared_workflows, 1);
-    assert_eq!(prepared_placements, 1);
+        .expect("admitting daemon should retain the pinned placement");
+    assert_eq!(admitting_placement.spec.host_direct.expect("host-direct snapshot").host_ref, remote_host_id);
+    assert!(
+        matches!(
+            remote_daemon.resource_backend().using::<Convoy>("flotilla").get("remote-work").await,
+            Err(ResourceError::NotFound { .. })
+        ),
+        "placement host must not become convoy authority"
+    );
 }
 
 #[tokio::test]

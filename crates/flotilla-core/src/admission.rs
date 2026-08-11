@@ -4,6 +4,10 @@ use sysinfo::Disks;
 
 const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
+pub(crate) fn free_space_floor_bytes(floor_gib: u64) -> Result<u64, String> {
+    floor_gib.checked_mul(BYTES_PER_GIB).ok_or_else(|| format!("free-space floor is too large: {floor_gib} GiB"))
+}
+
 pub(crate) trait AvailableSpaceProbe: Send + Sync {
     fn measure(&self, path: &Path) -> Option<u64>;
 }
@@ -32,7 +36,7 @@ pub(crate) fn check_free_space_floor(probe: &dyn AvailableSpaceProbe, host: &str
     }
 
     let floor_bytes =
-        floor_gib.checked_mul(BYTES_PER_GIB).ok_or_else(|| format!("free-space floor for host `{host}` is too large: {floor_gib} GiB"))?;
+        free_space_floor_bytes(floor_gib).map_err(|_| format!("free-space floor for host `{host}` is too large: {floor_gib} GiB"))?;
     let free_bytes = probe
         .measure(path)
         .ok_or_else(|| format!("placement refused on host `{host}`: free space could not be measured for {}", path.display()))?;
@@ -43,7 +47,7 @@ pub fn measure_available_space(path: &Path) -> Option<u64> {
     SystemAvailableSpaceProbe.measure(path)
 }
 
-fn check_measured_free_space(host: &str, free_bytes: u64, floor_bytes: u64) -> Result<(), String> {
+pub(crate) fn check_measured_free_space(host: &str, free_bytes: u64, floor_bytes: u64) -> Result<(), String> {
     if free_bytes >= floor_bytes {
         return Ok(());
     }

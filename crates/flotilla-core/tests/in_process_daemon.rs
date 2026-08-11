@@ -51,8 +51,8 @@ use flotilla_resources::{
     CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase, DockerCheckoutStrategy,
     DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
     HostStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
-    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryRelation, RepositorySpec, Stance, TypedResolver,
-    WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL,
+    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryRelation, RepositorySpec, ResourceError, Stance,
+    TypedResolver, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL,
 };
 use tokio::sync::Notify;
 
@@ -984,6 +984,19 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
 }
 
 async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBackend, image: &str, agent_adapters: BTreeSet<String>) {
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = match hosts.get("host-test").await {
+        Ok(host) => host,
+        Err(ResourceError::NotFound { .. }) => hosts
+            .create(&InputMeta::builder().name("host-test".to_string()).build(), &HostSpec::default())
+            .await
+            .expect("test placement host create"),
+        Err(error) => panic!("get test placement host: {error}"),
+    };
+    let mut status = host.status.unwrap_or_default();
+    status.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
+    status.admission_free_space_floor_bytes = Some(20 * 1024 * 1024 * 1024);
+    hosts.update_status("host-test", &host.metadata.resource_version, &status).await.expect("publish test placement host capacity");
     backend
         .clone()
         .using::<PlacementPolicy>("flotilla")
@@ -1298,6 +1311,8 @@ async fn create_test_host_direct_policy(
             capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),
             heartbeat_at: Some(chrono::Utc::now()),
             ready: true,
+            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
             resource_store: None,
             ..HostStatus::default()
         })

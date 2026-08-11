@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::Utc;
 use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
@@ -25,8 +26,9 @@ use flotilla_protocol::{
     PeerConnectionState, PrincipalRef, RepoSelector, ResourceRef, SurfaceCharacter, SurfaceDeclaration,
 };
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta, PlacementPolicy, Regard, Resource,
-    ResourceError, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
+    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, DockerCheckoutStrategy,
+    DockerPerVesselPlacementPolicySpec, Host, HostSpec, HostStatus, InputMeta, PlacementPolicy, PlacementPolicySpec, Regard, Resource,
+    ResourceError, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
 };
 
 fn test_config_store(config_dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -48,6 +50,49 @@ async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Op
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store_with_floor(tmp.keep(), free_space_floor_gib);
     InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::new(host_name)).await
+}
+
+async fn seed_host_capacity(daemon: &Arc<InProcessDaemon>, free_bytes: u64, floor_bytes: u64) {
+    let host_id = daemon.local_host_id().expect("host identity").to_string();
+    let hosts = daemon.resource_backend().using::<Host>("flotilla");
+    let host = hosts
+        .create(&InputMeta::builder().name(host_id.clone()).build(), &HostSpec::default())
+        .await
+        .expect("create host capacity resource");
+    hosts
+        .update_status(&host_id, &host.metadata.resource_version, &HostStatus {
+            ready: true,
+            disk_free_bytes: Some(free_bytes),
+            admission_free_space_floor_bytes: Some(floor_bytes),
+            ..HostStatus::default()
+        })
+        .await
+        .expect("publish host capacity");
+}
+
+async fn await_host_capacity(daemon: &Arc<InProcessDaemon>, host_id: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let capacity_available = daemon
+                .resource_backend()
+                .including_replicas::<Host>("flotilla")
+                .list()
+                .await
+                .expect("list federated hosts")
+                .items
+                .into_iter()
+                .any(|source| {
+                    source.object.metadata.name == host_id
+                        && source.object.status.is_some_and(|status| status.admission_free_space_floor_bytes.is_some())
+                });
+            if capacity_available {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("host capacity should replicate");
 }
 
 fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
@@ -126,6 +171,8 @@ async fn convoy_creation_attributes_provenance_and_regard_to_the_surface_princip
         .await
         .expect("create workflow");
     let follower = empty_daemon_named("follower").await;
+    seed_host_capacity(&follower, 2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024).await;
+    let follower_host_id = follower.local_host_id().expect("follower host identity").to_string();
     let principal_ref = PrincipalRef { namespace: "flotilla".to_string(), name: "alice".to_string() };
     let topology = spawn_in_memory_request_topology_stateful_with_surface(Arc::clone(&leader), follower, SurfaceDeclaration {
         principal_ref: principal_ref.clone(),
@@ -133,6 +180,7 @@ async fn convoy_creation_attributes_provenance_and_regard_to_the_surface_princip
     })
     .await
     .expect("spawn named focal client topology");
+    await_host_capacity(&leader, &follower_host_id).await;
     let mut events = leader.subscribe();
 
     let command_id = topology
@@ -459,9 +507,10 @@ async fn hostless_convoy_delete_uses_live_peer_route_when_connection_status_is_s
 }
 
 #[tokio::test]
-async fn convoy_start_uses_live_peer_route_when_presentation_membership_is_stale() {
+async fn convoy_start_stays_on_admitting_store_when_placement_membership_is_stale() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named("follower").await;
+    seed_host_capacity(&follower, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
     follower.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
     let namespace = "flotilla";
@@ -478,6 +527,7 @@ async fn convoy_start_uses_live_peer_route_when_presentation_membership_is_stale
     })
     .await
     .expect("peer host summary should materialize placement policy");
+    await_host_capacity(&topology.leader, &remote_host_id).await;
 
     seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
 
@@ -523,7 +573,7 @@ async fn convoy_start_uses_live_peer_route_when_presentation_membership_is_stale
             },
         })
         .await
-        .expect("live peer route should admit remote placement despite stale presentation membership");
+        .expect("admitting store should accept remote placement despite stale presentation membership");
 
     assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted {
         name: "remote-work".to_string(),
@@ -531,18 +581,26 @@ async fn convoy_start_uses_live_peer_route_when_presentation_membership_is_stale
         binding: None
     });
     topology
-        .follower
+        .leader
         .resource_backend()
         .using::<Convoy>(namespace)
         .get("remote-work")
         .await
-        .expect("convoy should be created on live placement host");
+        .expect("convoy should remain on the admitting store");
+    assert!(
+        matches!(
+            topology.follower.resource_backend().using::<Convoy>(namespace).get("remote-work").await,
+            Err(ResourceError::NotFound { .. })
+        ),
+        "placement host must not become the convoy authority"
+    );
 }
 
 #[tokio::test]
-async fn remote_convoy_start_enforces_target_free_space_floor_without_leaving_prepared_state() {
+async fn remote_convoy_start_enforces_target_capacity_without_moving_authority() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named_with_floor("follower", Some(1_000_000)).await;
+    seed_host_capacity(&follower, 0, 1_000_000 * 1024 * 1024 * 1024).await;
     follower.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
     let namespace = "flotilla";
@@ -559,29 +617,8 @@ async fn remote_convoy_start_enforces_target_free_space_floor_without_leaving_pr
     })
     .await
     .expect("peer host summary should materialize placement policy");
+    await_host_capacity(&topology.leader, &remote_host_id).await;
     seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
-
-    let follower_backend = topology.follower.resource_backend();
-    let workflows_before = follower_backend
-        .clone()
-        .using::<WorkflowTemplate>(namespace)
-        .list()
-        .await
-        .expect("list target workflows before dispatch")
-        .items
-        .into_iter()
-        .map(|resource| resource.metadata.name)
-        .collect::<BTreeSet<_>>();
-    let policies_before = follower_backend
-        .clone()
-        .using::<PlacementPolicy>(namespace)
-        .list()
-        .await
-        .expect("list target policies before dispatch")
-        .items
-        .into_iter()
-        .map(|resource| resource.metadata.name)
-        .collect::<BTreeSet<_>>();
 
     let mut events = topology.leader.subscribe();
     let command_id = topology
@@ -603,7 +640,7 @@ async fn remote_convoy_start_enforces_target_free_space_floor_without_leaving_pr
             },
         })
         .await
-        .expect("remote convoy dispatch should be routed");
+        .expect("admitting store should evaluate the convoy");
 
     let result = await_command_result(&mut events, command_id).await;
     let CommandValue::Error { message } = result else {
@@ -614,37 +651,125 @@ async fn remote_convoy_start_enforces_target_free_space_floor_without_leaving_pr
     assert!(message.contains("reap settled convoys"), "{message}");
     assert!(message.contains("scripts/prune-target.sh"), "{message}");
     assert!(message.contains("pick another host"), "{message}");
-
     assert!(
-        matches!(follower_backend.using::<Convoy>(namespace).get("remote-disk-hungry").await, Err(ResourceError::NotFound { .. })),
-        "refused remote dispatch must not create a Convoy"
+        matches!(
+            topology.leader.resource_backend().using::<Convoy>(namespace).get("remote-disk-hungry").await,
+            Err(ResourceError::NotFound { .. })
+        ),
+        "refused admission must not create a convoy on the admitting store"
     );
-    assert_eq!(
-        follower_backend
-            .clone()
-            .using::<WorkflowTemplate>(namespace)
-            .list()
-            .await
-            .expect("list target workflows after dispatch")
-            .items
-            .into_iter()
-            .map(|resource| resource.metadata.name)
-            .collect::<BTreeSet<_>>(),
-        workflows_before,
-        "refused remote dispatch must not persist a prepared workflow snapshot"
+    assert!(
+        matches!(
+            topology.follower.resource_backend().using::<Convoy>(namespace).get("remote-disk-hungry").await,
+            Err(ResourceError::NotFound { .. })
+        ),
+        "refused admission must not create a convoy on the placement host"
     );
-    assert_eq!(
-        follower_backend
-            .using::<PlacementPolicy>(namespace)
-            .list()
-            .await
-            .expect("list target policies after dispatch")
-            .items
-            .into_iter()
-            .map(|resource| resource.metadata.name)
-            .collect::<BTreeSet<_>>(),
-        policies_before,
-        "refused remote dispatch must not persist a prepared placement snapshot"
+}
+
+#[tokio::test]
+async fn remote_docker_admission_fails_closed_without_target_capacity() {
+    let daemon = empty_daemon_named_with_floor("leader", Some(0)).await;
+    let namespace = "flotilla";
+    seed_trusted_remote_convoy_project(&daemon, namespace).await;
+
+    let hosts = daemon.resource_backend().using::<Host>(namespace);
+    let host = hosts
+        .create(&InputMeta::builder().name("remote-docker-host".to_string()).build(), &HostSpec {
+            display_name: "remote-docker".to_string(),
+        })
+        .await
+        .expect("create remote Docker host");
+    hosts
+        .update_status("remote-docker-host", &host.metadata.resource_version, &HostStatus {
+            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            ..HostStatus::default()
+        })
+        .await
+        .expect("mark remote Docker host ready without capacity");
+    daemon
+        .resource_backend()
+        .using::<PlacementPolicy>(namespace)
+        .create(
+            &InputMeta::builder().name("remote-docker".to_string()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("cleat".to_string())
+                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    host_ref: "remote-docker-host".to_string(),
+                    image: "crew:latest".to_string(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::from(["codex".to_string()]),
+                    default_cwd: None,
+                    env: BTreeMap::new(),
+                    checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                })
+                .build(),
+        )
+        .await
+        .expect("create remote Docker placement");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(
+                    ConvoyStartIntent::builder()
+                        .project_ref("flotilla".to_string())
+                        .name("remote-docker-work".to_string())
+                        .branch("fix/remote-docker-work".to_string())
+                        .placement_policy("remote-docker".to_string())
+                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                        .build(),
+                ),
+            },
+        })
+        .await
+        .expect("dispatch remote Docker admission");
+
+    let result = await_command_result(&mut events, command_id).await;
+    let CommandValue::Error { message } = result else {
+        panic!("expected missing-capacity refusal, got {result:?}");
+    };
+    assert_eq!(message, "placement refused on host `remote-docker`: admission free-space floor is unavailable");
+    assert!(
+        matches!(daemon.resource_backend().using::<Convoy>(namespace).get("remote-docker-work").await, Err(ResourceError::NotFound { .. })),
+        "missing remote Docker capacity must fail before convoy persistence"
+    );
+
+    let legacy_command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "legacy-remote-docker-work".to_string(),
+                workflow_ref: "remote-workflow".to_string(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: Some("remote-docker".to_string()),
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("dispatch legacy remote Docker admission");
+    let legacy_result = await_command_result(&mut events, legacy_command_id).await;
+    let CommandValue::Error { message } = legacy_result else {
+        panic!("expected legacy missing-capacity refusal, got {legacy_result:?}");
+    };
+    assert_eq!(message, "placement refused on host `remote-docker`: admission free-space floor is unavailable");
+    assert!(
+        matches!(
+            daemon.resource_backend().using::<Convoy>(namespace).get("legacy-remote-docker-work").await,
+            Err(ResourceError::NotFound { .. })
+        ),
+        "legacy missing remote Docker capacity must fail before convoy persistence"
     );
 }
 
