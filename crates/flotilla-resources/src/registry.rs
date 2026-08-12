@@ -580,16 +580,30 @@ async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, n
     let (value, already_deleted) = match resolver.get(name).await {
         Ok(object) => {
             resolver.delete(name).await?;
+            if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
+                return Ok(DynamicResourceDelete {
+                    object: DynamicResourceObject {
+                        kind: T::API_PATHS.kind.to_string(),
+                        plural: T::API_PATHS.plural.to_string(),
+                        namespace: namespace.to_string(),
+                        value: object_value(&object)?,
+                    },
+                    already_deleted: false,
+                });
+            }
+            force_pending_finalization(&resolver, name).await?;
+            match resolver.get(name).await {
+                Err(ResourceError::NotFound { .. }) => {}
+                Ok(_) => return Err(ResourceError::other(format!("delete reported success but {name} remains in the resource store"))),
+                Err(error) => return Err(error),
+            }
+            if T::REPLICATION_CLASS != crate::ReplicationClass::None {
+                retain_authoritative_name_tombstone::<T>(backend, namespace, name).await?;
+            }
             (object_value(&object)?, false)
         }
         Err(ResourceError::NotFound { .. }) if T::REPLICATION_CLASS != crate::ReplicationClass::None => {
-            let write = resolver.tombstone(name).await?;
-            if write.created {
-                backend
-                    .replica_writer::<T>(backend.local_root()?, namespace)
-                    .apply(WatchEvent::DeletedByName(write.tombstone.clone()), Utc::now())
-                    .await?;
-            }
+            let write = retain_authoritative_name_tombstone::<T>(backend, namespace, name).await?;
             (tombstone_value::<T>(&write.tombstone), !write.created)
         }
         Err(error) => return Err(error),
@@ -603,6 +617,48 @@ async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, n
         },
         already_deleted,
     })
+}
+
+/// Raw resource deletion is the recovery path documented in the governor
+/// charter, so it must not leave an object stuck behind an abandoned
+/// finalizer. Ordinary controller deletion still goes through
+/// `TypedResolver::delete` and retains normal finalizer semantics.
+async fn force_pending_finalization<T: Resource>(resolver: &crate::TypedResolver<T>, name: &str) -> Result<(), ResourceError> {
+    for _ in 0..3 {
+        let object = match resolver.get(name).await {
+            Err(ResourceError::NotFound { .. }) => return Ok(()),
+            Ok(object) => object,
+            Err(error) => return Err(error),
+        };
+        if !object.metadata.is_pending_finalization() {
+            return Err(ResourceError::other(format!("delete left {name} present without pending finalizers")));
+        }
+
+        let mut meta = InputMeta::from(&object.metadata);
+        meta.finalizers.clear();
+        match resolver.update(&meta, &object.metadata.resource_version, &object.spec).await {
+            Ok(_) => {}
+            Err(ResourceError::Conflict { .. }) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(ResourceError::conflict(name, "finalizer removal retry budget exhausted"))
+}
+
+async fn retain_authoritative_name_tombstone<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    name: &str,
+) -> Result<crate::watch::TombstoneWrite, ResourceError> {
+    let write = backend.using::<T>(namespace).tombstone(name).await?;
+    if write.created {
+        backend
+            .replica_writer::<T>(backend.local_root()?, namespace)
+            .apply(WatchEvent::DeletedByName(write.tombstone.clone()), Utc::now())
+            .await?;
+    }
+    Ok(write)
 }
 
 async fn collect_replica_typed<T: Resource>(

@@ -1,0 +1,70 @@
+{
+  "apiVersion": "flotilla.work/v1",
+  "kind": "TerminalSession",
+  "metadata": {
+    "annotations": {
+      "flotilla.work/actuator-host-ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "flotilla.work/actuator-source-root": "0fe74f4d513e0b1cce3bc748f0ae6cf4"
+    },
+    "creationTimestamp": "2026-08-02T16:28:30.787142516Z",
+    "deletionTimestamp": "2026-08-02T16:38:59.098638511Z",
+    "finalizers": ["flotilla.work/terminal-teardown"],
+    "labels": {
+      "flotilla.work/authority": "managed",
+      "flotilla.work/convoy": "checkout-cascade",
+      "flotilla.work/crew_ordinal": "000",
+      "flotilla.work/role": "coder",
+      "flotilla.work/vessel": "work",
+      "flotilla.work/vessel_ordinal": "000",
+      "flotilla.work/vessel_ref": "checkout-cascade-work"
+    },
+    "name": "terminal-checkout-cascade-work-coder",
+    "namespace": "flotilla",
+    "ownerReferences": [
+      {
+        "apiVersion": "flotilla.work/v1",
+        "controller": true,
+        "kind": "Vessel",
+        "name": "checkout-cascade-work"
+      }
+    ],
+    "resourceVersion": "9234"
+  },
+  "spec": {
+    "cwd": "/workspace",
+    "env_ref": "env-checkout-cascade-work",
+    "pool": "cleat",
+    "role": "coder",
+    "source": {
+      "brief": {
+        "content": "",
+        "copies": ["/workspace"],
+        "path": ".flotilla/briefs/coder.md"
+      },
+      "context": {
+        "convoy": "checkout-cascade",
+        "namespace": "flotilla",
+        "vessel_ref": "checkout-cascade-work"
+      },
+      "kind": "agent",
+      "selector": {"capability": "code"}
+    }
+  },
+  "status": {
+    "attention": {
+      "as_of": "2026-08-02T16:38:47.198692512Z",
+      "source": "screen",
+      "state": "working"
+    },
+    "crew": {
+      "adapter": "codex",
+      "id": "e19bfd03-dc13-4c85-8657-fdb1ae911282",
+      "stance": "trusted-implicit"
+    },
+    "inner_command_status": "Running",
+    "launch_command": "codex --dangerously-bypass-approvals-and-sandbox 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'",
+    "phase": "Running",
+    "session_id": "terminal-checkout-cascade-work-coder",
+    "started_at": "2026-08-02T16:28:31.119287805Z"
+  }
+}

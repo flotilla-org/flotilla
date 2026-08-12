@@ -381,6 +381,81 @@ async fn authoritative_name_tombstone_survives_backend_restart() {
 }
 
 #[tokio::test]
+async fn raw_delete_removes_real_pending_terminal_row_and_prevents_relay_resurrection() {
+    // Extracted read-only from feta's resource_objects table on 2026-08-12.
+    // The fixture preserves the stored row shape and values; only the opaque
+    // brief body was elided because it has no resource-store semantics.
+    const NAME: &str = "terminal-checkout-cascade-work-coder";
+    const BODY: &str = include_str!("fixtures/terminal_session_pending_finalization.json");
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("resources.sqlite");
+    let authority_root = flotilla_protocol::NodeId::new("9ad3ffb1931f9996979535186f45027f");
+    drop(SqliteBackend::open(&path).expect("initialize sqlite backend"));
+    {
+        let connection = rusqlite::Connection::open(&path).expect("open raw sqlite fixture connection");
+        connection
+            .execute(
+                "INSERT INTO resource_objects (group_name, version, kind, namespace, name, resource_version, body_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params!["flotilla.work", "v1", "TerminalSession", "flotilla", NAME, 9234_u64, BODY],
+            )
+            .expect("insert row extracted from feta resource store");
+        connection
+            .execute(
+                "INSERT INTO resource_sequences (group_name, version, kind, namespace, next_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["flotilla.work", "v1", "TerminalSession", "flotilla", 9235_u64],
+            )
+            .expect("insert extracted stream sequence");
+    }
+
+    let authority =
+        ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("open fixture backend")).with_local_root(authority_root.clone());
+    let terminals = authority.using::<TerminalSession>("flotilla");
+    let extracted = terminals.get(NAME).await.expect("real pending row should be servable before recovery");
+    assert_eq!(extracted.metadata.resource_version, "9234");
+    assert!(extracted.metadata.is_pending_finalization());
+    let stale_snapshot = terminals.list().await.expect("capture stale relay snapshot");
+    let mut watch = terminals.watch(WatchStart::resuming_from(&stale_snapshot)).await.expect("watch authoritative deletion");
+
+    let deleted = flotilla_resources::delete_resource_kind(&authority, "flotilla", "terminalsessions", NAME)
+        .await
+        .expect("raw delete should force abandoned finalization");
+    assert!(!deleted.already_deleted);
+    assert!(matches!(terminals.get(NAME).await, Err(ResourceError::NotFound { .. })));
+
+    let mut delete_events = Vec::new();
+    while let Ok(Some(Ok(event))) = timeout(Duration::from_millis(100), watch.next()).await {
+        delete_events.push(event);
+    }
+    assert!(delete_events.iter().any(|event| matches!(event, WatchEvent::Deleted(object) if object.metadata.name == NAME)));
+    let tombstone = delete_events
+        .iter()
+        .find(|event| matches!(event, WatchEvent::DeletedByName(tombstone) if tombstone.name == NAME))
+        .cloned()
+        .expect("raw delete should retain an authoritative name tombstone");
+
+    let peers = [ResourceBackend::InMemory(InMemoryBackend::default()), ResourceBackend::InMemory(InMemoryBackend::default())];
+    let stale_synced_at = Utc::now() - chrono::Duration::minutes(1);
+    for peer in &peers {
+        let writer = peer.replica_writer::<TerminalSession>(authority_root.clone(), "flotilla");
+        writer.replace(&stale_snapshot, stale_synced_at).await.expect("seed stale peer row");
+        writer.apply(tombstone.clone(), Utc::now()).await.expect("relay authoritative tombstone");
+        writer
+            .apply(WatchEvent::Added(stale_snapshot.items[0].clone()), stale_synced_at)
+            .await
+            .expect("exercise stale relay after deletion");
+        assert!(peer.including_replicas::<TerminalSession>("flotilla").list().await.expect("list peer overlay").items.is_empty());
+    }
+
+    let repeated = flotilla_resources::delete_resource_kind(&authority, "flotilla", "terminalsessions", NAME)
+        .await
+        .expect("repeat delete should use retained tombstone");
+    assert!(repeated.already_deleted);
+}
+
+#[tokio::test]
 async fn replicated_project_definition_survives_backend_restart_without_peer() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("resources.sqlite");
