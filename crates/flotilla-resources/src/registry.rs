@@ -637,7 +637,7 @@ async fn force_pending_finalization<T: Resource>(resolver: &crate::TypedResolver
         let mut meta = InputMeta::from(&object.metadata);
         meta.finalizers.clear();
         match resolver.update(&meta, &object.metadata.resource_version, &object.spec).await {
-            Ok(_) => {}
+            Ok(_) => return Ok(()),
             Err(ResourceError::Conflict { .. }) => continue,
             Err(error) => return Err(error),
         }
