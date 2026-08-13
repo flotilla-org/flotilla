@@ -493,3 +493,47 @@ impl InteractiveWidget for CommandPaletteWidget {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_support::TestWidgetHarness;
+
+    #[test]
+    fn binding_mode_is_command_palette() {
+        let widget = CommandPaletteWidget::new();
+        assert_eq!(widget.binding_mode(), KeyBindingMode::from(BindingModeId::CommandPalette));
+    }
+
+    #[test]
+    fn command_palette_routes_text_through_raw_key_handling() {
+        let widget = CommandPaletteWidget::new();
+        assert!(!widget.captures_raw_keys());
+    }
+
+    #[test]
+    fn dismiss_returns_finished() {
+        let mut widget = CommandPaletteWidget::new();
+        let mut harness = TestWidgetHarness::new();
+        let outcome = widget.handle_action(Action::Dismiss, &mut harness.ctx());
+        assert!(matches!(outcome, Outcome::Finished));
+    }
+
+    #[test]
+    fn selection_wraps_in_both_directions() {
+        let mut widget = CommandPaletteWidget::new();
+        let mut harness = TestWidgetHarness::new();
+        let interactions = crate::interaction::InteractionContext::for_active_view(
+            harness.views.active_address(),
+            harness.views.active_table_state().selected(),
+            harness.model.active_repo_identity_opt().is_some(),
+        );
+        let count = widget.completions(&harness.model, &harness.namespaces, false, interactions).len();
+        assert!(count > 1);
+
+        widget.handle_action(Action::SelectPrev, &mut harness.ctx());
+        assert_eq!(widget.selected, count - 1);
+        widget.handle_action(Action::SelectNext, &mut harness.ctx());
+        assert_eq!(widget.selected, 0);
+    }
+}

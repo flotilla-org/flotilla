@@ -20,7 +20,7 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
-    ProvisioningTarget, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, ResourceRef, StepStatus, ViewAddress,
+    ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, ResourceRef, StepStatus, ViewAddress,
 };
 use indexmap::IndexMap;
 pub use open_views::{OpenView, OpenViews, ViewTarget};
@@ -1142,7 +1142,9 @@ impl App {
 
     pub fn handle_daemon_event(&mut self, event: DaemonEvent) {
         match event {
-            DaemonEvent::RepoSnapshot(_) | DaemonEvent::RepoDelta(_) | DaemonEvent::RepoRefreshCompleted { .. } => {}
+            DaemonEvent::RepoSnapshot(snapshot) => self.apply_provider_snapshot(*snapshot),
+            DaemonEvent::RepoDelta(delta) => self.apply_provider_delta(*delta),
+            DaemonEvent::RepoRefreshCompleted { .. } => {}
             DaemonEvent::RepoTracked(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoUntracked { repo_identity, .. } => self.handle_repo_removed(&repo_identity),
             DaemonEvent::CommandStarted { command_id, node_id, repo_identity, repo, description, .. } => {
@@ -1393,6 +1395,57 @@ impl App {
         }
     }
 
+    /// Preserve the snapshot-fed provider health consumed by the overview's
+    /// Providers panel. Work-item data remains deliberately ignored.
+    fn apply_provider_snapshot(&mut self, snapshot: RepoSnapshot) {
+        let repo_identity = snapshot.repo_identity;
+        let Some(repo) = self.model.repos.get_mut(&repo_identity) else { return };
+        repo.provider_health = snapshot.provider_health;
+        repo.loading = false;
+        self.sync_provider_statuses(&repo_identity);
+    }
+
+    /// Apply only provider-health changes from a Plane-A delta. The surviving
+    /// Providers panel still consumes this feed under #1457's escalation rule.
+    fn apply_provider_delta(&mut self, delta: RepoDelta) {
+        let repo_identity = delta.repo_identity;
+        let Some(repo) = self.model.repos.get_mut(&repo_identity) else { return };
+        for change in delta.changes {
+            match change {
+                flotilla_protocol::Change::ProviderHealth {
+                    category,
+                    provider,
+                    op: flotilla_protocol::EntryOp::Added(healthy) | flotilla_protocol::EntryOp::Updated(healthy),
+                } => {
+                    repo.provider_health.entry(category).or_default().insert(provider, healthy);
+                }
+                flotilla_protocol::Change::ProviderHealth { category, provider, op: flotilla_protocol::EntryOp::Removed } => {
+                    if let Some(providers) = repo.provider_health.get_mut(&category) {
+                        providers.remove(&provider);
+                        if providers.is_empty() {
+                            repo.provider_health.remove(&category);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.sync_provider_statuses(&repo_identity);
+    }
+
+    fn sync_provider_statuses(&mut self, repo_identity: &RepoIdentity) {
+        let Some(provider_health) = self.model.repos.get(repo_identity).map(|repo| repo.provider_health.clone()) else { return };
+        for (category, providers) in &provider_health {
+            for (provider_name, &healthy) in providers {
+                let status = if healthy { ProviderStatus::Ok } else { ProviderStatus::Error };
+                self.model.provider_statuses.insert((repo_identity.clone(), category.clone(), provider_name.clone()), status);
+            }
+        }
+        self.model.provider_statuses.retain(|key, _| {
+            &key.0 != repo_identity || provider_health.get(&key.1).is_some_and(|providers| providers.contains_key(&key.2))
+        });
+    }
+
     fn handle_repo_added(&mut self, info: RepoInfo) {
         let identity = info.identity.clone();
         if let Some(existing) = self.model.repos.get_mut(&identity) {
@@ -1477,5 +1530,43 @@ fn view_regard_target(address: &ViewAddress) -> Option<ResourceRef> {
         | ViewAddress::Independents { .. }
         | ViewAddress::Checkouts { scope: None }
         | ViewAddress::Repo { repository_key: None, .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod provider_status_tests {
+    use super::*;
+    use crate::app::test_support::stub_app;
+
+    #[test]
+    fn snapshot_and_delta_keep_overview_provider_statuses_current() {
+        let mut app = stub_app();
+        let repo_identity = app.model.repo_order[0].clone();
+        let category = "issue_tracker".to_string();
+        let provider = "github".to_string();
+        let status_key = (repo_identity.clone(), category.clone(), provider.clone());
+        let provider_health = HashMap::from([(category.clone(), HashMap::from([(provider.clone(), true)]))]);
+
+        app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(RepoSnapshot {
+            seq: 1,
+            repo_identity: repo_identity.clone(),
+            repo: None,
+            node_id: NodeId::new("test"),
+            work_items: vec![],
+            providers: ProviderData::default(),
+            provider_health,
+            errors: vec![],
+        })));
+        assert_eq!(app.model.provider_statuses.get(&status_key), Some(&ProviderStatus::Ok));
+
+        app.handle_daemon_event(DaemonEvent::RepoDelta(Box::new(RepoDelta {
+            seq: 2,
+            prev_seq: 1,
+            repo_identity,
+            repo: None,
+            changes: vec![flotilla_protocol::Change::ProviderHealth { category, provider, op: flotilla_protocol::EntryOp::Updated(false) }],
+            work_items: vec![],
+        })));
+        assert_eq!(app.model.provider_statuses.get(&status_key), Some(&ProviderStatus::Error));
     }
 }
