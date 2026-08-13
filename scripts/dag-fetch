@@ -98,8 +98,19 @@ def convoy_facts() -> dict[str, list[dict[str, Any]]]:
         status = obj.get("status", {})
         provenance = record.get("provenance", {})
         rows = rows_by_convoy.get(name, [])
-        row = min(rows, key=lambda item: json.dumps(item, sort_keys=True)) if rows else {}
-        host = row.get("host") or status.get("placement_decision", {}).get("target_host", {}).get("display_name")
+        freshness = {"stale": 1, "current": 2, "local": 3}
+        row = (
+            max(
+                rows,
+                key=lambda item: (
+                    freshness.get(item.get("staleness", {}).get("kind", ""), 0),
+                    json.dumps(item, sort_keys=True),
+                ),
+            )
+            if rows
+            else {}
+        )
+        host = status.get("placement_decision", {}).get("target_host", {}).get("display_name") or row.get("host")
         # Ages and sync timestamps advance even when the observation does not
         # change. Persist the semantic category only so refreshes stay stable.
         staleness = {"kind": (row.get("staleness") or {}).get("kind") or provenance.get("source", "unknown")}

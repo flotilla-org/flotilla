@@ -150,7 +150,12 @@ class DagFetchTest(unittest.TestCase):
                         }
                     ]
                 },
-                "ls": {"rows": []},
+                "ls": {
+                    "rows": [
+                        {"convoy": "exact-association", "host": "aaa", "staleness": {"kind": "stale"}},
+                        {"convoy": "exact-association", "host": "zzz", "staleness": {"kind": "current"}},
+                    ]
+                },
             },
         )
 
@@ -188,7 +193,7 @@ print(json.dumps(data['resource' if sys.argv[1] == 'resource' else 'ls']))
         self.assertEqual(tickets["flotilla-org/flotilla#12"]["status"], "blocked")
         self.assertEqual(tickets["flotilla-org/andamento#3"]["status"], "at-sea")
         self.assertEqual(tickets["flotilla-org/andamento#3"]["convoys"][0]["host"], "newer-host")
-        self.assertEqual(tickets["flotilla-org/andamento#3"]["convoys"][0]["staleness"], {"kind": "replica"})
+        self.assertEqual(tickets["flotilla-org/andamento#3"]["convoys"][0]["staleness"], {"kind": "current"})
         self.assertEqual(tickets["flotilla-org/flotilla#10"]["pullRequests"][0]["ci"], "success")
         self.assertEqual(
             generated["dependencyEdges"],

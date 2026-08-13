@@ -130,7 +130,7 @@ export function renderBoard(root, board) {
   const groupedRefs = new Set(Object.values(board.groups).flatMap((group) => group.ticketRefs));
   const groupEntries = Object.entries(board.groups);
   const uncategorized = board.tickets.filter((ticket) => !groupedRefs.has(ticket.ref)).map((ticket) => ticket.ref);
-  if (uncategorized.length) groupEntries.push(["uncategorized", { label: "Uncategorized", ticketRefs: uncategorized }]);
+  if (uncategorized.length) groupEntries.push(["__ungrouped__", { label: "Uncategorized", ticketRefs: uncategorized }]);
 
   for (const [name, group] of groupEntries.sort((left, right) => left[1].label.localeCompare(right[1].label))) {
     const refs = new Set(group.ticketRefs);
