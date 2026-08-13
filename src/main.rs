@@ -2244,13 +2244,14 @@ mod tests {
             }) if kind == "convoys" && name == "demo" && namespace == "ops"
         ));
 
-        let delete = Cli::try_parse_from(["flotilla", "resource", "delete", "workflowtemplates", "scratch", "--namespace", "ops"])
-            .expect("resource delete should parse");
+        let delete =
+            Cli::try_parse_from(["flotilla", "resource", "delete", "workflowtemplates", "scratch", "--namespace", "ops", "--host", "feta"])
+                .expect("resource delete should parse");
         assert!(matches!(
             delete.command,
             Some(SubCommand::Resource {
-                command: ResourceSubCommand::Delete(ResourceDeleteArgs { kind, name, namespace, replica: None, host: None })
-            }) if kind == "workflowtemplates" && name == "scratch" && namespace == "ops"
+                command: ResourceSubCommand::Delete(ResourceDeleteArgs { kind, name, namespace, replica: None, host: Some(host) })
+            }) if kind == "workflowtemplates" && name == "scratch" && namespace == "ops" && host == "feta"
         ));
 
         let collect =
@@ -2267,13 +2268,13 @@ mod tests {
             }) if origin == "retired-root" && host == "feta"
         ));
 
-        let apply = Cli::try_parse_from(["flotilla", "resource", "apply", "-f", "demand.yaml", "--namespace", "ops"])
+        let apply = Cli::try_parse_from(["flotilla", "resource", "apply", "-f", "demand.yaml", "--namespace", "ops", "--host", "feta"])
             .expect("resource apply should parse");
         assert!(matches!(
             apply.command,
             Some(SubCommand::Resource {
-                command: ResourceSubCommand::Apply(ResourceApplyArgs { file, namespace, host: None })
-            }) if file.as_path() == Path::new("demand.yaml") && namespace == "ops"
+                command: ResourceSubCommand::Apply(ResourceApplyArgs { file, namespace, host: Some(host) })
+            }) if file.as_path() == Path::new("demand.yaml") && namespace == "ops" && host == "feta"
         ));
 
         let patch_status =

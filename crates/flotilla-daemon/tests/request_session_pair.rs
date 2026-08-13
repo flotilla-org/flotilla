@@ -276,6 +276,66 @@ async fn in_memory_request_client_routes_remote_command_result() {
 }
 
 #[tokio::test]
+async fn resource_mutations_targeting_a_peer_modify_only_the_peer_store() {
+    let leader = empty_daemon_named("leader").await;
+    let follower = empty_daemon_named("follower").await;
+    let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
+    let follower_node_id = topology.follower.node_id().clone();
+    let namespace = "flotilla";
+    let name = "remote-template";
+    let leader_templates = topology.leader.resource_backend().using::<WorkflowTemplate>(namespace);
+    let follower_templates = topology.follower.resource_backend().using::<WorkflowTemplate>(namespace);
+
+    let mut events = topology.leader.subscribe();
+    let apply_id = topology
+        .client
+        .execute(Command {
+            node_id: Some(follower_node_id.clone()),
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ResourceApply {
+                namespace: namespace.to_string(),
+                document: serde_json::json!({
+                    "kind": "WorkflowTemplate",
+                    "metadata": {"name": name},
+                    "spec": {"vessels": []},
+                }),
+            },
+        })
+        .await
+        .expect("dispatch peer resource apply");
+
+    assert!(matches!(await_command_result(&mut events, apply_id).await, CommandValue::ResourceObject(_)));
+    assert!(
+        matches!(leader_templates.get(name).await, Err(ResourceError::NotFound { .. })),
+        "peer-targeted apply must not create the resource in the caller's store"
+    );
+    follower_templates.get(name).await.expect("peer-targeted apply should create the resource in the peer store");
+
+    let delete_id = topology
+        .client
+        .execute(Command {
+            node_id: Some(follower_node_id),
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ResourceDelete {
+                namespace: namespace.to_string(),
+                kind: "workflowtemplates".to_string(),
+                name: name.to_string(),
+                replica_origin: None,
+            },
+        })
+        .await
+        .expect("dispatch peer resource delete");
+
+    assert!(matches!(await_command_result(&mut events, delete_id).await, CommandValue::ResourceDeleted(_)));
+    assert!(
+        matches!(follower_templates.get(name).await, Err(ResourceError::NotFound { .. })),
+        "peer-targeted delete should remove the resource from the peer store"
+    );
+}
+
+#[tokio::test]
 async fn hostless_convoy_delete_routes_to_remote_home() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named("follower").await;

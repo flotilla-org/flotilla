@@ -6,9 +6,20 @@ The daemon's canonical structured log is
 `$XDG_STATE_HOME/flotilla/log/flotillad.jsonl`, or
 `~/.local/state/flotilla/log/flotillad.jsonl` when `XDG_STATE_HOME` is unset.
 Older size-rotated generations use numeric suffixes such as
-`flotillad.jsonl.1`. Detached daemons write their normal tracing output only
-to this JSON-lines log; `daemon-panic.log` under the configuration directory
-is reserved for panics and errors that occur before tracing initializes.
+`flotillad.jsonl.1` through `flotillad.jsonl.4` with the default configuration.
+For example, show warnings from the peer subsystem with:
+
+```bash
+jq -c 'select(.level == "WARN" and (.target | startswith("flotilla_daemon::peer")))' \
+  ~/.local/state/flotilla/log/flotillad.jsonl
+```
+
+Detached daemons write their normal tracing output only to this JSON-lines
+log. A legacy `~/.local/state/flotilla/daemon.log`, when present, contains only
+whatever stdout or stderr the host's launch command redirected there, such as
+startup failures or panics; it is not the structured daemon log and may be
+stale. The current built-in launcher sends that same pre-tracing and panic tail
+to `~/.config/flotilla/daemon-panic.log` instead.
 
 ## Cargo target cache policy
 
