@@ -42,7 +42,16 @@ impl<T: Resource> DefinitionResolver<T> {
     }
 
     pub async fn get(&self, name: &str) -> Result<ResourceObject<T>, ResourceError> {
-        self.list().await?.into_iter().find(|object| object.metadata.name == name).ok_or_else(|| ResourceError::not_found(name))
+        ensure_definitions::<T>()?;
+        let sources = self.sources_for_name(name).await?;
+        if sources.is_empty() {
+            return Err(ResourceError::not_found(name));
+        }
+        let object = merge_sources(&sources)?;
+        if !definition_is_visible(&object) {
+            return Err(ResourceError::not_found(name));
+        }
+        Ok(object)
     }
 
     pub async fn list(&self) -> Result<Vec<ResourceObject<T>>, ResourceError> {
@@ -54,13 +63,7 @@ impl<T: Resource> DefinitionResolver<T> {
         let mut merged = Vec::with_capacity(by_name.len());
         for sources in by_name.into_values() {
             let object = merge_sources(&sources)?;
-            let deleted = object
-                .metadata
-                .merge
-                .as_ref()
-                .and_then(|merge| merge.fields.get(DELETION_FIELD))
-                .is_some_and(|_| object.metadata.deletion_timestamp.is_some());
-            if !deleted || object.metadata.merge.as_ref().is_some_and(|merge| merge.conflicts.contains_key(DELETION_FIELD)) {
+            if definition_is_visible(&object) {
                 merged.push(object);
             }
         }
@@ -206,7 +209,24 @@ impl<T: Resource> DefinitionResolver<T> {
     }
 
     async fn sources_for_name(&self, name: &str) -> Result<Vec<DefinitionSource<T>>, ResourceError> {
-        Ok(self.sources().await?.into_iter().filter(|source| source.object.metadata.name == name).collect())
+        let local_root = self.backend.local_root()?;
+        let mut sources = match self.backend.using::<T>(&self.namespace).get(name).await {
+            Ok(object) => vec![DefinitionSource { object, origin: local_root, synced_at: None }],
+            Err(ResourceError::NotFound { .. }) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let replicas = match &self.backend {
+            ResourceBackend::InMemory(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
+            ResourceBackend::Sqlite(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
+            ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP definition views are served by the origin store")),
+        };
+        sources.extend(replicas.into_iter().filter_map(|replica| match replica.provenance {
+            ResourceProvenance::Replica { origin_root, last_synced_at } => {
+                Some(DefinitionSource { object: replica.object, origin: origin_root, synced_at: Some(last_synced_at) })
+            }
+            ResourceProvenance::Local => None,
+        }));
+        Ok(sources)
     }
 
     async fn sources(&self) -> Result<Vec<DefinitionSource<T>>, ResourceError> {
@@ -230,6 +250,16 @@ impl<T: Resource> DefinitionResolver<T> {
         }));
         Ok(sources)
     }
+}
+
+fn definition_is_visible<T: Resource>(object: &ResourceObject<T>) -> bool {
+    let deleted = object
+        .metadata
+        .merge
+        .as_ref()
+        .and_then(|merge| merge.fields.get(DELETION_FIELD))
+        .is_some_and(|_| object.metadata.deletion_timestamp.is_some());
+    !deleted || object.metadata.merge.as_ref().is_some_and(|merge| merge.conflicts.contains_key(DELETION_FIELD))
 }
 
 fn ensure_definitions<T: Resource>() -> Result<(), ResourceError> {

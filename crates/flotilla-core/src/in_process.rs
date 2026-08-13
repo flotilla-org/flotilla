@@ -39,23 +39,23 @@ use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
     apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name,
     controller::delete_lifecycle_owned_matching, ensure_repository, evaluate_landing_settlement, expected_change_request_leaves,
-    expected_checkout_refs, external_patches as convoy_external_patches, list_resource_kind, list_resource_kind_including_replicas,
-    normalize_project_spec, repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
-    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
-    Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec,
-    ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialGrant,
-    CredentialSpec, CrewCompletionPending, CrewSource, Demand as ResourceDemand, Environment as ResourceEnvironment, HoldAct,
-    Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
-    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
-    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey,
-    RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock,
-    TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung,
-    UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
-    WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL,
-    VESSEL_LABEL, VESSEL_REF_LABEL,
+    expected_checkout_refs, external_patches as convoy_external_patches, get_resource_kind_including_replicas, list_resource_kind,
+    list_resource_kind_including_replicas, normalize_project_spec, repository_display_labels, resolve_project_issue_sources,
+    terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
+    watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
+    ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource,
+    Demand as ResourceDemand, Environment as ResourceEnvironment, HoldAct, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
+    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
+    PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec,
+    ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
+    SettlementMode, SystemClock, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
+    TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
+    WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -9772,22 +9772,16 @@ impl DaemonHandle for InProcessDaemon {
                     Ok(listed) => listed,
                     Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
                 };
-                let visible = match list_resource_kind_including_replicas(&self.resource_backend, namespace, kind).await {
-                    Ok(listed) => listed,
+                let visible = match get_resource_kind_including_replicas(&self.resource_backend, namespace, kind, name).await {
+                    Ok(object) => object,
+                    Err(ResourceError::NotFound { .. }) => {
+                        return Ok(CommandValue::Error { message: format!("resource {kind}/{namespace}/{name} not found") });
+                    }
                     Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
-                };
-                let object = visible.value["items"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|object| object["metadata"]["name"].as_str() == Some(name.as_str()))
-                    .cloned();
-                let Some(object) = object else {
-                    return Ok(CommandValue::Error { message: format!("resource {kind}/{namespace}/{name} not found") });
                 };
                 let resource_version = cursor_list.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string();
                 let generation = cursor_list.value["metadata"]["generation"].as_str().map(ToOwned::to_owned);
-                let record = resource_record(ResourceRecordType::Current, object, &self.node_id);
+                let record = resource_record(ResourceRecordType::Current, visible.value, &self.node_id);
                 Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
                     visible.kind,
                     visible.plural,

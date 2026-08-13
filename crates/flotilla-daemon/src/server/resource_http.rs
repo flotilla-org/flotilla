@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use flotilla_resources::{
-    list_resource_kind, list_resource_kind_including_replicas, list_resource_kind_replica_sources, watch_resource_kind,
-    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceWatch,
-    ResourceBackend, ResourceError, WatchStart,
+    get_resource_kind, get_resource_kind_including_replicas, list_resource_kind, list_resource_kind_including_replicas,
+    list_resource_kind_replica_sources, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
+    watch_resource_kind_replica_sources, DynamicResourceWatch, ResourceBackend, ResourceError, WatchStart,
 };
 use futures::StreamExt;
 use tokio::{
@@ -38,13 +38,30 @@ pub(super) async fn serve_resource_http(mut stream: UnixStream, first_byte: u8, 
 
     let (path, raw_query) = target.split_once('?').map_or((target, ""), |parts| parts);
     let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
-    let ["apis", "flotilla.work", "v1", "namespaces", namespace, kind] = segments.as_slice() else {
-        return write_error(&mut stream, 404, "unknown resource API path").await;
+    let (namespace, kind, name) = match segments.as_slice() {
+        ["apis", "flotilla.work", "v1", "namespaces", namespace, kind] => (*namespace, *kind, None),
+        ["apis", "flotilla.work", "v1", "namespaces", namespace, kind, name] => (*namespace, *kind, Some(*name)),
+        _ => return write_error(&mut stream, 404, "unknown resource API path").await,
     };
     let query = parse_query(raw_query);
     let include_replicas = query_flag(&query, &["includeReplicas", "include-replicas", "include_replicas"]);
     let replica_sources = query_flag(&query, &["replicaSources", "replica-sources", "replica_sources"]);
     let watch = query.get("watch").is_some_and(|value| value == "true");
+
+    if let Some(name) = name {
+        if watch || replica_sources {
+            return write_error(&mut stream, 400, "resource point reads do not support watch or replicaSources").await;
+        }
+        let object = if include_replicas {
+            get_resource_kind_including_replicas(&backend, namespace, kind, name).await
+        } else {
+            get_resource_kind(&backend, namespace, kind, name).await
+        };
+        return match object {
+            Ok(object) => write_json(&mut stream, 200, &object.value).await,
+            Err(error) => write_resource_error(&mut stream, error).await,
+        };
+    }
 
     if !watch {
         let listed = if replica_sources {

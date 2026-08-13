@@ -43,6 +43,30 @@ fn backend() -> ResourceBackend {
     ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend should open"))
 }
 
+#[test]
+fn replica_point_lookup_uses_resource_name_index() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("resources.sqlite");
+    drop(SqliteBackend::open(&path).expect("initialize sqlite backend"));
+    let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
+
+    let plan = connection
+        .query_row(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT origin_root, last_synced_at, body_json
+            FROM replica_objects
+            WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
+            ORDER BY origin_root
+            "#,
+            rusqlite::params!["flotilla.work", "v1", "Convoy", "flotilla", "remote"],
+            |row| row.get::<_, String>(3),
+        )
+        .expect("explain replica point lookup");
+
+    assert!(plan.contains("replica_objects_by_resource_name"), "unexpected replica point-lookup plan: {plan}");
+}
+
 struct AlwaysEligible;
 
 #[async_trait]

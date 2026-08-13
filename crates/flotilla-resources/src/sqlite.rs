@@ -265,6 +265,9 @@ impl SqliteBackend {
                     PRIMARY KEY (origin_root, group_name, version, kind, namespace, name)
                 );
 
+                CREATE INDEX IF NOT EXISTS replica_objects_by_resource_name
+                    ON replica_objects (group_name, version, kind, namespace, name, origin_root);
+
                 CREATE TABLE IF NOT EXISTS replica_cursors (
                     origin_root TEXT NOT NULL,
                     group_name TEXT NOT NULL,
@@ -783,6 +786,78 @@ impl SqliteBackend {
                 .into_iter()
                 .filter_map(|(origin_root, item)| (!invalid_partitions.contains_key(&origin_root)).then_some(item))
                 .collect())
+        })
+        .await
+    }
+
+    pub(crate) async fn get_replicas_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        let requested_name = name.to_string();
+        self.call(move |connection| {
+            let rows = {
+                let mut statement = connection
+                    .prepare(
+                        r#"
+                        SELECT o.origin_root, o.last_synced_at, o.body_json
+                        FROM replica_objects o
+                        WHERE o.group_name = ?1 AND o.version = ?2 AND o.kind = ?3 AND o.namespace = ?4 AND o.name = ?5
+                        ORDER BY o.origin_root
+                        "#,
+                    )
+                    .map_err(|err| Self::map_sqlite(err, "prepare sqlite replica point lookup"))?;
+                let rows = statement
+                    .query_map(params![key.0, key.1, key.2, key.3, requested_name], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                    })
+                    .map_err(|err| Self::map_sqlite(err, "query sqlite replica point lookup"))?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(|err| Self::map_sqlite(err, "read sqlite replica point lookup row"))?
+            };
+
+            let mut items = Vec::new();
+            for (origin_root, last_synced_at, body) in rows {
+                let identity = format!("kind={} namespace={} name={} origin={}", T::API_PATHS.kind, key.3, requested_name, origin_root);
+                let decoded = serde_json::from_str(&body)
+                    .map_err(|err| format!("decode cached replica object {identity}: {err}"))
+                    .and_then(|value| Self::decode_object(value).map_err(|err| format!("decode cached replica object {identity}: {err}")))
+                    .and_then(|object| {
+                        DateTime::parse_from_rfc3339(&last_synced_at)
+                            .map(|last_synced_at| (object, last_synced_at.with_timezone(&Utc)))
+                            .map_err(|err| format!("decode cached replica sync timestamp {identity}: {err}"))
+                    });
+                match decoded {
+                    Ok((object, last_synced_at)) => items.push(ReadResourceObject {
+                        object,
+                        provenance: ResourceProvenance::Replica { origin_root: NodeId::new(origin_root), last_synced_at },
+                    }),
+                    Err(error) => {
+                        let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin invalid replica cache cleanup"))?;
+                        for table in ["replica_objects", "replica_tombstones", "replica_cursors"] {
+                            tx.execute(
+                                &format!(
+                                    "DELETE FROM {table}
+                                     WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5"
+                                ),
+                                params![origin_root, key.0, key.1, key.2, key.3],
+                            )
+                            .map_err(|err| Self::map_sqlite(err, "drop undecodable sqlite replica partition"))?;
+                        }
+                        tx.commit().map_err(|err| Self::map_sqlite(err, "commit invalid replica cache cleanup"))?;
+                        tracing::warn!(
+                            origin = %origin_root,
+                            kind = T::API_PATHS.kind,
+                            namespace = %key.3,
+                            name = %requested_name,
+                            %error,
+                            "dropping undecodable cached replica partition; origin will be fully resynced"
+                        );
+                    }
+                }
+            }
+            Ok(items)
         })
         .await
     }
