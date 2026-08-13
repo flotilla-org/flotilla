@@ -21,6 +21,7 @@ concurrency:
 
 env:
   CARGO_INCREMENTAL: "0"
+  FLEET_ORCHESTRATION_SHA: ${{ forgejo.sha }}
   FLEET_FLOTILLA_SHA: ${{ inputs.flotilla_sha }}
   FLEET_CLEAT_SHA: ${{ inputs.cleat_sha }}
 
@@ -42,8 +43,8 @@ jobs:
 
           git init orchestration
           git -C orchestration remote add origin https://github.com/flotilla-org/flotilla.git
-          git -C orchestration fetch --depth=1 origin "$FORGEJO_SHA"
-          test "$(git -C orchestration rev-parse FETCH_HEAD)" = "$FORGEJO_SHA"
+          git -C orchestration fetch --depth=1 origin "$FLEET_ORCHESTRATION_SHA"
+          test "$(git -C orchestration rev-parse FETCH_HEAD)" = "$FLEET_ORCHESTRATION_SHA"
           git -C orchestration checkout --detach FETCH_HEAD
 
       - name: Restore dependency and compiler caches
@@ -97,8 +98,8 @@ jobs:
           set -euo pipefail
           git init orchestration
           git -C orchestration remote add origin https://github.com/flotilla-org/flotilla.git
-          git -C orchestration fetch --depth=1 origin "$FORGEJO_SHA"
-          test "$(git -C orchestration rev-parse FETCH_HEAD)" = "$FORGEJO_SHA"
+          git -C orchestration fetch --depth=1 origin "$FLEET_ORCHESTRATION_SHA"
+          test "$(git -C orchestration rev-parse FETCH_HEAD)" = "$FLEET_ORCHESTRATION_SHA"
           git -C orchestration checkout --detach FETCH_HEAD
 
       - name: Verify the credential-free worker

@@ -51,6 +51,8 @@ for source in "$bundle_root"/lib/*; do
   name="$(basename "$source")"
   install -m 0755 "$source" "$prefix/lib/.$name.new"
 done
+# Deliberately no empty-glob guard: a candidate without binaries is invalid,
+# so installation must fail rather than report success without installing them.
 for source in "$bundle_root"/bin/*; do
   name="$(basename "$source")"
   install -m 0755 "$source" "$prefix/bin/.$name.new"
@@ -60,6 +62,7 @@ for source in "$bundle_root"/lib/*; do
   name="$(basename "$source")"
   mv -f "$prefix/lib/.$name.new" "$prefix/lib/$name"
 done
+# As above, reaching this loop without staged binaries must fail closed.
 for source in "$bundle_root"/bin/*; do
   name="$(basename "$source")"
   mv -f "$prefix/bin/.$name.new" "$prefix/bin/$name"

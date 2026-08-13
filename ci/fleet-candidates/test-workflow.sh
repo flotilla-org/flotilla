@@ -16,6 +16,16 @@ if grep -Eq '^[[:space:]]+(push|pull_request):' "$workflow"; then
 fi
 grep -Fq 'runs-on: debian-12' "$workflow"
 grep -Fq 'runs-on: darwin-aarch64' "$workflow"
+# The literals below are workflow syntax and shell source, not expressions for
+# this contract test to expand.
+# shellcheck disable=SC2016
+grep -Fq 'FLEET_ORCHESTRATION_SHA: ${{ forgejo.sha }}' "$workflow"
+# shellcheck disable=SC2016
+test "$(grep -Fc 'git -C orchestration fetch --depth=1 origin "$FLEET_ORCHESTRATION_SHA"' "$workflow")" -eq 2
+if grep -F 'git -C orchestration fetch' "$workflow" | grep -Fq 'FLEET_FLOTILLA_SHA'; then
+  echo 'orchestration checkout must not use the selected Flotilla source SHA' >&2
+  exit 1
+fi
 grep -Fq 'retention-days: 7' "$workflow"
 grep -Fq 'actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c' "$workflow"
 grep -Fq 'actions/cache/save@6f8efc29b200d32929f49075959781ed54ec270c' "$workflow"
