@@ -342,3 +342,6 @@ pub(super) fn repo_identity_matches_hint(identity: &RepoIdentity, hint: &RepoKey
     let url = format!("https://{}/{}", identity.authority, identity.path.trim_start_matches('/'));
     flotilla_resources::canonicalize_repo_url(&url).is_ok_and(|canonical| flotilla_resources::descriptive_repo_slug(&canonical) == hint.0)
 }
+
+#[cfg(test)]
+mod tests;
