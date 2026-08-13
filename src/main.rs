@@ -34,9 +34,17 @@ struct Cli {
     #[arg(long)]
     repo_root: Vec<PathBuf>,
 
-    /// Config directory
-    #[arg(long)]
+    /// Daemon identity root (config and state use ROOT/config and ROOT/state)
+    #[arg(long, conflicts_with_all = ["config_dir", "state_dir"])]
+    root: Option<PathBuf>,
+
+    /// Config directory (commands that may start a daemon also require --state-dir)
+    #[arg(long, conflicts_with = "root")]
     config_dir: Option<PathBuf>,
+
+    /// State directory (commands that may start a daemon also require --config-dir)
+    #[arg(long, conflicts_with = "root")]
+    state_dir: Option<PathBuf>,
 
     /// Socket path (default: ${config_dir}/run/flotilla.sock)
     #[arg(long)]
@@ -388,26 +396,44 @@ struct ResourceStatusPatchArgs {
 }
 
 impl Cli {
-    fn client_paths(&self) -> CliPaths {
+    fn client_paths(&self) -> Result<CliPaths, String> {
         let policy = PathPolicy::from_process_env();
         let environment_socket = std::env::var_os("FLOTILLA_DAEMON_SOCKET");
         let (config_dir, state_dir) = client_dirs_from(
+            self.root.as_deref(),
             self.config_dir.as_deref(),
+            self.state_dir.as_deref(),
             policy.config_dir.as_path(),
             policy.state_dir.as_path(),
             environment_socket.as_deref(),
-        );
+        )?;
         let socket_path = socket_path_from(self.socket.as_deref(), &config_dir, environment_socket.as_deref());
-        CliPaths { config_dir, state_dir, socket_path }
+        Ok(CliPaths { config_dir, state_dir, socket_path })
     }
 
-    fn daemon_paths(&self) -> CliPaths {
+    fn daemon_paths(&self) -> Result<CliPaths, String> {
         let policy = PathPolicy::from_process_env();
-        daemon_paths_from(self.config_dir.as_deref(), self.socket.as_deref(), policy.config_dir.as_path(), policy.state_dir.as_path())
+        daemon_paths_from(
+            self.root.as_deref(),
+            self.config_dir.as_deref(),
+            self.state_dir.as_deref(),
+            self.socket.as_deref(),
+            policy.config_dir.as_path(),
+            policy.state_dir.as_path(),
+        )
     }
 
     fn socket_path(&self) -> PathBuf {
-        self.client_paths().socket_path
+        // Socket-only commands never spawn, so they may select a socket through
+        // --config-dir without resolving the daemon's paired state directory.
+        let policy = PathPolicy::from_process_env();
+        let config_dir = self
+            .root
+            .as_deref()
+            .map(|root| root.join("config"))
+            .or_else(|| self.config_dir.clone())
+            .unwrap_or_else(|| policy.config_dir.into_path_buf());
+        socket_path_from(self.socket.as_deref(), &config_dir, std::env::var_os("FLOTILLA_DAEMON_SOCKET").as_deref())
     }
 }
 
@@ -419,17 +445,37 @@ struct CliPaths {
 }
 
 fn client_dirs_from(
+    explicit_root: Option<&Path>,
     explicit_config_dir: Option<&Path>,
+    explicit_state_dir: Option<&Path>,
     default_config_dir: &Path,
     default_state_dir: &Path,
     environment_socket: Option<&std::ffi::OsStr>,
-) -> (PathBuf, PathBuf) {
-    if explicit_config_dir.is_none() {
+) -> Result<(PathBuf, PathBuf), String> {
+    if explicit_root.is_none() && explicit_config_dir.is_none() && explicit_state_dir.is_none() {
         if let Some(dirs) = environment_socket.map(Path::new).and_then(flotilla_core::path_policy::scoped_daemon_dirs) {
-            return dirs;
+            return Ok(dirs);
         }
     }
-    (explicit_config_dir.unwrap_or(default_config_dir).to_path_buf(), default_state_dir.to_path_buf())
+    daemon_dirs_from(explicit_root, explicit_config_dir, explicit_state_dir, default_config_dir, default_state_dir)
+}
+
+fn daemon_dirs_from(
+    explicit_root: Option<&Path>,
+    explicit_config_dir: Option<&Path>,
+    explicit_state_dir: Option<&Path>,
+    default_config_dir: &Path,
+    default_state_dir: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
+    if let Some(root) = explicit_root {
+        return Ok((root.join("config"), root.join("state")));
+    }
+    match (explicit_config_dir, explicit_state_dir) {
+        (Some(config_dir), Some(state_dir)) => Ok((config_dir.to_path_buf(), state_dir.to_path_buf())),
+        (None, None) => Ok((default_config_dir.to_path_buf(), default_state_dir.to_path_buf())),
+        _ => Err("this command may start a daemon, so --config-dir and --state-dir must be supplied together; use --root to select both"
+            .to_string()),
+    }
 }
 
 fn socket_path_from(explicit: Option<&Path>, config_dir: &Path, environment: Option<&std::ffi::OsStr>) -> PathBuf {
@@ -437,14 +483,17 @@ fn socket_path_from(explicit: Option<&Path>, config_dir: &Path, environment: Opt
 }
 
 fn daemon_paths_from(
+    explicit_root: Option<&Path>,
     explicit_config_dir: Option<&Path>,
+    explicit_state_dir: Option<&Path>,
     explicit_socket: Option<&Path>,
     default_config_dir: &Path,
     default_state_dir: &Path,
-) -> CliPaths {
-    let config_dir = explicit_config_dir.unwrap_or(default_config_dir).to_path_buf();
+) -> Result<CliPaths, String> {
+    let (config_dir, state_dir) =
+        daemon_dirs_from(explicit_root, explicit_config_dir, explicit_state_dir, default_config_dir, default_state_dir)?;
     let socket_path = explicit_socket.map(PathBuf::from).unwrap_or_else(|| daemon_socket_path(&config_dir));
-    CliPaths { config_dir, state_dir: default_state_dir.to_path_buf(), socket_path }
+    Ok(CliPaths { config_dir, state_dir, socket_path })
 }
 
 fn host_daemon_socket_required(contained_marker: Option<&std::ffi::OsStr>) -> bool {
@@ -644,7 +693,7 @@ fn default_project_landing(
 /// Run the TUI. With `scoped_view`, run in scoped mode: exactly that View,
 /// no tab shell, no open-view persistence.
 async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) -> Result<()> {
-    let paths = cli.client_paths();
+    let paths = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
     let resolved_state_dir = DaemonHostPath::new(paths.state_dir);
     event_log::init_with_dir(resolved_state_dir.as_path());
     let startup = std::time::Instant::now();
@@ -816,7 +865,7 @@ fn restore_tui_handoff(app: &mut app::App) {
 
 async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
     let daemon_binary = resolve_flotillad_binary()?;
-    let CliPaths { config_dir, state_dir, socket_path } = cli.daemon_paths();
+    let CliPaths { config_dir, state_dir, socket_path } = cli.daemon_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
     flotilla_core::path_policy::ensure_daemon_socket_belongs_to_config(&socket_path, &config_dir)
         .map_err(|error| color_eyre::eyre::eyre!(error))?;
     let mut command = tokio::process::Command::new(&daemon_binary);
@@ -883,7 +932,7 @@ async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<()> {
                 .maybe_wheelhouse_socket(wheelhouse_socket)
                 .flotilla_bin(flotilla_bin)
                 .build();
-            let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths();
+            let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
             flotilla_tui::pm_connect::run(
                 &socket_path,
                 &config_dir,
@@ -913,7 +962,7 @@ async fn run_wait(
     format: OutputFormat,
 ) -> Result<()> {
     reset_sigpipe();
-    let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths();
+    let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
     let daemon = connect_cli_socket(
         &socket_path,
         &config_dir,
@@ -952,7 +1001,7 @@ async fn run_wait(
 }
 
 async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
-    let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths();
+    let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
     let daemon = connect_cli_socket(
         &socket_path,
         &config_dir,
@@ -2366,7 +2415,15 @@ mod tests {
     #[test]
     fn daemon_paths_use_only_explicit_values_and_policy_defaults() {
         assert_eq!(
-            daemon_paths_from(None, Some(Path::new("/explicit/flotilla.sock")), Path::new("/default/config"), Path::new("/default/state"),),
+            daemon_paths_from(
+                None,
+                None,
+                None,
+                Some(Path::new("/explicit/flotilla.sock")),
+                Path::new("/default/config"),
+                Path::new("/default/state"),
+            )
+            .expect("policy defaults form a complete identity"),
             CliPaths {
                 config_dir: PathBuf::from("/default/config"),
                 state_dir: PathBuf::from("/default/state"),
@@ -2380,10 +2437,13 @@ mod tests {
         assert_eq!(
             client_dirs_from(
                 None,
+                None,
+                None,
                 Path::new("/home/test/.config/flotilla"),
                 Path::new("/home/test/.local/state/flotilla"),
                 Some(std::ffi::OsStr::new("/work/live-session/config/run/flotilla.sock")),
-            ),
+            )
+            .expect("ambient scoped socket forms a complete identity"),
             (PathBuf::from("/work/live-session/config"), PathBuf::from("/work/live-session/state")),
         );
     }
@@ -2392,13 +2452,66 @@ mod tests {
     fn explicit_config_is_not_replaced_by_a_conflicting_scoped_socket() {
         assert_eq!(
             client_dirs_from(
+                None,
                 Some(Path::new("/work/root-b/config")),
+                Some(Path::new("/work/root-b/state")),
                 Path::new("/home/test/.config/flotilla"),
                 Path::new("/home/test/.local/state/flotilla"),
                 Some(std::ffi::OsStr::new("/work/root-a/config/run/flotilla.sock")),
-            ),
-            (PathBuf::from("/work/root-b/config"), PathBuf::from("/home/test/.local/state/flotilla")),
+            )
+            .expect("paired category overrides form a complete identity"),
+            (PathBuf::from("/work/root-b/config"), PathBuf::from("/work/root-b/state")),
         );
+    }
+
+    #[test]
+    fn daemon_starting_paths_require_config_and_state_overrides_together() {
+        let config_only =
+            Cli::try_parse_from(["flotilla", "--config-dir", "/work/a/config"]).expect("socket-only commands may parse a config override");
+        let state_only =
+            Cli::try_parse_from(["flotilla", "--state-dir", "/work/a/state"]).expect("socket-only commands may parse a state override");
+        let config_error = config_only.client_paths().expect_err("config-only startup identity must be rejected");
+        let state_error = state_only.client_paths().expect_err("state-only startup identity must be rejected");
+        assert!(config_error.contains("may start a daemon"), "unexpected error: {config_error}");
+        assert!(state_error.contains("may start a daemon"), "unexpected error: {state_error}");
+        assert!(Cli::try_parse_from(["flotilla", "--config-dir", "/work/a/config", "--state-dir", "/work/a/state", "status",])
+            .expect("paired overrides should parse")
+            .client_paths()
+            .is_ok());
+    }
+
+    #[test]
+    fn custom_roots_select_distinct_daemon_stores_and_lifecycle_locks() {
+        let paths_a =
+            daemon_paths_from(Some(Path::new("/work/a")), None, None, None, Path::new("/default/config"), Path::new("/default/state"))
+                .expect("root A forms a complete identity");
+        let paths_b =
+            daemon_paths_from(Some(Path::new("/work/b")), None, None, None, Path::new("/default/config"), Path::new("/default/state"))
+                .expect("root B forms a complete identity");
+
+        assert_eq!(paths_a.config_dir, Path::new("/work/a/config"));
+        assert_eq!(paths_a.state_dir, Path::new("/work/a/state"));
+        assert_eq!(paths_a.socket_path, Path::new("/work/a/config/run/flotilla.sock"));
+        assert_ne!(paths_a.state_dir.join("resources.sqlite"), paths_b.state_dir.join("resources.sqlite"));
+        assert_ne!(
+            paths_a.state_dir.join(flotilla_core::DAEMON_LIFECYCLE_LOCK_FILE),
+            paths_b.state_dir.join(flotilla_core::DAEMON_LIFECYCLE_LOCK_FILE),
+        );
+    }
+
+    #[test]
+    fn root_selector_conflicts_with_category_overrides() {
+        assert!(Cli::try_parse_from([
+            "flotilla",
+            "--root",
+            "/work/a",
+            "--config-dir",
+            "/work/b/config",
+            "--state-dir",
+            "/work/b/state",
+            "status",
+        ])
+        .is_err());
     }
 
     #[test]
