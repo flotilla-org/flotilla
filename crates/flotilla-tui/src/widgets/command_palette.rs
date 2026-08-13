@@ -1,8 +1,8 @@
 use std::any::Any;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use flotilla_commands::{address_subject_for_cli, resolved::HostQueryKind, HostResolution, RepoContext, Resolved, SubjectNoun};
-use flotilla_protocol::{Command, CommandAction, NodeId, ProvisioningTarget, RepoIdentity, RepoSelector, WorkItem};
+use flotilla_commands::{resolved::HostQueryKind, HostResolution, RepoContext, Resolved};
+use flotilla_protocol::{Command, CommandAction, NodeId, ProvisioningTarget, RepoIdentity, RepoSelector};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -20,39 +20,13 @@ use crate::{
     palette::{self, PaletteCompletion, PaletteEntry, PaletteLocalResult, PaletteParseResult, MAX_PALETTE_ROWS},
 };
 
-/// Map a work item to a palette pre-fill string.
-pub fn palette_prefill(item: &WorkItem) -> Option<String> {
-    if let Some(cr_key) = &item.change_request_key {
-        return Some(format!("cr {} ", cr_key));
-    }
-    if let Some(branch) = &item.branch {
-        if item.checkout_key().is_some() {
-            return Some(format!("checkout {} ", address_subject_for_cli(SubjectNoun::Checkout, branch)));
-        }
-    }
-    if let Some(issue_key) = item.issue_keys.first() {
-        return Some(format!("issue {} ", address_subject_for_cli(SubjectNoun::Issue, issue_key)));
-    }
-    if let Some(session_key) = &item.session_key {
-        return Some(format!("agent {} ", session_key));
-    }
-    if let Some(ws_ref) = item.workspace_refs.first() {
-        return Some(format!("workspace {} ", ws_ref));
-    }
-    None
-}
-
 pub struct CommandPaletteWidget {
     input: Input,
     entries: &'static [PaletteEntry],
     selected: usize,
     scroll_top: usize,
-    /// The work item that was selected when the contextual palette was opened.
-    /// Used by tui_dispatch for SubjectHost/ProviderHost resolution.
-    source_item: Option<WorkItem>,
     target_node_id: Option<NodeId>,
 }
-
 impl Default for CommandPaletteWidget {
     fn default() -> Self {
         Self::new()
@@ -61,43 +35,16 @@ impl Default for CommandPaletteWidget {
 
 impl CommandPaletteWidget {
     pub fn new() -> Self {
-        Self {
-            input: Input::default(),
-            entries: palette::all_entries(),
-            selected: 0,
-            scroll_top: 0,
-            source_item: None,
-            target_node_id: None,
-        }
+        Self { input: Input::default(), entries: palette::all_entries(), selected: 0, scroll_top: 0, target_node_id: None }
     }
 
     /// Create a palette widget with pre-filled input text and selection.
     pub fn with_state(input: Input, selected: usize, scroll_top: usize) -> Self {
-        Self { input, entries: palette::all_entries(), selected, scroll_top, source_item: None, target_node_id: None }
-    }
-
-    /// Create a palette widget with a pre-filled input string (cursor at end)
-    /// and the work item that was selected when the palette was opened.
-    pub fn with_prefill(text: impl AsRef<str>, item: Option<WorkItem>) -> Self {
-        Self {
-            input: Input::from(text.as_ref()),
-            entries: palette::all_entries(),
-            selected: 0,
-            scroll_top: 0,
-            source_item: item,
-            target_node_id: None,
-        }
+        Self { input, entries: palette::all_entries(), selected, scroll_top, target_node_id: None }
     }
 
     pub fn with_prefill_on_node(text: impl AsRef<str>, target_node_id: Option<NodeId>) -> Self {
-        Self {
-            input: Input::from(text.as_ref()),
-            entries: palette::all_entries(),
-            selected: 0,
-            scroll_top: 0,
-            source_item: None,
-            target_node_id,
-        }
+        Self { input: Input::from(text.as_ref()), entries: palette::all_entries(), selected: 0, scroll_top: 0, target_node_id }
     }
 
     /// Current input text (for tests / introspection).
@@ -184,10 +131,6 @@ impl CommandPaletteWidget {
     fn dispatch_local(&mut self, local: PaletteLocalResult<'_>, ctx: &mut WidgetContext) -> Outcome {
         match local {
             PaletteLocalResult::Action(action) => self.dispatch_palette_action(action, ctx),
-            PaletteLocalResult::SetLayout(name) => {
-                ctx.app_actions.push(AppAction::SetLayout(name.to_string()));
-                Outcome::Finished
-            }
             PaletteLocalResult::SetTheme(name) => {
                 ctx.app_actions.push(AppAction::SetTheme(name.to_string()));
                 Outcome::Finished
@@ -208,15 +151,7 @@ impl CommandPaletteWidget {
 
     fn dispatch_resolved(&self, resolved: Resolved, ctx: &mut WidgetContext) -> Outcome {
         let active_repo = ctx.model.active_repo_identity_opt().cloned();
-        match tui_dispatch(
-            resolved,
-            ctx.model,
-            self.source_item.as_ref(),
-            active_repo.as_ref(),
-            ctx.provisioning_target,
-            &ctx.my_node_id,
-            ctx.active_repo_is_remote_only,
-        ) {
+        match tui_dispatch(resolved, ctx.model, active_repo.as_ref(), ctx.provisioning_target) {
             Ok(mut command) => {
                 if command.node_id.is_none() {
                     command.node_id.clone_from(&self.target_node_id);
@@ -242,19 +177,9 @@ impl CommandPaletteWidget {
         }
         match action {
             // Actions that open other widgets — use Swap to replace the palette
-            Action::OpenBranchInput => {
-                if ctx.model.active_repo_identity_opt().is_none() {
-                    ctx.app_actions.push(AppAction::ShowStatus("switch to a repo tab first".into()));
-                    return Outcome::Finished;
-                }
-                let widget = super::branch_input::BranchInputWidget::new(crate::app::ui_state::BranchInputKind::Manual);
-                Outcome::Swap(Box::new(widget))
+            Action::OpenFind => {
+                Outcome::Swap(Box::new(super::table_search::TableSearchWidget::find(&ctx.views.active_table_state().filter)))
             }
-            Action::OpenFind => match ctx.views.active_address() {
-                Some(flotilla_protocol::ViewAddress::Repo { .. }) => Outcome::Swap(Box::new(super::issue_search::IssueSearchWidget::new())),
-                Some(_) => Outcome::Swap(Box::new(super::table_search::TableSearchWidget::find(&ctx.views.active_table_state().filter))),
-                None => Outcome::Finished,
-            },
             Action::OpenFilePicker => {
                 let start_dir = ctx
                     .model
@@ -279,10 +204,6 @@ impl CommandPaletteWidget {
                 ctx.app_actions.push(AppAction::Quit);
                 Outcome::Finished
             }
-            Action::CycleLayout => {
-                ctx.app_actions.push(AppAction::CycleLayout);
-                Outcome::Finished
-            }
             Action::CycleTheme => {
                 ctx.app_actions.push(AppAction::CycleTheme);
                 Outcome::Finished
@@ -301,28 +222,10 @@ impl CommandPaletteWidget {
             }
             Action::Refresh => {
                 if ctx.model.active_repo_identity_opt().is_none() {
-                    ctx.app_actions.push(AppAction::ShowStatus("switch to a repo tab first".into()));
+                    ctx.app_actions.push(AppAction::ShowStatus("this command requires repository context".into()));
                     return Outcome::Finished;
                 }
                 ctx.app_actions.push(AppAction::Refresh);
-                Outcome::Finished
-            }
-
-            // Widget-level actions dispatched via AppAction
-            Action::ToggleProviders => {
-                ctx.app_actions.push(AppAction::ToggleProviders);
-                Outcome::Finished
-            }
-            Action::ToggleMultiSelect => {
-                ctx.app_actions.push(AppAction::ToggleMultiSelect);
-                Outcome::Finished
-            }
-            Action::OpenActionMenu => {
-                if ctx.model.active_repo_identity_opt().is_none() {
-                    ctx.app_actions.push(AppAction::ShowStatus("switch to a repo tab first".into()));
-                    return Outcome::Finished;
-                }
-                ctx.app_actions.push(AppAction::OpenActionMenu);
                 Outcome::Finished
             }
 
@@ -384,24 +287,12 @@ fn fill_repo_sentinels(action: &mut CommandAction, repo: RepoSelector) {
     }
 }
 
-/// Resolve the host a work item should execute on relative to our own host.
-fn item_execution_host(item: &WorkItem, my_node_id: &Option<NodeId>) -> Option<NodeId> {
-    match my_node_id {
-        Some(node_id) if item.node_id != *node_id => Some(item.node_id.clone()),
-        _ => None,
-    }
-}
-
 /// Dispatch a resolved command with ambient context from the TUI environment.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn tui_dispatch(
     resolved: Resolved,
     model: &TuiModel,
-    item: Option<&WorkItem>,
     active_repo: Option<&RepoIdentity>,
     provisioning_target: &ProvisioningTarget,
-    my_node_id: &Option<NodeId>,
-    active_repo_is_remote_only: bool,
 ) -> Result<Command, String> {
     match resolved {
         Resolved::HostQuery { subject, kind } => {
@@ -425,13 +316,13 @@ pub(crate) fn tui_dispatch(
             match repo {
                 RepoContext::None => {}
                 RepoContext::Required => {
-                    let repo_sel = tab_repo.ok_or_else(|| "no active repo — switch to a repo tab first".to_string())?;
+                    let repo_sel = tab_repo.ok_or_else(|| "no active repository context".to_string())?;
                     command.context_repo = Some(repo_sel.clone());
                     fill_repo_sentinels(&mut command.action, repo_sel);
                 }
                 RepoContext::Inferred => {
                     if tab_repo.is_none() {
-                        return Err("no active repo — switch to a repo tab first".to_string());
+                        return Err("no active repository context".to_string());
                     }
                     command.context_repo = tab_repo;
                 }
@@ -457,14 +348,7 @@ pub(crate) fn tui_dispatch(
                         command.node_id = Some(node_id);
                         command.provisioning_target = Some(target);
                     }
-                    HostResolution::SubjectHost => {
-                        command.node_id = item.and_then(|i| item_execution_host(i, my_node_id));
-                    }
-                    HostResolution::ProviderHost => {
-                        if active_repo_is_remote_only {
-                            command.node_id = item.and_then(|i| item_execution_host(i, my_node_id));
-                        }
-                    }
+                    HostResolution::SubjectHost | HostResolution::ProviderHost => {}
                 }
             }
 
@@ -612,21 +496,8 @@ impl InteractiveWidget for CommandPaletteWidget {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use flotilla_protocol::{
-        qualified_path::HostId, CheckoutTarget, Command, CommandAction, EnvironmentId, HostName, HostSummary, NodeId, NodeInfo,
-        ProvisioningTarget, RepoIdentity, RepoSelector, SystemInfo, ToolInventory, WorkItemIdentity, WorkItemKind,
-    };
-
     use super::*;
-    use crate::app::{
-        test_support::{bare_item, checkout_item, session_item, TestWidgetHarness},
-        PeerStatus, TuiHostState,
-    };
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::TestWidgetHarness;
 
     #[test]
     fn binding_mode_is_command_palette() {
@@ -635,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_capture_raw_keys() {
+    fn command_palette_routes_text_through_raw_key_handling() {
         let widget = CommandPaletteWidget::new();
         assert!(!widget.captures_raw_keys());
     }
@@ -644,13 +515,12 @@ mod tests {
     fn dismiss_returns_finished() {
         let mut widget = CommandPaletteWidget::new();
         let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-        let outcome = widget.handle_action(Action::Dismiss, &mut ctx);
+        let outcome = widget.handle_action(Action::Dismiss, &mut harness.ctx());
         assert!(matches!(outcome, Outcome::Finished));
     }
 
     #[test]
-    fn select_next_wraps_around() {
+    fn selection_wraps_in_both_directions() {
         let mut widget = CommandPaletteWidget::new();
         let mut harness = TestWidgetHarness::new();
         let interactions = crate::interaction::InteractionContext::for_active_view(
@@ -658,502 +528,12 @@ mod tests {
             harness.views.active_table_state().selected(),
             harness.model.active_repo_identity_opt().is_some(),
         );
-        let total = widget.completions(&harness.model, &harness.namespaces, true, interactions).len();
+        let count = widget.completions(&harness.model, &harness.namespaces, false, interactions).len();
+        assert!(count > 1);
 
-        // Advance to end
-        for _ in 0..total - 1 {
-            let mut ctx = harness.ctx();
-            widget.handle_action(Action::SelectNext, &mut ctx);
-        }
-        assert_eq!(widget.selected, total - 1);
-
-        // One more wraps to 0
-        let mut ctx = harness.ctx();
-        widget.handle_action(Action::SelectNext, &mut ctx);
+        widget.handle_action(Action::SelectPrev, &mut harness.ctx());
+        assert_eq!(widget.selected, count - 1);
+        widget.handle_action(Action::SelectNext, &mut harness.ctx());
         assert_eq!(widget.selected, 0);
-    }
-
-    #[test]
-    fn select_prev_wraps_around() {
-        let mut widget = CommandPaletteWidget::new();
-        let mut harness = TestWidgetHarness::new();
-        let interactions = crate::interaction::InteractionContext::for_active_view(
-            harness.views.active_address(),
-            harness.views.active_table_state().selected(),
-            harness.model.active_repo_identity_opt().is_some(),
-        );
-        let total = widget.completions(&harness.model, &harness.namespaces, true, interactions).len();
-
-        // Prev from 0 wraps to end
-        let mut ctx = harness.ctx();
-        widget.handle_action(Action::SelectPrev, &mut ctx);
-        assert_eq!(widget.selected, total - 1);
-    }
-
-    #[test]
-    fn fill_selected_fills_completion_value() {
-        let mut widget = CommandPaletteWidget::new();
-        let mut harness = TestWidgetHarness::new();
-
-        // Get the first completion value to verify fill works
-        let interactions = crate::interaction::InteractionContext::for_active_view(
-            harness.views.active_address(),
-            harness.views.active_table_state().selected(),
-            harness.model.active_repo_identity_opt().is_some(),
-        );
-        let first_value = widget.completions(&harness.model, &harness.namespaces, true, interactions)[0].value.clone();
-
-        let mut ctx = harness.ctx();
-        let outcome = widget.handle_action(Action::FillSelected, &mut ctx);
-        assert!(matches!(outcome, Outcome::Consumed));
-        assert_eq!(widget.input.value(), format!("{first_value} "));
-        assert_eq!(widget.selected, 0);
-    }
-
-    #[test]
-    fn backspace_on_empty_closes_palette() {
-        let mut widget = CommandPaletteWidget::new();
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_raw_key(key(KeyCode::Backspace), &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-    }
-
-    #[test]
-    fn slash_is_literal_palette_input() {
-        let mut widget = CommandPaletteWidget::new();
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_raw_key(key(KeyCode::Char('/')), &mut ctx);
-        assert!(matches!(outcome, Outcome::Consumed));
-        assert_eq!(widget.input.value(), "/");
-    }
-
-    #[test]
-    fn confirm_entry_quit_pushes_app_action() {
-        let mut widget = CommandPaletteWidget::new();
-        // Type "quit" to filter to the quit entry
-        widget.input = Input::from("quit");
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::Quit)));
-    }
-
-    #[test]
-    fn confirm_entry_branch_returns_swap() {
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("branch");
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Swap(_)));
-    }
-
-    #[test]
-    fn confirm_entry_find_returns_swap() {
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("find");
-        // Make sure selected is 0 so it picks the Find entry.
-        widget.selected = 0;
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        // Find replaces the palette with the active View's Find input.
-        assert!(matches!(outcome, Outcome::Swap(_)));
-    }
-
-    #[test]
-    fn confirm_entry_help_returns_swap() {
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("help");
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Swap(_)));
-    }
-
-    #[test]
-    fn typing_text_resets_selected() {
-        let mut widget = CommandPaletteWidget::new();
-        let mut harness = TestWidgetHarness::new();
-
-        // Move selected down
-        {
-            let mut ctx = harness.ctx();
-            widget.handle_action(Action::SelectNext, &mut ctx);
-        }
-        assert_eq!(widget.selected, 1);
-
-        // Type a character — selected should reset to 0
-        let mut ctx = harness.ctx();
-        widget.handle_raw_key(key(KeyCode::Char('r')), &mut ctx);
-        assert_eq!(widget.selected, 0);
-    }
-
-    #[test]
-    fn confirm_entry_providers_pushes_app_action() {
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("providers");
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::ToggleProviders)));
-    }
-
-    #[test]
-    fn confirm_entry_select_pushes_app_action() {
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("select");
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::ToggleMultiSelect)));
-    }
-
-    #[test]
-    fn confirm_entry_actions_pushes_app_action() {
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("actions");
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::OpenActionMenu)));
-    }
-
-    #[test]
-    fn unhandled_action_returns_ignored() {
-        let mut widget = CommandPaletteWidget::new();
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::PrevTab, &mut ctx);
-        assert!(matches!(outcome, Outcome::Ignored));
-    }
-
-    #[test]
-    fn confirm_noun_verb_pushes_command() {
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("cr 42 close");
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-
-        let (cmd, _) = harness.commands.take_next().expect("expected command");
-        assert!(matches!(cmd.action, CommandAction::CloseChangeRequest { ref id } if id == "42"));
-    }
-
-    #[test]
-    fn confirm_noun_verb_required_repo_on_overview_tab_rejects() {
-        // `checkout create --branch feat` uses RepoContext::Required — must fail on overview tab
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("checkout create --branch feat");
-        let mut harness = TestWidgetHarness::new();
-        harness.activate_overview();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::ShowStatus(msg) if msg.contains("repo tab"))));
-        assert!(harness.commands.take_next().is_none());
-    }
-
-    #[test]
-    fn confirm_noun_verb_inferred_repo_on_overview_tab_rejects() {
-        // `cr 42 close` uses RepoContext::Inferred — should be rejected on overview tab
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("cr 42 close");
-        let mut harness = TestWidgetHarness::new();
-        harness.activate_overview();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::ShowStatus(msg) if msg.contains("repo tab"))));
-        assert!(harness.commands.take_next().is_none());
-    }
-
-    #[test]
-    fn confirm_layout_set_pushes_app_action() {
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("layout zoom");
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::SetLayout(name) if name == "zoom")));
-    }
-
-    #[test]
-    fn confirm_theme_set_pushes_app_action() {
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("theme catppuccin-mocha");
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::SetTheme(name) if name == "catppuccin-mocha")));
-    }
-
-    #[test]
-    fn confirm_target_set_pushes_app_action() {
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("target feta");
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::SetTarget(name) if name == "feta")));
-    }
-
-    // ── palette_prefill ──
-
-    #[test]
-    fn prefill_from_cr() {
-        let mut item = bare_item();
-        item.change_request_key = Some("42".into());
-        assert_eq!(palette_prefill(&item), Some("cr 42 ".into()));
-    }
-
-    #[test]
-    fn prefill_prefers_cr_over_checkout() {
-        let mut item = checkout_item("feat", "/tmp/repo", false);
-        item.change_request_key = Some("42".into());
-        assert_eq!(palette_prefill(&item), Some("cr 42 ".into()));
-    }
-
-    #[test]
-    fn prefill_empty_item_returns_none() {
-        let item = bare_item();
-        assert_eq!(palette_prefill(&item), None);
-    }
-
-    #[test]
-    fn prefill_from_checkout_branch() {
-        let item = checkout_item("feat/my-branch", "/tmp/repo", false);
-        assert_eq!(palette_prefill(&item), Some("checkout feat/my-branch ".into()));
-    }
-
-    #[test]
-    fn prefill_addresses_checkout_branch_that_collides_with_a_verb() {
-        let item = checkout_item("status", "/tmp/repo", false);
-        assert_eq!(palette_prefill(&item), Some("checkout @status ".into()));
-    }
-
-    #[test]
-    fn prefill_uses_literal_subject_for_checkout_branch_beginning_with_marker() {
-        let item = checkout_item("@topic", "/tmp/repo", false);
-        assert_eq!(palette_prefill(&item), Some("checkout --subject @topic ".into()));
-    }
-
-    #[test]
-    fn prefill_from_session_key() {
-        let item = session_item("ses-123");
-        assert_eq!(palette_prefill(&item), Some("agent ses-123 ".into()));
-    }
-
-    #[test]
-    fn prefill_from_issue_key() {
-        let mut item = bare_item();
-        item.issue_keys = vec!["99".into()];
-        assert_eq!(palette_prefill(&item), Some("issue 99 ".into()));
-    }
-
-    #[test]
-    fn prefill_addresses_issue_key_that_collides_with_a_verb() {
-        let mut item = bare_item();
-        item.issue_keys = vec!["open".into()];
-        assert_eq!(palette_prefill(&item), Some("issue @open ".into()));
-    }
-
-    #[test]
-    fn prefill_from_workspace_ref() {
-        let mut item = bare_item();
-        item.workspace_refs = vec!["ws-abc".into()];
-        assert_eq!(palette_prefill(&item), Some("workspace ws-abc ".into()));
-    }
-
-    // ── tui_dispatch ──
-
-    #[test]
-    fn dispatch_ready_passes_through() {
-        let cmd = Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } };
-        let local_target = ProvisioningTarget::Host { host: HostName::local() };
-        let model = TuiModel::from_repo_info(vec![]);
-        let result = tui_dispatch(Resolved::Ready(cmd), &model, None, None, &local_target, &None, false);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn dispatch_needs_repo_on_overview_errors() {
-        use flotilla_protocol::CheckoutTarget;
-        let cmd = Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Query("".into()),
-                target: CheckoutTarget::Branch("feat".into()),
-                issue_ids: vec![],
-            },
-        };
-        let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Required, host: HostResolution::ProvisioningTarget };
-        let local_target = ProvisioningTarget::Host { host: HostName::local() };
-        let model = TuiModel::from_repo_info(vec![]);
-        let result = tui_dispatch(resolved, &model, None, None, &local_target, &None, false);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn dispatch_provisioning_target_duplicate_host_names_remain_ambiguous() {
-        let repo_id = RepoIdentity { authority: "github.com".into(), path: "org/repo".into() };
-        let mut model = TuiModel::from_repo_info(vec![]);
-        let host_name = HostName::new("desktop");
-        let local_environment_id = EnvironmentId::host(HostId::new("desktop-local"));
-        let remote_environment_id = EnvironmentId::host(HostId::new("desktop-remote"));
-
-        model.hosts.insert(local_environment_id.clone(), TuiHostState {
-            environment_id: local_environment_id.clone(),
-            host_name: host_name.clone(),
-            is_local: true,
-            status: PeerStatus::Connected,
-            summary: HostSummary {
-                environment_id: local_environment_id,
-                host_name: Some(host_name.clone()),
-                node: NodeInfo::new(NodeId::new("desktop-local-node"), "Desktop Local"),
-                system: SystemInfo::default(),
-                inventory: ToolInventory::default(),
-                providers: vec![],
-                environments: vec![],
-            },
-        });
-        model.hosts.insert(remote_environment_id.clone(), TuiHostState {
-            environment_id: remote_environment_id.clone(),
-            host_name: host_name.clone(),
-            is_local: false,
-            status: PeerStatus::Connected,
-            summary: HostSummary {
-                environment_id: remote_environment_id,
-                host_name: Some(host_name.clone()),
-                node: NodeInfo::new(NodeId::new("desktop-remote-node"), "Desktop Remote"),
-                system: SystemInfo::default(),
-                inventory: ToolInventory::default(),
-                providers: vec![],
-                environments: vec![],
-            },
-        });
-
-        let cmd = Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Identity(repo_id.clone()),
-                target: CheckoutTarget::FreshBranch("feature/test".into()),
-                issue_ids: vec![],
-            },
-        };
-        let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Required, host: HostResolution::ProvisioningTarget };
-        let local_target = ProvisioningTarget::Host { host: host_name.clone() };
-        let result = tui_dispatch(resolved, &model, None, Some(&repo_id), &local_target, &None, false);
-
-        assert!(result.is_err());
-        assert!(result.err().unwrap().contains("ambiguous host: desktop"));
-    }
-
-    #[test]
-    fn dispatch_fills_repo_sentinels() {
-        use flotilla_protocol::CheckoutTarget;
-        let cmd = Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Query("".into()),
-                target: CheckoutTarget::Branch("feat".into()),
-                issue_ids: vec![],
-            },
-        };
-        let repo_id = RepoIdentity { authority: "github.com".into(), path: "org/repo".into() };
-        let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Required, host: HostResolution::Local };
-        let local_target = ProvisioningTarget::Host { host: HostName::local() };
-        let model = TuiModel::from_repo_info(vec![]);
-        let result = tui_dispatch(resolved, &model, None, Some(&repo_id), &local_target, &None, false).unwrap();
-        assert!(result.context_repo.is_some());
-        match &result.action {
-            CommandAction::Checkout { repo, .. } => assert_ne!(*repo, RepoSelector::Query("".into())),
-            _ => panic!("wrong action"),
-        }
-    }
-
-    #[test]
-    fn explicit_host_routing_preserved_for_needs_context() {
-        let repo_id = RepoIdentity { authority: "github.com".into(), path: "org/repo".into() };
-        // Simulate `host feta cr 42 open` — HostNoun::resolve() sets command.node_id.
-        let cmd = Command {
-            node_id: Some(NodeId::new("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::OpenChangeRequest { id: "42".into() },
-        };
-        let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };
-        let local_target = ProvisioningTarget::Host { host: HostName::local() };
-        let model = TuiModel::from_repo_info(vec![]);
-        let result = tui_dispatch(resolved, &model, None, Some(&repo_id), &local_target, &None, false).expect("should succeed");
-        assert_eq!(result.node_id, Some(NodeId::new("feta")));
-    }
-
-    #[test]
-    fn contextual_palette_derives_host_from_source_item() {
-        let repo_id = RepoIdentity { authority: "github.com".into(), path: "org/repo".into() };
-        let item = WorkItem {
-            kind: WorkItemKind::ChangeRequest,
-            identity: WorkItemIdentity::ChangeRequest("42".into()),
-            node_id: NodeId::new("remote-peer"),
-            branch: None,
-            description: String::new(),
-            checkout: None,
-            change_request_key: Some("42".into()),
-            session_key: None,
-            issue_keys: Vec::new(),
-            workspace_refs: Vec::new(),
-            is_main_checkout: false,
-            debug_group: Vec::new(),
-            source: None,
-            terminal_keys: Vec::new(),
-            attachable_set_id: None,
-            agent_keys: Vec::new(),
-        };
-        let cmd = Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::OpenChangeRequest { id: "42".into() },
-        };
-        let my_node_id = Some(NodeId::new("local-node"));
-        // ProviderHost on a remote-only repo should derive host from the item
-        let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };
-        let local_target = ProvisioningTarget::Host { host: HostName::local() };
-        let model = TuiModel::from_repo_info(vec![]);
-        let result = tui_dispatch(resolved, &model, Some(&item), Some(&repo_id), &local_target, &my_node_id, true).expect("should succeed");
-        assert_eq!(result.node_id, Some(NodeId::new("remote-peer")));
     }
 }

@@ -1,23 +1,13 @@
-pub mod action_menu;
-pub mod branch_input;
-pub mod close_confirm;
-pub mod columns;
 pub mod command_palette;
 pub mod convoy_delete_confirm;
-pub mod delete_confirm;
 pub mod describe;
 pub mod dispatch_confirm;
 pub mod event_log;
 pub mod file_picker;
 pub mod help;
-pub mod issue_search;
 pub mod overview_page;
-pub mod preview_panel;
 pub mod project_page;
-pub mod repo_page;
 pub mod screen;
-pub mod section_table;
-pub mod split_table;
 pub mod status_bar_widget;
 pub mod table;
 pub mod table_action_menu;
@@ -28,7 +18,7 @@ use std::{any::Any, collections::HashMap};
 
 use crossterm::event::{KeyEvent, MouseEvent};
 use flotilla_core::config::ConfigStore;
-use flotilla_protocol::{HostName, NodeId, ProvisioningTarget, RepoIdentity};
+use flotilla_protocol::{HostName, NodeId, ProvisioningTarget};
 use ratatui::{layout::Rect, Frame};
 
 use crate::{
@@ -61,16 +51,10 @@ pub enum AppAction {
     CancelCommand(u64),
     CycleTheme,
     SetTheme(String),
-    CycleLayout,
-    SetLayout(String),
     CycleHost,
     SetTarget(String),
     ToggleDebug,
     ToggleStatusBarKeys,
-    ToggleProviders,
-    ToggleMultiSelect,
-    OpenActionMenu,
-    ActionEnter,
     StatusBarKeyPress {
         code: crossterm::event::KeyCode,
         modifiers: crossterm::event::KeyModifiers,
@@ -109,13 +93,6 @@ pub enum AppAction {
     MoveTabRight,
     Refresh,
     ShowStatus(String),
-    SetSearchQuery {
-        repo: RepoIdentity,
-        query: String,
-    },
-    ClearSearchQuery {
-        repo: RepoIdentity,
-    },
 }
 
 /// Result of handling an event in a widget.

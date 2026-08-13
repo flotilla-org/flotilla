@@ -219,6 +219,7 @@ impl OpenViews {
     /// if the file was hand-edited out of shape.
     pub fn from_entries(entries: Vec<OpenViewEntry>) -> Self {
         let mut views: Vec<OpenView> = entries.into_iter().map(OpenView::parse).collect();
+        views.retain(|view| !matches!(view.address(), Some(ViewAddress::Repo { .. })));
         match views.iter().position(OpenView::is_pinned) {
             Some(0) => {}
             Some(idx) => {
@@ -244,9 +245,7 @@ impl OpenViews {
         Self { views, active: 0, last_active: None, mode: TabSetMode::Tabbed }
     }
 
-    /// The default set for a config with no `open-views.toml`: overview,
-    /// the flotilla convoys view, and one repo view per registered repo —
-    /// matching what the pre-View TUI always showed.
+    /// The default set for a config with no `open-views.toml`.
     pub fn seed(repos: impl IntoIterator<Item = RepoIdentity>) -> Self {
         Self::seed_with_keys(repos.into_iter().map(|identity| (identity, None)))
     }
@@ -255,8 +254,8 @@ impl OpenViews {
         Self::seed_with_landing(repos, None)
     }
 
-    /// Build the fresh-config tab set, replacing the selected repo's Plane-A
-    /// tab with its composite landing View when one was resolved.
+    /// Build the fresh-config tab set, adding a composite landing View when
+    /// one was resolved.
     pub fn seed_with_landing(
         repos: impl IntoIterator<Item = (RepoIdentity, Option<RepositoryKey>)>,
         landing: Option<(RepoIdentity, ViewAddress)>,
@@ -265,25 +264,14 @@ impl OpenViews {
             address: ViewAddress::Convoys { namespace: "flotilla".to_string(), scope: None }.to_string(),
             label: None,
         }];
-        entries.extend(repos.into_iter().map(|(identity, repository_key)| {
-            let address = landing
-                .as_ref()
-                .filter(|(landing_identity, _)| landing_identity == &identity)
-                .map(|(_, address)| address.clone())
-                .unwrap_or_else(|| match repository_key {
-                    Some(key) => ViewAddress::repo_with_key(identity, key),
-                    None => ViewAddress::repo(identity),
-                });
-            OpenViewEntry { address: address.to_string(), label: None }
-        }));
-        let mut views = Self::from_entries(entries);
-        views.active = landing.as_ref().and_then(|(_, address)| views.find(address)).unwrap_or_else(|| {
-            if views.views.len() > 2 {
-                2
-            } else {
-                views.views.len() - 1
+        let _ = repos.into_iter().count();
+        if let Some((_, address)) = &landing {
+            if !matches!(address, ViewAddress::Repo { .. }) {
+                entries.push(OpenViewEntry { address: address.to_string(), label: None });
             }
-        });
+        }
+        let mut views = Self::from_entries(entries);
+        views.active = landing.as_ref().and_then(|(_, address)| views.find(address)).unwrap_or_else(|| views.views.len() - 1);
         views
     }
 
@@ -299,7 +287,18 @@ impl OpenViews {
     /// A single-View set for scoped mode (`flotilla view <address>`): no
     /// pinned overview, no tab shell; opens navigate in place.
     pub fn scoped(address: ViewAddress) -> Self {
-        Self { views: vec![OpenView::of(address)], active: 0, last_active: None, mode: TabSetMode::Scoped }
+        let view = if matches!(address, ViewAddress::Repo { .. }) {
+            OpenView {
+                target: ViewTarget::Broken { raw: address.to_string(), error: "repository views have been retired".into() },
+                label_override: None,
+                table_state: TableState::default(),
+                project_table_state: ProjectTableState::default(),
+                history: Vec::new(),
+            }
+        } else {
+            OpenView::of(address)
+        };
+        Self { views: vec![view], active: 0, last_active: None, mode: TabSetMode::Scoped }
     }
 
     pub fn mode(&self) -> TabSetMode {
@@ -361,6 +360,9 @@ impl OpenViews {
     /// Drill into `address` in the active tab, preserving the current target
     /// on that tab's history stack. This never grows or switches the tab set.
     pub fn drill(&mut self, address: ViewAddress) -> bool {
+        if matches!(address, ViewAddress::Repo { .. }) {
+            return false;
+        }
         if self.views.get(self.active).and_then(OpenView::address) == Some(&address) {
             return false;
         }
@@ -480,6 +482,9 @@ impl OpenViews {
     /// pushing the previous address onto the back stack. Returns true if
     /// the view set changed.
     pub fn open_or_focus(&mut self, address: ViewAddress) -> bool {
+        if matches!(address, ViewAddress::Repo { .. }) {
+            return false;
+        }
         if self.active_address() == Some(&address) {
             return false;
         }
@@ -571,7 +576,7 @@ mod tests {
     }
 
     fn three_tabs() -> OpenViews {
-        OpenViews::from_entries(vec![entry("overview"), entry("convoys/flotilla"), entry("repo/github.com/o/r")])
+        OpenViews::from_entries(vec![entry("overview"), entry("convoys/flotilla"), entry("project/flotilla/roadmap")])
     }
 
     #[test]
@@ -623,12 +628,12 @@ mod tests {
         let repo = RepoIdentity { authority: "github.com".to_string(), path: "o/r".to_string() };
         let views = OpenViews::seed(vec![repo]);
         let addresses: Vec<String> = views.iter().map(|view| view.address().expect("parsed").to_string()).collect();
-        assert_eq!(addresses, vec!["overview", "convoys/flotilla", "repo/github.com/o/r"]);
-        assert_eq!(views.active_index(), 2, "seed lands on the first repo tab");
+        assert_eq!(addresses, vec!["overview", "convoys/flotilla"]);
+        assert_eq!(views.active_index(), 1, "seed lands on the convoy tab");
     }
 
     #[test]
-    fn fresh_project_landing_replaces_only_its_seeded_repo_view() {
+    fn fresh_project_landing_adds_only_the_project_view() {
         let selected = RepoIdentity { authority: "github.com".to_string(), path: "o/selected".to_string() };
         let other = RepoIdentity { authority: "github.com".to_string(), path: "o/other".to_string() };
         let project = addr("project/flotilla/selected");
@@ -636,18 +641,18 @@ mod tests {
             OpenViews::seed_with_landing(vec![(other.clone(), None), (selected.clone(), None)], Some((selected.clone(), project.clone())));
 
         let addresses = views.iter().map(|view| view.address().expect("parsed").to_string()).collect::<Vec<_>>();
-        assert_eq!(addresses, vec!["overview", "convoys/flotilla", "repo/github.com/o/other", "project/flotilla/selected"]);
+        assert_eq!(addresses, vec!["overview", "convoys/flotilla", "project/flotilla/selected"]);
         assert_eq!(views.active_address(), Some(&project));
         assert!(views.find(&ViewAddress::repo(selected)).is_none());
     }
 
     #[test]
-    fn explicit_repo_address_remains_openable_after_project_landing() {
+    fn explicit_repo_address_is_not_openable_after_project_landing() {
         let repo = RepoIdentity { authority: "github.com".to_string(), path: "o/r".to_string() };
         let mut views = OpenViews::seed_with_landing(vec![(repo.clone(), None)], Some((repo.clone(), addr("project/flotilla/r"))));
 
-        assert!(views.open_or_focus(ViewAddress::repo(repo.clone())));
-        assert_eq!(views.active_address(), Some(&ViewAddress::repo(repo)));
+        assert!(!views.open_or_focus(ViewAddress::repo(repo)));
+        assert_eq!(views.active_address(), Some(&addr("project/flotilla/r")));
     }
 
     #[test]
@@ -682,7 +687,7 @@ mod tests {
     #[test]
     fn open_or_focus_inserts_after_active_never_before_overview() {
         let mut views = three_tabs();
-        assert!(views.open_or_focus(addr("repo/github.com/o/other")));
+        assert!(views.open_or_focus(addr("convoy/flotilla/other")));
         assert_eq!(views.active_index(), 1, "inserted after the pinned overview when it was active");
         assert_eq!(views.len(), 4);
     }
@@ -714,7 +719,7 @@ mod tests {
         views.switch_to(2);
         assert!(views.close(1));
         assert_eq!(views.active_index(), 1);
-        assert_eq!(views.active_address(), Some(&addr("repo/github.com/o/r")));
+        assert_eq!(views.active_address(), Some(&addr("project/flotilla/roadmap")));
     }
 
     #[test]
@@ -727,11 +732,10 @@ mod tests {
     }
 
     #[test]
-    fn active_repo_identity_only_for_repo_views() {
-        let mut views = three_tabs();
+    fn retired_repo_addresses_are_not_restored() {
+        let views = OpenViews::from_entries(vec![entry("overview"), entry("repo/github.com/o/r")]);
+        assert_eq!(views.len(), 1);
         assert_eq!(views.active_repo_identity(), None);
-        views.switch_to(2);
-        assert_eq!(views.active_repo_identity().map(|id| id.path.as_str()), Some("o/r"));
     }
 
     #[test]
@@ -764,25 +768,12 @@ mod tests {
         assert_eq!(views.active_address(), Some(&addr("convoy/flotilla/manifest")));
 
         views.switch_to(2);
-        assert_eq!(views.active_address(), Some(&addr("repo/github.com/o/r")), "another tab keeps its own current address");
+        assert_eq!(views.active_address(), Some(&addr("project/flotilla/roadmap")), "another tab keeps its own current address");
         assert!(!views.back(), "another tab has no history of the first tab's drill");
 
         views.switch_to(1);
         assert!(views.back());
         assert_eq!(views.active_address(), Some(&addr("convoys/flotilla")));
-    }
-
-    #[test]
-    fn repository_key_binding_updates_a_repo_address_in_navigation_history() {
-        let identity = RepoIdentity { authority: "github.com".into(), path: "o/r".into() };
-        let key = RepositoryKey("repo_history".into());
-        let mut views = OpenViews::scoped(ViewAddress::repo(identity.clone()));
-        assert!(views.drill(addr("convoy/flotilla/manifest")));
-
-        views.bind_repository_keys(&HashMap::from([(identity.clone(), key.clone())]));
-        assert!(views.back());
-
-        assert_eq!(views.active_address(), Some(&ViewAddress::repo_with_key(identity, key)));
     }
 
     #[test]
@@ -805,7 +796,7 @@ mod tests {
             entry("overview"),
             entry("convoys/flotilla"),
             entry("convoy/flotilla/manifest"),
-            entry("repo/github.com/o/r"),
+            entry("project/flotilla/roadmap"),
         ]);
         views.switch_to(1);
 

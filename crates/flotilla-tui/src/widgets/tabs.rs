@@ -509,8 +509,10 @@ mod tests {
     #[test]
     fn drag_swaps_open_views_and_follows_the_tab() {
         let mut app = stub_app_with_repos(2);
+        app.views.open_or_focus("project/flotilla/one".parse().expect("project address"));
+        app.views.open_or_focus("project/flotilla/two".parse().expect("project address"));
         let mut tabs = Tabs::new();
-        // Tabs: 0 overview, 1 convoys, 2 repo0, 3 repo1
+        // Tabs: 0 overview, 1 convoys, 2 project one, 3 project two
         tabs.tab_areas.insert(TabId::View(2), Rect::new(20, 0, 10, 1));
         tabs.tab_areas.insert(TabId::View(3), Rect::new(30, 0, 10, 1));
         tabs.drag.dragging_tab = Some(2);
@@ -603,15 +605,5 @@ mod tests {
         let labels = tab_labels(&views, &app.model);
         assert_eq!(labels[1].text, "ns-one/alpha/leg-1");
         assert_eq!(labels[2].text, "ns-two/alpha/leg-1");
-    }
-
-    #[test]
-    fn dangling_repo_view_labels_loudly() {
-        let app = stub_app_with_repos(0);
-        let address: ViewAddress = "repo/github.com/gone/repo".parse().expect("valid");
-        let mut views = OpenViews::from_entries(vec![]);
-        views.open_or_focus(address);
-        let view = views.active().clone();
-        assert_eq!(tab_label(&view, &app.model), "⚠ repo");
     }
 }

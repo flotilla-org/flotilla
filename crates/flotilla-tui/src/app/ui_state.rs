@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
-use flotilla_protocol::{HostName, IssueRef, ProvisioningTarget, RepoIdentity, ViewAddress, WorkItemIdentity};
+use flotilla_protocol::{HostName, IssueRef, ProvisioningTarget, RepoIdentity, ViewAddress};
 use ratatui::layout::Rect;
-use serde::{Deserialize, Serialize};
 
 use crate::{
     status_bar::StatusBarTarget,
@@ -17,35 +16,11 @@ pub struct DirEntry {
     pub is_added: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum BranchInputKind {
-    /// User is manually typing a branch name.
-    #[default]
-    Manual,
-    /// AI is generating a branch name from issue context.
-    Generating,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RepoViewLayout {
-    #[default]
-    Auto,
-    Zoom,
-    Right,
-    Below,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingStatus {
     Submitting,
     InFlight { command_id: u64 },
     Failed(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingAction {
-    pub status: PendingStatus,
-    pub description: String,
 }
 
 #[derive(Clone, Debug)]
@@ -55,23 +30,12 @@ pub struct PendingActionContext {
 }
 
 impl PendingActionContext {
-    pub fn work_item(identity: WorkItemIdentity, repo_identity: RepoIdentity, description: String) -> Self {
-        Self { description, target: PendingActionTarget::WorkItem { identity, repo_identity } }
-    }
-
     pub fn table_row(target: PendingRowContext, description: String) -> Self {
         Self { description, target: PendingActionTarget::TableRow(target) }
     }
 
     pub fn project_issue_start(target: ProjectIssueStartContext, description: String) -> Self {
         Self { description, target: PendingActionTarget::ProjectIssueStart(target) }
-    }
-
-    pub fn work_item_identity(&self) -> Option<&WorkItemIdentity> {
-        match &self.target {
-            PendingActionTarget::WorkItem { identity, .. } => Some(identity),
-            _ => None,
-        }
     }
 
     pub fn project_issue_start_context(&self) -> Option<&ProjectIssueStartContext> {
@@ -91,7 +55,6 @@ impl PendingActionContext {
 
 #[derive(Clone, Debug)]
 pub enum PendingActionTarget {
-    WorkItem { identity: WorkItemIdentity, repo_identity: RepoIdentity },
     TableRow(PendingRowContext),
     ProjectIssueStart(ProjectIssueStartContext),
 }
@@ -150,7 +113,6 @@ pub struct DragState {
 
 pub struct UiState {
     pub provisioning_target: ProvisioningTarget,
-    pub view_layout: RepoViewLayout,
     pub status_bar: StatusBarUiState,
     pub layout: LayoutAreas,
     pub show_debug: bool,
@@ -164,22 +126,12 @@ impl UiState {
     pub fn new(_repo_ids: &[RepoIdentity]) -> Self {
         Self {
             provisioning_target: ProvisioningTarget::Host { host: HostName::local() },
-            view_layout: RepoViewLayout::default(),
             status_bar: StatusBarUiState::default(),
             layout: LayoutAreas::default(),
             show_debug: false,
             help_scroll: 0,
             command_echo: None,
         }
-    }
-
-    pub fn cycle_layout(&mut self) {
-        self.view_layout = match self.view_layout {
-            RepoViewLayout::Auto => RepoViewLayout::Zoom,
-            RepoViewLayout::Zoom => RepoViewLayout::Right,
-            RepoViewLayout::Right => RepoViewLayout::Below,
-            RepoViewLayout::Below => RepoViewLayout::Auto,
-        };
     }
 }
 
@@ -195,13 +147,6 @@ mod tests {
     fn new_with_empty_paths() {
         let state = UiState::new(&[]);
         assert!(!state.show_debug);
-        assert_eq!(state.view_layout, RepoViewLayout::Auto);
-    }
-
-    #[test]
-    fn ui_state_defaults_to_auto_layout() {
-        let state = UiState::new(&[]);
-        assert_eq!(state.view_layout, RepoViewLayout::Auto);
     }
 
     #[test]
@@ -219,22 +164,5 @@ mod tests {
     #[test]
     fn status_bar_ui_state_defaults_to_showing_keys() {
         assert!(StatusBarUiState::default().show_keys);
-    }
-
-    #[test]
-    fn layout_cycles_auto_zoom_right_below_auto() {
-        let mut state = UiState::new(&[]);
-
-        state.cycle_layout();
-        assert_eq!(state.view_layout, RepoViewLayout::Zoom);
-
-        state.cycle_layout();
-        assert_eq!(state.view_layout, RepoViewLayout::Right);
-
-        state.cycle_layout();
-        assert_eq!(state.view_layout, RepoViewLayout::Below);
-
-        state.cycle_layout();
-        assert_eq!(state.view_layout, RepoViewLayout::Auto);
     }
 }

@@ -1,12 +1,8 @@
 pub mod executor;
 mod file_picker;
-pub mod intent;
-pub mod issue_view;
 mod key_handlers;
 mod navigation;
 pub mod open_views;
-#[doc(hidden)]
-pub mod test_builders;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod ui_state;
@@ -19,41 +15,27 @@ use std::{
 };
 
 use flotilla_core::{
-    config::{ConfigStore, RepoViewLayoutConfig},
+    config::ConfigStore,
     daemon::{DaemonHandle, QuerySubscription},
 };
 use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
-    ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, ResourceRef, StepStatus,
-    ViewAddress, WorkItem, WorkItemIdentity,
+    ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, ResourceRef, StepStatus, ViewAddress,
 };
 use indexmap::IndexMap;
-pub use intent::Intent;
 pub use open_views::{OpenView, OpenViews, ViewTarget};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tui_input::Input;
 use ui_state::PendingStatus;
-pub use ui_state::{BranchInputKind, DirEntry, ProjectIssueStartContext, RepoViewLayout, TabId, UiState};
+pub use ui_state::{DirEntry, ProjectIssueStartContext, TabId, UiState};
 
 use crate::{
     convoy_model::{ConvoyId, ConvoySummary},
     keymap::Keymap,
     pm_open::PmConnector,
-    shared::Shared,
     theme::Theme,
-    widgets::{
-        repo_page::{RepoData, RepoPage, RepoPageHandoff},
-        section_table::IssueRow,
-        split_table::SelectedRow,
-    },
 };
-
-/// Owned version of `SelectedRow` for use when the borrow can't be held.
-pub(super) enum OwnedSelectedRow {
-    WorkItem(Box<WorkItem>),
-    IssueRow(Box<IssueRow>),
-}
 
 /// Per-provider auth/health status from last refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,27 +431,8 @@ pub fn collect_visible_status_items(model: &TuiModel, ui: &UiState) -> Vec<Visib
 ///
 /// Suppresses "issues disabled" messages since the daemon handles those.
 /// Returns `None` when there are no displayable errors.
-fn format_error_status(errors: &[ProviderError], repo_path: &Path) -> Option<String> {
-    let name = TuiModel::repo_name(repo_path);
-    let mut all_errors: Vec<String> = Vec::new();
-    for e in errors {
-        if e.category == "issues" && e.message.contains("has disabled issues") {
-            continue;
-        }
-        let provider_suffix = if e.provider.is_empty() { String::new() } else { format!(" ({})", e.provider) };
-        tracing::error!(%name, category = %e.category, provider = %e.provider, message = %e.message, "provider error");
-        all_errors.push(format!("{name}: {}{provider_suffix}: {}", e.category, e.message));
-    }
-    if all_errors.is_empty() {
-        None
-    } else {
-        Some(all_errors.join("; "))
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct RecentCommandFinish {
-    error_message: Option<String>,
     row_error_message: Option<String>,
 }
 
@@ -503,20 +466,11 @@ pub struct App {
     pub pending_cancel: Option<u64>,
     pub should_quit: bool,
     pub screen: crate::widgets::screen::Screen,
-    /// Per-repo shared data handles. Written by `apply_snapshot()`/`apply_delta()`,
-    /// read by `RepoPage` widgets during reconciliation and rendering.
-    pub repo_data: HashMap<RepoIdentity, Shared<RepoData>>,
-    /// Per-repo issue paging state, driven by stateless queries.
-    pub issue_views: HashMap<RepoIdentity, issue_view::IssueViewState>,
     /// Demand-backed issue windows keyed by their fully parameterized query.
     /// Default issue sections consume this; stateless paging remains for
     /// ephemeral searches beyond the window.
     pub query_tables: QueryTableCache,
     pub pending_fetch_more: HashSet<flotilla_protocol::QueryId>,
-    /// Sender half for background issue query tasks. Cloned into spawned tasks.
-    pub issue_update_tx: mpsc::UnboundedSender<issue_view::IssueQueryUpdate>,
-    /// Receiver half, drained each event-loop iteration.
-    pub issue_update_rx: mpsc::UnboundedReceiver<issue_view::IssueQueryUpdate>,
     /// Connected presentation-manager realization path, when this TUI is
     /// running inside a supported PM.
     pub pm_connector: Option<Arc<dyn PmConnector>>,
@@ -547,15 +501,12 @@ pub struct App {
 pub struct AppHandoff {
     views: OpenViews,
     provisioning_target: ProvisioningTarget,
-    view_layout: RepoViewLayout,
     status_keys_visible: bool,
     dismissed_status_ids: HashSet<usize>,
     show_debug: bool,
     help_scroll: u16,
     command_echo: Option<String>,
     event_log: Vec<crate::event_log::HandoffLogEntry>,
-    repo_pages: Vec<(RepoIdentity, RepoPageHandoff)>,
-    issue_search_input: Option<String>,
 }
 
 impl App {
@@ -563,43 +514,24 @@ impl App {
         AppHandoff {
             views: self.views.clone(),
             provisioning_target: self.ui.provisioning_target.clone(),
-            view_layout: self.ui.view_layout,
             status_keys_visible: self.ui.status_bar.show_keys,
             dismissed_status_ids: self.ui.status_bar.dismissed_status_ids.clone(),
             show_debug: self.ui.show_debug,
             help_scroll: self.ui.help_scroll,
             command_echo: self.ui.command_echo.clone(),
             event_log: crate::event_log::handoff_entries(),
-            repo_pages: self.screen.repo_pages.iter().map(|(identity, page)| (identity.clone(), page.handoff())).collect(),
-            issue_search_input: self
-                .screen
-                .modal_stack
-                .last()
-                .and_then(|widget| widget.as_any().downcast_ref::<crate::widgets::issue_search::IssueSearchWidget>())
-                .map(|widget| widget.input_value().to_string()),
         }
     }
 
     pub fn restore_handoff(&mut self, handoff: AppHandoff) {
         self.views = handoff.views;
         self.ui.provisioning_target = handoff.provisioning_target;
-        self.ui.view_layout = handoff.view_layout;
         self.ui.status_bar.show_keys = handoff.status_keys_visible;
         self.ui.status_bar.dismissed_status_ids = handoff.dismissed_status_ids;
         self.ui.show_debug = handoff.show_debug;
         self.ui.help_scroll = handoff.help_scroll;
         self.ui.command_echo = handoff.command_echo;
         crate::event_log::restore_handoff_entries(handoff.event_log);
-        for (identity, page_handoff) in handoff.repo_pages {
-            if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
-                page.restore_handoff(page_handoff);
-            }
-        }
-        if let Some(input) = handoff.issue_search_input {
-            let mut widget = crate::widgets::issue_search::IssueSearchWidget::new();
-            widget.prefill(&input);
-            self.screen.modal_stack.push(Box::new(widget));
-        }
         self.subscriptions_dirty = true;
         self.sync_active_view();
     }
@@ -633,7 +565,7 @@ impl App {
     ) -> Self {
         let mut model = TuiModel::from_repo_info(repos_info);
         // Open-view set: persisted if present, else seeded with overview,
-        // convoys, and one landing View per tracked repo.
+        // convoys, and the resolved landing View.
         // The seed isn't written back here — it is deterministic, and any
         // tab mutation persists the set (scoped mode must never write it).
         let mut views = match config.load_open_views() {
@@ -650,37 +582,10 @@ impl App {
             model.repos.iter().filter_map(|(identity, repo)| repo.repository_key.clone().map(|key| (identity.clone(), key))).collect();
         views.bind_repository_keys(&repository_keys);
         model.active_repo = views.active_repo_identity().cloned();
-        let mut ui = UiState::new(&model.repo_order);
+        let ui = UiState::new(&model.repo_order);
         let loaded_config = config.load_config();
-        ui.view_layout = match loaded_config.ui.preview.layout {
-            RepoViewLayoutConfig::Auto => RepoViewLayout::Auto,
-            RepoViewLayoutConfig::Zoom => RepoViewLayout::Zoom,
-            RepoViewLayoutConfig::Right => RepoViewLayout::Right,
-            RepoViewLayoutConfig::Below => RepoViewLayout::Below,
-        };
         let keymap = Keymap::from_config(&loaded_config.ui.keys);
-
-        // Create Shared<RepoData> handles and RepoPage instances for each repo
-        let mut repo_data_map = HashMap::new();
-        let mut screen = crate::widgets::screen::Screen::new();
-        for (identity, rm) in &model.repos {
-            let shared = Shared::new(RepoData {
-                path: rm.path.clone(),
-                providers: Arc::new(ProviderData::default()),
-                labels: rm.labels.clone(),
-                provider_names: rm.provider_names.clone(),
-                provider_health: rm.provider_health.clone(),
-                work_items: Vec::new(),
-                issue_rows: Vec::new(),
-                issue_section_label: String::new(),
-                loading: rm.loading,
-            });
-            let page = RepoPage::new(identity.clone(), shared.clone(), ui.view_layout);
-            repo_data_map.insert(identity.clone(), shared);
-            screen.repo_pages.insert(identity.clone(), page);
-        }
-
-        let (issue_update_tx, issue_update_rx) = mpsc::unbounded_channel();
+        let screen = crate::widgets::screen::Screen::new();
         let (pm_update_tx, pm_update_rx) = mpsc::unbounded_channel();
         let session_id = uuid::Uuid::new_v4();
         let query_subscription = daemon.query_subscription(session_id);
@@ -704,12 +609,8 @@ impl App {
             pending_cancel: None,
             should_quit: false,
             screen,
-            repo_data: repo_data_map,
-            issue_views: HashMap::new(),
             query_tables: QueryTableCache::default(),
             pending_fetch_more: HashSet::new(),
-            issue_update_tx,
-            issue_update_rx,
             pm_connector: None,
             pm_update_tx,
             pm_update_rx,
@@ -756,23 +657,6 @@ impl App {
                     repo.loading = info.loading;
                     repo.has_unseen_changes = false;
                 }
-                if let Some(data) = self.repo_data.get(&identity) {
-                    let repo = &self.model.repos[&identity];
-                    data.mutate(|data| {
-                        data.path = repo.path.clone();
-                        data.providers = Arc::new(ProviderData::default());
-                        data.labels = repo.labels.clone();
-                        data.provider_names = repo.provider_names.clone();
-                        data.provider_health = repo.provider_health.clone();
-                        data.work_items.clear();
-                        data.issue_rows.clear();
-                        data.issue_section_label.clear();
-                        data.loading = repo.loading;
-                    });
-                }
-                if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
-                    page.pending_actions.clear();
-                }
             } else {
                 self.handle_repo_added(info);
             }
@@ -790,7 +674,6 @@ impl App {
         self.namespaces.clear();
         self.query_seqs.clear();
         self.pending_fetch_more.clear();
-        self.issue_views.clear();
         self.in_flight.clear();
         self.acknowledged_dispatches.clear();
         self.pending_dispatch_acks = 0;
@@ -820,8 +703,7 @@ impl App {
     }
 
     /// The named queries the open Views consume, with re-subscribe cursors —
-    /// the tab set IS the subscription set (ADR 0013). Repo views ride the
-    /// Plane-A repo streams and stay outside this lifecycle.
+    /// the tab set IS the subscription set (ADR 0013).
     pub fn query_cursors(&self) -> Vec<flotilla_protocol::QueryCursor> {
         let mut queries = Vec::new();
         for view in self.views.iter() {
@@ -840,26 +722,8 @@ impl App {
         if !self.in_flight.is_empty() {
             return true;
         }
-        if self.screen.repo_pages.values().any(|page| {
-            page.pending_actions.values().any(|a| matches!(a.status, PendingStatus::Submitting | PendingStatus::InFlight { .. }))
-        }) {
-            return true;
-        }
         if self.views.has_pending_rows() {
             return true;
-        }
-        // Check modal stack for loading states
-        if let Some(widget) = self.screen.modal_stack.last() {
-            if let Some(biw) = widget.as_any().downcast_ref::<crate::widgets::branch_input::BranchInputWidget>() {
-                if biw.is_generating() {
-                    return true;
-                }
-            }
-            if let Some(dcw) = widget.as_any().downcast_ref::<crate::widgets::delete_confirm::DeleteConfirmWidget>() {
-                if dcw.loading {
-                    return true;
-                }
-            }
         }
         false
     }
@@ -946,16 +810,6 @@ impl App {
         }
     }
 
-    pub fn persist_layout(&self) {
-        let layout = match self.ui.view_layout {
-            RepoViewLayout::Auto => RepoViewLayoutConfig::Auto,
-            RepoViewLayout::Zoom => RepoViewLayoutConfig::Zoom,
-            RepoViewLayout::Right => RepoViewLayoutConfig::Right,
-            RepoViewLayout::Below => RepoViewLayoutConfig::Below,
-        };
-        self.config.save_layout(layout);
-    }
-
     pub fn command(&self, action: CommandAction) -> Command {
         Command { node_id: None, provisioning_target: None, context_repo: None, action }
     }
@@ -1021,50 +875,6 @@ impl App {
         }
     }
 
-    pub fn item_host_command(&self, action: CommandAction, item: &WorkItem) -> Command {
-        Command { node_id: self.item_execution_host(item), provisioning_target: None, context_repo: None, action }
-    }
-
-    pub fn item_host_repo_command(&self, action: CommandAction, item: &WorkItem) -> Command {
-        Command {
-            node_id: self.item_execution_host(item),
-            provisioning_target: None,
-            context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())),
-            action,
-        }
-    }
-
-    pub fn provider_repo_command(&self, action: CommandAction, item: &WorkItem) -> Command {
-        if self.active_repo_is_remote_only() {
-            self.item_host_repo_command(action, item)
-        } else {
-            self.repo_command(action)
-        }
-    }
-
-    pub(super) fn work_item_for_issue_row(&self, row: &IssueRow) -> WorkItem {
-        WorkItem {
-            kind: flotilla_protocol::WorkItemKind::Issue,
-            identity: WorkItemIdentity::Issue(row.id.clone()),
-            // Issue rows are synthesized from the local repo view, so the local
-            // node id should already be known; this fallback is only a safety net.
-            node_id: self.model.my_node_id().cloned().unwrap_or_else(|| NodeId::new("issue-row")),
-            branch: None,
-            description: row.issue.title.clone(),
-            checkout: None,
-            change_request_key: None,
-            session_key: None,
-            issue_keys: vec![row.id.clone()],
-            workspace_refs: vec![],
-            is_main_checkout: false,
-            debug_group: vec![],
-            source: (!row.issue.provider_display_name.is_empty()).then(|| row.issue.provider_display_name.clone()),
-            terminal_keys: vec![],
-            attachable_set_id: None,
-            agent_keys: vec![],
-        }
-    }
-
     pub fn repo_path_for_identity(&self, identity: &RepoIdentity) -> Option<PathBuf> {
         self.model.repos.get(identity).map(|repo| repo.path.clone())
     }
@@ -1073,13 +883,6 @@ impl App {
     /// Used to tell the remote host what commands to prepare.
     pub fn local_template_commands(&self) -> Vec<flotilla_protocol::PreparedTerminalCommand> {
         flotilla_core::template::resolve_template_commands(self.model.active_repo_root(), self.config.base_path().as_path())
-    }
-
-    fn item_execution_host(&self, item: &WorkItem) -> Option<NodeId> {
-        match self.model.my_node_id() {
-            Some(my_node_id) if item.node_id != *my_node_id => Some(item.node_id.clone()),
-            _ => None,
-        }
     }
 
     fn active_repo_is_remote_only(&self) -> bool {
@@ -1098,18 +901,13 @@ impl App {
         }
     }
 
-    /// Re-derive tab-dependent state after any change to the active tab:
-    /// the model's active-repo scope, the unseen-changes badge, and the
-    /// status bar's layout indicator.
+    /// Re-derive tab-dependent state after any change to the active tab.
     pub fn sync_active_view(&mut self) {
         self.screen.invalidate_page_layout();
         self.model.active_repo = self.views.active_repo_identity().cloned();
         if let Some(identity) = self.model.active_repo.clone() {
             if let Some(rm) = self.model.repos.get_mut(&identity) {
                 rm.has_unseen_changes = false;
-            }
-            if let Some(page) = self.screen.repo_pages.get(&identity) {
-                self.ui.view_layout = page.layout;
             }
         }
         self.report_active_view_focus();
@@ -1150,175 +948,11 @@ impl App {
     }
 
     pub(crate) fn drain_background_updates(&mut self) {
-        use issue_view::{IssueFetchCompletion, IssueFetchFailure, IssueQueryUpdate};
-
-        while let Ok(update) = self.issue_update_rx.try_recv() {
-            match update {
-                IssueQueryUpdate::PageFetched { repo, params, requested_page, page } => {
-                    let Some(view) = self.issue_views.get_mut(&repo) else { continue };
-                    match view.complete_fetch(&params, requested_page, page) {
-                        IssueFetchCompletion::Ignored => continue,
-                        IssueFetchCompletion::Applied => {}
-                        IssueFetchCompletion::AppliedAndRefresh => {
-                            self.spawn_query_page(repo.clone(), params, 1, 50);
-                        }
-                    }
-                    self.push_issue_items_to_repo_data(&repo);
-                }
-                IssueQueryUpdate::QueryFailed { repo, params, requested_page, message } => {
-                    tracing::warn!(%message, requested_page, is_search = params.search.is_some(), "issue query failed");
-                    let Some(view) = self.issue_views.get_mut(&repo) else { continue };
-                    let failure = view.fail_fetch(&params, requested_page);
-                    if failure == IssueFetchFailure::Ignored {
-                        continue;
-                    }
-
-                    let initial_failure = failure == IssueFetchFailure::Initial;
-                    let refresh_after_failure = failure == IssueFetchFailure::ExistingAndRefresh;
-                    self.set_status_message(Some(message));
-
-                    if initial_failure && params.search.is_some() {
-                        if let Some(view) = self.issue_views.get_mut(&repo) {
-                            view.search = None;
-                            view.search_query = None;
-                        }
-                        if let Some(page) = self.screen.repo_pages.get_mut(&repo) {
-                            page.active_search_query = None;
-                        }
-                        self.push_issue_items_to_repo_data(&repo);
-                    } else if initial_failure {
-                        if let Some(view) = self.issue_views.get_mut(&repo) {
-                            view.default = None;
-                        }
-                    }
-
-                    if refresh_after_failure {
-                        self.spawn_query_page(repo, params, 1, 50);
-                    }
-                }
-            }
-        }
-
         while let Ok(update) = self.pm_update_rx.try_recv() {
             match update.result {
                 Ok(()) => self.set_status_message(Some(format!("Opened {} in PM", update.label))),
                 Err(error) => self.set_status_message(Some(format!("Could not open {} in PM: {error}", update.label))),
             }
-        }
-    }
-
-    fn begin_issue_page_fetch(&mut self, repo: &RepoIdentity, params: &flotilla_protocol::issue_query::IssueQuery, page: u32) -> bool {
-        let view = self.issue_views.entry(repo.clone()).or_default();
-        view.begin_page_fetch(params, page)
-    }
-
-    fn begin_issue_refresh(&mut self, repo: &RepoIdentity, params: &flotilla_protocol::issue_query::IssueQuery) -> bool {
-        let Some(view) = self.issue_views.get_mut(repo) else { return false };
-        view.request_refresh(params) == issue_view::IssueRefreshRequest::Started
-    }
-
-    /// Spawn a background task to query one page of issue results.
-    ///
-    /// Currently always queries the local daemon (`host: None`). Remote-only
-    /// repos are skipped in `maybe_fetch_default_issues` and the search widgets
-    /// don't set a host. If future code paths need to query a remote host's
-    /// issues, this method (or the executor interception) will need to forward
-    /// the original `Command.host`.
-    fn spawn_query_page(&self, repo: RepoIdentity, params: flotilla_protocol::issue_query::IssueQuery, page: u32, count: usize) {
-        let daemon = self.daemon.clone();
-        let tx = self.issue_update_tx.clone();
-        let session_id = self.session_id;
-        let params_clone = params.clone();
-        tokio::spawn(async move {
-            let cmd = Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryIssues {
-                    repo: RepoSelector::Identity(repo.clone()),
-                    params: params_clone.clone(),
-                    page,
-                    count,
-                },
-            };
-            match daemon.execute_query(cmd, session_id).await {
-                Ok(CommandValue::IssuePage(result_page)) => {
-                    let _ = tx.send(issue_view::IssueQueryUpdate::PageFetched {
-                        repo,
-                        params: params_clone,
-                        requested_page: page,
-                        page: result_page,
-                    });
-                }
-                Ok(other) => {
-                    let _ = tx.send(issue_view::IssueQueryUpdate::QueryFailed {
-                        repo,
-                        params: params_clone,
-                        requested_page: page,
-                        message: format!("unexpected query result: {other:?}"),
-                    });
-                }
-                Err(e) => {
-                    let _ =
-                        tx.send(issue_view::IssueQueryUpdate::QueryFailed { repo, params: params_clone, requested_page: page, message: e });
-                }
-            }
-        });
-    }
-
-    /// Fetch default issues for a repo if they haven't been fetched yet.
-    fn maybe_fetch_default_issues(&mut self, repo_identity: &RepoIdentity) {
-        if self.model.repos.get(repo_identity).is_some_and(|r| r.path.starts_with("<remote>")) {
-            return;
-        }
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let params = flotilla_protocol::issue_query::IssueQuery::default();
-        if !self.begin_issue_page_fetch(repo_identity, &params, 1) {
-            return;
-        }
-        self.spawn_query_page(repo_identity.clone(), params, 1, 50);
-    }
-
-    /// Refresh settled issue listings while preserving their current rows until
-    /// replacement page-one results arrive. An initial fetch already in flight
-    /// is left alone.
-    fn refresh_issue_views(&mut self, repo_identity: &RepoIdentity) {
-        if self.model.repos.get(repo_identity).is_some_and(|r| r.path.starts_with("<remote>")) {
-            return;
-        }
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-
-        self.maybe_fetch_default_issues(repo_identity);
-        let params: Vec<_> = self
-            .issue_views
-            .get(repo_identity)
-            .into_iter()
-            .flat_map(|view| [view.default.as_ref(), view.search.as_ref()])
-            .flatten()
-            .map(|state| state.params.clone())
-            .collect();
-        for params in params {
-            if self.begin_issue_refresh(repo_identity, &params) {
-                self.spawn_query_page(repo_identity.clone(), params, 1, 50);
-            }
-        }
-    }
-
-    /// Push issue rows from `IssueViewState` into the `Shared<RepoData>` for
-    /// a repo so the `SplitTable` can render them in the native issue section.
-    fn push_issue_items_to_repo_data(&self, repo_identity: &RepoIdentity) {
-        let Some(view) = self.issue_views.get(repo_identity) else { return };
-        let issue_rows = view.active_issue_rows();
-        let label = self.model.repos.get(repo_identity).map(|rm| rm.labels.issues.section.clone()).unwrap_or_else(|| "Issues".to_string());
-        if let Some(handle) = self.repo_data.get(repo_identity) {
-            handle.mutate(|d| {
-                d.issue_rows = issue_rows;
-                d.issue_section_label = label;
-            });
         }
     }
 
@@ -1373,37 +1007,6 @@ impl App {
                 AppAction::SetTheme(name) => {
                     self.theme = crate::theme::theme_by_name(&name);
                 }
-                AppAction::CycleLayout => {
-                    // Cycle the active page's layout (handles both the direct
-                    // repo_page path where the page already cycled, and the
-                    // command palette path where only the AppAction was emitted).
-                    if let Some(identity) = self.model.active_repo.clone() {
-                        if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
-                            page.cycle_layout();
-                            self.ui.view_layout = page.layout;
-                        }
-                    }
-                    self.persist_layout();
-                }
-                AppAction::SetLayout(name) => {
-                    let layout = match name.as_str() {
-                        "auto" => RepoViewLayout::Auto,
-                        "zoom" => RepoViewLayout::Zoom,
-                        "right" => RepoViewLayout::Right,
-                        "below" => RepoViewLayout::Below,
-                        _ => {
-                            self.set_status_message(Some(format!("unknown layout: {name}")));
-                            continue;
-                        }
-                    };
-                    self.ui.view_layout = layout;
-                    if let Some(identity) = self.model.active_repo.clone() {
-                        if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
-                            page.layout = layout;
-                        }
-                    }
-                    self.persist_layout();
-                }
                 AppAction::CycleHost => {
                     // CycleHost is no longer the primary way to set targets;
                     // the `target` command in the command palette is. Keep the
@@ -1437,35 +1040,6 @@ impl App {
                 }
                 AppAction::ToggleStatusBarKeys => {
                     self.ui.status_bar.show_keys = !self.ui.status_bar.show_keys;
-                }
-                AppAction::ToggleProviders => {
-                    if let Some(identity) = self.model.active_repo_identity_opt() {
-                        if let Some(page) = self.screen.repo_pages.get_mut(identity) {
-                            page.show_providers = !page.show_providers;
-                        }
-                    } else {
-                        self.set_status_message(Some("No active repo".into()));
-                    }
-                }
-                AppAction::ToggleMultiSelect => {
-                    if let Some(repo_identity) = self.model.active_repo_identity_opt().cloned() {
-                        if let Some(page) = self.screen.repo_pages.get_mut(&repo_identity) {
-                            if let Some(item) = page.table.selected_work_item() {
-                                let item_identity = item.identity.clone();
-                                if !page.multi_selected.remove(&item_identity) {
-                                    page.multi_selected.insert(item_identity);
-                                }
-                            }
-                        }
-                    } else {
-                        self.set_status_message(Some("No active repo".into()));
-                    }
-                }
-                AppAction::OpenActionMenu => {
-                    self.open_action_menu();
-                }
-                AppAction::ActionEnter => {
-                    self.action_enter();
                 }
                 AppAction::StatusBarKeyPress { code, modifiers } => {
                     self.handle_key(crossterm::event::KeyEvent::new(code, modifiers));
@@ -1560,26 +1134,6 @@ impl App {
                 AppAction::ShowStatus(message) => {
                     self.set_status_message(Some(message));
                 }
-                AppAction::SetSearchQuery { repo, query } => {
-                    if let Some(page) = self.screen.repo_pages.get_mut(&repo) {
-                        page.active_search_query = Some(query.clone());
-                    }
-                    // Reset search paging state and set search_query so that
-                    // in-flight results from a previous search are discarded.
-                    let view = self.issue_views.entry(repo.clone()).or_default();
-                    view.search = None;
-                    view.search_query = Some(query);
-                }
-                AppAction::ClearSearchQuery { repo } => {
-                    if let Some(page) = self.screen.repo_pages.get_mut(&repo) {
-                        page.active_search_query = None;
-                    }
-                    if let Some(view) = self.issue_views.get_mut(&repo) {
-                        view.search = None;
-                        view.search_query = None;
-                    }
-                    self.push_issue_items_to_repo_data(&repo);
-                }
             }
         }
     }
@@ -1588,9 +1142,9 @@ impl App {
 
     pub fn handle_daemon_event(&mut self, event: DaemonEvent) {
         match event {
-            DaemonEvent::RepoSnapshot(snap) => self.apply_snapshot(*snap),
-            DaemonEvent::RepoDelta(delta) => self.apply_delta(*delta),
-            DaemonEvent::RepoRefreshCompleted { repo_identity, .. } => self.refresh_issue_views(&repo_identity),
+            DaemonEvent::RepoSnapshot(snapshot) => self.apply_provider_snapshot(*snapshot),
+            DaemonEvent::RepoDelta(delta) => self.apply_provider_delta(*delta),
+            DaemonEvent::RepoRefreshCompleted { .. } => {}
             DaemonEvent::RepoTracked(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoUntracked { repo_identity, .. } => self.handle_repo_removed(&repo_identity),
             DaemonEvent::CommandStarted { command_id, node_id, repo_identity, repo, description, .. } => {
@@ -1602,16 +1156,14 @@ impl App {
             }
             DaemonEvent::CommandFinished { command_id, node_id: _, repo_identity: _, repo: _, result, .. } => {
                 if let Some(cmd) = self.in_flight.remove(&command_id) {
-                    let error_message = match &result {
+                    match &result {
                         CommandValue::Error { message } => {
                             tracing::warn!(%command_id, description = %cmd.description, error = %message, "command failed");
-                            Some(message.clone())
                         }
                         _ => {
                             tracing::info!(%command_id, description = %cmd.description, "command finished");
-                            None
                         }
-                    };
+                    }
                     let row_error_message = match &result {
                         CommandValue::Error { message } => Some(message.clone()),
                         CommandValue::Cancelled => Some("Command cancelled".to_string()),
@@ -1634,31 +1186,10 @@ impl App {
                         }
                     }
 
-                    // Find which repo+identity has this command_id
-                    let found: Option<(RepoIdentity, WorkItemIdentity)> =
-                        self.screen.repo_pages.iter().find_map(|(repo_identity, page)| {
-                            page.pending_actions
-                                .iter()
-                                .find(|(_, a)| matches!(a.status, PendingStatus::InFlight { command_id: id } if id == command_id))
-                                .map(|(id, _)| (repo_identity.clone(), id.clone()))
-                        });
-
-                    if let Some((repo_identity, identity)) = found {
-                        if let Some(ref message) = error_message {
-                            if let Some(page) = self.screen.repo_pages.get_mut(&repo_identity) {
-                                if let Some(entry) = page.pending_actions.get_mut(&identity) {
-                                    entry.status = PendingStatus::Failed(message.clone());
-                                }
-                            }
-                        } else if let Some(page) = self.screen.repo_pages.get_mut(&repo_identity) {
-                            page.pending_actions.remove(&identity);
-                        }
-                    }
-
                     self.views.finish_pending_row_command(command_id, row_error_message.as_deref());
 
                     if !self.acknowledged_dispatches.remove(&command_id) && self.pending_dispatch_acks > 0 {
-                        self.recent_command_finishes.insert(command_id, RecentCommandFinish { error_message, row_error_message });
+                        self.recent_command_finishes.insert(command_id, RecentCommandFinish { row_error_message });
                     }
                 }
             }
@@ -1864,150 +1395,55 @@ impl App {
         }
     }
 
-    fn apply_snapshot(&mut self, snap: RepoSnapshot) {
-        let repo_identity = snap.repo_identity.clone();
-        let path = snap
-            .repo
-            .clone()
-            .or_else(|| self.model.repos.get(&repo_identity).map(|rm| rm.path.clone()))
-            .unwrap_or_else(|| TuiModel::display_path(&repo_identity, None));
-        let rm = match self.model.repos.get_mut(&repo_identity) {
-            Some(rm) => rm,
-            None => return,
-        };
-        rm.path = path.clone();
-
-        let old_providers = std::mem::replace(&mut rm.providers, Arc::new(snap.providers));
-        rm.provider_health = snap.provider_health.clone();
-        rm.loading = false;
-
-        // Provider health -> model-level statuses (now 1:1)
-        for (category, providers) in &rm.provider_health {
-            for (provider_name, &healthy) in providers {
-                let status = if healthy { ProviderStatus::Ok } else { ProviderStatus::Error };
-                let key = (repo_identity.clone(), category.clone(), provider_name.clone());
-                self.model.provider_statuses.insert(key, status);
-            }
-        }
-
-        // Remove stale provider_statuses entries for providers no longer in health map
-        self.model
-            .provider_statuses
-            .retain(|k, _| k.0 != repo_identity || rm.provider_health.get(&k.1).is_some_and(|ps| ps.contains_key(&k.2)));
-
-        // Change detection badge for inactive tabs
-        if self.model.active_repo.as_ref() != Some(&repo_identity) && *old_providers != *rm.providers {
-            if let Some(repo_model) = self.model.repos.get_mut(&repo_identity) {
-                repo_model.has_unseen_changes = true;
-            }
-        }
-
-        // Feed data into Shared<RepoData> for RepoPage rendering
-        if let Some(handle) = self.repo_data.get(&repo_identity) {
-            let rm = &self.model.repos[&repo_identity];
-            handle.mutate(|d| {
-                d.path = path.clone();
-                d.providers = rm.providers.clone();
-                d.labels = rm.labels.clone();
-                d.provider_names = rm.provider_names.clone();
-                d.provider_health = rm.provider_health.clone();
-                d.work_items = snap.work_items;
-                d.loading = false;
-            });
-        }
-
-        // Log and display errors (clears status when errors resolve)
-        self.set_status_message(format_error_status(&snap.errors, &path));
-
-        self.maybe_fetch_default_issues(&repo_identity);
+    /// Preserve the snapshot-fed provider health consumed by the overview's
+    /// Providers panel. Work-item data remains deliberately ignored.
+    fn apply_provider_snapshot(&mut self, snapshot: RepoSnapshot) {
+        let repo_identity = snapshot.repo_identity;
+        let Some(repo) = self.model.repos.get_mut(&repo_identity) else { return };
+        repo.provider_health = snapshot.provider_health;
+        repo.loading = false;
+        self.sync_provider_statuses(&repo_identity);
     }
 
-    fn apply_delta(&mut self, delta: RepoDelta) {
-        let repo_identity = delta.repo_identity.clone();
-        let path = delta
-            .repo
-            .clone()
-            .or_else(|| self.model.repos.get(&repo_identity).map(|rm| rm.path.clone()))
-            .unwrap_or_else(|| TuiModel::display_path(&repo_identity, None));
-        let mut status_message_update = None;
-        let rm = match self.model.repos.get_mut(&repo_identity) {
-            Some(rm) => rm,
-            None => return,
-        };
-        rm.path = path.clone();
-
-        // Apply provider data changes
-        let mut providers = (*rm.providers).clone();
-        flotilla_core::delta::apply_changes(&mut providers, delta.changes.clone());
-        rm.providers = Arc::new(providers);
-
-        // Apply provider health and error changes from the delta
-        for change in &delta.changes {
+    /// Apply only provider-health changes from a Plane-A delta. The surviving
+    /// Providers panel still consumes this feed under #1457's escalation rule.
+    fn apply_provider_delta(&mut self, delta: RepoDelta) {
+        let repo_identity = delta.repo_identity;
+        let Some(repo) = self.model.repos.get_mut(&repo_identity) else { return };
+        for change in delta.changes {
             match change {
                 flotilla_protocol::Change::ProviderHealth {
                     category,
                     provider,
-                    op: flotilla_protocol::EntryOp::Added(v) | flotilla_protocol::EntryOp::Updated(v),
+                    op: flotilla_protocol::EntryOp::Added(healthy) | flotilla_protocol::EntryOp::Updated(healthy),
                 } => {
-                    rm.provider_health.entry(category.clone()).or_default().insert(provider.clone(), *v);
+                    repo.provider_health.entry(category).or_default().insert(provider, healthy);
                 }
                 flotilla_protocol::Change::ProviderHealth { category, provider, op: flotilla_protocol::EntryOp::Removed } => {
-                    if let Some(providers) = rm.provider_health.get_mut(category) {
-                        providers.remove(provider);
+                    if let Some(providers) = repo.provider_health.get_mut(&category) {
+                        providers.remove(&provider);
                         if providers.is_empty() {
-                            rm.provider_health.remove(category);
+                            repo.provider_health.remove(&category);
                         }
                     }
-                }
-                flotilla_protocol::Change::ErrorsChanged(errors) => {
-                    status_message_update = Some(format_error_status(errors, &path));
                 }
                 _ => {}
             }
         }
+        self.sync_provider_statuses(&repo_identity);
+    }
 
-        // Provider health -> model-level statuses (now 1:1)
-        for (category, providers) in &rm.provider_health {
+    fn sync_provider_statuses(&mut self, repo_identity: &RepoIdentity) {
+        let Some(provider_health) = self.model.repos.get(repo_identity).map(|repo| repo.provider_health.clone()) else { return };
+        for (category, providers) in &provider_health {
             for (provider_name, &healthy) in providers {
                 let status = if healthy { ProviderStatus::Ok } else { ProviderStatus::Error };
-                let key = (repo_identity.clone(), category.clone(), provider_name.clone());
-                self.model.provider_statuses.insert(key, status);
+                self.model.provider_statuses.insert((repo_identity.clone(), category.clone(), provider_name.clone()), status);
             }
         }
-
-        // Remove stale provider_statuses entries for providers no longer in health map
-        self.model
-            .provider_statuses
-            .retain(|k, _| k.0 != repo_identity || rm.provider_health.get(&k.1).is_some_and(|ps| ps.contains_key(&k.2)));
-
-        // Change detection badge — any non-empty delta on inactive tab
-        let has_data_changes = delta
-            .changes
-            .iter()
-            .any(|c| !matches!(c, flotilla_protocol::Change::ProviderHealth { .. } | flotilla_protocol::Change::ErrorsChanged(_)));
-        if has_data_changes && self.model.active_repo.as_ref() != Some(&repo_identity) {
-            if let Some(repo_model) = self.model.repos.get_mut(&repo_identity) {
-                repo_model.has_unseen_changes = true;
-            }
-        }
-
-        // Feed data into Shared<RepoData> for RepoPage rendering
-        if let Some(handle) = self.repo_data.get(&repo_identity) {
-            let rm = &self.model.repos[&repo_identity];
-            handle.mutate(|d| {
-                d.path = path.clone();
-                d.providers = rm.providers.clone();
-                d.labels = rm.labels.clone();
-                d.provider_names = rm.provider_names.clone();
-                d.provider_health = rm.provider_health.clone();
-                d.work_items = delta.work_items;
-                d.loading = false;
-            });
-        }
-
-        if let Some(status_message) = status_message_update {
-            self.set_status_message(status_message);
-        }
+        self.model.provider_statuses.retain(|key, _| {
+            &key.0 != repo_identity || provider_health.get(&key.1).is_some_and(|providers| providers.contains_key(&key.2))
+        });
     }
 
     fn handle_repo_added(&mut self, info: RepoInfo) {
@@ -2023,22 +1459,6 @@ impl App {
             return;
         }
         let path = TuiModel::display_path(&identity, info.path.clone());
-
-        // Create Shared<RepoData> and RepoPage for the new repo
-        let shared = Shared::new(RepoData {
-            path: path.clone(),
-            providers: Arc::new(ProviderData::default()),
-            labels: info.labels.clone(),
-            provider_names: info.provider_names.clone(),
-            provider_health: info.provider_health.clone(),
-            work_items: Vec::new(),
-            issue_rows: Vec::new(),
-            issue_section_label: String::new(),
-            loading: info.loading,
-        });
-        let page = RepoPage::new(identity.clone(), shared.clone(), self.ui.view_layout);
-        self.repo_data.insert(identity.clone(), shared);
-        self.screen.repo_pages.insert(identity.clone(), page);
 
         self.model.repos.insert(identity.clone(), TuiRepoModel {
             identity: info.identity,
@@ -2059,12 +1479,7 @@ impl App {
         // grows tabs (ADR 0013).
         if let Some(pos) = self.pending_repo_opens.iter().position(|pending| pending == &path) {
             self.pending_repo_opens.remove(pos);
-            if !self.views.is_scoped() {
-                self.open_view(match info.repository_key {
-                    Some(key) => ViewAddress::repo_with_key(identity, key),
-                    None => ViewAddress::repo(identity),
-                });
-            }
+            self.set_status_message(Some(format!("Tracked {}", path.display())));
         }
     }
 
@@ -2074,37 +1489,9 @@ impl App {
     fn handle_repo_removed(&mut self, repo_identity: &RepoIdentity) {
         self.model.repos.remove(repo_identity);
         self.model.repo_order.retain(|repo| repo != repo_identity);
-        self.repo_data.remove(repo_identity);
-        self.issue_views.remove(repo_identity);
-        self.screen.repo_pages.remove(repo_identity);
-        // A modal opened against this repo (action menu, delete/close
-        // confirm) must not outlive it: those widgets read the active repo's
-        // labels unconditionally during render, which panics once the repo
-        // is gone. RepoUntracked can arrive from another session at any
-        // moment, so dismiss modals when the active tab loses its repo.
         if self.model.active_repo.as_ref() == Some(repo_identity) {
             self.dismiss_modals();
         }
-    }
-
-    pub fn selected_work_item(&self) -> Option<&WorkItem> {
-        let identity = self.model.active_repo.as_ref()?;
-        self.screen.repo_pages.get(identity).and_then(|page| page.table.selected_work_item())
-    }
-
-    /// Get the selected row (WorkItem or IssueRow) as an owned enum.
-    pub(super) fn selected_row_cloned(&self) -> Option<OwnedSelectedRow> {
-        let identity = self.model.active_repo.as_ref()?;
-        let page = self.screen.repo_pages.get(identity)?;
-        match page.table.selected_row()? {
-            SelectedRow::WorkItem(item) => Some(OwnedSelectedRow::WorkItem(Box::new(item.clone()))),
-            SelectedRow::Issue(row) => Some(OwnedSelectedRow::IssueRow(Box::new(row.clone()))),
-        }
-    }
-
-    /// Build a repo command for an issue-row action (where no WorkItem context exists).
-    pub(super) fn provider_repo_command_for_issue(&self, action: CommandAction) -> Command {
-        self.repo_command(action)
     }
 
     /// Returns convoys for a namespace in daemon-provided order.
@@ -2147,4 +1534,39 @@ fn view_regard_target(address: &ViewAddress) -> Option<ResourceRef> {
 }
 
 #[cfg(test)]
-mod tests;
+mod provider_status_tests {
+    use super::*;
+    use crate::app::test_support::stub_app;
+
+    #[test]
+    fn snapshot_and_delta_keep_overview_provider_statuses_current() {
+        let mut app = stub_app();
+        let repo_identity = app.model.repo_order[0].clone();
+        let category = "issue_tracker".to_string();
+        let provider = "github".to_string();
+        let status_key = (repo_identity.clone(), category.clone(), provider.clone());
+        let provider_health = HashMap::from([(category.clone(), HashMap::from([(provider.clone(), true)]))]);
+
+        app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(RepoSnapshot {
+            seq: 1,
+            repo_identity: repo_identity.clone(),
+            repo: None,
+            node_id: NodeId::new("test"),
+            work_items: vec![],
+            providers: ProviderData::default(),
+            provider_health,
+            errors: vec![],
+        })));
+        assert_eq!(app.model.provider_statuses.get(&status_key), Some(&ProviderStatus::Ok));
+
+        app.handle_daemon_event(DaemonEvent::RepoDelta(Box::new(RepoDelta {
+            seq: 2,
+            prev_seq: 1,
+            repo_identity,
+            repo: None,
+            changes: vec![flotilla_protocol::Change::ProviderHealth { category, provider, op: flotilla_protocol::EntryOp::Updated(false) }],
+            work_items: vec![],
+        })));
+        assert_eq!(app.model.provider_statuses.get(&status_key), Some(&ProviderStatus::Error));
+    }
+}
