@@ -8,8 +8,7 @@ use std::path::PathBuf;
 
 use crate::{
     provider_data::{
-        ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CorrelationKey, Issue, IssueRef, IssueSource, IssueState,
-        SessionStatus,
+        ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, Issue, IssueRef, IssueSource, IssueState, SessionStatus,
     },
     qualified_path::QualifiedPath,
     HostName, HostPath,
@@ -32,17 +31,14 @@ pub fn qp(path: &str) -> QualifiedPath {
 pub struct TestCheckout {
     branch: String,
     is_main: bool,
-    correlation_keys: Vec<CorrelationKey>,
 }
 
 impl TestCheckout {
     pub fn new(branch: &str) -> Self {
-        Self { branch: branch.to_string(), is_main: false, correlation_keys: Vec::new() }
+        Self { branch: branch.to_string(), is_main: false }
     }
 
-    /// Set the checkout path. Adds a `CorrelationKey::CheckoutPath`.
-    pub fn at(mut self, path: &str) -> Self {
-        self.correlation_keys.push(CorrelationKey::CheckoutPath(qp(path)));
+    pub fn at(self, _path: &str) -> Self {
         self
     }
 
@@ -51,9 +47,7 @@ impl TestCheckout {
         self
     }
 
-    /// Add a `CorrelationKey::Branch` for this checkout's branch name.
-    pub fn with_branch_key(mut self) -> Self {
-        self.correlation_keys.push(CorrelationKey::Branch(self.branch.clone()));
+    pub fn with_branch_key(self) -> Self {
         self
     }
 
@@ -65,8 +59,6 @@ impl TestCheckout {
             remote_ahead_behind: None,
             working_tree: None,
             last_commit: None,
-            correlation_keys: self.correlation_keys,
-            association_keys: vec![],
             host_name: None,
             environment_id: None,
         }
@@ -80,17 +72,14 @@ impl TestCheckout {
 pub struct TestChangeRequest {
     title: String,
     branch: String,
-    correlation_keys: Vec<CorrelationKey>,
 }
 
 impl TestChangeRequest {
     pub fn new(title: &str, branch: &str) -> Self {
-        Self { title: title.to_string(), branch: branch.to_string(), correlation_keys: Vec::new() }
+        Self { title: title.to_string(), branch: branch.to_string() }
     }
 
-    /// Add a `CorrelationKey::Branch` for this CR's branch name.
-    pub fn with_branch_key(mut self) -> Self {
-        self.correlation_keys.push(CorrelationKey::Branch(self.branch.clone()));
+    pub fn with_branch_key(self) -> Self {
         self
     }
 
@@ -100,8 +89,6 @@ impl TestChangeRequest {
             branch: self.branch,
             status: ChangeRequestStatus::Open,
             body: None,
-            correlation_keys: self.correlation_keys,
-            association_keys: vec![],
             provider_name: String::new(),
             provider_display_name: String::new(),
         }
@@ -115,12 +102,12 @@ impl TestChangeRequest {
 pub struct TestSession {
     title: String,
     status: SessionStatus,
-    correlation_keys: Vec<CorrelationKey>,
+    provider_name: String,
 }
 
 impl TestSession {
     pub fn new(title: &str) -> Self {
-        Self { title: title.to_string(), status: SessionStatus::Running, correlation_keys: Vec::new() }
+        Self { title: title.to_string(), status: SessionStatus::Running, provider_name: String::new() }
     }
 
     pub fn with_status(mut self, status: SessionStatus) -> Self {
@@ -128,15 +115,12 @@ impl TestSession {
         self
     }
 
-    /// Add a `CorrelationKey::SessionRef`.
-    pub fn with_session_ref(mut self, provider: &str, id: &str) -> Self {
-        self.correlation_keys.push(CorrelationKey::SessionRef(provider.to_string(), id.to_string()));
+    pub fn with_session_ref(mut self, provider: &str, _id: &str) -> Self {
+        self.provider_name = provider.to_string();
         self
     }
 
-    /// Add a `CorrelationKey::Branch`.
-    pub fn with_branch_key(mut self, branch: &str) -> Self {
-        self.correlation_keys.push(CorrelationKey::Branch(branch.to_string()));
+    pub fn with_branch_key(self, _branch: &str) -> Self {
         self
     }
 
@@ -146,8 +130,7 @@ impl TestSession {
             status: self.status,
             model: None,
             updated_at: None,
-            correlation_keys: self.correlation_keys,
-            provider_name: String::new(),
+            provider_name: self.provider_name,
             provider_display_name: String::new(),
             item_noun: String::new(),
         }
@@ -188,7 +171,6 @@ impl TestIssue {
             labels: self.labels,
             as_of: "2026-07-15T09:30:00Z".parse().expect("valid test issue timestamp"),
             observed_at: None,
-            association_keys: vec![],
             provider_name: String::new(),
             provider_display_name: String::new(),
         }

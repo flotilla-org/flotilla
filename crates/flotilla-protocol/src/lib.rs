@@ -121,18 +121,17 @@ pub use commands::{
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
-    Agent, AgentContext, AgentEventType, AgentHarness, AgentHookEvent, AgentHookTerminalRef, AgentStatus, AheadBehind, AssociationKey,
-    AttachableId, AttachableSet, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo,
-    CorrelationKey, Issue, IssueChangeset, IssueRef, IssueSource, IssueState, ManagedTerminal, ProviderData, RemoteAccessPoint,
-    RemoteAccessType, SessionStatus, TerminalStatus, WorkingTreeStatus, Workspace,
+    Agent, AgentContext, AgentEventType, AgentHarness, AgentHookEvent, AgentHookTerminalRef, AgentStatus, AheadBehind, AttachableId,
+    AttachableSet, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, Issue, IssueChangeset,
+    IssueRef, IssueSource, IssueState, ManagedTerminal, ProviderData, RemoteAccessPoint, RemoteAccessType, SessionStatus, TerminalStatus,
+    WorkingTreeStatus, Workspace,
 };
 pub use query::{
     CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DiscoveryEntry, DispatchQueueResponse, DispatchQueueRow,
     FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement,
     FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse,
-    PeerReconnectStatus, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderHealthMap, ProviderInfo, RepoDetailResponse,
-    RepoProvidersResponse, RepoSummary, RepoWorkResponse, SleepInhibitionHealth, StatusResponse, TopologyResponse, TopologyRoute,
-    UnmetRequirementInfo,
+    PeerReconnectStatus, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderHealthMap, ProviderInfo,
+    RepoProvidersResponse, RepoSummary, SleepInhibitionHealth, StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
 };
 pub use repository::{RepositoryRelation, RepositoryUpstream};
 pub use resource_ref::ResourceRef;
@@ -178,14 +177,12 @@ impl SurfaceDeclaration {
     }
 }
 
-pub use snapshot::{
-    CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoKey, RepoLabels, RepoSnapshot, WorkItem, WorkItemIdentity, WorkItemKind,
-};
+pub use snapshot::{CategoryLabels, ProviderError, RepoInfo, RepoKey, RepoLabels, RepoSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 
 const BUILD_ID_SEPARATOR: &str = "\u{1f}flotilla-build:";
 
@@ -243,9 +240,6 @@ pub struct QueryCursor {
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum Request {
     ListRepos,
-    GetState {
-        repo: std::path::PathBuf,
-    },
     Execute {
         command: Command,
     },
@@ -310,7 +304,6 @@ pub enum Request {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
     ListRepos(Vec<RepoInfo>),
-    GetState(Box<RepoSnapshot>),
     Execute {
         command_id: u64,
     },
@@ -389,11 +382,10 @@ impl Message {
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "kind")]
 pub enum DaemonEvent {
-    /// Full snapshot — sent on initial connect, after seq gaps, or when delta
-    /// would be larger than the full snapshot.
+    /// Provider snapshot retained for convoy change-request refresh.
     #[serde(rename = "repo_snapshot")]
     RepoSnapshot(Box<RepoSnapshot>),
-    /// Incremental delta — sent when only a subset of data changed.
+    /// Provider delta retained for convoy change-request refresh.
     #[serde(rename = "repo_delta")]
     RepoDelta(Box<RepoDelta>),
     /// A local provider refresh cycle completed for a repo. This is distinct
@@ -475,7 +467,7 @@ pub enum PeerConnectionState {
     Rejected { reason: String },
 }
 
-/// A delta update for a repo snapshot.
+/// A delta update for the provider snapshot consumed by convoy refresh.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoDelta {
     pub seq: u64,
@@ -484,8 +476,6 @@ pub struct RepoDelta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<std::path::PathBuf>,
     pub changes: Vec<Change>,
-    /// Pre-correlated work items from the daemon (avoids re-correlation on TUI side).
-    pub work_items: Vec<snapshot::WorkItem>,
 }
 
 #[cfg(test)]

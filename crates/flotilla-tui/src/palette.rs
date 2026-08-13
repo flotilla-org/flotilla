@@ -790,7 +790,6 @@ mod tests {
                     phase: WorkPhase::Pending,
                     crew: vec![],
                     host: None,
-                    checkout: None,
                     workspace_ref: None,
                     materialize_ref: None,
                     completion_target: None,
@@ -830,8 +829,6 @@ mod tests {
             branch: "fix-bug".into(),
             status: ChangeRequestStatus::Open,
             body: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
             provider_name: String::new(),
             provider_display_name: String::new(),
         });
@@ -840,8 +837,6 @@ mod tests {
             branch: "add-feature".into(),
             status: ChangeRequestStatus::Draft,
             body: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
             provider_name: String::new(),
             provider_display_name: String::new(),
         });

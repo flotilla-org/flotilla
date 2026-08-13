@@ -3876,8 +3876,6 @@ mod tests {
                     branch: "feat/convoy".into(),
                     status: flotilla_protocol::ChangeRequestStatus::Open,
                     body: None,
-                    correlation_keys: Vec::new(),
-                    association_keys: Vec::new(),
                     provider_name: "github".into(),
                     provider_display_name: "GitHub".into(),
                 });
@@ -3890,7 +3888,6 @@ mod tests {
                         },
                         repo: Some(std::path::PathBuf::from("/virtual/kiwi/flotilla")),
                         node_id: flotilla_protocol::NodeId::new("kiwi"),
-                        work_items: Vec::new(),
                         providers,
                         provider_health: HashMap::new(),
                         errors: Vec::new(),
@@ -3922,7 +3919,6 @@ mod tests {
             repo_identity: repo_identity.clone(),
             repo: Some(std::path::PathBuf::from("/repo")),
             node_id: flotilla_protocol::NodeId::new("kiwi"),
-            work_items: Vec::new(),
             providers: flotilla_protocol::ProviderData::default(),
             provider_health: HashMap::new(),
             errors: Vec::new(),
@@ -3935,8 +3931,6 @@ mod tests {
             branch: "feat/convoy".into(),
             status: flotilla_protocol::ChangeRequestStatus::Open,
             body: None,
-            correlation_keys: Vec::new(),
-            association_keys: Vec::new(),
             provider_name: "github".into(),
             provider_display_name: "GitHub".into(),
         });

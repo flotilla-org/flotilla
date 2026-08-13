@@ -485,8 +485,8 @@ mod tests {
 
     #[test]
     fn disabled_host_provider_is_not_rendered_as_healthy() {
-        let provider = flotilla_protocol::HostProviderStatus::disabled("issue_tracker", "Issue Provider", "follower mode");
-        assert_eq!(format_host_provider_status(&provider), "Issue Provider (disabled: follower mode)");
+        let provider = flotilla_protocol::HostProviderStatus::disabled("issue_tracker", "Issue Provider", "credentials unavailable");
+        assert_eq!(format_host_provider_status(&provider), "Issue Provider (disabled: credentials unavailable)");
     }
 
     // ── select_next ───────────────────────────────────────────────────

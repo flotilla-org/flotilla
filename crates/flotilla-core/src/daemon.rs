@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    arg::Arg, commands::CommandValue, AttachExcursionId, Command, DaemonEvent, QueryCursor, RepoInfo, RepoSelector, RepoSnapshot,
-    StatusResponse, StreamKey, TopologyResponse,
+    arg::Arg, commands::CommandValue, AttachExcursionId, Command, DaemonEvent, QueryCursor, RepoInfo, StatusResponse, StreamKey,
+    TopologyResponse,
 };
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -49,13 +49,6 @@ pub trait DaemonHandle: Send + Sync {
         QuerySubscription::noop()
     }
 
-    /// Get full current state for a repo.
-    ///
-    /// Note: the `SocketDaemon` implementation currently requires a
-    /// `RepoSelector::Path` because the wire format sends a raw path.
-    /// `Query` and `Identity` selectors work with `InProcessDaemon`.
-    async fn get_state(&self, repo: &RepoSelector) -> Result<RepoSnapshot, String>;
-
     /// List all tracked repos.
     async fn list_repos(&self) -> Result<Vec<RepoInfo>, String>;
 
@@ -67,13 +60,7 @@ pub trait DaemonHandle: Send + Sync {
     /// `CommandValue::Cancelled` once cancellation takes effect.
     async fn cancel(&self, command_id: u64) -> Result<(), String>;
 
-    /// Get replay events for repos based on last-seen sequence numbers.
-    ///
-    /// For each repo in `last_seen`, checks the delta log:
-    /// - If replayable: returns `RepoDelta` events for each missing entry
-    /// - If not replayable (seq too old or unknown): returns `RepoSnapshot`
-    ///
-    /// Repos not in `last_seen` get a `RepoSnapshot`.
+    /// Get replay events for host streams based on last-seen sequence numbers.
     async fn replay_since(&self, last_seen: &HashMap<StreamKey, u64>) -> Result<Vec<DaemonEvent>, String>;
 
     /// Subscribe to named query result sets, replacing any previous

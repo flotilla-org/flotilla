@@ -11,7 +11,7 @@ use flotilla_manifest::{
 };
 use flotilla_protocol::{
     result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessState, SessionPhase},
-    Command, CommandValue, HostName, RepoInfo, RepoSelector, RepoSnapshot, ResourceRef, StatusResponse, StreamKey, TopologyResponse,
+    Command, CommandValue, HostName, RepoInfo, ResourceRef, StatusResponse, StreamKey, TopologyResponse,
 };
 use tokio::sync::broadcast;
 
@@ -192,10 +192,6 @@ impl MockDaemon {
 impl DaemonHandle for MockDaemon {
     fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
         self.tx.subscribe()
-    }
-
-    async fn get_state(&self, _repo: &RepoSelector) -> Result<RepoSnapshot, String> {
-        Err("mock".into())
     }
 
     async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {

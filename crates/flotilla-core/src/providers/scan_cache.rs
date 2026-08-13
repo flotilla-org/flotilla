@@ -67,11 +67,6 @@ impl<T: Clone> SharedScan<T> {
         state.result = None;
     }
 
-    #[cfg(test)]
-    pub(crate) fn seed(&self, value: T) {
-        self.state.lock().expect("shared scan state lock poisoned").result = Some(CachedScan { scanned_at: Instant::now(), result: value });
-    }
-
     fn fresh_result(&self) -> Option<T> {
         self.state
             .lock()
@@ -290,7 +285,7 @@ mod tests {
         }
 
         async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
-            let workspace = Workspace { name: config.name.clone(), correlation_keys: vec![], attachable_set_id: None };
+            let workspace = Workspace { name: config.name.clone(), attachable_set_id: None };
             let entry = (format!("workspace:{}", config.name), workspace);
             self.workspaces.lock().await.push(entry.clone());
             Ok(entry)

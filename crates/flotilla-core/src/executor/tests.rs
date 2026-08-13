@@ -73,8 +73,6 @@ impl MockCheckoutManager {
                 remote_ahead_behind: None,
                 working_tree: None,
                 last_commit: None,
-                correlation_keys: vec![],
-                association_keys: vec![],
                 host_name: None,
                 environment_id: None,
             })))),
@@ -170,9 +168,7 @@ impl PresentationManager for MockWorkspaceManager {
         self.calls.lock().await.push(format!("create_workspace:{}", config.name));
         let result = self.create_result.lock().await;
         match &*result {
-            Ok(()) => {
-                Ok(("mock-ref".to_string(), Workspace { name: config.name.clone(), correlation_keys: vec![], attachable_set_id: None }))
-            }
+            Ok(()) => Ok(("mock-ref".to_string(), Workspace { name: config.name.clone(), attachable_set_id: None })),
             Err(e) => Err(e.clone()),
         }
     }
@@ -896,7 +892,7 @@ async fn create_workspace_from_prepared_terminal_persists_remote_attachable_set_
 #[tokio::test]
 async fn create_workspace_for_checkout_selects_existing_workspace() {
     let checkout_path = PathBuf::from("/repo/wt-feat");
-    let existing_workspace = Workspace { name: "feat".to_string(), correlation_keys: vec![], attachable_set_id: None };
+    let existing_workspace = Workspace { name: "feat".to_string(), attachable_set_id: None };
     let ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:42".to_string(), existing_workspace)]));
 
     let mut registry = empty_registry();
@@ -947,7 +943,6 @@ async fn checkout_action_creates_workspace_after_checkout() {
     // always created (binding-based lookup returns None).
     let ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:99".to_string(), Workspace {
         name: "feat-x".to_string(),
-        correlation_keys: vec![],
         attachable_set_id: None,
     })]));
 
@@ -1020,7 +1015,7 @@ async fn teleport_session_creates_workspace_even_when_one_exists() {
     // is session-specific. Reusing an existing workspace would attach to
     // whatever session was there before, not the requested one.
     let checkout_path = PathBuf::from("/repo/wt-feat");
-    let existing_workspace = Workspace { name: "feat".to_string(), correlation_keys: vec![], attachable_set_id: None };
+    let existing_workspace = Workspace { name: "feat".to_string(), attachable_set_id: None };
     let ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:77".to_string(), existing_workspace)]));
 
     let mut registry = empty_registry();

@@ -5,10 +5,7 @@ use tracing::info;
 
 use crate::{
     path_context::ExecutionEnvironmentPath,
-    providers::{
-        types::{Checkout, CorrelationKey},
-        ChannelLabel, CommandRunner,
-    },
+    providers::{types::Checkout, ChannelLabel, CommandRunner},
 };
 
 /// A `CheckoutManager` for sandbox/container environments that uses
@@ -105,9 +102,6 @@ impl super::CheckoutManager for CloneCheckoutManager {
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|_| entry.to_string());
 
-            let host_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), std::path::Path::new(&dir));
-            let correlation_keys = vec![CorrelationKey::Branch(branch.clone()), CorrelationKey::CheckoutPath(host_path.into())];
-
             let checkout = Checkout {
                 branch,
                 is_main: false,
@@ -115,8 +109,6 @@ impl super::CheckoutManager for CloneCheckoutManager {
                 remote_ahead_behind: None,
                 working_tree: None,
                 last_commit: None,
-                correlation_keys,
-                association_keys: Vec::new(),
                 host_name: None,
                 environment_id: None,
             };
@@ -176,9 +168,6 @@ impl super::CheckoutManager for CloneCheckoutManager {
                 .await?;
         }
 
-        let host_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), std::path::Path::new(&checkout_dir));
-        let correlation_keys = vec![CorrelationKey::Branch(branch.to_string()), CorrelationKey::CheckoutPath(host_path.into())];
-
         let checkout = Checkout {
             branch: branch.to_string(),
             is_main: false,
@@ -186,8 +175,6 @@ impl super::CheckoutManager for CloneCheckoutManager {
             remote_ahead_behind: None,
             working_tree: None,
             last_commit: None,
-            correlation_keys,
-            association_keys: Vec::new(),
             host_name: None,
             environment_id: None,
         };

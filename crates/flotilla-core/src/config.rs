@@ -353,8 +353,6 @@ impl HostsConfig {
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct DaemonConfig {
     #[serde(default)]
-    pub follower: bool,
-    #[serde(default)]
     pub machine_id: Option<String>,
     pub host_name: Option<String>,
     #[serde(default)]

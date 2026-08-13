@@ -52,7 +52,7 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
     let repo_roots = config.load_and_migrate_repos();
     info!(repo_count = repo_roots.len(), "starting daemon");
 
-    let discovery = DiscoveryRuntime::for_process(daemon_config.follower);
+    let discovery = DiscoveryRuntime::for_process();
     let repo_root_paths = repo_roots.into_iter().map(|p| p.into_path_buf()).collect();
     let server = DaemonServer::new_with_socket_discovery_path(
         repo_root_paths,

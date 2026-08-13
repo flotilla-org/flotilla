@@ -34,8 +34,6 @@ pub enum RepoVerb {
     PrepareTerminal { path: PathBuf },
     /// Show providers for a repository
     Providers,
-    /// Show work items for a repository
-    Work,
 }
 
 impl RepoNoun {
@@ -88,19 +86,7 @@ impl RepoNoun {
                 action: CommandAction::QueryRepoProviders { repo: RepoSelector::Query(subject) },
             })),
             (None, Some(RepoVerb::Providers)) => Err("providers requires a repository subject".into()),
-            (Some(subject), Some(RepoVerb::Work)) => Ok(Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryRepoWork { repo: RepoSelector::Query(subject) },
-            })),
-            (None, Some(RepoVerb::Work)) => Err("work requires a repository subject".into()),
-            (Some(subject), None) => Ok(Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryRepoDetail { repo: RepoSelector::Query(subject) },
-            })),
+            (Some(_), None) => Err("missing repo verb".into()),
             (None, None) => Err("missing repo arguments".into()),
         }
     }
@@ -124,7 +110,6 @@ impl fmt::Display for RepoNoun {
                 }
                 RepoVerb::PrepareTerminal { path } => write!(f, " prepare-terminal {}", path.display())?,
                 RepoVerb::Providers => write!(f, " providers")?,
-                RepoVerb::Work => write!(f, " work")?,
             }
         }
         Ok(())
@@ -218,20 +203,6 @@ mod tests {
     }
 
     #[test]
-    fn repo_query_detail() {
-        let resolved = parse(&["repo", "myslug"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryRepoDetail { repo: RepoSelector::Query("myslug".into()) },
-            })
-        );
-    }
-
-    #[test]
     fn repo_query_providers() {
         let resolved = parse(&["repo", "myslug", "providers"]).resolve().unwrap();
         assert_eq!(
@@ -269,20 +240,6 @@ mod tests {
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::QueryRepoProviders { repo: RepoSelector::Query("@refresh".into()) },
-            })
-        );
-    }
-
-    #[test]
-    fn repo_query_work() {
-        let resolved = parse(&["repo", "myslug", "work"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryRepoWork { repo: RepoSelector::Query("myslug".into()) },
             })
         );
     }
@@ -383,11 +340,6 @@ mod tests {
     fn marked_and_explicit_subjects_round_trip() {
         assert_round_trip::<RepoNoun>(&["repo", "@refresh", "providers"]);
         assert_round_trip::<RepoNoun>(&["repo", "--subject", "@refresh", "providers"]);
-    }
-
-    #[test]
-    fn round_trip_work() {
-        assert_round_trip::<RepoNoun>(&["repo", "myslug", "work"]);
     }
 
     #[test]

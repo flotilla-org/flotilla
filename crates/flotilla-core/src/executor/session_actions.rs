@@ -8,10 +8,7 @@ use crate::{
     attachable::SharedAttachableStore,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     provider_data::ProviderData,
-    providers::{
-        registry::ProviderRegistry,
-        types::{CloudAgentSession, CorrelationKey},
-    },
+    providers::{registry::ProviderRegistry, types::CloudAgentSession},
     terminal_manager::TerminalManager,
 };
 
@@ -275,11 +272,8 @@ impl<'a> TeleportFlow<'a> {
     }
 }
 
-fn session_provider_key<'a>(session: &'a CloudAgentSession, session_id: &str) -> Option<&'a str> {
-    session.correlation_keys.iter().find_map(|key| match key {
-        CorrelationKey::SessionRef(provider, id) if id == session_id => Some(provider.as_str()),
-        _ => None,
-    })
+fn session_provider_key<'a>(session: &'a CloudAgentSession, _session_id: &str) -> Option<&'a str> {
+    (!session.provider_name.is_empty()).then_some(session.provider_name.as_str())
 }
 
 pub(super) async fn resolve_attach_command(

@@ -3,10 +3,7 @@ use std::{collections::HashMap, path::PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    snapshot::{ProviderError, WorkItem},
-    EnvironmentInfo, HostName, HostSummary, IssueSource, NodeInfo, PeerConnectionState, RepositoryKey, RepositoryUpstream, ViewAddress,
-};
+use crate::{EnvironmentInfo, HostName, HostSummary, IssueSource, NodeInfo, PeerConnectionState, RepositoryKey, ViewAddress};
 
 /// Provider health across categories. Outer key: category (e.g. "vcs",
 /// "change_request"). Inner key: provider name. Value: healthy.
@@ -103,23 +100,8 @@ pub struct RepoSummary {
     pub path: PathBuf,
     pub slug: Option<String>,
     pub provider_health: ProviderHealthMap,
-    pub work_item_count: usize,
-    pub error_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmet_requirements: Vec<UnmetRequirementInfo>,
-}
-
-// --- repo detail ---
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepoDetailResponse {
-    pub path: PathBuf,
-    pub slug: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream: Option<RepositoryUpstream>,
-    pub provider_health: ProviderHealthMap,
-    pub work_items: Vec<WorkItem>,
-    pub errors: Vec<ProviderError>,
 }
 
 // --- repo providers ---
@@ -155,15 +137,6 @@ pub struct UnmetRequirementInfo {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
-}
-
-// --- repo work ---
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepoWorkResponse {
-    pub path: PathBuf,
-    pub slug: Option<String>,
-    pub work_items: Vec<WorkItem>,
 }
 
 // --- project list ---

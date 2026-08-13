@@ -73,7 +73,7 @@ pub(crate) mod tests {
     };
 
     use chrono::Utc;
-    use flotilla_protocol::{AssociationKey, IssueState};
+    use flotilla_protocol::IssueState;
 
     use super::*;
 
@@ -120,7 +120,6 @@ pub(crate) mod tests {
                 .state(IssueState::Open)
                 .labels(vec![])
                 .as_of(Utc::now())
-                .association_keys(Vec::<AssociationKey>::new())
                 .provider_name("test".into())
                 .provider_display_name("Test".into())
                 .build())

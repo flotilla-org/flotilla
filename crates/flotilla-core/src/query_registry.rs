@@ -290,7 +290,6 @@ mod tests {
                 labels: Vec::new(),
                 as_of: Utc::now(),
                 observed_at: None,
-                association_keys: Vec::new(),
                 provider_name: "github".into(),
                 provider_display_name: "GitHub".into(),
             },

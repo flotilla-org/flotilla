@@ -370,9 +370,7 @@ pub async fn build_plan(
         | CommandAction::TrackRepoPath { .. }
         | CommandAction::UntrackRepo { .. }
         | CommandAction::Refresh { .. }
-        | CommandAction::QueryRepoDetail { .. }
         | CommandAction::QueryRepoProviders { .. }
-        | CommandAction::QueryRepoWork { .. }
         | CommandAction::QueryHostList {}
         | CommandAction::QueryProjectList {}
         | CommandAction::QueryDispatchQueue { .. }

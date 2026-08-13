@@ -221,21 +221,6 @@ mod tests {
     }
 
     #[test]
-    fn marked_host_and_nested_repo_subjects_compose() {
-        let resolved = parse_and_resolve(&["host", "@checkout", "repo", "@refresh", "work"]);
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryRepoWork { repo: RepoSelector::Query("refresh".into()) },
-            },
-            repo: RepoContext::None,
-            host: HostResolution::Explicit(HostName::new("checkout")),
-        });
-    }
-
-    #[test]
     fn host_providers() {
         assert_eq!(parse_and_resolve(&["host", "alpha", "providers"]), Resolved::HostQuery {
             subject: HostName::new("alpha"),
@@ -352,28 +337,6 @@ mod tests {
             Resolved::NeedsContext { ref command, host: HostResolution::Explicit(ref host), .. } if command.node_id.is_none()
                 && host == &HostName::new("feta")
                 && matches!(command.action, CommandAction::QueryRepoProviders { ref repo } if *repo == RepoSelector::Query("myslug".into()))
-        ));
-    }
-
-    #[test]
-    fn host_routed_repo_detail_becomes_host_targeted() {
-        let resolved = parse_and_resolve(&["host", "feta", "repo", "myslug"]);
-        assert!(matches!(
-            resolved,
-            Resolved::NeedsContext { ref command, host: HostResolution::Explicit(ref host), .. } if command.node_id.is_none()
-                && host == &HostName::new("feta")
-                && matches!(command.action, CommandAction::QueryRepoDetail { ref repo } if *repo == RepoSelector::Query("myslug".into()))
-        ));
-    }
-
-    #[test]
-    fn host_routed_repo_work_becomes_host_targeted() {
-        let resolved = parse_and_resolve(&["host", "feta", "repo", "myslug", "work"]);
-        assert!(matches!(
-            resolved,
-            Resolved::NeedsContext { ref command, host: HostResolution::Explicit(ref host), .. } if command.node_id.is_none()
-                && host == &HostName::new("feta")
-                && matches!(command.action, CommandAction::QueryRepoWork { ref repo } if *repo == RepoSelector::Query("myslug".into()))
         ));
     }
 

@@ -1,7 +1,7 @@
 //! Integration test for peer connect / reconnect local state send flow (#306).
 //!
 //! Verifies the end-to-end path: peer connects → outbound task receives
-//! PeerConnectedNotice → send_local_to_peer sends data → peer receives it.
+//! PeerConnectedNotice → send_local_to_peer sends the local host summary → peer receives it.
 //!
 //! Uses a `NotifyPeerSender` that signals a `tokio::sync::Notify` on each
 //! message, replacing timing-dependent sleeps with deterministic waits.
@@ -57,11 +57,11 @@ async fn wait_for_local_state(sent: &Arc<StdMutex<Vec<PeerWireMessage>>>, notify
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let notified = notify.notified();
-            let complete = {
-                let messages = sent.lock().expect("lock");
-                messages.iter().any(|message| matches!(message, PeerWireMessage::HostSummary(summary) if summary.node.node_id == *node_id))
-                    && messages.iter().any(|message| matches!(message, PeerWireMessage::Data(data) if data.origin_node_id == *node_id))
-            };
+            let complete = sent
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|message| matches!(message, PeerWireMessage::HostSummary(summary) if summary.node.node_id == *node_id));
             if complete {
                 return;
             }
@@ -72,8 +72,8 @@ async fn wait_for_local_state(sent: &Arc<StdMutex<Vec<PeerWireMessage>>>, notify
     .expect("timed out waiting for local peer state");
 }
 
-fn local_data_count(messages: &[PeerWireMessage], node_id: &NodeId) -> usize {
-    messages.iter().filter(|message| matches!(message, PeerWireMessage::Data(data) if data.origin_node_id == *node_id)).count()
+fn local_summary_count(messages: &[PeerWireMessage], node_id: &NodeId) -> usize {
+    messages.iter().filter(|message| matches!(message, PeerWireMessage::HostSummary(summary) if summary.node.node_id == *node_id)).count()
 }
 
 #[tokio::test]
@@ -112,10 +112,6 @@ async fn peer_connect_triggers_local_state_send() {
         messages.iter().any(|m| matches!(m, PeerWireMessage::HostSummary(s) if s.node.node_id == node_a)),
         "peer should receive HostSummary from host-a, got: {messages:?}"
     );
-    assert!(
-        messages.iter().any(|m| matches!(m, PeerWireMessage::Data(d) if d.origin_node_id == node_a)),
-        "peer should receive repo data from host-a, got: {messages:?}"
-    );
 }
 
 #[tokio::test]
@@ -150,7 +146,7 @@ async fn peer_reconnect_resends_local_state() {
     wait_for_local_state(&sent, &notify, &node_a).await;
 
     let first_count = sent.lock().expect("lock").len();
-    let first_data_count = local_data_count(&sent.lock().expect("lock"), &node_a);
+    let first_summary_count = local_summary_count(&sent.lock().expect("lock"), &node_a);
     assert!(first_count > 0, "first connect should have sent messages");
 
     // Disconnect + reconnect
@@ -166,7 +162,7 @@ async fn peer_reconnect_resends_local_state() {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let notified = notify.notified();
-            if local_data_count(&sent.lock().expect("lock"), &node_a) > first_data_count {
+            if local_summary_count(&sent.lock().expect("lock"), &node_a) > first_summary_count {
                 break;
             }
             notified.await;

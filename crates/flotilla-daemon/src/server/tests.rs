@@ -52,10 +52,7 @@ use super::{
     client_connection::QuerySubscriptions,
     handle_client, handle_client_session,
     peer_connection::PEER_IDLE_TIMEOUT,
-    peer_runtime::{
-        disconnect_peer_and_rebuild, forward_with_keepalive_for_test, handle_remote_restart_if_needed, relay_peer_data, send_local_to_peer,
-        should_send_local_version, ForwardResult,
-    },
+    peer_runtime::{forward_with_keepalive_for_test, relay_peer_data, send_local_to_peer, should_send_local_version, ForwardResult},
     publish_socket_path,
     remote_commands::{
         extract_command_repo_identity, ForwardedCommand, ForwardedCommandMap, ForwardedCommandState, PendingRemoteCancelMap,
@@ -64,7 +61,7 @@ use super::{
     replicator::replicate_kind_over_http,
     request_dispatch::RequestDispatcher,
     resource_http::serve_resource_http,
-    shared::{sync_peer_query_state, write_message, SocketPeerSender},
+    shared::{sync_peer_query_state, write_message},
     test_support::{apply_convoy_replica_feed, seed_trusted_remote_convoy_project},
     AcceptErrorBackoff, BoundSocketGuard, DaemonServer, PeerConnectionEvent, ACCEPT_ERROR_INITIAL_BACKOFF, ACCEPT_ERROR_MAX_BACKOFF,
     CONNECTION_PREFACE_TIMEOUT, HELLO_HANDSHAKE_TIMEOUT,
@@ -577,7 +574,7 @@ async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
 }
 
 use crate::peer::{
-    test_support::{ensure_test_connection_generation, handle_test_peer_data, wait_for_command_result, BlockingPeerSender, MockPeerSender},
+    test_support::{ensure_test_connection_generation, wait_for_command_result, BlockingPeerSender, MockPeerSender},
     InboundPeerEnvelope, PeerConnectionStatus, PeerManager, PeerSender, PeerTransport,
 };
 
@@ -588,21 +585,6 @@ fn ok_response(msg: Message, expected_id: u64) -> Response {
             match *response {
                 ResponseResult::Ok { response } => *response,
                 ResponseResult::Err { message } => panic!("expected ok response, got error: {message}"),
-            }
-        }
-        other => panic!("expected response, got {other:?}"),
-    }
-}
-
-fn assert_error_response(msg: Message, expected_id: u64, needle: &str) {
-    match msg {
-        Message::Response { id, response } => {
-            assert_eq!(id, expected_id);
-            match *response {
-                ResponseResult::Err { message } => {
-                    assert!(message.contains(needle), "unexpected error payload: {message}");
-                }
-                other => panic!("expected error response, got {:?}", other),
             }
         }
         other => panic!("expected response, got {other:?}"),
@@ -842,8 +824,6 @@ fn checkout(branch: &str) -> Checkout {
         remote_ahead_behind: None,
         working_tree: None,
         last_commit: None,
-        correlation_keys: vec![],
-        association_keys: vec![],
         host_name: None,
         environment_id: None,
     }
@@ -894,14 +874,6 @@ async fn write_message_writes_json_line() {
         }
         other => panic!("expected response, got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn dispatch_request_handles_error_response_for_untracked_repo() {
-    let (_tmp, daemon) = empty_daemon().await;
-
-    let missing_repo = dispatch_request_test(&daemon, 2, Request::GetState { repo: PathBuf::from("/tmp/missing") }).await;
-    assert_error_response(missing_repo, 2, "repo not tracked");
 }
 
 #[tokio::test]
@@ -1034,24 +1006,6 @@ async fn daemon_server_observed_resource_backend_is_ephemeral_per_restart() {
 }
 
 #[tokio::test]
-async fn dispatch_replay_since_with_empty_last_seen_returns_only_host_snapshots() {
-    let (_tmp, daemon) = empty_daemon().await;
-
-    let replay = dispatch_request_test(&daemon, 30, Request::ReplaySince { last_seen: vec![] }).await;
-    match ok_response(replay, 30) {
-        Response::ReplaySince(events) => {
-            // With no repos, we should only get the local HostSnapshot
-            let repo_events: Vec<_> =
-                events.iter().filter(|e| matches!(e, DaemonEvent::RepoSnapshot(_) | DaemonEvent::RepoDelta(_))).collect();
-            assert!(repo_events.is_empty(), "should have no repo events");
-            let host_events: Vec<_> = events.iter().filter(|e| matches!(e, DaemonEvent::HostSnapshot(_))).collect();
-            assert!(!host_events.is_empty(), "should have at least one HostSnapshot for local host");
-        }
-        other => panic!("expected replay response, got {:?}", other),
-    };
-}
-
-#[tokio::test]
 async fn dispatch_host_query_methods_round_trip() {
     let (_tmp, daemon) = empty_daemon().await;
     let local_environment_id = daemon.local_host_summary().await.environment_id;
@@ -1087,36 +1041,6 @@ async fn dispatch_host_query_methods_round_trip() {
         }
         other => panic!("expected topology response, got {:?}", other),
     }
-}
-
-#[tokio::test]
-async fn dispatch_repo_query_methods_round_trip() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir_all(&repo).expect("create repo dir");
-    let config = test_config_store(tmp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::new("local")).await;
-    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
-
-    let repo_name = repo.file_name().expect("repo file name").to_string_lossy().to_string();
-
-    // GetStatus still has a dedicated Request variant.
-    let status = dispatch_request_test(&daemon, 1, Request::GetStatus).await;
-    match ok_response(status, 1) {
-        Response::GetStatus(parsed) => assert!(parsed.repos.iter().any(|entry| entry.path == repo)),
-        other => panic!("expected status response, got {:?}", other),
-    }
-
-    // Repo queries now go through execute() via CommandAction::Query* variants.
-    // Test the internal methods directly to validate the data path.
-    let detail = daemon.get_repo_detail_internal(&RepoSelector::Query(repo_name.clone())).await.expect("repo detail");
-    assert_eq!(detail.path, repo);
-
-    let providers = daemon.get_repo_providers_internal(&RepoSelector::Query(repo_name.clone())).await.expect("repo providers");
-    assert_eq!(providers.path, repo);
-
-    let work = daemon.get_repo_work_internal(&RepoSelector::Query(repo_name)).await.expect("repo work");
-    assert_eq!(work.path, repo);
 }
 
 #[tokio::test]
@@ -2364,7 +2288,6 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
     assert_eq!(created_workspaces.len(), 1, "expected local workspace creation");
     assert_eq!(created_workspaces[0].0, "workspace:1");
     assert_eq!(created_workspaces[0].1.name, "feat-workspace-local@feta");
-    assert!(created_workspaces[0].1.correlation_keys.is_empty());
 }
 
 #[tokio::test]
@@ -3062,170 +2985,6 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
         assert!(saw_response);
     }
     assert!(forwarded_commands.lock().await.is_empty(), "forwarded command should be retired after completion");
-}
-
-#[tokio::test]
-async fn execute_forwarded_prepare_terminal_returns_terminal_prepared() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let repo = tmp.path().join("remote-root").join("repo");
-    let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
-    let config = test_config_store(tmp.path().join("config"));
-    let daemon =
-        InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery_with_workspace_manager(), HostName::new("local")).await;
-    daemon.refresh(&flotilla_protocol::RepoSelector::Path(repo.clone())).await.expect("refresh repo");
-
-    let mut setup_rx = daemon.subscribe();
-    let checkout_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Identity(repo_identity.clone()),
-                target: CheckoutTarget::FreshBranch("feat-remote".into()),
-                issue_ids: vec![],
-            },
-        })
-        .await
-        .expect("dispatch checkout");
-    let checkout_result = wait_for_command_result(&mut setup_rx, checkout_id, StdDuration::from_secs(5)).await;
-    match checkout_result {
-        CommandValue::CheckoutCreated { branch, path } => {
-            assert_eq!(branch, "feat-remote");
-            assert!(path.path.ends_with("repo.feat-remote"), "unexpected checkout path: {path}");
-        }
-        other => panic!("expected checkout creation, got {other:?}"),
-    };
-    let checkout_path = tokio::time::timeout(StdDuration::from_secs(5), async {
-        loop {
-            let snapshot = daemon.get_state(&flotilla_protocol::RepoSelector::Path(repo.clone())).await.expect("get state");
-            if let Some((path, _checkout)) = snapshot.providers.checkouts.iter().find(|(_, checkout)| checkout.branch == "feat-remote") {
-                return path.path.clone();
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("timeout waiting for checkout path from state");
-
-    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
-    let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
-    let forwarded_commands = Arc::new(Mutex::new(HashMap::new()));
-    let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
-    let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
-    let sent = Arc::new(StdMutex::new(Vec::new()));
-    peer_manager.lock().await.register_sender(NodeId::new("relay"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
-    let remote_command_router = make_remote_command_router(
-        &daemon,
-        &peer_manager,
-        &pending_remote_commands,
-        &forwarded_commands,
-        &pending_remote_cancels,
-        &next_remote_command_id,
-    );
-
-    let ready = Arc::new(Notify::new());
-    forwarded_commands.lock().await.insert(8, ForwardedCommand { state: ForwardedCommandState::Launching { ready: Arc::clone(&ready) } });
-    remote_command_router
-        .execute_forwarded_command_for_test(
-            8,
-            NodeId::new("desktop"),
-            NodeId::new("relay"),
-            Command {
-                node_id: Some(daemon.node_id().clone()),
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Identity(repo_identity.clone())),
-                action: CommandAction::PrepareTerminalForCheckout { checkout_path: checkout_path.clone(), commands: vec![] },
-            },
-            ready,
-        )
-        .await;
-
-    let sent = sent.lock().expect("lock");
-    let mut saw_preparing = false;
-    let mut saw_finished = false;
-    let mut saw_response = false;
-
-    for msg in sent.iter() {
-        match msg {
-            PeerWireMessage::Routed(RoutedPeerMessage::CommandEvent {
-                request_id, requester_node_id, responder_node_id, event, ..
-            }) => {
-                assert_eq!(*request_id, 8);
-                assert_eq!(requester_node_id, &NodeId::new("desktop"));
-                assert_eq!(responder_node_id, daemon.node_id());
-                match event.as_ref() {
-                    CommandPeerEvent::Started { repo_identity: event_identity, repo: event_repo, description } => {
-                        assert_eq!(event_identity, &repo_identity);
-                        assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
-                        assert_eq!(description, "Preparing terminal...");
-                        saw_preparing = true;
-                    }
-                    CommandPeerEvent::Finished { repo_identity: event_identity, repo: event_repo, result } => {
-                        assert_eq!(event_identity, &repo_identity);
-                        assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
-                        match result {
-                            CommandValue::TerminalPrepared {
-                                repo_identity: result_identity,
-                                target_node_id,
-                                branch,
-                                checkout_path: returned_path,
-                                attachable_set_id,
-                                commands,
-                            } => {
-                                assert_eq!(result_identity, &repo_identity);
-                                assert_eq!(target_node_id, daemon.node_id());
-                                assert_eq!(branch, "feat-remote");
-                                assert_eq!(returned_path, &checkout_path);
-                                assert!(attachable_set_id.is_some(), "prepared terminal should include an attachable set id");
-                                assert!(!commands.is_empty(), "prepared terminal should include commands");
-                            }
-                            other => panic!("expected TerminalPrepared finish event, got {other:?}"),
-                        }
-                        saw_finished = true;
-                    }
-                    CommandPeerEvent::StepUpdate { repo_identity: event_identity, .. } => {
-                        assert_eq!(event_identity, &repo_identity);
-                    }
-                }
-            }
-            PeerWireMessage::Routed(RoutedPeerMessage::CommandResponse {
-                request_id,
-                requester_node_id,
-                responder_node_id,
-                result,
-                ..
-            }) => {
-                assert_eq!(*request_id, 8);
-                assert_eq!(requester_node_id, &NodeId::new("desktop"));
-                assert_eq!(responder_node_id, daemon.node_id());
-                match result.as_ref() {
-                    CommandValue::TerminalPrepared {
-                        repo_identity: result_identity,
-                        target_node_id,
-                        branch,
-                        checkout_path: returned_path,
-                        attachable_set_id,
-                        commands,
-                    } => {
-                        assert_eq!(result_identity, &repo_identity);
-                        assert_eq!(target_node_id, daemon.node_id());
-                        assert_eq!(branch, "feat-remote");
-                        assert_eq!(returned_path, &checkout_path);
-                        assert!(attachable_set_id.is_some(), "prepared terminal response should include an attachable set id");
-                        assert!(!commands.is_empty(), "prepared terminal should include commands");
-                    }
-                    other => panic!("expected TerminalPrepared response, got {other:?}"),
-                }
-                saw_response = true;
-            }
-            other => panic!("unexpected proxied message: {other:?}"),
-        }
-    }
-
-    assert!(saw_preparing);
-    assert!(saw_finished);
-    assert!(saw_response);
 }
 
 #[tokio::test]
@@ -4257,133 +4016,6 @@ fn should_send_local_version_dedupes_by_repo_identity() {
 }
 
 #[tokio::test]
-async fn handle_remote_restart_if_needed_clears_stale_remote_only_peer_state() {
-    let (_tmp, daemon) = empty_daemon().await;
-    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
-    let repo_identity = RepoIdentity { authority: "github.com".into(), path: "owner/remote-only".into() };
-    let repo_path = PathBuf::from("/srv/remote-only");
-
-    {
-        let mut pm = peer_manager.lock().await;
-        assert_eq!(
-            handle_test_peer_data(
-                &mut pm,
-                peer_snapshot("peer-a", &repo_identity, &repo_path, "/srv/peer-a/remote-only", "feature-a"),
-                || { Arc::new(SocketPeerSender { tx: tokio::sync::Mutex::new(None) }) as Arc<dyn PeerSender> },
-            )
-            .await,
-            crate::peer::HandleResult::Updated(repo_identity.clone())
-        );
-        assert_eq!(
-            handle_test_peer_data(
-                &mut pm,
-                peer_snapshot("peer-b", &repo_identity, &repo_path, "/srv/peer-b/remote-only", "feature-b"),
-                || { Arc::new(SocketPeerSender { tx: tokio::sync::Mutex::new(None) }) as Arc<dyn PeerSender> },
-            )
-            .await,
-            crate::peer::HandleResult::Updated(repo_identity.clone())
-        );
-        pm.store_host_summary(flotilla_protocol::HostSummary {
-            environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("peer-a-host")),
-            host_name: Some(HostName::new("peer-a")),
-            node: node_info("peer-a"),
-            system: flotilla_protocol::SystemInfo {
-                home_dir: None,
-                os: None,
-                arch: None,
-                cpu_count: None,
-                memory_total_mb: None,
-                environment: flotilla_protocol::HostEnvironment::Unknown,
-            },
-            inventory: Default::default(),
-            providers: vec![],
-            environments: vec![],
-        });
-    }
-
-    let synthetic = crate::peer::synthetic_repo_path(&NodeId::new("peer-a"), &repo_identity, Some(&repo_path));
-    daemon
-        .add_virtual_repo(
-            repo_identity.clone(),
-            None,
-            synthetic.clone(),
-            vec![
-                (NodeInfo::new(NodeId::new("peer-a"), "peer-a"), ProviderData {
-                    checkouts: IndexMap::from([(
-                        HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only").into(),
-                        checkout("feature-a"),
-                    )]),
-                    ..Default::default()
-                }),
-                (NodeInfo::new(NodeId::new("peer-b"), "peer-b"), ProviderData {
-                    checkouts: IndexMap::from([(
-                        HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only").into(),
-                        checkout("feature-b"),
-                    )]),
-                    ..Default::default()
-                }),
-            ],
-            0,
-        )
-        .await
-        .expect("add virtual repo");
-    let old_session_id = uuid::Uuid::new_v4();
-    let new_session_id = uuid::Uuid::new_v4();
-    {
-        let mut pm = peer_manager.lock().await;
-        pm.register_remote_repo(repo_identity.clone(), synthetic.clone());
-        let peer = NodeId::new("peer-a");
-        let previous_generation = pm.current_generation(&peer).expect("peer-a should already have an active test connection");
-        let second_sender = MockPeerSender::discard();
-        match pm.activate_connection_with_session(
-            peer.clone(),
-            second_sender,
-            crate::peer::ConnectionMeta {
-                direction: crate::peer::ConnectionDirection::Outbound,
-                config_label: Some(ConfigLabel("peer-a".into())),
-                expected_peer: Some(peer.clone()),
-                config_backed: true,
-            },
-            Some(new_session_id),
-        ) {
-            crate::peer::ActivationResult::Accepted { displaced, .. } => {
-                assert_eq!(displaced, Some(previous_generation));
-            }
-            crate::peer::ActivationResult::Rejected { reason } => panic!("expected accepted replacement connection, got {reason:?}"),
-        }
-    }
-
-    let current_session_id = handle_remote_restart_if_needed(&peer_manager, &daemon, &NodeId::new("peer-a"), Some(old_session_id)).await;
-
-    assert_eq!(current_session_id, Some(new_session_id), "current session id should update to the reconnected peer session");
-    let snapshot =
-        daemon.get_state(&flotilla_protocol::RepoSelector::Path(synthetic.clone())).await.expect("remote-only repo should remain");
-    assert!(
-        !snapshot.providers.checkouts.contains_key(&flotilla_protocol::qualified_path::QualifiedPath::from(HostPath::new(
-            HostName::new("peer-a"),
-            "/srv/peer-a/remote-only",
-        ))),
-        "restart cleanup should remove stale peer-a checkout"
-    );
-    assert_eq!(
-        snapshot.providers.checkouts
-            [&flotilla_protocol::qualified_path::QualifiedPath::from(HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only",))]
-            .branch,
-        "feature-b"
-    );
-
-    let pm = peer_manager.lock().await;
-    assert!(
-        !pm.get_peer_data().get(&NodeId::new("peer-a")).is_some_and(|repos| repos.contains_key(&repo_identity)),
-        "restart cleanup should clear stale cached repo data for the restarted peer"
-    );
-    assert!(
-        !pm.get_peer_host_summaries().values().any(|summary| summary.node.node_id == NodeId::new("peer-a")),
-        "restart cleanup should clear stale host summary for the restarted peer"
-    );
-}
-
-#[tokio::test]
 async fn peer_manager_initialized_from_config() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("config");
@@ -4651,118 +4283,6 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
     let _ = tokio::time::timeout(Duration::from_secs(2), handle_b).await;
 }
 
-#[tokio::test]
-async fn clear_peer_data_rebuilds_remote_only_repo_without_stale_first_event() {
-    let (_tmp, daemon) = empty_daemon().await;
-    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
-    let repo_identity = RepoIdentity { authority: "github.com".into(), path: "owner/remote-only".into() };
-    let repo_path = PathBuf::from("/srv/remote-only");
-
-    {
-        let mut pm = peer_manager.lock().await;
-        assert_eq!(
-            handle_test_peer_data(
-                &mut pm,
-                peer_snapshot("peer-a", &repo_identity, &repo_path, "/srv/peer-a/remote-only", "feature-a",),
-                || { Arc::new(SocketPeerSender { tx: tokio::sync::Mutex::new(None) }) as Arc<dyn PeerSender> },
-            )
-            .await,
-            crate::peer::HandleResult::Updated(repo_identity.clone())
-        );
-        assert_eq!(
-            handle_test_peer_data(
-                &mut pm,
-                peer_snapshot("peer-b", &repo_identity, &repo_path, "/srv/peer-b/remote-only", "feature-b",),
-                || { Arc::new(SocketPeerSender { tx: tokio::sync::Mutex::new(None) }) as Arc<dyn PeerSender> },
-            )
-            .await,
-            crate::peer::HandleResult::Updated(repo_identity.clone())
-        );
-    }
-
-    let synthetic = crate::peer::synthetic_repo_path(&NodeId::new("peer-a"), &repo_identity, Some(&repo_path));
-    daemon
-        .add_virtual_repo(
-            repo_identity.clone(),
-            None,
-            synthetic.clone(),
-            vec![
-                (NodeInfo::new(NodeId::new("peer-a"), "peer-a"), ProviderData {
-                    checkouts: IndexMap::from([(
-                        HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only").into(),
-                        checkout("feature-a"),
-                    )]),
-                    ..Default::default()
-                }),
-                (NodeInfo::new(NodeId::new("peer-b"), "peer-b"), ProviderData {
-                    checkouts: IndexMap::from([(
-                        HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only").into(),
-                        checkout("feature-b"),
-                    )]),
-                    ..Default::default()
-                }),
-            ],
-            0,
-        )
-        .await
-        .expect("add virtual repo");
-    {
-        let mut pm = peer_manager.lock().await;
-        pm.register_remote_repo(repo_identity.clone(), synthetic.clone());
-    }
-
-    let mut rx = daemon.subscribe();
-    let gen_a = {
-        let mut pm = peer_manager.lock().await;
-        ensure_test_connection_generation(&mut pm, &NodeId::new("peer-a"), || {
-            Arc::new(SocketPeerSender { tx: tokio::sync::Mutex::new(Some(mpsc::channel(1).0)) }) as Arc<dyn PeerSender>
-        })
-    };
-
-    disconnect_peer_and_rebuild(&peer_manager, &daemon, &NodeId::new("peer-a"), gen_a).await;
-
-    let event = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match rx.recv().await.expect("broadcast channel should stay open") {
-                DaemonEvent::HostRemoved { .. } => continue,
-                other => return other,
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for first repo event");
-
-    let stale_key = HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only");
-    let remaining_key = HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only");
-    match event {
-        DaemonEvent::RepoSnapshot(snapshot) => {
-            assert_eq!(snapshot.repo.as_deref(), Some(synthetic.as_path()));
-            assert!(
-                !snapshot.providers.checkouts.contains_key(&flotilla_protocol::qualified_path::QualifiedPath::from(stale_key.clone())),
-                "first snapshot after disconnect should not include stale peer-a checkout"
-            );
-            assert_eq!(
-                snapshot.providers.checkouts[&flotilla_protocol::qualified_path::QualifiedPath::from(remaining_key.clone())].branch,
-                "feature-b"
-            );
-        }
-        DaemonEvent::RepoDelta(delta) => {
-            assert_eq!(delta.repo.as_deref(), Some(synthetic.as_path()));
-            assert!(
-                delta.changes.iter().any(|change| matches!(
-                    change,
-                    flotilla_protocol::Change::Checkout {
-                        key,
-                        op: flotilla_protocol::EntryOp::Removed
-                    } if *key == flotilla_protocol::qualified_path::QualifiedPath::from(stale_key.clone())
-                )),
-                "first delta after disconnect should remove stale peer-a checkout"
-            );
-        }
-        other => panic!("expected snapshot event, got {other:?}"),
-    }
-}
-
 /// Verifies the fix for the cancel race: when the `Launching` entry is
 /// pre-inserted (as the dispatch loop now does), a cancel that arrives
 /// before `execute_forwarded_command` transitions to `Running` will wait
@@ -4818,31 +4338,4 @@ async fn cancel_before_execute_registration_finds_entry() {
         }
         other => panic!("expected cancel response, got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn set_peer_providers_rejects_stale_version() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir_all(repo.join(".git")).expect("create .git");
-    let config = test_config_store(tmp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::new("local")).await;
-
-    let fresh_peers = vec![(NodeInfo::new(NodeId::new("hostB"), "hostB"), ProviderData {
-        checkouts: IndexMap::from([(HostPath::new(HostName::new("hostB"), "/b/repo").into(), checkout("fresh"))]),
-        ..Default::default()
-    })];
-    let stale_peers = vec![(NodeInfo::new(NodeId::new("hostB"), "hostB"), ProviderData {
-        checkouts: IndexMap::from([(HostPath::new(HostName::new("hostB"), "/b/repo").into(), checkout("stale"))]),
-        ..Default::default()
-    })];
-
-    // Apply version 5 first, then try to apply version 3 — should be rejected
-    daemon.set_peer_providers(&repo, fresh_peers.clone(), 5).await;
-    daemon.set_peer_providers(&repo, stale_peers, 3).await;
-
-    let identity = daemon.tracked_repo_identity_for_path(&repo).await.expect("identity");
-    let pp = daemon.peer_providers_for_test(&identity).await;
-    let branch = pp[0].1.checkouts.values().next().expect("checkout").branch.as_str();
-    assert_eq!(branch, "fresh", "stale version should have been rejected");
 }

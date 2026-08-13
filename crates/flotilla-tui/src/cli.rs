@@ -6,28 +6,10 @@ use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
     output::OutputFormat, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus, FleetHealthResponse,
     FleetHostStaleness, FleetListResponse, FleetObservationAgreement, FleetStaleness, HostProvidersResponse, HostStatusResponse, NodeInfo,
-    PeerConnectionState, ProjectListResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse, StreamKey,
-    TopologyResponse,
+    PeerConnectionState, ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey, TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
-
-fn format_work_items_table(items: &[flotilla_protocol::snapshot::WorkItem]) -> Table {
-    let mut table = Table::new();
-    table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Kind", "Branch", "Description", "PR", "Session", "Issues"]);
-    for item in items {
-        table.add_row(vec![
-            Cell::new(format!("{:?}", item.kind)),
-            Cell::new(item.branch.as_deref().unwrap_or("-")),
-            Cell::new(&item.description),
-            Cell::new(item.change_request_key.as_deref().unwrap_or("-")),
-            Cell::new(item.session_key.as_deref().unwrap_or("-")),
-            Cell::new(if item.issue_keys.is_empty() { "-".into() } else { item.issue_keys.join(", ") }),
-        ]);
-    }
-    table
-}
 
 fn format_status_response_human(status: &StatusResponse) -> String {
     if status.repos.is_empty() {
@@ -35,7 +17,7 @@ fn format_status_response_human(status: &StatusResponse) -> String {
     }
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Repo", "Path", "Work Items", "Errors", "Health", "Unavailable"]);
+    table.set_header(vec!["Repo", "Path", "Health", "Unavailable"]);
     for repo in &status.repos {
         let name = repo.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let mut health: Vec<String> = repo
@@ -59,8 +41,6 @@ fn format_status_response_human(status: &StatusResponse) -> String {
         table.add_row(vec![
             Cell::new(&name),
             Cell::new(repo.path.display()),
-            Cell::new(repo.work_item_count),
-            Cell::new(repo.error_count),
             Cell::new(&health_str),
             Cell::new(if unavailable.is_empty() { "-" } else { &unavailable }),
         ]);
@@ -708,9 +688,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::PreparedWorkspace(_) | CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutPathResolved { .. } => {
             "internal step result".to_string()
         }
-        CommandValue::RepoDetail(detail) => format_repo_detail_human(detail),
         CommandValue::RepoProviders(providers) => format_repo_providers_human(providers),
-        CommandValue::RepoWork(work) => format_repo_work_human(work),
         // HostList remains a protocol-level query used by host/environment
         // target resolution; keep its formatter for direct query diagnostics
         // even though `host list` now presents the richer fleet-health view.
@@ -769,22 +747,15 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
 pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> String {
     use flotilla_protocol::{DaemonEvent, PeerConnectionState};
     match event {
-        DaemonEvent::RepoSnapshot(snap) => {
+        DaemonEvent::RepoSnapshot(snapshot) => {
             format!(
-                "[snapshot] {}: full snapshot (seq {}, {} work items)",
-                repo_label(snap.repo.as_deref(), &snap.repo_identity),
-                snap.seq,
-                snap.work_items.len()
+                "[repo]     {}: provider snapshot (seq {})",
+                repo_label(snapshot.repo.as_deref(), &snapshot.repo_identity),
+                snapshot.seq
             )
         }
         DaemonEvent::RepoDelta(delta) => {
-            format!(
-                "[delta]    {}: delta seq {}\u{2192}{} ({} changes)",
-                repo_label(delta.repo.as_deref(), &delta.repo_identity),
-                delta.prev_seq,
-                delta.seq,
-                delta.changes.len()
-            )
+            format!("[repo]     {}: provider delta (seq {})", repo_label(delta.repo.as_deref(), &delta.repo_identity), delta.seq)
         }
         DaemonEvent::RepoRefreshCompleted { repo_identity, repo } => {
             format!("[refresh]  {}: completed", repo_label(repo.as_deref(), repo_identity))
@@ -856,13 +827,13 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
 /// Extract the (stream_key, seq) from a snapshot/delta event, if present.
 fn event_stream_seq(event: &DaemonEvent) -> Option<(StreamKey, u64)> {
     match event {
-        DaemonEvent::RepoSnapshot(snap) => Some((StreamKey::Repo { identity: snap.repo_identity.clone() }, snap.seq)),
-        DaemonEvent::RepoDelta(delta) => Some((StreamKey::Repo { identity: delta.repo_identity.clone() }, delta.seq)),
         DaemonEvent::HostSnapshot(snap) => Some((StreamKey::Host { environment_id: snap.environment_id.clone() }, snap.seq)),
         DaemonEvent::HostRemoved { environment_id, seq } => Some((StreamKey::Host { environment_id: environment_id.clone() }, *seq)),
         DaemonEvent::ResultSet(result_set) => Some((StreamKey::Query { query: result_set.query() }, result_set.seq)),
         DaemonEvent::ResultDelta(delta) => Some((StreamKey::Query { query: delta.query() }, delta.seq)),
-        DaemonEvent::RepoTracked(_)
+        DaemonEvent::RepoSnapshot(_)
+        | DaemonEvent::RepoDelta(_)
+        | DaemonEvent::RepoTracked(_)
         | DaemonEvent::RepoRefreshCompleted { .. }
         | DaemonEvent::RepoUntracked { .. }
         | DaemonEvent::CommandStarted { .. }
@@ -892,32 +863,6 @@ pub async fn run_topology(daemon: &dyn DaemonHandle, format: OutputFormat) -> Re
     };
     print!("{output}");
     Ok(())
-}
-
-fn format_repo_detail_human(detail: &RepoDetailResponse) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("Repo: {}\n", detail.path.display()));
-    if let Some(slug) = &detail.slug {
-        out.push_str(&format!("Slug: {slug}\n"));
-    }
-    if let Some(upstream) = &detail.upstream {
-        out.push_str(&format!("Upstream: {} ({})\n", upstream.url, upstream.relation));
-    }
-    out.push('\n');
-
-    if !detail.work_items.is_empty() {
-        let table = format_work_items_table(&detail.work_items);
-        out.push_str(&table.to_string());
-        out.push('\n');
-    }
-
-    if !detail.errors.is_empty() {
-        out.push_str("\nErrors:\n");
-        for err in &detail.errors {
-            out.push_str(&format!("  [{}/{}] {}\n", err.category, err.provider, err.message));
-        }
-    }
-    out
 }
 
 fn format_repo_providers_human(resp: &RepoProvidersResponse) -> String {
@@ -972,24 +917,6 @@ fn format_repo_providers_human(resp: &RepoProvidersResponse) -> String {
                 None => out.push_str(&format!("  {}: {}\n", ur.factory, ur.kind)),
             }
         }
-    }
-    out
-}
-
-fn format_repo_work_human(resp: &RepoWorkResponse) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("Repo: {}\n", resp.path.display()));
-    if let Some(slug) = &resp.slug {
-        out.push_str(&format!("Slug: {slug}\n"));
-    }
-    out.push('\n');
-
-    if resp.work_items.is_empty() {
-        out.push_str("No work items.\n");
-    } else {
-        let table = format_work_items_table(&resp.work_items);
-        out.push_str(&table.to_string());
-        out.push('\n');
     }
     out
 }

@@ -11,8 +11,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    Command, ConnectionRole, DaemonEvent, LeafFire, Message, NodeId, QueryCursor, QueryId, ReplayCursor, RepoIdentity, RepoInfo,
-    RepoSnapshot, Request, Response, ResponseResult, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, PROTOCOL_VERSION,
+    Command, ConnectionRole, DaemonEvent, LeafFire, Message, NodeId, QueryCursor, QueryId, ReplayCursor, RepoInfo, Request, Response,
+    ResponseResult, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, PROTOCOL_VERSION,
 };
 use flotilla_transport::message::{connect_unix_message_session, MessageSession};
 use tokio::sync::{broadcast, oneshot, Mutex};
@@ -162,20 +162,17 @@ impl SocketDaemon {
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
         let subscribed_queries: Arc<QuerySet> = Arc::new(std::sync::RwLock::new(HashSet::new()));
         let initial_sync_complete = Arc::new(AtomicBool::new(false));
-        let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         // Spawn background reader task
         let reader_session = Arc::clone(&session);
         let reader_context = EventContext::builder()
             .local_seqs(Arc::clone(&local_seqs))
             .subscribed_queries(Arc::clone(&subscribed_queries))
-            .recovering(recovering)
             .event_tx(event_tx_weak.clone())
             .wait_event_tx(wait_event_tx_weak.clone())
             .session(Arc::clone(&session))
             .pending(Arc::clone(&pending))
             .next_id(Arc::clone(&next_id))
-            .initial_sync_complete(Arc::clone(&initial_sync_complete))
             .build();
         let reader_task = tokio::spawn(async move {
             let _event_channel_guard = event_tx;
@@ -709,29 +706,11 @@ fn into_success_response(result: ResponseResult) -> Result<Response, String> {
 struct EventContext {
     local_seqs: Arc<SeqMap>,
     subscribed_queries: Arc<QuerySet>,
-    recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>>,
     event_tx: broadcast::WeakSender<DaemonEvent>,
     wait_event_tx: broadcast::WeakSender<LeafFire>,
     session: Arc<MessageSession>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
     next_id: Arc<AtomicU64>,
-    initial_sync_complete: Arc<AtomicBool>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InitialSyncState {
-    Pending,
-    Complete,
-}
-
-impl InitialSyncState {
-    fn load(flag: &AtomicBool) -> Self {
-        if flag.load(Ordering::Acquire) {
-            Self::Complete
-        } else {
-            Self::Pending
-        }
-    }
 }
 
 fn send_event(event_tx: &broadcast::WeakSender<DaemonEvent>, event: DaemonEvent) {
@@ -753,89 +732,8 @@ fn send_wait_event(event_tx: &broadcast::WeakSender<LeafFire>, event: LeafFire) 
 /// is spawned on a separate task to avoid deadlocking the reader (which must
 /// remain free to route the recovery response).
 fn handle_event(event: DaemonEvent, ctx: &EventContext) {
-    let EventContext { local_seqs, recovering, event_tx, wait_event_tx, .. } = ctx;
+    let EventContext { local_seqs, event_tx, wait_event_tx, .. } = ctx;
     match &event {
-        DaemonEvent::RepoSnapshot(snap) => {
-            debug!(repo_identity = %snap.repo_identity, repo = ?snap.repo, seq = snap.seq, "received full snapshot");
-            // Sync lock: update seq before dispatching event so a
-            // quickly-following delta sees the correct local seq.
-            local_seqs.write().expect("sequence lock poisoned").insert(StreamKey::Repo { identity: snap.repo_identity.clone() }, snap.seq);
-            send_event(event_tx, event);
-        }
-        DaemonEvent::RepoDelta(delta) => {
-            let repo = delta.repo.clone();
-            let repo_identity = delta.repo_identity.clone();
-            let prev_seq = delta.prev_seq;
-            let seq = delta.seq;
-
-            let stream_key = StreamKey::Repo { identity: repo_identity.clone() };
-
-            // Check seq under sync lock, then spawn only if recovery needed.
-            let local_seq = local_seqs.read().expect("sequence lock poisoned").get(&stream_key).copied();
-
-            match local_seq {
-                Some(ls) if prev_seq == ls => {
-                    // Happy path: apply delta (sync lock, no spawn needed)
-                    local_seqs.write().expect("sequence lock poisoned").insert(stream_key, seq);
-                    debug!(repo_identity = %repo_identity, repo = ?repo, %prev_seq, %seq, "applied delta");
-                    send_event(event_tx, event);
-                }
-                _ => {
-                    // Seq gap or unknown repo — spawn recovery if not already in progress.
-                    // If recovery is already running, buffer this delta so it can be
-                    // re-processed after recovery completes (prevents permanent staleness
-                    // when a live delta arrives during the recovery window).
-                    let mut guard = recovering.lock().unwrap();
-                    if let Some(buf) = guard.get_mut(&repo_identity) {
-                        debug!(repo_identity = %repo_identity, repo = ?repo, %seq, "recovery in progress, buffering delta");
-                        buf.push(event);
-                        return;
-                    }
-                    guard.insert(repo_identity.clone(), vec![event]);
-                    drop(guard);
-
-                    if let Some(ls) = local_seq {
-                        warn!(repo_identity = %repo_identity, repo = ?repo, local_seq = ls, %prev_seq, "seq gap, requesting replay");
-                    } else {
-                        match InitialSyncState::load(&ctx.initial_sync_complete) {
-                            InitialSyncState::Complete => {
-                                warn!(repo_identity = %repo_identity, repo = ?repo, "received delta for unknown repo, requesting replay");
-                            }
-                            InitialSyncState::Pending => {
-                                debug!(repo_identity = %repo_identity, repo = ?repo, "received startup delta before initial sync, requesting replay");
-                            }
-                        }
-                    }
-
-                    let ctx = ctx.clone();
-                    tokio::spawn(async move {
-                        recover_from_gap(&ctx).await;
-                        // Drain buffered deltas, discarding any that recovery
-                        // already covered (their seq <= recovered local_seq).
-                        // Only re-process deltas that are genuinely ahead.
-                        let buffered = ctx.recovering.lock().unwrap().remove(&repo_identity).unwrap_or_default();
-                        let stream_key = StreamKey::Repo { identity: repo_identity };
-                        let recovered_seq = ctx.local_seqs.read().expect("sequence lock poisoned").get(&stream_key).copied();
-                        for buffered_event in buffered {
-                            let dominated = match &buffered_event {
-                                DaemonEvent::RepoDelta(d) => recovered_seq.is_some_and(|rs| d.seq <= rs),
-                                _ => false,
-                            };
-                            if dominated {
-                                debug!("discarding buffered delta already covered by recovery");
-                                continue;
-                            }
-                            handle_event(buffered_event, &ctx);
-                        }
-                    });
-                }
-            }
-        }
-        DaemonEvent::RepoUntracked { repo_identity, .. } => {
-            // Sync lock: evict before dispatching
-            local_seqs.write().expect("sequence lock poisoned").remove(&StreamKey::Repo { identity: repo_identity.clone() });
-            send_event(event_tx, event);
-        }
         DaemonEvent::HostRemoved { environment_id, seq } => {
             local_seqs.write().expect("sequence lock poisoned").insert(StreamKey::Host { environment_id: environment_id.clone() }, *seq);
             send_event(event_tx, event);
@@ -880,7 +778,10 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
                 }
             }
         }
-        DaemonEvent::RepoTracked(_)
+        DaemonEvent::RepoSnapshot(_)
+        | DaemonEvent::RepoDelta(_)
+        | DaemonEvent::RepoTracked(_)
+        | DaemonEvent::RepoUntracked { .. }
         | DaemonEvent::RepoRefreshCompleted { .. }
         | DaemonEvent::CommandStarted { .. }
         | DaemonEvent::CommandFinished { .. }
@@ -891,86 +792,6 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
         DaemonEvent::LeafFired(fire) => {
             send_wait_event(wait_event_tx, fire.clone());
             send_event(event_tx, event);
-        }
-    }
-}
-
-/// Recover from a seq gap by calling `replay_since` with the stale seq,
-/// updating local seq tracking, and forwarding replay events to the TUI.
-async fn recover_from_gap(ctx: &EventContext) {
-    let EventContext { local_seqs, event_tx, session, pending, next_id, .. } = ctx;
-    let last_seen = {
-        let seqs = local_seqs.read().expect("sequence lock poisoned");
-        seqs.clone()
-    };
-
-    let last_seen = encode_replay_cursors(&last_seen);
-    let resp = send_request(session.as_ref(), pending, next_id, Request::ReplaySince { last_seen }).await;
-
-    match resp {
-        Ok(result) => match into_success_response(result) {
-            Ok(Response::ReplaySince(events)) => {
-                debug!(event_count = events.len(), "gap recovery: got replay events");
-                // Update seqs monotonically — a live event may have advanced
-                // a repo's seq while this replay was in flight.
-                {
-                    let mut seqs = local_seqs.write().expect("sequence lock poisoned");
-                    for event in &events {
-                        match event {
-                            DaemonEvent::RepoSnapshot(snap) => {
-                                let key = StreamKey::Repo { identity: snap.repo_identity.clone() };
-                                let current = seqs.get(&key).copied().unwrap_or(0);
-                                if snap.seq >= current {
-                                    seqs.insert(key, snap.seq);
-                                }
-                            }
-                            DaemonEvent::RepoDelta(delta) => {
-                                let key = StreamKey::Repo { identity: delta.repo_identity.clone() };
-                                let current = seqs.get(&key).copied().unwrap_or(0);
-                                if delta.seq >= current {
-                                    seqs.insert(key, delta.seq);
-                                }
-                            }
-                            DaemonEvent::HostSnapshot(snap) => {
-                                let key = StreamKey::Host { environment_id: snap.environment_id.clone() };
-                                let current = seqs.get(&key).copied().unwrap_or(0);
-                                if snap.seq >= current {
-                                    seqs.insert(key, snap.seq);
-                                }
-                            }
-                            DaemonEvent::HostRemoved { environment_id, seq } => {
-                                let key = StreamKey::Host { environment_id: environment_id.clone() };
-                                let current = seqs.get(&key).copied().unwrap_or(0);
-                                if *seq >= current {
-                                    seqs.insert(key, *seq);
-                                }
-                            }
-                            DaemonEvent::RepoTracked(_)
-                            | DaemonEvent::RepoRefreshCompleted { .. }
-                            | DaemonEvent::RepoUntracked { .. }
-                            | DaemonEvent::CommandStarted { .. }
-                            | DaemonEvent::CommandFinished { .. }
-                            | DaemonEvent::CommandStepUpdate { .. }
-                            | DaemonEvent::PeerStatusChanged { .. }
-                            | DaemonEvent::ResultSet(_)
-                            | DaemonEvent::ResultDelta(_)
-                            | DaemonEvent::LeafFired(_) => {}
-                        }
-                    }
-                }
-                for event in events {
-                    send_event(event_tx, event);
-                }
-            }
-            Ok(other) => {
-                error!(response = ?other, "gap recovery: unexpected replay_since response");
-            }
-            Err(e) => {
-                error!(err = %e, "gap recovery: replay_since returned error response");
-            }
-        },
-        Err(e) => {
-            error!(err = %e, "gap recovery: replay_since request failed");
         }
     }
 }
@@ -1057,19 +878,6 @@ impl DaemonHandle for SocketDaemon {
         }
     }
 
-    async fn get_state(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoSnapshot, String> {
-        // Always RPC to server — local state only tracks seqs for gap detection,
-        // not full snapshots (work_items can't be materialized client-side).
-        let repo_path = match repo {
-            flotilla_protocol::RepoSelector::Path(p) => p.clone(),
-            other => return Err(format!("get_state requires a path selector, got: {other:?}")),
-        };
-        match into_success_response(self.request(Request::GetState { repo: repo_path }).await?)? {
-            Response::GetState(snapshot) => Ok(*snapshot),
-            other => Err(format!("unexpected response for get_state: {other:?}")),
-        }
-    }
-
     async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
         match into_success_response(self.request(Request::ListRepos).await?)? {
             Response::ListRepos(repos) => Ok(repos),
@@ -1145,11 +953,11 @@ impl DaemonHandle for SocketDaemon {
             let mut seqs = self.local_seqs.write().expect("sequence lock poisoned");
             for event in &events {
                 let (stream_key, seq) = match event {
-                    DaemonEvent::RepoSnapshot(snap) => (StreamKey::Repo { identity: snap.repo_identity.clone() }, snap.seq),
-                    DaemonEvent::RepoDelta(delta) => (StreamKey::Repo { identity: delta.repo_identity.clone() }, delta.seq),
                     DaemonEvent::HostSnapshot(snap) => (StreamKey::Host { environment_id: snap.environment_id.clone() }, snap.seq),
                     DaemonEvent::HostRemoved { environment_id, seq } => (StreamKey::Host { environment_id: environment_id.clone() }, *seq),
-                    DaemonEvent::RepoTracked(_)
+                    DaemonEvent::RepoSnapshot(_)
+                    | DaemonEvent::RepoDelta(_)
+                    | DaemonEvent::RepoTracked(_)
                     | DaemonEvent::RepoRefreshCompleted { .. }
                     | DaemonEvent::RepoUntracked { .. }
                     | DaemonEvent::CommandStarted { .. }

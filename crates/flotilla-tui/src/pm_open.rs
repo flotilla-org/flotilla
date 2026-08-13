@@ -169,7 +169,7 @@ mod tests {
 
         async fn create_workspace(&self, request: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
             self.created.lock().expect("created lock").push((request.name.clone(), request.attach_commands.clone(), request.stamp.clone()));
-            let workspace = Workspace { name: request.name.clone(), correlation_keys: vec![], attachable_set_id: None };
+            let workspace = Workspace { name: request.name.clone(), attachable_set_id: None };
             self.workspaces.lock().expect("workspaces lock").push(("session:7".into(), workspace.clone()));
             Ok(("session:7".into(), workspace))
         }
