@@ -14,6 +14,9 @@ env:
   # Cached dependency artifacts pay off across runs; short-lived incremental
   # generations cost more to upload and store than they save in CI.
   CARGO_INCREMENTAL: "0"
+  # CI needs file:line in backtraces, not full debuginfo — this halves
+  # target size and link time for test binaries.
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
 
 jobs:
   fmt:
@@ -41,23 +44,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: actions/cache@v4
+      # Caches dependency artifacts only (workspace-member artifacts are
+      # pruned before save) — the previous whole-target cache reached 4.5GB
+      # and thrashed the repo's 10GB cache pool against compose's blobs.
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-clippy-v2-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-clippy-v2-
+          shared-key: "clippy"
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Remove incremental state before caching
-        if: always()
-        run: |
-          if [ -d target ]; then
-            find target -type d -name incremental -prune -exec rm -rf {} +
-          fi
 
   test:
     name: Test
@@ -66,20 +59,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
+      # Caches dependency artifacts only (workspace-member artifacts are
+      # pruned before save) — the previous whole-target cache reached 4.5GB
+      # and thrashed the repo's 10GB cache pool against compose's blobs.
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-test-v2-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-test-v2-
+          shared-key: "test"
       - run: cargo test --workspace --locked
-      - name: Remove incremental state before caching
-        if: always()
-        run: |
-          if [ -d target ]; then
-            find target -type d -name incremental -prune -exec rm -rf {} +
-          fi
