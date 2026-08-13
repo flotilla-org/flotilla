@@ -38,11 +38,11 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["config_dir", "state_dir"])]
     root: Option<PathBuf>,
 
-    /// Config directory (daemon-starting commands also require --state-dir)
+    /// Config directory (commands that may start a daemon also require --state-dir)
     #[arg(long, conflicts_with = "root")]
     config_dir: Option<PathBuf>,
 
-    /// State directory (daemon-starting commands also require --config-dir)
+    /// State directory (commands that may start a daemon also require --config-dir)
     #[arg(long, conflicts_with = "root")]
     state_dir: Option<PathBuf>,
 
@@ -424,6 +424,8 @@ impl Cli {
     }
 
     fn socket_path(&self) -> PathBuf {
+        // Socket-only commands never spawn, so they may select a socket through
+        // --config-dir without resolving the daemon's paired state directory.
         let policy = PathPolicy::from_process_env();
         let config_dir = self
             .root
@@ -471,7 +473,8 @@ fn daemon_dirs_from(
     match (explicit_config_dir, explicit_state_dir) {
         (Some(config_dir), Some(state_dir)) => Ok((config_dir.to_path_buf(), state_dir.to_path_buf())),
         (None, None) => Ok((default_config_dir.to_path_buf(), default_state_dir.to_path_buf())),
-        _ => Err("daemon-starting commands require --config-dir and --state-dir together; use --root to select both".to_string()),
+        _ => Err("this command may start a daemon, so --config-dir and --state-dir must be supplied together; use --root to select both"
+            .to_string()),
     }
 }
 
@@ -2467,8 +2470,10 @@ mod tests {
             Cli::try_parse_from(["flotilla", "--config-dir", "/work/a/config"]).expect("socket-only commands may parse a config override");
         let state_only =
             Cli::try_parse_from(["flotilla", "--state-dir", "/work/a/state"]).expect("socket-only commands may parse a state override");
-        assert!(config_only.client_paths().is_err());
-        assert!(state_only.client_paths().is_err());
+        let config_error = config_only.client_paths().expect_err("config-only startup identity must be rejected");
+        let state_error = state_only.client_paths().expect_err("state-only startup identity must be rejected");
+        assert!(config_error.contains("may start a daemon"), "unexpected error: {config_error}");
+        assert!(state_error.contains("may start a daemon"), "unexpected error: {state_error}");
         assert!(Cli::try_parse_from(["flotilla", "--config-dir", "/work/a/config", "--state-dir", "/work/a/state", "status",])
             .expect("paired overrides should parse")
             .client_paths()
