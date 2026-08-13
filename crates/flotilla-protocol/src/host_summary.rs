@@ -95,7 +95,7 @@ pub struct HostProviderStatus {
     #[serde(default)]
     pub implementation: String,
     pub healthy: bool,
-    /// Why this provider category is intentionally unavailable.
+    /// Why this provider is fully or partially disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
 }

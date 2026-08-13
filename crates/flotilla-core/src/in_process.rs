@@ -105,13 +105,13 @@ use crate::{
         ai_utility::{AiUtility, ConvoyNames},
         discovery::{
             discover_providers_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion,
-            EnvironmentBag,
+            EnvironmentBag, ObserverPolling,
         },
         issue_tracker::{forge_issue_source, IssueProvider},
         ssh_runner::SshCommandRunner,
         ChannelLabel, CommandRunner,
     },
-    refresh::RefreshSnapshot,
+    refresh::{ExternalPolling, RefreshSnapshot},
     regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome, DEFAULT_REGARD_DECAY_SECONDS, DEFAULT_REGARD_REFRESH_SECONDS},
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
     repository_inspection::{
@@ -1955,6 +1955,13 @@ fn mark_external_polling_disabled(providers: &mut [HostProviderStatus], follower
     }
 }
 
+fn external_polling_policy(discovery: &DiscoveryRuntime) -> ExternalPolling {
+    match discovery.observer_polling() {
+        ObserverPolling::Enabled => ExternalPolling::Enabled,
+        ObserverPolling::Disabled => ExternalPolling::Disabled,
+    }
+}
+
 fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
     let exponent = restart_count.min(5);
     ChronoDuration::seconds((30_i64.saturating_mul(1_i64 << exponent)).min(15 * 60))
@@ -2089,10 +2096,7 @@ impl InProcessDaemon {
                 Some(local_host_id.clone()),
                 attachable_store,
                 Arc::clone(&agent_state_store),
-                match discovery.observer_polling() {
-                    crate::providers::discovery::ObserverPolling::Enabled => crate::refresh::ExternalPolling::Enabled,
-                    crate::providers::discovery::ObserverPolling::Disabled => crate::refresh::ExternalPolling::Disabled,
-                },
+                external_polling_policy(&discovery),
             );
             model.data.loading = true;
             let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
@@ -2336,9 +2340,9 @@ impl InProcessDaemon {
             .host_scoped_providers
             .discover_for_environment(&self.local_environment_id, &host_bag, &self.discovery.factories, &self.config, &probe_root, runner)
             .await;
-        let provider = host_scoped.issue_provider_for(source).ok_or_else(|| {
-            self.missing_external_provider_error(&format!("no issue provider available for {} {}", source.service, source.scope))
-        })?;
+        let provider = host_scoped
+            .issue_provider_for(source)
+            .ok_or_else(|| format!("no issue provider available for {} {}", source.service, source.scope))?;
         Ok(provider)
     }
 
@@ -6264,10 +6268,7 @@ impl InProcessDaemon {
             Some(self.environment_manager.host_id_for_environment(&self.local_environment_id).expect("local host id must be available")),
             self.discovery.shared_attachable_store(&self.config),
             Arc::clone(&self.agent_state_store),
-            match self.discovery.observer_polling() {
-                crate::providers::discovery::ObserverPolling::Enabled => crate::refresh::ExternalPolling::Enabled,
-                crate::providers::discovery::ObserverPolling::Disabled => crate::refresh::ExternalPolling::Disabled,
-            },
+            external_polling_policy(&self.discovery),
         );
         model.data.loading = true;
         let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
@@ -8218,14 +8219,11 @@ impl InProcessDaemon {
         let repos = self.repos.read().await;
         let state = repos.get(&identity).ok_or_else(|| "repo not found".to_string())?;
         let source = forge_issue_source(state.identity());
-        let provider = state.registry().issue_provider_for(&source).ok_or_else(|| {
-            self.missing_external_provider_error(&format!("no issue provider available for {} {}", source.service, source.scope))
-        })?;
+        let provider = state
+            .registry()
+            .issue_provider_for(&source)
+            .ok_or_else(|| format!("no issue provider available for {} {}", source.service, source.scope))?;
         Ok((provider, source))
-    }
-
-    fn missing_external_provider_error(&self, error: &str) -> String {
-        error.to_string()
     }
 
     pub async fn execute_with_remote_executor(
