@@ -104,6 +104,12 @@ pub trait Resource: Send + Sync + 'static {
     fn validate_spec_update(_current: &Self::Spec, _requested: &Self::Spec) -> Result<(), ResourceError> {
         Ok(())
     }
+
+    /// Validates a status write against the currently stored status after
+    /// optimistic concurrency has established which version is current.
+    fn validate_status_update(_current: Option<&Self::Status>, _requested: &Self::Status) -> Result<(), ResourceError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

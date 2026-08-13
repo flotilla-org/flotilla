@@ -22,6 +22,18 @@ impl Resource for Usage {
             Err(ResourceError::invalid("Usage subject is immutable"))
         }
     }
+
+    fn validate_status_update(current: Option<&Self::Status>, requested: &Self::Status) -> Result<(), ResourceError> {
+        let Some(current) = current else { return Ok(()) };
+        if requested.observed_at > current.observed_at || requested == current {
+            return Ok(());
+        }
+        if requested.observed_at == current.observed_at {
+            Err(ResourceError::invalid("Usage observations with equal observed_at must be identical"))
+        } else {
+            Err(ResourceError::invalid("Usage observed_at must not precede the stored observation"))
+        }
+    }
 }
 
 /// An account at a provider is the stable subject. Plan, organization, and
@@ -95,6 +107,9 @@ pub struct UsageStatus {
     pub provider_cost: Option<UsageProviderCost>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_credits_available: Option<u64>,
+    /// Orders observations for this latest-only gauge. A later timestamp
+    /// replaces the status; an equal timestamp is valid only for an identical,
+    /// idempotent write.
     pub observed_at: DateTime<Utc>,
 }
 
@@ -158,6 +173,51 @@ mod tests {
         assert_eq!(diagnostics.event_count, 1, "usage observations retain only the latest watch handoff event");
     }
 
+    async fn assert_observations_are_monotonically_ordered(backend: ResourceBackend) {
+        let records = backend.using::<Usage>("flotilla");
+        let created = records
+            .create(&InputMeta::builder().name("usage-account".to_string()).build(), &UsageSpec {
+                provider: "codex".to_string(),
+                account: "user@example.com".to_string(),
+            })
+            .await
+            .expect("create usage observation");
+        let older = status(8.0, "2026-08-06T10:00:00Z".parse().expect("time"));
+        let newer = status(12.0, "2026-08-06T10:05:00Z".parse().expect("time"));
+        let stored =
+            records.update_status("usage-account", &created.metadata.resource_version, &newer).await.expect("publish newer observation");
+
+        let racing_write = records.update_status("usage-account", &created.metadata.resource_version, &older).await;
+        assert!(matches!(racing_write, Err(ResourceError::Conflict { .. })));
+        let retried_write = records.update_status("usage-account", &stored.metadata.resource_version, &older).await;
+        assert!(matches!(retried_write, Err(ResourceError::Invalid { .. })));
+
+        let current = records.get("usage-account").await.expect("read current usage observation");
+        assert_eq!(current.status, Some(newer));
+    }
+
+    async fn assert_equal_observation_times_are_idempotent_only(backend: ResourceBackend) {
+        let records = backend.using::<Usage>("flotilla");
+        let created = records
+            .create(&InputMeta::builder().name("usage-account".to_string()).build(), &UsageSpec {
+                provider: "codex".to_string(),
+                account: "user@example.com".to_string(),
+            })
+            .await
+            .expect("create usage observation");
+        let observed_at = "2026-08-06T10:00:00Z".parse().expect("time");
+        let first = status(8.0, observed_at);
+        let stored =
+            records.update_status("usage-account", &created.metadata.resource_version, &first).await.expect("publish first observation");
+
+        let repeated =
+            records.update_status("usage-account", &stored.metadata.resource_version, &first).await.expect("repeat identical observation");
+        assert_eq!(repeated.metadata.resource_version, stored.metadata.resource_version);
+
+        let divergent = records.update_status("usage-account", &stored.metadata.resource_version, &status(9.0, observed_at)).await;
+        assert!(matches!(divergent, Err(ResourceError::Invalid { .. })));
+    }
+
     #[test]
     fn provider_account_record_names_are_stable_case_insensitive_and_bounded() {
         let lower = usage_record_name("codex", "user@example.com");
@@ -187,5 +247,29 @@ mod tests {
     #[tokio::test]
     async fn sqlite_observation_history_is_thin() {
         assert_observation_history_is_thin(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend"))).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_observations_are_monotonically_ordered() {
+        assert_observations_are_monotonically_ordered(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_observations_are_monotonically_ordered() {
+        assert_observations_are_monotonically_ordered(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend")))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_equal_observation_times_are_idempotent_only() {
+        assert_equal_observation_times_are_idempotent_only(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_equal_observation_times_are_idempotent_only() {
+        assert_equal_observation_times_are_idempotent_only(ResourceBackend::Sqlite(
+            SqliteBackend::open_in_memory().expect("sqlite backend"),
+        ))
+        .await;
     }
 }
