@@ -869,8 +869,8 @@ async fn subscribe_queries_replays_result_set_after_seq() {
         heartbeat_interval: Duration::from_secs(300),
         controller_resync_interval: Duration::from_secs(300),
         // This test exercises query replay, not convoy reconciliation. Keeping
-        // controllers stopped prevents the intentionally incomplete fixtures
-        // from being failed and hidden from the default active-convoy query.
+        // controllers stopped prevents unrelated status transitions in the
+        // intentionally incomplete fixtures.
         start_controllers: false,
         ..RuntimeOptions::default()
     };

@@ -3203,7 +3203,7 @@ async fn fleet_health_keeps_link_heartbeat_and_generation_disagreements_visible(
 }
 
 #[tokio::test]
-async fn fleet_list_hides_local_crewless_terminal_convoys() {
+async fn fleet_list_shows_local_crewless_failed_convoys_with_failure_state() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -3218,7 +3218,12 @@ async fn fleet_list_hides_local_crewless_terminal_convoys() {
 
     let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
 
-    assert!(response.rows.is_empty());
+    assert_eq!(response.rows.len(), 1);
+    let row = &response.rows[0];
+    assert_eq!(row.convoy, "convoy-failed");
+    assert_eq!(row.vessel, "-");
+    assert_eq!(row.crew, "-");
+    assert_eq!(row.crew_state, "failed: missing input 'topic'");
 }
 
 #[tokio::test]
