@@ -1163,12 +1163,21 @@ interactions:
             .expect("explicit Claude config dir")
             .is_empty());
 
+        assert!(
+            store.prepare("env-without-grant", &BTreeSet::new(), runner.clone()).await.expect("prepare without a grant").is_empty(),
+            "an ungranted session must receive no credential environment"
+        );
         let delivered = store.prepare("env-a", &credential_refs, runner.clone()).await.expect("prepare claude-oauth credential");
 
-        assert_eq!(delivered, vec![
-            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), secret.to_string()),
-            ("CLAUDE_CONFIG_DIR".to_string(), "/run/flotilla/credentials/claude-max/claude".to_string()),
-        ]);
+        assert_eq!(delivered.len(), 2);
+        assert!(
+            delivered.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == secret),
+            "the OAuth token must be delivered under CLAUDE_CODE_OAUTH_TOKEN"
+        );
+        assert!(
+            delivered.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == "/run/flotilla/credentials/claude-max/claude"),
+            "the isolated Claude config directory must be delivered"
+        );
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/run/flotilla/credentials/claude-max/claude"]));
         assert!(calls.iter().any(|(cmd, args, input)| {

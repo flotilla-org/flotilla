@@ -365,6 +365,18 @@ impl CapabilityTable {
     }
 }
 
+impl AgentRequirement {
+    /// Credential delivery slot required for a contained invocation of this
+    /// adapter. Host-direct sessions may retain ambient authentication, but a
+    /// contained Claude session must never fall through to interactive login.
+    pub fn contained_credential_delivery_slot(&self) -> Option<&'static str> {
+        match self.adapter.as_str() {
+            "claude-code" => Some("claude"),
+            _ => None,
+        }
+    }
+}
+
 impl Default for CapabilityTable {
     fn default() -> Self {
         Self::seeded()
@@ -402,15 +414,12 @@ struct CliAgentAdapter {
 /// different thing seeded before it will run unattended, so the differences are
 /// named here rather than inferred from an id string.
 enum AdapterFlavor {
-    /// `--dangerously-skip-permissions` clears Claude Code's directory-trust and
-    /// tool-approval gates outright, so there is no persisted trust to pre-seed
-    /// for either a convoy checkout or a multi-repo workspace root. What a
-    /// managed session *does* need is Flotilla's hooks: without them the crew
-    /// runs, but no phase or attention signal ever leaves the pane. `--settings`
-    /// layers them on for this invocation only, leaving the user's own settings
-    /// untouched — which also means a crew works on a host where nobody has run
-    /// `flotilla hooks install`.
-    ClaudeCode,
+    /// Claude requires onboarding, workspace trust, and bypass-mode consent
+    /// even when credentials and `--dangerously-skip-permissions` are already
+    /// present. Managed sessions seed the first two into Claude's mutable state
+    /// and carry the documented bypass-consent setting alongside Flotilla's
+    /// hooks in the invocation-only `--settings` overlay.
+    ClaudeCode { state_config: Option<ClaudeStateConfig> },
     /// Codex gates on a persisted per-project trust level, so the workspace has
     /// to be marked trusted in its config before launch.
     Codex { trust_config: Option<CodexTrustConfig> },
@@ -419,14 +428,14 @@ enum AdapterFlavor {
 impl AdapterFlavor {
     fn id(&self) -> &'static str {
         match self {
-            Self::ClaudeCode => "claude-code",
+            Self::ClaudeCode { .. } => "claude-code",
             Self::Codex { .. } => "codex",
         }
     }
 
     fn autonomy_args(&self) -> &'static [&'static str] {
         match self {
-            Self::ClaudeCode => &["--dangerously-skip-permissions"],
+            Self::ClaudeCode { .. } => &["--dangerously-skip-permissions"],
             Self::Codex { .. } => &["--dangerously-bypass-approvals-and-sandbox"],
         }
     }
@@ -435,7 +444,7 @@ impl AdapterFlavor {
     /// teardown, beyond the brief itself.
     fn managed_files(&self) -> &'static [&'static str] {
         match self {
-            Self::ClaudeCode => &[CLAUDE_MANAGED_SETTINGS_PATH],
+            Self::ClaudeCode { .. } => &[CLAUDE_MANAGED_SETTINGS_PATH],
             Self::Codex { .. } => &[],
         }
     }
@@ -447,11 +456,17 @@ struct CodexTrustConfig {
     lock: Arc<Mutex<()>>,
 }
 
+#[derive(Clone)]
+struct ClaudeStateConfig {
+    path: PathBuf,
+    lock: Arc<Mutex<()>>,
+}
+
 impl CliAgentAdapter {
     fn command(&self, request: &AgentLaunchRequest) -> String {
         let mut args = vec![Arg::Literal(self.binary.clone())];
         args.extend(self.flavor.autonomy_args().iter().map(|arg| Arg::Literal((*arg).into())));
-        if matches!(self.flavor, AdapterFlavor::ClaudeCode) {
+        if matches!(&self.flavor, AdapterFlavor::ClaudeCode { .. }) {
             args.extend([Arg::Literal("--settings".into()), Arg::Literal(CLAUDE_MANAGED_SETTINGS_PATH.into())]);
         }
         if let Some(model) = &request.model {
@@ -470,9 +485,15 @@ impl AgentAdapter for CliAgentAdapter {
 
     async fn prepare(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String> {
         match &self.flavor {
-            AdapterFlavor::ClaudeCode => {
-                let settings = serde_json::to_string_pretty(&crate::agents::claude_code_hook_settings())
-                    .map_err(|error| format!("render Claude Code settings overlay: {error}"))?;
+            AdapterFlavor::ClaudeCode { state_config } => {
+                let state_config = state_config.as_ref().ok_or_else(|| {
+                    "cannot determine Claude state path because neither CLAUDE_CONFIG_DIR nor HOME was detected".to_string()
+                })?;
+                seed_claude_headless_state(&*self.runner, cwd.as_path(), state_config).await?;
+                let mut settings = crate::agents::claude_code_hook_settings();
+                settings["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
+                let settings =
+                    serde_json::to_string_pretty(&settings).map_err(|error| format!("render Claude Code settings overlay: {error}"))?;
                 self.runner.write_file(&cwd.as_path().join(CLAUDE_MANAGED_SETTINGS_PATH), &settings).await?;
             }
             AdapterFlavor::Codex { trust_config } => {
@@ -491,10 +512,10 @@ impl AgentAdapter for CliAgentAdapter {
     }
 
     fn classify_screen_attention(&self, screen: &str) -> Option<TerminalAttentionState> {
-        match self.flavor {
+        match &self.flavor {
             // Claude Code reports its own permission prompts through the hook
             // path, which is more precise than matching rendered text.
-            AdapterFlavor::ClaudeCode => None,
+            AdapterFlavor::ClaudeCode { .. } => None,
             AdapterFlavor::Codex { .. } => codex_screen_needs_input(screen).then_some(TerminalAttentionState::NeedsInput),
         }
     }
@@ -550,6 +571,40 @@ async fn seed_codex_workspace_trust(runner: &dyn CommandRunner, cwd: &Path, conf
     }
     project["trust_level"] = value("trusted");
     runner.write_file(&config.path, &document.to_string()).await
+}
+
+async fn seed_claude_headless_state(runner: &dyn CommandRunner, cwd: &Path, config: &ClaudeStateConfig) -> Result<(), String> {
+    let _guard = config.lock.lock().await;
+    let output = runner
+        .run_output("pwd", &["-P"], cwd, &ChannelLabel::Noop)
+        .await
+        .map_err(|error| format!("resolve canonical Claude workspace {}: {error}", cwd.display()))?;
+    if !output.success {
+        return Err(format!("resolve canonical Claude workspace {}: {}", cwd.display(), output.stderr.trim()));
+    }
+    let canonical_cwd = output.stdout.trim();
+    if canonical_cwd.is_empty() {
+        return Err(format!("resolve canonical Claude workspace {}: `pwd -P` returned an empty path", cwd.display()));
+    }
+
+    let source = runner.ensure_file(&config.path, "{}").await?;
+    let mut state = serde_json::from_str::<serde_json::Value>(&source)
+        .map_err(|error| format!("parse Claude state {}: {error}", config.path.display()))?;
+    let root = state.as_object_mut().ok_or_else(|| format!("Claude state {} is not a JSON object", config.path.display()))?;
+    root.insert("hasCompletedOnboarding".to_string(), serde_json::Value::Bool(true));
+    let projects = root
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| format!("Claude state {} has a non-object `projects` value", config.path.display()))?;
+    let project = projects
+        .entry(canonical_cwd)
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| format!("Claude state {} has a non-object project entry for {canonical_cwd}", config.path.display()))?;
+    project.insert("hasTrustDialogAccepted".to_string(), serde_json::Value::Bool(true));
+    let rendered = serde_json::to_string_pretty(&state).map_err(|error| format!("render Claude state: {error}"))?;
+    runner.write_file(&config.path, &rendered).await
 }
 
 async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, cwd: &Path) -> Result<(), String> {
@@ -610,10 +665,16 @@ impl AgentAdapterRegistry {
     pub fn discover(env: &EnvironmentBag, runner: Arc<dyn CommandRunner>) -> Self {
         let mut registry = Self::default();
         if let Some(binary) = env.find_binary("claude") {
+            let state_path = env
+                .find_env_var("CLAUDE_CONFIG_DIR")
+                .map(|config_dir| PathBuf::from(config_dir).join(".claude.json"))
+                .or_else(|| env.find_env_var("HOME").map(|home| PathBuf::from(home).join(".claude.json")));
             registry.insert(Arc::new(CliAgentAdapter {
                 binary: binary.as_path().display().to_string(),
                 runner: Arc::clone(&runner),
-                flavor: AdapterFlavor::ClaudeCode,
+                flavor: AdapterFlavor::ClaudeCode {
+                    state_config: state_path.map(|path| ClaudeStateConfig { path, lock: Arc::new(Mutex::new(())) }),
+                },
             }));
         }
         if let Some(binary) = env.find_binary("codex") {
@@ -1153,8 +1214,12 @@ mod tests {
     async fn claude_prepare_writes_a_settings_overlay_the_launch_command_loads() {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
+        let claude_config = temp.path().join("claude-config");
         std::fs::create_dir_all(&workspace).expect("workspace");
-        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
+        std::fs::create_dir_all(&claude_config).expect("Claude config");
+        let env = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("CLAUDE_CONFIG_DIR", claude_config.display().to_string()))
+            .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
         let claude = registry.get("claude-code").expect("claude adapter");
         let brief =
@@ -1172,9 +1237,14 @@ mod tests {
                 .expect("parse settings");
         assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"], "flotilla hook claude-code session-start");
         assert_eq!(settings["hooks"]["Notification"][0]["matcher"], "permission_prompt");
-        // The overlay carries hooks only: anything else would silently override
-        // the user's own settings for the managed session.
-        assert_eq!(settings.as_object().expect("settings object").keys().collect::<Vec<_>>(), vec!["hooks"]);
+        assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
+
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(claude_config.join(".claude.json")).expect("read Claude state"))
+                .expect("parse Claude state");
+        let canonical_workspace = workspace.canonicalize().expect("canonical workspace").display().to_string();
+        assert_eq!(state["hasCompletedOnboarding"], true);
+        assert_eq!(state["projects"][canonical_workspace]["hasTrustDialogAccepted"], true);
 
         claude.cleanup(&ExecutionEnvironmentPath::new(&workspace), &brief).await.expect("cleanup");
         assert!(!workspace.join(".flotilla/claude-settings.json").exists(), "settings overlay should be removed");
@@ -1182,16 +1252,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_needs_no_workspace_trust_seeding_for_any_checkout_shape() {
-        // `--dangerously-skip-permissions` clears the directory-trust gate, so
-        // unlike Codex there is nothing to pre-seed — and preparing a workspace
-        // root that is not a git checkout (the multi-repo shape from #1002) must
-        // still succeed.
+    async fn claude_seeds_headless_state_for_a_multi_repo_workspace() {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace_root = temp.path().join("multi-repo-workspace");
+        let claude_config = temp.path().join("claude-config");
         std::fs::create_dir_all(workspace_root.join("repo-a")).expect("repo a");
         std::fs::create_dir_all(workspace_root.join("repo-b")).expect("repo b");
-        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
+        std::fs::create_dir_all(&claude_config).expect("Claude config");
+        let env = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("CLAUDE_CONFIG_DIR", claude_config.display().to_string()))
+            .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
         let brief =
             flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
@@ -1205,6 +1275,12 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(workspace_root.join(".flotilla/briefs/coder.md")).expect("brief"), "brief");
         assert!(workspace_root.join(".flotilla/claude-settings.json").exists());
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(claude_config.join(".claude.json")).expect("Claude state"))
+                .expect("parse Claude state");
+        let canonical_workspace = workspace_root.canonicalize().expect("canonical workspace").display().to_string();
+        assert_eq!(state["hasCompletedOnboarding"], true);
+        assert_eq!(state["projects"][canonical_workspace]["hasTrustDialogAccepted"], true);
     }
 
     #[test]

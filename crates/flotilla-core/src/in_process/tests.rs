@@ -7536,6 +7536,74 @@ async fn contained_workflow_grants_default_deny_and_admission_names_an_unheld_cr
 }
 
 #[tokio::test]
+async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    backend
+        .clone()
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&empty_input_meta("claude-max"), &CredentialSpecSpec {
+            consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
+            source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
+            lifecycle: CredentialLifecycle::Static,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("create Claude credential declaration");
+    let workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder()
+            .name("work".to_string())
+            .stance(Stance::Contained)
+            .crew(vec![CrewSpec::builder()
+                .role("coder".to_string())
+                .source(CrewSource::Agent {
+                    selector: Selector { capability: "code".to_string(), adapter: Some("claude-code".to_string()), model: None },
+                    prompt: None,
+                    brief_template: None,
+                })
+                .build()])
+            .build()])
+        .build();
+
+    let mut without_grant = workflow.clone();
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut without_grant)
+        .await
+        .expect("resolve default-deny grants");
+    let error = validate_workflow_credentials(&backend, "flotilla", &without_grant, None)
+        .await
+        .expect_err("contained Claude must not reach interactive login without OAuth");
+    assert_eq!(
+        error,
+        "contained agent adapter `claude-code` requires credential `claude-max`, but no matching CredentialGrant selected it"
+    );
+
+    backend
+        .clone()
+        .definitions::<CredentialGrant>("flotilla")
+        .create(
+            &empty_input_meta("claude-max-contained"),
+            &CredentialGrantSpec::builder()
+                .selector(
+                    CredentialGrantSelector::builder().stance(Stance::Contained).projects(BTreeSet::from(["flotilla".to_string()])).build(),
+                )
+                .credentials(BTreeSet::from(["claude-max".to_string()]))
+                .build(),
+        )
+        .await
+        .expect("create project-selected Claude grant");
+    let mut with_grant = workflow;
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut with_grant)
+        .await
+        .expect("resolve matching Claude grant");
+    assert_eq!(with_grant.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
+
+    create_docker_placement(&backend, "docker-claude", "host-a", BTreeSet::from(["claude-max".to_string()])).await;
+    let placement = backend.using::<PlacementPolicy>("flotilla").get("docker-claude").await.expect("get placement");
+    validate_workflow_credentials(&backend, "flotilla", &with_grant, Some(&placement))
+        .await
+        .expect("matching held OAuth grant admits contained Claude");
+}
+
+#[tokio::test]
 async fn credential_grant_repository_selector_becomes_the_vessel_credential_scope() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     let granted_repository = RepositoryKey("github.com-flotilla-org-flotilla".to_string());
