@@ -213,10 +213,11 @@ fn convoy_open_pr_routes_with_repository_context() {
 fn modal_is_a_focus_barrier_for_tab_switching() {
     let mut app = stub_app();
     let active = app.views.active_index();
-    app.execute_table_intent(TableIntent::StartConvoy {
+    app.execute_table_intent(TableIntent::DeleteConvoy {
+        row_id: RowId::new("flotilla/roadmap"),
         namespace: "flotilla".into(),
-        project: "roadmap".into(),
-        issue: issue("1457", true),
+        name: "roadmap".into(),
+        host: None,
     });
 
     app.handle_key(key(KeyCode::Char(']')));
