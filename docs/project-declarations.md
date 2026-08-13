@@ -101,7 +101,7 @@ presents-as: fleet
 `placement`, `stance`, and `presents-as` are optional. A stance preference
 overrides every vessel in the pinned workflow snapshot. `presents-as` is only
 a presentation annotation; `fleet` has no special scope semantics. Fleet-level
-independents are declared by convention in the fleet project.
+standing convoys are declared by convention in the fleet project.
 
 The ensure loop starts a missing convoy and restarts a failed or explicitly
 reaped convoy with exponential backoff. Convoy metadata records the entry name,
