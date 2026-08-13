@@ -77,6 +77,75 @@ fn turn_delivery_session_plans_preserve_terminal_lifecycle_invariants() {
 const TEST_LOCAL_ATTACH_HOST: &str = "local";
 
 #[tokio::test]
+async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_replica() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-host\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local-host"),
+        backend.clone(),
+    )
+    .await;
+    let host_id = daemon.local_host_id().expect("local host identity").to_string();
+
+    let stale_source = ResourceBackend::InMemory(InMemoryBackend::default());
+    stale_source
+        .using::<ResourceHost>("flotilla")
+        .create(&empty_input_meta(&host_id), &HostSpec { display_name: "local-host".to_string() })
+        .await
+        .expect("stale self-origin host");
+    backend
+        .replica_writer::<ResourceHost>(daemon.node_id.clone(), "flotilla")
+        .replace(&stale_source.using::<ResourceHost>("flotilla").list().await.expect("stale host list"), Utc::now())
+        .await
+        .expect("seed stale self-origin replica");
+
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let local = hosts
+        .create(&empty_input_meta(&host_id), &HostSpec { display_name: "local-host".to_string() })
+        .await
+        .expect("authoritative local host");
+    hosts
+        .update_status(&host_id, &local.metadata.resource_version, &HostStatus {
+            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
+            ..HostStatus::default()
+        })
+        .await
+        .expect("publish live local capacity");
+    backend
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &empty_input_meta("self-targeted"),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: host_id.clone(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("self-targeted placement policy");
+
+    daemon
+        .check_remote_placement_free_space_floor(
+            "flotilla",
+            Some(&PlacementDecision {
+                policy_name: "self-targeted".to_string(),
+                target_host: PlacementTargetHost { reference: host_id, display_name: "local-host".to_string() },
+                refused_candidates: Vec::new(),
+                viable_not_selected: Vec::new(),
+            }),
+        )
+        .await
+        .expect("healthy authoritative local capacity should admit self-targeted placement");
+}
+
+#[tokio::test]
 async fn standing_convoy_ensure_starts_restarts_with_backoff_and_recovers_from_reaping() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"standing-test\"\n").expect("daemon config");

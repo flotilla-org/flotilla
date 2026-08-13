@@ -3,10 +3,10 @@ use std::{collections::BTreeSet, time::Duration};
 use chrono::Utc;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    delete_resource_kind, Convoy, Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, InMemoryBackend, InputMeta, IssueSource,
-    OwnerReference, PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, RegardSpec,
-    RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TypedResolver, WatchEvent, WatchStart,
-    WorkflowTemplate,
+    delete_resource_kind, Convoy, Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, Host, HostSpec, HostStatus,
+    InMemoryBackend, InputMeta, IssueSource, OwnerReference, PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, Regard,
+    RegardExpiryPolicy, RegardSource, RegardSpec, RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, TypedResolver, WatchEvent, WatchStart, WorkflowTemplate,
 };
 use futures::StreamExt;
 use tokio::time::timeout;
@@ -352,6 +352,53 @@ pub async fn assert_missing_authority_delete_tombstones_replica_with_backend(bac
         delete_resource_kind(&backend, "flotilla", "convoys", "lost-at-authority").await.expect("repeat missing authority delete");
     assert!(repeated.already_deleted, "a retained name tombstone must make repeat deletion idempotent");
     assert!(timeout(Duration::from_millis(100), watch.next()).await.is_err(), "repeat deletion must not emit a fresh tombstone event");
+}
+
+pub async fn assert_local_authority_shadows_self_origin_replica_with_backend(backend: ResourceBackend) {
+    let local_root = flotilla_protocol::NodeId::new("local-root");
+    let backend = backend.with_local_root(local_root.clone());
+    let stale_source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let stale_hosts = stale_source.using::<Host>("flotilla");
+    stale_hosts
+        .create(&InputMeta::builder().name("local-host".to_string()).build(), &HostSpec::default())
+        .await
+        .expect("create stale self-origin host");
+    backend
+        .replica_writer::<Host>(local_root, "flotilla")
+        .replace(&stale_hosts.list().await.expect("list stale self-origin host"), Utc::now())
+        .await
+        .expect("seed stale self-origin replica");
+
+    let hosts = backend.using::<Host>("flotilla");
+    let local = hosts
+        .create(&InputMeta::builder().name("local-host".to_string()).build(), &HostSpec::default())
+        .await
+        .expect("create authoritative local host");
+    hosts
+        .update_status(&local.metadata.name, &local.metadata.resource_version, &HostStatus {
+            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
+            ..HostStatus::default()
+        })
+        .await
+        .expect("publish authoritative local capacity");
+
+    let visible = backend.including_replicas::<Host>("flotilla").list().await.expect("list converged host view");
+    assert_eq!(visible.items.len(), 1, "a stale self-origin replica must not remain visible beside local authority");
+    assert!(matches!(visible.items[0].provenance, ResourceProvenance::Local));
+    assert_eq!(visible.items[0].object.status.as_ref().and_then(|status| status.disk_free_bytes), Some(100 * 1024 * 1024 * 1024));
+
+    let mut visible_watch = backend.including_replicas::<Host>("flotilla").watch().await.expect("watch converged host view");
+    let stale = stale_hosts.get("local-host").await.expect("read stale self-origin host");
+    backend
+        .replica_writer::<Host>(flotilla_protocol::NodeId::new("local-root"), "flotilla")
+        .apply(WatchEvent::Modified(stale), Utc::now() + chrono::Duration::seconds(1))
+        .await
+        .expect("relay newer stale self-origin host");
+    assert!(
+        timeout(Duration::from_millis(100), visible_watch.next()).await.is_err(),
+        "a self-origin replica event must not overwrite the live local row"
+    );
 }
 
 pub async fn assert_watch_rejects_version_ahead_of_stream_with_backend(backend: ResourceBackend) {

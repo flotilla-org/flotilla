@@ -4961,9 +4961,6 @@ impl InProcessDaemon {
             return Ok(());
         };
         let target_host = &placement.target_host;
-        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == target_host.reference) {
-            return Ok(());
-        }
 
         let sources =
             self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
@@ -4981,10 +4978,19 @@ impl InProcessDaemon {
             return Ok(());
         }
 
-        let capacity = matching_sources
-            .into_iter()
-            .filter_map(|source| source.object.status)
-            .find_map(|status| status.admission_free_space_floor_bytes.map(|floor| (floor, status.disk_free_bytes)));
+        let owns_target_identity = self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == target_host.reference);
+        let capacity = if owns_target_identity {
+            matching_sources
+                .iter()
+                .find(|source| matches!(source.provenance, ResourceProvenance::Local))
+                .and_then(|source| source.object.status.as_ref())
+                .and_then(|status| status.admission_free_space_floor_bytes.map(|floor| (floor, status.disk_free_bytes)))
+        } else {
+            matching_sources
+                .into_iter()
+                .filter_map(|source| source.object.status)
+                .find_map(|status| status.admission_free_space_floor_bytes.map(|floor| (floor, status.disk_free_bytes)))
+        };
         let Some((floor_bytes, free_bytes)) = capacity else {
             return Err(format!("placement refused on host `{}`: admission free-space floor is unavailable", target_host.display_name));
         };

@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, marker::PhantomData};
+use std::{
+    collections::{BTreeMap, HashSet},
+    marker::PhantomData,
+};
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::NodeId;
@@ -160,7 +163,22 @@ impl<T: Resource> ReplicaReadResolver<T> {
                 .collect();
             return Ok(ReadResourceList { items });
         }
-        self.list_sources().await
+        let local_root = self.backend.local_root()?;
+        let mut listed = self.list_sources().await?;
+        let local_names = listed
+            .items
+            .iter()
+            .filter(|item| matches!(item.provenance, ResourceProvenance::Local))
+            .map(|item| item.object.metadata.name.clone())
+            .collect::<HashSet<_>>();
+        listed.items.retain(|item| {
+            !matches!(
+                &item.provenance,
+                ResourceProvenance::Replica { origin_root, .. }
+                    if origin_root == &local_root && local_names.contains(&item.object.metadata.name)
+            )
+        });
+        Ok(listed)
     }
 
     pub(crate) async fn list_sources(&self) -> Result<ReadResourceList<T>, ResourceError> {
@@ -198,7 +216,42 @@ impl<T: Resource> ReplicaReadResolver<T> {
         }
         let raw = self.watch_sources().await?;
         if T::REPLICATION_CLASS != crate::ReplicationClass::Definitions {
-            return Ok(raw);
+            let backend = self.backend.clone();
+            let namespace = self.namespace.clone();
+            let local_root = backend.local_root()?;
+            return Ok(raw
+                .filter_map(move |event| {
+                    let backend = backend.clone();
+                    let namespace = namespace.clone();
+                    let local_root = local_root.clone();
+                    async move {
+                        let event = match event {
+                            Ok(event) => event,
+                            Err(error) => return Some(Err(error)),
+                        };
+                        let self_origin_name = match &event {
+                            ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) | ReadWatchEvent::Deleted(item) => matches!(
+                                &item.provenance,
+                                ResourceProvenance::Replica { origin_root, .. } if origin_root == &local_root
+                            )
+                            .then_some(item.object.metadata.name.as_str()),
+                            ReadWatchEvent::DeletedByName { tombstone, provenance } => matches!(
+                                provenance,
+                                ResourceProvenance::Replica { origin_root, .. } if origin_root == &local_root
+                            )
+                            .then_some(tombstone.name.as_str()),
+                        };
+                        let Some(name) = self_origin_name else {
+                            return Some(Ok(event));
+                        };
+                        match backend.using::<T>(&namespace).get(name).await {
+                            Ok(_) => None,
+                            Err(ResourceError::NotFound { .. }) => Some(Ok(event)),
+                            Err(error) => Some(Err(error)),
+                        }
+                    }
+                })
+                .boxed());
         }
         let backend = self.backend.clone();
         let namespace = self.namespace.clone();
