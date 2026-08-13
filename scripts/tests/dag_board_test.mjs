@@ -8,7 +8,10 @@ const generated = {
     { ref: "flotilla-org/flotilla#11", status: "ready", title: "Next" },
   ],
   dependencyEdges: [{ from: "flotilla-org/flotilla#10", to: "flotilla-org/flotilla#11" }],
-  groups: { infrastructure: ["flotilla-org/flotilla#10"] },
+  groups: Object.fromEntries([
+    ["infrastructure", ["flotilla-org/flotilla#10"]],
+    ["__proto__", ["flotilla-org/flotilla#11"]],
+  ]),
 };
 const authored = {
   pulse: "The authored narrative stays authored.",
@@ -26,6 +29,7 @@ assert.equal(annotated.status, "landed", "generated status wins");
 assert.equal(annotated.detail, authored.tickets["flotilla-org/flotilla#10"].detail);
 assert.equal(annotated.noteStale, true);
 assert.equal(board.groups.infrastructure.label, "Infrastructure");
+assert.equal(Object.hasOwn(board.groups, "__proto__"), true, "external labels remain own properties");
 assert.equal(board.edges.length, 2);
 assert.equal(noteIsStale({ status: "ready" }, { detail: "new", statusAtAuthoring: "ready" }), false);
 assert.equal(noteIsStale({ status: "ready" }, { detail: "old" }), false, "legacy notes without a status are not guessed stale");

@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 REPOSITORIES = ("flotilla-org/andamento", "flotilla-org/flotilla")
 ISSUE_FIELDS = (
-    "number,title,state,url,updatedAt,closedAt,labels,blockedBy,blocking,"
+    "number,title,state,url,updatedAt,closedAt,labels,blockedBy,"
     "closedByPullRequestsReferences"
 )
 PR_FIELDS = "number,state,url,mergedAt,mergeStateStatus,statusCheckRollup"
@@ -24,11 +24,13 @@ PR_FIELDS = "number,state,url,mergedAt,mergeStateStatus,statusCheckRollup"
 
 def command_json(arguments: list[str]) -> Any:
     try:
-        result = subprocess.run(arguments, check=True, stdout=subprocess.PIPE, text=True)
+        result = subprocess.run(arguments, check=True, stdout=subprocess.PIPE, text=True, timeout=300)
     except FileNotFoundError as error:
         raise SystemExit(f"required command not found: {arguments[0]}") from error
     except subprocess.CalledProcessError as error:
         raise SystemExit(f"command failed ({error.returncode}): {' '.join(arguments)}") from error
+    except subprocess.TimeoutExpired as error:
+        raise SystemExit(f"command timed out after 300 seconds: {' '.join(arguments)}") from error
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError as error:

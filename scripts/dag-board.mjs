@@ -20,7 +20,9 @@ export function mergeLayers(generated, authored) {
     };
   });
 
-  const groups = {};
+  // Label names are external keys; a null prototype keeps names such as
+  // `__proto__` as ordinary own properties.
+  const groups = Object.create(null);
   for (const [name, refs] of Object.entries(generated.groups || {})) {
     groups[name] = { name, label: name, ticketRefs: [...refs], ...(authored.groups?.[name] || {}) };
   }
