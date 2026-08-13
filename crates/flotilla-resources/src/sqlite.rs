@@ -265,6 +265,9 @@ impl SqliteBackend {
                     PRIMARY KEY (origin_root, group_name, version, kind, namespace, name)
                 );
 
+                CREATE INDEX IF NOT EXISTS replica_objects_by_resource_name
+                    ON replica_objects (group_name, version, kind, namespace, name, origin_root);
+
                 CREATE TABLE IF NOT EXISTS replica_cursors (
                     origin_root TEXT NOT NULL,
                     group_name TEXT NOT NULL,

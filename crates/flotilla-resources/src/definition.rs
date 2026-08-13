@@ -48,13 +48,7 @@ impl<T: Resource> DefinitionResolver<T> {
             return Err(ResourceError::not_found(name));
         }
         let object = merge_sources(&sources)?;
-        let deleted = object
-            .metadata
-            .merge
-            .as_ref()
-            .and_then(|merge| merge.fields.get(DELETION_FIELD))
-            .is_some_and(|_| object.metadata.deletion_timestamp.is_some());
-        if deleted && !object.metadata.merge.as_ref().is_some_and(|merge| merge.conflicts.contains_key(DELETION_FIELD)) {
+        if !definition_is_visible(&object) {
             return Err(ResourceError::not_found(name));
         }
         Ok(object)
@@ -69,13 +63,7 @@ impl<T: Resource> DefinitionResolver<T> {
         let mut merged = Vec::with_capacity(by_name.len());
         for sources in by_name.into_values() {
             let object = merge_sources(&sources)?;
-            let deleted = object
-                .metadata
-                .merge
-                .as_ref()
-                .and_then(|merge| merge.fields.get(DELETION_FIELD))
-                .is_some_and(|_| object.metadata.deletion_timestamp.is_some());
-            if !deleted || object.metadata.merge.as_ref().is_some_and(|merge| merge.conflicts.contains_key(DELETION_FIELD)) {
+            if definition_is_visible(&object) {
                 merged.push(object);
             }
         }
@@ -262,6 +250,16 @@ impl<T: Resource> DefinitionResolver<T> {
         }));
         Ok(sources)
     }
+}
+
+fn definition_is_visible<T: Resource>(object: &ResourceObject<T>) -> bool {
+    let deleted = object
+        .metadata
+        .merge
+        .as_ref()
+        .and_then(|merge| merge.fields.get(DELETION_FIELD))
+        .is_some_and(|_| object.metadata.deletion_timestamp.is_some());
+    !deleted || object.metadata.merge.as_ref().is_some_and(|merge| merge.conflicts.contains_key(DELETION_FIELD))
 }
 
 fn ensure_definitions<T: Resource>() -> Result<(), ResourceError> {
