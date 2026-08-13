@@ -532,8 +532,9 @@ mod command_result_human {
     use flotilla_protocol::{
         commands::{CheckoutStatus, CommandValue, RepositoryIdentityChange, ResourceJsonResponse},
         qualified_path::{HostId, QualifiedPath},
-        CrewListMember, CrewListResponse, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow,
-        FleetObservationAgreement, FleetReplicaStatus, FleetStaleness, HostName, NodeId, PeerConnectionState, PreparedWorkspace,
+        CrewAttention, CrewListMember, CrewListResponse, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse,
+        FleetListRow, FleetObservationAgreement, FleetReplicaStatus, FleetStaleness, HostName, NodeId, PeerConnectionState,
+        PreparedWorkspace,
     };
 
     use crate::cli::format_command_result;
@@ -748,6 +749,7 @@ mod command_result_human {
                 .authority("adopted")
                 .crew("implement/coder")
                 .crew_state("running")
+                .attention(CrewAttention::NeedsInput)
                 .host(HostName::new("feta"))
                 .namespace("dev")
                 .staleness(FleetStaleness::Unreachable { last_sync: None, message: "connection refused".to_string() })
@@ -922,6 +924,7 @@ mod command_result_human {
                     role: "coder".into(),
                     kind: "agent".into(),
                     state: "active".into(),
+                    attention: Some(CrewAttention::Stalled),
                     adapter: Some("codex".into()),
                     model: None,
                     stance: Some("trusted-implicit".into()),
@@ -930,6 +933,7 @@ mod command_result_human {
                     role: "reviewer".into(),
                     kind: "agent".into(),
                     state: "latent".into(),
+                    attention: None,
                     adapter: None,
                     model: None,
                     stance: None,
@@ -942,6 +946,7 @@ mod command_result_human {
         assert!(output.contains("Convoy: convoy-a"));
         assert!(output.contains("coder"));
         assert!(output.contains("active"));
+        assert!(output.contains("stalled"));
         assert!(output.contains("reviewer"));
         assert!(output.contains("latent"));
         assert!(output.contains("trusted-implicit"));

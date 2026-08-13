@@ -439,7 +439,7 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
     } else {
         let mut table = Table::new();
         table.load_preset(UTF8_FULL_CONDENSED);
-        table.set_header(vec!["Convoy", "Vessel", "Crew", "State", "Host", "Placement", "Staleness"]);
+        table.set_header(vec!["Convoy", "Vessel", "Crew", "State", "Attention", "Host", "Placement", "Staleness"]);
         for row in &response.rows {
             let vessel = match &row.authority {
                 Some(authority) => format!("{} ({authority})", row.vessel),
@@ -450,6 +450,7 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
                 Cell::new(vessel),
                 Cell::new(&row.crew),
                 Cell::new(&row.crew_state),
+                Cell::new(row.attention.map_or_else(|| "-".to_string(), |attention| attention.to_string())),
                 Cell::new(row.host.as_str()),
                 Cell::new(row.placement_decision.as_ref().map_or_else(
                     || "-".to_string(),
@@ -518,12 +519,13 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
 fn format_crew_list_human(response: &CrewListResponse) -> String {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Role", "Kind", "State", "Adapter", "Model", "Stance"]);
+    table.set_header(vec!["Role", "Kind", "State", "Attention", "Adapter", "Model", "Stance"]);
     for member in &response.members {
         table.add_row(vec![
             Cell::new(&member.role),
             Cell::new(&member.kind),
             Cell::new(&member.state),
+            Cell::new(member.attention.map_or_else(|| "-".to_string(), |attention| attention.to_string())),
             Cell::new(member.adapter.as_deref().unwrap_or("-")),
             Cell::new(member.model.as_deref().unwrap_or("-")),
             Cell::new(member.stance.as_deref().unwrap_or("-")),

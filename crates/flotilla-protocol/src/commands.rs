@@ -1562,6 +1562,7 @@ mod tests {
                     role: "coder".into(),
                     kind: "agent".into(),
                     state: "active".into(),
+                    attention: None,
                     adapter: Some("codex".into()),
                     model: None,
                     stance: Some("trusted-implicit".into()),

@@ -14,7 +14,7 @@ use flotilla_protocol::{
         IndependentRow, IssueRow, QueryId, ResultSet, ResultSetState, Rows, SessionPhase,
     },
     test_support::TestIssue,
-    AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, ConvoyStartIntent,
+    AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, ConvoyStartIntent, CrewAttention,
     CrewCommandContext, DaemonEvent, EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostProviderStatus, HostSummary, ImageId,
     Issue, IssueRef, IssueSource, IssueState, PlacementDecision, PlacementTargetHost, QueryCursor, QueryScope, RepoSelector, RepositoryKey,
     ResourceRef, ResultSetCondition, SystemInfo, ToolInventory, TopologyRoute, AGENT_ADAPTER_PROVIDER_CATEGORY,
@@ -30,11 +30,12 @@ use flotilla_resources::{
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, LifecycleAuthority,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, PlacementStatus, Project,
     ProjectRepositorySpec, ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus, Selector, Stance,
-    TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
-    Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, VirtualClock, WorkCompletionAuthority, WorkPhase, WorkState,
-    WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL,
-    MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase,
+    VesselRequirement, VesselSpec, VesselStatus, VirtualClock, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, MANAGED_BY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -2758,6 +2759,12 @@ async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
     let env_ref = create_local_attach_environment(&daemon).await;
     create_two_agent_crew(&daemon, &env_ref).await;
     let context = CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() };
+    let sessions = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
+    let coder = sessions.get("terminal-demo-implement-coder").await.expect("coder session");
+    let mut status = coder.status.expect("running coder status");
+    status.attention =
+        Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: Utc::now(), source: TerminalAttentionSource::Screen });
+    sessions.update_status("terminal-demo-implement-coder", &coder.metadata.resource_version, &status).await.expect("observe idle coder");
 
     let response = daemon
         .execute_query(
@@ -2776,6 +2783,8 @@ async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
         ("coder", "active"),
         ("reviewer", "latent")
     ]);
+    assert_eq!(response.members[0].attention, Some(CrewAttention::Stalled));
+    assert_eq!(response.members[1].attention, None);
 
     let mut events = daemon.subscribe();
     let complete_id = daemon
@@ -3000,6 +3009,15 @@ async fn fleet_list_reports_store_backed_local_sessions_with_authority() {
     create_adopted_checkout_for_convoy(&daemon, "convoy-a").await;
     create_running_attach_session(&daemon, &env_ref, "terminal-convoy-a-implement-coder", "session-a", "convoy-a", "implement", "coder")
         .await;
+    let terminals = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
+    let session = terminals.get("terminal-convoy-a-implement-coder").await.expect("running session");
+    let mut status = session.status.expect("session status");
+    status.attention =
+        Some(TerminalAttention { state: TerminalAttentionState::NeedsInput, as_of: Utc::now(), source: TerminalAttentionSource::Screen });
+    terminals
+        .update_status("terminal-convoy-a-implement-coder", &session.metadata.resource_version, &status)
+        .await
+        .expect("attention status");
 
     let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
 
@@ -3011,6 +3029,7 @@ async fn fleet_list_reports_store_backed_local_sessions_with_authority() {
     assert_eq!(row.authority.as_deref(), Some("adopted"));
     assert_eq!(row.crew, "implement/coder");
     assert_eq!(row.crew_state, "running");
+    assert_eq!(row.attention, Some(CrewAttention::NeedsInput));
     assert_eq!(row.host, daemon.host_name);
     assert_eq!(row.staleness, FleetStaleness::Local);
 

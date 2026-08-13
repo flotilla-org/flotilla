@@ -22,15 +22,15 @@ use flotilla_protocol::{
     commands::{AttachMode, RepositoryIdentityChange},
     qualified_path::{HostId, QualifiedPath},
     result_set::{CheckoutRow, ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
-    AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CorrelationKey, CrewCommandContext,
-    CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry, DispatchQueueResponse, DispatchQueueRow, EnvironmentId, EvidenceFreshness,
-    ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedLeafFiring, ExplainedSettlement,
-    ExplainedSubscription, ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse,
-    FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
-    HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
-    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
-    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity, RepoInfo,
-    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor,
+    AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CorrelationKey, CrewAttention,
+    CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry, DispatchQueueResponse, DispatchQueueRow, EnvironmentId,
+    EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedLeafFiring,
+    ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness,
+    FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse,
+    HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState,
+    PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry,
+    ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity,
+    RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor,
     ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef,
     StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress,
     AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
@@ -45,17 +45,17 @@ use flotilla_resources::{
     watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
     ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase,
     Demand as ResourceDemand, Environment as ResourceEnvironment, HoldAct, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
     IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
     PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec,
     ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
-    SettlementMode, SystemClock, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
-    TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
-    WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
+    WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -762,6 +762,21 @@ fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
         Some(ResourceTerminalSessionPhase::Stopped) => "stopped".to_string(),
         Some(ResourceTerminalSessionPhase::Failed) => "failed".to_string(),
     }
+}
+
+fn crew_attention(status: Option<&TerminalSessionStatus>, work_unsettled: bool, now: DateTime<Utc>) -> Option<CrewAttention> {
+    let status = status.filter(|status| status.phase == ResourceTerminalSessionPhase::Running)?;
+    let attention = status.attention.as_ref()?;
+    if attention.is_stale_at(now) {
+        return Some(CrewAttention::Unobservable);
+    }
+    Some(match attention.state {
+        TerminalAttentionState::Working => CrewAttention::Working,
+        TerminalAttentionState::NeedsInput => CrewAttention::NeedsInput,
+        TerminalAttentionState::Idle if work_unsettled => CrewAttention::Stalled,
+        TerminalAttentionState::Idle => CrewAttention::Idle,
+        TerminalAttentionState::Unobservable => CrewAttention::Unobservable,
+    })
 }
 
 fn convoy_state_label(row: &ConvoyRow) -> String {
@@ -7052,6 +7067,12 @@ impl InProcessDaemon {
             .iter()
             .map(|process| {
                 let session = by_role.get(&process.role);
+                let work_unsettled = convoy
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.crew_work.get(&context.vessel))
+                    .and_then(|crew| crew.get(&process.role))
+                    .is_none_or(|work| !matches!(work.phase, CrewWorkPhase::Done | CrewWorkPhase::Failed));
                 let state = match session.and_then(|session| session.status.as_ref().map(|status| status.phase)) {
                     Some(ResourceTerminalSessionPhase::Starting) => "starting",
                     Some(ResourceTerminalSessionPhase::Running) => "active",
@@ -7065,6 +7086,7 @@ impl InProcessDaemon {
                     .role(process.role.clone())
                     .kind(if matches!(process.source, CrewSource::Agent { .. }) { "agent" } else { "tool" }.to_string())
                     .state(state.to_string())
+                    .maybe_attention(crew_attention(session.and_then(|session| session.status.as_ref()), work_unsettled, Utc::now()))
                     .maybe_adapter(crew.map(|crew| crew.adapter.clone()))
                     .maybe_model(crew.and_then(|crew| crew.model.clone()))
                     .maybe_stance(crew.map(|crew| crew.stance.clone()))
@@ -7713,6 +7735,7 @@ impl InProcessDaemon {
         let terminal_sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
         let environments = self.resource_backend.clone().using::<ResourceEnvironment>(namespace);
         let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let observed_checkouts = self.observed_resource_backend.clone().using::<ResourceCheckout>(namespace);
 
         let session_list = terminal_sessions.list().await.map_err(|err| err.to_string())?;
@@ -7734,6 +7757,28 @@ impl InProcessDaemon {
             .into_iter()
             .map(|environment| (environment.metadata.name.clone(), environment))
             .collect();
+        let work_unsettled = convoys
+            .list()
+            .await
+            .map_err(|err| err.to_string())?
+            .items
+            .into_iter()
+            .flat_map(|convoy| {
+                let convoy_name = convoy.metadata.name;
+                convoy.status.into_iter().flat_map(move |status| {
+                    let convoy_name = convoy_name.clone();
+                    status.crew_work.into_iter().flat_map(move |(vessel, crew)| {
+                        let convoy_name = convoy_name.clone();
+                        crew.into_iter().map(move |(role, work)| {
+                            (
+                                (convoy_name.clone(), vessel.clone(), role),
+                                !matches!(work.phase, CrewWorkPhase::Done | CrewWorkPhase::Failed),
+                            )
+                        })
+                    })
+                })
+            })
+            .collect::<HashMap<_, _>>();
         let mut authority_by_convoy = HashMap::new();
         for checkout in checkouts.list().await.map_err(|err| err.to_string())?.items {
             let Some(convoy) = checkout.metadata.labels.get(CONVOY_LABEL).cloned() else {
@@ -7755,10 +7800,18 @@ impl InProcessDaemon {
             let convoy = labels.get(CONVOY_LABEL).cloned().unwrap_or_else(|| "-".to_string());
             let task = labels.get(VESSEL_LABEL).cloned();
             let role = labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
-            let crew = match task {
+            let crew = match task.as_ref() {
                 Some(task) => format!("{task}/{role}"),
                 None => role,
             };
+            let attention = crew_attention(
+                session.status.as_ref(),
+                task.as_ref()
+                    .and_then(|task| work_unsettled.get(&(convoy.clone(), task.clone(), session.spec.role.clone())))
+                    .copied()
+                    .unwrap_or(true),
+                Utc::now(),
+            );
             let convoy_key = (session.metadata.namespace.clone(), convoy.clone());
             let host = environment_map
                 .get(&session.spec.env_ref)
@@ -7772,6 +7825,7 @@ impl InProcessDaemon {
                     .maybe_authority(authority_by_convoy.get(&convoy).cloned().flatten())
                     .crew(crew)
                     .crew_state(session_status_label(session.status.as_ref().map(|status| status.phase)))
+                    .maybe_attention(attention)
                     .host(host)
                     .maybe_placement_decision(placement_by_convoy.get(&convoy_key).cloned())
                     .namespace(session.metadata.namespace.clone())
