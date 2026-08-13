@@ -105,6 +105,26 @@ fn turn_delivery_session_plans_preserve_terminal_lifecycle_invariants() {
 const TEST_LOCAL_ATTACH_HOST: &str = "local";
 
 #[tokio::test]
+async fn resource_host_routing_falls_back_to_unregistered_canonical_ref() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local-host"),
+        ResourceBackend::InMemory(InMemoryBackend::default()),
+    )
+    .await;
+
+    let target = daemon
+        .target_host_for_resource_ref("flotilla", "unregistered-host-id")
+        .await
+        .expect("unknown canonical ids remain routable for legacy environment records");
+
+    assert_eq!(target, HostName::new("unregistered-host-id"));
+}
+
+#[tokio::test]
 async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_replica() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-host\"\n").expect("daemon config");
@@ -171,6 +191,144 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
         )
         .await
         .expect("healthy authoritative local capacity should admit self-targeted placement");
+}
+
+#[tokio::test]
+async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-host\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local-host"),
+        backend.clone(),
+    )
+    .await;
+    let host_id = daemon.local_host_id().expect("local host identity").to_string();
+
+    let foreign_root = NodeId::new("foreign-root");
+    let foreign_authority = ResourceBackend::InMemory(InMemoryBackend::default());
+    foreign_authority
+        .using::<ResourceHost>("flotilla")
+        .create(&empty_input_meta(&host_id), &HostSpec { display_name: "local-host".to_string() })
+        .await
+        .expect("foreign peer's stale authoritative host");
+    let stale_hosts = foreign_authority.using::<ResourceHost>("flotilla").list().await.expect("stale foreign host list");
+
+    let relay = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("relay-root"));
+    relay
+        .replica_writer::<ResourceHost>(foreign_root.clone(), "flotilla")
+        .replace(&stale_hosts, Utc::now())
+        .await
+        .expect("relay foreign authoritative residue");
+    assert_eq!(
+        relay.including_replicas::<ResourceHost>("flotilla").list().await.expect("relay host view").items.len(),
+        1,
+        "the intermediate peer must hold the stale foreign record"
+    );
+    backend
+        .replica_writer::<ResourceHost>(foreign_root, "flotilla")
+        .replace(&stale_hosts, Utc::now())
+        .await
+        .expect("seed stale foreign-origin replica at admitting host");
+
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let local = hosts
+        .create(&empty_input_meta(&host_id), &HostSpec { display_name: "local-host".to_string() })
+        .await
+        .expect("authoritative local host");
+    hosts
+        .update_status(&host_id, &local.metadata.resource_version, &HostStatus {
+            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
+            ..HostStatus::default()
+        })
+        .await
+        .expect("publish live local capacity");
+    let policy = backend
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &empty_input_meta("self-targeted"),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: "local-host".to_string(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("self-targeted placement policy");
+    let target_host = placement_target_host(&backend, "flotilla", &policy).await.expect("resolve display-name host reference");
+    assert_eq!(target_host.reference, host_id, "placement decisions must carry the canonical Host resource id");
+    assert_eq!(
+        daemon.remote_host_direct_placement_host("flotilla", Some("self-targeted")).await.expect("resolve host-direct routing"),
+        None,
+        "a display-name alias for the local Host must not be routed as a remote host id"
+    );
+
+    daemon
+        .check_remote_placement_free_space_floor(
+            "flotilla",
+            Some(&PlacementDecision {
+                policy_name: "self-targeted".to_string(),
+                target_host,
+                refused_candidates: Vec::new(),
+                viable_not_selected: Vec::new(),
+            }),
+        )
+        .await
+        .expect("healthy authoritative local capacity should admit self-targeted placement");
+}
+
+#[tokio::test]
+async fn placement_target_host_rejects_unknown_display_name() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let policy = backend
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &empty_input_meta("unknown-host"),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: "missing-host".to_string(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("placement policy");
+
+    let error = placement_target_host(&backend, "flotilla", &policy).await.expect_err("unknown host alias must be rejected");
+    assert_eq!(error, "placement `unknown-host` references unknown host `missing-host`");
+}
+
+#[tokio::test]
+async fn placement_target_host_rejects_ambiguous_display_name() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    for host_id in ["host-id-a", "host-id-b"] {
+        hosts.create(&empty_input_meta(host_id), &HostSpec { display_name: "shared-name".to_string() }).await.expect("host");
+    }
+    let policy = backend
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &empty_input_meta("ambiguous-host"),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: "shared-name".to_string(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("placement policy");
+
+    let error = placement_target_host(&backend, "flotilla", &policy).await.expect_err("ambiguous host alias must be rejected");
+    assert_eq!(error, "placement `ambiguous-host` host reference `shared-name` is ambiguous");
 }
 
 #[tokio::test]
@@ -1078,6 +1236,46 @@ async fn default_placement_prefers_the_viable_local_host() {
 }
 
 #[tokio::test]
+async fn default_placement_prefers_local_host_referenced_by_display_name() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    create_host_direct_placement(&backend, "host-direct-a-remote", "remote-host", 0, BTreeSet::from(["codex".to_string()])).await;
+
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let local =
+        hosts.create(&empty_input_meta("local-host-id"), &HostSpec { display_name: "local-host".to_string() }).await.expect("local host");
+    hosts
+        .update_status(&local.metadata.name, &local.metadata.resource_version, &HostStatus {
+            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            ..HostStatus::default()
+        })
+        .await
+        .expect("local host status");
+    backend
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &empty_input_meta("host-direct-z-local"),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: "local-host".to_string(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("local placement");
+
+    let resolution = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), Some("local-host-id"))
+        .await
+        .expect("default placement");
+
+    assert_eq!(resolution.selected.expect("viable placement").metadata.name, "host-direct-z-local");
+    assert_eq!(resolution.viable_not_selected[0].reason, "fallback ordering preferred local policy `host-direct-z-local`");
+}
+
+#[tokio::test]
 async fn default_placement_priority_can_prefer_a_remote_work_host_over_the_local_desk() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     create_host_direct_placement(&backend, "host-direct-feta", "feta", 100, BTreeSet::from(["codex".to_string()])).await;
@@ -1134,6 +1332,46 @@ async fn default_placement_preserves_a_refusal_for_a_policy_without_a_target_hos
         resolution.refused_candidates[0].reason,
         "workflow requires agent adapter `codex`, which is not available in placement `a-malformed` (unknown target environment)"
     );
+}
+
+#[tokio::test]
+async fn default_placement_refuses_unknown_host_without_blocking_tool_workflow() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    backend
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &empty_input_meta("a-unknown-host"),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: "deleted-host".to_string(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("orphaned placement create");
+    create_host_direct_placement(&backend, "z-clean", "clean-host", 0, BTreeSet::new()).await;
+    let workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder()
+            .name("work".to_string())
+            .stance(Stance::Trusted)
+            .crew(vec![CrewSpec::builder()
+                .role("watcher".to_string())
+                .source(CrewSource::Tool { command: "tail -f log".to_string() })
+                .build()])
+            .build()])
+        .build();
+
+    let resolution = default_convoy_placement_policy(&backend, "flotilla", &workflow, None)
+        .await
+        .expect("one orphaned policy must not block a clean candidate");
+
+    assert_eq!(resolution.selected.expect("clean placement").metadata.name, "z-clean");
+    assert_eq!(resolution.refused_candidates.len(), 1);
+    assert_eq!(resolution.refused_candidates[0].policy_name, "a-unknown-host");
+    assert_eq!(resolution.refused_candidates[0].target_host.display_name, "no target host");
+    assert_eq!(resolution.refused_candidates[0].reason, "placement `a-unknown-host` references unknown host `deleted-host`");
 }
 
 #[tokio::test]
@@ -3063,6 +3301,42 @@ async fn fleet_list_reports_store_backed_local_sessions_with_authority() {
     let snapshot = daemon.fleet_replica_snapshot_internal().await.expect("fleet replica snapshot should succeed");
     assert_eq!(snapshot.host, daemon.host_name);
     assert_eq!(snapshot.rows, response.rows);
+}
+
+#[tokio::test]
+async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let local_env = create_local_attach_environment(&daemon).await;
+    let ambiguous_env = create_remote_attach_environment(&daemon, "shared-host").await;
+    let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
+    for host_id in ["shared-host-id-a", "shared-host-id-b"] {
+        hosts
+            .create(&empty_input_meta(host_id), &HostSpec { display_name: "shared-host".to_string() })
+            .await
+            .expect("ambiguous host record");
+    }
+    create_running_attach_session(
+        &daemon,
+        &ambiguous_env,
+        "terminal-ambiguous",
+        "session-ambiguous",
+        "convoy-ambiguous",
+        "work",
+        "watcher",
+    )
+    .await;
+    create_running_attach_session(&daemon, &local_env, "terminal-local", "session-local", "convoy-local", "work", "watcher").await;
+
+    let rows = daemon.fleet_list_internal().await.expect("one ambiguous alias must not fail the fleet listing").rows;
+    let hosts_by_convoy = rows.into_iter().map(|row| (row.convoy, row.host)).collect::<BTreeMap<_, _>>();
+
+    assert_eq!(hosts_by_convoy.get("convoy-ambiguous"), Some(&HostName::new("shared-host")));
+    assert_eq!(hosts_by_convoy.get("convoy-local"), Some(&daemon.host_name));
 }
 
 #[tokio::test]

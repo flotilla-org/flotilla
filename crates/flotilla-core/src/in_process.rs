@@ -50,8 +50,8 @@ use flotilla_resources::{
     HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
     IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
     PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec,
-    ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
-    SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    ProjectSpec, ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
     WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
@@ -1166,15 +1166,56 @@ async fn placement_target_host(
     policy: &ResourceObject<PlacementPolicy>,
 ) -> Result<PlacementTargetHost, String> {
     let host_ref = placement_host_ref(policy).ok_or_else(|| format!("placement `{}` has no target host", policy.metadata.name))?;
-    let display_name = backend
-        .clone()
-        .using::<ResourceHost>(namespace)
-        .get(host_ref)
+    canonical_placement_host_ref(backend, namespace, host_ref)
         .await
-        .ok()
-        .and_then(|host| (!host.spec.display_name.is_empty()).then_some(host.spec.display_name))
-        .unwrap_or_else(|| host_ref.to_string());
-    Ok(PlacementTargetHost { reference: host_ref.to_string(), display_name })
+        .and_then(|target| target.ok_or_else(|| format!("references unknown host `{host_ref}`")))
+        .map_err(|error| format!("placement `{}` {error}", policy.metadata.name))
+}
+
+async fn canonical_placement_host_ref(
+    backend: &ResourceBackend,
+    namespace: &str,
+    host_ref: &str,
+) -> Result<Option<PlacementTargetHost>, String> {
+    let hosts = backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
+    canonical_placement_host_ref_from_sources(&hosts.items, host_ref)
+}
+
+fn canonical_placement_host_ref_from_sources(
+    hosts: &[ReadResourceObject<ResourceHost>],
+    host_ref: &str,
+) -> Result<Option<PlacementTargetHost>, String> {
+    let exact = hosts.iter().find(|host| host.object.metadata.name == host_ref);
+    let resolved = if let Some(host) = exact {
+        host
+    } else {
+        let mut matching = hosts.iter().filter(|host| host.object.spec.display_name == host_ref);
+        let Some(host) = matching.next() else {
+            return Ok(None);
+        };
+        if matching.any(|candidate| candidate.object.metadata.name != host.object.metadata.name) {
+            return Err(format!("host reference `{host_ref}` is ambiguous"));
+        }
+        host
+    };
+    let display_name = if resolved.object.spec.display_name.is_empty() {
+        resolved.object.metadata.name.clone()
+    } else {
+        resolved.object.spec.display_name.clone()
+    };
+    Ok(Some(PlacementTargetHost { reference: resolved.object.metadata.name.clone(), display_name }))
+}
+
+fn check_placement_capacity(target_host: &PlacementTargetHost, capacity: Option<(u64, Option<u64>)>) -> Result<(), String> {
+    let Some((floor_bytes, free_bytes)) = capacity else {
+        return Err(format!("placement refused on host `{}`: admission free-space floor is unavailable", target_host.display_name));
+    };
+    if floor_bytes == 0 {
+        return Ok(());
+    }
+    let free_bytes =
+        free_bytes.ok_or_else(|| format!("placement refused on host `{}`: free space is unavailable", target_host.display_name))?;
+    crate::admission::check_measured_free_space(&target_host.display_name, free_bytes, floor_bytes)
 }
 
 async fn default_convoy_placement_policy(
@@ -1212,20 +1253,35 @@ async fn default_convoy_placement_policy(
             viable.push(policy);
         }
     }
+    let mut viable_targets = HashMap::new();
+    let mut resolved_viable = Vec::with_capacity(viable.len());
+    for policy in viable {
+        match placement_target_host(backend, namespace, &policy).await {
+            Ok(target_host) => {
+                viable_targets.insert(policy.metadata.name.clone(), target_host);
+                resolved_viable.push(policy);
+            }
+            Err(reason) => refused_candidates.push(PlacementRefusal {
+                policy_name: policy.metadata.name.clone(),
+                target_host: PlacementTargetHost { reference: String::new(), display_name: "no target host".to_string() },
+                reason,
+            }),
+        }
+    }
+    viable = resolved_viable;
     viable.sort_by_key(|policy| {
-        let target_host = placement_host_ref(policy);
-        let is_local = local_host_ref.is_some_and(|local| target_host == Some(local));
+        let target_host = &viable_targets[&policy.metadata.name].reference;
+        let is_local = local_host_ref.is_some_and(|local| target_host == local);
         let is_host_direct = policy.spec.host_direct.is_some();
         (Reverse(policy.spec.priority), !is_local, !is_host_direct, policy.metadata.name.clone())
     });
     if !viable.is_empty() {
         let selected = viable.remove(0);
+        let selected_target = viable_targets.remove(&selected.metadata.name).expect("viable placement target was resolved");
         let mut viable_not_selected = Vec::with_capacity(viable.len());
         for policy in viable {
-            let target_host = placement_target_host(backend, namespace, &policy)
-                .await
-                .unwrap_or_else(|_| PlacementTargetHost { reference: String::new(), display_name: "no target host".to_string() });
-            let reason = placement_ordering_reason(&selected, &policy, local_host_ref);
+            let target_host = viable_targets.remove(&policy.metadata.name).expect("viable placement target was resolved");
+            let reason = placement_ordering_reason(&selected, &selected_target, &policy, &target_host, local_host_ref);
             viable_not_selected.push(PlacementViableCandidate { policy_name: policy.metadata.name.clone(), target_host, reason });
         }
         return Ok(PlacementResolution { selected: Some(selected), refused_candidates, viable_not_selected });
@@ -1250,7 +1306,9 @@ async fn default_convoy_placement_policy(
 
 fn placement_ordering_reason(
     selected: &ResourceObject<PlacementPolicy>,
+    selected_target: &PlacementTargetHost,
     candidate: &ResourceObject<PlacementPolicy>,
+    candidate_target: &PlacementTargetHost,
     local_host_ref: Option<&str>,
 ) -> String {
     if candidate.spec.priority != selected.spec.priority {
@@ -1260,10 +1318,8 @@ fn placement_ordering_reason(
         );
     }
 
-    let selected_host = placement_host_ref(selected);
-    let candidate_host = placement_host_ref(candidate);
-    let selected_is_local = local_host_ref.is_some_and(|local| selected_host == Some(local));
-    let candidate_is_local = local_host_ref.is_some_and(|local| candidate_host == Some(local));
+    let selected_is_local = local_host_ref.is_some_and(|local| selected_target.reference == local);
+    let candidate_is_local = local_host_ref.is_some_and(|local| candidate_target.reference == local);
     if selected_is_local && !candidate_is_local {
         return format!("fallback ordering preferred local policy `{}`", selected.metadata.name);
     }
@@ -2874,13 +2930,14 @@ impl InProcessDaemon {
             .get(policy_name)
             .await
             .map_err(|error| format!("placement policy {policy_name}: {error}"))?;
-        let Some(host_direct) = policy.spec.host_direct else {
-            return Ok(None);
-        };
-        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == host_direct.host_ref) {
+        if policy.spec.host_direct.is_none() {
             return Ok(None);
         }
-        Ok(Some(flotilla_protocol::qualified_path::HostId::new(host_direct.host_ref)))
+        let target_host = placement_target_host(&self.resource_backend, namespace, &policy).await?;
+        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == target_host.reference) {
+            return Ok(None);
+        }
+        Ok(Some(flotilla_protocol::qualified_path::HostId::new(target_host.reference)))
     }
 
     pub async fn resolve_existing_convoy_target(
@@ -4279,20 +4336,14 @@ async fn validate_workflow_credentials(
     let placement = placement.ok_or_else(|| {
         format!("workflow requires credential `{}`, but no placement is available", required.first().expect("required is non-empty"))
     })?;
-    let host_ref = placement
-        .spec
-        .docker_per_vessel
-        .as_ref()
-        .map(|docker| docker.host_ref.as_str())
-        .or_else(|| placement.spec.host_direct.as_ref().map(|host| host.host_ref.as_str()))
-        .ok_or_else(|| format!("placement `{}` has no credential-bearing host", placement.metadata.name))?;
+    let target_host = placement_target_host(backend, namespace, placement).await?;
     let host = backend
         .clone()
         .using::<ResourceHost>(namespace)
-        .get(host_ref)
+        .get(&target_host.reference)
         .await
         .map_err(|error| format!("placement `{}` target host is not ready: {error}", placement.metadata.name))?;
-    let host_label = if host.spec.display_name.is_empty() { host_ref.to_string() } else { host.spec.display_name.clone() };
+    let host_label = target_host.display_name;
     let mut status =
         host.status.ok_or_else(|| format!("placement `{}` host `{host_label}` has no observed status", placement.metadata.name))?;
     status.apply_heartbeat_readiness(Utc::now());
@@ -4392,14 +4443,15 @@ async fn placement_agent_adapters(
 ) -> Result<(BTreeSet<String>, String), String> {
     if let Some(docker) = &placement.spec.docker_per_vessel {
         Ok((docker.agent_adapters.clone(), format!("image `{}`", docker.image)))
-    } else if let Some(host_direct) = &placement.spec.host_direct {
+    } else if placement.spec.host_direct.is_some() {
+        let target_host = placement_target_host(backend, namespace, placement).await?;
         let host = backend
             .clone()
             .using::<ResourceHost>(namespace)
-            .get(&host_direct.host_ref)
+            .get(&target_host.reference)
             .await
             .map_err(|error| format!("placement `{}` target host is not ready: {error}", placement.metadata.name))?;
-        let host_label = if host.spec.display_name.is_empty() { host_direct.host_ref.clone() } else { host.spec.display_name.clone() };
+        let host_label = target_host.display_name;
         let mut status =
             host.status.ok_or_else(|| format!("placement `{}` host `{host_label}` has no observed status", placement.metadata.name))?;
         status.apply_heartbeat_readiness(Utc::now());
@@ -5010,15 +5062,7 @@ impl InProcessDaemon {
                 .filter_map(|source| source.object.status)
                 .find_map(|status| status.admission_free_space_floor_bytes.map(|floor| (floor, status.disk_free_bytes)))
         };
-        let Some((floor_bytes, free_bytes)) = capacity else {
-            return Err(format!("placement refused on host `{}`: admission free-space floor is unavailable", target_host.display_name));
-        };
-        if floor_bytes == 0 {
-            return Ok(());
-        }
-        let free_bytes =
-            free_bytes.ok_or_else(|| format!("placement refused on host `{}`: free space is unavailable", target_host.display_name))?;
-        crate::admission::check_measured_free_space(&target_host.display_name, free_bytes, floor_bytes)
+        check_placement_capacity(target_host, capacity)
     }
 
     async fn create_convoy_with_workflow_snapshot(
@@ -7743,6 +7787,8 @@ impl InProcessDaemon {
         let observed_checkouts = self.observed_resource_backend.clone().using::<ResourceCheckout>(namespace);
 
         let session_list = terminal_sessions.list().await.map_err(|err| err.to_string())?;
+        let host_sources =
+            self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|err| err.to_string())?;
         let observed_generation = observed_checkouts.list().await.map_err(|err| err.to_string())?.generation;
         let result_sets = self.aggregator_projection_state().await.local_result_sets().await;
         let placement_by_convoy = result_sets
@@ -7810,11 +7856,18 @@ impl InProcessDaemon {
                 Utc::now(),
             );
             let convoy_key = (session.metadata.namespace.clone(), convoy.clone());
-            let host = environment_map
-                .get(&session.spec.env_ref)
-                .and_then(|environment| resource_environment_host_ref(environment))
-                .map(|host_ref| self.target_host_for_resource_ref(host_ref))
-                .unwrap_or_else(|| self.host_name.clone());
+            let host = if let Some(host_ref) =
+                environment_map.get(&session.spec.env_ref).and_then(|environment| resource_environment_host_ref(environment))
+            {
+                let canonical_ref = canonical_placement_host_ref_from_sources(&host_sources.items, host_ref)
+                    .ok()
+                    .flatten()
+                    .map(|target| target.reference)
+                    .unwrap_or_else(|| host_ref.to_string());
+                self.host_name_for_canonical_ref(&canonical_ref)
+            } else {
+                self.host_name.clone()
+            };
             rows.push(
                 FleetListRow::builder()
                     .convoy(convoy.clone())
@@ -8119,7 +8172,7 @@ impl InProcessDaemon {
             .map(|spec| spec.host_ref.as_str())
             .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
             .ok_or_else(|| format!("environment {} has no host binding", session.spec.env_ref))?;
-        let target_host = self.target_host_for_resource_ref(host_ref);
+        let target_host = self.target_host_for_resource_ref(&namespace, host_ref).await?;
         if target_host != self.host_name {
             let plan = self.recursive_attach_plan_for_remote(&target_host, reference, seat).await?;
             return Ok((plan, target_host));
@@ -8227,11 +8280,20 @@ impl InProcessDaemon {
         Ok(ResolvedAttachPlan(vec![ResolvedAttachAction::Command(attach_args)]))
     }
 
-    fn target_host_for_resource_ref(&self, host_ref: &str) -> HostName {
-        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == host_ref) {
+    async fn target_host_for_resource_ref(&self, namespace: &str, host_ref: &str) -> Result<HostName, String> {
+        let canonical_ref = match canonical_placement_host_ref(&self.resource_backend, namespace, host_ref).await {
+            Ok(Some(target_host)) => target_host.reference,
+            Ok(None) => host_ref.to_string(),
+            Err(error) => return Err(error),
+        };
+        Ok(self.host_name_for_canonical_ref(&canonical_ref))
+    }
+
+    fn host_name_for_canonical_ref(&self, canonical_ref: &str) -> HostName {
+        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == canonical_ref) {
             self.host_name.clone()
         } else {
-            HostName::new(host_ref)
+            HostName::new(canonical_ref)
         }
     }
 
@@ -8241,7 +8303,13 @@ impl InProcessDaemon {
         cwd: &Path,
     ) -> Result<Arc<crate::providers::registry::ProviderRegistry>, String> {
         let environment_id = if let Some(host_direct) = environment.spec.host_direct.as_ref() {
-            if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == host_direct.host_ref) {
+            let canonical_ref =
+                match canonical_placement_host_ref(&self.resource_backend, &environment.metadata.namespace, &host_direct.host_ref).await {
+                    Ok(Some(target_host)) => target_host.reference,
+                    Ok(None) => host_direct.host_ref.clone(),
+                    Err(error) => return Err(error),
+                };
+            if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == canonical_ref) {
                 self.local_environment_id.clone()
             } else {
                 EnvironmentId::new(environment.metadata.name.clone())
