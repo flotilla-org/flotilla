@@ -79,15 +79,16 @@ def wait_for_follower(follower: str):
     )
 
 
-def wait_for_checkout_on_workstation(branch: str, source: str):
+def wait_for_checkout_on_workstation(branch: str):
+    """Wait until the remote checkout resource has replicated to the hub."""
     wait_for(
         lambda: any(
-            item.get("branch") == branch and item.get("source") == source
-            for item in hub_json("workstation", "repo /home/flotilla/repo work")[
-                "work_items"
-            ]
+            (record.get("object") or {}).get("spec", {}).get("ref") == branch
+            for record in hub_json(
+                "workstation", "resource list checkouts --include-replicas"
+            )["records"]
         ),
-        f"workstation sees {branch} from {source}",
+        f"workstation sees replicated checkout resource for {branch}",
         timeout=30,
         interval=1.0,
     )
@@ -268,48 +269,6 @@ def test_provider_heterogeneity(hub_spoke_topology):
     assert no_gemini.returncode != 0
 
 
-def test_work_correlation_across_three_hosts(hub_spoke_topology):
-    """Matching main branches retain all three sources on workstation."""
-
-    def all_nodes_visible():
-        result = hub_json("workstation", "repo /home/flotilla/repo work")
-        sources = {
-            item["source"]
-            for item in result["work_items"]
-            if item.get("branch") == "master" and item["is_main_checkout"]
-        }
-        return set(NODES) <= sources
-
-    wait_for(
-        all_nodes_visible,
-        "workstation sees the main checkout from all three nodes",
-        timeout=30,
-        interval=1.0,
-    )
-
-
-def test_followers_receive_leader_data(hub_spoke_topology):
-    """A follower sees a workstation checkout through peer publication."""
-    checkout = hub_json(
-        "workstation",
-        "repo /home/flotilla/repo checkout --fresh feat-leader-data",
-    )
-    assert checkout["kind"] == "checkout_created"
-
-    wait_for(
-        lambda: any(
-            item.get("branch") == "feat-leader-data"
-            and item.get("source") == "workstation"
-            for item in hub_json("homelab-1", "repo /home/flotilla/repo work")[
-                "work_items"
-            ]
-        ),
-        "homelab-1 sees workstation checkout feat-leader-data",
-        timeout=30,
-        interval=1.0,
-    )
-
-
 def test_shpool_attachable_set_survives_daemon_restart(
     hub_spoke_topology,
 ):
@@ -320,8 +279,7 @@ def test_shpool_attachable_set_survives_daemon_restart(
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
-    wait_for_checkout_on_workstation("feat-shpool-persist", "homelab-1")
-
+    wait_for_checkout_on_workstation("feat-shpool-persist")
     prepared = hub_json(
         "workstation",
         f"host homelab-1 repo /home/flotilla/repo prepare-terminal {checkout_path}",
@@ -367,8 +325,7 @@ def test_terminal_without_shpool_uses_passthrough(hub_spoke_topology):
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
-    wait_for_checkout_on_workstation("feat-no-shpool", "homelab-2")
-
+    wait_for_checkout_on_workstation("feat-no-shpool")
     prepared = hub_json(
         "workstation",
         f"host homelab-2 repo /home/flotilla/repo prepare-terminal {checkout_path}",
@@ -392,7 +349,7 @@ def test_reprepare_reuses_attachable_identity(hub_spoke_topology):
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
-    wait_for_checkout_on_workstation("feat-workspace-reprepare", "homelab-1")
+    wait_for_checkout_on_workstation("feat-workspace-reprepare")
     command = (
         f"host homelab-1 repo /home/flotilla/repo prepare-terminal {checkout_path}"
     )

@@ -2751,7 +2751,6 @@ mod tests {
             reconnect: None,
             has_summary: true,
             repo_count: 0,
-            work_item_count: 0,
         }];
 
         let (environment_id, node_id) = select_host_target(&hosts, &HostName::new("desktop")).expect("resolve host");
@@ -2772,7 +2771,6 @@ mod tests {
                 reconnect: None,
                 has_summary: true,
                 repo_count: 0,
-                work_item_count: 0,
             },
             HostListEntry {
                 environment_id: Some(EnvironmentId::host(HostId::new("desktop-b"))),
@@ -2784,7 +2782,6 @@ mod tests {
                 reconnect: None,
                 has_summary: true,
                 repo_count: 0,
-                work_item_count: 0,
             },
         ];
 

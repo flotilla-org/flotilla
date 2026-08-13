@@ -1439,7 +1439,6 @@ mod tests {
                     reconnect: None,
                     has_summary: true,
                     repo_count: 1,
-                    work_item_count: 3,
                 }],
             })),
             CommandValue::ProjectList(Box::new(crate::ProjectListResponse { projects: vec![] })),
@@ -1474,7 +1473,6 @@ mod tests {
                 }),
                 visible_environments: vec![],
                 repo_count: 1,
-                work_item_count: 3,
             })),
             CommandValue::HostProviders(Box::new(HostProvidersResponse {
                 environment_id: EnvironmentId::host(HostId::new("desktop-host")),

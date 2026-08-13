@@ -83,18 +83,6 @@ def test_status_shows_repos(topology):
 
     repo = result["repos"][0]
     assert "path" in repo
-    assert "work_item_count" in repo
-
-
-def test_peer_repo_visible_in_merged_repo_work(topology):
-    """node-b's tracked repo is visible in node-a's merged repo work."""
-    result = flotilla_json(
-        topology["node-a"], "repo /home/flotilla/repo work"
-    )
-    assert any(
-        item.get("source") == "node-b"
-        for item in result.get("work_items", [])
-    )
 
 
 def test_remote_prepare_terminal_returns_attachable_set_id(topology):
@@ -106,17 +94,16 @@ def test_remote_prepare_terminal_returns_attachable_set_id(topology):
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
 
-    def checkout_visible_on_node_a():
-        result = flotilla_json(topology["node-a"], "repo /home/flotilla/repo work")
-        return any(
-            item.get("branch") == "feat-prepare"
-            and item.get("source") == "node-b"
-            for item in result.get("work_items", [])
-        )
-
     wait_for(
-        checkout_visible_on_node_a,
-        "node-a sees node-b checkout feat-prepare",
+        lambda: any(
+            (record.get("object") or {}).get("spec", {}).get("ref")
+            == "feat-prepare"
+            for record in flotilla_json(
+                topology["node-a"],
+                "resource list checkouts --include-replicas",
+            )["records"]
+        ),
+        "node-a sees node-b's replicated checkout resource for feat-prepare",
         timeout=30,
         interval=1.0,
     )

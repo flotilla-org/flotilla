@@ -116,7 +116,7 @@ fn format_host_list_human(response: &flotilla_protocol::HostListResponse) -> Str
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Host", "Node", "Local", "Configured", "Status", "Summary", "Repos", "Work"]);
+    table.set_header(vec!["Host", "Node", "Local", "Configured", "Status", "Summary", "Repos"]);
     for host in &response.hosts {
         table.add_row(vec![
             Cell::new(host.host_name.as_str()),
@@ -131,7 +131,6 @@ fn format_host_list_human(response: &flotilla_protocol::HostListResponse) -> Str
             }),
             Cell::new(if host.has_summary { "yes" } else { "no" }),
             Cell::new(host.repo_count),
-            Cell::new(host.work_item_count),
         ]);
     }
     format!("{table}\n")
@@ -298,7 +297,6 @@ fn format_host_status_human(response: &HostStatusResponse) -> String {
     out.push_str(&format!("Status: {}\n", format_connection_status(&response.connection_status)));
     out.push_str(&format!("Configured: {}\n", if response.configured { "yes" } else { "no" }));
     out.push_str(&format!("Repositories: {}\n", response.repo_count));
-    out.push_str(&format!("Work Items: {}\n", response.work_item_count));
 
     if let Some(summary) = &response.summary {
         out.push_str("\nSystem:\n");

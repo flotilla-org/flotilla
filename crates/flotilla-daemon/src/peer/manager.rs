@@ -445,7 +445,6 @@ impl PeerManager {
                 reconnect,
                 has_summary: false,
                 repo_count: 0,
-                work_item_count: 0,
             });
         }
 

@@ -716,7 +716,6 @@ fn host_list_projection_enriches_every_environment_row_for_configured_node() {
                 reconnect: None,
                 has_summary: true,
                 repo_count: 0,
-                work_item_count: 0,
             })
             .collect(),
     };

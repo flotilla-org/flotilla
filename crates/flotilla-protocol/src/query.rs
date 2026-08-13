@@ -393,7 +393,6 @@ pub struct HostListEntry {
     /// non-`None` summary for this host.
     pub has_summary: bool,
     pub repo_count: usize,
-    pub work_item_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,7 +415,6 @@ pub struct HostStatusResponse {
     #[serde(default)]
     pub visible_environments: Vec<EnvironmentInfo>,
     pub repo_count: usize,
-    pub work_item_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -544,7 +542,6 @@ mod tests {
                 reconnect: None,
                 has_summary: false,
                 repo_count: 0,
-                work_item_count: 0,
             }],
         };
 
@@ -567,7 +564,6 @@ mod tests {
             summary: Some(sample_host_summary()),
             visible_environments: sample_visible_environments(),
             repo_count: 2,
-            work_item_count: 5,
         };
 
         let json = serde_json::to_value(&response).expect("serialize host status");
@@ -607,7 +603,6 @@ mod tests {
             summary: Some(sample_host_summary()),
             visible_environments: vec![],
             repo_count: 2,
-            work_item_count: 5,
         })
         .expect("serialize host status");
         value.as_object_mut().expect("object").remove("visible_environments");
