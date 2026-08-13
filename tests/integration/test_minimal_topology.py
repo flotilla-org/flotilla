@@ -96,14 +96,17 @@ def test_remote_prepare_terminal_returns_attachable_set_id(topology):
 
     wait_for(
         lambda: any(
-            (record.get("object") or {}).get("spec", {}).get("ref")
-            == "feat-prepare"
+            (record.get("object") or {})
+            .get("spec", {})
+            .get("identity", {})
+            .get("host_ref")
+            == "node-b"
             for record in flotilla_json(
                 topology["node-a"],
-                "resource list checkouts --include-replicas",
+                "resource list repositories --include-replicas",
             )["records"]
         ),
-        "node-a sees node-b's replicated checkout resource for feat-prepare",
+        "node-a sees node-b's replicated repository resource",
         timeout=30,
         interval=1.0,
     )
