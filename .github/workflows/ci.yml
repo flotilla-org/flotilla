@@ -37,6 +37,15 @@ jobs:
       - name: Check Rust formatting
         run: cargo +nightly-2026-03-12 fmt --check
 
+  dag-scripts:
+    name: DAG scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          python3 -m unittest scripts.tests.test_dag_fetch
+          node scripts/tests/dag_board_test.mjs
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
