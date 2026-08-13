@@ -56,6 +56,14 @@ def check_state(checks: list[dict[str, Any]]) -> str:
     return "success" if all(conclusion in acceptable for conclusion in conclusions) else "unknown"
 
 
+def resource_version_rank(value: Any) -> tuple[bool, int, str]:
+    text = str(value or "")
+    try:
+        return True, int(text), ""
+    except ValueError:
+        return False, 0, text
+
+
 def convoy_facts() -> dict[str, list[dict[str, Any]]]:
     resources = command_json(["flotilla", "resource", "list", "convoys", "--json"])
     fleet_list = command_json(["flotilla", "ls", "--json"])
@@ -66,7 +74,7 @@ def convoy_facts() -> dict[str, list[dict[str, Any]]]:
 
     # A peer can expose the same convoy through more than one provenance. Prefer
     # local authority, then the newest replica, without depending on input order.
-    records: dict[str, tuple[tuple[bool, str, str], dict[str, Any]]] = {}
+    records: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
     for record in resources.get("records", []):
         obj = record.get("object", {})
         name = obj.get("metadata", {}).get("name")
@@ -76,7 +84,7 @@ def convoy_facts() -> dict[str, list[dict[str, Any]]]:
         rank = (
             provenance.get("source") == "local",
             provenance.get("lastSyncedAt", ""),
-            obj.get("metadata", {}).get("resourceVersion", ""),
+            resource_version_rank(obj.get("metadata", {}).get("resourceVersion")),
         )
         old = records.get(name)
         if old is None or rank > old[0]:

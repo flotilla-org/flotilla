@@ -103,6 +103,7 @@ class DagFetchTest(unittest.TestCase):
                                 "metadata": {
                                     "name": "exact-association",
                                     "annotations": {"flotilla.work/last-synced-at": "2026-08-10T12:30:00Z"},
+                                    "resourceVersion": "9",
                                 },
                                 "spec": {
                                     "issues": [
@@ -123,18 +124,33 @@ class DagFetchTest(unittest.TestCase):
                                 },
                             },
                             "provenance": {"source": "replica", "lastSyncedAt": "2026-08-10T12:30:00Z"},
-                        }
-                    ]
-                },
-                "ls": {
-                    "rows": [
+                        },
                         {
-                            "convoy": "exact-association",
-                            "host": "kiwi",
-                            "staleness": {"kind": "current", "last_synced_at": "2026-08-10T12:30:00Z"},
+                            "object": {
+                                "metadata": {"name": "exact-association", "resourceVersion": "10"},
+                                "spec": {
+                                    "issues": [
+                                        {
+                                            "reference": {
+                                                "id": "3",
+                                                "source": {
+                                                    "service": "https://github.com",
+                                                    "scope": "flotilla-org/andamento",
+                                                },
+                                            }
+                                        }
+                                    ]
+                                },
+                                "status": {
+                                    "phase": "Active",
+                                    "placement_decision": {"target_host": {"display_name": "newer-host"}},
+                                },
+                            },
+                            "provenance": {"source": "replica", "lastSyncedAt": "2026-08-10T12:30:00Z"},
                         }
                     ]
                 },
+                "ls": {"rows": []},
             },
         )
 
@@ -171,8 +187,8 @@ print(json.dumps(data['resource' if sys.argv[1] == 'resource' else 'ls']))
         self.assertEqual(tickets["flotilla-org/flotilla#10"]["status"], "landed")
         self.assertEqual(tickets["flotilla-org/flotilla#12"]["status"], "blocked")
         self.assertEqual(tickets["flotilla-org/andamento#3"]["status"], "at-sea")
-        self.assertEqual(tickets["flotilla-org/andamento#3"]["convoys"][0]["host"], "kiwi")
-        self.assertEqual(tickets["flotilla-org/andamento#3"]["convoys"][0]["staleness"], {"kind": "current"})
+        self.assertEqual(tickets["flotilla-org/andamento#3"]["convoys"][0]["host"], "newer-host")
+        self.assertEqual(tickets["flotilla-org/andamento#3"]["convoys"][0]["staleness"], {"kind": "replica"})
         self.assertEqual(tickets["flotilla-org/flotilla#10"]["pullRequests"][0]["ci"], "success")
         self.assertEqual(
             generated["dependencyEdges"],
