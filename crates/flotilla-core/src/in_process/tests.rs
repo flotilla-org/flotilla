@@ -5437,6 +5437,46 @@ async fn create_empty_workflow(backend: &ResourceBackend, name: &str) {
 }
 
 #[tokio::test]
+async fn local_and_published_admission_capacity_use_checkout_root_when_state_is_on_another_mount() {
+    struct MountAwareAvailableSpaceProbe {
+        state_dir: PathBuf,
+        repo_default_dir: PathBuf,
+    }
+
+    impl crate::admission::AvailableSpaceProbe for MountAwareAvailableSpaceProbe {
+        fn measure(&self, path: &Path) -> Option<u64> {
+            const GIB: u64 = 1024 * 1024 * 1024;
+            if path == self.state_dir {
+                Some(100 * GIB)
+            } else if path == self.repo_default_dir {
+                Some(10 * GIB)
+            } else {
+                None
+            }
+        }
+    }
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_dir = temp.path().join("config");
+    let state_dir = temp.path().join("state-mount");
+    let repo_default_dir = temp.path().join("checkout-mount");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n\n[admission]\nfree_space_floor_gib = 20\n")
+        .expect("write daemon config");
+    let mut discovery = fake_discovery(false);
+    discovery.available_space_probe =
+        Arc::new(MountAwareAvailableSpaceProbe { state_dir: state_dir.clone(), repo_default_dir: repo_default_dir.clone() });
+    let config = Arc::new(ConfigStore::new(DaemonHostPath::new(config_dir), DaemonHostPath::new(state_dir)));
+    let daemon = InProcessDaemon::new(vec![], config, discovery, HostName::new("kiwi")).await;
+    daemon.set_admission_free_space_path(repo_default_dir);
+
+    let local_error = daemon.check_local_free_space_floor().await.expect_err("checkout mount below floor must be refused");
+
+    assert!(local_error.contains("10.0 GiB free is below the 20.0 GiB floor"), "{local_error}");
+    assert_eq!(daemon.admission_free_space_bytes().await.expect("published capacity measurement"), Some(10 * 1024 * 1024 * 1024));
+}
+
+#[tokio::test]
 async fn convoy_start_refuses_local_placement_below_configured_free_space_floor_without_creating_state() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");

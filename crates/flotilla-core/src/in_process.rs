@@ -1933,6 +1933,13 @@ pub struct InProcessDaemon {
     resource_replication_failures: RwLock<HashMap<NodeId, BTreeMap<String, String>>>,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
     local_placement_provider_statuses: RwLock<Vec<HostProviderStatus>>,
+    /// Filesystem path whose capacity governs convoy admission on this host.
+    ///
+    /// The daemon runtime sets this to the host-direct checkout root. Keeping
+    /// the path here makes the local gate and the capacity published to peers
+    /// use the same measurement basis even when daemon state is on another
+    /// mount.
+    admission_free_space_path: std::sync::RwLock<PathBuf>,
     leaf_subscriptions: LeafSubscriptionTable,
 }
 
@@ -2114,6 +2121,7 @@ impl InProcessDaemon {
             tracing::warn!(%error, "garbage collect orphaned change request observations at startup failed");
         }
         let leaf_subscriptions = LeafSubscriptionTable::new(resource_backend.clone(), event_tx.clone(), change_request_refresher);
+        let admission_free_space_path = config.state_dir().as_path().to_path_buf();
         let daemon = Arc::new_cyclic(|self_weak| Self {
             repos: RwLock::new(repos),
             repo_order: RwLock::new(order),
@@ -2152,6 +2160,7 @@ impl InProcessDaemon {
             resource_replication_failures: RwLock::new(HashMap::new()),
             repository_inspector: RwLock::new(None),
             local_placement_provider_statuses: RwLock::new(Vec::new()),
+            admission_free_space_path: std::sync::RwLock::new(admission_free_space_path),
             leaf_subscriptions: leaf_subscriptions.clone(),
         });
         leaf_subscriptions.set_turn_delivery_actuator(Arc::new(DaemonTurnDeliveryActuator { daemon: Arc::downgrade(&daemon) })).await;
@@ -2229,6 +2238,18 @@ impl InProcessDaemon {
         statuses.sort_by(|left, right| (&left.category, &left.implementation).cmp(&(&right.category, &right.implementation)));
         *self.local_placement_provider_statuses.write().await = statuses;
         let _ = self.refresh_local_host_summary().await;
+    }
+
+    /// Use `path` as the canonical capacity source for both local and
+    /// federated convoy admission.
+    pub fn set_admission_free_space_path(&self, path: PathBuf) {
+        *self.admission_free_space_path.write().expect("admission free-space path lock poisoned") = path;
+    }
+
+    pub async fn admission_free_space_bytes(&self) -> Result<Option<u64>, String> {
+        let path = self.admission_free_space_path.read().expect("admission free-space path lock poisoned").clone();
+        let probe = Arc::clone(&self.discovery.available_space_probe);
+        tokio::task::spawn_blocking(move || probe.measure(&path)).await.map_err(|error| format!("measure available disk space: {error}"))
     }
 
     pub fn local_environment_id(&self) -> &EnvironmentId {
@@ -4894,13 +4915,14 @@ impl InProcessDaemon {
     async fn check_local_free_space_floor(&self) -> Result<(), String> {
         let config = Arc::clone(&self.config);
         let available_space_probe = Arc::clone(&self.discovery.available_space_probe);
+        let admission_free_space_path = self.admission_free_space_path.read().expect("admission free-space path lock poisoned").clone();
         let host_name = self.host_name.to_string();
         tokio::task::spawn_blocking(move || {
             let daemon_config = config.load_daemon_config()?;
             crate::admission::check_free_space_floor(
                 &*available_space_probe,
                 &host_name,
-                config.state_dir().as_path(),
+                &admission_free_space_path,
                 daemon_config.admission.free_space_floor_gib,
             )
         })
