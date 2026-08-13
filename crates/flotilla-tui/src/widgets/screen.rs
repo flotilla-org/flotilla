@@ -1,7 +1,7 @@
-use std::{any::Any, collections::HashMap};
+use std::any::Any;
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{RepoIdentity, ViewAddress};
+use flotilla_protocol::ViewAddress;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     text::Line,
@@ -12,7 +12,6 @@ use ratatui::{
 use super::{
     overview_page::OverviewPage,
     project_page::ProjectPageWidget,
-    repo_page::RepoPage,
     status_bar_widget::{self, StatusBarWidget},
     table::TableWidget,
     tabs::Tabs,
@@ -32,7 +31,6 @@ enum ActivePage {
     Overview,
     Table,
     Project,
-    Repo(RepoIdentity),
     /// A repo view whose repo is no longer tracked, or an address that
     /// failed to parse: renders its own error, handles only shell actions.
     Error {
@@ -43,7 +41,7 @@ enum ActivePage {
 
 /// Root widget that owns the tab bar, page content, status bar, and modal stack.
 ///
-/// Renders the tab bar (via `Tabs`), page content (repo pages or overview
+/// Renders the tab bar (via `Tabs`), page content (resource views or overview
 /// page), status bar, and then any modals on top. Owns the `has_modal()`,
 /// `dismiss_modals()`, and `apply_outcome()` helpers that previously lived
 /// on `App`.
@@ -56,7 +54,6 @@ pub struct Screen {
     pub tabs: Tabs,
     pub status_bar: StatusBarWidget,
     pub modal_stack: Vec<Box<dyn InteractiveWidget>>,
-    pub repo_pages: HashMap<RepoIdentity, RepoPage>,
     pub overview_page: OverviewPage,
     pub table: TableWidget,
     pub project_page: ProjectPageWidget,
@@ -76,7 +73,6 @@ impl Screen {
             tabs: Tabs::new(),
             status_bar: StatusBarWidget::new(),
             modal_stack: Vec::new(),
-            repo_pages: HashMap::new(),
             overview_page: OverviewPage::new(),
             table: TableWidget::default(),
             project_page: ProjectPageWidget::default(),
@@ -127,7 +123,7 @@ impl Screen {
     /// Resolve what the active View dispatches to, applying the loud-failure
     /// rule: dangling repos and unparseable addresses become error pages,
     /// never a silent fallback to another view (ADR 0013).
-    fn active_page(&self, view: &crate::app::OpenView, repos: &HashMap<RepoIdentity, crate::app::TuiRepoModel>) -> ActivePage {
+    fn active_page(&self, view: &crate::app::OpenView) -> ActivePage {
         match &view.target {
             ViewTarget::View(ViewAddress::Overview) => ActivePage::Overview,
             ViewTarget::View(
@@ -139,16 +135,10 @@ impl Screen {
                 | ViewAddress::Checkouts { .. },
             ) => ActivePage::Table,
             ViewTarget::View(ViewAddress::Project { .. }) => ActivePage::Project,
-            ViewTarget::View(ViewAddress::Repo { identity, .. }) => {
-                if repos.contains_key(identity) {
-                    ActivePage::Repo(identity.clone())
-                } else {
-                    ActivePage::Error {
-                        title: format!("repo not tracked: {}/{}", identity.authority, identity.path),
-                        detail: format!("view address: {}", ViewAddress::repo(identity.clone()).human_label()),
-                    }
-                }
-            }
+            ViewTarget::View(ViewAddress::Repo { identity, .. }) => ActivePage::Error {
+                title: format!("repo views have been retired: {}/{}", identity.authority, identity.path),
+                detail: "Open a resource-fed project or checkout view instead.".to_string(),
+            },
             ViewTarget::Broken { raw, error } => ActivePage::Error { title: format!("invalid view address: {raw}"), detail: error.clone() },
         }
     }
@@ -243,7 +233,7 @@ impl InteractiveWidget for Screen {
         }
 
         // Phase 3: No modal — dispatch to the active View's page.
-        let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
+        let outcome = match self.active_page(ctx.views.active()) {
             ActivePage::Overview => self.overview_page.handle_action(action, ctx),
             ActivePage::Table => {
                 let outcome = self.table.handle_action(action, ctx);
@@ -262,10 +252,6 @@ impl InteractiveWidget for Screen {
                 }
             }
             ActivePage::Error { .. } => Self::fallback_page_action(action, ctx),
-            ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
-                Some(page) => page.handle_action(action, ctx),
-                None => Self::fallback_page_action(action, ctx),
-            },
         };
         if !matches!(outcome, Outcome::Ignored) {
             self.apply_outcome(outcome);
@@ -286,13 +272,9 @@ impl InteractiveWidget for Screen {
         }
 
         // No modal — dispatch to the active View's page
-        let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
+        let outcome = match self.active_page(ctx.views.active()) {
             ActivePage::Overview => self.overview_page.handle_raw_key(key, ctx),
             ActivePage::Table | ActivePage::Project | ActivePage::Error { .. } => Outcome::Ignored,
-            ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
-                Some(page) => page.handle_raw_key(key, ctx),
-                None => Outcome::Ignored,
-            },
         };
         if !matches!(outcome, Outcome::Ignored) {
             self.apply_outcome(outcome);
@@ -370,15 +352,11 @@ impl InteractiveWidget for Screen {
         }
 
         // Dispatch to the active View's page for content area mouse events
-        let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
+        let outcome = match self.active_page(ctx.views.active()) {
             ActivePage::Overview => self.overview_page.handle_mouse(mouse, ctx),
             ActivePage::Table => self.table.handle_mouse(mouse, ctx),
             ActivePage::Project => self.project_page.handle_mouse(mouse, ctx),
             ActivePage::Error { .. } => Outcome::Ignored,
-            ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
-                Some(page) => page.handle_mouse(mouse, ctx),
-                None => Outcome::Ignored,
-            },
         };
         if !matches!(outcome, Outcome::Ignored) {
             self.apply_outcome(outcome);
@@ -415,7 +393,7 @@ impl InteractiveWidget for Screen {
         }
 
         // 3. Content: dispatch to the active View's page
-        let active_page = self.active_page(ctx.views.active(), &ctx.model.repos);
+        let active_page = self.active_page(ctx.views.active());
         match &active_page {
             ActivePage::Table => {
                 let address = ctx.views.active_address().cloned().expect("table page has a parsed address");
@@ -436,19 +414,6 @@ impl InteractiveWidget for Screen {
             }
             ActivePage::Project => self.project_page.render(frame, chunks[2], ctx),
             ActivePage::Overview => self.overview_page.render(frame, chunks[2], ctx),
-            ActivePage::Repo(identity) => {
-                let identity = identity.clone();
-                match self.repo_pages.get_mut(&identity) {
-                    Some(page) => page.render(frame, chunks[2], ctx),
-                    None => Self::render_error_page(
-                        frame,
-                        chunks[2],
-                        ctx.theme,
-                        &format!("no page for repo: {}/{}", identity.authority, identity.path),
-                        "",
-                    ),
-                }
-            }
             ActivePage::Error { title, detail } => Self::render_error_page(frame, chunks[2], ctx.theme, title, detail),
         }
 
@@ -463,16 +428,12 @@ impl InteractiveWidget for Screen {
             (modal.binding_mode(), modal.status_fragment())
         } else {
             // Kind-level modes come from the page widget when it carries
-            // state (overview, repo pages), from `view_kind` otherwise; the
+            // state (overview and modals), from `view_kind` otherwise; the
             // shell layer (TabPage, TabShell unless scoped) composes here.
             match &active_page {
                 ActivePage::Overview => {
                     (view_kind::compose_with_shell(scoped, self.overview_page.binding_mode().modes()), self.overview_page.status_fragment())
                 }
-                ActivePage::Repo(identity) => match self.repo_pages.get(identity) {
-                    Some(page) => (view_kind::compose_with_shell(scoped, page.binding_mode().modes()), page.status_fragment()),
-                    None => (view_kind::compose_with_shell(scoped, []), StatusFragment::default()),
-                },
                 ActivePage::Table | ActivePage::Project => (view_kind::binding_mode(address, scoped), StatusFragment::default()),
                 ActivePage::Error { .. } => (view_kind::compose_with_shell(scoped, []), StatusFragment::default()),
             }

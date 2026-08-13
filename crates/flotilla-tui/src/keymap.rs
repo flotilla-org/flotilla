@@ -1,12 +1,11 @@
 // Keymap module: configurable key bindings for the TUI.
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 
 use crokey::KeyCombination;
 use flotilla_core::config::KeysConfig;
 
 use crate::{
-    app::intent::Intent,
     binding_table::{BindingModeId, CompiledBindings, KeyBindingMode, BINDINGS},
     status_bar::KeyChip,
 };
@@ -14,8 +13,7 @@ use crate::{
 /// An action that can be triggered by a key binding.
 ///
 /// Most variants correspond to UI-level operations (navigation, mode transitions).
-/// `Dispatch(Intent)` wraps an `Intent` for actions that go through the executor pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     SelectNext,
     SelectPrev,
@@ -32,15 +30,11 @@ pub enum Action {
     CloseTab,
     ToggleHelp,
     ToggleMultiSelect,
-    ToggleProviders,
-    ToggleArchived,
     ToggleDebug,
     ToggleStatusBarKeys,
     CycleHost,
-    CycleLayout,
     CycleTheme,
     OpenActionMenu,
-    OpenBranchInput,
     OpenFind,
     FetchMore,
     OpenFilePicker,
@@ -54,16 +48,6 @@ pub enum Action {
     AttachConvoyVessel,
     /// Materialize or focus the selected convoy/vessel in the connected PM.
     OpenInPm,
-    Dispatch(Intent),
-}
-
-impl Hash for Action {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        if let Action::Dispatch(intent) = self {
-            std::mem::discriminant(intent).hash(state);
-        }
-    }
 }
 
 impl Action {
@@ -81,7 +65,6 @@ impl Action {
                 | Action::MoveTabRight
                 | Action::CloseTab
                 | Action::CycleTheme
-                | Action::CycleLayout
                 | Action::CycleHost
                 | Action::ToggleDebug
                 | Action::ToggleStatusBarKeys
@@ -91,8 +74,6 @@ impl Action {
 
     /// Parse an action from its snake_case config string representation.
     ///
-    /// Intent-wrapping actions use the intent name directly (e.g. "remove_checkout"
-    /// maps to `Action::Dispatch(Intent::RemoveCheckout)`).
     pub fn from_config_str(s: &str) -> Option<Action> {
         let action = match s {
             "select_next" => Action::SelectNext,
@@ -110,15 +91,11 @@ impl Action {
             "close_tab" => Action::CloseTab,
             "toggle_help" => Action::ToggleHelp,
             "toggle_multi_select" => Action::ToggleMultiSelect,
-            "toggle_providers" => Action::ToggleProviders,
-            "toggle_archived" => Action::ToggleArchived,
             "toggle_debug" => Action::ToggleDebug,
             "toggle_status_bar_keys" => Action::ToggleStatusBarKeys,
             "cycle_host" => Action::CycleHost,
-            "cycle_layout" => Action::CycleLayout,
             "cycle_theme" => Action::CycleTheme,
             "open_action_menu" => Action::OpenActionMenu,
-            "open_branch_input" => Action::OpenBranchInput,
             "open_find" => Action::OpenFind,
             "fetch_more" => Action::FetchMore,
             "open_file_picker" => Action::OpenFilePicker,
@@ -129,18 +106,6 @@ impl Action {
             "complete_convoy_work" => Action::CompleteConvoyWork,
             "attach_convoy_vessel" => Action::AttachConvoyVessel,
             "open_in_pm" => Action::OpenInPm,
-            // Intent-wrapping actions
-            "switch_to_workspace" => Action::Dispatch(Intent::SwitchToWorkspace),
-            "create_workspace" => Action::Dispatch(Intent::CreateWorkspace),
-            "remove_checkout" => Action::Dispatch(Intent::RemoveCheckout),
-            "create_checkout" => Action::Dispatch(Intent::CreateCheckout),
-            "generate_branch_name" => Action::Dispatch(Intent::GenerateBranchName),
-            "open_change_request" => Action::Dispatch(Intent::OpenChangeRequest),
-            "open_issue" => Action::Dispatch(Intent::OpenIssue),
-            "link_issues_to_change_request" => Action::Dispatch(Intent::LinkIssuesToChangeRequest),
-            "teleport_session" => Action::Dispatch(Intent::TeleportSession),
-            "archive_session" => Action::Dispatch(Intent::ArchiveSession),
-            "close_change_request" => Action::Dispatch(Intent::CloseChangeRequest),
             _ => return None,
         };
         Some(action)
@@ -166,15 +131,11 @@ impl Action {
             Action::CloseTab => "close_tab",
             Action::ToggleHelp => "toggle_help",
             Action::ToggleMultiSelect => "toggle_multi_select",
-            Action::ToggleProviders => "toggle_providers",
-            Action::ToggleArchived => "toggle_archived",
             Action::ToggleDebug => "toggle_debug",
             Action::ToggleStatusBarKeys => "toggle_status_bar_keys",
             Action::CycleHost => "cycle_host",
-            Action::CycleLayout => "cycle_layout",
             Action::CycleTheme => "cycle_theme",
             Action::OpenActionMenu => "open_action_menu",
-            Action::OpenBranchInput => "open_branch_input",
             Action::OpenFind => "open_find",
             Action::FetchMore => "fetch_more",
             Action::OpenFilePicker => "open_file_picker",
@@ -185,19 +146,6 @@ impl Action {
             Action::CompleteConvoyWork => "complete_convoy_work",
             Action::AttachConvoyVessel => "attach_convoy_vessel",
             Action::OpenInPm => "open_in_pm",
-            Action::Dispatch(intent) => match intent {
-                Intent::SwitchToWorkspace => "switch_to_workspace",
-                Intent::CreateWorkspace => "create_workspace",
-                Intent::RemoveCheckout => "remove_checkout",
-                Intent::CreateCheckout => "create_checkout",
-                Intent::GenerateBranchName => "generate_branch_name",
-                Intent::OpenChangeRequest => "open_change_request",
-                Intent::OpenIssue => "open_issue",
-                Intent::LinkIssuesToChangeRequest => "link_issues_to_change_request",
-                Intent::TeleportSession => "teleport_session",
-                Intent::ArchiveSession => "archive_session",
-                Intent::CloseChangeRequest => "close_change_request",
-            },
         }
     }
 
@@ -219,15 +167,11 @@ impl Action {
             Action::CloseTab => "Close current tab",
             Action::ToggleHelp => "Toggle help screen",
             Action::ToggleMultiSelect => "Toggle multi-select",
-            Action::ToggleProviders => "Toggle provider config",
-            Action::ToggleArchived => "Toggle archived sessions",
             Action::ToggleDebug => "Toggle debug panel",
             Action::ToggleStatusBarKeys => "Toggle status bar key hints",
             Action::CycleHost => "Cycle host filter",
-            Action::CycleLayout => "Cycle layout",
             Action::CycleTheme => "Cycle colour theme",
             Action::OpenActionMenu => "Open action menu",
-            Action::OpenBranchInput => "New branch input",
             Action::OpenFind => "Find",
             Action::FetchMore => "Fetch more rows",
             Action::OpenFilePicker => "Open file picker",
@@ -238,19 +182,6 @@ impl Action {
             Action::CompleteConvoyWork => "Force complete work",
             Action::AttachConvoyVessel => "Attach to vessel workspace",
             Action::OpenInPm => "Open in presentation manager",
-            Action::Dispatch(intent) => match intent {
-                Intent::SwitchToWorkspace => "Switch to workspace",
-                Intent::CreateWorkspace => "Create workspace",
-                Intent::RemoveCheckout => "Remove checkout",
-                Intent::CreateCheckout => "Create checkout",
-                Intent::GenerateBranchName => "Generate branch name",
-                Intent::OpenChangeRequest => "Open change request in browser",
-                Intent::OpenIssue => "Open issue in browser",
-                Intent::LinkIssuesToChangeRequest => "Link issues to change request",
-                Intent::TeleportSession => "Teleport session",
-                Intent::ArchiveSession => "Archive session",
-                Intent::CloseChangeRequest => "Close change request",
-            },
         }
     }
 }
@@ -303,7 +234,6 @@ impl Keymap {
         let mut keymap = Self::defaults();
 
         let mode_configs: &[(&std::collections::HashMap<String, String>, BindingModeId)] = &[
-            (&config.normal, BindingModeId::Normal),
             (&config.tab_page, BindingModeId::TabPage),
             (&config.tab_shell, BindingModeId::TabShell),
             (&config.help, BindingModeId::Help),
@@ -313,7 +243,6 @@ impl Keymap {
             (&config.convoy_vessels, BindingModeId::ConvoyVessels),
             (&config.action_menu, BindingModeId::ActionMenu),
             (&config.delete_confirm, BindingModeId::DeleteConfirm),
-            (&config.close_confirm, BindingModeId::CloseConfirm),
             (&config.dispatch_confirm, BindingModeId::DispatchConfirm),
             (&config.command_palette, BindingModeId::CommandPalette),
             (&config.file_picker, BindingModeId::FilePicker),
@@ -405,26 +334,14 @@ impl Keymap {
                 Action::OpenCommandPalette,
                 Action::OpenContextualPalette,
                 Action::OpenActionMenu,
-                Action::OpenBranchInput,
-                Action::Dispatch(Intent::RemoveCheckout),
-                Action::Dispatch(Intent::OpenChangeRequest),
                 Action::OpenFind,
                 Action::OpenFilePicker,
-                Action::CycleLayout,
                 Action::Refresh,
                 Action::ToggleStatusBarKeys,
             ]),
             ("Multi-select (issues)", &[Action::ToggleMultiSelect]),
             ("Repos", &[Action::PrevTab, Action::NextTab, Action::MoveTabLeft, Action::MoveTabRight]),
-            ("General", &[
-                Action::ToggleProviders,
-                Action::ToggleArchived,
-                Action::ToggleDebug,
-                Action::CycleTheme,
-                Action::ToggleHelp,
-                Action::Dismiss,
-                Action::Quit,
-            ]),
+            ("General", &[Action::ToggleDebug, Action::CycleTheme, Action::ToggleHelp, Action::Dismiss, Action::Quit]),
         ];
 
         section_defs
@@ -442,6 +359,3 @@ impl Keymap {
         Some((combo, action))
     }
 }
-
-#[cfg(test)]
-mod tests;

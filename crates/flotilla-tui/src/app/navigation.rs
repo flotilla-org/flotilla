@@ -26,6 +26,10 @@ impl App {
     /// sessions navigate in place (with a back stack) instead of growing a
     /// tab set — the pane stays one View (ADR 0013).
     pub fn open_view(&mut self, address: ViewAddress) {
+        if matches!(address, ViewAddress::Repo { .. }) {
+            self.set_status_message(Some("Repo views have been retired; open a project or checkout view".into()));
+            return;
+        }
         self.dismiss_modals();
         if self.views.open_or_focus(address) {
             self.subscriptions_dirty = true;
@@ -37,6 +41,9 @@ impl App {
     /// Navigate in place inside the active tab. The previous address and its
     /// table state remain on that tab's history stack.
     pub fn drill_view(&mut self, address: ViewAddress) {
+        if matches!(address, ViewAddress::Repo { .. }) {
+            return;
+        }
         self.dismiss_modals();
         if self.views.drill(address) {
             self.subscriptions_dirty = true;
@@ -97,27 +104,4 @@ impl App {
     pub fn close_active_tab(&mut self) -> bool {
         self.close_tab(self.views.active_index())
     }
-
-    #[cfg(test)]
-    pub(super) fn select_next(&mut self) {
-        let Some(identity) = self.model.active_repo.clone() else { return };
-        if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
-            let total = page.table.total_item_count();
-            if total == 0 {
-                return;
-            }
-            page.table.select_next();
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn select_prev(&mut self) {
-        let Some(identity) = self.model.active_repo.clone() else { return };
-        if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
-            page.table.select_prev();
-        }
-    }
 }
-
-#[cfg(test)]
-mod tests;

@@ -10,8 +10,8 @@ use flotilla_protocol::{AwarenessGrouping, AwarenessLimit, QueryId, QueryScope, 
 
 use crate::binding_table::{BindingModeId, KeyBindingMode};
 
-/// The named query a view kind consumes — the tab set IS the subscription
-/// set. Repo views ride the Plane-A repo streams and return None.
+/// The named queries a view kind consumes — the tab set IS the subscription
+/// set. Retired repository addresses consume nothing.
 pub(crate) fn queries(address: &ViewAddress, source_search: Option<&str>) -> Vec<QueryId> {
     match address {
         ViewAddress::Convoys { scope, .. } => vec![QueryId::Convoys { scope: scope.clone() }],
@@ -58,10 +58,9 @@ pub(crate) fn compose_with_shell(scoped: bool, kind_modes: impl IntoIterator<Ite
 }
 
 /// The kind-level binding modes derived from the address alone. `None`
-/// (broken/dangling tabs) composes only the shell. The overview and repo
-/// pages carry widget state (e.g. an active search) — their `binding_mode()`
-/// stays authoritative for status-bar hints; this function mirrors them for
-/// key resolution at the base layer.
+/// (broken/dangling tabs) composes only the shell. Overview carries widget
+/// state, so its `binding_mode()` stays authoritative for status-bar hints;
+/// this function mirrors it for key resolution at the base layer.
 pub(crate) fn kind_modes(address: Option<&ViewAddress>) -> Vec<BindingModeId> {
     match address {
         Some(ViewAddress::Overview) => vec![BindingModeId::Overview],
@@ -76,7 +75,7 @@ pub(crate) fn kind_modes(address: Option<&ViewAddress>) -> Vec<BindingModeId> {
         }
         Some(ViewAddress::Project { .. }) => vec![BindingModeId::Convoys, BindingModeId::DemandTable, BindingModeId::Project],
         Some(ViewAddress::Issues { .. }) => vec![BindingModeId::Convoys, BindingModeId::DemandTable],
-        Some(ViewAddress::Repo { .. }) => vec![BindingModeId::Normal],
+        Some(ViewAddress::Repo { .. }) => vec![],
         None => vec![],
     }
 }

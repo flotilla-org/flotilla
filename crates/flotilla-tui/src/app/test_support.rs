@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -8,17 +8,14 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, data::SectionLabels};
+use flotilla_core::{config::ConfigStore, daemon::DaemonHandle};
 use flotilla_protocol::{
-    qualified_path::HostId, Change, Command, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, NodeInfo,
-    ProviderData, ProviderError, ProvisioningTarget, RepoDelta, RepoInfo, RepoLabels, RepoSnapshot, StatusResponse, StreamKey,
-    TopologyResponse, WorkItem,
+    qualified_path::HostId, Command, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, NodeInfo, ProvisioningTarget,
+    RepoInfo, RepoLabels, RepoSnapshot, StatusResponse, StreamKey, TopologyResponse,
 };
 use tokio::sync::{broadcast, Semaphore};
 use tui_input::Input;
 
-// Re-export shared builders so unit tests can use `test_support::checkout_item` etc.
-pub(crate) use super::test_builders::*;
 use super::{App, CommandQueue, DirEntry, InFlightCommand, OpenViews, TuiHostState, TuiModel};
 use crate::{keymap::Keymap, widgets::WidgetContext};
 
@@ -66,10 +63,6 @@ fn insert_stub_local_host(model: &mut TuiModel) {
 impl StubDaemon {
     pub(crate) fn new() -> Self {
         Self::builder().build()
-    }
-
-    pub(crate) fn observations(&self) -> Vec<(uuid::Uuid, Vec<flotilla_protocol::ResourceRef>)> {
-        self.observations.lock().expect("observations lock").clone()
     }
 }
 
@@ -137,72 +130,8 @@ pub(crate) fn stub_app_with_repos(count: usize) -> App {
     stub_app_with_repo_infos(repos_info)
 }
 
-pub(crate) fn active_repo_path(app: &App) -> PathBuf {
-    app.model.active_repo_root().clone()
-}
-
-/// Switch the app to the tab of the i-th seeded repo. The seeded tab layout
-/// is `[overview, convoys, repo-0, repo-1, ...]`, so repo `i` is tab `i + 2`.
-pub(crate) fn activate_repo_tab(app: &mut App, repo_idx: usize) {
-    app.switch_tab(repo_idx + 2);
-}
-
-pub(crate) fn provider_error(category: &str, provider: &str, message: &str) -> ProviderError {
-    ProviderError { category: category.into(), provider: provider.into(), message: message.into() }
-}
-
-pub(crate) fn snapshot(repo: &Path) -> RepoSnapshot {
-    RepoSnapshot {
-        seq: 1,
-        repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: repo.display().to_string() },
-        repo: Some(repo.to_path_buf()),
-        node_id: local_node_id(),
-        work_items: vec![],
-        providers: ProviderData::default(),
-        provider_health: HashMap::new(),
-        errors: vec![],
-    }
-}
-
-pub(crate) fn delta(repo: &Path, changes: Vec<Change>) -> RepoDelta {
-    RepoDelta {
-        seq: 2,
-        prev_seq: 1,
-        repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: repo.display().to_string() },
-        repo: Some(repo.to_path_buf()),
-        changes,
-        work_items: vec![],
-    }
-}
-
 pub(crate) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
-}
-
-pub(crate) fn set_active_table_items(app: &mut App, items: Vec<WorkItem>) {
-    let repo_key = app.model.active_repo.clone().expect("test requires an active repo tab");
-    if let Some(page) = app.screen.repo_pages.get_mut(&repo_key) {
-        let providers = flotilla_protocol::ProviderData::default();
-        let labels = SectionLabels::default();
-        let sections = flotilla_core::data::group_work_items_split(&items, &providers, &labels, std::path::Path::new("/tmp"));
-        page.table.update_sections(sections);
-        // Clear the auto-selection so tests retain None until they explicitly navigate.
-        page.table.clear_selection();
-    }
-}
-
-pub(crate) fn setup_selectable_table(app: &mut App, items: Vec<WorkItem>) {
-    // Populate Shared<RepoData> so the RepoPage can reconcile the items.
-    let repo_key = app.model.active_repo.clone().expect("test requires an active repo tab");
-    if let Some(handle) = app.repo_data.get(&repo_key) {
-        handle.mutate(|d| {
-            d.work_items = items;
-        });
-    }
-    // Trigger reconciliation on the RepoPage so its table is populated.
-    if let Some(page) = app.screen.repo_pages.get_mut(&repo_key) {
-        page.reconcile_if_changed();
-    }
 }
 
 pub(crate) fn enter_file_picker(app: &mut App, path: &str, entries: Vec<DirEntry>) {
@@ -211,6 +140,20 @@ pub(crate) fn enter_file_picker(app: &mut App, path: &str, entries: Vec<DirEntry
 
 pub(crate) fn dir_entry(name: &str, is_git_repo: bool, is_added: bool) -> DirEntry {
     DirEntry { name: name.to_string(), is_dir: true, is_git_repo, is_added }
+}
+
+pub(crate) fn repo_info(path: impl Into<PathBuf>, name: impl Into<String>, labels: RepoLabels) -> RepoInfo {
+    let path = path.into();
+    RepoInfo {
+        identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: path.display().to_string() },
+        repository_key: None,
+        path: Some(path),
+        name: name.into(),
+        labels,
+        provider_names: HashMap::new(),
+        provider_health: HashMap::new(),
+        loading: false,
+    }
 }
 
 fn default_repo_info() -> RepoInfo {
@@ -224,10 +167,6 @@ fn stub_app_with_repo_info(repo_info: RepoInfo) -> App {
 fn stub_app_with_repo_infos(repos_info: Vec<RepoInfo>) -> App {
     let daemon: Arc<dyn DaemonHandle> = Arc::new(StubDaemon::new());
     stub_app_with_daemon(daemon, repos_info)
-}
-
-pub(crate) fn stub_app_with_query_result(result: Result<CommandValue, String>) -> App {
-    stub_app_with_daemon(Arc::new(StubDaemon::builder().query_result(result).build()), vec![default_repo_info()])
 }
 
 pub(crate) fn stub_app_with_daemon(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>) -> App {

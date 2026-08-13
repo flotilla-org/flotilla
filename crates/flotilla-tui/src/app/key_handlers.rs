@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{Command, CommandAction, ConvoyStartIntent, HostName, IssueSelector, NodeId, RepoIdentity, RepoKey, WorkItem};
+use flotilla_protocol::{CommandAction, ConvoyStartIntent, HostName, IssueSelector, NodeId, RepoIdentity, RepoKey};
 
-use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent, OwnedSelectedRow};
+use super::{ui_state::PendingActionContext, App};
 use crate::{
     binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
@@ -31,35 +31,19 @@ impl App {
 
     /// Handle actions that the widget stack returned `Ignored` for.
     ///
-    /// These are actions that need `&mut App` context the widget doesn't
-    /// have: confirm/enter, action menu, file picker, and dispatch intent.
+    /// These are actions that need `&mut App` context the widget doesn't have.
     pub(super) fn dispatch_action(&mut self, action: Action) {
         // Scoped panes: Esc walks the in-place navigation history.
         if action == Action::Dismiss && self.views.is_scoped() {
             self.scoped_back();
             return;
         }
-        // Repo-scoped fallthrough actions apply only on a live repo view.
-        if self.model.active_repo.is_none() {
-            return;
-        }
-        match action {
-            Action::Confirm => self.action_enter(),
-            Action::OpenActionMenu => self.open_action_menu(),
-            Action::OpenFilePicker => self.open_file_picker_from_active_repo_parent(),
-            Action::Dispatch(intent) => self.dispatch_if_available(intent),
-            // Handled by the widget stack (page widgets or modals) or
-            // pre-dispatched as global actions. No-op if they reach here.
-            _ => {}
-        }
+        let _ = action;
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         // Clear the transient command echo on every key press.
         self.ui.command_echo = None;
-
-        // Snapshot selection so we can detect changes for infinite scroll.
-        let prev_selection = self.active_page_selection();
 
         // Determine the topmost widget's mode. Screen delegates to the
         // top modal (if any) for mode_id / captures_raw_keys.
@@ -105,21 +89,11 @@ impl App {
             }
         }
         self.process_app_actions(app_actions);
-
-        // Post-dispatch: check for infinite scroll only if the selection
-        // actually changed. This avoids spurious fetches from unrelated
-        // key presses that happen to fire when the selection is near the bottom.
-        if self.active_page_selection() != prev_selection {
-            self.check_infinite_scroll();
-        }
     }
 
     // ── Mouse handling ──
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        // Snapshot selection so we can detect changes for infinite scroll.
-        let prev_selection = self.active_page_selection();
-
         // Dispatch to Screen, which handles modal routing internally.
         let mut screen = std::mem::take(&mut self.screen);
         let app_actions = {
@@ -138,239 +112,6 @@ impl App {
             if tabs.drag.dragging_tab.is_some() && tabs.drag.active && tabs.handle_drag(mouse.column, mouse.row, &mut self.views) {
                 self.sync_active_view();
             }
-        }
-
-        // ── Infinite scroll check ──
-        // Only if the selection actually changed — avoids spurious fetches
-        // from tab bar clicks, status bar clicks, etc.
-        if self.active_page_selection() != prev_selection {
-            self.check_infinite_scroll();
-        }
-    }
-
-    /// Get the current selection index from the active RepoPage, if any.
-    fn active_page_selection(&self) -> Option<usize> {
-        let identity = self.model.active_repo.as_ref()?;
-        self.screen.repo_pages.get(identity).and_then(|page| page.table.selected_flat_index())
-    }
-
-    // ── Private helpers ──
-
-    /// Check if the current selection is near the bottom of the issue section
-    /// and fetch more results if the active paging state has more pages.
-    fn check_infinite_scroll(&mut self) {
-        let Some(repo_identity) = self.model.active_repo.clone() else { return };
-        let Some(page) = self.screen.repo_pages.get(&repo_identity) else { return };
-        let Some((issue_idx, _issue_count)) = page.table.selected_issue_position() else { return };
-
-        let Some(view) = self.issue_views.get(&repo_identity) else { return };
-        let Some(active) = view.active() else { return };
-        if !active.has_more || active.fetch_pending() {
-            return;
-        }
-        let issue_count = active.items.len();
-        if issue_count == 0 {
-            return;
-        }
-        if issue_count.saturating_sub(issue_idx + 1) <= 5 {
-            let params = active.params.clone();
-            let next_page = active.next_page;
-            if !self.begin_issue_page_fetch(&repo_identity, &params, next_page) {
-                return;
-            }
-            self.spawn_query_page(repo_identity, params, next_page, 50);
-        }
-    }
-
-    pub(super) fn action_enter(&mut self) {
-        let Some(identity) = self.model.active_repo.as_ref() else { return };
-        let has_multi = self.screen.repo_pages.get(identity).is_some_and(|p| !p.multi_selected.is_empty());
-        if has_multi {
-            self.action_enter_multi_select();
-            return;
-        }
-
-        let Some(selected) = self.selected_row_cloned() else {
-            return;
-        };
-
-        match selected {
-            OwnedSelectedRow::WorkItem(ref item) => {
-                let my_node_id = self.model.my_node_id().cloned();
-                for &intent in Intent::enter_priority() {
-                    if intent.is_available(item) && intent.is_allowed_for_host(item, &my_node_id) {
-                        self.resolve_and_push(intent, item);
-                        return;
-                    }
-                }
-            }
-            OwnedSelectedRow::IssueRow(row) => {
-                // For issue rows, the primary action is OpenIssue.
-                let cmd = self.provider_repo_command_for_issue(CommandAction::OpenIssue { id: row.id });
-                self.proto_commands.push(cmd);
-            }
-        }
-    }
-
-    fn action_enter_multi_select(&mut self) {
-        let Some(identity) = self.model.active_repo.as_ref() else { return };
-        let Some(page) = self.screen.repo_pages.get(identity) else {
-            return;
-        };
-        let multi_selected = page.multi_selected.clone();
-        let mut all_issue_keys: Vec<String> = Vec::new();
-
-        for selected in &multi_selected {
-            if let Some(issue_keys) = page.table.issue_keys_for_identity(selected) {
-                all_issue_keys.extend(issue_keys);
-            }
-        }
-
-        // Also include current selection if not already in multi_selected
-        if let Some(selected_identity) = page.table.selected_identity() {
-            if !multi_selected.contains(&selected_identity) {
-                if let Some(issue_keys) = page.table.issue_keys_for_identity(&selected_identity) {
-                    all_issue_keys.extend(issue_keys);
-                }
-            }
-        }
-
-        all_issue_keys.sort();
-        all_issue_keys.dedup();
-        if !all_issue_keys.is_empty() {
-            self.screen.modal_stack.push(Box::new(crate::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Generating)));
-            self.proto_commands.push(self.targeted_repo_command(CommandAction::GenerateBranchName { issue_keys: all_issue_keys }));
-        }
-        let identity = identity.clone();
-        if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
-            page.multi_selected.clear();
-        }
-    }
-
-    fn dispatch_if_available(&mut self, intent: Intent) {
-        let Some(item) = (match self.selected_row_cloned() {
-            Some(OwnedSelectedRow::WorkItem(item)) => Some(*item),
-            Some(OwnedSelectedRow::IssueRow(row)) => Some(self.work_item_for_issue_row(&row)),
-            None => None,
-        }) else {
-            return;
-        };
-        let my_node_id = self.model.my_node_id().cloned();
-        if intent.is_available(&item) && intent.is_allowed_for_host(&item, &my_node_id) {
-            self.resolve_and_push(intent, &item);
-        }
-    }
-
-    fn resolve_and_push(&mut self, intent: Intent, item: &WorkItem) {
-        // Safety net: block filesystem operations on remote items even if
-        // the caller somehow bypassed the menu/availability filter.
-        let my_node_id = self.model.my_node_id().cloned();
-        if !intent.is_allowed_for_host(item, &my_node_id) {
-            tracing::warn!(?intent, node_id = %item.node_id, "blocked intent on remote item");
-            self.set_status_message(Some("Cannot perform this action on a remote item".to_string()));
-            return;
-        }
-
-        // Try registry path for convertible intents.
-        if let Some(noun) = intent.to_noun_command(item) {
-            self.ui.command_echo = Some(noun.to_string());
-
-            match noun.resolve() {
-                Ok(resolved) => {
-                    let active_repo = self.model.active_repo.clone();
-                    let provisioning_target = self.ui.provisioning_target.clone();
-                    let remote_only = self.active_repo_is_remote_only();
-
-                    match crate::widgets::command_palette::tui_dispatch(
-                        resolved,
-                        &self.model,
-                        Some(item),
-                        active_repo.as_ref(),
-                        &provisioning_target,
-                        &my_node_id,
-                        remote_only,
-                    ) {
-                        Ok(cmd) => {
-                            // Modal handling for convertible intents that need confirmation
-                            match intent {
-                                Intent::CloseChangeRequest => {
-                                    let id = match &cmd {
-                                        Command { action: CommandAction::CloseChangeRequest { id }, .. } => id.clone(),
-                                        _ => return,
-                                    };
-                                    let widget = crate::widgets::close_confirm::CloseConfirmWidget::new(
-                                        id,
-                                        item.description.clone(),
-                                        item.identity.clone(),
-                                        cmd,
-                                    );
-                                    self.screen.modal_stack.push(Box::new(widget));
-                                    return;
-                                }
-                                Intent::GenerateBranchName => {
-                                    self.screen
-                                        .modal_stack
-                                        .push(Box::new(crate::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Generating)));
-                                }
-                                _ => {}
-                            }
-                            let pending_ctx = PendingActionContext::work_item(
-                                item.identity.clone(),
-                                self.model.active_repo_identity().clone(),
-                                intent.label(self.model.active_labels()),
-                            );
-                            self.proto_commands.push_with_context(cmd, Some(pending_ctx));
-                            return;
-                        }
-                        Err(e) => {
-                            self.set_status_message(Some(e));
-                            return;
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Registry parse failed — clear stale echo and fall back to old path
-                    self.ui.command_echo = None;
-                    tracing::warn!(%e, ?intent, "registry parse failed, falling back to intent.resolve");
-                }
-            }
-        }
-
-        // Non-convertible intents (or registry fallback): use old path
-        if let Some(cmd) = intent.resolve(item, self) {
-            match intent {
-                Intent::RemoveCheckout => {
-                    let checkout_path = item.checkout_key().map(|hp| hp.path.clone());
-                    let widget = crate::widgets::delete_confirm::DeleteConfirmWidget::new(
-                        item.identity.clone(),
-                        self.item_execution_host(item),
-                        checkout_path,
-                    );
-                    self.screen.modal_stack.push(Box::new(widget));
-                }
-                Intent::GenerateBranchName => {
-                    self.screen
-                        .modal_stack
-                        .push(Box::new(crate::widgets::branch_input::BranchInputWidget::new(BranchInputKind::Generating)));
-                }
-                Intent::CloseChangeRequest => {
-                    let id = match &cmd {
-                        Command { action: CommandAction::CloseChangeRequest { id }, .. } => id.clone(),
-                        _ => return,
-                    };
-                    let widget =
-                        crate::widgets::close_confirm::CloseConfirmWidget::new(id, item.description.clone(), item.identity.clone(), cmd);
-                    self.screen.modal_stack.push(Box::new(widget));
-                    return;
-                }
-                _ => {}
-            }
-            let pending_ctx = PendingActionContext::work_item(
-                item.identity.clone(),
-                self.model.active_repo_identity().clone(),
-                intent.label(self.model.active_labels()),
-            );
-            self.proto_commands.push_with_context(cmd, Some(pending_ctx));
         }
     }
 
@@ -589,35 +330,6 @@ impl App {
         }
         self.model.node_id_for_host(host).cloned().map(Some).ok_or_else(|| format!("host '{}' is not connected", host.as_str()))
     }
-
-    pub(super) fn open_action_menu(&mut self) {
-        let Some(item) = (match self.selected_row_cloned() {
-            Some(OwnedSelectedRow::WorkItem(item)) => Some(*item),
-            Some(OwnedSelectedRow::IssueRow(row)) => Some(self.work_item_for_issue_row(&row)),
-            None => None,
-        }) else {
-            return;
-        };
-
-        let my_node_id = self.model.my_node_id().cloned();
-        let entries: Vec<crate::widgets::action_menu::MenuEntry> = Intent::all_in_menu_order()
-            .iter()
-            .copied()
-            .filter_map(|intent| {
-                if intent.is_available(&item) && intent.is_allowed_for_host(&item, &my_node_id) {
-                    intent.resolve(&item, self).map(|command| crate::widgets::action_menu::MenuEntry { intent, command })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if entries.is_empty() {
-            return;
-        }
-
-        self.screen.modal_stack.push(Box::new(crate::widgets::action_menu::ActionMenuWidget::new(entries, item)));
-    }
 }
 
 pub(super) fn repo_identity_matches_hint(identity: &RepoIdentity, hint: &RepoKey) -> bool {
@@ -630,6 +342,3 @@ pub(super) fn repo_identity_matches_hint(identity: &RepoIdentity, hint: &RepoKey
     let url = format!("https://{}/{}", identity.authority, identity.path.trim_start_matches('/'));
     flotilla_resources::canonicalize_repo_url(&url).is_ok_and(|canonical| flotilla_resources::descriptive_repo_slug(&canonical) == hint.0)
 }
-
-#[cfg(test)]
-mod tests;

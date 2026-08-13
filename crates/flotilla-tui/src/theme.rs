@@ -1,4 +1,3 @@
-use flotilla_protocol::WorkItemKind;
 use ratatui::style::{Color, Modifier, Style};
 
 // ---------------------------------------------------------------------------
@@ -243,18 +242,6 @@ impl Theme {
         }
     }
 
-    pub fn work_item_color(&self, kind: &WorkItemKind) -> Color {
-        match kind {
-            WorkItemKind::Checkout => self.checkout,
-            WorkItemKind::AttachableSet => self.checkout,
-            WorkItemKind::Session => self.session,
-            WorkItemKind::ChangeRequest => self.change_request,
-            WorkItemKind::Issue => self.issue,
-            WorkItemKind::RemoteBranch => self.remote_branch,
-            WorkItemKind::Agent => self.session,
-        }
-    }
-
     pub fn header_style(&self) -> Style {
         Style::default().fg(self.section_header).add_modifier(Modifier::BOLD)
     }
@@ -495,16 +482,6 @@ mod tests {
         assert_eq!(s.fg, Some(Color::Cyan));
         assert!(s.add_modifier.contains(Modifier::BOLD));
         assert!(s.add_modifier.contains(Modifier::UNDERLINED));
-    }
-
-    #[test]
-    fn work_item_color_all_kinds() {
-        let t = Theme::classic();
-        assert_eq!(t.work_item_color(&WorkItemKind::Checkout), Color::Green);
-        assert_eq!(t.work_item_color(&WorkItemKind::Session), Color::Magenta);
-        assert_eq!(t.work_item_color(&WorkItemKind::ChangeRequest), Color::Blue);
-        assert_eq!(t.work_item_color(&WorkItemKind::Issue), Color::Yellow);
-        assert_eq!(t.work_item_color(&WorkItemKind::RemoteBranch), Color::DarkGray);
     }
 
     #[test]

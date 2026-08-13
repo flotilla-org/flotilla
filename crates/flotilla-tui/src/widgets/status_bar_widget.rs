@@ -1,6 +1,6 @@
 use std::{any::Any, collections::HashMap};
 
-use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::Rect,
     style::Style,
@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
-    app::{InFlightCommand, NamespaceMap, RepoViewLayout, TuiModel, UiState},
+    app::{InFlightCommand, NamespaceMap, TuiModel, UiState},
     binding_table::{KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
     segment_bar::{self, BarStyle, ThemedRibbonStyle},
@@ -268,29 +268,13 @@ pub(crate) fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCom
     Some(TaskSection::new(&description, 0))
 }
 
-/// Build mode indicators for Normal mode (layout and host).
+/// Build global mode indicators.
 pub(crate) fn normal_mode_indicators(ui: &UiState, namespaces: &NamespaceMap) -> Vec<ModeIndicator> {
-    let layout_icon = match ui.view_layout {
-        RepoViewLayout::Auto => "◫",
-        RepoViewLayout::Zoom => "□",
-        RepoViewLayout::Right => "▥",
-        RepoViewLayout::Below => "▤",
-    };
-    let layout_label = match ui.view_layout {
-        RepoViewLayout::Auto => "auto",
-        RepoViewLayout::Zoom => "zoom",
-        RepoViewLayout::Right => "right",
-        RepoViewLayout::Below => "below",
-    };
-
     let host_label = ui.provisioning_target.to_string();
 
     let attention_count =
         namespaces.values().flat_map(|namespace| namespace.convoys.values()).filter(|convoy| convoy.needs_attention).count();
-    let mut indicators = vec![
-        ModeIndicator::new(layout_icon, layout_label, StatusBarAction::key(KeyCode::Char('l'))),
-        ModeIndicator::new("", &host_label, StatusBarAction::None),
-    ];
+    let mut indicators = vec![ModeIndicator::new("", &host_label, StatusBarAction::None)];
     if attention_count > 0 {
         indicators.push(ModeIndicator::new("⚠", &format!("{attention_count} need attention"), StatusBarAction::None));
     }
@@ -324,6 +308,7 @@ pub(crate) fn resolve_task_from_fragment(fragment: &StatusFragment) -> Option<Ta
 mod tests {
     use std::path::PathBuf;
 
+    use crossterm::event::KeyCode;
     use flotilla_protocol::{RepoIdentity, RepoLabels};
     use ratatui::layout::Rect;
 

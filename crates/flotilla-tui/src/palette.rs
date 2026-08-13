@@ -22,17 +22,12 @@ pub fn all_entries() -> &'static [PaletteEntry] {
         vec![
             PaletteEntry { name: "find", description: "find work in the current view", key_hint: Some("/"), action: Action::OpenFind },
             PaletteEntry { name: "refresh", description: "refresh active repo", key_hint: Some("r"), action: Action::Refresh },
-            PaletteEntry { name: "branch", description: "create a new branch", key_hint: Some("n"), action: Action::OpenBranchInput },
             PaletteEntry { name: "help", description: "show key bindings", key_hint: Some("h"), action: Action::ToggleHelp },
             PaletteEntry { name: "quit", description: "exit flotilla", key_hint: Some("q"), action: Action::Quit },
-            PaletteEntry { name: "layout", description: "set view layout", key_hint: Some("l"), action: Action::CycleLayout },
             PaletteEntry { name: "target", description: "set provisioning target", key_hint: None, action: Action::CycleHost },
             PaletteEntry { name: "theme", description: "cycle color theme", key_hint: None, action: Action::CycleTheme },
-            PaletteEntry { name: "providers", description: "show provider health", key_hint: None, action: Action::ToggleProviders },
             PaletteEntry { name: "debug", description: "show debug panel", key_hint: None, action: Action::ToggleDebug },
-            PaletteEntry { name: "actions", description: "open context menu", key_hint: Some("."), action: Action::OpenActionMenu },
             PaletteEntry { name: "add repo", description: "track a repository", key_hint: None, action: Action::OpenFilePicker },
-            PaletteEntry { name: "select", description: "toggle multi-select", key_hint: Some("space"), action: Action::ToggleMultiSelect },
             PaletteEntry { name: "keys", description: "toggle key hints", key_hint: Some("K"), action: Action::ToggleStatusBarKeys },
         ]
     })
@@ -50,7 +45,6 @@ pub fn filter_entries<'a>(entries: &'a [PaletteEntry], prefix: &str) -> Vec<&'a 
 #[derive(Debug, PartialEq)]
 pub enum PaletteLocalResult<'a> {
     Action(Action),
-    SetLayout(&'a str),
     SetTheme(&'a str),
     SetTarget(&'a str),
     /// Open (or focus) the View at this address (ADR 0013).
@@ -62,7 +56,6 @@ pub fn parse_palette_local(input: &str) -> Option<PaletteLocalResult<'_>> {
     let (cmd, rest) = input.split_once(' ').unwrap_or((input, ""));
     let arg = rest.trim();
     match cmd {
-        "layout" if !arg.is_empty() => Some(PaletteLocalResult::SetLayout(arg)),
         "theme" if !arg.is_empty() => Some(PaletteLocalResult::SetTheme(arg)),
         "target" if !arg.is_empty() => Some(PaletteLocalResult::SetTarget(arg)),
         "open" if !arg.is_empty() => Some(PaletteLocalResult::OpenView(arg)),
@@ -74,8 +67,6 @@ pub fn parse_palette_local(input: &str) -> Option<PaletteLocalResult<'_>> {
     }
 }
 
-pub const LAYOUT_VALUES: &[&str] = &["auto", "zoom", "right", "below"];
-
 /// Get completions for palette-local argument commands at the current input position.
 pub fn palette_local_completions(input: &str) -> Vec<&'static str> {
     let (cmd, rest) = input.split_once(' ').unwrap_or((input, ""));
@@ -84,14 +75,13 @@ pub fn palette_local_completions(input: &str) -> Vec<&'static str> {
         return vec![];
     }
     match cmd {
-        "layout" => LAYOUT_VALUES.iter().filter(|v| v.starts_with(rest.trim())).copied().collect(),
         "open" => VIEW_KIND_PREFIXES.iter().filter(|v| v.starts_with(rest.trim())).copied().collect(),
         _ => vec![],
     }
 }
 
 /// View-address kind prefixes offered as `open` completions (ADR 0013).
-pub const VIEW_KIND_PREFIXES: &[&str] = &["overview", "convoys/", "convoy/", "vessel/", "project/", "repo/"];
+pub const VIEW_KIND_PREFIXES: &[&str] = &["overview", "convoys/", "convoy/", "vessel/", "project/", "issues", "checkouts"];
 
 /// Result of parsing palette input text.
 #[derive(Debug)]
@@ -608,7 +598,7 @@ fn completion_cursor(consumed: &[&str], partial: &str) -> usize {
     format_completion_line(consumed, partial).len()
 }
 
-/// Argument completions for palette-local commands (layout, theme, target, search).
+/// Argument completions for palette-local commands.
 fn local_arg_completions(input: &str, command: &str, tokens: &[&str], trailing_space: bool, model: &TuiModel) -> Vec<PaletteCompletion> {
     if tokens.len() == 1 && !trailing_space {
         // Still typing the command name — no arg completions yet.
@@ -618,11 +608,6 @@ fn local_arg_completions(input: &str, command: &str, tokens: &[&str], trailing_s
     let partial = if trailing_space { "" } else { tokens.last().copied().unwrap_or("") };
 
     match command {
-        "layout" => LAYOUT_VALUES
-            .iter()
-            .filter(|v| partial.is_empty() || v.starts_with(partial))
-            .map(|v| PaletteCompletion { value: v.to_string(), description: String::new(), key_hint: None })
-            .collect(),
         "target" => target_completions(partial, model),
         _ => {
             // Other palette-local commands (theme, search) don't have
@@ -690,12 +675,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_layout_command() {
-        let result = parse_palette_local("layout zoom");
-        assert_eq!(result, Some(PaletteLocalResult::SetLayout("zoom")));
-    }
-
-    #[test]
     fn parse_target_command() {
         let result = parse_palette_local("target feta");
         assert_eq!(result, Some(PaletteLocalResult::SetTarget("feta")));
@@ -715,21 +694,9 @@ mod tests {
     }
 
     #[test]
-    fn layout_completions() {
-        let completions = palette_local_completions("layout z");
-        assert_eq!(completions, vec!["zoom"]);
-    }
-
-    #[test]
-    fn layout_completions_all() {
-        let completions = palette_local_completions("layout ");
-        assert_eq!(completions.len(), 4);
-    }
-
-    #[test]
     fn all_entries_returns_expected_count() {
         let entries = all_entries();
-        assert_eq!(entries.len(), 14);
+        assert_eq!(entries.len(), 9);
         assert_eq!(entries[0].name, "find");
         assert_eq!(entries[entries.len() - 1].name, "keys");
     }
@@ -771,12 +738,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_palette_input_layout() {
-        let result = parse_palette_input("layout zoom").expect("should parse");
-        assert!(matches!(result, PaletteParseResult::Local(PaletteLocalResult::SetLayout("zoom"))));
-    }
-
-    #[test]
     fn parse_palette_input_host_routed() {
         let result = parse_palette_input("host feta cr #42 open").expect("should parse");
         assert!(matches!(
@@ -801,7 +762,7 @@ mod tests {
         qualified_path::HostId, ChangeRequest, ChangeRequestStatus, EnvironmentId, HostName, NodeId, NodeInfo, ProviderData, RepoLabels,
     };
 
-    use crate::app::test_builders::repo_info;
+    use crate::app::test_support::repo_info;
 
     fn namespaces_with_convoy(name: &str, vessels: &[&str]) -> crate::app::NamespaceMap {
         use crate::convoy_model::{ConvoyId, ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase};
@@ -935,7 +896,6 @@ mod tests {
         assert!(values.contains(&"cr"), "expected 'cr' in {values:?}");
         assert!(values.contains(&"checkout"), "expected 'checkout' in {values:?}");
         assert!(values.contains(&"host"), "expected 'host' in {values:?}");
-        assert!(values.contains(&"layout"), "expected 'layout' in {values:?}");
         assert!(values.contains(&"quit"), "expected 'quit' in {values:?}");
     }
 
@@ -961,7 +921,6 @@ mod tests {
         let completions = palette_completions("", &model, &Default::default(), false);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"host"), "expected 'host' in {values:?}");
-        assert!(values.contains(&"layout"), "expected 'layout' in {values:?}");
         assert!(!values.contains(&"cr"), "cr should be hidden on overview tab");
         assert!(!values.contains(&"checkout"), "checkout should be hidden on overview tab");
         assert!(!values.contains(&"issue"), "issue should be hidden on overview tab");
@@ -994,17 +953,6 @@ mod tests {
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"open"), "expected 'open' in {values:?}");
         assert!(values.contains(&"close"), "expected 'close' in {values:?}");
-    }
-
-    #[test]
-    fn layout_shows_values() {
-        let model = empty_model();
-        let completions = palette_completions("layout ", &model, &Default::default(), true);
-        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
-        assert!(values.contains(&"zoom"), "expected 'zoom' in {values:?}");
-        assert!(values.contains(&"auto"), "expected 'auto' in {values:?}");
-        assert!(values.contains(&"right"), "expected 'right' in {values:?}");
-        assert!(values.contains(&"below"), "expected 'below' in {values:?}");
     }
 
     #[test]
@@ -1042,14 +990,6 @@ mod tests {
         let completions = palette_completions("", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"repo"), "expected 'repo' in {values:?}");
-    }
-
-    #[test]
-    fn layout_partial_arg_filters() {
-        let model = empty_model();
-        let completions = palette_completions("layout z", &model, &Default::default(), true);
-        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
-        assert_eq!(values, vec!["zoom"]);
     }
 
     fn model_with_rich_hosts() -> TuiModel {

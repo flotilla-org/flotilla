@@ -6,7 +6,6 @@ use crokey::KeyCombination;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::{
-    app::intent::Intent,
     keymap::Action,
     status_bar::{KeyChip, StatusBarAction},
 };
@@ -42,13 +41,10 @@ pub enum BindingModeId {
     Help,
     ActionMenu,
     DeleteConfirm,
-    CloseConfirm,
     DispatchConfirm,
-    BranchInput,
     FindInput,
     CommandPalette,
     FilePicker,
-    SearchActive,
 }
 
 /// What widgets return from `binding_mode()`.
@@ -149,19 +145,6 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::TabShell, "{", Action::MoveTabLeft),
     b(BindingModeId::TabShell, "}", Action::MoveTabRight),
     b(BindingModeId::TabShell, "S-X", Action::CloseTab),
-    // ── Normal ──
-    // Hint order matters: ENT, ., n, ?, q matches the old status bar layout.
-    hk(BindingModeId::Normal, "enter", "ENT", Action::Confirm, "Open"),
-    h(BindingModeId::Normal, ".", Action::OpenActionMenu, "Menu"),
-    h(BindingModeId::Normal, "n", Action::OpenBranchInput, "New"),
-    b(BindingModeId::Normal, "r", Action::Refresh),
-    b(BindingModeId::Normal, "space", Action::ToggleMultiSelect),
-    b(BindingModeId::Normal, "l", Action::CycleLayout),
-    b(BindingModeId::Normal, "a", Action::OpenFilePicker),
-    b(BindingModeId::Normal, "c", Action::ToggleProviders),
-    b(BindingModeId::Normal, "u", Action::ToggleArchived),
-    b(BindingModeId::Normal, "d", Action::Dispatch(Intent::RemoveCheckout)),
-    b(BindingModeId::Normal, "p", Action::Dispatch(Intent::OpenChangeRequest)),
     // ── Curated tables ──
     // j/k/up/down and Enter/Esc come from Shared. Every table uses one cursor
     // regime; Enter drills and Esc pops the active tab's history.
@@ -193,7 +176,7 @@ pub static BINDINGS: &[Binding] = &[
     h(BindingModeId::Overview, "j", Action::SelectNext, "Down"),
     h(BindingModeId::Overview, "k", Action::SelectPrev, "Up"),
     // [, ] come from TabPage (composed). q is intentionally Dismiss (not Quit) on
-    // the Overview tab — it switches back to the active repo tab, not quit the app.
+    // the Overview tab — it switches back to the last active view, not quit the app.
     h(BindingModeId::Overview, "q", Action::Dismiss, "Quit"),
     // ── Help ──
     h(BindingModeId::Help, "j", Action::SelectNext, "Down"),
@@ -211,16 +194,9 @@ pub static BINDINGS: &[Binding] = &[
     h(BindingModeId::DeleteConfirm, "y", Action::Confirm, "Yes"),
     h(BindingModeId::DeleteConfirm, "n", Action::Dismiss, "No"),
     b(BindingModeId::DeleteConfirm, "q", Action::Dismiss),
-    // ── CloseConfirm ──
-    h(BindingModeId::CloseConfirm, "y", Action::Confirm, "Yes"),
-    h(BindingModeId::CloseConfirm, "n", Action::Dismiss, "No"),
-    b(BindingModeId::CloseConfirm, "q", Action::Dismiss),
     // ── DispatchConfirm ──
     hk(BindingModeId::DispatchConfirm, "enter", "ENT", Action::Confirm, "Dispatch"),
     hk(BindingModeId::DispatchConfirm, "esc", "ESC", Action::Dismiss, "Cancel"),
-    // ── BranchInput ──
-    hk(BindingModeId::BranchInput, "enter", "ENT", Action::Confirm, "Create"),
-    hk(BindingModeId::BranchInput, "esc", "ESC", Action::Dismiss, "Cancel"),
     // ── Find input ──
     hk(BindingModeId::FindInput, "enter", "ENT", Action::Confirm, "Apply"),
     hk(BindingModeId::FindInput, "esc", "ESC", Action::Dismiss, "Cancel"),
@@ -238,8 +214,6 @@ pub static BINDINGS: &[Binding] = &[
     hk(BindingModeId::FilePicker, "enter", "ENT", Action::Confirm, "Select"),
     hk(BindingModeId::FilePicker, "esc", "ESC", Action::Dismiss, "Cancel"),
     hk(BindingModeId::FilePicker, "tab", "TAB", Action::FillSelected, "Complete"),
-    // ── SearchActive ──
-    h(BindingModeId::SearchActive, "esc", Action::Dismiss, "Clear"),
 ];
 
 // ── Compiled bindings ────────────────────────────────────────────────
@@ -627,7 +601,7 @@ mod tests {
     fn from_table_parses_all_keys_without_panic() {
         // Just call from_table on the BINDINGS constant and verify it doesn't panic.
         let compiled = CompiledBindings::from_table(BINDINGS);
-        assert!(compiled.key_map.contains_key(&BindingModeId::Normal));
+        assert!(compiled.key_map.contains_key(&BindingModeId::TabPage));
     }
 
     #[test]
