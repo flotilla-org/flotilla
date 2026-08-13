@@ -3269,7 +3269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_convoy_remains_in_rows_and_salience_until_deleted() {
+    async fn soft_deleting_convoy_remains_in_rows_and_salience() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
