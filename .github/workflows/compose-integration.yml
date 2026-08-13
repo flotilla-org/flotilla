@@ -8,7 +8,7 @@ on:
     branches:
       - main
   # Compose runs are off the PR critical path (~20 min, catches concentrated
-  # in multi-daemon PRs — see #1477). Opt a PR in with the `compose` label,
+  # in multi-daemon PRs — see PR #1478). Opt a PR in with the `compose` label,
   # or rely on the post-merge push run before a fleet bump.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
