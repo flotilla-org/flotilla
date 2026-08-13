@@ -1691,7 +1691,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
 async fn dispatch_execute_keeps_remote_placement_convoy_on_the_admitting_store() {
     let (_tmp, daemon) = empty_daemon().await;
     let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
-    let remote_host_id = remote_daemon.local_host_id().expect("remote host identity").to_string();
+    let remote_host_id = "feta-host-id".to_string();
     let remote_hosts = remote_daemon.resource_backend().using::<Host>("flotilla");
     let remote_host = remote_hosts
         .create(&InputMeta::builder().name(remote_host_id.clone()).build(), &HostSpec::default())
@@ -1708,7 +1708,7 @@ async fn dispatch_execute_keeps_remote_placement_convoy_on_the_admitting_store()
         .expect("publish remote host capacity");
     daemon
         .resource_backend()
-        .replica_writer::<Host>(remote_daemon.node_id().clone(), "flotilla")
+        .replica_writer::<Host>(node("feta"), "flotilla")
         .replace(&remote_hosts.list().await.expect("list remote host resources"), chrono::Utc::now())
         .await
         .expect("replicate remote host capacity");

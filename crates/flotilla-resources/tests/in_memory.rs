@@ -6,7 +6,8 @@ use common::{
     contract::{
         assert_consumer_relists_after_expired_watch_and_converges_with_backend, assert_create_get_list_roundtrip,
         assert_delete_emits_event, assert_identical_status_update_is_noop_with_backend, assert_identical_update_is_noop_with_backend,
-        assert_metadata_roundtrip, assert_missing_authority_delete_tombstones_replica_with_backend, assert_namespace_isolation,
+        assert_local_authority_shadows_self_origin_replica_with_backend, assert_metadata_roundtrip,
+        assert_missing_authority_delete_tombstones_replica_with_backend, assert_namespace_isolation,
         assert_project_definition_causal_merge_with_backend, assert_project_definition_delete_conflicts_with_concurrent_edit_with_backend,
         assert_project_definition_edit_converges_with_backend, assert_project_definition_edit_preserves_unrelated_conflict_with_backend,
         assert_project_definition_metadata_edit_converges_with_backend,
@@ -21,6 +22,11 @@ use common::{
     convoy_meta, convoy_spec,
 };
 use flotilla_resources::{Convoy, EventRetention, InMemoryBackend, ResourceBackend};
+
+#[tokio::test]
+async fn local_authority_shadows_self_origin_replica() {
+    assert_local_authority_shadows_self_origin_replica_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}
 
 fn resolver(namespace: &str) -> flotilla_resources::TypedResolver<Convoy> {
     ResourceBackend::InMemory(InMemoryBackend::default()).using::<Convoy>(namespace)
