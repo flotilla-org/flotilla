@@ -238,7 +238,17 @@ Appears in the `independents` query and nowhere else; joining a Convoy removes
 it there (convoy-bound sessions surface on vessel rows instead), so nothing is
 ever double-listed.
 _Avoid_: Session (maximally overloaded — cloud agents, cleat, tmux, zellij all
-claim it), free-floating session, loose session.
+claim it), free-floating session, loose session. Do not use for ensure-declared
+services — that is a **Standing Convoy**.
+
+**Standing Convoy**:
+A **Convoy** declared by an `ensure` ops entry whose workflow omits `exit`:
+the ensure loop maintains its presence — starting it, force-restarting it on
+failure with backoff — until the entry is removed and the project refreshed
+(ADR 0027, ADR 0030). Its crew serves operator turns; the first instance is
+the andamento **Governor**.
+_Avoid_: Independent (reserved for convoy-less terminal sessions), service,
+daemon-agent.
 
 **External Result**:
 An artifact a **Convoy** produces in an external service — a PR, a CMS article, a
