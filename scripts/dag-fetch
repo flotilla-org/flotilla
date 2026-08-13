@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Materialize the deterministic facts used by the portfolio DAG board."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import tempfile
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+
+REPOSITORIES = ("flotilla-org/andamento", "flotilla-org/flotilla")
+ISSUE_FIELDS = (
+    "number,title,state,url,updatedAt,closedAt,labels,blockedBy,blocking,"
+    "closedByPullRequestsReferences"
+)
+PR_FIELDS = "number,state,url,mergedAt,mergeStateStatus,statusCheckRollup"
+
+
+def command_json(arguments: list[str]) -> Any:
+    try:
+        result = subprocess.run(arguments, check=True, stdout=subprocess.PIPE, text=True)
+    except FileNotFoundError as error:
+        raise SystemExit(f"required command not found: {arguments[0]}") from error
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(f"command failed ({error.returncode}): {' '.join(arguments)}") from error
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"command returned invalid JSON: {' '.join(arguments)}: {error}") from error
+
+
+def github_ref(url: str) -> str | None:
+    parts = urlparse(url).path.strip("/").split("/")
+    if len(parts) >= 4 and parts[2] in {"issues", "pull"}:
+        return f"{parts[0]}/{parts[1]}#{parts[3]}"
+    return None
+
+
+def check_state(checks: list[dict[str, Any]]) -> str:
+    if not checks:
+        return "none"
+    pending = {"EXPECTED", "IN_PROGRESS", "PENDING", "QUEUED", "REQUESTED", "WAITING"}
+    acceptable = {"NEUTRAL", "SKIPPED", "SUCCESS"}
+    states = [str(check.get("status") or check.get("state") or "").upper() for check in checks]
+    if any(state in pending for state in states):
+        return "pending"
+    conclusions = [str(check.get("conclusion") or check.get("state") or "").upper() for check in checks]
+    if any(conclusion and conclusion not in acceptable for conclusion in conclusions):
+        return "failure"
+    return "success" if all(conclusion in acceptable for conclusion in conclusions) else "unknown"
+
+
+def convoy_facts() -> dict[str, list[dict[str, Any]]]:
+    resources = command_json(["flotilla", "resource", "list", "convoys", "--json"])
+    fleet_list = command_json(["flotilla", "ls", "--json"])
+    rows_by_convoy: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in fleet_list.get("rows", []):
+        if row.get("convoy"):
+            rows_by_convoy[row["convoy"]].append(row)
+
+    # A peer can expose the same convoy through more than one provenance. Prefer
+    # local authority, then the newest replica, without depending on input order.
+    records: dict[str, tuple[tuple[bool, str, str], dict[str, Any]]] = {}
+    for record in resources.get("records", []):
+        obj = record.get("object", {})
+        name = obj.get("metadata", {}).get("name")
+        if not name:
+            continue
+        provenance = record.get("provenance", {})
+        rank = (
+            provenance.get("source") == "local",
+            provenance.get("lastSyncedAt", ""),
+            obj.get("metadata", {}).get("resourceVersion", ""),
+        )
+        old = records.get(name)
+        if old is None or rank > old[0]:
+            records[name] = (rank, record)
+
+    by_issue: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for name, (_, record) in sorted(records.items()):
+        obj = record["object"]
+        status = obj.get("status", {})
+        provenance = record.get("provenance", {})
+        rows = rows_by_convoy.get(name, [])
+        row = min(rows, key=lambda item: json.dumps(item, sort_keys=True)) if rows else {}
+        host = row.get("host") or status.get("placement_decision", {}).get("target_host", {}).get("display_name")
+        # Ages and sync timestamps advance even when the observation does not
+        # change. Persist the semantic category only so refreshes stay stable.
+        staleness = {"kind": (row.get("staleness") or {}).get("kind") or provenance.get("source", "unknown")}
+        fact = {
+            "name": name,
+            "phase": status.get("phase", "Unknown"),
+            "host": host,
+            "staleness": staleness,
+        }
+        for carried in obj.get("spec", {}).get("issues") or []:
+            reference = carried.get("reference", {})
+            source = reference.get("source", {})
+            if source.get("service", "").rstrip("/") != "https://github.com":
+                continue
+            scope, issue_id = source.get("scope"), reference.get("id")
+            if scope in REPOSITORIES and issue_id is not None:
+                by_issue[f"{scope}#{issue_id}"].append(fact)
+    return {ref: sorted(facts, key=lambda fact: fact["name"]) for ref, facts in sorted(by_issue.items())}
+
+
+def fetch_repository(repository: str) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]]]:
+    issues = command_json(
+        ["gh", "issue", "list", "-R", repository, "--state", "all", "--limit", "10000", "--json", ISSUE_FIELDS]
+    )
+    pull_requests = command_json(
+        ["gh", "pr", "list", "-R", repository, "--state", "all", "--limit", "10000", "--json", PR_FIELDS]
+    )
+    return issues, {pull_request["number"]: pull_request for pull_request in pull_requests}
+
+
+def generated_layer() -> dict[str, Any]:
+    convoys = convoy_facts()
+    tickets: list[dict[str, Any]] = []
+    edges: set[tuple[str, str]] = set()
+    groups: dict[str, list[str]] = defaultdict(list)
+    timestamps: list[str] = []
+
+    for repository in REPOSITORIES:
+        issues, pull_requests = fetch_repository(repository)
+        for issue in issues:
+            ref = f"{repository}#{issue['number']}"
+            carried_by = convoys.get(ref, [])
+            open_blockers = [node for node in issue.get("blockedBy", {}).get("nodes", []) if node.get("state") == "OPEN"]
+            if issue["state"] == "CLOSED":
+                status = "landed"
+            elif any(convoy["phase"].lower() == "active" for convoy in carried_by):
+                status = "at-sea"
+            elif carried_by or open_blockers:
+                status = "blocked"
+            else:
+                status = "ready"
+
+            labels = sorted(label["name"] for label in issue.get("labels", []))
+            for label in labels:
+                groups[label].append(ref)
+            for blocker in issue.get("blockedBy", {}).get("nodes", []):
+                blocker_ref = github_ref(blocker.get("url", ""))
+                if blocker_ref:
+                    edges.add((blocker_ref, ref))
+
+            prs = []
+            for closing_ref in issue.get("closedByPullRequestsReferences", []):
+                pr_repository = closing_ref.get("repository", {})
+                slug = f"{pr_repository.get('owner', {}).get('login')}/{pr_repository.get('name')}"
+                details = pull_requests.get(closing_ref.get("number")) if slug == repository else None
+                pr = {
+                    "ref": github_ref(closing_ref["url"]),
+                    "url": closing_ref["url"],
+                    "state": str(details.get("state", "unknown")).lower() if details else "unknown",
+                    "ci": check_state(details.get("statusCheckRollup", [])) if details else "unknown",
+                }
+                if details and details.get("mergeStateStatus"):
+                    pr["mergeState"] = details["mergeStateStatus"].lower()
+                prs.append(pr)
+
+            timestamps.extend(value for value in (issue.get("updatedAt"), issue.get("closedAt")) if value)
+            tickets.append(
+                {
+                    "ref": ref,
+                    "repository": repository,
+                    "number": issue["number"],
+                    "title": issue["title"],
+                    "url": issue["url"],
+                    "status": status,
+                    "trackerState": issue["state"].lower(),
+                    "updatedAt": issue["updatedAt"],
+                    "labels": labels,
+                    "blockedBy": sorted(
+                        filter(None, (github_ref(node.get("url", "")) for node in issue.get("blockedBy", {}).get("nodes", [])))
+                    ),
+                    "pullRequests": sorted(prs, key=lambda pr: pr["url"]),
+                    "convoys": carried_by,
+                }
+            )
+
+    return {
+        "schemaVersion": 1,
+        "asOf": max(timestamps, default=None),
+        "repositories": list(REPOSITORIES),
+        "tickets": sorted(tickets, key=lambda ticket: (ticket["repository"], ticket["number"])),
+        "dependencyEdges": [{"from": source, "to": target} for source, target in sorted(edges)],
+        "groups": {label: sorted(refs) for label, refs in sorted(groups.items())},
+    }
+
+
+def write_json(path: Path, value: Any) -> None:
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("~/dev/flotilla-tickets-dag.generated.json"),
+        help="generated JSON path (default: %(default)s)",
+    )
+    args = parser.parse_args()
+    write_json(args.output, generated_layer())
+
+
+if __name__ == "__main__":
+    main()
