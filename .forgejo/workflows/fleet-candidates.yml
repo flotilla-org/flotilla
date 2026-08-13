@@ -1,0 +1,125 @@
+name: Build fleet candidates
+
+on:
+  workflow_dispatch:
+    inputs:
+      flotilla_sha:
+        description: Exact 40-character commit from flotilla-org/flotilla
+        required: true
+        type: string
+      cleat_sha:
+        description: Exact 40-character commit from flotilla-org/cleat
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-candidates-${{ inputs.flotilla_sha }}-${{ inputs.cleat_sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  FLEET_ORCHESTRATION_SHA: ${{ forgejo.sha }}
+  FLEET_FLOTILLA_SHA: ${{ inputs.flotilla_sha }}
+  FLEET_CLEAT_SHA: ${{ inputs.cleat_sha }}
+
+jobs:
+  linux:
+    name: Linux x86_64 candidate
+    runs-on: debian-12
+    timeout-minutes: 120
+    steps:
+      - name: Bootstrap the pinned worker environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install --no-install-recommends --yes \
+            build-essential ca-certificates clang cmake curl git nodejs \
+            patchelf pkg-config python3 xz-utils
+
+          git init orchestration
+          git -C orchestration remote add origin https://github.com/flotilla-org/flotilla.git
+          git -C orchestration fetch --depth=1 origin "$FLEET_ORCHESTRATION_SHA"
+          test "$(git -C orchestration rev-parse FETCH_HEAD)" = "$FLEET_ORCHESTRATION_SHA"
+          git -C orchestration checkout --detach FETCH_HEAD
+
+      - name: Restore dependency and compiler caches
+        uses: https://code.forgejo.org/actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c
+        with:
+          path: |
+            .fleet-cache/toolchains
+            .fleet-cache/cargo
+            sources/flotilla/target
+            sources/cleat/target
+            sources/cleat/.tools/ghostty-src/.zig-cache
+          key: fleet-linux-v1-${{ inputs.flotilla_sha }}-${{ inputs.cleat_sha }}
+          restore-keys: |
+            fleet-linux-v1-
+
+      - name: Build and verify the coordinated candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          source orchestration/ci/fleet-candidates/setup-linux-toolchain.sh
+          orchestration/ci/fleet-candidates/build-candidate.sh
+
+      - name: Upload seven-day Linux candidate
+        uses: https://code.forgejo.org/actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32
+        with:
+          name: fleet-candidate-linux-x86_64-gnu2.36
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Save dependency and compiler caches
+        if: always()
+        uses: https://code.forgejo.org/actions/cache/save@6f8efc29b200d32929f49075959781ed54ec270c
+        with:
+          path: |
+            .fleet-cache/toolchains
+            .fleet-cache/cargo
+            sources/flotilla/target
+            sources/cleat/target
+            sources/cleat/.tools/ghostty-src/.zig-cache
+          key: fleet-linux-v1-${{ inputs.flotilla_sha }}-${{ inputs.cleat_sha }}
+
+  darwin:
+    name: Darwin arm64 candidate
+    runs-on: darwin-aarch64
+    timeout-minutes: 120
+    steps:
+      - name: Check out the orchestration scripts
+        shell: /bin/bash -e {0}
+        run: |
+          set -euo pipefail
+          git init orchestration
+          git -C orchestration remote add origin https://github.com/flotilla-org/flotilla.git
+          git -C orchestration fetch --depth=1 origin "$FLEET_ORCHESTRATION_SHA"
+          test "$(git -C orchestration rev-parse FETCH_HEAD)" = "$FLEET_ORCHESTRATION_SHA"
+          git -C orchestration checkout --detach FETCH_HEAD
+
+      - name: Verify the credential-free worker
+        shell: /bin/bash -e {0}
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          security find-identity -v -p codesigning | grep -Eq '^[[:space:]]*0 valid identities found[[:space:]]*$'
+          test -z "${FLEET_CODESIGN_IDENTITY:-}"
+          test -z "${FORGEJO_ADMIN_TOKEN:-}"
+
+      - name: Build and verify the coordinated candidate
+        shell: /bin/bash -e {0}
+        run: orchestration/ci/fleet-candidates/build-candidate.sh
+
+      - name: Upload seven-day Darwin candidate
+        uses: https://code.forgejo.org/actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32
+        with:
+          name: fleet-candidate-darwin-aarch64
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
