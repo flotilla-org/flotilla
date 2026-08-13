@@ -105,13 +105,13 @@ use crate::{
         ai_utility::{AiUtility, ConvoyNames},
         discovery::{
             discover_providers_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion,
-            EnvironmentBag,
+            EnvironmentBag, ObserverPolling,
         },
         issue_tracker::{forge_issue_source, IssueProvider},
         ssh_runner::SshCommandRunner,
         ChannelLabel, CommandRunner,
     },
-    refresh::RefreshSnapshot,
+    refresh::{ExternalPolling, RefreshSnapshot},
     regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome, DEFAULT_REGARD_DECAY_SECONDS, DEFAULT_REGARD_REFRESH_SECONDS},
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
     repository_inspection::{
@@ -1951,6 +1951,24 @@ const FLEET_REPLICA_FRESH_SECS: i64 = 90;
 const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 const ENSURE_BACKOFF_RESET_AFTER: ChronoDuration = ChronoDuration::minutes(10);
 
+fn mark_external_polling_disabled(providers: &mut [HostProviderStatus], follower: bool) {
+    if !follower {
+        return;
+    }
+    for provider in providers {
+        if matches!(provider.category.as_str(), "change_request" | "cloud_agent") {
+            provider.disabled_reason = Some("polling disabled".to_string());
+        }
+    }
+}
+
+fn external_polling_policy(discovery: &DiscoveryRuntime) -> ExternalPolling {
+    match discovery.observer_polling() {
+        ObserverPolling::Enabled => ExternalPolling::Enabled,
+        ObserverPolling::Disabled => ExternalPolling::Disabled,
+    }
+}
+
 fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
     let exponent = restart_count.min(5);
     ChronoDuration::seconds((30_i64.saturating_mul(1_i64 << exponent)).min(15 * 60))
@@ -2077,7 +2095,7 @@ impl InProcessDaemon {
                 }
             }
             let slug = repo_slug.clone();
-            let mut model = RepoModel::new(
+            let mut model = RepoModel::new_with_external_polling(
                 path.clone(),
                 registry,
                 repo_slug,
@@ -2085,6 +2103,7 @@ impl InProcessDaemon {
                 Some(local_host_id.clone()),
                 attachable_store,
                 Arc::clone(&agent_state_store),
+                external_polling_policy(&discovery),
             );
             model.data.loading = true;
             let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
@@ -2098,14 +2117,16 @@ impl InProcessDaemon {
             path_identities.insert(path.clone(), identity);
         }
 
+        let mut local_provider_statuses = crate::host_summary::provider_statuses_from_registries(
+            repos.values().map(|state| state.preferred_root().model.registry.as_ref()),
+        );
+        mark_external_polling_disabled(&mut local_provider_statuses, follower);
         let local_host_summary = crate::host_summary::build_local_host_summary(
             &local_node_id,
             &host_name,
             EnvironmentId::host(environment_manager.local_host_id().clone()),
             &environment_manager,
-            crate::host_summary::provider_statuses_from_registries(
-                repos.values().map(|state| state.preferred_root().model.registry.as_ref()),
-            ),
+            local_provider_statuses,
             &*discovery.env,
         )
         .await;
@@ -2340,9 +2361,9 @@ impl InProcessDaemon {
             .host_scoped_providers
             .discover_for_environment(&self.local_environment_id, &host_bag, &self.discovery.factories, &self.config, &probe_root, runner)
             .await;
-        let provider = host_scoped.issue_provider_for(source).ok_or_else(|| {
-            self.missing_external_provider_error(&format!("no issue provider available for {} {}", source.service, source.scope))
-        })?;
+        let provider = host_scoped
+            .issue_provider_for(source)
+            .ok_or_else(|| format!("no issue provider available for {} {}", source.service, source.scope))?;
         Ok(provider)
     }
 
@@ -6261,7 +6282,7 @@ impl InProcessDaemon {
             }
         }
         let slug = repo_slug.clone();
-        let mut model = RepoModel::new(
+        let mut model = RepoModel::new_with_external_polling(
             path.clone(),
             registry,
             repo_slug,
@@ -6269,6 +6290,7 @@ impl InProcessDaemon {
             Some(self.environment_manager.host_id_for_environment(&self.local_environment_id).expect("local host id must be available")),
             self.discovery.shared_attachable_store(&self.config),
             Arc::clone(&self.agent_state_store),
+            external_polling_policy(&self.discovery),
         );
         model.data.loading = true;
         let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
@@ -6469,14 +6491,10 @@ impl InProcessDaemon {
             .into_iter()
             .map(|(category, name)| {
                 let healthy = snapshot.provider_health.get(&category).and_then(|providers| providers.get(&name)).copied().unwrap_or(true);
-                ProviderInfo { category, name, healthy, disabled_reason: None }
+                let disabled_reason = (self.follower && matches!(category.as_str(), "change_request" | "cloud_agent"))
+                    .then(|| "polling disabled".to_string());
+                ProviderInfo { category, name, healthy, disabled_reason }
             })
-            .chain(self.discovery.follower_suppressions().map(|category| ProviderInfo {
-                category: category.slug().to_string(),
-                name: category.display_name().to_string(),
-                healthy: true,
-                disabled_reason: Some("follower mode".to_string()),
-            }))
             .collect();
 
         let unmet_requirements =
@@ -8203,11 +8221,7 @@ impl InProcessDaemon {
                 providers.push(advertised.clone());
             }
         }
-        providers.extend(
-            self.discovery
-                .follower_suppressions()
-                .map(|category| HostProviderStatus::disabled(category.slug(), category.display_name(), "follower mode")),
-        );
+        mark_external_polling_disabled(&mut providers, self.follower);
         providers.sort_by(|left, right| (&left.category, &left.name).cmp(&(&right.category, &right.name)));
         let summary = crate::host_summary::build_local_host_summary(
             &self.node_id,
@@ -8227,18 +8241,11 @@ impl InProcessDaemon {
         let repos = self.repos.read().await;
         let state = repos.get(&identity).ok_or_else(|| "repo not found".to_string())?;
         let source = forge_issue_source(state.identity());
-        let provider = state.registry().issue_provider_for(&source).ok_or_else(|| {
-            self.missing_external_provider_error(&format!("no issue provider available for {} {}", source.service, source.scope))
-        })?;
+        let provider = state
+            .registry()
+            .issue_provider_for(&source)
+            .ok_or_else(|| format!("no issue provider available for {} {}", source.service, source.scope))?;
         Ok((provider, source))
-    }
-
-    fn missing_external_provider_error(&self, error: &str) -> String {
-        if self.follower {
-            format!("{error}: this host runs in follower mode; dispatch from a leader host")
-        } else {
-            error.to_string()
-        }
     }
 
     pub async fn execute_with_remote_executor(

@@ -22,10 +22,10 @@ use flotilla_core::{
         coding_agent::CloudAgentService,
         discovery::{
             test_support::{
-                fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_providers, fake_vcs_discovery, git_process_discovery,
-                init_git_repo, init_git_repo_with_remote, DiscoveryMockRunner, FakeChangeRequest, FakeCheckoutManager,
-                FakeCheckoutManagerFactory, FakeDiscoveryProviders, FakeIssueProvider, FakePresentationManager, FakeTerminalPool,
-                FakeVcsFactory, FakeVcsState, TestEnvVars,
+                fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_provider_set_for_follower,
+                fake_discovery_with_providers, fake_vcs_discovery, git_process_discovery, init_git_repo, init_git_repo_with_remote,
+                DiscoveryMockRunner, FakeChangeRequest, FakeCheckoutManager, FakeCheckoutManagerFactory, FakeDiscoveryProviders,
+                FakeIssueProvider, FakePresentationManager, FakeTerminalPool, FakeVcsFactory, FakeVcsState, TestEnvVars,
             },
             DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, Factory, HostDetector, HostPlatform, ProviderCategory,
             ProviderDescriptor, RepoDetector, UnmetRequirement,
@@ -653,6 +653,39 @@ impl ChangeRequestTracker for FailingChangeRequestTracker {
 
     async fn list_merged_branch_names(&self, _: &Path, _: usize) -> Result<Vec<String>, String> {
         Err("merged branch listing failed".into())
+    }
+}
+
+struct CountingChangeRequestTracker {
+    polls: AtomicUsize,
+}
+
+#[async_trait]
+impl ChangeRequestTracker for CountingChangeRequestTracker {
+    async fn list_change_requests(&self, _: &Path, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+
+    async fn get_change_request(&self, _: &Path, id: &str) -> Result<(String, ChangeRequest), String> {
+        Err(format!("change request {id} not found"))
+    }
+
+    async fn open_in_browser(&self, _: &Path, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn close_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn merge_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn list_merged_branch_names(&self, _: &Path, _: usize) -> Result<Vec<String>, String> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
     }
 }
 
@@ -2287,6 +2320,58 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     ));
 
     drop(temp);
+}
+
+#[tokio::test]
+async fn follower_convoy_start_resolves_issue_through_local_provider() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+    let reference = IssueRef { source: source.clone(), id: "1432".into() };
+    let mut issue = TestIssue::new("Decouple providers from follower mode").id("1432").build();
+    issue.reference = reference.clone();
+    let provider = Arc::new(FakeIssueProvider::new());
+    provider.add_issues(vec![(reference.id.clone(), issue)]).await;
+    let discovery = fake_discovery_with_provider_set_for_follower(
+        FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
+    );
+    let daemon = InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    assert!(daemon.is_follower());
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, Some(source)).await;
+    let mut events = daemon.subscribe();
+
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "flotilla".into(),
+                    change_request: None,
+                    issues: vec![IssueSelector::Reference(reference.clone())],
+                    name: Some("issue-1432".into()),
+                    branch: Some("fix/issue-1432".into()),
+                    workflow_ref: Some("single-agent-contained".into()),
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: None,
+                    agent_overrides: Vec::new(),
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                }),
+            },
+        })
+        .await
+        .expect("start command accepted");
+
+    assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::ConvoyStarted {
+        name: "issue-1432".into(),
+        attach_plan: None,
+        binding: None,
+    });
+    let convoy = backend.using::<ResourceConvoy>("flotilla").get("issue-1432").await.expect("persisted convoy");
+    assert_eq!(convoy.spec.issues[0].reference, reference);
 }
 
 #[tokio::test]
@@ -6265,60 +6350,44 @@ async fn follower_mode_flag_is_stored() {
 }
 
 #[tokio::test]
-async fn follower_mode_skips_external_providers() {
+async fn follower_mode_constructs_external_providers_without_polling_them() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().to_path_buf();
     init_git_repo(&repo);
 
     let config = test_config_store(temp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(true), HostName::local()).await;
+    let provider = Arc::new(CountingChangeRequestTracker { polls: AtomicUsize::new(0) });
+    let discovery = fake_discovery_with_provider_set_for_follower(
+        FakeDiscoveryProviders::new().with_change_request(provider.clone() as Arc<dyn ChangeRequestTracker>),
+    );
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
 
     assert!(daemon.is_follower());
 
     // list_repos gives us RepoInfo with provider_names populated from the registry
     let repos = daemon.list_repos().await.expect("list_repos");
     assert_eq!(repos.len(), 1);
-    assert!(repos[0].repository_key.is_some(), "startup repo should expose its queryable repository key");
     let provider_names = &repos[0].provider_names;
 
-    // VCS should be present (local provider, .git dir exists)
-    assert!(provider_names.contains_key("vcs"), "follower should have VCS provider");
-    // checkout_manager should also be present (git-based fallback)
-    assert!(provider_names.contains_key("checkout_manager"), "follower should have checkout_manager provider");
+    assert!(provider_names.contains_key("change_request"), "follower should construct its credentialed change-request provider");
 
-    // External providers should be absent
-    assert!(!provider_names.contains_key("change_request"), "follower should not have change_request provider");
-    assert!(!provider_names.contains_key("issue_tracker"), "follower should not have issue_tracker provider");
-    // cloud_agent and ai_utility depend on Claude/Codex/Cursor being
-    // installed, so they may or may not be present in non-follower mode.
-    // In follower mode they should always be absent.
-    assert!(!provider_names.contains_key("cloud_agent"), "follower should not have cloud_agent provider");
-    assert!(!provider_names.contains_key("ai_utility"), "follower should not have ai_utility provider");
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("manual refresh accepted");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(provider.polls.load(Ordering::SeqCst), 0, "follower must not start external observer polling");
 
-    let expected_suppressions = ["ai_utility", "change_request", "cloud_agent", "issue_tracker"];
     let host_summary = daemon.local_host_summary().await;
-    let mut host_suppressions = host_summary
-        .providers
-        .iter()
-        .filter(|provider| provider.disabled_reason.as_deref() == Some("follower mode"))
-        .map(|provider| provider.category.as_str())
-        .collect::<Vec<_>>();
-    host_suppressions.sort_unstable();
-    assert_eq!(host_suppressions, expected_suppressions);
+    let host_polling_disabled =
+        host_summary.providers.iter().find(|status| status.category == "change_request").expect("host change-request status");
+    assert_eq!(host_polling_disabled.disabled_reason.as_deref(), Some("polling disabled"));
 
     let repo_providers = daemon.get_repo_providers_internal(&RepoSelector::Path(repo)).await.expect("repo providers");
-    let mut repo_suppressions = repo_providers
-        .providers
-        .iter()
-        .filter(|provider| provider.disabled_reason.as_deref() == Some("follower mode"))
-        .map(|provider| provider.category.as_str())
-        .collect::<Vec<_>>();
-    repo_suppressions.sort_unstable();
-    assert_eq!(repo_suppressions, expected_suppressions);
+    let repo_polling_disabled =
+        repo_providers.providers.iter().find(|status| status.category == "change_request").expect("repo change-request status");
+    assert_eq!(repo_polling_disabled.disabled_reason.as_deref(), Some("polling disabled"));
 }
 
 #[tokio::test]
-async fn missing_issue_provider_explains_follower_mode_only_on_followers() {
+async fn missing_issue_provider_names_the_missing_capability_on_every_host() {
     let config_tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(config_tmp.path().to_path_buf());
     let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
@@ -6329,10 +6398,7 @@ async fn missing_issue_provider_explains_follower_mode_only_on_followers() {
 
     let follower = InProcessDaemon::new(vec![], config, fake_discovery(true), HostName::local()).await;
     let follower_error = follower.issue_provider_for_source(&source).await.err().expect("follower should have no issue provider");
-    assert_eq!(
-        follower_error,
-        "no issue provider available for https://github.com flotilla-org/flotilla: this host runs in follower mode; dispatch from a leader host"
-    );
+    assert_eq!(follower_error, "no issue provider available for https://github.com flotilla-org/flotilla");
 }
 
 #[tokio::test]

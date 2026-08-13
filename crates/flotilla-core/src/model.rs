@@ -15,7 +15,7 @@ use crate::{
         registry::{ProviderRegistry, ProviderSet},
         types::RepoCriteria,
     },
-    refresh::{RefreshSchedule, RepoRefreshHandle},
+    refresh::{ExternalPolling, RefreshSchedule, RepoRefreshHandle},
 };
 pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
     fn labels<T: ?Sized>(set: &ProviderSet<T>) -> CategoryLabels {
@@ -92,11 +92,34 @@ impl RepoModel {
         attachable_store: SharedAttachableStore,
         agent_state_store: crate::agents::SharedAgentStateStore,
     ) -> Self {
+        Self::new_with_external_polling(
+            repo_root,
+            registry,
+            repo_slug,
+            environment_id,
+            host_id,
+            attachable_store,
+            agent_state_store,
+            ExternalPolling::Enabled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_external_polling(
+        repo_root: PathBuf,
+        registry: ProviderRegistry,
+        repo_slug: Option<String>,
+        environment_id: Option<EnvironmentId>,
+        host_id: Option<HostId>,
+        attachable_store: SharedAttachableStore,
+        agent_state_store: crate::agents::SharedAgentStateStore,
+        external_polling: ExternalPolling,
+    ) -> Self {
         let labels = labels_from_registry(&registry);
         let registry = Arc::new(registry);
         let criteria = RepoCriteria { repo_slug };
         let refresh_schedule = RefreshSchedule::for_repo(&repo_root, Duration::from_secs(10), Duration::from_secs(60));
-        let refresh_handle = RepoRefreshHandle::spawn_with_schedule(
+        let refresh_handle = RepoRefreshHandle::spawn_with_schedule_and_external_polling(
             repo_root,
             registry.clone(),
             criteria,
@@ -105,6 +128,7 @@ impl RepoModel {
             attachable_store,
             agent_state_store,
             refresh_schedule,
+            external_polling,
         );
         Self { registry, data: DataStore::default(), labels, refresh_handle, environment_id }
     }
