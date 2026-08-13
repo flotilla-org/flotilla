@@ -78,6 +78,14 @@ fn crew_attention_keeps_monitoring_distinct_from_lifecycle_state() {
 }
 
 #[test]
+fn handed_back_crew_is_settled_for_its_own_attention() {
+    assert!(crew_work_unsettled(CrewWorkPhase::Working));
+    assert!(!crew_work_unsettled(CrewWorkPhase::Done));
+    assert!(!crew_work_unsettled(CrewWorkPhase::HandedBack));
+    assert!(!crew_work_unsettled(CrewWorkPhase::Failed));
+}
+
+#[test]
 fn turn_delivery_session_plans_preserve_terminal_lifecycle_invariants() {
     assert_eq!(
         turn_delivery_session_plan(Some(ResourceTerminalSessionPhase::Running), "work", "coder").expect("running session"),

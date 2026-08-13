@@ -779,6 +779,10 @@ fn crew_attention(status: Option<&TerminalSessionStatus>, work_unsettled: bool, 
     })
 }
 
+fn crew_work_unsettled(phase: CrewWorkPhase) -> bool {
+    !matches!(phase, CrewWorkPhase::Done | CrewWorkPhase::HandedBack | CrewWorkPhase::Failed)
+}
+
 fn convoy_state_label(row: &ConvoyRow) -> String {
     match row.message.as_deref().filter(|message| !message.trim().is_empty()) {
         Some(message) => format!("{}: {message}", row.phase),
@@ -7072,7 +7076,7 @@ impl InProcessDaemon {
                     .as_ref()
                     .and_then(|status| status.crew_work.get(&context.vessel))
                     .and_then(|crew| crew.get(&process.role))
-                    .is_none_or(|work| !matches!(work.phase, CrewWorkPhase::Done | CrewWorkPhase::Failed));
+                    .is_none_or(|work| crew_work_unsettled(work.phase));
                 let state = match session.and_then(|session| session.status.as_ref().map(|status| status.phase)) {
                     Some(ResourceTerminalSessionPhase::Starting) => "starting",
                     Some(ResourceTerminalSessionPhase::Running) => "active",
@@ -7769,12 +7773,8 @@ impl InProcessDaemon {
                     let convoy_name = convoy_name.clone();
                     status.crew_work.into_iter().flat_map(move |(vessel, crew)| {
                         let convoy_name = convoy_name.clone();
-                        crew.into_iter().map(move |(role, work)| {
-                            (
-                                (convoy_name.clone(), vessel.clone(), role),
-                                !matches!(work.phase, CrewWorkPhase::Done | CrewWorkPhase::Failed),
-                            )
-                        })
+                        crew.into_iter()
+                            .map(move |(role, work)| ((convoy_name.clone(), vessel.clone(), role), crew_work_unsettled(work.phase)))
                     })
                 })
             })
