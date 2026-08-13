@@ -23,7 +23,6 @@ use flotilla_core::{
     },
     config::ConfigStore,
     in_process::InProcessDaemon,
-    measure_available_space,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
     providers::{
@@ -405,6 +404,7 @@ impl DaemonRuntime {
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
+        daemon.set_admission_free_space_path(PathBuf::from(&profile.repo_default_dir));
         let credential_store = Arc::new(CredentialStore::new(
             daemon.resource_backend(),
             &options.namespace,
@@ -1217,6 +1217,7 @@ async fn apply_host_heartbeat_with_credentials(
     health: &DaemonHealthIdentity,
     runtime_health: &RuntimeHealth,
 ) -> Result<(), String> {
+    daemon.set_admission_free_space_path(PathBuf::from(&profile.repo_default_dir));
     ensure_host_exists(&daemon.resource_backend(), namespace, &profile.host_id, &profile.display_name).await?;
     let backend = daemon.resource_backend();
     let hosts = backend.using::<Host>(namespace);
@@ -1241,10 +1242,7 @@ async fn apply_host_heartbeat_with_credentials(
         Some(store) => store.held_credentials().await?,
         None => BTreeSet::new(),
     };
-    let repo_default_dir = PathBuf::from(&profile.repo_default_dir);
-    let disk_free_bytes = tokio::task::spawn_blocking(move || measure_available_space(&repo_default_dir))
-        .await
-        .map_err(|error| format!("measure available disk space: {error}"))?;
+    let disk_free_bytes = daemon.admission_free_space_bytes().await?;
     let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
     let mut conditions = runtime_health.conditions().await;
     conditions.extend(file_descriptor_pressure_condition());

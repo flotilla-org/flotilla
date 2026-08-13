@@ -44,6 +44,7 @@ pub struct HostStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Available bytes on the host-direct checkout root used for convoy admission.
     pub disk_free_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_free_space_floor_bytes: Option<u64>,
