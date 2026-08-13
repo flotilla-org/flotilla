@@ -157,6 +157,16 @@ enum PlacementStrategy {
     },
 }
 
+impl PlacementStrategy {
+    fn canonicalize_host_ref(&mut self, host_ref: &str) {
+        match self {
+            Self::HostDirect { host_ref: strategy_host_ref, .. }
+            | Self::DockerWorktreeOnHostAndMount { host_ref: strategy_host_ref, .. }
+            | Self::DockerFreshCloneInContainer { host_ref: strategy_host_ref, .. } => host_ref.clone_into(strategy_host_ref),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum PlannedPatch {
     None,
@@ -284,10 +294,13 @@ impl Reconciler for VesselReconciler {
             }
             Err(err) => return Err(err),
         };
-        let strategy = match placement_strategy(&placement_policy.spec) {
+        let mut strategy = match placement_strategy(&placement_policy.spec) {
             Ok(strategy) => strategy,
             Err(message) => return Ok(VesselDeps::failed(message)),
         };
+        if let Some(decision) = placement_decision.as_ref() {
+            strategy.canonicalize_host_ref(&decision.target_host.reference);
+        }
         let declared_agent_adapters =
             placement_policy.spec.docker_per_vessel.as_ref().map(|docker| docker.agent_adapters.clone()).unwrap_or_default();
 
@@ -1366,9 +1379,15 @@ mod tests {
     };
 
     use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
-    use flotilla_resources::{Convoy, ConvoySpec, InputMeta, ResourceBackend};
+    use flotilla_resources::{
+        Convoy, ConvoySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicySpec,
+        ResourceBackend,
+    };
 
-    use super::{checkout_name, checkout_placement_scope, environment_with_credentials, legible_waiting_for, VesselReconciler};
+    use super::{
+        checkout_name, checkout_placement_scope, environment_with_credentials, legible_waiting_for, placement_strategy, PlacementStrategy,
+        VesselReconciler,
+    };
 
     #[derive(Clone)]
     struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
@@ -1426,6 +1445,31 @@ mod tests {
             legible_waiting_for("checkout checkout-01HXYZ to become ready".to_string(), Some(&decision)),
             "checkout checkout-01HXYZ to become ready",
             "unrelated names containing the host ref must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn placement_strategy_replaces_display_name_alias_with_canonical_host_reference() {
+        let policy = PlacementPolicySpec::builder()
+            .pool("cleat".to_string())
+            .host_direct(HostDirectPlacementPolicySpec {
+                host_ref: "udder".to_string(),
+                checkout: HostDirectPlacementPolicyCheckout::Worktree,
+            })
+            .build();
+        let decision = PlacementDecision {
+            policy_name: "host-direct-udder".to_string(),
+            target_host: PlacementTargetHost { reference: "1c8df992".to_string(), display_name: "udder".to_string() },
+            refused_candidates: Vec::new(),
+            viable_not_selected: Vec::new(),
+        };
+        let mut strategy = placement_strategy(&policy).expect("host-direct policy should produce a placement strategy");
+
+        strategy.canonicalize_host_ref(&decision.target_host.reference);
+
+        assert!(
+            matches!(strategy, PlacementStrategy::HostDirect { ref host_ref, .. } if host_ref == "1c8df992"),
+            "placement strategy should carry the canonical host reference from the decision"
         );
     }
 

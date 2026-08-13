@@ -360,7 +360,7 @@ struct ResourceDeleteArgs {
     /// Collect a read-only replica from this origin root
     #[arg(long, value_name = "ORIGIN_ROOT")]
     replica: Option<String>,
-    /// Route the deletion to a peer host
+    /// Delete the authoritative record on this peer host (including incorrectly authored residue)
     #[arg(long)]
     host: Option<String>,
 }

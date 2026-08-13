@@ -31,6 +31,18 @@ use tracing::warn;
 
 type RegistryLookup = dyn Fn(&str) -> Result<Arc<ProviderRegistry>, String> + Send + Sync;
 
+fn canonical_host_ref(hosts: &[ResourceObject<Host>], host_ref: &str) -> Result<String, String> {
+    if hosts.iter().any(|host| host.metadata.name == host_ref) {
+        return Ok(host_ref.to_string());
+    }
+    let mut matching = hosts.iter().filter(|host| host.spec.display_name == host_ref);
+    let host = matching.next().ok_or_else(|| format!("host {host_ref} lookup failed: not found"))?;
+    if matching.any(|candidate| candidate.metadata.name != host.metadata.name) {
+        return Err(format!("host reference {host_ref} is ambiguous"));
+    }
+    Ok(host.metadata.name.clone())
+}
+
 #[async_trait]
 pub trait PresentationRuntime: Send + Sync {
     async fn apply(&self, plan: &PresentationPlan) -> Result<AppliedPresentation, ApplyPresentationError>;
@@ -232,6 +244,11 @@ impl<R> PresentationReconciler<R> {
         vec![Box::new(LabelJoinWatch::<TerminalSession, Presentation> { label_key: CONVOY_LABEL, _marker: PhantomData })]
     }
 
+    async fn canonical_host_ref(&self, host_ref: &str) -> Result<String, String> {
+        let hosts = self.hosts.list().await.map_err(|error| format!("host list failed: {error}"))?;
+        canonical_host_ref(&hosts.items, host_ref)
+    }
+
     async fn resolve_process(&self, session: &ResourceObject<TerminalSession>) -> Result<ResolvedProcess, String> {
         let environment = self
             .environments
@@ -245,7 +262,7 @@ impl<R> PresentationReconciler<R> {
             .map(|spec| spec.host_ref.as_str())
             .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
             .ok_or_else(|| format!("environment {} has no host binding", session.spec.env_ref))?;
-        self.hosts.get(host_ref).await.map_err(|err| format!("host {} lookup failed: {err}", host_ref))?;
+        let host_ref = self.canonical_host_ref(host_ref).await?;
 
         let registry = self.hop_chain.registry_for_env(&session.spec.env_ref)?;
         let pool = registry
@@ -257,13 +274,13 @@ impl<R> PresentationReconciler<R> {
         let session_cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
         let attach_target = flotilla_resources::terminal_session_attach_target(session)?;
         let attach_args = pool.attach_args(attach_target.session_id, attach_target.launch_command, &session_cwd, &Vec::new())?;
-        let attach_command = self.build_attach_command(session, &environment, host_ref, attach_args)?;
+        let attach_command = self.build_attach_command(session, &environment, &host_ref, attach_args)?;
 
         Ok(ResolvedProcess {
             role: session.spec.role.clone(),
             labels: session.metadata.labels.clone(),
             attach_command,
-            host: self.hop_chain.target_host(host_ref),
+            host: self.hop_chain.target_host(&host_ref),
         })
     }
 
@@ -613,10 +630,44 @@ fn session_sort_key(session: &ResourceObject<TerminalSession>) -> (&str, &str, &
 
 #[cfg(test)]
 mod tests {
-    use super::yaml_string;
+    use std::collections::BTreeMap;
+
+    use chrono::Utc;
+    use flotilla_resources::{HostSpec, ObjectMeta};
+
+    use super::{canonical_host_ref, yaml_string, HopChainContext, Host, HostName, ResourceObject};
 
     #[test]
     fn yaml_string_escapes_control_characters() {
         assert_eq!(yaml_string("role\n\r\t\"\\\u{7}"), "\"role\\n\\r\\t\\\"\\\\\\u0007\"");
+    }
+
+    #[test]
+    fn presentation_routes_local_display_name_alias_without_ssh() {
+        let hosts = [ResourceObject::<Host> {
+            metadata: ObjectMeta {
+                name: "local-host-id".to_string(),
+                namespace: "flotilla".to_string(),
+                resource_version: "1".to_string(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: Utc::now(),
+                merge: None,
+            },
+            spec: HostSpec { display_name: "local-host".to_string() },
+            status: None,
+        }];
+        let canonical = canonical_host_ref(&hosts, "local-host").expect("resolve display-name alias");
+        let context = HopChainContext::new(
+            "local-host-id",
+            HostName::new("local-host"),
+            flotilla_core::path_context::DaemonHostPath::new("/tmp"),
+            |_| Err("registry is not used by host routing".to_string()),
+        );
+
+        assert_eq!(context.target_host(&canonical), HostName::new("local-host"));
     }
 }
