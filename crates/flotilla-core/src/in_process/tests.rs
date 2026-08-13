@@ -147,10 +147,8 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
     .await;
     let host_id = daemon.local_host_id().expect("local host identity").to_string();
     let hosts = backend.using::<ResourceHost>("flotilla");
-    let local = hosts
-        .create(&test_meta(&host_id), &HostSpec { display_name: "local-host".to_string() })
-        .await
-        .expect("authoritative local host");
+    let local =
+        hosts.create(&test_meta(&host_id), &HostSpec { display_name: "local-host".to_string() }).await.expect("authoritative local host");
     hosts
         .update_status(&host_id, &local.metadata.resource_version, &HostStatus {
             disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
@@ -231,12 +229,7 @@ async fn placement_target_host_rejects_ambiguous_display_name() {
     assert_eq!(error, "placement `ambiguous-host` host reference `shared-name` is ambiguous");
 }
 
-async fn create_host_direct_placement(
-    backend: &ResourceBackend,
-    policy_name: &str,
-    host_ref: &str,
-    agent_adapters: BTreeSet<String>,
-) {
+async fn create_host_direct_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, agent_adapters: BTreeSet<String>) {
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts.create(&test_meta(host_ref), &HostSpec { display_name: host_ref.to_string() }).await.expect("host create");
     hosts
@@ -262,10 +255,7 @@ async fn default_placement_prefers_local_host_referenced_by_display_name() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     create_host_direct_placement(&backend, "host-direct-a-remote", "remote-host", BTreeSet::from(["codex".to_string()])).await;
     let hosts = backend.using::<ResourceHost>("flotilla");
-    let local = hosts
-        .create(&test_meta("local-host-id"), &HostSpec { display_name: "local-host".to_string() })
-        .await
-        .expect("local host");
+    let local = hosts.create(&test_meta("local-host-id"), &HostSpec { display_name: "local-host".to_string() }).await.expect("local host");
     hosts
         .update_status(&local.metadata.name, &local.metadata.resource_version, &HostStatus {
             capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
