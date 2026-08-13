@@ -18,7 +18,7 @@ use flotilla_core::{
         SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
     },
     project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
-    providers::discovery::test_support::fake_discovery,
+    providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote},
     repository_inspection::{LocalCheckoutInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
@@ -28,6 +28,7 @@ use flotilla_resources::{
     ProjectRepositoryRole, ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend, Stance,
     WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
 };
+use tracing::instrument::WithSubscriber;
 #[derive(Clone)]
 struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -645,19 +646,19 @@ async fn tracking_repo_materializes_whole_repo_project() {
     }]);
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test]
 async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_custom_fields() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("tracked");
-    std::fs::create_dir(&checkout_path).expect("checkout dir");
+    init_git_repo_with_remote(&checkout_path, "https://github.com/org/tracked.git");
     let repository_spec = RepositorySpec::remote("https://github.com/org/tracked.git").expect("repository spec");
     let repository_key = repository_spec.key();
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![checkout_path],
         config,
-        fake_discovery(false),
+        git_process_discovery(false),
         HostName::new("local"),
         backend.clone(),
     )
@@ -674,10 +675,6 @@ async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_cu
         .with_max_level(tracing::Level::WARN)
         .with_writer(move || writer.clone())
         .finish();
-    // Capture from before drift is introduced: the daemon's background poll may
-    // reconcile it before the explicit call below. The current-thread runtime
-    // keeps this thread-local subscriber active across each await.
-    let log_guard = tracing::subscriber::set_default(subscriber);
     projects
         .create(
             &InputMeta::builder()
@@ -700,8 +697,7 @@ async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_cu
         .await
         .expect("stale whole-repository Project should be created");
 
-    daemon.materialize_tracked_repo_projects().await.expect("tracked Project reconciliation should succeed");
-    drop(log_guard);
+    daemon.materialize_tracked_repo_projects().with_subscriber(subscriber).await.expect("tracked Project reconciliation should succeed");
 
     let reconciled = projects.get("tracked").await.expect("tracked Project should remain");
     assert_eq!(reconciled.spec.display_name, "My Tracked Repository");
@@ -717,8 +713,11 @@ async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_cu
     assert_eq!(reconciled.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("whole-repository-project"));
     assert_eq!(reconciled.metadata.labels.get("example.com/preserved").map(String::as_str), Some("true"));
     let logs = String::from_utf8(log_output.lock().expect("log capture lock should be healthy").clone()).expect("logs should be utf-8");
-    assert!(logs.contains("stored generator-owned whole-repository Project fields diverged; overwriting"), "{logs}");
-    assert!(logs.contains("tracked"), "{logs}");
+    assert!(
+        logs.contains("stored generator-owned whole-repository Project fields diverged; overwriting"),
+        "expected generator-field divergence warning; captured logs: {logs:?}"
+    );
+    assert!(logs.contains("tracked"), "expected warning to identify project `tracked`; captured logs: {logs:?}");
 
     daemon.materialize_tracked_repo_projects().await.expect("steady-state reconciliation should succeed");
     let unchanged = projects.get("tracked").await.expect("tracked Project should remain");
