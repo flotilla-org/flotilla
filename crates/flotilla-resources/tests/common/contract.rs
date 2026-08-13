@@ -393,6 +393,13 @@ pub async fn assert_project_definition_edit_converges_with_backend(backend: Reso
 
     let visible_on_feta = feta.definitions::<Project>("flotilla").get("widgets").await.expect("Project should be visible on feta");
     assert_eq!(visible_on_feta.spec.display_name, "Widgets");
+    let point_read = feta.including_replicas::<Project>("flotilla").get("widgets").await.expect("point-read replicated Project definition");
+    assert_eq!(point_read.object.spec.display_name, "Widgets");
+    assert_eq!(point_read.provenance, ResourceProvenance::Local, "merged definitions are presented as the local read view");
+    assert!(matches!(
+        feta.including_replicas::<Project>("flotilla").get("missing").await,
+        Err(flotilla_resources::ResourceError::NotFound { .. })
+    ));
     assert!(feta.using::<Project>("flotilla").list().await.expect("list feta local log").items.is_empty());
 
     feta.definitions::<Project>("flotilla")

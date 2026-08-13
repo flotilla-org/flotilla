@@ -42,7 +42,22 @@ impl<T: Resource> DefinitionResolver<T> {
     }
 
     pub async fn get(&self, name: &str) -> Result<ResourceObject<T>, ResourceError> {
-        self.list().await?.into_iter().find(|object| object.metadata.name == name).ok_or_else(|| ResourceError::not_found(name))
+        ensure_definitions::<T>()?;
+        let sources = self.sources_for_name(name).await?;
+        if sources.is_empty() {
+            return Err(ResourceError::not_found(name));
+        }
+        let object = merge_sources(&sources)?;
+        let deleted = object
+            .metadata
+            .merge
+            .as_ref()
+            .and_then(|merge| merge.fields.get(DELETION_FIELD))
+            .is_some_and(|_| object.metadata.deletion_timestamp.is_some());
+        if deleted && !object.metadata.merge.as_ref().is_some_and(|merge| merge.conflicts.contains_key(DELETION_FIELD)) {
+            return Err(ResourceError::not_found(name));
+        }
+        Ok(object)
     }
 
     pub async fn list(&self) -> Result<Vec<ResourceObject<T>>, ResourceError> {
