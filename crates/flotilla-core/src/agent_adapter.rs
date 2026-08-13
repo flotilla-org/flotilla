@@ -327,6 +327,8 @@ pub struct AgentRequirement {
     pub model: Option<String>,
 }
 
+const CLAUDE_CODE_ADAPTER_ID: &str = "claude-code";
+
 pub struct CapabilityTable {
     requirements: BTreeMap<String, AgentRequirement>,
 }
@@ -371,7 +373,7 @@ impl AgentRequirement {
     /// contained Claude session must never fall through to interactive login.
     pub fn contained_credential_delivery_slot(&self) -> Option<&'static str> {
         match self.adapter.as_str() {
-            "claude-code" => Some("claude"),
+            CLAUDE_CODE_ADAPTER_ID => Some("claude"),
             _ => None,
         }
     }
@@ -428,7 +430,7 @@ enum AdapterFlavor {
 impl AdapterFlavor {
     fn id(&self) -> &'static str {
         match self {
-            Self::ClaudeCode { .. } => "claude-code",
+            Self::ClaudeCode { .. } => CLAUDE_CODE_ADAPTER_ID,
             Self::Codex { .. } => "codex",
         }
     }
@@ -486,10 +488,9 @@ impl AgentAdapter for CliAgentAdapter {
     async fn prepare(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String> {
         match &self.flavor {
             AdapterFlavor::ClaudeCode { state_config } => {
-                let state_config = state_config.as_ref().ok_or_else(|| {
-                    "cannot determine Claude state path because neither CLAUDE_CONFIG_DIR nor HOME was detected".to_string()
-                })?;
-                seed_claude_headless_state(&*self.runner, cwd.as_path(), state_config).await?;
+                if let Some(state_config) = state_config {
+                    seed_claude_headless_state(&*self.runner, cwd.as_path(), state_config).await?;
+                }
                 let mut settings = crate::agents::claude_code_hook_settings();
                 settings["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
                 let settings =
@@ -665,10 +666,7 @@ impl AgentAdapterRegistry {
     pub fn discover(env: &EnvironmentBag, runner: Arc<dyn CommandRunner>) -> Self {
         let mut registry = Self::default();
         if let Some(binary) = env.find_binary("claude") {
-            let state_path = env
-                .find_env_var("CLAUDE_CONFIG_DIR")
-                .map(|config_dir| PathBuf::from(config_dir).join(".claude.json"))
-                .or_else(|| env.find_env_var("HOME").map(|home| PathBuf::from(home).join(".claude.json")));
+            let state_path = env.find_env_var("CLAUDE_CONFIG_DIR").map(|config_dir| PathBuf::from(config_dir).join(".claude.json"));
             registry.insert(Arc::new(CliAgentAdapter {
                 binary: binary.as_path().display().to_string(),
                 runner: Arc::clone(&runner),
@@ -1281,6 +1279,32 @@ mod tests {
         let canonical_workspace = workspace_root.canonicalize().expect("canonical workspace").display().to_string();
         assert_eq!(state["hasCompletedOnboarding"], true);
         assert_eq!(state["projects"][canonical_workspace]["hasTrustDialogAccepted"], true);
+    }
+
+    #[tokio::test]
+    async fn host_direct_claude_does_not_mutate_global_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&home).expect("home");
+        let global_state = home.join(".claude.json");
+        std::fs::write(&global_state, r#"{"existing":true}"#).expect("global Claude state");
+        let env = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("HOME", home.display().to_string()))
+            .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
+        let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
+        let brief =
+            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
+
+        registry
+            .get("claude-code")
+            .expect("Claude adapter")
+            .prepare(&ExecutionEnvironmentPath::new(&workspace), &brief)
+            .await
+            .expect("prepare host-direct Claude");
+
+        assert_eq!(std::fs::read_to_string(global_state).expect("global Claude state"), r#"{"existing":true}"#);
     }
 
     #[test]
