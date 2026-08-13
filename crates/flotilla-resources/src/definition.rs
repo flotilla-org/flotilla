@@ -206,7 +206,24 @@ impl<T: Resource> DefinitionResolver<T> {
     }
 
     async fn sources_for_name(&self, name: &str) -> Result<Vec<DefinitionSource<T>>, ResourceError> {
-        Ok(self.sources().await?.into_iter().filter(|source| source.object.metadata.name == name).collect())
+        let local_root = self.backend.local_root()?;
+        let mut sources = match self.backend.using::<T>(&self.namespace).get(name).await {
+            Ok(object) => vec![DefinitionSource { object, origin: local_root, synced_at: None }],
+            Err(ResourceError::NotFound { .. }) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let replicas = match &self.backend {
+            ResourceBackend::InMemory(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
+            ResourceBackend::Sqlite(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
+            ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP definition views are served by the origin store")),
+        };
+        sources.extend(replicas.into_iter().filter_map(|replica| match replica.provenance {
+            ResourceProvenance::Replica { origin_root, last_synced_at } => {
+                Some(DefinitionSource { object: replica.object, origin: origin_root, synced_at: Some(last_synced_at) })
+            }
+            ResourceProvenance::Local => None,
+        }));
+        Ok(sources)
     }
 
     async fn sources(&self) -> Result<Vec<DefinitionSource<T>>, ResourceError> {

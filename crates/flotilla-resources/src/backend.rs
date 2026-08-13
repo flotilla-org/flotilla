@@ -117,6 +117,33 @@ impl<T: Resource> Clone for ReplicaReadResolver<T> {
 }
 
 impl<T: Resource> ReplicaReadResolver<T> {
+    pub async fn get(&self, name: &str) -> Result<ReadResourceObject<T>, ResourceError> {
+        ensure_replication_enabled::<T>()?;
+        if let ResourceBackend::Http(backend) = &self.backend {
+            return backend.get_including_replicas_typed::<T>(&self.namespace, name).await;
+        }
+        if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
+            return self
+                .backend
+                .definitions::<T>(&self.namespace)
+                .get(name)
+                .await
+                .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local });
+        }
+        match self.backend.using::<T>(&self.namespace).get(name).await {
+            Ok(object) => Ok(ReadResourceObject { object, provenance: ResourceProvenance::Local }),
+            Err(ResourceError::NotFound { .. }) => {
+                let replicas = match &self.backend {
+                    ResourceBackend::InMemory(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
+                    ResourceBackend::Sqlite(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
+                    ResourceBackend::Http(_) => unreachable!("HTTP handled above"),
+                };
+                replicas.into_iter().next().ok_or_else(|| ResourceError::not_found(name))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn list(&self) -> Result<ReadResourceList<T>, ResourceError> {
         ensure_replication_enabled::<T>()?;
         if let ResourceBackend::Http(backend) = &self.backend {

@@ -157,7 +157,7 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind resource HTTP socket");
     let server_backend = source.clone();
     let server = tokio::spawn(async move {
-        for _ in 0..3 {
+        for _ in 0..4 {
             let (mut stream, _) = listener.accept().await.expect("accept resource HTTP request");
             let first_byte = tokio::io::AsyncReadExt::read_u8(&mut stream).await.expect("read HTTP preface");
             let backend = server_backend.clone();
@@ -177,6 +177,11 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
                     if origin_root == &NodeId::new("remote-root")
             )
     }));
+    let replica = remote.including_replicas::<Convoy>("flotilla").get("replica-row").await.expect("get replica over Unix-socket HTTP");
+    assert!(matches!(
+        replica.provenance,
+        ResourceProvenance::Replica { ref origin_root, .. } if origin_root == &NodeId::new("remote-root")
+    ));
     let listed = remote.using::<Convoy>("flotilla").list().await.expect("list convoys over Unix-socket HTTP");
     assert_eq!(listed.items.len(), 1);
     let mut watch =

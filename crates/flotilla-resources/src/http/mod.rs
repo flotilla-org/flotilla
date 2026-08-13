@@ -100,6 +100,23 @@ impl HttpBackend {
         self.list_read_view_typed::<T>(namespace, "includeReplicas").await
     }
 
+    pub(crate) async fn get_including_replicas_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<ReadResourceObject<T>, ResourceError> {
+        let url = self.namespaced_url(T::API_PATHS, namespace, Some(name), false);
+        let response = self
+            .http
+            .get(url)
+            .query(&[("includeReplicas", "true")])
+            .send()
+            .await
+            .map_err(|err| ResourceError::other(format!("GET resource including replicas: {err}")))?;
+        let object: K8sResourceObject<T> = Self::decode_response(response, Some(name)).await?;
+        read_resource_object(ResourceObject::from_k8s_object(object)?)
+    }
+
     pub async fn list_replica_sources_typed<T: Resource>(&self, namespace: &str) -> Result<ReadResourceList<T>, ResourceError> {
         self.list_read_view_typed::<T>(namespace, "replicaSources").await
     }

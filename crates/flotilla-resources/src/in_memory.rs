@@ -256,6 +256,35 @@ impl InMemoryBackend {
         Ok(items)
     }
 
+    pub(crate) async fn get_replicas_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        let replicas = self.replicas.lock().await;
+        let mut items = Vec::new();
+        for ((origin_root, partition_key), partition) in &replicas.partitions {
+            if partition_key != &key {
+                continue;
+            }
+            let Some(value) = partition.objects.get(name) else {
+                continue;
+            };
+            let last_synced_at = partition
+                .synced_at_by_name
+                .get(name)
+                .copied()
+                .ok_or_else(|| ResourceError::other(format!("replica row '{name}' has no sync timestamp")))?;
+            items.push((origin_root.clone(), ReadResourceObject {
+                object: Self::decode_object(value.clone())?,
+                provenance: ResourceProvenance::Replica { origin_root: origin_root.clone(), last_synced_at },
+            }));
+        }
+        items.sort_by(|(left, _), (right, _)| left.cmp(right));
+        Ok(items.into_iter().map(|(_, item)| item).collect())
+    }
+
     pub(crate) async fn watch_replicas_typed<T: Resource>(
         &self,
         namespace: &str,

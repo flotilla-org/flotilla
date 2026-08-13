@@ -322,6 +322,15 @@ pub async fn get_resource_kind(
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, get_typed(backend, namespace, name).await)
 }
 
+pub async fn get_resource_kind_including_replicas(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    name: &str,
+) -> Result<DynamicResourceObject, ResourceError> {
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, get_typed_including_replicas(backend, namespace, name).await)
+}
+
 pub async fn delete_resource_kind(
     backend: &ResourceBackend,
     namespace: &str,
@@ -572,6 +581,20 @@ async fn get_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name
         plural: T::API_PATHS.plural.to_string(),
         namespace: namespace.to_string(),
         value: object_value(&object)?,
+    })
+}
+
+async fn get_typed_including_replicas<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    name: &str,
+) -> Result<DynamicResourceObject, ResourceError> {
+    let object = backend.including_replicas::<T>(namespace).get(name).await?;
+    Ok(DynamicResourceObject {
+        kind: T::API_PATHS.kind.to_string(),
+        plural: T::API_PATHS.plural.to_string(),
+        namespace: namespace.to_string(),
+        value: read_object_value(&object)?,
     })
 }
 

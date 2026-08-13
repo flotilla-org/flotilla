@@ -191,6 +191,7 @@ pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
     let remote = remote_backend.using::<Convoy>("flotilla");
     remote.create(&convoy_meta("remote"), &convoy_spec("remote-template")).await.expect("create remote convoy");
     remote.create(&convoy_meta("untouched"), &convoy_spec("untouched-template")).await.expect("create untouched remote convoy");
+    remote.create(&convoy_meta("local"), &convoy_spec("shadowed-template")).await.expect("create shadowed remote convoy");
     let remote_list = remote.list().await.expect("list remote convoy");
     let synced_at = Utc::now();
 
@@ -200,7 +201,7 @@ pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
     assert_eq!(local_only.items.iter().map(|item| item.metadata.name.as_str()).collect::<Vec<_>>(), ["local"]);
 
     let all = backend.including_replicas::<Convoy>("flotilla").list().await.expect("list resources including replicas");
-    assert_eq!(all.items.len(), 3);
+    assert_eq!(all.items.len(), 4);
     assert!(matches!(all.items[0].provenance, ResourceProvenance::Local));
     let replica = all.items.iter().find(|item| item.object.metadata.name == "remote").expect("remote replica row");
     assert_eq!(replica.provenance, ResourceProvenance::Replica { origin_root: origin.clone(), last_synced_at: synced_at });
@@ -214,6 +215,15 @@ pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
         .expect("wire replica row");
     assert_eq!(wire_replica["metadata"]["annotations"]["flotilla.work/origin-root"], "feta-root");
     assert!(wire_replica["metadata"]["annotations"]["flotilla.work/last-synced-at"].is_string());
+
+    let read = backend.including_replicas::<Convoy>("flotilla");
+    let local_point = read.get("local").await.expect("point-read local convoy");
+    assert_eq!(local_point.object.spec.workflow_ref, "local-template");
+    assert_eq!(local_point.provenance, ResourceProvenance::Local);
+    let replica_point = read.get("remote").await.expect("point-read remote convoy");
+    assert_eq!(replica_point.object.spec.workflow_ref, "remote-template");
+    assert_eq!(replica_point.provenance, ResourceProvenance::Replica { origin_root: origin.clone(), last_synced_at: synced_at });
+    assert!(matches!(read.get("missing").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
 
     let cursor =
         backend.replica_writer::<Convoy>(origin.clone(), "flotilla").cursor().await.expect("read replica cursor").expect("replica cursor");
@@ -251,7 +261,7 @@ pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
     let event = timeout(Duration::from_secs(1), watch.next()).await.expect("replica delete watch timeout");
     assert!(matches!(event, Some(Ok(flotilla_resources::ReadWatchEvent::Deleted(_)))));
     let remaining = backend.including_replicas::<Convoy>("flotilla").list().await.expect("list after replica delete");
-    assert_eq!(remaining.items.len(), 2);
+    assert_eq!(remaining.items.len(), 3);
 
     let mut new_generation = remote.list().await.expect("list new origin generation");
     new_generation.generation = Some("generation-2".to_string());
