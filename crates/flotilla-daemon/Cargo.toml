@@ -45,3 +45,4 @@ tempfile = "3"
 flotilla-core = { path = "../flotilla-core", features = ["test-support", "replay"] }
 flotilla-daemon = { path = ".", features = ["test-support"] }
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
+flotilla-resources = { path = "../flotilla-resources", features = ["test-support"] }

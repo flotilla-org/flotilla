@@ -77,7 +77,7 @@ impl ResourceBackend {
     /// This deliberately returns a different resolver type with no mutation
     /// methods, so controllers cannot accidentally reconcile replica rows.
     pub fn including_replicas<T: Resource>(&self, namespace: &str) -> ReplicaReadResolver<T> {
-        ReplicaReadResolver { backend: self.clone(), namespace: namespace.to_string(), _marker: PhantomData }
+        ReplicaReadResolver { backend: self.clone(), namespace: namespace.to_string(), suppress_self_origin: true, _marker: PhantomData }
     }
 
     pub fn replica_writer<T: Resource>(&self, origin_root: NodeId, namespace: &str) -> ReplicaWriter<T> {
@@ -110,16 +110,31 @@ impl ResourceBackend {
 pub struct ReplicaReadResolver<T: Resource> {
     backend: ResourceBackend,
     namespace: String,
+    suppress_self_origin: bool,
     _marker: PhantomData<T>,
 }
 
 impl<T: Resource> Clone for ReplicaReadResolver<T> {
     fn clone(&self) -> Self {
-        Self { backend: self.backend.clone(), namespace: self.namespace.clone(), _marker: PhantomData }
+        Self {
+            backend: self.backend.clone(),
+            namespace: self.namespace.clone(),
+            suppress_self_origin: self.suppress_self_origin,
+            _marker: PhantomData,
+        }
     }
 }
 
 impl<T: Resource> ReplicaReadResolver<T> {
+    /// Fault-injection seam for convergence tests. Production callers must
+    /// leave self-origin suppression enabled.
+    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn with_self_origin_suppression_disabled_for_test(mut self) -> Self {
+        self.suppress_self_origin = false;
+        self
+    }
+
     pub async fn get(&self, name: &str) -> Result<ReadResourceObject<T>, ResourceError> {
         ensure_replication_enabled::<T>()?;
         if let ResourceBackend::Http(backend) = &self.backend {
@@ -162,6 +177,9 @@ impl<T: Resource> ReplicaReadResolver<T> {
                 .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
                 .collect();
             return Ok(ReadResourceList { items });
+        }
+        if !self.suppress_self_origin {
+            return self.list_sources().await;
         }
         let local_root = self.backend.local_root()?;
         let mut listed = self.list_sources().await?;
@@ -215,7 +233,7 @@ impl<T: Resource> ReplicaReadResolver<T> {
             return backend.watch_including_replicas_typed::<T>(&self.namespace).await;
         }
         let raw = self.watch_sources().await?;
-        if T::REPLICATION_CLASS != crate::ReplicationClass::Definitions {
+        if T::REPLICATION_CLASS != crate::ReplicationClass::Definitions && self.suppress_self_origin {
             let backend = self.backend.clone();
             let namespace = self.namespace.clone();
             let local_root = backend.local_root()?;
