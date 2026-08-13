@@ -303,7 +303,6 @@ pub fn git_process_discovery(follower: bool) -> super::DiscoveryRuntime {
 }
 
 fn minimal_discovery_runtime(follower: bool, runner: std::sync::Arc<dyn CommandRunner>) -> super::DiscoveryRuntime {
-    let factories = if follower { super::FactoryRegistry::for_follower() } else { super::FactoryRegistry::default_all() };
     super::DiscoveryRuntime {
         runner,
         env: std::sync::Arc::new(TestEnvVars::default()),
@@ -314,7 +313,8 @@ fn minimal_discovery_runtime(follower: bool, runner: std::sync::Arc<dyn CommandR
             super::detectors::generic::parse_first_dotted_version,
         ))],
         repo_detectors: super::detectors::default_repo_detectors(),
-        factories,
+        factories: super::FactoryRegistry::default_all(),
+        observer_polling: if follower { super::ObserverPolling::Disabled } else { super::ObserverPolling::Enabled },
         attachable_store: OnceLock::new(),
         host_scoped_providers: Default::default(),
     }
@@ -1331,11 +1331,20 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
             presentation_managers: presentation_manager_factories,
             terminal_pools: terminal_pool_factories,
             environment_providers: vec![],
-            suppressions: vec![],
         },
+        observer_polling: super::ObserverPolling::Enabled,
         attachable_store,
         host_scoped_providers: Default::default(),
     }
+}
+
+/// Build a follower-mode discovery runtime with deterministic injected
+/// providers. Provider construction remains enabled while observer polling is
+/// disabled, matching production follower behavior.
+pub fn fake_discovery_with_provider_set_for_follower(providers: FakeDiscoveryProviders) -> DiscoveryRuntime {
+    let mut runtime = fake_discovery_with_provider_set(providers);
+    runtime.observer_polling = super::ObserverPolling::Disabled;
+    runtime
 }
 
 fn fixed_available_space_probe() -> Arc<dyn crate::admission::AvailableSpaceProbe> {

@@ -269,8 +269,6 @@ pub enum ProviderCategory {
 }
 
 impl ProviderCategory {
-    pub const FOLLOWER_SUPPRESSED: [Self; 4] = [Self::ChangeRequest, Self::IssueProvider, Self::CloudAgent, Self::AiUtility];
-
     pub fn slug(&self) -> &'static str {
         match self {
             Self::Vcs => "vcs",
@@ -432,8 +430,6 @@ pub struct FactoryRegistry {
     pub presentation_managers: Vec<Box<PresentationManagerFactory>>,
     pub terminal_pools: Vec<Box<TerminalPoolFactory>>,
     pub environment_providers: Vec<Box<EnvironmentProviderFactory>>,
-    /// Categories intentionally omitted by the selected daemon mode.
-    pub suppressions: Vec<ProviderCategory>,
 }
 
 impl FactoryRegistry {
@@ -505,8 +501,15 @@ pub struct DiscoveryRuntime {
     pub host_detectors: Vec<Box<dyn HostDetector>>,
     pub repo_detectors: Vec<Box<dyn RepoDetector>>,
     pub factories: FactoryRegistry,
+    observer_polling: ObserverPolling,
     pub(crate) attachable_store: OnceLock<SharedAttachableStore>,
     pub(crate) host_scoped_providers: HostScopedProviderCache,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObserverPolling {
+    Enabled,
+    Disabled,
 }
 
 const HOST_SCAN_CACHE_TTL: Duration = Duration::from_secs(10);
@@ -635,14 +638,14 @@ impl HostScopedProviderCache {
 
 impl DiscoveryRuntime {
     pub fn for_process(follower: bool) -> Self {
-        let factories = if follower { FactoryRegistry::for_follower() } else { FactoryRegistry::default_all() };
         Self {
             runner: Arc::new(crate::providers::ProcessCommandRunner),
             env: Arc::new(ProcessEnvVars),
             available_space_probe: system_available_space_probe(),
             host_detectors: detectors::default_host_detectors(),
             repo_detectors: detectors::default_repo_detectors(),
-            factories,
+            factories: FactoryRegistry::default_all(),
+            observer_polling: if follower { ObserverPolling::Disabled } else { ObserverPolling::Enabled },
             attachable_store: OnceLock::new(),
             host_scoped_providers: HostScopedProviderCache::default(),
         }
@@ -653,12 +656,11 @@ impl DiscoveryRuntime {
     }
 
     pub fn is_follower(&self) -> bool {
-        self.factories.suppressions.len() == ProviderCategory::FOLLOWER_SUPPRESSED.len()
-            && ProviderCategory::FOLLOWER_SUPPRESSED.iter().all(|category| self.factories.suppressions.contains(category))
+        self.observer_polling == ObserverPolling::Disabled
     }
 
-    pub fn follower_suppressions(&self) -> impl Iterator<Item = ProviderCategory> + '_ {
-        self.factories.suppressions.iter().copied()
+    pub fn observer_polling(&self) -> ObserverPolling {
+        self.observer_polling
     }
 }
 
@@ -1037,7 +1039,6 @@ mod orchestrator_tests {
             presentation_managers: vec![],
             terminal_pools: vec![],
             environment_providers: vec![],
-            suppressions: vec![],
         };
 
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
@@ -1067,7 +1068,6 @@ mod orchestrator_tests {
             presentation_managers: vec![],
             terminal_pools: vec![],
             environment_providers: vec![],
-            suppressions: vec![],
         };
 
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;

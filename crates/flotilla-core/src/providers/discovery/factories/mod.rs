@@ -66,22 +66,6 @@ impl FactoryRegistry {
             presentation_managers: presentation_factories(),
             terminal_pools: terminal_pool_factories(),
             environment_providers: vec![Box::new(docker::DockerEnvironmentFactory)],
-            suppressions: vec![],
-        }
-    }
-
-    pub fn for_follower() -> Self {
-        Self {
-            vcs: vec![Box::new(git::GitVcsFactory)],
-            checkout_managers: checkout_manager_factories(),
-            change_requests: vec![],
-            issue_trackers: vec![],
-            cloud_agents: vec![],
-            ai_utilities: vec![],
-            presentation_managers: presentation_factories(),
-            terminal_pools: terminal_pool_factories(),
-            environment_providers: vec![Box::new(docker::DockerEnvironmentFactory)],
-            suppressions: super::ProviderCategory::FOLLOWER_SUPPRESSED.to_vec(),
         }
     }
 }
@@ -101,27 +85,20 @@ mod tests {
         assert!(!reg.ai_utilities.is_empty());
         assert!(!reg.presentation_managers.is_empty());
         assert!(!reg.terminal_pools.is_empty());
-        assert!(reg.suppressions.is_empty());
     }
 
     #[test]
-    fn for_follower_omits_external_providers() {
-        let reg = FactoryRegistry::for_follower();
+    fn follower_runtime_constructs_external_providers() {
+        let runtime = super::super::DiscoveryRuntime::for_process(true);
+        let reg = &runtime.factories;
         assert!(!reg.vcs.is_empty());
         assert!(!reg.checkout_managers.is_empty());
-        assert!(reg.change_requests.is_empty());
-        assert!(reg.issue_trackers.is_empty());
-        assert!(reg.cloud_agents.is_empty());
-        assert!(reg.ai_utilities.is_empty());
+        assert!(!reg.change_requests.is_empty());
+        assert!(!reg.issue_trackers.is_empty());
+        assert!(!reg.cloud_agents.is_empty());
+        assert!(!reg.ai_utilities.is_empty());
         assert!(!reg.presentation_managers.is_empty());
         assert!(!reg.terminal_pools.is_empty());
-        assert_eq!(reg.suppressions, super::super::ProviderCategory::FOLLOWER_SUPPRESSED);
-    }
-
-    #[test]
-    fn follower_detection_is_independent_of_suppression_order() {
-        let mut runtime = super::super::DiscoveryRuntime::for_process(true);
-        runtime.factories.suppressions.reverse();
         assert!(runtime.is_follower());
     }
 }

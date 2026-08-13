@@ -54,6 +54,12 @@ pub struct RepoRefreshHandle {
     _task_handle: JoinHandle<()>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalPolling {
+    Enabled,
+    Disabled,
+}
+
 #[derive(Clone, Copy)]
 struct RefreshCadence {
     interval: Duration,
@@ -183,6 +189,31 @@ impl RepoRefreshHandle {
         agent_state_store: crate::agents::SharedAgentStateStore,
         schedule: RefreshSchedule,
     ) -> Self {
+        Self::spawn_with_schedule_and_external_polling(
+            repo_root,
+            registry,
+            criteria,
+            environment_id,
+            host_id,
+            attachable_store,
+            agent_state_store,
+            schedule,
+            ExternalPolling::Enabled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_schedule_and_external_polling(
+        repo_root: PathBuf,
+        registry: Arc<ProviderRegistry>,
+        criteria: RepoCriteria,
+        environment_id: Option<EnvironmentId>,
+        host_id: Option<HostId>,
+        attachable_store: SharedAttachableStore,
+        agent_state_store: crate::agents::SharedAgentStateStore,
+        schedule: RefreshSchedule,
+        external_polling: ExternalPolling,
+    ) -> Self {
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(RefreshSnapshot::default()));
         let refresh_trigger = Arc::new(Notify::new());
         let trigger = refresh_trigger.clone();
@@ -211,6 +242,7 @@ impl RepoRefreshHandle {
                 host_id.as_ref(),
                 &attachable_store,
                 &agent_state_store,
+                external_polling,
             )
             .await;
             if snapshot_tx.send(initial).is_err() {
@@ -239,6 +271,7 @@ impl RepoRefreshHandle {
                     host_id.as_ref(),
                     &attachable_store,
                     &agent_state_store,
+                    external_polling,
                 )
                 .await;
 
@@ -285,6 +318,7 @@ async fn run_refresh_cycle(
     host_id: Option<&HostId>,
     attachable_store: &SharedAttachableStore,
     agent_state_store: &crate::agents::SharedAgentStateStore,
+    external_polling: ExternalPolling,
 ) -> Arc<RefreshSnapshot> {
     match kind {
         RefreshKind::Full => {
@@ -292,7 +326,7 @@ async fn run_refresh_cycle(
             let mut slow_data = provider_data.clone();
             let (new_fast_errors, new_slow_errors) = tokio::join!(
                 refresh_fast_providers(&mut fast_data, repo_root, registry, environment_id, host_id, attachable_store, agent_state_store,),
-                refresh_slow_providers(&mut slow_data, repo_root, registry, criteria, host_id),
+                refresh_slow_providers(&mut slow_data, repo_root, registry, criteria, host_id, external_polling),
             );
             install_fast_provider_data(provider_data, fast_data);
             install_slow_provider_data(provider_data, slow_data);
@@ -305,7 +339,7 @@ async fn run_refresh_cycle(
                     .await;
         }
         RefreshKind::Slow => {
-            *slow_errors = refresh_slow_providers(provider_data, repo_root, registry, criteria, host_id).await;
+            *slow_errors = refresh_slow_providers(provider_data, repo_root, registry, criteria, host_id, external_polling).await;
         }
     }
     let errors: Vec<_> = fast_errors.iter().chain(slow_errors.iter()).cloned().collect();
@@ -386,7 +420,7 @@ async fn refresh_providers(
     agent_state_store: &crate::agents::SharedAgentStateStore,
 ) -> Vec<RefreshError> {
     let mut errors = refresh_fast_providers(pd, repo_root, registry, environment_id, host_id, attachable_store, agent_state_store).await;
-    errors.extend(refresh_slow_providers(pd, repo_root, registry, criteria, host_id).await);
+    errors.extend(refresh_slow_providers(pd, repo_root, registry, criteria, host_id, ExternalPolling::Enabled).await);
     errors
 }
 
@@ -485,21 +519,33 @@ async fn refresh_slow_providers(
     registry: &ProviderRegistry,
     criteria: &RepoCriteria,
     host_id: Option<&HostId>,
+    external_polling: ExternalPolling,
 ) -> Vec<RefreshError> {
     let mut errors = Vec::new();
     let ee_root = ExecutionEnvironmentPath::new(repo_root);
-    let cr_fut = collect_named_results(
-        registry.change_requests.iter().map(|(desc, cr)| (desc.display_name.clone(), cr.list_change_requests(repo_root, 20))).collect(),
-    );
-    let sessions_fut = collect_named_results(
-        registry.cloud_agents.iter().map(|(desc, agent)| (desc.display_name.clone(), agent.list_sessions(criteria))).collect(),
-    );
+    let cr_fut = collect_named_results(match external_polling {
+        ExternalPolling::Enabled => {
+            registry.change_requests.iter().map(|(desc, cr)| (desc.display_name.clone(), cr.list_change_requests(repo_root, 20))).collect()
+        }
+        ExternalPolling::Disabled => Vec::new(),
+    });
+    let sessions_fut = collect_named_results(match external_polling {
+        ExternalPolling::Enabled => {
+            registry.cloud_agents.iter().map(|(desc, agent)| (desc.display_name.clone(), agent.list_sessions(criteria))).collect()
+        }
+        ExternalPolling::Disabled => Vec::new(),
+    });
     let branches_fut = collect_named_results(
         registry.vcs.iter().map(|(desc, vcs)| (desc.display_name.clone(), vcs.list_remote_branches(&ee_root))).collect(),
     );
-    let merged_fut = collect_named_results(
-        registry.change_requests.iter().map(|(desc, cr)| (desc.display_name.clone(), cr.list_merged_branch_names(repo_root, 50))).collect(),
-    );
+    let merged_fut = collect_named_results(match external_polling {
+        ExternalPolling::Enabled => registry
+            .change_requests
+            .iter()
+            .map(|(desc, cr)| (desc.display_name.clone(), cr.list_merged_branch_names(repo_root, 50)))
+            .collect(),
+        ExternalPolling::Disabled => Vec::new(),
+    });
     let ((change_requests, cr_errors), (sessions, session_errors), (branches, branch_errors), (merged, merged_errors)) =
         tokio::join!(cr_fut, sessions_fut, branches_fut, merged_fut);
 
