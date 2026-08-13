@@ -45,6 +45,5 @@ pub mod terminal_manager;
 pub const DAEMON_LIFECYCLE_LOCK_FILE: &str = "flotillad-lifecycle.lock";
 
 // Re-export shared infrastructure and host types for convenience.
-pub use admission::measure_available_space;
 pub use flotilla_protocol::HostName;
 pub use flotilla_resources::tls;

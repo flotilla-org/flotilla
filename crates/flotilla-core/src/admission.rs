@@ -43,10 +43,6 @@ pub(crate) fn check_free_space_floor(probe: &dyn AvailableSpaceProbe, host: &str
     check_measured_free_space(host, free_bytes, floor_bytes)
 }
 
-pub fn measure_available_space(path: &Path) -> Option<u64> {
-    SystemAvailableSpaceProbe.measure(path)
-}
-
 pub(crate) fn check_measured_free_space(host: &str, free_bytes: u64, floor_bytes: u64) -> Result<(), String> {
     if free_bytes >= floor_bytes {
         return Ok(());
