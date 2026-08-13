@@ -17,7 +17,8 @@ fi
 grep -Fq 'runs-on: debian-12' "$workflow"
 grep -Fq 'runs-on: darwin-aarch64' "$workflow"
 grep -Fq 'retention-days: 7' "$workflow"
-grep -Fq 'actions/cache@6f8efc29b200d32929f49075959781ed54ec270c' "$workflow"
+grep -Fq 'actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c' "$workflow"
+grep -Fq 'actions/cache/save@6f8efc29b200d32929f49075959781ed54ec270c' "$workflow"
 test "$(grep -Fc 'actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32' "$workflow")" -eq 2
 
 # shellcheck disable=SC1090,SC1091

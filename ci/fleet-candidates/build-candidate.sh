@@ -95,20 +95,25 @@ install -m 0755 "$flotilla_root/target/release/flotilla" "$bundle/bin/flotilla"
 install -m 0755 "$flotilla_root/target/release/flotillad" "$bundle/bin/flotillad"
 install -m 0755 "$cleat_root/target/release/cleat" "$bundle/bin/cleat"
 
-if [[ -f "$cleat_root/.tools/ghostty-install/lib/$ghostty_library" ]]; then
+if [[ "$platform" == darwin-aarch64 && -f "$cleat_root/.tools/ghostty-install/lib/$ghostty_library" ]]; then
   install -m 0755 "$cleat_root/.tools/ghostty-install/lib/$ghostty_library" "$bundle/lib/$ghostty_library"
 fi
 
 if [[ "$platform" == linux-x86_64-gnu2.36 ]]; then
-  if ldd "$bundle/bin/cleat" | grep -q "$ghostty_library"; then
-    test -f "$bundle/lib/$ghostty_library"
+  dependency="$(patchelf --print-needed "$bundle/bin/cleat" | awk '/^libghostty-vt\.so/{print; exit}')"
+  if [[ -n "$dependency" ]]; then
+    ghostty_source="$cleat_root/.tools/ghostty-install/lib/$dependency"
+    if [[ ! -f "$ghostty_source" ]]; then
+      ghostty_source="$cleat_root/.tools/ghostty-install/lib/$ghostty_library"
+    fi
+    test -f "$ghostty_source"
+    install -m 0755 "$ghostty_source" "$bundle/lib/$dependency"
     # The literal ELF loader token must reach patchelf unchanged.
     # shellcheck disable=SC2016
     patchelf --set-rpath '$ORIGIN/../lib' "$bundle/bin/cleat"
     # shellcheck disable=SC2016
     readelf -d "$bundle/bin/cleat" | grep -Fq '$ORIGIN/../lib'
-  else
-    rm -f "$bundle/lib/$ghostty_library"
+    ldd "$bundle/bin/cleat" | grep -F "$dependency" | grep -Fvq 'not found'
   fi
 else
   dependency="$(otool -L "$bundle/bin/cleat" | awk '/libghostty-vt\.dylib/{print $1; exit}')"

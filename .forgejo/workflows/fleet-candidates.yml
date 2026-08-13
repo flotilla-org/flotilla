@@ -47,7 +47,7 @@ jobs:
           git -C orchestration checkout --detach FETCH_HEAD
 
       - name: Restore dependency and compiler caches
-        uses: https://code.forgejo.org/actions/cache@6f8efc29b200d32929f49075959781ed54ec270c
+        uses: https://code.forgejo.org/actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c
         with:
           path: |
             .fleet-cache/toolchains
@@ -73,6 +73,18 @@ jobs:
           path: dist/
           retention-days: 7
           if-no-files-found: error
+
+      - name: Save dependency and compiler caches
+        if: always()
+        uses: https://code.forgejo.org/actions/cache/save@6f8efc29b200d32929f49075959781ed54ec270c
+        with:
+          path: |
+            .fleet-cache/toolchains
+            .fleet-cache/cargo
+            sources/flotilla/target
+            sources/cleat/target
+            sources/cleat/.tools/ghostty-src/.zig-cache
+          key: fleet-linux-v1-${{ inputs.flotilla_sha }}-${{ inputs.cleat_sha }}
 
   darwin:
     name: Darwin arm64 candidate
