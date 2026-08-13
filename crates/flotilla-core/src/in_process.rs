@@ -7802,14 +7802,11 @@ impl InProcessDaemon {
             let role = labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
             let crew = match task.as_ref() {
                 Some(task) => format!("{task}/{role}"),
-                None => role,
+                None => role.clone(),
             };
             let attention = crew_attention(
                 session.status.as_ref(),
-                task.as_ref()
-                    .and_then(|task| work_unsettled.get(&(convoy.clone(), task.clone(), session.spec.role.clone())))
-                    .copied()
-                    .unwrap_or(true),
+                task.as_ref().and_then(|task| work_unsettled.get(&(convoy.clone(), task.clone(), role))).copied().unwrap_or(true),
                 Utc::now(),
             );
             let convoy_key = (session.metadata.namespace.clone(), convoy.clone());

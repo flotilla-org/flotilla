@@ -59,6 +59,25 @@ use crate::{
 };
 
 #[test]
+fn crew_attention_keeps_monitoring_distinct_from_lifecycle_state() {
+    let now = Utc::now();
+    let mut status = ResourceTerminalSessionStatus {
+        phase: ResourceTerminalSessionPhase::Running,
+        attention: Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Screen }),
+        ..Default::default()
+    };
+
+    assert_eq!(crew_attention(Some(&status), true, now), Some(CrewAttention::Stalled));
+    assert_eq!(crew_attention(Some(&status), false, now), Some(CrewAttention::Idle));
+
+    status.attention.as_mut().expect("attention").as_of = now - chrono::Duration::seconds(31);
+    assert_eq!(crew_attention(Some(&status), true, now), Some(CrewAttention::Unobservable));
+
+    status.phase = ResourceTerminalSessionPhase::Stopped;
+    assert_eq!(crew_attention(Some(&status), true, now), None);
+}
+
+#[test]
 fn turn_delivery_session_plans_preserve_terminal_lifecycle_invariants() {
     assert_eq!(
         turn_delivery_session_plan(Some(ResourceTerminalSessionPhase::Running), "work", "coder").expect("running session"),

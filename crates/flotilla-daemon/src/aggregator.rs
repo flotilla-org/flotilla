@@ -2147,9 +2147,11 @@ mod tests {
     #[tokio::test]
     async fn attention_projection_is_namespace_scoped_and_tracks_idle_unsettled_sessions() {
         let state = AggregatorProjectionState::new();
-        let (event_tx, _) = broadcast::channel(4);
+        let (event_tx, mut event_rx) = broadcast::channel(4);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+        let query = QueryId::Convoys { scope: None };
+        state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: query.clone(), since: None }]);
 
         let mut session = session_object("terminal-convoy-a-implement").await;
         session.metadata.labels =
@@ -2169,6 +2171,21 @@ mod tests {
         let convoy = result_set.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
         assert!(convoy.vessels.first().expect("vessel row").needs_attention);
         assert!(convoy.needs_attention);
+
+        let delta = timeout(Duration::from_secs(1), async {
+            loop {
+                if let DaemonEvent::ResultDelta(delta) = event_rx.recv().await.expect("aggregator event") {
+                    if delta.query() == query {
+                        break delta;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("attention result delta");
+        assert_eq!(delta.query(), query);
+        let QueryChanges::Convoys { changed, .. } = &delta.changes else { panic!("expected convoy changes") };
+        assert!(changed.iter().any(|convoy| convoy.name == "convoy-a" && convoy.needs_attention));
     }
 
     #[tokio::test]
