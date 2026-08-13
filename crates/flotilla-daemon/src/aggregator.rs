@@ -1120,7 +1120,12 @@ impl Aggregator {
 
     async fn rebuild_local_projection(&mut self) {
         self.refresh_origin_hosts().await;
-        let effective_convoys = self.effective_convoy_reads();
+        // A deletion timestamp begins finalizer-driven reaping; it does not
+        // mean the Convoy or its child resources have left the store yet.
+        // Keep the parent row projected until the watch emits Deleted so
+        // vessels, checkouts, and sessions never appear parentless during
+        // teardown.
+        let effective_convoys = self.effective_convoy_reads_including_deleted();
         let salience_changed = self.rebuild_salience_projection().await;
         let presentation_keys = effective_convoys
             .values()
@@ -3042,6 +3047,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_convoy_remains_projected_until_reaping_finishes() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(1);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let mut convoy = convoy_object("failed-convoy").await;
+        convoy.status = Some(ConvoyStatus {
+            phase: ResourceConvoyPhase::Failed,
+            message: Some("acceptance criteria not met".to_string()),
+            ..Default::default()
+        });
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+
+        convoy.metadata.deletion_timestamp = Some(Utc::now());
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(convoy.clone())).await;
+
+        let result = state.result_set().await;
+        let rows = result.rows.as_convoys().expect("convoy rows");
+        assert!(
+            matches!(rows, [row] if row.name == "failed-convoy" && row.phase == ConvoyPhase::Failed),
+            "a terminal convoy must remain visible while its finalizers reap child resources: {rows:?}"
+        );
+
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Deleted(convoy)).await;
+
+        let result = state.result_set().await;
+        assert!(result.rows.as_convoys().expect("convoy rows").is_empty(), "a reaped convoy must leave the projection");
+    }
+
+    #[tokio::test]
     async fn reclaim_refusal_demand_marks_convoy_for_attention_with_reason() {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
@@ -3177,7 +3211,8 @@ mod tests {
         let durable_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(watch_events(vec![
             WatchEvent::Added(convoy),
             WatchEvent::Added(unrelated_convoy),
-            WatchEvent::Modified(deleting_convoy),
+            WatchEvent::Modified(deleting_convoy.clone()),
+            WatchEvent::Deleted(deleting_convoy),
         ]))]);
         let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -3234,7 +3269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_convoy_is_hidden_from_rows_but_retained_for_salience() {
+    async fn deleting_convoy_remains_in_rows_and_salience_until_deleted() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
@@ -3250,7 +3285,8 @@ mod tests {
             Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Hook });
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
 
-        assert!(state.result_set().await.rows.as_convoys().expect("convoy rows").is_empty());
+        let result = state.result_set().await;
+        assert_eq!(result.rows.as_convoys().expect("convoy rows")[0].name, "convoy-a");
         assert!(!aggregator.salience_facts_at(now).attention[0].work_unsettled);
     }
 

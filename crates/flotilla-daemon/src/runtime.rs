@@ -1136,12 +1136,7 @@ async fn projection_parity_condition(
     projection: &AggregatorProjectionState,
 ) -> Result<Option<HostCondition>, String> {
     let stored = backend.using::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?;
-    let expected = stored
-        .items
-        .into_iter()
-        .filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
-        .map(|convoy| convoy.metadata.name)
-        .collect::<BTreeSet<_>>();
+    let expected = stored.items.into_iter().map(|convoy| convoy.metadata.name).collect::<BTreeSet<_>>();
     let projected = match projection.local_result_set().await.rows {
         Rows::Convoys { rows, .. } => rows.into_iter().map(|row| row.resource.name).collect::<BTreeSet<_>>(),
         rows => return Err(format!("local convoy projection returned unexpected rows: {rows:?}")),
@@ -1151,7 +1146,7 @@ async fn projection_parity_condition(
         return Ok(None);
     }
     let message = format!(
-        "durable store has {} live convoys but the local aggregator projection has {}; missing: {}",
+        "durable store has {} convoys but the local aggregator projection has {}; missing: {}",
         expected.len(),
         projected.len(),
         missing.join(", ")
@@ -5800,11 +5795,20 @@ mod tests {
     #[tokio::test]
     async fn projection_parity_reports_and_clears_missing_local_convoys() {
         let backend = ResourceBackend::InMemory(Default::default());
-        backend
-            .using::<Convoy>(NAMESPACE)
-            .create(&empty_meta("convoy-a"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
+        let convoys = backend.using::<Convoy>(NAMESPACE);
+        let meta = InputMeta::builder().name("convoy-a".to_string()).finalizers(vec!["flotilla.work/test-finalizer".to_string()]).build();
+        let created = convoys
+            .create(&meta, &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
             .await
             .expect("create durable convoy");
+        let failed = convoys
+            .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Failed,
+                ..Default::default()
+            })
+            .await
+            .expect("mark durable convoy failed");
+        convoys.delete(&failed.metadata.name).await.expect("begin durable convoy reaping");
         let projection = AggregatorProjectionState::new();
 
         let degraded = projection_parity_condition(&backend, NAMESPACE, &projection)
