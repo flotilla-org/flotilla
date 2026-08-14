@@ -2778,11 +2778,11 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     .agent_adapters
                     .get(&requirement.adapter)
                     .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
-                adapter.prepare(&cwd, brief).await?;
+                adapter.prepare_with_environment(&cwd, brief, &credential_env).await?;
                 for copy_root in &brief.copies {
                     let copy_root = ExecutionEnvironmentPath::new(copy_root);
                     if copy_root != cwd {
-                        adapter.prepare(&copy_root, brief).await?;
+                        adapter.prepare_with_environment(&copy_root, brief, &credential_env).await?;
                     }
                 }
                 let plan = adapter.launch(&AgentLaunchRequest {
@@ -3016,6 +3016,7 @@ mod tests {
     };
 
     use flotilla_core::{
+        agent_adapter::AgentAdapterRegistry,
         config::ConfigStore,
         daemon::DaemonHandle,
         in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE,
@@ -3025,7 +3026,7 @@ mod tests {
                     fake_discovery_with_provider_set, git_process_discovery, DiscoveryMockRunner, FakeDiscoveryProviders, FakeTerminalPool,
                     MergedPrProcessRunner, TestEnvVars,
                 },
-                EnvironmentAssertion, EnvironmentBag,
+                EnvironmentAssertion, EnvironmentBag, ProviderCategory, ProviderDescriptor,
             },
             environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
             ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
@@ -3477,6 +3478,46 @@ mod tests {
 
         async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
             ProcessCommandRunner.exists(cmd, args).await
+        }
+    }
+
+    struct CredentialInteriorRunner(DiscoveryMockRunner);
+
+    #[async_trait]
+    impl CommandRunner for CredentialInteriorRunner {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            self.0.run(cmd, args, cwd, label).await
+        }
+
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            self.0.run_output(cmd, args, cwd, label).await
+        }
+
+        async fn run_with_input(
+            &self,
+            _cmd: &str,
+            _args: &[&str],
+            _cwd: &Path,
+            _label: &ChannelLabel,
+            _input: &[u8],
+        ) -> Result<String, String> {
+            Ok("ok".to_string())
+        }
+
+        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+            self.0.exists(cmd, args).await
+        }
+
+        async fn path_exists(&self, path: &Path) -> Result<bool, String> {
+            self.0.path_exists(path).await
+        }
+
+        async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
+            self.0.ensure_file(path, content).await
+        }
+
+        async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+            self.0.write_file(path, content).await
         }
     }
 
@@ -7070,6 +7111,121 @@ mod tests {
         .await;
 
         run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo, CompletionAction::Delete).await;
+    }
+
+    #[tokio::test]
+    async fn contained_claude_launch_uses_granted_invocation_environment_without_ambient_config() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        fs::create_dir_all(config.base_path()).expect("config directory");
+        fs::write(config.base_path().join("daemon.toml"), "machine_id = \"contained-claude-test\"\n").expect("daemon config");
+        let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+        let backend = daemon.resource_backend();
+        backend
+            .clone()
+            .definitions::<CredentialSpec>(NAMESPACE)
+            .create(&empty_meta("claude-max"), &CredentialSpecSpec {
+                consumer: CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() },
+                source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("Claude credential declaration");
+
+        let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
+            DiscoveryMockRunner::builder()
+                .tool_exists("claude", true)
+                .on_run("mkdir", &["-p", "/run/flotilla/credentials/claude-max/claude"], Ok(String::new()))
+                .build(),
+        ));
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"));
+        assert!(bag.find_env_var("CLAUDE_CONFIG_DIR").is_none(), "the contained discovery environment must reproduce udder");
+        let pool = Arc::new(FakeTerminalPool::new());
+        let mut contained_registry = ProviderRegistry::new();
+        contained_registry.agent_adapters = AgentAdapterRegistry::discover(&bag, Arc::clone(&runner));
+        contained_registry.terminal_pools.insert(
+            "fake-terminals",
+            ProviderDescriptor::named(ProviderCategory::TerminalPool, "fake-terminals"),
+            pool.clone(),
+        );
+        let contained_registry = Arc::new(contained_registry);
+        let env_id = EnvironmentId::new("contained-claude");
+        let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+            id: env_id.clone(),
+            image: ImageId::new("contained-image"),
+            runner: Arc::clone(&runner),
+            env_vars: HashMap::from([("HOME".to_string(), "/home/crew".to_string())]),
+            destroyed: Arc::new(AtomicBool::new(false)),
+        });
+        daemon
+            .register_provisioned_environment(env_id.clone(), handle, bag.clone(), Some(Arc::clone(&contained_registry)))
+            .expect("register contained environment");
+
+        let credential_store = Arc::new(CredentialStore::new(
+            backend,
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("TEST_CLAUDE_TOKEN", "oauth-secret-material")])),
+            bag,
+            Arc::clone(&runner),
+            config.state_dir().as_path().to_path_buf(),
+        ));
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                Arc::clone(&daemon),
+                config,
+                Arc::new(ProviderRegistry::new()),
+                None,
+                "host-test".to_string(),
+                None,
+                "host-direct-host-test".to_string(),
+            )
+            .with_credential_store(credential_store),
+        );
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let spec = flotilla_resources::TerminalSessionSpec {
+            env_ref: env_id.to_string(),
+            role: "coder".to_string(),
+            source: TerminalSessionSource::Agent {
+                selector: Selector { capability: "code".to_string(), adapter: Some("claude-code".to_string()), model: None },
+                brief: flotilla_resources::TerminalBrief {
+                    path: ".flotilla/briefs/coder.md".to_string(),
+                    content: "Implement the issue.".to_string(),
+                    copies: Vec::new(),
+                },
+                context: Box::new(flotilla_resources::TerminalCrewContext {
+                    namespace: NAMESPACE.to_string(),
+                    convoy: "demo".to_string(),
+                    vessel_ref: "demo-work".to_string(),
+                }),
+                message: None,
+            },
+            cwd: workspace.display().to_string(),
+            pool: "fake-terminals".to_string(),
+        };
+        let tags = [flotilla_resources::TerminalSessionTag::new(CREDENTIAL_REF_SESSION_TAG, "claude-max")];
+
+        TerminalControllerRuntime { state }
+            .ensure_session("terminal-demo-work-coder", &spec, &tags)
+            .await
+            .expect("launch contained Claude with its granted credential");
+
+        let ensured = pool.ensured.lock().await;
+        let [launch] = ensured.as_slice() else {
+            panic!("expected exactly one contained Claude launch");
+        };
+        assert!(
+            launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == "oauth-secret-material"),
+            "the contained Claude process must receive its OAuth token"
+        );
+        assert!(
+            launch
+                .env_vars
+                .iter()
+                .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == "/run/flotilla/credentials/claude-max/claude"),
+            "the contained Claude process must receive its isolated config directory"
+        );
     }
 
     #[tokio::test]
