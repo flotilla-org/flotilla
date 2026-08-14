@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use flotilla_protocol::arg::{flatten, Arg};
 use flotilla_resources::{TerminalAttentionState, TerminalBrief};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use toml_edit::{value, DocumentMut, Item, Table};
 
@@ -312,6 +313,7 @@ pub struct AgentLaunchRequest {
     pub role: String,
     pub model: Option<String>,
     pub brief: TerminalBrief,
+    pub environment: TerminalEnvVars,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,6 +418,8 @@ pub trait AgentAdapter: Send + Sync {
 /// relative to the session's working directory. It lives under `.flotilla/`
 /// alongside the brief so it inherits the same git exclusion and teardown.
 pub const CLAUDE_MANAGED_SETTINGS_PATH: &str = ".flotilla/claude-settings.json";
+const CONTAINED_CLAUDE_CONFIG_DIR: &str = "/run/flotilla/claude";
+const HOST_DIRECT_CLAUDE_OAUTH_CONFIG_ROOT: &str = "/run/flotilla/claude-oauth";
 
 struct CliAgentAdapter {
     binary: String,
@@ -432,7 +436,7 @@ enum AdapterFlavor {
     /// present. Managed sessions seed the first two into Claude's mutable state
     /// and carry the documented bypass-consent setting alongside Flotilla's
     /// hooks in the invocation-only `--settings` overlay.
-    ClaudeCode { state_config: Option<ClaudeStateConfig>, state_lock: Arc<Mutex<()>> },
+    ClaudeCode { state_config: Option<ClaudeStateConfig>, state_lock: Arc<Mutex<()>>, contained: bool },
     /// Codex gates on a persisted per-project trust level, so the workspace has
     /// to be marked trusted in its config before launch.
     Codex { trust_config: Option<CodexTrustConfig> },
@@ -488,6 +492,27 @@ impl CliAgentAdapter {
         args.push(Arg::Quoted(self.deliver_brief(&request.brief)));
         flatten(&args, 0)
     }
+
+    fn claude_invocation_config_dir(&self, environment: &TerminalEnvVars) -> Option<PathBuf> {
+        let AdapterFlavor::ClaudeCode { contained, .. } = &self.flavor else {
+            return None;
+        };
+        let oauth_token = environment.iter().find(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN").map(|(_, value)| value.as_str());
+        if *contained {
+            return oauth_token.map(|_| PathBuf::from(CONTAINED_CLAUDE_CONFIG_DIR));
+        }
+        if let Some((_, config_dir)) = environment.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR") {
+            return Some(PathBuf::from(config_dir));
+        }
+        oauth_token.map(|token| {
+            // Host-direct OAuth identities still need separate supervisor and
+            // mutable-state homes. Key the ephemeral directory without putting
+            // credential material or a reversible account identifier in paths.
+            let digest = Sha256::digest(token.as_bytes());
+            let account_key = digest[..16].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            PathBuf::from(HOST_DIRECT_CLAUDE_OAUTH_CONFIG_ROOT).join(account_key)
+        })
+    }
 }
 
 #[async_trait]
@@ -507,10 +532,17 @@ impl AgentAdapter for CliAgentAdapter {
         environment: &TerminalEnvVars,
     ) -> Result<(), String> {
         match &self.flavor {
-            AdapterFlavor::ClaudeCode { state_config, state_lock } => {
-                let invocation_state = environment.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, config_dir)| {
-                    ClaudeStateConfig { path: PathBuf::from(config_dir).join(".claude.json"), lock: Arc::clone(state_lock) }
-                });
+            AdapterFlavor::ClaudeCode { state_config, state_lock, contained } => {
+                if *contained && !environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
+                    return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
+                }
+                let invocation_state = if let Some(config_dir) = self.claude_invocation_config_dir(environment) {
+                    let config_dir_string = config_dir.display().to_string();
+                    self.runner.run("mkdir", &["-p", &config_dir_string], Path::new("/"), &ChannelLabel::Noop).await?;
+                    Some(ClaudeStateConfig { path: config_dir.join(".claude.json"), lock: Arc::clone(state_lock) })
+                } else {
+                    None
+                };
                 if let Some(state_config) = invocation_state.as_ref().or(state_config.as_ref()) {
                     seed_claude_headless_state(&*self.runner, cwd.as_path(), state_config).await?;
                 }
@@ -545,7 +577,17 @@ impl AgentAdapter for CliAgentAdapter {
     }
 
     fn launch(&self, request: &AgentLaunchRequest) -> Result<AgentLaunchPlan, String> {
-        Ok(AgentLaunchPlan { command: self.command(request), env: Vec::new(), stance: TRUSTED_IMPLICIT_STANCE.into() })
+        let mut env = request.environment.clone();
+        if matches!(&self.flavor, AdapterFlavor::ClaudeCode { contained: true, .. })
+            && !env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
+        {
+            return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
+        }
+        if let Some(config_dir) = self.claude_invocation_config_dir(&env) {
+            env.retain(|(name, _)| name != "CLAUDE_CONFIG_DIR");
+            env.push(("CLAUDE_CONFIG_DIR".to_string(), config_dir.display().to_string()));
+        }
+        Ok(AgentLaunchPlan { command: self.command(request), env, stance: TRUSTED_IMPLICIT_STANCE.into() })
     }
 }
 
@@ -697,6 +739,7 @@ impl AgentAdapterRegistry {
                 flavor: AdapterFlavor::ClaudeCode {
                     state_config: state_path.map(|path| ClaudeStateConfig { path, lock: Arc::clone(&state_lock) }),
                     state_lock,
+                    contained: env.find_env_var("FLOTILLA_ENVIRONMENT_ID").is_some(),
                 },
             }));
         }
@@ -744,8 +787,9 @@ mod tests {
 
     use crate::{
         agent_adapter::{
-            append_convoy_work_context, build_crew_brief, build_crew_brief_with_options, AgentAdapterRegistry, AgentLaunchRequest,
-            CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefRenderOptions, CrewBriefTemplateOverride, CrewBriefTemplateResolver,
+            append_convoy_work_context, build_crew_brief, build_crew_brief_with_options, AgentAdapterRegistry, AgentLaunchPlan,
+            AgentLaunchRequest, CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefRenderOptions, CrewBriefTemplateOverride,
+            CrewBriefTemplateResolver, CONTAINED_CLAUDE_CONFIG_DIR,
         },
         path_context::ExecutionEnvironmentPath,
         providers::{
@@ -1188,8 +1232,9 @@ mod tests {
 
         let codex = registry.get("codex").expect("codex adapter");
         codex.prepare(&cwd, &brief).await.expect("prepare brief");
-        let plan =
-            codex.launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief: brief.clone() }).expect("codex launch plan");
+        let plan = codex
+            .launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief: brief.clone(), environment: Vec::new() })
+            .expect("codex launch plan");
         assert_eq!(
             plan.command,
             "/tools/codex --dangerously-bypass-approvals-and-sandbox 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
@@ -1199,7 +1244,12 @@ mod tests {
 
         let claude = registry.get("claude-code").expect("claude adapter");
         let plan = claude
-            .launch(&AgentLaunchRequest { role: "reviewer".into(), model: Some("opus".into()), brief: brief.clone() })
+            .launch(&AgentLaunchRequest {
+                role: "reviewer".into(),
+                model: Some("opus".into()),
+                brief: brief.clone(),
+                environment: Vec::new(),
+            })
             .expect("claude launch plan");
         assert_eq!(
             plan.command,
@@ -1211,7 +1261,12 @@ mod tests {
         // the sink still shell-quotes so a hostile model can never splice
         // into the command line even if that boundary regressed.
         let plan = claude
-            .launch(&AgentLaunchRequest { role: "reviewer".into(), model: Some("opus; touch /tmp/pwned".into()), brief })
+            .launch(&AgentLaunchRequest {
+                role: "reviewer".into(),
+                model: Some("opus; touch /tmp/pwned".into()),
+                brief,
+                environment: Vec::new(),
+            })
             .expect("claude launch plan");
         assert!(plan.command.contains("--model 'opus; touch /tmp/pwned'"));
     }
@@ -1226,7 +1281,7 @@ mod tests {
         let plan = registry
             .get("claude-code")
             .expect("claude adapter")
-            .launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief })
+            .launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief, environment: Vec::new() })
             .expect("launch plan");
 
         assert!(plan.command.starts_with("/x/y/claude "));
@@ -1240,24 +1295,30 @@ mod tests {
         let claude_config = temp.path().join("claude-config");
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::create_dir_all(&claude_config).expect("Claude config");
-        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
+        let env = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("CLAUDE_CONFIG_DIR", claude_config.display().to_string()))
+            .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
         let claude = registry.get("claude-code").expect("claude adapter");
         let brief =
             flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
 
+        let invocation_environment = vec![("CLAUDE_CONFIG_DIR".to_string(), claude_config.display().to_string())];
         claude
-            .prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &vec![(
-                "CLAUDE_CONFIG_DIR".to_string(),
-                claude_config.display().to_string(),
-            )])
+            .prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &invocation_environment)
             .await
             .expect("prepare claude workspace");
 
         // The launch command names this path relatively, so it must resolve
         // against the session's working directory.
-        let plan = claude.launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief: brief.clone() }).expect("launch plan");
+        let plan = claude
+            .launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief: brief.clone(), environment: invocation_environment })
+            .expect("launch plan");
         assert!(plan.command.contains("--settings .flotilla/claude-settings.json"), "{}", plan.command);
+        assert!(
+            plan.env.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == &claude_config.display().to_string()),
+            "the adapter launch plan must preserve explicit trusted config"
+        );
 
         let settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(workspace.join(".flotilla/claude-settings.json")).expect("read settings"))
@@ -1276,6 +1337,29 @@ mod tests {
         claude.cleanup(&ExecutionEnvironmentPath::new(&workspace), &brief).await.expect("cleanup");
         assert!(!workspace.join(".flotilla/claude-settings.json").exists(), "settings overlay should be removed");
         assert!(!workspace.join(".flotilla").exists(), "settings overlay should not keep .flotilla alive");
+    }
+
+    #[tokio::test]
+    async fn contained_claude_owns_ephemeral_config_without_accepting_a_config_input() {
+        let workspace = ExecutionEnvironmentPath::new("/workspace");
+        let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok("/workspace\n".to_string()), Err("not a checkout".to_string())]));
+        let env = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "contained-claude"))
+            .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
+        let registry = AgentAdapterRegistry::discover(&env, runner.clone());
+        let claude = registry.get("claude-code").expect("Claude adapter");
+        let brief =
+            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
+        let invocation_environment = vec![("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string())];
+
+        claude.prepare_with_environment(&workspace, &brief, &invocation_environment).await.expect("prepare contained Claude");
+        let plan = claude
+            .launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief, environment: invocation_environment })
+            .expect("contained launch plan");
+
+        assert!(plan.env.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == "redacted-test-token"));
+        assert!(plan.env.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == CONTAINED_CLAUDE_CONFIG_DIR));
+        assert!(runner.calls().iter().any(|(command, args)| command == "mkdir" && args == &["-p", CONTAINED_CLAUDE_CONFIG_DIR]));
     }
 
     #[tokio::test]
@@ -1334,6 +1418,39 @@ mod tests {
             .expect("prepare host-direct Claude");
 
         assert_eq!(std::fs::read_to_string(global_state).expect("global Claude state"), r#"{"existing":true}"#);
+    }
+
+    #[test]
+    fn host_direct_claude_oauth_accounts_get_distinct_adapter_owned_config_dirs() {
+        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
+        let registry = AgentAdapterRegistry::discover(&env, Arc::new(MockRunner::new(Vec::new())));
+        let claude = registry.get("claude-code").expect("Claude adapter");
+        let brief =
+            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
+        let launch = |token: &str| {
+            claude
+                .launch(&AgentLaunchRequest {
+                    role: "coder".into(),
+                    model: None,
+                    brief: brief.clone(),
+                    environment: vec![("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.to_string())],
+                })
+                .expect("host-direct OAuth launch")
+        };
+
+        let alice = launch("token-alice");
+        let bob = launch("token-bob");
+        let config_dir = |plan: &AgentLaunchPlan| {
+            plan.env
+                .iter()
+                .find(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+                .map(|(_, value)| value.clone())
+                .expect("adapter-owned Claude config")
+        };
+
+        assert_ne!(config_dir(&alice), config_dir(&bob));
+        assert!(config_dir(&alice).starts_with("/run/flotilla/claude-oauth/"));
+        assert!(config_dir(&bob).starts_with("/run/flotilla/claude-oauth/"));
     }
 
     #[test]

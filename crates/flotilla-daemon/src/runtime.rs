@@ -2771,7 +2771,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             None => return Err("host-local credential store unavailable".to_string()),
         };
         let (command, mut env, crew, initial_message) = match &spec.source {
-            TerminalSessionSource::Tool { command } => (command.clone(), Vec::new(), None, None),
+            TerminalSessionSource::Tool { command } => (command.clone(), credential_env.clone(), None, None),
             TerminalSessionSource::Agent { selector, brief, context, message } => {
                 let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
                 let adapter = registry
@@ -2789,6 +2789,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     role: spec.role.clone(),
                     model: requirement.model.clone(),
                     brief: brief.clone(),
+                    environment: credential_env.clone(),
                 })?;
                 let crew_id = uuid::Uuid::new_v4().to_string();
                 let crew = flotilla_resources::CrewSessionStatus::builder()
@@ -2809,7 +2810,6 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 (plan.command, env, Some(crew), message.clone())
             }
         };
-        env.extend(credential_env);
         env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
 
         if matches!(spec.source, TerminalSessionSource::Agent { .. })
@@ -7133,13 +7133,19 @@ mod tests {
             .await
             .expect("Claude credential declaration");
 
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let env_id = EnvironmentId::new("contained-claude");
         let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
             DiscoveryMockRunner::builder()
                 .tool_exists("claude", true)
                 .on_run("mkdir", &["-p", "/run/flotilla/credentials/claude-max/claude"], Ok(String::new()))
+                .on_run("mkdir", &["-p", "/run/flotilla/claude"], Ok(String::new()))
                 .build(),
         ));
-        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"));
+        let bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", env_id.to_string()))
+            .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"));
         assert!(bag.find_env_var("CLAUDE_CONFIG_DIR").is_none(), "the contained discovery environment must reproduce udder");
         let pool = Arc::new(FakeTerminalPool::new());
         let mut contained_registry = ProviderRegistry::new();
@@ -7150,7 +7156,6 @@ mod tests {
             pool.clone(),
         );
         let contained_registry = Arc::new(contained_registry);
-        let env_id = EnvironmentId::new("contained-claude");
         let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
             id: env_id.clone(),
             image: ImageId::new("contained-image"),
@@ -7182,8 +7187,6 @@ mod tests {
             )
             .with_credential_store(credential_store),
         );
-        let workspace = temp.path().join("workspace");
-        fs::create_dir_all(&workspace).expect("workspace");
         let spec = flotilla_resources::TerminalSessionSpec {
             env_ref: env_id.to_string(),
             role: "coder".to_string(),
@@ -7220,11 +7223,8 @@ mod tests {
             "the contained Claude process must receive its OAuth token"
         );
         assert!(
-            launch
-                .env_vars
-                .iter()
-                .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == "/run/flotilla/credentials/claude-max/claude"),
-            "the contained Claude process must receive its isolated config directory"
+            launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == "/run/flotilla/claude"),
+            "the contained Claude process must receive the config directory owned by its adapter"
         );
     }
 
