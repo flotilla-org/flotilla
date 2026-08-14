@@ -3514,6 +3514,10 @@ mod tests {
             self.0.path_exists(path).await
         }
 
+        async fn writable_scratch_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
+            Ok(PathBuf::from("/home/crew/flotilla"))
+        }
+
         async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
             self.0.ensure_file(path, content).await
         }
@@ -7221,9 +7225,10 @@ mod tests {
         let workspace = temp.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
         let env_id = EnvironmentId::new("contained-claude");
-        // The preflight scratch dir must derive from a daemon-owned writable
-        // base (here the state dir), never absolute /run on the host (#1498).
-        let preflight_config_dir = config.state_dir().as_path().join("credentials/claude-max/claude");
+        // Credential preflight runs through the contained runner, so its
+        // scratch directory must be inside the container user's writable
+        // world rather than derived from daemon-host paths (#1508).
+        let preflight_config_dir = PathBuf::from("/home/crew/flotilla/credentials/claude-max/claude");
         let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
             DiscoveryMockRunner::builder()
                 .tool_exists("claude", true)

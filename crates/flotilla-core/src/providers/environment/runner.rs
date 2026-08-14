@@ -1,4 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -62,6 +65,27 @@ impl CommandRunner for DockerEnvironmentRunner {
     async fn exists(&self, cmd: &str, _args: &[&str]) -> bool {
         let docker_args = ["exec", &self.container_name, "which", cmd];
         self.inner.run("docker", &docker_args, Path::new("/"), &ChannelLabel::Noop).await.is_ok()
+    }
+
+    async fn writable_scratch_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
+        let scratch = self
+            .run(
+                "sh",
+                &[
+                    "-c",
+                    "if [ -n \"${HOME:-}\" ] && [ -d \"$HOME\" ] && [ -w \"$HOME\" ]; then printf '%s' \"$HOME\"; elif [ -d /tmp ] && [ -w /tmp ]; then printf /tmp; else exit 1; fi",
+                    "flotilla-scratch-base",
+                ],
+                Path::new("/"),
+                &ChannelLabel::Noop,
+            )
+            .await
+            .map_err(|error| format!("find writable scratch directory in container: {error}"))?;
+        let scratch = scratch.trim();
+        if scratch.is_empty() {
+            return Err("find writable scratch directory in container: probe returned an empty path".to_string());
+        }
+        Ok(PathBuf::from(scratch).join("flotilla"))
     }
 
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
@@ -135,6 +159,24 @@ mod tests {
         let args = runner.docker_exec_args("sh", &["-lc", "pwd"], Path::new("/workspace"), true);
 
         assert_eq!(args, ["exec", "-i", "-w", "/workspace", "my-container", "sh", "-lc", "pwd"]);
+    }
+
+    #[tokio::test]
+    async fn writable_scratch_base_is_resolved_inside_the_container() {
+        let inner = Arc::new(MockRunner::new(vec![Ok("/home/crew".into())]));
+        let runner = DockerEnvironmentRunner::new("my-container".into(), inner.clone());
+
+        let scratch = runner
+            .writable_scratch_base(Some(Path::new("/run/user/1000")), Path::new("/host/state"))
+            .await
+            .expect("container scratch base");
+
+        assert_eq!(scratch, Path::new("/home/crew/flotilla"));
+        let calls = inner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "docker");
+        assert!(calls[0].1.starts_with(&["exec".to_string(), "-w".to_string(), "/".to_string(), "my-container".to_string()]));
+        assert!(calls[0].1.iter().all(|arg| arg != "/run/user/1000" && arg != "/host/state"));
     }
 
     #[tokio::test]
