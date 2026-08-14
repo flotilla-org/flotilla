@@ -6,9 +6,9 @@ use flotilla_resources::{
     Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Selector,
     Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement,
-    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
+    TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -371,7 +371,7 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
 
 async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, held_credentials: BTreeSet<String>) {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host = hosts.create(&empty_input_meta(host_ref), &HostSpec { display_name: host_ref.to_string() }).await.expect("host create");
+    let host = hosts.create(&test_meta(host_ref), &HostSpec { display_name: host_ref.to_string() }).await.expect("host create");
     hosts
         .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
             capabilities: [(flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials))]
@@ -388,7 +388,7 @@ async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, h
         .clone()
         .using::<PlacementPolicy>("flotilla")
         .create(
-            &empty_input_meta(policy_name),
+            &test_meta(policy_name),
             &PlacementPolicySpec::builder()
                 .pool("passthrough".to_string())
                 .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
@@ -412,7 +412,7 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
-        .create(&empty_input_meta("claude-max"), &CredentialSpecSpec {
+        .create(&test_meta("claude-max"), &CredentialSpecSpec {
             consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
             source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
             lifecycle: CredentialLifecycle::Static,
@@ -451,7 +451,7 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
         .clone()
         .definitions::<CredentialGrant>("flotilla")
         .create(
-            &empty_input_meta("claude-max-contained"),
+            &test_meta("claude-max-contained"),
             &CredentialGrantSpec::builder()
                 .selector(
                     CredentialGrantSelector::builder().stance(Stance::Contained).projects(BTreeSet::from(["flotilla".to_string()])).build(),
