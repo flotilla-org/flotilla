@@ -41,7 +41,7 @@ const PRE_HELLO_CLOSE_ERROR: &str = "peer closed before sending hello";
 
 const REMOTE_DAEMON_NOT_LISTENING: &str = "FLOTILLA_DAEMON_NOT_LISTENING";
 
-/// Channel buffer size for inbound and outbound peer data messages.
+/// Channel buffer size for inbound and outbound peer wire messages.
 const CHANNEL_BUFFER: usize = 256;
 
 pub(crate) fn peer_resource_socket_path(peer_resource_socket_dir: &Path, config_label: &ConfigLabel) -> Result<PathBuf, String> {
@@ -119,7 +119,7 @@ pub struct SshTransport {
     command_runner: Arc<dyn CommandRunner>,
     ssh_process: Option<Box<dyn CommandProcess>>,
     status: PeerConnectionStatus,
-    /// Receiver for inbound peer data, produced by `connect_socket()` and
+    /// Receiver for inbound peer wire messages, produced by `connect_socket()` and
     /// returned once via `subscribe()`.
     inbound_rx: Option<mpsc::Receiver<PeerWireMessage>>,
     outbound_tx: Option<mpsc::Sender<PeerWireMessage>>,
@@ -673,7 +673,6 @@ impl Drop for SshTransport {
 mod tests {
     use std::{collections::VecDeque, sync::Mutex as StdMutex};
 
-    use flotilla_protocol::PeerDataMessage;
     use tokio::io::AsyncWriteExt;
 
     use super::*;
@@ -1287,15 +1286,12 @@ mod tests {
                 surface: None,
             })
             .expect("serialize hello");
-            let peer = serde_json::to_string(&Message::Peer(Box::new(PeerWireMessage::Data(PeerDataMessage {
+            let peer = serde_json::to_string(&Message::Peer(Box::new(PeerWireMessage::RouteAdvertisement {
                 origin_node_id: NodeId::new("remote"),
                 origin_display_name: "remote".into(),
-                repo_identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-                repository_key: None,
-                host_repo_root: Some(PathBuf::from("/home/remote/repo")),
-                clock: flotilla_protocol::VectorClock::default(),
-                kind: flotilla_protocol::PeerDataKind::Snapshot { data: Box::new(flotilla_protocol::ProviderData::default()), seq: 1 },
-            }))))
+                remaining_hops: 8,
+                visited: vec![NodeId::new("remote")],
+            })))
             .expect("serialize peer");
             stream.write_all(format!("{hello}\n{peer}\n").as_bytes()).await.expect("write hello and peer");
         });
@@ -1303,15 +1299,9 @@ mod tests {
         let mut inbound = transport.connect_socket().await.expect("connect socket");
         let msg = inbound.recv().await.expect("first peer message");
         match msg {
-            PeerWireMessage::Data(PeerDataMessage {
-                origin_node_id,
-                host_repo_root,
-                kind: flotilla_protocol::PeerDataKind::Snapshot { seq, .. },
-                ..
-            }) => {
+            PeerWireMessage::RouteAdvertisement { origin_node_id, remaining_hops, .. } => {
                 assert_eq!(origin_node_id, NodeId::new("remote"));
-                assert_eq!(host_repo_root, Some(PathBuf::from("/home/remote/repo")));
-                assert_eq!(seq, 1);
+                assert_eq!(remaining_hops, 8);
             }
             other => panic!("unexpected message: {other:?}"),
         }

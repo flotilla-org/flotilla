@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     mem,
-    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -9,44 +8,19 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     Command, CommandPeerEvent, CommandValue, ConfigLabel, EnvironmentId, GoodbyeReason, HostListEntry, HostListResponse, HostName,
-    HostSummary, NodeId, NodeInfo, PeerConnectionState, PeerDataKind, PeerDataMessage, PeerReconnectStatus, PeerWireMessage, ProviderData,
-    RepoIdentity, RepositoryKey, RoutedPeerMessage, Step, StepOutcome, StepStatus, TopologyRoute, VectorClock,
+    HostSummary, NodeId, NodeInfo, PeerConnectionState, PeerReconnectStatus, PeerWireMessage, RepoIdentity, RoutedPeerMessage, Step,
+    StepOutcome, StepStatus, TopologyRoute,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::transport::{PeerSender, PeerTransport};
 
-/// Generate a synthetic path for a remote-only repo.
-///
-/// Remote-only repos have no local filesystem path. This function produces
-/// a deterministic `PathBuf` that serves as a stable key for tab identity
-/// and repo tracking. When a peer reports a concrete checkout root we fold
-/// it into the synthetic path for readability; otherwise we fall back to a
-/// repo-identity-based key.
-pub fn synthetic_repo_path(node_id: &NodeId, repo_identity: &RepoIdentity, host_repo_root: Option<&Path>) -> PathBuf {
-    if let Some(host_repo_root) = host_repo_root {
-        // Strip leading `/` from absolute paths to avoid double-slash in the
-        // resulting string (e.g. `<remote>/desktop//home/...`).
-        let stripped = host_repo_root.strip_prefix("/").unwrap_or(host_repo_root);
-        return PathBuf::from(format!("<remote>/{}/{}", node_id, stripped.display()));
-    }
-
-    PathBuf::from(format!("<remote>/{}/{}/{}", node_id, repo_identity.authority, repo_identity.path))
-}
-
-/// Result of handling an inbound PeerDataMessage.
+/// Result of handling an inbound peer transport message.
 #[derive(Debug, PartialEq, Eq)]
 pub enum HandleResult {
-    /// Data was updated for this repo — caller should trigger re-merge.
-    Updated(RepoIdentity),
-    /// The sender is requesting a resync — caller should send a snapshot back.
-    ResyncRequested { request_id: u64, requester_node_id: NodeId, reply_via: NodeId, repo: RepoIdentity, since_seq: u64 },
     /// Peer intentionally retired this connection; reconnect should be suppressed briefly.
     ReconnectSuppressed { peer: NodeId },
-    /// A delta was received but cannot be applied (seq gap or not yet implemented).
-    /// Caller should request a full resync from the origin.
-    NeedsResync { from: NodeId, repo: RepoIdentity },
     /// A routed command targeted this daemon and should be executed locally.
     CommandRequested { request_id: u64, requester_node_id: NodeId, reply_via: NodeId, command: Command, session_id: Option<uuid::Uuid> },
     /// A routed command cancel request targeted this daemon.
@@ -134,14 +108,6 @@ pub struct RouteState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ReversePathKey {
-    pub request_id: u64,
-    pub requester_node_id: NodeId,
-    pub target_node_id: NodeId,
-    pub repo_identity: RepoIdentity,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CommandReversePathKey {
     pub request_id: u64,
     pub requester_node_id: NodeId,
@@ -153,11 +119,6 @@ pub struct ReversePathHop {
     pub next_hop: NodeId,
     pub next_hop_generation: u64,
     pub learned_at: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct PendingResyncRequest {
-    pub deadline_at: Instant,
 }
 
 pub struct PendingPeerSend {
@@ -212,11 +173,9 @@ pub async fn dispatch_pending_sends(pending_sends: Vec<PendingPeerSend>) {
 
 fn peer_wire_message_kind(msg: &PeerWireMessage) -> &'static str {
     match msg {
-        PeerWireMessage::Data(_) => "data",
         PeerWireMessage::HostSummary(_) => "host_summary",
+        PeerWireMessage::RouteAdvertisement { .. } => "route_advertisement",
         PeerWireMessage::Routed(msg) => match msg {
-            RoutedPeerMessage::RequestResync { .. } => "request_resync",
-            RoutedPeerMessage::ResyncSnapshot { .. } => "resync_snapshot",
             RoutedPeerMessage::CommandRequest { .. } => "command_request",
             RoutedPeerMessage::CommandCancelRequest { .. } => "command_cancel_request",
             RoutedPeerMessage::CommandEvent { .. } => "command_event",
@@ -234,47 +193,12 @@ fn peer_wire_message_kind(msg: &PeerWireMessage) -> &'static str {
     }
 }
 
-/// Pre-computed overlay update to apply to InProcessDaemon after releasing the PeerManager lock.
-///
-/// For `SetProviders`, the caller resolves `identity` → local path at apply time
-/// (not at computation time) so the path is always fresh, avoiding TOCTOU if a repo
-/// is added or removed concurrently with the disconnect.
-#[derive(Debug, Clone)]
-pub enum OverlayUpdate {
-    /// Update peer_providers for a repo with remaining peer data.
-    /// The caller resolves `identity` to the current local path at apply time.
-    /// `overlay_version` gates the apply — stale versions are rejected.
-    SetProviders { identity: RepoIdentity, peers: Vec<(NodeInfo, ProviderData)>, overlay_version: u64 },
-    /// Remove a virtual repo — no peers remain.
-    RemoveRepo { identity: RepoIdentity, path: PathBuf },
-}
-
 #[derive(Debug, Clone)]
 pub struct DisconnectPlan {
     pub was_active: bool,
-    pub affected_repos: Vec<RepoIdentity>,
-    pub resync_requests: Vec<RoutedPeerMessage>,
-    /// Pre-computed overlay state for each affected repo, captured atomically
-    /// with the disconnect under the same lock.
-    pub overlay_updates: Vec<OverlayUpdate>,
 }
 
-/// Per-repo state received from a single peer host.
-pub struct PerRepoPeerState {
-    pub provider_data: ProviderData,
-    pub repository_key: Option<RepositoryKey>,
-    pub host_repo_root: Option<PathBuf>,
-    pub seq: u64,
-    pub via_peer: NodeId,
-    pub via_generation: u64,
-    pub stale: bool,
-}
-
-/// Manages connections to remote peer hosts and stores their provider data.
-///
-/// The PeerManager does NOT own the InProcessDaemon. It returns information
-/// about what changed so the caller (DaemonServer / wiring code) can trigger
-/// re-merge on the daemon.
+/// Manages live connections and routing between peer hosts.
 pub struct PeerManager {
     local_node_id: NodeId,
     configured_targets: HashMap<ConfigLabel, ConfiguredPeerTarget>,
@@ -295,30 +219,14 @@ pub struct PeerManager {
     routes: HashMap<NodeId, RouteState>,
     /// TODO: expire abandoned reverse-path entries when routed replies time out
     /// instead of only clearing them on reply delivery or disconnect.
-    reverse_paths: HashMap<ReversePathKey, ReversePathHop>,
     command_reverse_paths: HashMap<CommandReversePathKey, ReversePathHop>,
-    /// TODO: sweep overdue requests by deadline_at; today these are removed on
-    /// reply, targeted disconnect, or process restart.
-    pending_resync_requests: HashMap<ReversePathKey, PendingResyncRequest>,
     pending_sends: Vec<PendingPeerSend>,
     route_epoch: u64,
     request_id_counter: u64,
-    peer_data: HashMap<NodeId, HashMap<RepoIdentity, PerRepoPeerState>>,
     peer_host_summaries: HashMap<EnvironmentId, HostSummary>,
-    /// RepoIdentity values that exist only on remote peers — no local repo
-    /// matches. Each maps to the synthetic path used for tab identity.
-    known_remote_repos: HashMap<RepoIdentity, PathBuf>,
-    /// Last-seen vector clock per (origin_host, repo_identity) — used to
-    /// detect and drop duplicate / already-seen messages.
-    last_seen_clocks: HashMap<(NodeId, RepoIdentity), VectorClock>,
-    /// Monotonic counter incremented on every peer-data mutation. Callers
-    /// pass this version into `set_peer_providers` so stale applies (from
-    /// a read-then-apply that lost the race) are rejected.
-    overlay_version: u64,
 }
 
 impl PeerManager {
-    const RESYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
     const GOODBYE_RECONNECT_SUPPRESSION: Duration = Duration::from_secs(15);
     pub(crate) const DEFAULT_ROUTED_HOPS: u8 = 8;
 
@@ -337,29 +245,12 @@ impl PeerManager {
             learned_node_names: HashMap::new(),
             generations: HashMap::new(),
             routes: HashMap::new(),
-            reverse_paths: HashMap::new(),
-            pending_resync_requests: HashMap::new(),
             pending_sends: Vec::new(),
             route_epoch: 0,
             request_id_counter: 0,
-            peer_data: HashMap::new(),
             peer_host_summaries: HashMap::new(),
-            known_remote_repos: HashMap::new(),
             command_reverse_paths: HashMap::new(),
-            last_seen_clocks: HashMap::new(),
-            overlay_version: 0,
         }
-    }
-
-    /// Current overlay version. Callers read this while holding the PM lock
-    /// and pass it to `set_peer_providers` so stale applies are rejected.
-    pub fn overlay_version(&self) -> u64 {
-        self.overlay_version
-    }
-
-    fn bump_overlay_version(&mut self) -> u64 {
-        self.overlay_version += 1;
-        self.overlay_version
     }
 
     fn node_info_for(&self, node_id: &NodeId) -> NodeInfo {
@@ -369,6 +260,10 @@ impl PeerManager {
             .map(|summary| summary.node.clone())
             .or_else(|| self.learned_node_names.get(node_id).map(|display_name| NodeInfo::new(node_id.clone(), display_name.clone())))
             .unwrap_or_else(|| NodeInfo::new(node_id.clone(), node_id.to_string()))
+    }
+
+    pub fn learn_node_info(&mut self, node: &NodeInfo) {
+        self.learned_node_names.insert(node.node_id.clone(), node.display_name.clone());
     }
 
     /// Register a configured outbound connection target.
@@ -470,56 +365,6 @@ impl PeerManager {
     pub fn next_request_id(&mut self) -> u64 {
         self.request_id_counter = self.request_id_counter.saturating_add(1);
         self.request_id_counter
-    }
-
-    pub fn note_pending_resync_request(&mut self, target_node_id: NodeId, repo_identity: RepoIdentity) -> u64 {
-        let request_id = self.next_request_id();
-        self.pending_resync_requests.insert(
-            ReversePathKey { request_id, requester_node_id: self.local_node_id.clone(), target_node_id, repo_identity },
-            PendingResyncRequest { deadline_at: Instant::now() + Self::RESYNC_REQUEST_TIMEOUT },
-        );
-        request_id
-    }
-
-    pub fn sweep_expired_resyncs(&mut self, now: Instant) -> Vec<RepoIdentity> {
-        let expired: Vec<ReversePathKey> =
-            self.pending_resync_requests.iter().filter(|(_, pending)| pending.deadline_at <= now).map(|(key, _)| key.clone()).collect();
-
-        let mut affected_repos = Vec::new();
-        for key in expired {
-            self.pending_resync_requests.remove(&key);
-            let origin = key.target_node_id.clone();
-            let repo = key.repo_identity.clone();
-
-            let removed = if let Some(repos) = self.peer_data.get_mut(&origin) {
-                if let Some(state) = repos.get(&repo) {
-                    if state.stale {
-                        repos.remove(&repo);
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if removed {
-                self.last_seen_clocks.remove(&(origin.clone(), repo.clone()));
-                if self.peer_data.get(&origin).is_some_and(|repos| repos.is_empty()) {
-                    self.peer_data.remove(&origin);
-                }
-                affected_repos.push(repo);
-            }
-        }
-
-        if !affected_repos.is_empty() {
-            self.bump_overlay_version();
-        }
-
-        affected_repos
     }
 
     pub fn current_generation(&self, name: &NodeId) -> Option<u64> {
@@ -694,69 +539,6 @@ impl PeerManager {
         ActivationResult::Accepted { generation, displaced }
     }
 
-    fn store_snapshot_from(&mut self, via_peer: &NodeId, via_generation: u64, msg: PeerDataMessage) -> HandleResult {
-        let origin = msg.origin_node_id.clone();
-        if !msg.origin_display_name.is_empty() {
-            self.learned_node_names.insert(origin.clone(), msg.origin_display_name.clone());
-        }
-        let repo = msg.repo_identity.clone();
-        let repository_key = msg.repository_key.clone();
-        let host_repo_root = msg.host_repo_root.clone();
-
-        let dedup_key = (origin.clone(), repo.clone());
-        if let Some(last_seen) = self.last_seen_clocks.get(&dedup_key) {
-            if msg.clock.dominated_by(last_seen) {
-                debug!(
-                    origin = %origin,
-                    repo = %repo,
-                    "dropping duplicate peer message (clock dominated)"
-                );
-                return HandleResult::Ignored;
-            }
-        }
-
-        self.last_seen_clocks.entry(dedup_key).or_default().merge(&msg.clock);
-
-        match msg.kind {
-            PeerDataKind::Snapshot { data, seq } => {
-                let repo_states = self.peer_data.entry(origin.clone()).or_default();
-                repo_states.insert(repo.clone(), PerRepoPeerState {
-                    provider_data: *data,
-                    repository_key,
-                    host_repo_root,
-                    seq,
-                    via_peer: via_peer.clone(),
-                    via_generation,
-                    stale: false,
-                });
-
-                self.observe_route(&origin, via_peer, via_generation);
-                self.bump_overlay_version();
-
-                HandleResult::Updated(repo)
-            }
-            PeerDataKind::Delta { seq, prev_seq, changes: _ } => {
-                debug!(
-                    origin = %origin,
-                    repo = %repo,
-                    %seq,
-                    %prev_seq,
-                    "received peer delta, requesting resync (delta application not yet implemented)"
-                );
-
-                HandleResult::NeedsResync { from: origin, repo }
-            }
-            PeerDataKind::RequestResync { .. } => {
-                debug!(
-                    origin = %origin,
-                    repo = %repo,
-                    "ignoring legacy direct peer request-resync message"
-                );
-                HandleResult::Ignored
-            }
-        }
-    }
-
     pub async fn handle_inbound(&mut self, env: InboundPeerEnvelope) -> HandleResult {
         if !self.generation_is_current(&env.connection_peer, env.connection_generation) {
             debug!(
@@ -768,16 +550,33 @@ impl PeerManager {
         }
 
         match env.msg {
-            PeerWireMessage::Data(msg) => {
-                if msg.origin_node_id == self.local_node_id {
-                    debug!(node = %msg.origin_node_id, "ignoring peer data from self");
-                    return HandleResult::Ignored;
-                }
-                self.store_snapshot_from(&env.connection_peer, env.connection_generation, msg)
-            }
             PeerWireMessage::HostSummary(mut summary) => {
                 summary.node.node_id = env.connection_peer.clone();
                 self.store_host_summary(summary);
+                HandleResult::Ignored
+            }
+            PeerWireMessage::RouteAdvertisement { origin_node_id, origin_display_name, remaining_hops, mut visited } => {
+                if origin_node_id == self.local_node_id || visited.contains(&self.local_node_id) {
+                    return HandleResult::Ignored;
+                }
+
+                self.learned_node_names.insert(origin_node_id.clone(), origin_display_name.clone());
+                self.observe_route(&origin_node_id, &env.connection_peer, env.connection_generation);
+
+                if remaining_hops > 1 {
+                    visited.push(self.local_node_id.clone());
+                    let forwarded = PeerWireMessage::RouteAdvertisement {
+                        origin_node_id,
+                        origin_display_name,
+                        remaining_hops: remaining_hops - 1,
+                        visited: visited.clone(),
+                    };
+                    let targets: Vec<NodeId> =
+                        self.senders.keys().filter(|peer| **peer != env.connection_peer && !visited.contains(peer)).cloned().collect();
+                    for target in targets {
+                        self.queue_send_to(&target, forwarded.clone());
+                    }
+                }
                 HandleResult::Ignored
             }
             PeerWireMessage::Routed(msg) => self.handle_routed(env.connection_peer, env.connection_generation, msg),
@@ -798,122 +597,6 @@ impl PeerManager {
 
     fn handle_routed(&mut self, connection_peer: NodeId, connection_generation: u64, msg: RoutedPeerMessage) -> HandleResult {
         match msg {
-            RoutedPeerMessage::RequestResync {
-                request_id,
-                requester_node_id,
-                target_node_id,
-                remaining_hops,
-                repo_identity,
-                since_seq,
-            } => {
-                if remaining_hops == 0 {
-                    return HandleResult::Ignored;
-                }
-                if target_node_id == self.local_node_id {
-                    return HandleResult::ResyncRequested {
-                        request_id,
-                        requester_node_id,
-                        reply_via: connection_peer,
-                        repo: repo_identity,
-                        since_seq,
-                    };
-                }
-
-                let key = ReversePathKey {
-                    request_id,
-                    requester_node_id: requester_node_id.clone(),
-                    target_node_id: target_node_id.clone(),
-                    repo_identity: repo_identity.clone(),
-                };
-                let learned_at = self.next_route_epoch();
-                self.reverse_paths.insert(key, ReversePathHop {
-                    next_hop: connection_peer,
-                    next_hop_generation: connection_generation,
-                    learned_at,
-                });
-
-                let forwarded = RoutedPeerMessage::RequestResync {
-                    request_id,
-                    requester_node_id,
-                    target_node_id: target_node_id.clone(),
-                    remaining_hops: remaining_hops.saturating_sub(1),
-                    repo_identity,
-                    since_seq,
-                };
-                self.queue_send_to(&target_node_id, PeerWireMessage::Routed(forwarded));
-                HandleResult::Ignored
-            }
-            RoutedPeerMessage::ResyncSnapshot {
-                request_id,
-                requester_node_id,
-                responder_node_id,
-                responder_display_name,
-                remaining_hops,
-                repo_identity,
-                repository_key,
-                host_repo_root,
-                clock,
-                seq,
-                data,
-            } => {
-                let key = ReversePathKey {
-                    request_id,
-                    requester_node_id: requester_node_id.clone(),
-                    target_node_id: responder_node_id.clone(),
-                    repo_identity: repo_identity.clone(),
-                };
-
-                if requester_node_id == self.local_node_id {
-                    if self.pending_resync_requests.remove(&key).is_none() {
-                        return HandleResult::Ignored;
-                    }
-                    self.last_seen_clocks.remove(&(responder_node_id.clone(), repo_identity.clone()));
-                    return self.store_snapshot_from(&connection_peer, connection_generation, PeerDataMessage {
-                        origin_node_id: responder_node_id,
-                        origin_display_name: responder_display_name,
-                        repo_identity,
-                        repository_key,
-                        host_repo_root,
-                        clock,
-                        kind: PeerDataKind::Snapshot { data, seq },
-                    });
-                }
-
-                if remaining_hops == 0 {
-                    return HandleResult::Ignored;
-                }
-
-                let Some(reverse_hop) = self.reverse_paths.get(&key).cloned() else {
-                    return HandleResult::Ignored;
-                };
-                if !self.generation_is_current(&reverse_hop.next_hop, reverse_hop.next_hop_generation) {
-                    self.reverse_paths.remove(&key);
-                    return HandleResult::Ignored;
-                }
-
-                let forwarded = RoutedPeerMessage::ResyncSnapshot {
-                    request_id,
-                    requester_node_id,
-                    responder_node_id,
-                    responder_display_name,
-                    remaining_hops: remaining_hops.saturating_sub(1),
-                    repo_identity,
-                    repository_key,
-                    host_repo_root,
-                    clock,
-                    seq,
-                    data,
-                };
-                if let Some(sender) = self.senders.get(&reverse_hop.next_hop).cloned() {
-                    self.pending_sends.push(PendingPeerSend {
-                        target: reverse_hop.next_hop.clone(),
-                        sender,
-                        msg: PeerWireMessage::Routed(forwarded),
-                    });
-                }
-                self.reverse_paths.remove(&key);
-                HandleResult::Ignored
-            }
             RoutedPeerMessage::CommandRequest { request_id, requester_node_id, target_node_id, remaining_hops, command, session_id } => {
                 if remaining_hops == 0 {
                     return HandleResult::Ignored;
@@ -1340,58 +1023,9 @@ impl PeerManager {
         }
     }
 
-    /// Forward a message to all connected peers except the origin, self,
-    /// and any host already present in the message's vector clock (which
-    /// indicates that host has already seen or relayed the message).
-    pub async fn relay(&self, origin: &NodeId, msg: &PeerDataMessage) {
-        // Stamp our own host into the clock before relaying
-        let mut relayed_msg = msg.clone();
-        relayed_msg.clock.tick(&self.local_node_id);
-
-        for (name, sender) in &self.senders {
-            if name == origin || name == &self.local_node_id {
-                continue;
-            }
-            // Skip peers that already appear in the clock — they've
-            // already seen or relayed this message.
-            if msg.clock.get(name) > 0 {
-                debug!(
-                    to = %name,
-                    repo = %msg.repo_identity,
-                    "skipping relay to peer already in clock"
-                );
-                continue;
-            }
-
-            match sender.send(PeerWireMessage::Data(relayed_msg.clone())).await {
-                Ok(()) => {
-                    debug!(
-                        from = %origin,
-                        to = %name,
-                        repo = %msg.repo_identity,
-                        "relayed peer data"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        from = %origin,
-                        to = %name,
-                        err = %e,
-                        "failed to relay peer data"
-                    );
-                }
-            }
-        }
-    }
-
     /// Accessor for the local host name.
     pub fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
-    }
-
-    /// Accessor for all stored peer data — used by the merge layer.
-    pub fn get_peer_data(&self) -> &HashMap<NodeId, HashMap<RepoIdentity, PerRepoPeerState>> {
-        &self.peer_data
     }
 
     pub fn store_host_summary(&mut self, summary: HostSummary) {
@@ -1437,6 +1071,18 @@ impl PeerManager {
         routes
     }
 
+    pub fn route_advertisements_for(&self, peer: &NodeId) -> Vec<PeerWireMessage> {
+        std::iter::once(self.local_node_id.clone())
+            .chain(self.routes.keys().filter(|target| *target != peer && *target != &self.local_node_id).cloned())
+            .map(|origin_node_id| PeerWireMessage::RouteAdvertisement {
+                origin_display_name: self.node_info_for(&origin_node_id).display_name,
+                origin_node_id,
+                remaining_hops: Self::DEFAULT_ROUTED_HOPS,
+                visited: vec![self.local_node_id.clone()],
+            })
+            .collect()
+    }
+
     fn configured_label_for_node(&self, node_id: &NodeId) -> Option<&ConfigLabel> {
         self.active_connections
             .get(node_id)
@@ -1450,27 +1096,11 @@ impl PeerManager {
             })
     }
 
-    /// Snapshot relay targets without performing any async sends.
-    ///
-    /// Returns a list of `(target, sender, stamped message)` tuples for peers
-    /// that should receive the relayed message. The caller sends concurrently
-    /// outside the PeerManager lock, eliminating head-of-line blocking.
-    pub fn prepare_relay(&self, origin: &NodeId, msg: &PeerDataMessage) -> Vec<(NodeId, Arc<dyn PeerSender>, PeerDataMessage)> {
-        let mut relayed_msg = msg.clone();
-        relayed_msg.clock.tick(&self.local_node_id);
-
-        self.senders
-            .iter()
-            .filter(|(name, _)| *name != origin && *name != &self.local_node_id && msg.clock.get(name) == 0)
-            .map(|(name, sender)| (name.clone(), Arc::clone(sender), relayed_msg.clone()))
-            .collect()
-    }
-
     /// Connect all registered peer transports and return inbound receivers.
     ///
     /// For each successfully connected peer, calls `subscribe()` to obtain the
     /// inbound message receiver. The caller should spawn forwarding tasks that
-    /// feed these receivers into the shared `peer_data_tx` channel.
+    /// feed these receivers into the shared inbound peer-message channel.
     pub async fn connect_all(&mut self) -> Vec<ConnectedConfiguredPeer> {
         let labels: Vec<ConfigLabel> = self.configured_targets.keys().cloned().collect();
         let mut receivers = Vec::new();
@@ -1503,6 +1133,7 @@ impl PeerManager {
                         continue;
                     };
                     let name = remote_node.node_id.clone();
+                    self.learn_node_info(&remote_node);
                     info!(target = %label.0, peer = %name, "peer transport connected");
                     let mut generation = 0;
                     if let Some(sender) = sender {
@@ -1575,26 +1206,6 @@ impl PeerManager {
                 }
             }
         }
-    }
-
-    /// Register a repo identity as remote-only.
-    ///
-    /// Called by the wiring layer after determining that a peer's repo has
-    /// no matching local repo. The `synthetic_path` is used as the stable
-    /// key for tab identity in the TUI.
-    pub fn register_remote_repo(&mut self, identity: RepoIdentity, synthetic_path: PathBuf) {
-        info!(repo = %identity, path = %synthetic_path.display(), "registered remote-only repo");
-        self.known_remote_repos.insert(identity, synthetic_path);
-    }
-
-    /// Check whether a repo identity is known to be remote-only.
-    pub fn is_remote_repo(&self, identity: &RepoIdentity) -> bool {
-        self.known_remote_repos.contains_key(identity)
-    }
-
-    /// Accessor for all known remote-only repos and their synthetic paths.
-    pub fn known_remote_repos(&self) -> &HashMap<RepoIdentity, PathBuf> {
-        &self.known_remote_repos
     }
 
     pub fn configured_targets(&self) -> Vec<ConfiguredPeerTargetInfo> {
@@ -1677,34 +1288,6 @@ impl PeerManager {
         self.displaced_senders.remove(&(name.clone(), generation))
     }
 
-    /// Remove all stored data for a peer (e.g. on disconnect).
-    ///
-    /// Returns the list of RepoIdentity values that were affected, so the
-    /// caller can rebuild the daemon's peer overlay for those repos.
-    pub fn remove_peer_data(&mut self, name: &NodeId) -> Vec<RepoIdentity> {
-        let affected: Vec<RepoIdentity> = self.peer_data.get(name).map(|repos| repos.keys().cloned().collect()).unwrap_or_default();
-        self.peer_data.remove(name);
-        self.peer_host_summaries.retain(|_, summary| summary.node.node_id != *name);
-        self.last_seen_clocks.retain(|(host, _), _| host != name);
-        info!(peer = %name, repos = affected.len(), "cleared peer data");
-        affected
-    }
-
-    /// Check whether a remote-only repo still has any peer data backing it.
-    ///
-    /// Returns `true` if at least one remaining peer holds data for this identity.
-    pub fn has_peer_data_for(&self, identity: &RepoIdentity) -> bool {
-        self.peer_data.values().any(|repos| repos.contains_key(identity))
-    }
-
-    /// Unregister a remote-only repo identity.
-    ///
-    /// Returns the synthetic path if it was tracked, so the caller can
-    /// call `remove_repo` on the daemon.
-    pub fn unregister_remote_repo(&mut self, identity: &RepoIdentity) -> Option<PathBuf> {
-        self.known_remote_repos.remove(identity)
-    }
-
     /// Send a message to a specific peer by name.
     pub async fn send_to(&self, name: &NodeId, msg: PeerWireMessage) -> Result<(), String> {
         let sender = self.resolve_sender(name)?;
@@ -1761,6 +1344,7 @@ impl PeerManager {
             return Err(error);
         };
         let name = remote_node.node_id.clone();
+        self.learn_node_info(&remote_node);
 
         let mut generation = 0;
         if let Some(sender) = sender {
@@ -1799,34 +1383,15 @@ impl PeerManager {
         Ok(ConnectedConfiguredPeer { label: label.clone(), node: remote_node, generation, inbound_rx: rx })
     }
 
-    /// Clear all stored peer data originating from a specific host.
-    ///
-    /// Used when a remote daemon restart is detected (session_id changed).
-    /// Unlike `disconnect_peer`, this does NOT tear down the connection.
-    pub fn clear_peer_data_for_restart(&mut self, origin: &NodeId) -> Vec<RepoIdentity> {
-        let Some(repos) = self.peer_data.remove(origin) else {
-            // Restart cleanup still owns host-summary eviction even when no repo snapshots were cached.
-            self.peer_host_summaries.retain(|_, summary| summary.node.node_id != *origin);
-            return Vec::new();
-        };
-        let affected: Vec<RepoIdentity> = repos.keys().cloned().collect();
+    /// Clear cached live-link metadata after a remote daemon restart.
+    pub fn clear_peer_state_for_restart(&mut self, origin: &NodeId) {
         self.peer_host_summaries.retain(|_, summary| summary.node.node_id != *origin);
-        self.last_seen_clocks.retain(|(host, _), _| host != origin);
-        if !affected.is_empty() {
-            self.bump_overlay_version();
-        }
-        info!(peer = %origin, repo_count = affected.len(), "cleared stale peer data after restart");
-        affected
+        info!(peer = %origin, "cleared stale peer state after restart");
     }
 
     pub fn disconnect_peer(&mut self, name: &NodeId, generation: u64) -> DisconnectPlan {
         if !self.generation_is_current(name, generation) {
-            return DisconnectPlan {
-                was_active: false,
-                affected_repos: Vec::new(),
-                resync_requests: Vec::new(),
-                overlay_updates: Vec::new(),
-            };
+            return DisconnectPlan { was_active: false };
         }
 
         self.senders.remove(name);
@@ -1838,113 +1403,16 @@ impl PeerManager {
         // one-sided daemon restart.
         self.displaced_senders.retain(|(host, _), _| host != name);
         self.transport_peers.retain(|_, node_id| node_id != name);
-        self.reverse_paths.retain(|_, hop| hop.next_hop != *name);
         self.command_reverse_paths.retain(|_, hop| hop.next_hop != *name);
-        self.pending_resync_requests.retain(|key, _| key.target_node_id != *name);
         self.peer_host_summaries.retain(|_, summary| summary.node.node_id != *name);
-
-        let mut affected_repos = Vec::new();
-        let mut resync_requests = Vec::new();
-        let origins: Vec<NodeId> = self.peer_data.keys().cloned().collect();
-
-        for origin in origins {
-            let affected_for_origin: Vec<RepoIdentity> = self
-                .peer_data
-                .get(&origin)
-                .map(|repos| {
-                    repos
-                        .iter()
-                        .filter(|(_, state)| state.via_peer == *name && state.via_generation == generation)
-                        .map(|(repo_id, _)| repo_id.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            if affected_for_origin.is_empty() {
-                continue;
-            }
-
-            let replacement = self.promote_route_after_disconnect(&origin);
-            if let Some(next_hop) = replacement {
-                if let Some(repos) = self.peer_data.get_mut(&origin) {
-                    for repo_id in &affected_for_origin {
-                        if let Some(state) = repos.get_mut(repo_id) {
-                            state.stale = true;
-                            state.via_peer = next_hop.next_hop.clone();
-                            state.via_generation = next_hop.next_hop_generation;
-                        }
-                    }
-                }
-
-                for repo_id in &affected_for_origin {
-                    let request_id = self.next_request_id();
-                    let key = ReversePathKey {
-                        request_id,
-                        requester_node_id: self.local_node_id.clone(),
-                        target_node_id: origin.clone(),
-                        repo_identity: repo_id.clone(),
-                    };
-                    self.pending_resync_requests
-                        .insert(key, PendingResyncRequest { deadline_at: Instant::now() + Self::RESYNC_REQUEST_TIMEOUT });
-                    resync_requests.push(RoutedPeerMessage::RequestResync {
-                        request_id,
-                        requester_node_id: self.local_node_id.clone(),
-                        target_node_id: origin.clone(),
-                        remaining_hops: Self::DEFAULT_ROUTED_HOPS,
-                        repo_identity: repo_id.clone(),
-                        since_seq: 0,
-                    });
-                }
-
-                debug!(
-                    origin = %origin,
-                    via = %next_hop.next_hop,
-                    repos = affected_for_origin.len(),
-                    "retaining stale peer data while failover resync is pending"
-                );
-            } else {
-                if let Some(repos) = self.peer_data.get_mut(&origin) {
-                    for repo_id in &affected_for_origin {
-                        repos.remove(repo_id);
-                    }
-                    if repos.is_empty() {
-                        self.peer_data.remove(&origin);
-                    }
-                }
-                self.routes.remove(&origin);
-            }
-
-            affected_repos.extend(affected_for_origin);
+        self.routes.remove(name);
+        let affected_routes: Vec<NodeId> =
+            self.routes.iter().filter(|(_, route)| route.primary.next_hop == *name).map(|(target, _)| target.clone()).collect();
+        for target in affected_routes {
+            self.promote_route_after_disconnect(&target);
         }
 
-        self.last_seen_clocks.retain(|(host, _), _| host != name);
-
-        // Compute overlay updates atomically while still holding &mut self.
-        // The caller resolves identity → path at apply time to avoid TOCTOU
-        // with concurrent add_repo/remove_repo.
-        //
-        // Bump the overlay version once for the entire disconnect. All
-        // SetProviders updates carry this version so stale applies are rejected.
-        let overlay_version = if !affected_repos.is_empty() { self.bump_overlay_version() } else { self.overlay_version };
-        let mut overlay_updates = Vec::new();
-        for repo_id in &affected_repos {
-            if self.has_peer_data_for(repo_id) {
-                // Repo still has data from other peers — collect remaining peer data
-                let peers: Vec<(NodeInfo, ProviderData)> = self
-                    .peer_data
-                    .iter()
-                    .filter_map(|(node_id, repos)| {
-                        repos.get(repo_id).map(|state| (self.node_info_for(node_id), state.provider_data.clone()))
-                    })
-                    .collect();
-                overlay_updates.push(OverlayUpdate::SetProviders { identity: repo_id.clone(), peers, overlay_version });
-            } else if let Some(synthetic_path) = self.unregister_remote_repo(repo_id) {
-                // Remote-only, no peers remain — remove the virtual tab
-                overlay_updates.push(OverlayUpdate::RemoveRepo { identity: repo_id.clone(), path: synthetic_path });
-            }
-        }
-
-        DisconnectPlan { was_active: true, affected_repos, resync_requests, overlay_updates }
+        DisconnectPlan { was_active: true }
     }
 }
 

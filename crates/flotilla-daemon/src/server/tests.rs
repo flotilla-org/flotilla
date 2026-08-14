@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
@@ -23,12 +23,12 @@ use flotilla_protocol::{
     commands::DaemonLogQuery,
     qualified_path::QualifiedPath,
     result_set::{QueryChanges, QueryId, ResultDelta},
-    AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachBinding, AttachExcursionId, AttachableId, Checkout, CheckoutTarget,
-    Command, CommandAction, CommandPeerEvent, CommandValue, ConfigLabel, ConvoyStartIntent, CrewCommandContext, DaemonEvent, EnvironmentId,
-    HostName, HostPath, HostProviderStatus, HostSummary, Message, NodeId, NodeInfo, PeerConnectionState, PeerDataKind, PeerDataMessage,
-    PeerWireMessage, PreparedWorkspace, ProviderData, QueryCursor, RepoIdentity, RepoSelector, Request, ResourceCursor, Response,
-    ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome, StepStatus, StreamKey, VectorClock,
-    AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
+    AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachBinding, AttachExcursionId, AttachableId, CheckoutTarget, Command,
+    CommandAction, CommandPeerEvent, CommandValue, ConfigLabel, ConvoyStartIntent, CrewCommandContext, DaemonEvent, EnvironmentId,
+    HostName, HostProviderStatus, HostSummary, Message, NodeId, NodeInfo, PeerConnectionState, PeerWireMessage, PreparedWorkspace,
+    QueryCursor, RepoIdentity, RepoSelector, Request, ResourceCursor, Response, ResponseResult, RoutedPeerMessage, StepAction,
+    StepExecutionContext, StepOutcome, StepStatus, StreamKey, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION,
+    TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus, Host,
@@ -39,7 +39,6 @@ use flotilla_resources::{
 };
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
-use indexmap::IndexMap;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     sync::{mpsc, oneshot, watch, Mutex, Notify},
@@ -52,7 +51,7 @@ use super::{
     client_connection::QuerySubscriptions,
     handle_client, handle_client_session,
     peer_connection::PEER_IDLE_TIMEOUT,
-    peer_runtime::{forward_with_keepalive_for_test, relay_peer_data, send_local_to_peer, should_send_local_version, ForwardResult},
+    peer_runtime::{forward_with_keepalive_for_test, send_link_state, ForwardResult},
     publish_socket_path,
     remote_commands::{
         extract_command_repo_identity, ForwardedCommand, ForwardedCommandMap, ForwardedCommandState, PendingRemoteCancelMap,
@@ -816,43 +815,12 @@ async fn dispatch_request_with_state(
     request_dispatcher.dispatch(id, request).await
 }
 
-fn checkout(branch: &str) -> Checkout {
-    Checkout {
-        branch: branch.to_string(),
-        is_main: false,
-        trunk_ahead_behind: None,
-        remote_ahead_behind: None,
-        working_tree: None,
-        last_commit: None,
-        host_name: None,
-        environment_id: None,
-    }
-}
-
 fn node(name: &str) -> NodeId {
     NodeId::new(name)
 }
 
 fn node_info(name: &str) -> NodeInfo {
     NodeInfo::new(node(name), name)
-}
-
-fn peer_snapshot(host: &str, repo_identity: &RepoIdentity, repo_path: &Path, checkout_path: &str, branch: &str) -> PeerDataMessage {
-    PeerDataMessage {
-        origin_node_id: NodeId::new(host),
-        origin_display_name: host.to_string(),
-        repo_identity: repo_identity.clone(),
-        repository_key: None,
-        host_repo_root: Some(repo_path.to_path_buf()),
-        clock: VectorClock::default(),
-        kind: PeerDataKind::Snapshot {
-            data: Box::new(ProviderData {
-                checkouts: IndexMap::from([(HostPath::new(HostName::new(host), checkout_path).into(), checkout(branch))]),
-                ..Default::default()
-            }),
-            seq: 1,
-        },
-    }
 }
 
 #[tokio::test]
@@ -3047,15 +3015,15 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
 }
 
 #[tokio::test]
-async fn take_peer_data_rx_returns_some_once() {
+async fn take_inbound_peer_rx_returns_some_once() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(tmp.path().join("config"));
     let mut server = DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60))
         .await
         .expect("create daemon server");
 
-    assert!(server.take_peer_data_rx().is_some(), "first call should return Some");
-    assert!(server.take_peer_data_rx().is_none(), "second call should return None");
+    assert!(server.take_inbound_peer_rx().is_some(), "first call should return Some");
+    assert!(server.take_inbound_peer_rx().is_none(), "second call should return None");
 }
 
 #[tokio::test]
@@ -3086,15 +3054,12 @@ async fn daemon_server_does_not_replay_configured_peers_without_host_environment
     );
 }
 
-fn test_peer_msg(host: &str) -> PeerDataMessage {
-    PeerDataMessage {
+fn test_peer_msg(host: &str) -> PeerWireMessage {
+    PeerWireMessage::RouteAdvertisement {
         origin_node_id: NodeId::new(host),
         origin_display_name: host.to_string(),
-        repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-        repository_key: None,
-        host_repo_root: Some(PathBuf::from("/tmp/repo")),
-        clock: VectorClock::default(),
-        kind: PeerDataKind::RequestResync { since_seq: 0 },
+        remaining_hops: 8,
+        visited: vec![NodeId::new(host)],
     }
 }
 
@@ -3109,7 +3074,7 @@ fn host_seq_for(events: &[DaemonEvent], host_name: &NodeId) -> Option<u64> {
 }
 
 #[tokio::test]
-async fn handle_client_forwards_peer_data_and_registers_peer() {
+async fn handle_client_forwards_peer_link_state_and_registers_peer() {
     let (_tmp, daemon) = empty_daemon().await;
     let daemon_socket_path = PathBuf::from("/tmp/flotilla-follower.sock");
     daemon.set_daemon_socket_path(daemon_socket_path.clone()).await;
@@ -3183,21 +3148,19 @@ async fn handle_client_forwards_peer_data_and_registers_peer() {
 
     // Send a peer message from the client side
     let peer_msg = test_peer_msg("remote-host");
-    let wire_msg = Message::Peer(Box::new(PeerWireMessage::Data(peer_msg.clone())));
+    let wire_msg = Message::Peer(Box::new(peer_msg));
     flotilla_protocol::framing::write_message_line(&mut writer, &wire_msg).await.expect("write peer message");
 
     // The server should forward the peer envelope
     let received = tokio::time::timeout(Duration::from_secs(2), peer_data_rx.recv())
         .await
-        .expect("timeout waiting for peer data")
+        .expect("timeout waiting for peer message")
         .expect("channel closed");
     assert_eq!(received.connection_peer, NodeId::new("remote-host"));
     assert_eq!(received.connection_generation, 1);
     match received.msg {
-        PeerWireMessage::Data(msg) => {
-            assert_eq!(msg.origin_node_id, NodeId::new("remote-host"));
-        }
-        other => panic!("expected data message, got {other:?}"),
+        PeerWireMessage::RouteAdvertisement { origin_node_id, .. } => assert_eq!(origin_node_id, NodeId::new("remote-host")),
+        other => panic!("expected route advertisement, got {other:?}"),
     }
 
     {
@@ -3883,24 +3846,24 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
 }
 
 #[tokio::test]
-async fn send_local_to_peer_sends_host_summary_for_empty_daemon() {
+async fn send_link_state_sends_host_summary_and_route_advertisement() {
     let (_tmp, daemon) = empty_daemon().await;
     let peer = NodeId::new("remote-host");
-    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(daemon.node_id().clone())));
     let sent = Arc::new(StdMutex::new(Vec::new()));
     let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
     let generation = {
         let mut pm = peer_manager.lock().await;
         ensure_test_connection_generation(&mut pm, &peer, || Arc::clone(&sender))
     };
-    let mut clock = VectorClock::default();
     let host_name = daemon.node_id().clone();
 
-    let sent_any = send_local_to_peer(&daemon, &peer_manager, &host_name, &mut clock, &peer, generation).await;
+    let sent_any = send_link_state(&daemon, &peer_manager, &peer, generation).await;
 
     assert!(sent_any, "host summary should count as initial peer sync");
     let sent = sent.lock().expect("lock");
     assert!(matches!(&sent[0], PeerWireMessage::HostSummary(summary) if summary.node.node_id == host_name));
+    assert!(matches!(&sent[1], PeerWireMessage::RouteAdvertisement { origin_node_id, .. } if origin_node_id == &host_name));
 }
 
 #[tokio::test]
@@ -3961,61 +3924,6 @@ async fn forward_with_keepalive_stays_connected_when_pongs_arrive() {
 }
 
 #[tokio::test]
-async fn relay_peer_data_does_not_hold_peer_manager_lock_across_send() {
-    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("leader"))));
-    let started = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let sent = Arc::new(StdMutex::new(Vec::new()));
-    let sender: Arc<dyn PeerSender> =
-        Arc::new(BlockingPeerSender { started: Arc::clone(&started), release: Arc::clone(&release), sent: Arc::clone(&sent) });
-
-    {
-        let mut pm = peer_manager.lock().await;
-        pm.register_sender(NodeId::new("follower-b"), sender);
-    }
-
-    let msg = peer_snapshot(
-        "follower-a",
-        &RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-        Path::new("/tmp/repo"),
-        "/tmp/repo",
-        "feature",
-    );
-    let started_wait = started.notified();
-
-    let relay_task = tokio::spawn({
-        let peer_manager = Arc::clone(&peer_manager);
-        async move {
-            relay_peer_data(&peer_manager, &NodeId::new("follower-a"), &msg).await;
-        }
-    });
-
-    started_wait.await;
-    let _guard = tokio::time::timeout(Duration::from_millis(100), peer_manager.lock())
-        .await
-        .expect("peer manager lock should remain available while relay send is blocked");
-
-    release.notify_waiters();
-    relay_task.await.expect("relay task should finish");
-
-    let sent = sent.lock().expect("lock");
-    assert_eq!(sent.len(), 1, "relay should eventually send one message");
-}
-
-#[test]
-fn should_send_local_version_dedupes_by_repo_identity() {
-    let identity = RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() };
-    let mut last_sent_versions = HashMap::new();
-
-    assert!(should_send_local_version(&last_sent_versions, &identity, 1));
-    last_sent_versions.insert(identity.clone(), 1);
-
-    // Different local roots for the same repo identity should share one dedup entry.
-    assert!(!should_send_local_version(&last_sent_versions, &identity, 1));
-    assert!(should_send_local_version(&last_sent_versions, &identity, 2));
-}
-
-#[tokio::test]
 async fn peer_manager_initialized_from_config() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("config");
@@ -4033,10 +3941,8 @@ async fn peer_manager_initialized_from_config() {
         .await
         .expect("create daemon server");
 
-    // PeerManager should be initialized and accessible
     let pm = server.peer_manager.lock().await;
-    // peer_data is empty since no data has been received yet
-    assert!(pm.get_peer_data().is_empty());
+    assert!(pm.configured_peers().is_empty());
 }
 
 #[tokio::test]
@@ -4047,9 +3953,8 @@ async fn peer_manager_default_when_no_config() {
         .await
         .expect("create daemon server");
 
-    // Should still have a PeerManager with no peers
     let pm = server.peer_manager.lock().await;
-    assert!(pm.get_peer_data().is_empty());
+    assert!(pm.configured_peers().is_empty());
 }
 
 #[tokio::test]
@@ -4139,7 +4044,7 @@ async fn handle_client_relays_outbound_peer_messages() {
 
     {
         let pm = peer_manager.lock().await;
-        pm.send_to(&NodeId::new("remote-host"), PeerWireMessage::Data(test_peer_msg("other-host"))).await.expect("send relay");
+        pm.send_to(&NodeId::new("remote-host"), test_peer_msg("other-host")).await.expect("send relay");
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -4149,8 +4054,8 @@ async fn handle_client_relays_outbound_peer_messages() {
             Ok(Ok(Some(line))) => {
                 let msg: Message = serde_json::from_str(&line).expect("parse");
                 if let Message::Peer(peer_msg) = msg {
-                    if let PeerWireMessage::Data(peer_msg) = *peer_msg {
-                        assert_eq!(peer_msg.origin_node_id, node("other-host"));
+                    if let PeerWireMessage::RouteAdvertisement { origin_node_id, .. } = *peer_msg {
+                        assert_eq!(origin_node_id, node("other-host"));
                         found_relay = true;
                         break;
                     }

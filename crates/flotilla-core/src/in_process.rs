@@ -3059,14 +3059,6 @@ impl InProcessDaemon {
         Ok(())
     }
 
-    /// Provider snapshot overlays were retired with the observer pipeline.
-    pub async fn set_peer_providers(&self, _repo: &Path, _peers: Vec<(NodeInfo, ProviderData)>, _overlay_version: u64) {}
-
-    /// Provider snapshots are no longer published to peers.
-    pub async fn get_local_providers(&self, _repo: &Path) -> Option<(ProviderData, u64)> {
-        None
-    }
-
     /// Send an arbitrary event to all subscribers.
     ///
     /// Mirrors host events into daemon-owned host state so replay/query paths

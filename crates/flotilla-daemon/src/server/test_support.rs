@@ -115,8 +115,8 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
         pm.add_configured_target(flotilla_protocol::ConfigLabel("leader".into()), leader_host.clone(), None, Box::new(follower_transport));
     }
 
-    let (leader_peer_data_tx, leader_peer_data_rx) = mpsc::channel(256);
-    let (follower_peer_data_tx, follower_peer_data_rx) = mpsc::channel(256);
+    let (leader_inbound_peer_tx, leader_inbound_peer_rx) = mpsc::channel(256);
+    let (follower_inbound_peer_tx, follower_inbound_peer_rx) = mpsc::channel(256);
     let leader_remote_router = build_remote_command_router(&leader, &leader_peer_manager);
     let follower_remote_router = build_remote_command_router(&follower, &follower_peer_manager);
 
@@ -124,8 +124,8 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
         spawn_peer_networking_runtime(
             Arc::clone(&leader),
             Arc::clone(&leader_peer_manager),
-            Some(leader_peer_data_rx),
-            leader_peer_data_tx.clone(),
+            Some(leader_inbound_peer_rx),
+            leader_inbound_peer_tx.clone(),
             leader_remote_router.clone(),
             None,
         );
@@ -133,8 +133,8 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
         spawn_peer_networking_runtime(
             Arc::clone(&follower),
             Arc::clone(&follower_peer_manager),
-            Some(follower_peer_data_rx),
-            follower_peer_data_tx,
+            Some(follower_inbound_peer_rx),
+            follower_inbound_peer_tx,
             follower_remote_router,
             None,
         );
@@ -148,7 +148,7 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
     let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
     let leader_for_client = Arc::clone(&leader);
     let leader_peer_manager_for_client = Arc::clone(&leader_peer_manager);
-    let leader_peer_data_tx_for_client = leader_peer_data_tx;
+    let leader_inbound_peer_tx_for_client = leader_inbound_peer_tx;
     let leader_remote_router_for_client = leader_remote_router;
     let client_count_for_task = Arc::clone(&client_count);
     let client_notify_for_task = Arc::clone(&client_notify);
@@ -157,7 +157,7 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
             server_session,
             leader_for_client,
             shutdown_rx,
-            leader_peer_data_tx_for_client,
+            leader_inbound_peer_tx_for_client,
             leader_peer_manager_for_client,
             leader_remote_router_for_client,
             client_count_for_task,

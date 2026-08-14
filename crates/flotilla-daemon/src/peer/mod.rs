@@ -7,13 +7,9 @@ pub mod transport;
 
 pub use channel_transport::{channel_transport_pair, ChannelTransport};
 pub use manager::{
-    dispatch_pending_sends, synthetic_repo_path, ActivationResult, ConnectionDirection, ConnectionMeta, DisconnectPlan, HandleResult,
-    InboundPeerEnvelope, OverlayUpdate, PeerManager, PendingPeerSend, PendingResyncRequest, PerRepoPeerState, ReversePathHop,
-    ReversePathKey, RouteHop, RouteState,
+    dispatch_pending_sends, ActivationResult, ConnectionDirection, ConnectionMeta, DisconnectPlan, HandleResult, InboundPeerEnvelope,
+    PeerManager, PendingPeerSend, ReversePathHop, RouteHop, RouteState,
 };
 pub(crate) use ssh_transport::{peer_resource_socket_path, reverse_peer_resource_socket_path};
 pub use ssh_transport::{SshTransport, SshTransportPaths};
 pub use transport::{PeerConnectionStatus, PeerSender, PeerTransport};
-
-#[cfg(test)]
-mod channel_tests;

@@ -257,7 +257,7 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
             sync_peer_query_state(&peer_manager, &daemon).await;
         });
     }
-    let (peer_data_tx, peer_data_rx) = mpsc::channel(256);
+    let (inbound_peer_tx, inbound_peer_rx) = mpsc::channel(256);
     let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
     {
         let router = remote_command_router.clone();
@@ -266,8 +266,8 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
     let (handle, _peer_connected_tx) = spawn_peer_networking_runtime(
         daemon,
         peer_manager,
-        Some(peer_data_rx),
-        peer_data_tx,
+        Some(inbound_peer_rx),
+        inbound_peer_tx,
         remote_command_router,
         Some(config.state_dir().as_path().join("peers")),
     );
@@ -277,7 +277,7 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
 /// Spawn the peer networking runtime with pre-built components.
 ///
 /// Test-only entry point: callers provide a PeerManager with pre-configured
-/// senders (e.g. CapturePeerSender). Passes `None` for `peer_data_rx` to skip
+/// senders (e.g. CapturePeerSender). Passes `None` for `inbound_peer_rx` to skip
 /// the inbound connection task — tests drive the outbound task via the returned
 /// `PeerConnectionEvent` sender.
 #[cfg(feature = "test-support")]
@@ -287,13 +287,13 @@ pub fn spawn_test_peer_networking(
 ) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) {
     // Receiver dropped intentionally — None is passed for the inbound task,
     // so no messages are forwarded; the sender satisfies the runtime signature.
-    let (peer_data_tx, _peer_data_rx) = mpsc::channel(256);
+    let (inbound_peer_tx, _inbound_peer_rx) = mpsc::channel(256);
     let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
     spawn_peer_networking_runtime(
         daemon,
         peer_manager,
         None, // No inbound task — test drives outbound via PeerConnectionEvent
-        peer_data_tx,
+        inbound_peer_tx,
         remote_command_router,
         None,
     )
@@ -313,9 +313,9 @@ pub struct DaemonServer {
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     /// Channel for inbound peer wire messages tagged with connection authority.
-    peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
-    peer_data_rx: Option<mpsc::Receiver<InboundPeerEnvelope>>,
-    /// Manages connections to remote peer hosts and stores their provider data.
+    inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
+    inbound_peer_rx: Option<mpsc::Receiver<InboundPeerEnvelope>>,
+    /// Manages live connections and routing between remote peer hosts.
     peer_manager: Arc<Mutex<PeerManager>>,
     remote_command_router: RemoteCommandRouter,
     peer_resource_socket_dir: PathBuf,
@@ -361,7 +361,7 @@ impl DaemonServer {
         let peer_manager = build_peer_manager(&daemon, &config, &socket_path)?;
         sync_peer_query_state(&peer_manager, &daemon).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (peer_data_tx, peer_data_rx) = mpsc::channel(256);
+        let (inbound_peer_tx, inbound_peer_rx) = mpsc::channel(256);
 
         let agent_state_store = Arc::clone(daemon.agent_state_store());
         let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
@@ -375,8 +375,8 @@ impl DaemonServer {
             client_notify: Arc::new(Notify::new()),
             shutdown_tx,
             shutdown_rx,
-            peer_data_tx,
-            peer_data_rx: Some(peer_data_rx),
+            inbound_peer_tx,
+            inbound_peer_rx: Some(inbound_peer_rx),
             peer_manager,
             remote_command_router,
             peer_resource_socket_dir,
@@ -385,12 +385,12 @@ impl DaemonServer {
         })
     }
 
-    /// Take the receiver for inbound peer data messages.
+    /// Take the receiver for inbound peer wire messages.
     ///
     /// Returns `Some` on the first call, `None` thereafter. The PeerManager
     /// consumes this to process data arriving from peer daemons.
-    pub fn take_peer_data_rx(&mut self) -> Option<mpsc::Receiver<InboundPeerEnvelope>> {
-        self.peer_data_rx.take()
+    pub fn take_inbound_peer_rx(&mut self) -> Option<mpsc::Receiver<InboundPeerEnvelope>> {
+        self.inbound_peer_rx.take()
     }
 
     pub fn daemon(&self) -> Arc<InProcessDaemon> {
@@ -424,8 +424,8 @@ impl DaemonServer {
         // can get FLOTILLA_DAEMON_SOCKET injected.
         self.daemon.set_daemon_socket_path(self.socket_path.clone()).await;
 
-        // Take peer_data_rx before destructuring self
-        let peer_data_rx = self.take_peer_data_rx();
+        // Take the inbound receiver before destructuring self.
+        let inbound_peer_rx = self.take_inbound_peer_rx();
 
         let daemon = self.daemon;
         let client_count = self.client_count;
@@ -433,7 +433,7 @@ impl DaemonServer {
         let mut shutdown_rx = self.shutdown_rx;
         let idle_timeout = self.idle_timeout;
         let client_notify = self.client_notify;
-        let peer_data_tx = self.peer_data_tx;
+        let inbound_peer_tx = self.inbound_peer_tx;
         let agent_state_store = self.agent_state_store;
         let remote_command_router = self.remote_command_router;
         let peer_resource_socket_dir = self.peer_resource_socket_dir;
@@ -466,8 +466,8 @@ impl DaemonServer {
         let (_peer_runtime_handle, peer_connected_tx) = spawn_peer_networking_runtime(
             Arc::clone(&daemon),
             Arc::clone(&peer_manager),
-            peer_data_rx,
-            peer_data_tx.clone(),
+            inbound_peer_rx,
+            inbound_peer_tx.clone(),
             remote_command_router.clone(),
             Some(peer_resource_socket_dir),
         );
@@ -489,7 +489,7 @@ impl DaemonServer {
                             let client_count = Arc::clone(&client_count);
                             let client_notify = Arc::clone(&client_notify);
                             let shutdown_rx = shutdown_rx.clone();
-                            let peer_data_tx = peer_data_tx.clone();
+                            let inbound_peer_tx = inbound_peer_tx.clone();
                             let peer_manager = Arc::clone(&peer_manager);
                             let remote_command_router = remote_command_router.clone();
                             let peer_connected_tx = peer_connected_tx.clone();
@@ -500,7 +500,7 @@ impl DaemonServer {
                                     stream,
                                     daemon,
                                     shutdown_rx,
-                                    peer_data_tx,
+                                    inbound_peer_tx,
                                     peer_manager,
                                     remote_command_router,
                                     client_count,
@@ -571,12 +571,12 @@ fn publish_socket_path(discovery_path: &Path, socket_path: &Path) -> Result<(), 
 fn spawn_peer_networking_runtime(
     daemon: Arc<InProcessDaemon>,
     peer_manager: Arc<Mutex<PeerManager>>,
-    peer_data_rx: Option<mpsc::Receiver<InboundPeerEnvelope>>,
-    peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
+    inbound_peer_rx: Option<mpsc::Receiver<InboundPeerEnvelope>>,
+    inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     remote_command_router: RemoteCommandRouter,
     resource_socket_dir: Option<PathBuf>,
 ) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) {
-    PeerRuntime::new(daemon, peer_manager, peer_data_rx, peer_data_tx, remote_command_router, resource_socket_dir).spawn()
+    PeerRuntime::new(daemon, peer_manager, inbound_peer_rx, inbound_peer_tx, remote_command_router, resource_socket_dir).spawn()
 }
 
 /// Handle a single client connection.
@@ -590,7 +590,7 @@ async fn handle_client(
     mut stream: tokio::net::UnixStream,
     daemon: Arc<InProcessDaemon>,
     shutdown_rx: watch::Receiver<bool>,
-    peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
+    inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     peer_manager: Arc<Mutex<PeerManager>>,
     remote_command_router: RemoteCommandRouter,
     client_count: Arc<AtomicUsize>,
@@ -621,7 +621,7 @@ async fn handle_client(
         unix_message_session_with_prefix(stream, first_byte.to_vec()),
         daemon,
         shutdown_rx,
-        peer_data_tx,
+        inbound_peer_tx,
         peer_manager,
         remote_command_router,
         client_count,
@@ -638,7 +638,7 @@ async fn handle_client_session(
     session: MessageSession,
     daemon: Arc<InProcessDaemon>,
     mut shutdown_rx: watch::Receiver<bool>,
-    peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
+    inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     peer_manager: Arc<Mutex<PeerManager>>,
     remote_command_router: RemoteCommandRouter,
     client_count: Arc<AtomicUsize>,
@@ -720,7 +720,7 @@ async fn handle_client_session(
                     .await;
             } else {
                 // Peer path (ConnectionRole::Peer or None) — existing behavior.
-                PeerConnection::new(daemon, shutdown_rx, peer_data_tx, peer_manager, peer_connected_tx, client_count, client_notify)
+                PeerConnection::new(daemon, shutdown_rx, inbound_peer_tx, peer_manager, peer_connected_tx, client_count, client_notify)
                     .run(session, protocol_version, node_id, display_name, session_id)
                     .await;
             }

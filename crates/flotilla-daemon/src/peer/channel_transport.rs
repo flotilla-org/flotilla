@@ -339,22 +339,17 @@ pub fn channel_transport_pair_with_nodes(local_node: NodeInfo, remote_node: Node
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use flotilla_protocol::{NodeId, PeerDataKind, PeerDataMessage, ProviderData, RepoIdentity, VectorClock};
+    use flotilla_protocol::NodeId;
 
     use super::*;
 
-    fn test_snapshot_msg(origin: &str, seq: u64) -> PeerWireMessage {
-        PeerWireMessage::Data(PeerDataMessage {
+    fn test_message(origin: &str, sequence: u8) -> PeerWireMessage {
+        PeerWireMessage::RouteAdvertisement {
             origin_node_id: NodeId::new(origin),
             origin_display_name: origin.to_string(),
-            repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-            repository_key: None,
-            host_repo_root: Some(PathBuf::from("/repo")),
-            clock: VectorClock::default(),
-            kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq },
-        })
+            remaining_hops: sequence,
+            visited: Vec::new(),
+        }
     }
 
     #[test]
@@ -438,23 +433,23 @@ mod tests {
         let mut rx_b = b.subscribe().await.expect("subscribe B");
 
         // A sends to B
-        sender_a.send(test_snapshot_msg("alpha", 1)).await.expect("A send");
+        sender_a.send(test_message("alpha", 1)).await.expect("A send");
         let msg = rx_b.recv().await.expect("B should receive message from A");
         match msg {
-            PeerWireMessage::Data(PeerDataMessage { origin_node_id, kind: PeerDataKind::Snapshot { seq, .. }, .. }) => {
+            PeerWireMessage::RouteAdvertisement { origin_node_id, remaining_hops, .. } => {
                 assert_eq!(origin_node_id, NodeId::new("alpha"));
-                assert_eq!(seq, 1);
+                assert_eq!(remaining_hops, 1);
             }
             other => panic!("unexpected message: {other:?}"),
         }
 
         // B sends to A
-        sender_b.send(test_snapshot_msg("beta", 2)).await.expect("B send");
+        sender_b.send(test_message("beta", 2)).await.expect("B send");
         let msg = rx_a.recv().await.expect("A should receive message from B");
         match msg {
-            PeerWireMessage::Data(PeerDataMessage { origin_node_id, kind: PeerDataKind::Snapshot { seq, .. }, .. }) => {
+            PeerWireMessage::RouteAdvertisement { origin_node_id, remaining_hops, .. } => {
                 assert_eq!(origin_node_id, NodeId::new("beta"));
-                assert_eq!(seq, 2);
+                assert_eq!(remaining_hops, 2);
             }
             other => panic!("unexpected message: {other:?}"),
         }
@@ -497,7 +492,7 @@ mod tests {
         }
 
         // Subsequent sends through the same sender should fail
-        let err = sender_a.send(test_snapshot_msg("alpha", 99)).await.expect_err("send after retire should fail");
+        let err = sender_a.send(test_message("alpha", 99)).await.expect_err("send after retire should fail");
         assert!(err.contains("retired"), "unexpected error: {err}");
     }
 
@@ -528,9 +523,9 @@ mod tests {
         b.connect().await.expect("connect B");
         let sender_a1 = a.sender().expect("sender A");
         let mut rx_b1 = b.subscribe().await.expect("subscribe B");
-        sender_a1.send(test_snapshot_msg("alpha", 1)).await.expect("send");
+        sender_a1.send(test_message("alpha", 1)).await.expect("send");
         let msg = rx_b1.recv().await.expect("recv");
-        assert!(matches!(msg, PeerWireMessage::Data(PeerDataMessage { kind: PeerDataKind::Snapshot { seq: 1, .. }, .. })));
+        assert!(matches!(msg, PeerWireMessage::RouteAdvertisement { remaining_hops: 1, .. }));
 
         // Disconnect both sides
         a.disconnect().await.expect("disconnect A");
@@ -541,9 +536,9 @@ mod tests {
         b.connect().await.expect("reconnect B");
         let sender_a2 = a.sender().expect("sender A after reconnect");
         let mut rx_b2 = b.subscribe().await.expect("subscribe B after reconnect");
-        sender_a2.send(test_snapshot_msg("alpha", 2)).await.expect("send after reconnect");
+        sender_a2.send(test_message("alpha", 2)).await.expect("send after reconnect");
         let msg = rx_b2.recv().await.expect("recv after reconnect");
-        assert!(matches!(msg, PeerWireMessage::Data(PeerDataMessage { kind: PeerDataKind::Snapshot { seq: 2, .. }, .. })));
+        assert!(matches!(msg, PeerWireMessage::RouteAdvertisement { remaining_hops: 2, .. }));
     }
 
     #[tokio::test]
@@ -606,14 +601,14 @@ mod tests {
         let mut rx_a = a.subscribe().await.expect("subscribe A");
         let mut rx_b = b.subscribe().await.expect("subscribe B");
 
-        sender_a.send(test_snapshot_msg("alpha", 10)).await.expect("send A→B");
-        sender_b.send(test_snapshot_msg("beta", 20)).await.expect("send B→A");
+        sender_a.send(test_message("alpha", 10)).await.expect("send A→B");
+        sender_b.send(test_message("beta", 20)).await.expect("send B→A");
 
         let msg_at_b = rx_b.recv().await.expect("B recv");
-        assert!(matches!(msg_at_b, PeerWireMessage::Data(PeerDataMessage { kind: PeerDataKind::Snapshot { seq: 10, .. }, .. })));
+        assert!(matches!(msg_at_b, PeerWireMessage::RouteAdvertisement { remaining_hops: 10, .. }));
 
         let msg_at_a = rx_a.recv().await.expect("A recv");
-        assert!(matches!(msg_at_a, PeerWireMessage::Data(PeerDataMessage { kind: PeerDataKind::Snapshot { seq: 20, .. }, .. })));
+        assert!(matches!(msg_at_a, PeerWireMessage::RouteAdvertisement { remaining_hops: 20, .. }));
     }
 
     #[tokio::test]
@@ -627,10 +622,10 @@ mod tests {
             let sender = a.sender().expect("sender A");
             let mut rx = b.subscribe().await.expect("subscribe B");
 
-            let seq = cycle * 10 + 1;
-            sender.send(test_snapshot_msg("alpha", seq)).await.expect("send");
+            let sequence = (cycle * 10 + 1) as u8;
+            sender.send(test_message("alpha", sequence)).await.expect("send");
             let msg = rx.recv().await.expect("recv");
-            assert!(matches!(msg, PeerWireMessage::Data(PeerDataMessage { kind: PeerDataKind::Snapshot { seq: s, .. }, .. }) if s == seq));
+            assert!(matches!(msg, PeerWireMessage::RouteAdvertisement { remaining_hops, .. } if remaining_hops == sequence));
 
             a.disconnect().await.unwrap_or_else(|e| panic!("disconnect A cycle {cycle}: {e}"));
             b.disconnect().await.unwrap_or_else(|e| panic!("disconnect B cycle {cycle}: {e}"));
