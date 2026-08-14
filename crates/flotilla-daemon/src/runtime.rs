@@ -7136,10 +7136,13 @@ mod tests {
         let workspace = temp.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
         let env_id = EnvironmentId::new("contained-claude");
+        // The preflight scratch dir must derive from a daemon-owned writable
+        // base (here the state dir), never absolute /run on the host (#1498).
+        let preflight_config_dir = config.state_dir().as_path().join("credentials/claude-max/claude");
         let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
             DiscoveryMockRunner::builder()
                 .tool_exists("claude", true)
-                .on_run("mkdir", &["-p", "/run/flotilla/credentials/claude-max/claude"], Ok(String::new()))
+                .on_run("mkdir", &["-p", &preflight_config_dir.to_string_lossy()], Ok(String::new()))
                 .on_run("mkdir", &["-p", "/run/flotilla/claude"], Ok(String::new()))
                 .build(),
         ));

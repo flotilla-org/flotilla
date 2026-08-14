@@ -555,6 +555,23 @@ impl CredentialStore {
             .unwrap_or_else(|| PathBuf::from(path))
     }
 
+    // The preflight scratch dir must keep the `claude -p` probe blind to
+    // ambient authentication (`apiKeyHelper`, stored logins) — an empty
+    // per-credential dir. The daemon runs as an unprivileged user with no
+    // systemd `RuntimeDirectory=`, so absolute `/run` is unwritable; derive
+    // the dir from a daemon-owned writable base instead: the user runtime dir
+    // when present, the daemon state dir otherwise (#1498).
+    fn claude_preflight_config_dir(&self, credential_name: &str) -> String {
+        let base = self
+            .env
+            .get("XDG_RUNTIME_DIR")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|runtime_dir| PathBuf::from(runtime_dir).join("flotilla"))
+            .unwrap_or_else(|| self.state_dir.clone());
+        base.join("credentials").join(safe_component(credential_name)).join("claude").to_string_lossy().into_owned()
+    }
+
     async fn prepare_adapter(
         &self,
         name: &str,
@@ -686,8 +703,7 @@ impl CredentialStore {
                 if !runner.exists("claude", &["--version"]).await {
                     return Err("consumer binary is unavailable".to_string());
                 }
-                let config_dir_fragment = claude_config_dir_fragment(name);
-                let config_dir = config_dir_fragment.value;
+                let config_dir = self.claude_preflight_config_dir(name);
                 if !already_prepared {
                     runner
                         .run("mkdir", &["-p", &config_dir], Path::new("/"), &ChannelLabel::Noop)
@@ -793,14 +809,6 @@ fn codex_home_fragment(credential_name: &str) -> Fragment {
         "CODEX_HOME",
         format!("/run/flotilla/credentials/{}/codex", safe_component(credential_name)),
         format!("credential/codex {credential_name}"),
-    )
-}
-
-fn claude_config_dir_fragment(credential_name: &str) -> Fragment {
-    agent_environment_fragment(
-        "CLAUDE_CONFIG_DIR",
-        format!("/run/flotilla/credentials/{}/claude", safe_component(credential_name)),
-        format!("credential/claude-oauth {credential_name}"),
     )
 }
 
@@ -1163,16 +1171,45 @@ interactions:
         );
         assert!(delivered.iter().all(|(name, _)| name != "CLAUDE_CONFIG_DIR"));
         let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls.iter().any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/run/flotilla/credentials/claude-max/claude"]));
+        assert!(calls
+            .iter()
+            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude"]));
         assert!(calls.iter().any(|(cmd, args, input)| {
             cmd == "sh"
                 && args.iter().any(|arg| arg.contains("unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN"))
                 && args.iter().any(|arg| arg.contains("CLAUDE_CODE_OAUTH_TOKEN=\"$token\"") && arg.contains("claude -p"))
                 && args.iter().any(|arg| arg.contains("claude -p ok 2>&1") && arg.contains("printf '%s\\n' \"$output\" >&2"))
-                && args.iter().any(|arg| arg == "/run/flotilla/credentials/claude-max/claude")
+                && args.iter().any(|arg| arg == "/tmp/flotilla-test-state/credentials/claude-max/claude")
                 && input == secret.as_bytes()
         }));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
+    }
+
+    #[tokio::test]
+    async fn claude_oauth_preflight_scratch_dir_prefers_the_user_runtime_dir_over_absolute_run() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
+        let env = Arc::new(TestEnv(BTreeMap::from([
+            ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
+            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
+        ])));
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+
+        store.prepare("env-a", &BTreeSet::from(["claude-max".to_string()]), runner.clone()).await.expect("prepare claude-oauth credential");
+
+        let calls = runner.calls.lock().expect("calls lock");
+        assert!(calls
+            .iter()
+            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/run/user/1000/flotilla/credentials/claude-max/claude"]));
+        assert!(calls.iter().any(|(cmd, args, _)| {
+            cmd == "sh" && args.iter().any(|arg| arg == "/run/user/1000/flotilla/credentials/claude-max/claude")
+        }));
+        assert!(
+            calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.starts_with("/run/flotilla")),
+            "the preflight must never touch root-owned /run/flotilla on the host"
+        );
     }
 
     #[tokio::test]
