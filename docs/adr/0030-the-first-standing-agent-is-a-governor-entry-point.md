@@ -99,6 +99,13 @@ never a desk machine whose lid couples governor liveness. Placement is free
 because dispatch works from any credentialed host (ADR 0031's
 rank-retirement).
 
+Engine and model selection is **declarative** — the capability table (and,
+as trajectory, issue labels driving a table lookup) decides; an inline
+governor override at dispatch time is an exception that must name its
+reason. Inline model-picking mid-context is suspect by default: it gets
+poisoned by whatever else the governor is holding (ruled 2026-08-14 on
+#1440; see #1501 for the label-driven direction).
+
 ## Consequences
 
 - The ensure mechanism's first real exerciser tests presence, restart
