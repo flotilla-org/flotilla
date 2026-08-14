@@ -4324,6 +4324,47 @@ async fn validate_workflow_credentials(
     workflow: &WorkflowTemplateSpec,
     placement: Option<&ResourceObject<PlacementPolicy>>,
 ) -> Result<(), String> {
+    let specs = backend
+        .clone()
+        .definitions::<CredentialSpec>(namespace)
+        .list()
+        .await
+        .map_err(|error| format!("list credential specs: {error}"))?
+        .into_iter()
+        .map(|spec| (spec.metadata.name, spec.spec.consumer))
+        .collect::<BTreeMap<_, _>>();
+    let capabilities = CapabilityTable::seeded();
+    for vessel in workflow.vessels.iter().filter(|vessel| vessel.stance == flotilla_resources::Stance::Contained) {
+        for crew in &vessel.crew {
+            let CrewSource::Agent { selector, .. } = &crew.source else {
+                continue;
+            };
+            let requirement = capabilities.resolve_selector(selector)?;
+            let Some(delivery_slot) = requirement.contained_credential_delivery_slot() else {
+                continue;
+            };
+            let has_granted_credential =
+                vessel.credential_refs.iter().any(|name| specs.get(name).is_some_and(|consumer| consumer.delivery_slot() == delivery_slot));
+            if has_granted_credential {
+                continue;
+            }
+            let compatible = specs
+                .iter()
+                .filter(|(_, consumer)| consumer.delivery_slot() == delivery_slot)
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            let credential = match compatible.as_slice() {
+                [name] => format!("credential `{name}`"),
+                [] => format!("a `{delivery_slot}` credential"),
+                names => format!("one of credentials `{}`", names.join("`, `")),
+            };
+            return Err(format!(
+                "contained agent adapter `{}` requires {credential}, but no matching CredentialGrant selected it",
+                requirement.adapter
+            ));
+        }
+    }
+
     let required = workflow
         .vessels
         .iter()

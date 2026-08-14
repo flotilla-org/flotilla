@@ -48,11 +48,13 @@ use flotilla_protocol::{
 use flotilla_resources::{
     apply_status_patch, controller_patches as convoy_controller_patches, implement_review_workflow_spec,
     single_agent_contained_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
-    CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
-    HostStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
-    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryRelation, RepositorySpec, ResourceBackend, ResourceError,
-    Stance, TypedResolver, WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY,
+    CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase, CredentialConsumer, CredentialGrant,
+    CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
+    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host as ResourceHost,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, LifecycleAuthority,
+    ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy,
+    RegardSource, Repository, RepositoryRelation, RepositorySpec, ResourceBackend, ResourceError, Stance, TypedResolver, WatchEvent,
+    WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
     REPO_KEY_LABEL, REPO_LABEL,
 };
 use futures::StreamExt;
@@ -1334,6 +1336,38 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
             .expect("workflow create");
     }
     create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string(), "claude-code".to_string()])).await;
+    backend
+        .clone()
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&InputMeta::builder().name("claude-max".to_string()).build(), &CredentialSpecSpec {
+            consumer: CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() },
+            source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+            lifecycle: CredentialLifecycle::Static,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("Claude credential create");
+    backend
+        .clone()
+        .definitions::<CredentialGrant>("flotilla")
+        .create(
+            &InputMeta::builder().name("claude-max-contained".to_string()).build(),
+            &CredentialGrantSpec::builder()
+                .selector(
+                    CredentialGrantSelector::builder().stance(Stance::Contained).projects(BTreeSet::from(["zellij".to_string()])).build(),
+                )
+                .credentials(BTreeSet::from(["claude-max".to_string()]))
+                .build(),
+        )
+        .await
+        .expect("Claude credential grant create");
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.get("host-test").await.expect("test placement host");
+    let mut status = host.status.expect("test placement host status");
+    status.ready = true;
+    status.heartbeat_at = Some(chrono::Utc::now());
+    status.capabilities.insert(HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["claude-max"]));
+    hosts.update_status("host-test", &host.metadata.resource_version, &status).await.expect("publish held Claude credential");
     backend
         .clone()
         .using::<Project>("flotilla")
