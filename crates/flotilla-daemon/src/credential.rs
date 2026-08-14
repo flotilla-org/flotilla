@@ -613,16 +613,16 @@ impl CredentialStore {
     // per-credential dir. The daemon runs as an unprivileged user with no
     // systemd `RuntimeDirectory=`, so absolute `/run` is unwritable; derive
     // the dir from a daemon-owned writable base instead: the user runtime dir
-    // when present, the daemon state dir otherwise (#1498).
-    fn claude_preflight_config_dir(&self, credential_name: &str) -> String {
-        let base = self
-            .env
-            .get("XDG_RUNTIME_DIR")
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(|runtime_dir| PathBuf::from(runtime_dir).join("flotilla"))
-            .unwrap_or_else(|| self.state_dir.clone());
-        base.join("credentials").join(safe_component(credential_name)).join("claude").to_string_lossy().into_owned()
+    // when present and writable, the daemon state dir otherwise (#1498,
+    // #1508). The runner owns the choice because it may target a different
+    // filesystem world, such as a provisioned container. Resolve on every
+    // preflight because logind can remove an inherited runtime dir after
+    // daemon startup.
+    async fn claude_preflight_config_dir(&self, credential_name: &str, runner: &dyn CommandRunner) -> Result<String, String> {
+        let runtime_dir =
+            self.env.get("XDG_RUNTIME_DIR").map(|value| PathBuf::from(value.trim())).filter(|value| !value.as_os_str().is_empty());
+        let base = runner.writable_scratch_base(runtime_dir.as_deref(), &self.state_dir).await?;
+        Ok(base.join("credentials").join(safe_component(credential_name)).join("claude").to_string_lossy().into_owned())
     }
 
     async fn prepare_adapter(
@@ -756,8 +756,8 @@ impl CredentialStore {
                 if !runner.exists("claude", &["--version"]).await {
                     return Err("consumer binary is unavailable".to_string());
                 }
-                let config_dir = self.claude_preflight_config_dir(name);
                 if !already_prepared {
+                    let config_dir = self.claude_preflight_config_dir(name, &*runner).await?;
                     runner
                         .run("mkdir", &["-p", &config_dir], Path::new("/"), &ChannelLabel::Noop)
                         .await
@@ -941,7 +941,7 @@ fn validate_scalar_material(name: &str, adapter: &str, material: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex as StdMutex;
+    use std::{collections::VecDeque, sync::Mutex as StdMutex};
 
     use async_trait::async_trait;
     use flotilla_core::providers::{
@@ -969,6 +969,13 @@ mod tests {
     struct RecordingRunner {
         calls: StdMutex<Vec<RecordedCall>>,
         writes: StdMutex<Vec<(PathBuf, String)>>,
+        runtime_dir_checks: StdMutex<VecDeque<bool>>,
+    }
+
+    impl RecordingRunner {
+        fn with_runtime_dir_checks(checks: impl IntoIterator<Item = bool>) -> Self {
+            Self { runtime_dir_checks: StdMutex::new(checks.into_iter().collect()), ..Self::default() }
+        }
     }
 
     #[async_trait]
@@ -979,7 +986,13 @@ mod tests {
         }
 
         async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-            self.run(cmd, args, cwd, label).await.map(|stdout| CommandOutput { stdout, stderr: String::new(), success: true })
+            let stdout = self.run(cmd, args, cwd, label).await?;
+            let success = if cmd == "sh" && args.contains(&"flotilla-xdg-runtime-dir") {
+                self.runtime_dir_checks.lock().expect("runtime dir checks lock").pop_front().unwrap_or(true)
+            } else {
+                true
+            };
+            Ok(CommandOutput { stdout, stderr: String::new(), success })
         }
 
         async fn run_with_input(
@@ -1368,6 +1381,54 @@ interactions:
         store.prepare("env-a", &BTreeSet::from(["claude-max".to_string()]), runner.clone()).await.expect("prepare claude-oauth credential");
 
         let calls = runner.calls.lock().expect("calls lock");
+        assert!(calls
+            .iter()
+            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude"]));
+    }
+
+    #[tokio::test]
+    async fn a_dangling_user_runtime_dir_falls_back_to_the_daemon_state_dir() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
+        let env = Arc::new(TestEnv(BTreeMap::from([
+            ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
+            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000-removed".to_string()),
+        ])));
+        let runner = Arc::new(RecordingRunner::with_runtime_dir_checks([false]));
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+
+        store.prepare("env-a", &BTreeSet::from(["claude-max".to_string()]), runner.clone()).await.expect("prepare claude-oauth credential");
+
+        let calls = runner.calls.lock().expect("calls lock");
+        assert!(calls
+            .iter()
+            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude"]));
+        assert!(calls
+            .iter()
+            .all(|(cmd, args, _)| { cmd != "mkdir" || args != &["-p", "/run/user/1000-removed/flotilla/credentials/claude-max/claude"] }));
+    }
+
+    #[tokio::test]
+    async fn user_runtime_dir_is_rechecked_for_each_claude_oauth_preflight() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
+        let env = Arc::new(TestEnv(BTreeMap::from([
+            ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
+            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
+        ])));
+        let runner = Arc::new(RecordingRunner::with_runtime_dir_checks([true, false]));
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+        let credential_refs = BTreeSet::from(["claude-max".to_string()]);
+
+        store.prepare("env-a", &credential_refs, runner.clone()).await.expect("first preflight");
+        store.prepare("env-b", &credential_refs, runner.clone()).await.expect("second preflight");
+
+        let calls = runner.calls.lock().expect("calls lock");
+        assert!(calls
+            .iter()
+            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/run/user/1000/flotilla/credentials/claude-max/claude"]));
         assert!(calls
             .iter()
             .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude"]));

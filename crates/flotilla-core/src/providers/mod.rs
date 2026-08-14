@@ -13,7 +13,7 @@ pub mod terminal;
 pub mod types;
 pub mod vcs;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -264,6 +264,32 @@ pub trait CommandRunner: Send + Sync {
     async fn path_exists(&self, path: &Path) -> Result<bool, String> {
         let path = path.to_string_lossy();
         self.run_output("test", &["-e", &path], Path::new("/"), &ChannelLabel::Noop).await.map(|output| output.success)
+    }
+
+    /// Choose a Flotilla-owned writable scratch base in this runner's
+    /// filesystem world.
+    ///
+    /// Direct runners use the host's preferred runtime directory when it is
+    /// still usable, then fall back to the daemon-owned state directory.
+    /// Runners that cross into another filesystem namespace must override
+    /// this method and choose a path owned by that environment instead.
+    async fn writable_scratch_base(&self, preferred: Option<&Path>, fallback: &Path) -> Result<PathBuf, String> {
+        if let Some(preferred) = preferred {
+            let preferred_arg = preferred.to_string_lossy();
+            let output = self
+                .run_output(
+                    "sh",
+                    &["-c", "test -d \"$1\" && test -w \"$1\"", "flotilla-xdg-runtime-dir", &preferred_arg],
+                    Path::new("/"),
+                    &ChannelLabel::Noop,
+                )
+                .await;
+            if output.is_ok_and(|output| output.success) {
+                return Ok(preferred.join("flotilla"));
+            }
+            tracing::debug!(rejected_path = %preferred.display(), "preferred scratch directory is missing or unwritable; using fallback");
+        }
+        Ok(fallback.to_path_buf())
     }
 
     /// Ensure `path` exists with `content` if absent, returning the resulting
