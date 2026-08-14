@@ -38,13 +38,13 @@ use flotilla_protocol::{EnvironmentId, HostSummary, ImageId, NodeId, Rows, Termi
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, ChangeRequest, ChangeRequestStatus, Checkout,
     CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy, ConvoyReconciler, ConvoyTeardownRuntime,
-    CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment,
-    EnvironmentSpec, EnvironmentWaitReason, ForgeIdentity, Host, HostCondition, HostDirectEnvironmentSpec,
+    CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec,
+    Environment, EnvironmentSpec, EnvironmentWaitReason, ForgeIdentity, Host, HostCondition, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta,
     PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, Resource, ResourceBackend,
     ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
-    CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS,
+    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG,
+    CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS,
     SLEEP_INHIBITION_CONDITION_TYPE,
 };
 use serde_json::json;
@@ -1233,9 +1233,9 @@ async fn apply_host_heartbeat_with_credentials(
             "resource event log tripwire triggered",
         );
     }
-    let held_credentials = match credential_store {
-        Some(store) => store.held_credentials().await?,
-        None => BTreeSet::new(),
+    let (held_credentials, credential_expiry) = match credential_store {
+        Some(store) => (store.held_credentials().await?, store.credential_expiry().await),
+        None => (BTreeSet::new(), BTreeMap::new()),
     };
     let disk_free_bytes = daemon.admission_free_space_bytes().await?;
     let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
@@ -1258,7 +1258,7 @@ async fn apply_host_heartbeat_with_credentials(
         conditions.push(condition.clone());
     }
     let status = HostStatus {
-        capabilities: host_capabilities(&summary, profile, &held_credentials),
+        capabilities: host_capabilities(&summary, profile, &held_credentials, &credential_expiry),
         agent_adapter_baseline: Some(adapter_assessment.baseline),
         heartbeat_at: Some(Utc::now()),
         ready: conditions.is_empty(),
@@ -1422,10 +1422,12 @@ fn host_capabilities(
     _summary: &HostSummary,
     profile: &LocalProvisioningProfile,
     held_credentials: &BTreeSet<String>,
+    credential_expiry: &BTreeMap<String, CredentialExpiry>,
 ) -> BTreeMap<String, serde_json::Value> {
     BTreeMap::from([
         (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
         (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(held_credentials)),
+        (CREDENTIAL_EXPIRY_CAPABILITY.to_string(), json!(credential_expiry)),
         ("docker".to_string(), json!(profile.docker_available)),
         ("terminal_pools".to_string(), json!(profile.available_pools)),
     ])
@@ -5689,6 +5691,89 @@ mod tests {
             available_agent_adapters: BTreeSet::new(),
             docker_available,
         }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_publishes_ambient_claude_expiry_metadata_without_material() {
+        let temp = TempDir::new().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).expect("create claude dir");
+        std::fs::write(
+            home.join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-material","refreshToken":"sk-ant-ort01-material","expiresAt":1753000000000,"refreshTokenExpiresAt":1753900000000}}"#,
+        )
+        .expect("write ambient credentials");
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+        let host_id = daemon.local_host_id().expect("local host id").to_string();
+        let credential_store = CredentialStore::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("HOME", home.display().to_string())])),
+            EnvironmentBag::new(),
+            Arc::new(ProcessCommandRunner),
+            config.state_dir().as_path().to_path_buf(),
+        );
+
+        apply_host_heartbeat_with_credentials(
+            &daemon,
+            NAMESPACE,
+            &manual_profile(&host_id, false),
+            Some(&credential_store),
+            &test_health_identity(),
+            &RuntimeHealth::default(),
+        )
+        .await
+        .expect("publish heartbeat");
+
+        let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(&host_id).await.expect("host resource");
+        let status = host.status.expect("host status");
+        let expiry = status.credential_expiry().expect("decode credential expiry capability");
+        let ambient = expiry.get(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE).expect("ambient claude entry");
+        assert_eq!(ambient.expires_at, chrono::DateTime::from_timestamp_millis(1_753_000_000_000));
+        assert_eq!(ambient.refresh_expires_at, chrono::DateTime::from_timestamp_millis(1_753_900_000_000));
+        let encoded = serde_json::to_string(&status).expect("serialize host status");
+        assert!(!encoded.contains("sk-ant"), "credential material leaked into host status: {encoded}");
+    }
+
+    #[tokio::test]
+    async fn fleet_health_surfaces_an_expired_ambient_claude_login_without_any_crew_dispatched() {
+        let temp = TempDir::new().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).expect("create claude dir");
+        std::fs::write(
+            home.join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-material","expiresAt":1577836800000,"refreshTokenExpiresAt":1580515200000}}"#,
+        )
+        .expect("write expired ambient credentials");
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+        let host_id = daemon.local_host_id().expect("local host id").to_string();
+        let credential_store = CredentialStore::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("HOME", home.display().to_string())])),
+            EnvironmentBag::new(),
+            Arc::new(ProcessCommandRunner),
+            config.state_dir().as_path().to_path_buf(),
+        );
+        apply_host_heartbeat_with_credentials(
+            &daemon,
+            NAMESPACE,
+            &manual_profile(&host_id, false),
+            Some(&credential_store),
+            &test_health_identity(),
+            &RuntimeHealth::default(),
+        )
+        .await
+        .expect("publish heartbeat");
+
+        let health = daemon.fleet_health_internal().await.expect("fleet health");
+        let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
+        assert_eq!(local.credential_attention, vec![flotilla_protocol::CredentialAttention {
+            severity: flotilla_protocol::CredentialAttentionSeverity::Expired,
+            message: "ambient claude login expired on 2020-02-01".to_string(),
+        }]);
     }
 
     #[tokio::test]

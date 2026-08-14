@@ -195,6 +195,10 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
             if !host.degraded_conditions.is_empty() {
                 diagnoses.push(format!("⚠ DEGRADED: {}", host.degraded_conditions.join("; ")));
             }
+            if !host.credential_attention.is_empty() {
+                let details = host.credential_attention.iter().map(|attention| attention.message.as_str()).collect::<Vec<_>>().join("; ");
+                diagnoses.push(format!("⚠ CREDENTIALS: {details}"));
+            }
             if matches!(&host.sleep_inhibition, flotilla_protocol::SleepInhibitionHealth::Failed { .. }) {
                 diagnoses.push("⚠ SLEEP INHIBITION FAILED".to_string());
             }

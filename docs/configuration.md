@@ -119,6 +119,21 @@ measurement from silently disabling admission.
 Set the floor to `0` only when an external system provides an equivalent
 capacity guard.
 
+## Credential health
+
+Each daemon's heartbeat probes expiry metadata for held credential material
+(the ambient claude login today; declared credentials as adapters learn to
+express expiry) and publishes it on the Host resource — timestamps and scope
+names only, never material. Expired material refuses dependent dispatch at
+admission; expired *and* near-expiry material surfaces in `flotilla host list`
+and the TUI fleet health pane. Override the near-expiry warning window
+(default 7 days) per host in that host's `~/.config/flotilla/daemon.toml`:
+
+```toml
+[credentials]
+warning_window_days = 14
+```
+
 ## Daemon logging
 
 Each daemon writes structured JSON-lines to

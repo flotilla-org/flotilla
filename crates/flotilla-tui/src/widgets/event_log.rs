@@ -2,7 +2,9 @@ use std::{any::Any, collections::HashMap};
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{FleetHostRow, FleetHostStaleness, FleetObservationAgreement, PeerConnectionState, SleepInhibitionHealth};
+use flotilla_protocol::{
+    CredentialAttentionSeverity, FleetHostRow, FleetHostStaleness, FleetObservationAgreement, PeerConnectionState, SleepInhibitionHealth,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
@@ -390,14 +392,18 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
         let degraded = !host.degraded_conditions.is_empty();
         let disagreement = host.observation_agreement == FleetObservationAgreement::Disagree;
         let inhibition_failed = matches!(host.sleep_inhibition, SleepInhibitionHealth::Failed { .. });
-        let icon = if degraded || disagreement || inhibition_failed {
+        let credential_alert = host
+            .credential_attention
+            .iter()
+            .any(|attention| matches!(attention.severity, CredentialAttentionSeverity::Expired | CredentialAttentionSeverity::Unreadable));
+        let icon = if degraded || disagreement || inhibition_failed || credential_alert {
             "⚠"
         } else if host.staleness == FleetHostStaleness::Current {
             "●"
         } else {
             "○"
         };
-        let style = if degraded || disagreement || inhibition_failed {
+        let style = if degraded || disagreement || inhibition_failed || credential_alert {
             Style::default().fg(theme.warning)
         } else if host.staleness == FleetHostStaleness::Current {
             Style::default().fg(theme.status_ok)
@@ -436,6 +442,15 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
             SleepInhibitionHealth::Acquiring { .. } => "acquiring",
             SleepInhibitionHealth::Failed { .. } => "FAILED",
         };
+        let credentials = if host.credential_attention.iter().any(|attention| attention.severity == CredentialAttentionSeverity::Expired) {
+            "EXPIRED"
+        } else if host.credential_attention.iter().any(|attention| attention.severity == CredentialAttentionSeverity::Unreadable) {
+            "unreadable"
+        } else if host.credential_attention.is_empty() {
+            "-"
+        } else {
+            "expiring"
+        };
         Row::new(vec![
             Cell::from(Span::styled(icon, style)),
             Cell::from(name),
@@ -446,6 +461,7 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
             Cell::from(format!("{}/{}", host.crew_count, host.convoy_count)),
             Cell::from(disk),
             Cell::from(sleep),
+            Cell::from(credentials),
             Cell::from(stale),
         ])
     });
@@ -460,10 +476,22 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
         Constraint::Length(9),
         Constraint::Length(10),
         Constraint::Length(8),
+        Constraint::Length(8),
     ];
-    let header =
-        Row::new(["", "Host", "Daemon v/gen/up", "Link", "Heartbeat", "Replica sync/gen", "Crew/Conv", "Disk", "Sleep", "Staleness"])
-            .style(theme.header_style());
+    let header = Row::new([
+        "",
+        "Host",
+        "Daemon v/gen/up",
+        "Link",
+        "Heartbeat",
+        "Replica sync/gen",
+        "Crew/Conv",
+        "Disk",
+        "Sleep",
+        "Creds",
+        "Staleness",
+    ])
+    .style(theme.header_style());
     let table = Table::new(rows, widths).header(header).block(Block::bordered().style(theme.block_style()).title(" Fleet Health "));
     frame.render_widget(table, area);
 }

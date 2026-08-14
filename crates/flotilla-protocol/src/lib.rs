@@ -127,11 +127,12 @@ pub use provider_data::{
     WorkingTreeStatus, Workspace,
 };
 pub use query::{
-    CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DiscoveryEntry, DispatchQueueResponse, DispatchQueueRow,
-    FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement,
-    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse,
-    PeerReconnectStatus, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderHealthMap, ProviderInfo,
-    RepoProvidersResponse, RepoSummary, SleepInhibitionHealth, StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
+    CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DiscoveryEntry,
+    DispatchQueueResponse, DispatchQueueRow, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow,
+    FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListEntry, HostListResponse,
+    HostProvidersResponse, HostStatusResponse, PeerReconnectStatus, ProjectListEntry, ProjectListRepository, ProjectListResponse,
+    ProviderHealthMap, ProviderInfo, RepoProvidersResponse, RepoSummary, SleepInhibitionHealth, StatusResponse, TopologyResponse,
+    TopologyRoute, UnmetRequirementInfo,
 };
 pub use repository::{RepositoryRelation, RepositoryUpstream};
 pub use resource_ref::ResourceRef;

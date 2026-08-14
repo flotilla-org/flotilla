@@ -358,6 +358,8 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub admission: AdmissionConfig,
     #[serde(default)]
+    pub credentials: CredentialHealthConfig,
+    #[serde(default)]
     pub logging: DaemonLoggingConfig,
     #[serde(default)]
     pub environments: BTreeMap<String, StaticEnvironmentConfig>,
@@ -412,6 +414,25 @@ impl Default for AdmissionConfig {
     fn default() -> Self {
         Self { free_space_floor_gib: default_free_space_floor_gib() }
     }
+}
+
+/// Host-local credential health settings.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CredentialHealthConfig {
+    /// Days before expiry at which held credential material surfaces as
+    /// near-expiry in `flotilla host list` and TUI attention.
+    #[serde(default = "default_credential_warning_window_days")]
+    pub warning_window_days: u32,
+}
+
+impl Default for CredentialHealthConfig {
+    fn default() -> Self {
+        Self { warning_window_days: default_credential_warning_window_days() }
+    }
+}
+
+const fn default_credential_warning_window_days() -> u32 {
+    7
 }
 
 const fn default_free_space_floor_gib() -> u64 {

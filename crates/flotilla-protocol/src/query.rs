@@ -268,6 +268,28 @@ pub struct FleetHostRow {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded_conditions: Vec<String>,
+    /// Expired or near-expiry credential material on this host, one entry per
+    /// affected scope ("ambient claude login expired on 2026-07-30").
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_attention: Vec<CredentialAttention>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialAttention {
+    pub severity: CredentialAttentionSeverity,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialAttentionSeverity {
+    /// Material is past its effective expiry; dependent dispatch is refused.
+    Expired,
+    /// Material expires within the host's warning window.
+    Expiring,
+    /// The published expiry capability could not be decoded.
+    Unreadable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

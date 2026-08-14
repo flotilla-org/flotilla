@@ -5,13 +5,14 @@ use std::{
     sync::Arc,
 };
 
+use chrono::{DateTime, Utc};
 use flotilla_core::providers::{
     discovery::{EnvVars, EnvironmentBag},
     ChannelLabel, CommandRunner, HttpClient, ReqwestHttpClient,
 };
 use flotilla_resources::{
-    CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Repository, RepositoryKey,
-    ResourceBackend, ResourceError,
+    CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Repository,
+    RepositoryKey, ResourceBackend, ResourceError, AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,23 @@ struct GithubAppTokenRequest {
 #[derive(Deserialize)]
 struct GithubAppTokenResponse {
     token: String,
+}
+
+/// Metadata-only view of the ambient claude credentials file. Deliberately
+/// captures nothing but expiry timestamps — the token fields never
+/// deserialize into daemon memory.
+#[derive(Deserialize)]
+struct AmbientClaudeCredentialsMetadata {
+    #[serde(rename = "claudeAiOauth")]
+    claude_ai_oauth: Option<AmbientClaudeOauthMetadata>,
+}
+
+#[derive(Deserialize)]
+struct AmbientClaudeOauthMetadata {
+    #[serde(rename = "expiresAt")]
+    expires_at: Option<i64>,
+    #[serde(rename = "refreshTokenExpiresAt")]
+    refresh_token_expires_at: Option<i64>,
 }
 
 pub(crate) struct CredentialStore {
@@ -188,6 +206,41 @@ impl CredentialStore {
             }
         }
         Ok(held)
+    }
+
+    /// Expiry metadata for held material, keyed by scope name. Timestamps
+    /// only — material is never read into the result. Declared
+    /// `CredentialSpec`s contribute here once an adapter can express expiry
+    /// without touching material; today none of the declared sources carry
+    /// such metadata, so the map holds only the ambient claude login.
+    pub(crate) async fn credential_expiry(&self) -> BTreeMap<String, CredentialExpiry> {
+        let mut expiry = BTreeMap::new();
+        if let Some(ambient) = self.ambient_claude_expiry().await {
+            expiry.insert(AMBIENT_CLAUDE_CREDENTIAL_SCOPE.to_string(), ambient);
+        }
+        expiry
+    }
+
+    async fn ambient_claude_expiry(&self) -> Option<CredentialExpiry> {
+        let path = match self.env.get("CLAUDE_CONFIG_DIR").filter(|dir| !dir.trim().is_empty()) {
+            Some(dir) => PathBuf::from(dir).join(".credentials.json"),
+            None => self.expand_path("~/.claude/.credentials.json"),
+        };
+        let contents = tokio::fs::read(&path).await.ok()?;
+        let metadata: AmbientClaudeCredentialsMetadata = match serde_json::from_slice(&contents) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::debug!(path = %path.display(), line = error.line(), "ambient claude credentials file is not readable as JSON");
+                return None;
+            }
+        };
+        let oauth = metadata.claude_ai_oauth?;
+        let expires_at = oauth.expires_at.and_then(epoch_to_datetime);
+        let refresh_expires_at = oauth.refresh_token_expires_at.and_then(epoch_to_datetime);
+        if expires_at.is_none() && refresh_expires_at.is_none() {
+            return None;
+        }
+        Some(CredentialExpiry::builder().maybe_expires_at(expires_at).maybe_refresh_expires_at(refresh_expires_at).build())
     }
 
     #[cfg(test)]
@@ -841,6 +894,17 @@ async fn remove_registry_config(path: &Path) -> Result<(), std::io::Error> {
     }
 }
 
+/// The claude CLI writes millisecond epochs; treat implausibly-large
+/// second values as milliseconds so either unit decodes to the same instant.
+fn epoch_to_datetime(value: i64) -> Option<DateTime<Utc>> {
+    const MILLISECOND_THRESHOLD: i64 = 100_000_000_000;
+    if value.abs() >= MILLISECOND_THRESHOLD {
+        DateTime::from_timestamp_millis(value)
+    } else {
+        DateTime::from_timestamp(value, 0)
+    }
+}
+
 fn sanitize_curl_config(value: &str) -> String {
     value.replace(['\\', '"', '\r', '\n'], "")
 }
@@ -955,6 +1019,71 @@ mod tests {
     fn registry_matching_does_not_confuse_prefixes() {
         assert!(image_registry_matches("forgejo.lab/org/image:tag", "forgejo.lab"));
         assert!(!image_registry_matches("forgejo.lab.evil/org/image:tag", "forgejo.lab"));
+    }
+
+    fn store_with_env(env: BTreeMap<String, String>) -> CredentialStore {
+        CredentialStore::new(
+            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
+            "flotilla",
+            Arc::new(TestEnv(env)),
+            EnvironmentBag::new(),
+            Arc::new(RecordingRunner::default()),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        )
+    }
+
+    #[tokio::test]
+    async fn ambient_claude_expiry_probe_reports_timestamps_and_never_material() {
+        let home = tempfile::tempdir().expect("home dir");
+        let claude_dir = home.path().join(".claude");
+        tokio::fs::create_dir_all(&claude_dir).await.expect("create claude dir");
+        let expires_at_ms: i64 = 1_756_000_000_000;
+        let refresh_expires_at_secs: i64 = 1_753_000_000;
+        let credentials = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"sk-ant-oat01-material","refreshToken":"sk-ant-ort01-material","expiresAt":{expires_at_ms},"refreshTokenExpiresAt":{refresh_expires_at_secs},"scopes":["user:inference"],"subscriptionType":"max"}}}}"#
+        );
+        tokio::fs::write(claude_dir.join(".credentials.json"), &credentials).await.expect("write credentials file");
+        let store = store_with_env(BTreeMap::from([("HOME".to_string(), home.path().to_string_lossy().into_owned())]));
+
+        let expiry = store.credential_expiry().await;
+
+        let ambient = expiry.get(AMBIENT_CLAUDE_CREDENTIAL_SCOPE).expect("ambient claude entry");
+        assert_eq!(ambient.expires_at, DateTime::from_timestamp_millis(expires_at_ms));
+        assert_eq!(ambient.refresh_expires_at, DateTime::from_timestamp(refresh_expires_at_secs, 0));
+        let encoded = serde_json::to_string(&expiry).expect("serialize expiry map");
+        assert!(!encoded.contains("material") && !encoded.contains("sk-ant"), "material leaked into expiry metadata: {encoded}");
+    }
+
+    #[tokio::test]
+    async fn ambient_claude_expiry_probe_prefers_the_configured_claude_dir() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        tokio::fs::write(config_dir.path().join(".credentials.json"), r#"{"claudeAiOauth":{"expiresAt":1756000000000}}"#)
+            .await
+            .expect("write credentials file");
+        let store = store_with_env(BTreeMap::from([("CLAUDE_CONFIG_DIR".to_string(), config_dir.path().to_string_lossy().into_owned())]));
+
+        let expiry = store.credential_expiry().await;
+
+        let ambient = expiry.get(AMBIENT_CLAUDE_CREDENTIAL_SCOPE).expect("ambient claude entry");
+        assert_eq!(ambient.expires_at, DateTime::from_timestamp_millis(1_756_000_000_000));
+        assert_eq!(ambient.refresh_expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn ambient_claude_expiry_probe_is_silent_without_a_login_or_metadata() {
+        let home = tempfile::tempdir().expect("home dir");
+        let store = store_with_env(BTreeMap::from([("HOME".to_string(), home.path().to_string_lossy().into_owned())]));
+        assert_eq!(store.credential_expiry().await, BTreeMap::new());
+
+        let claude_dir = home.path().join(".claude");
+        tokio::fs::create_dir_all(&claude_dir).await.expect("create claude dir");
+        tokio::fs::write(claude_dir.join(".credentials.json"), r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-material"}}"#)
+            .await
+            .expect("write credentials file");
+        assert_eq!(store.credential_expiry().await, BTreeMap::new());
+
+        tokio::fs::write(claude_dir.join(".credentials.json"), "not json").await.expect("write malformed file");
+        assert_eq!(store.credential_expiry().await, BTreeMap::new());
     }
 
     #[tokio::test]
