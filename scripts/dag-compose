@@ -40,6 +40,18 @@ def node_id(reference: str) -> str:
     return reference.rsplit("#", 1)[-1]
 
 
+def repository(reference: str) -> str | None:
+    return reference.rsplit("#", 1)[0] if "#" in reference else None
+
+
+def board_node_id(reference: str, board_repository: str) -> str:
+    identifier = node_id(reference)
+    if repository(reference) in {None, board_repository}:
+        return identifier
+    qualified = re.sub(r"[^A-Za-z0-9_]", "_", str(repository(reference)))
+    return f"{qualified}__{identifier}"
+
+
 def fact_suffix(ticket: dict[str, Any]) -> list[str]:
     lines = []
     for pull_request in ticket.get("pullRequests") or []:
@@ -79,11 +91,13 @@ def compose_data(generated: dict[str, Any], authored: dict[str, Any]) -> dict[st
     authored_tickets = authored.get("tickets") or {}
     generated_tickets = {ticket["ref"]: ticket for ticket in generated.get("tickets") or []}
     curated_refs = set(authored_tickets)
+    board_repository = authored.get("repo", "flotilla-org/flotilla")
+    identifiers = {reference: board_node_id(reference, board_repository) for reference in curated_refs}
 
     tickets = []
     for reference, annotation in authored_tickets.items():
         generated_ticket = generated_tickets.get(reference)
-        identifier = node_id(reference)
+        identifier = identifiers[reference]
         ticket = {
             "id": identifier,
             "status": ticket_status(annotation, generated_ticket),
@@ -92,12 +106,19 @@ def compose_data(generated: dict[str, Any], authored: dict[str, Any]) -> dict[st
         }
         if annotation.get("shape"):
             ticket["shape"] = annotation["shape"]
-        if not identifier.isdigit():
+        external = repository(reference) not in {None, board_repository} or not identifier.isdigit()
+        if external:
             ticket["external"] = True
 
         title = annotation.get("title")
         if not title and generated_ticket:
-            title = f"#{identifier} {html.escape(str(generated_ticket.get('title') or ''))}".rstrip()
+            generated_title = html.escape(str(generated_ticket.get("title") or ""))
+            if repository(reference) not in {None, board_repository}:
+                url = html.escape(str(generated_ticket.get("url") or ""), quote=True)
+                label = html.escape(f"{repository(reference)} issue {node_id(reference)}")
+                title = f'<a href="{url}">{label}</a> {generated_title}'.rstrip()
+            else:
+                title = f"#{identifier} {generated_title}".rstrip()
         if title:
             ticket["card"] = {
                 "title": title,
@@ -109,7 +130,13 @@ def compose_data(generated: dict[str, Any], authored: dict[str, Any]) -> dict[st
     seen_edges = set()
 
     def add_edge(edge: dict[str, Any]) -> None:
-        normalized = {**edge, "from": node_id(str(edge["from"])), "to": node_id(str(edge["to"]))}
+        source = str(edge["from"])
+        target = str(edge["to"])
+        normalized = {
+            **edge,
+            "from": identifiers.get(source, board_node_id(source, board_repository)),
+            "to": identifiers.get(target, board_node_id(target, board_repository)),
+        }
         identity = json.dumps(normalized, sort_keys=True, ensure_ascii=False)
         if identity not in seen_edges:
             seen_edges.add(identity)
@@ -132,7 +159,7 @@ def compose_data(generated: dict[str, Any], authored: dict[str, Any]) -> dict[st
     as_of = generated.get("asOf")
 
     return {
-        "repo": authored.get("repo", "flotilla-org/flotilla"),
+        "repo": board_repository,
         "snapshot": str(as_of)[:10] if as_of else "unknown",
         "pulse": authored.get("pulse", ""),
         "groups": groups,

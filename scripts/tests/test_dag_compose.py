@@ -66,10 +66,20 @@ class DagComposeTest(unittest.TestCase):
                             "pullRequests": [],
                             "convoys": [],
                         },
+                        {
+                            "ref": "flotilla-org/andamento#10",
+                            "number": 10,
+                            "title": "Same number, other repository",
+                            "url": "https://github.com/flotilla-org/andamento/issues/10",
+                            "status": "ready",
+                            "pullRequests": [],
+                            "convoys": [],
+                        },
                     ],
                     "dependencyEdges": [
                         {"from": "flotilla-org/flotilla#10", "to": "flotilla-org/flotilla#11"},
                         {"from": "flotilla-org/flotilla#99", "to": "flotilla-org/flotilla#12"},
+                        {"from": "flotilla-org/andamento#10", "to": "flotilla-org/flotilla#10"},
                     ],
                 }
             )
@@ -101,6 +111,11 @@ class DagComposeTest(unittest.TestCase):
                             "stage": "design",
                             "group": "track",
                             "dagLabel": "Twelve",
+                        },
+                        "flotilla-org/andamento#10": {
+                            "stage": "ready",
+                            "group": "track",
+                            "dagLabel": "Andamento ten",
                         },
                     },
                     "edges": [
@@ -148,7 +163,11 @@ class DagComposeTest(unittest.TestCase):
         self.assertEqual(board["notes"], ["An authored note"])
 
         tickets = {ticket["id"]: ticket for ticket in board["tickets"]}
-        self.assertEqual(set(tickets), {"10", "11", "12"}, "generated-only tickets are not curated into the board")
+        self.assertEqual(
+            set(tickets),
+            {"10", "11", "12", "flotilla_org_andamento__10"},
+            "generated-only tickets are not curated into the board",
+        )
         self.assertEqual(tickets["10"]["status"], "landed", "landed generated facts dominate authored stage")
         self.assertEqual(tickets["11"]["status"], "flight", "active generated facts dominate authored stage")
         self.assertEqual(tickets["12"]["status"], "design", "other generated states preserve authored judgment")
@@ -159,9 +178,13 @@ class DagComposeTest(unittest.TestCase):
         self.assertNotIn("#19", tickets["10"]["card"]["detail"], "only open PR facts are shown")
         self.assertIn("live-work · kiwi · Active", tickets["11"]["card"]["detail"])
         self.assertEqual(tickets["12"]["card"]["title"], "#12 Generated twelve")
+        andamento = tickets["flotilla_org_andamento__10"]
+        self.assertTrue(andamento["external"])
+        self.assertIn("https://github.com/flotilla-org/andamento/issues/10", andamento["card"]["title"])
 
         self.assertIn({"from": "12", "to": "10", "style": "dashed", "label": "informs"}, board["edges"])
         self.assertIn({"from": "10", "to": "11"}, board["edges"])
+        self.assertIn({"from": "flotilla_org_andamento__10", "to": "10"}, board["edges"])
         self.assertNotIn({"from": "99", "to": "12"}, board["edges"])
 
     def test_output_is_byte_stable(self):

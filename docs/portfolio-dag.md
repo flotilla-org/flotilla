@@ -59,6 +59,14 @@ The authored ticket map is keyed by the exact reference, for example:
 }
 ```
 
+Authored `title`, `detail`, `dagLabel`, and note values retain the trusted HTML
+from the hand-board (`<a>`, `<br>`, and `<b>` are used intentionally). Treat
+these as operator-authored presentation, not untrusted tracker text. The
+composer HTML-escapes all generated tracker and convoy facts before appending
+them. Tickets curated directly from another repository receive a qualified DAG
+node ID and use their generated per-ticket URL rather than the board-wide repo
+link.
+
 When editing a detail, keep `stage` as the operator's intended column and set
 `statusAtAuthoring` to the generated status visible at that moment (`landed`,
 `at-sea`, `ready`, or `blocked`). Do not update either during a mechanical
