@@ -2789,7 +2789,6 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     role: spec.role.clone(),
                     model: requirement.model.clone(),
                     brief: brief.clone(),
-                    cwd: cwd.clone(),
                     environment: credential_env.clone(),
                 })?;
                 let crew_id = uuid::Uuid::new_v4().to_string();
@@ -7136,13 +7135,12 @@ mod tests {
 
         let workspace = temp.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
-        let contained_config_dir = workspace.join(".flotilla/claude");
         let env_id = EnvironmentId::new("contained-claude");
         let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
             DiscoveryMockRunner::builder()
                 .tool_exists("claude", true)
                 .on_run("mkdir", &["-p", "/run/flotilla/credentials/claude-max/claude"], Ok(String::new()))
-                .on_run("mkdir", &["-p", &contained_config_dir.display().to_string()], Ok(String::new()))
+                .on_run("mkdir", &["-p", "/run/flotilla/claude"], Ok(String::new()))
                 .build(),
         ));
         let bag = EnvironmentBag::new()
@@ -7225,7 +7223,7 @@ mod tests {
             "the contained Claude process must receive its OAuth token"
         );
         assert!(
-            launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == &contained_config_dir.display().to_string()),
+            launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == "/run/flotilla/claude"),
             "the contained Claude process must receive the config directory owned by its adapter"
         );
     }
