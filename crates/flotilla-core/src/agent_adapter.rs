@@ -312,6 +312,8 @@ pub struct AgentLaunchRequest {
     pub role: String,
     pub model: Option<String>,
     pub brief: TerminalBrief,
+    pub cwd: ExecutionEnvironmentPath,
+    pub environment: TerminalEnvVars,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,7 +434,7 @@ enum AdapterFlavor {
     /// present. Managed sessions seed the first two into Claude's mutable state
     /// and carry the documented bypass-consent setting alongside Flotilla's
     /// hooks in the invocation-only `--settings` overlay.
-    ClaudeCode { state_config: Option<ClaudeStateConfig>, state_lock: Arc<Mutex<()>> },
+    ClaudeCode { state_config: Option<ClaudeStateConfig>, state_lock: Arc<Mutex<()>>, contained: bool },
     /// Codex gates on a persisted per-project trust level, so the workspace has
     /// to be marked trusted in its config before launch.
     Codex { trust_config: Option<CodexTrustConfig> },
@@ -507,10 +509,21 @@ impl AgentAdapter for CliAgentAdapter {
         environment: &TerminalEnvVars,
     ) -> Result<(), String> {
         match &self.flavor {
-            AdapterFlavor::ClaudeCode { state_config, state_lock } => {
-                let invocation_state = environment.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, config_dir)| {
-                    ClaudeStateConfig { path: PathBuf::from(config_dir).join(".claude.json"), lock: Arc::clone(state_lock) }
-                });
+            AdapterFlavor::ClaudeCode { state_config, state_lock, contained } => {
+                let invocation_state = if *contained {
+                    if !environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
+                        return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
+                    }
+                    let config_dir = cwd.as_path().join(".flotilla/claude");
+                    let config_dir_string = config_dir.display().to_string();
+                    self.runner.run("mkdir", &["-p", &config_dir_string], Path::new("/"), &ChannelLabel::Noop).await?;
+                    Some(ClaudeStateConfig { path: config_dir.join(".claude.json"), lock: Arc::clone(state_lock) })
+                } else {
+                    environment.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, config_dir)| ClaudeStateConfig {
+                        path: PathBuf::from(config_dir).join(".claude.json"),
+                        lock: Arc::clone(state_lock),
+                    })
+                };
                 if let Some(state_config) = invocation_state.as_ref().or(state_config.as_ref()) {
                     seed_claude_headless_state(&*self.runner, cwd.as_path(), state_config).await?;
                 }
@@ -532,6 +545,12 @@ impl AgentAdapter for CliAgentAdapter {
     }
 
     async fn cleanup(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String> {
+        if matches!(&self.flavor, AdapterFlavor::ClaudeCode { contained: true, .. }) {
+            let config_dir = cwd.as_path().join(".flotilla/claude");
+            let config_dir =
+                config_dir.to_str().ok_or_else(|| format!("contained Claude config path is not valid UTF-8: {}", config_dir.display()))?;
+            self.runner.run("rm", &["-rf", config_dir], Path::new("/"), &ChannelLabel::Noop).await?;
+        }
         remove_agent_files(&*self.runner, cwd.as_path(), brief, self.flavor.managed_files()).await
     }
 
@@ -545,7 +564,15 @@ impl AgentAdapter for CliAgentAdapter {
     }
 
     fn launch(&self, request: &AgentLaunchRequest) -> Result<AgentLaunchPlan, String> {
-        Ok(AgentLaunchPlan { command: self.command(request), env: Vec::new(), stance: TRUSTED_IMPLICIT_STANCE.into() })
+        let mut env = request.environment.clone();
+        if matches!(&self.flavor, AdapterFlavor::ClaudeCode { contained: true, .. }) {
+            if !env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
+                return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
+            }
+            env.retain(|(name, _)| name != "CLAUDE_CONFIG_DIR");
+            env.push(("CLAUDE_CONFIG_DIR".to_string(), request.cwd.as_path().join(".flotilla/claude").display().to_string()));
+        }
+        Ok(AgentLaunchPlan { command: self.command(request), env, stance: TRUSTED_IMPLICIT_STANCE.into() })
     }
 }
 
@@ -697,6 +724,7 @@ impl AgentAdapterRegistry {
                 flavor: AdapterFlavor::ClaudeCode {
                     state_config: state_path.map(|path| ClaudeStateConfig { path, lock: Arc::clone(&state_lock) }),
                     state_lock,
+                    contained: env.find_env_var("FLOTILLA_ENVIRONMENT_ID").is_some(),
                 },
             }));
         }
@@ -1188,8 +1216,15 @@ mod tests {
 
         let codex = registry.get("codex").expect("codex adapter");
         codex.prepare(&cwd, &brief).await.expect("prepare brief");
-        let plan =
-            codex.launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief: brief.clone() }).expect("codex launch plan");
+        let plan = codex
+            .launch(&AgentLaunchRequest {
+                role: "coder".into(),
+                model: None,
+                brief: brief.clone(),
+                cwd: cwd.clone(),
+                environment: Vec::new(),
+            })
+            .expect("codex launch plan");
         assert_eq!(
             plan.command,
             "/tools/codex --dangerously-bypass-approvals-and-sandbox 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
@@ -1199,7 +1234,13 @@ mod tests {
 
         let claude = registry.get("claude-code").expect("claude adapter");
         let plan = claude
-            .launch(&AgentLaunchRequest { role: "reviewer".into(), model: Some("opus".into()), brief: brief.clone() })
+            .launch(&AgentLaunchRequest {
+                role: "reviewer".into(),
+                model: Some("opus".into()),
+                brief: brief.clone(),
+                cwd: cwd.clone(),
+                environment: Vec::new(),
+            })
             .expect("claude launch plan");
         assert_eq!(
             plan.command,
@@ -1211,7 +1252,13 @@ mod tests {
         // the sink still shell-quotes so a hostile model can never splice
         // into the command line even if that boundary regressed.
         let plan = claude
-            .launch(&AgentLaunchRequest { role: "reviewer".into(), model: Some("opus; touch /tmp/pwned".into()), brief })
+            .launch(&AgentLaunchRequest {
+                role: "reviewer".into(),
+                model: Some("opus; touch /tmp/pwned".into()),
+                brief,
+                cwd,
+                environment: Vec::new(),
+            })
             .expect("claude launch plan");
         assert!(plan.command.contains("--model 'opus; touch /tmp/pwned'"));
     }
@@ -1226,7 +1273,13 @@ mod tests {
         let plan = registry
             .get("claude-code")
             .expect("claude adapter")
-            .launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief })
+            .launch(&AgentLaunchRequest {
+                role: "coder".into(),
+                model: None,
+                brief,
+                cwd: ExecutionEnvironmentPath::new("/workspace"),
+                environment: Vec::new(),
+            })
             .expect("launch plan");
 
         assert!(plan.command.starts_with("/x/y/claude "));
@@ -1237,10 +1290,10 @@ mod tests {
     async fn claude_prepare_writes_a_settings_overlay_the_launch_command_loads() {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
-        let claude_config = temp.path().join("claude-config");
         std::fs::create_dir_all(&workspace).expect("workspace");
-        std::fs::create_dir_all(&claude_config).expect("Claude config");
-        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
+        let env = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "contained-claude"))
+            .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
         let claude = registry.get("claude-code").expect("claude adapter");
         let brief =
@@ -1248,16 +1301,34 @@ mod tests {
 
         claude
             .prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &vec![(
-                "CLAUDE_CONFIG_DIR".to_string(),
-                claude_config.display().to_string(),
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "redacted-test-token".to_string(),
             )])
             .await
             .expect("prepare claude workspace");
 
         // The launch command names this path relatively, so it must resolve
         // against the session's working directory.
-        let plan = claude.launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief: brief.clone() }).expect("launch plan");
+        let plan = claude
+            .launch(&AgentLaunchRequest {
+                role: "coder".into(),
+                model: None,
+                brief: brief.clone(),
+                cwd: ExecutionEnvironmentPath::new(&workspace),
+                environment: vec![("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string())],
+            })
+            .expect("launch plan");
         assert!(plan.command.contains("--settings .flotilla/claude-settings.json"), "{}", plan.command);
+        assert!(
+            plan.env.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == "redacted-test-token"),
+            "the adapter launch plan must carry the granted token"
+        );
+        assert!(
+            plan.env
+                .iter()
+                .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == &workspace.join(".flotilla/claude").display().to_string()),
+            "the adapter launch plan must carry its contained config path"
+        );
 
         let settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(workspace.join(".flotilla/claude-settings.json")).expect("read settings"))
@@ -1266,9 +1337,10 @@ mod tests {
         assert_eq!(settings["hooks"]["Notification"][0]["matcher"], "permission_prompt");
         assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
 
-        let state: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(claude_config.join(".claude.json")).expect("read Claude state"))
-                .expect("parse Claude state");
+        let state: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(workspace.join(".flotilla/claude/.claude.json")).expect("read contained Claude state"),
+        )
+        .expect("parse Claude state");
         let canonical_workspace = workspace.canonicalize().expect("canonical workspace").display().to_string();
         assert_eq!(state["hasCompletedOnboarding"], true);
         assert_eq!(state["projects"][canonical_workspace]["hasTrustDialogAccepted"], true);

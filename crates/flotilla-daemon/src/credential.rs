@@ -167,9 +167,6 @@ impl CredentialStore {
             let spec = self.spec(name).await?;
             match spec.consumer {
                 CredentialConsumer::Codex if !environment.contains_key("CODEX_HOME") => fragments.push(codex_home_fragment(name)),
-                CredentialConsumer::ClaudeOauth { .. } if !environment.contains_key("CLAUDE_CONFIG_DIR") => {
-                    fragments.push(claude_config_dir_fragment(name))
-                }
                 _ => {}
             }
         }
@@ -679,18 +676,11 @@ impl CredentialStore {
             // Subscription OAuth material (a `claude setup-token` long-lived
             // token) is delivered per-process through `CLAUDE_CODE_OAUTH_TOKEN`
             // — no login transformation exists or is needed, and one mint
-            // serves N crews (ADR 0022 amendment). A per-credential
-            // `CLAUDE_CONFIG_DIR` slot is delivered alongside it even though
-            // the crew adapter's `--settings` overlay already isolates hooks:
-            // the overlay does not isolate the per-config-dir singleton
-            // supervisor (which captures its environment from the first shell
-            // that uses it, so a shared dir would serve crew A's dispatches
-            // with crew B's credentials), the mutable `.claude.json` blob
-            // (lost writes observed in practice), or an ambient `apiKeyHelper`
-            // whose precedence outranks `CLAUDE_CODE_OAUTH_TOKEN` and would
-            // silently override the delivered identity. The slot is keyed by
-            // credential name, so two claude accounts coexist the same way two
-            // codex homes do. See
+            // serves N crews (ADR 0022 amendment). The credential-specific
+            // config directory below isolates the
+            // preflight from ambient authentication, but is not delivered to
+            // the crew. The Claude AgentAdapter owns the contained invocation's
+            // mutable config path and exports it in the launch plan. See
             // docs/research/2026-07-28-multi-crew-agent-config-seeding.md.
             CredentialConsumer::ClaudeOauth { .. } => {
                 if !runner.exists("claude", &["--version"]).await {
@@ -746,7 +736,6 @@ impl CredentialStore {
                         })?;
                 }
                 env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), material.to_string());
-                env.insert("CLAUDE_CONFIG_DIR".to_string(), config_dir);
             }
             CredentialConsumer::Codex => {
                 let codex_home_fragment = codex_home_fragment(name);
@@ -1146,7 +1135,7 @@ interactions:
     }
 
     #[tokio::test]
-    async fn claude_oauth_material_is_delivered_as_env_token_with_an_isolated_config_dir() {
+    async fn claude_oauth_material_is_delivered_as_an_env_token_without_owning_agent_config() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
         let secret = "sk-ant-oat01-test-token-never-in-argv";
@@ -1156,12 +1145,10 @@ interactions:
         let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
         let credential_refs = BTreeSet::from(["claude-max".to_string()]);
 
-        assert_eq!(store.vessel_config_fragments(&credential_refs, &BTreeMap::new()).await.expect("Claude fragment").len(), 1);
-        assert!(store
-            .vessel_config_fragments(&credential_refs, &BTreeMap::from([("CLAUDE_CONFIG_DIR".to_string(), "/image/claude".to_string())]))
-            .await
-            .expect("explicit Claude config dir")
-            .is_empty());
+        assert!(
+            store.vessel_config_fragments(&credential_refs, &BTreeMap::new()).await.expect("Claude fragments").is_empty(),
+            "Claude config belongs to the agent adapter, not credential delivery"
+        );
 
         assert!(
             store.prepare("env-without-grant", &BTreeSet::new(), runner.clone()).await.expect("prepare without a grant").is_empty(),
@@ -1169,15 +1156,12 @@ interactions:
         );
         let delivered = store.prepare("env-a", &credential_refs, runner.clone()).await.expect("prepare claude-oauth credential");
 
-        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered.len(), 1);
         assert!(
             delivered.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == secret),
             "the OAuth token must be delivered under CLAUDE_CODE_OAUTH_TOKEN"
         );
-        assert!(
-            delivered.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == "/run/flotilla/credentials/claude-max/claude"),
-            "the isolated Claude config directory must be delivered"
-        );
+        assert!(delivered.iter().all(|(name, _)| name != "CLAUDE_CONFIG_DIR"));
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/run/flotilla/credentials/claude-max/claude"]));
         assert!(calls.iter().any(|(cmd, args, input)| {
@@ -1231,7 +1215,8 @@ interactions:
 
         assert_eq!(alice.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-alice".to_string()));
         assert_eq!(bob.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-bob".to_string()));
-        assert_ne!(alice.get("CLAUDE_CONFIG_DIR"), bob.get("CLAUDE_CONFIG_DIR"), "accounts must not share supervisor state");
+        assert!(!alice.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!bob.contains_key("CLAUDE_CONFIG_DIR"));
 
         let error = store
             .prepare("env-c", &BTreeSet::from(["claude-alice".to_string(), "claude-bob".to_string()]), runner.clone())
