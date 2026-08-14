@@ -722,7 +722,7 @@ impl CredentialStore {
                     // `apiKeyHelper`, since each of those outranks
                     // `CLAUDE_CODE_OAUTH_TOKEN` and would mask a dead token
                     // (the stored ambient login ranks below it, so it cannot).
-                    runner
+                    let probe = runner
                         .run_with_input(
                             "sh",
                             &[
@@ -749,7 +749,15 @@ impl CredentialStore {
                             } else {
                                 Err(format!("subscription token preflight failed: {error}"))
                             }
-                        })?;
+                        });
+                    // The scratch dir is only needed while the probe runs; the
+                    // persistent-base fallback would otherwise accumulate
+                    // whatever `claude -p` writes for the daemon's lifetime,
+                    // and removal guarantees the next probe starts empty.
+                    if let Err(error) = runner.run("rm", &["-rf", &config_dir], Path::new("/"), &ChannelLabel::Noop).await {
+                        tracing::warn!(credential = %name, %error, "failed to remove Claude OAuth preflight scratch directory");
+                    }
+                    probe?;
                 }
                 env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), material.to_string());
             }
@@ -1182,6 +1190,10 @@ interactions:
                 && args.iter().any(|arg| arg == "/tmp/flotilla-test-state/credentials/claude-max/claude")
                 && input == secret.as_bytes()
         }));
+        assert!(
+            calls.iter().any(|(cmd, args, _)| cmd == "rm" && args == &["-rf", "/tmp/flotilla-test-state/credentials/claude-max/claude"]),
+            "the preflight scratch directory must not outlive the probe"
+        );
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
     }
 
@@ -1210,6 +1222,26 @@ interactions:
             calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.starts_with("/run/flotilla")),
             "the preflight must never touch root-owned /run/flotilla on the host"
         );
+    }
+
+    #[tokio::test]
+    async fn a_blank_user_runtime_dir_falls_back_to_the_daemon_state_dir() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
+        let env = Arc::new(TestEnv(BTreeMap::from([
+            ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
+            ("XDG_RUNTIME_DIR".to_string(), "   ".to_string()),
+        ])));
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+
+        store.prepare("env-a", &BTreeSet::from(["claude-max".to_string()]), runner.clone()).await.expect("prepare claude-oauth credential");
+
+        let calls = runner.calls.lock().expect("calls lock");
+        assert!(calls
+            .iter()
+            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude"]));
     }
 
     #[tokio::test]
