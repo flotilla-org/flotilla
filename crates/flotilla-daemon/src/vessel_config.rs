@@ -1,7 +1,5 @@
 use std::{collections::BTreeMap, fmt};
 
-pub const AGENT_ENVIRONMENT_PATH: &str = "/run/flotilla/agent-environment";
-
 pub mod order {
     pub const FIRST: u16 = 0;
     pub const EARLY: u16 = 500;

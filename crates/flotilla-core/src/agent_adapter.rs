@@ -427,7 +427,6 @@ pub trait AgentAdapter: Send + Sync {
 /// relative to the session's working directory. It lives under `.flotilla/`
 /// alongside the brief so it inherits the same git exclusion and teardown.
 pub const CLAUDE_MANAGED_SETTINGS_PATH: &str = ".flotilla/claude-settings.json";
-const CONTAINED_CLAUDE_CONFIG_DIR: &str = "/run/flotilla/claude";
 
 struct CliAgentAdapter {
     binary: String,
@@ -505,14 +504,7 @@ impl CliAgentAdapter {
         let AdapterFlavor::ClaudeCode { contained, .. } = &self.flavor else {
             return None;
         };
-        let oauth_token = environment.iter().find(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN").map(|(_, value)| value.as_str());
-        if *contained {
-            return oauth_token.map(|_| PathBuf::from(CONTAINED_CLAUDE_CONFIG_DIR));
-        }
-        if let Some((_, config_dir)) = environment.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR") {
-            return Some(PathBuf::from(config_dir));
-        }
-        None
+        contained.then(|| environment.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, value)| PathBuf::from(value))).flatten()
     }
 }
 
@@ -536,6 +528,12 @@ impl AgentAdapter for CliAgentAdapter {
             AdapterFlavor::ClaudeCode { state_config, state_lock, contained } => {
                 if *contained && !environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
                     return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
+                }
+                if *contained
+                    && environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
+                    && !environment.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+                {
+                    return Err("Claude Code OAuth requires seam-resolved environment `CLAUDE_CONFIG_DIR`".to_string());
                 }
                 let invocation_state = if let Some(config_dir) = self.claude_invocation_config_dir(environment) {
                     let config_dir_string = config_dir.display().to_string();
@@ -584,9 +582,23 @@ impl AgentAdapter for CliAgentAdapter {
         {
             return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
         }
+        if matches!(&self.flavor, AdapterFlavor::ClaudeCode { contained: true, .. })
+            && env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
+            && !env.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+        {
+            return Err("Claude Code OAuth requires seam-resolved environment `CLAUDE_CONFIG_DIR`".to_string());
+        }
         if let Some(config_dir) = self.claude_invocation_config_dir(&env) {
             env.retain(|(name, _)| name != "CLAUDE_CONFIG_DIR");
             env.push(("CLAUDE_CONFIG_DIR".to_string(), config_dir.display().to_string()));
+        } else if matches!(&self.flavor, AdapterFlavor::ClaudeCode { contained: false, .. })
+            && env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
+        {
+            // Credential delivery supplies a private config directory for
+            // contained crews. Trusted crews deliberately retain the host's
+            // ambient settings, skills, and MCP configuration while the token
+            // alone replaces ambient authentication.
+            env.retain(|(name, _)| name != "CLAUDE_CONFIG_DIR");
         }
         Ok(AgentLaunchPlan { command: self.command(request), env, stance: TRUSTED_IMPLICIT_STANCE.into() })
     }
@@ -790,7 +802,6 @@ mod tests {
         agent_adapter::{
             append_convoy_work_context, build_crew_brief, build_crew_brief_with_options, AgentAdapterRegistry, AgentLaunchRequest,
             CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefRenderOptions, CrewBriefTemplateOverride, CrewBriefTemplateResolver,
-            CONTAINED_CLAUDE_CONFIG_DIR,
         },
         path_context::ExecutionEnvironmentPath,
         providers::{
@@ -1304,10 +1315,7 @@ mod tests {
         let brief =
             flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
 
-        let invocation_environment = vec![
-            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "delivered-token".to_string()),
-            ("CLAUDE_CONFIG_DIR".to_string(), claude_config.display().to_string()),
-        ];
+        let invocation_environment = vec![("CLAUDE_CONFIG_DIR".to_string(), claude_config.display().to_string())];
         claude
             .prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &invocation_environment)
             .await
@@ -1323,11 +1331,6 @@ mod tests {
             plan.env.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == &claude_config.display().to_string()),
             "the adapter launch plan must preserve explicit trusted config"
         );
-        assert!(
-            plan.env.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == "delivered-token"),
-            "the adapter launch plan must deliver OAuth separately from trusted config"
-        );
-
         let settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(workspace.join(".flotilla/claude-settings.json")).expect("read settings"))
                 .expect("parse settings");
@@ -1348,7 +1351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contained_claude_owns_ephemeral_config_without_accepting_a_config_input() {
+    async fn contained_claude_uses_the_seam_resolved_invocation_config() {
         let workspace = ExecutionEnvironmentPath::new("/workspace");
         let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok("/workspace\n".to_string()), Err("not a checkout".to_string())]));
         let env = EnvironmentBag::new()
@@ -1358,7 +1361,10 @@ mod tests {
         let claude = registry.get("claude-code").expect("Claude adapter");
         let brief =
             flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
-        let invocation_environment = vec![("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string())];
+        let invocation_environment = vec![
+            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string()),
+            ("CLAUDE_CONFIG_DIR".to_string(), "/home/crew/flotilla/credentials/claude-max/claude".to_string()),
+        ];
 
         claude.prepare_with_environment(&workspace, &brief, &invocation_environment).await.expect("prepare contained Claude");
         let plan = claude
@@ -1366,8 +1372,15 @@ mod tests {
             .expect("contained launch plan");
 
         assert!(plan.env.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == "redacted-test-token"));
-        assert!(plan.env.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == CONTAINED_CLAUDE_CONFIG_DIR));
-        assert!(runner.calls().iter().any(|(command, args)| command == "mkdir" && args == &["-p", CONTAINED_CLAUDE_CONFIG_DIR]));
+        assert!(plan
+            .env
+            .iter()
+            .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == "/home/crew/flotilla/credentials/claude-max/claude"));
+        assert!(runner
+            .calls()
+            .iter()
+            .any(|(command, args)| { command == "mkdir" && args == &["-p", "/home/crew/flotilla/credentials/claude-max/claude"] }));
+        assert!(runner.calls().iter().flat_map(|(_, args)| args).all(|arg| !arg.starts_with("/run/flotilla")));
     }
 
     #[tokio::test]
@@ -1440,7 +1453,10 @@ mod tests {
                 role: "coder".into(),
                 model: None,
                 brief,
-                environment: vec![("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "token-alice".to_string())],
+                environment: vec![
+                    ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "token-alice".to_string()),
+                    ("CLAUDE_CONFIG_DIR".to_string(), "/state/flotilla/credentials/alice/claude".to_string()),
+                ],
             })
             .expect("host-direct OAuth launch");
 

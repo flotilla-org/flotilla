@@ -60,7 +60,7 @@ use crate::{
     resource_manifest::ResourceManifestReconciler,
     sleep_inhibitor,
     supervisor::{supervise, ControllerSupervision, RestartBudgetExhausted},
-    vessel_config::{compose, ComposedFile, Fragment, TargetId, AGENT_ENVIRONMENT_PATH},
+    vessel_config::{compose, ComposedFile, Fragment, TargetId},
     Aggregator, AggregatorResolvers,
 };
 
@@ -81,6 +81,14 @@ fn compose_agent_environment(fragments: impl IntoIterator<Item = Fragment>) -> R
         return Ok(None);
     }
     compose(TargetId::AgentEnvironment, fragments).map(Some).map_err(|error| format!("compose shared agent environment: {error}"))
+}
+
+async fn stage_agent_environment(runner: &dyn CommandRunner, fallback: &Path, contents: &str) -> Result<PathBuf, String> {
+    let config_base =
+        runner.writable_config_base(None, fallback).await.map_err(|error| format!("resolve agent environment path: {error}"))?;
+    let path = config_base.join("agent-environment");
+    runner.write_file(&path, contents).await.map_err(|error| format!("stage composed agent environment: {error}"))?;
+    Ok(path)
 }
 
 struct DaemonConvoyTeardownRuntime {
@@ -1868,20 +1876,23 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .as_deref()
             .map(|registry| registry.fragments(&spec.required_agent_adapters, &spec.env))
             .unwrap_or_default();
-        let agent_environment = match compose_agent_environment(credential_config_fragments.into_iter().chain(agent_material_fragments)) {
-            Ok(composed) => composed,
-            Err(error) => {
-                return Err(discard_uncreated_environment(
-                    self.state.credential_store.as_deref(),
-                    self.state.agent_material.as_deref(),
-                    name,
-                    error,
-                )
-                .await
-                .into())
-            }
-        };
-        if let Some(composed) = &agent_environment {
+        let agent_environment_claims =
+            match compose_agent_environment(credential_config_fragments.iter().cloned().chain(agent_material_fragments.iter().cloned())) {
+                Ok(composed) => composed,
+                Err(error) => {
+                    return Err(discard_uncreated_environment(
+                        self.state.credential_store.as_deref(),
+                        self.state.agent_material.as_deref(),
+                        name,
+                        error,
+                    )
+                    .await
+                    .into())
+                }
+            };
+        let creation_agent_environment = compose_agent_environment(agent_material_fragments.iter().cloned())
+            .expect("agent material fragments already composed successfully with credential claims");
+        if let Some(composed) = &creation_agent_environment {
             for (name, value) in &composed.environment {
                 if !environment_variables.iter().any(|(existing, _)| existing == name) {
                     environment_variables.push((name.clone(), value.clone()));
@@ -1961,19 +1972,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             }
         };
         let image_ref = handle.image().as_str().to_string();
-        if let Some(composed) = &agent_environment {
-            if let Err(error) = handle.runner().write_file(Path::new(AGENT_ENVIRONMENT_PATH), &composed.contents).await {
-                return Err(discard_failed_environment(
-                    &handle,
-                    self.state.credential_store.as_deref(),
-                    self.state.agent_material.as_deref(),
-                    name,
-                    format!("stage composed agent environment: {error}"),
-                )
-                .await
-                .into());
-            }
-        }
+        drop(agent_environment_claims);
         let image_digest = match handle.image_digest() {
             Some(digest) => digest.to_string(),
             None => {
@@ -2006,6 +2005,41 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             )
             .await
             .into());
+        }
+        let resolved_credential_fragments = match &self.state.credential_store {
+            Some(store) => match store.vessel_config_fragments_for_runner(&credential_refs, &spec.env, &*handle.runner()).await {
+                Ok(fragments) => fragments,
+                Err(error) => {
+                    return Err(discard_failed_environment(
+                        &handle,
+                        self.state.credential_store.as_deref(),
+                        self.state.agent_material.as_deref(),
+                        name,
+                        error,
+                    )
+                    .await
+                    .into())
+                }
+            },
+            None => Vec::new(),
+        };
+        let resolved_agent_environment =
+            compose_agent_environment(resolved_credential_fragments.into_iter().chain(agent_material_fragments.iter().cloned()))
+                .expect("resolved fragments preserve the successfully checked agent environment claims");
+        if let Some(composed) = &resolved_agent_environment {
+            if let Err(error) =
+                stage_agent_environment(&*handle.runner(), self.state.config.state_dir().as_path(), &composed.contents).await
+            {
+                return Err(discard_failed_environment(
+                    &handle,
+                    self.state.credential_store.as_deref(),
+                    self.state.agent_material.as_deref(),
+                    name,
+                    error,
+                )
+                .await
+                .into());
+            }
         }
         for delivery in &material_deliveries {
             let args = delivery.preflight.args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -3118,7 +3152,10 @@ mod tests {
     #[tokio::test]
     async fn repeated_reclaim_refusal_with_changing_reason_raises_demand() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"reclaim-refusal-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         let daemon = InProcessDaemon::new(vec![], config, git_process_discovery(false), HostName::local()).await;
         let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
         let convoy = convoys
@@ -3186,7 +3223,10 @@ mod tests {
     #[tokio::test]
     async fn landed_convoy_reclaim_accepts_sanctioned_checkout_absence() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"landed-reclaim-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         let daemon = InProcessDaemon::new(vec![], config, git_process_discovery(false), HostName::local()).await;
         let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
         let created = convoys
@@ -3242,7 +3282,10 @@ mod tests {
     #[tokio::test]
     async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout_first() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"checkout-authority-collected-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         let daemon = InProcessDaemon::new(vec![], config, git_process_discovery(false), HostName::local()).await;
         let backend = daemon.resource_backend();
         let convoys = backend.clone().using::<Convoy>(NAMESPACE);
@@ -3341,7 +3384,10 @@ mod tests {
     #[tokio::test]
     async fn connected_peer_with_replicable_resources_and_zero_cursors_is_degraded() {
         let temp = TempDir::new().expect("tempdir");
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("feta")));
+        let config_base = temp.path().join("feta");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"feta-degraded-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         let feta = in_memory_daemon(Vec::new(), config).await;
         let kiwi_node = NodeId::new("kiwi-root");
         let kiwi = NodeInfo::new(kiwi_node.clone(), "kiwi");
@@ -3408,6 +3454,7 @@ mod tests {
     #[tokio::test]
     async fn field_ownership_violation_is_exposed_in_fleet_diagnosis() {
         let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"field-ownership-violation-test\"\n").expect("daemon config");
         let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
         let host_id = daemon.local_host_id().expect("local host id").to_string();
         let profile = manual_profile(&host_id, false);
@@ -3484,6 +3531,51 @@ mod tests {
     }
 
     struct CredentialInteriorRunner(DiscoveryMockRunner);
+
+    #[derive(Default)]
+    struct PersistentPathRecordingRunner {
+        writes: StdMutex<Vec<(PathBuf, String)>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for PersistentPathRecordingRunner {
+        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            Ok(String::new())
+        }
+
+        async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            true
+        }
+
+        async fn writable_config_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
+            Ok(PathBuf::from("/home/crew/flotilla"))
+        }
+
+        async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+            self.writes.lock().expect("writes lock").push((path.to_path_buf(), content.to_string()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_environment_is_staged_at_the_runner_writable_config_base() {
+        let runner = PersistentPathRecordingRunner::default();
+
+        let path = stage_agent_environment(&runner, Path::new("/host/state"), "export CODEX_HOME='/mounted/codex'\n")
+            .await
+            .expect("stage agent environment");
+
+        assert_eq!(path, Path::new("/home/crew/flotilla/agent-environment"));
+        assert_eq!(runner.writes.lock().expect("writes lock").as_slice(), &[(
+            PathBuf::from("/home/crew/flotilla/agent-environment"),
+            "export CODEX_HOME='/mounted/codex'\n".to_string()
+        )]);
+        assert!(!path.starts_with("/run/flotilla"));
+    }
 
     #[async_trait]
     impl CommandRunner for CredentialInteriorRunner {
@@ -5707,7 +5799,10 @@ mod tests {
             r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-material","refreshToken":"sk-ant-ort01-material","expiresAt":1753000000000,"refreshTokenExpiresAt":1753900000000}}"#,
         )
         .expect("write ambient credentials");
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        std::fs::create_dir_all(&config_base).expect("config directory");
+        std::fs::write(config_base.join("daemon.toml"), "machine_id = \"ambient-claude-expiry-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
         let host_id = daemon.local_host_id().expect("local host id").to_string();
         let credential_store = CredentialStore::new(
@@ -5750,7 +5845,10 @@ mod tests {
             r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-material","expiresAt":1577836800000,"refreshTokenExpiresAt":1580515200000}}"#,
         )
         .expect("write expired ambient credentials");
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        std::fs::create_dir_all(&config_base).expect("config directory");
+        std::fs::write(config_base.join("daemon.toml"), "machine_id = \"expired-ambient-claude-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
         let host_id = daemon.local_host_id().expect("local host id").to_string();
         let credential_store = CredentialStore::new(
@@ -5783,6 +5881,8 @@ mod tests {
     #[tokio::test]
     async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
         let temp = TempDir::new().expect("tempdir");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"daemon-restart-adapter-regression-test\"\n")
+            .expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(temp.path()));
         let daemon = in_memory_daemon(Vec::new(), config).await;
         let host_id = daemon.local_host_id().expect("local host id").to_string();
@@ -6030,7 +6130,10 @@ mod tests {
         let authority = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default()).with_local_root(authority_root.clone());
         let checkout_host =
             ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default()).with_local_root(checkout_root.clone());
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("authority-config")));
+        let authority_config_base = temp.path().join("authority-config");
+        fs::create_dir_all(&authority_config_base).expect("config directory");
+        fs::write(authority_config_base.join("daemon.toml"), "machine_id = \"checkout-authority-evidence-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(authority_config_base));
         let authority_daemon = daemon_with_backend(Vec::new(), config, authority.clone()).await;
         let repository_key = flotilla_resources::RepositoryKey("repo-a".to_string());
 
@@ -6189,6 +6292,8 @@ mod tests {
 
         async fn build(&self, _scenario: LivenessScenario) -> Result<Self::World, String> {
             let temp = TempDir::new().map_err(|error| error.to_string())?;
+            std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"lease-recovery-world-test\"\n")
+                .map_err(|error| error.to_string())?;
             let config = Arc::new(ConfigStore::with_base(temp.path()));
             let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
             let backend = daemon.resource_backend();
@@ -6370,6 +6475,7 @@ mod tests {
     #[tokio::test]
     async fn daemon_boot_quarantines_every_undecodable_replicated_kind_and_reports_them() {
         let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"boot-quarantine-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(temp.path()));
         let sqlite_path = config.state_dir().join("resources.sqlite");
         drop(SqliteBackend::open(&sqlite_path).expect("initialize sqlite store"));
@@ -6432,6 +6538,7 @@ mod tests {
     #[tokio::test]
     async fn daemon_reports_recent_abnormal_restart_frequency_in_fleet_health() {
         let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"abnormal-restart-frequency-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(temp.path()));
         let now = Utc::now();
         fs::write(
@@ -6775,6 +6882,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_task_updates_host_status_without_socket_server() {
         let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"heartbeat-no-socket-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(temp.path()));
         let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
         let host_id = daemon.local_host_id().expect("local host id").to_string();
@@ -6829,6 +6937,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_task_advances_connected_peer_host_status_after_restart() {
         let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"heartbeat-peer-restart-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(temp.path()));
         let daemon = in_memory_daemon(Vec::new(), config).await;
         let local_host_id = daemon.local_host_id().expect("local host id").to_string();
@@ -6896,6 +7005,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn adopted_checkout_reconciliation_task_runs_after_interval() {
         let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"adopted-checkout-reconciliation-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(temp.path()));
         let daemon = in_memory_daemon(Vec::new(), config).await;
         let durable = daemon.resource_backend().using::<ResourceCheckout>(NAMESPACE);
@@ -6948,7 +7058,10 @@ mod tests {
             TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
         let repo = git_repo.path().to_path_buf();
 
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"startup-registration-idempotent-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         config.save_repo(&ExecutionEnvironmentPath::new(&repo));
         let daemon = in_memory_daemon(vec![repo.clone()], Arc::clone(&config)).await;
         let host_id = daemon.local_host_id().expect("local host id").to_string();
@@ -7124,7 +7237,10 @@ mod tests {
         let git_repo = TestGitRepo::init(temp.path().join("repo-no-origin"));
         let repo = git_repo.path().to_path_buf();
 
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"startup-registration-no-origin-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         config.save_repo(&ExecutionEnvironmentPath::new(&repo));
         let daemon = in_memory_daemon(vec![repo.clone()], Arc::clone(&config)).await;
         let host_id = daemon.local_host_id().expect("local host id").to_string();
@@ -7143,7 +7259,10 @@ mod tests {
         );
 
         let temp2 = TempDir::new().expect("tempdir");
-        let config2 = Arc::new(ConfigStore::with_base(temp2.path().join("config")));
+        let config2_base = temp2.path().join("config");
+        fs::create_dir_all(&config2_base).expect("config directory");
+        fs::write(config2_base.join("daemon.toml"), "machine_id = \"startup-registration-no-origin-test-2\"\n").expect("daemon config");
+        let config2 = Arc::new(ConfigStore::with_base(config2_base));
         let daemon2 = in_memory_daemon(Vec::new(), Arc::clone(&config2)).await;
         let host_id2 = daemon2.local_host_id().expect("local host id").to_string();
         register_startup_resources(&daemon2, NAMESPACE, &manual_profile(&host_id2, true))
@@ -7163,7 +7282,10 @@ mod tests {
         let git_repo =
             TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
         let repo = git_repo.path().to_path_buf();
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"in-memory-stage4a-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         config.save_repo(&ExecutionEnvironmentPath::new(&repo));
         let daemon = in_memory_daemon(vec![repo.clone()], Arc::clone(&config)).await;
         run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo, CompletionAction::Retain).await;
@@ -7176,7 +7298,10 @@ mod tests {
         let git_repo =
             TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
         let repo = git_repo.path().to_path_buf();
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"sqlite-stage4a-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         config.save_repo(&ExecutionEnvironmentPath::new(&repo));
         let daemon = sqlite_daemon(vec![repo.clone()], Arc::clone(&config)).await;
         run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo, CompletionAction::Retain).await;
@@ -7189,7 +7314,10 @@ mod tests {
         let git_repo =
             TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
         let repo = git_repo.path().to_path_buf();
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"passing-teardown-gate-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         config.save_repo(&ExecutionEnvironmentPath::new(&repo));
         let daemon = daemon_with_backend_and_runner(
             vec![repo.clone()],
@@ -7228,12 +7356,13 @@ mod tests {
         // Credential preflight runs through the contained runner, so its
         // scratch directory must be inside the container user's writable
         // world rather than derived from daemon-host paths (#1508).
-        let preflight_config_dir = PathBuf::from("/home/crew/flotilla/credentials/claude-max/claude");
+        let preflight_config_dir = PathBuf::from("/home/crew/flotilla/credentials/claude-max/claude-preflight");
+        let crew_config_dir = PathBuf::from("/home/crew/flotilla/credentials/claude-max/claude");
         let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
             DiscoveryMockRunner::builder()
                 .tool_exists("claude", true)
                 .on_run("mkdir", &["-p", &preflight_config_dir.to_string_lossy()], Ok(String::new()))
-                .on_run("mkdir", &["-p", "/run/flotilla/claude"], Ok(String::new()))
+                .on_run("mkdir", &["-p", &crew_config_dir.to_string_lossy()], Ok(String::new()))
                 .build(),
         ));
         let bag = EnvironmentBag::new()
@@ -7316,7 +7445,10 @@ mod tests {
             "the contained Claude process must receive its OAuth token"
         );
         assert!(
-            launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == "/run/flotilla/claude"),
+            launch
+                .env_vars
+                .iter()
+                .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == crew_config_dir.to_str().expect("UTF-8 path")),
             "the contained Claude process must receive the config directory owned by its adapter"
         );
     }
@@ -8032,7 +8164,10 @@ mod tests {
         let git_repo =
             TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
         let repo = git_repo.path().to_path_buf();
-        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        let config_base = temp.path().join("config");
+        std::fs::create_dir_all(&config_base).expect("config directory");
+        std::fs::write(config_base.join("daemon.toml"), "machine_id = \"sqlite-adopted-checkout-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
         config.save_repo(&ExecutionEnvironmentPath::new(&repo));
         let daemon = sqlite_daemon(vec![repo.clone()], Arc::clone(&config)).await;
         let host_id = daemon.local_host_id().expect("local host id").to_string();

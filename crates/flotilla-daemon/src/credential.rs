@@ -21,8 +21,6 @@ use url::Url;
 
 use crate::vessel_config::{agent_environment_fragment, compose, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey};
 
-const GIT_CONFIG_PATH: &str = "/run/flotilla/credentials/gitconfig";
-
 #[derive(Serialize)]
 struct GithubAppJwtClaims {
     iat: i64,
@@ -82,6 +80,22 @@ struct GitCredentialContribution {
     preflight: Option<GitCredentialPreflight>,
 }
 
+struct CredentialDeliveryPaths {
+    base: PathBuf,
+    git_config: PathBuf,
+}
+
+impl CredentialDeliveryPaths {
+    fn new(base: PathBuf) -> Self {
+        let git_config = base.join("credentials/gitconfig");
+        Self { base, git_config }
+    }
+
+    fn credential_dir(&self, name: &str) -> PathBuf {
+        self.base.join("credentials").join(safe_component(name))
+    }
+}
+
 #[derive(bon::Builder)]
 struct PendingGitPreflight {
     credential_name: String,
@@ -97,7 +111,8 @@ enum GitCredentialPreflight {
 }
 
 impl GitCredentialPreflight {
-    async fn run(&self, runner: &dyn CommandRunner, material: &str) -> Result<(), String> {
+    async fn run(&self, runner: &dyn CommandRunner, material: &str, git_config_path: &Path) -> Result<(), String> {
+        let git_config_path = git_config_path.to_string_lossy();
         match self {
             Self::Gh => {
                 runner
@@ -107,7 +122,7 @@ impl GitCredentialPreflight {
                             "-c",
                             "IFS= read -r token; export GH_TOKEN=\"$token\" GIT_CONFIG_GLOBAL=\"$1\" GIT_TERMINAL_PROMPT=0; printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill >/dev/null",
                             "flotilla-gh-git-preflight",
-                            GIT_CONFIG_PATH,
+                            &git_config_path,
                         ],
                         Path::new("/"),
                         &ChannelLabel::Noop,
@@ -124,7 +139,7 @@ impl GitCredentialPreflight {
                         "-c",
                         "export GIT_CONFIG_GLOBAL=\"$1\" GIT_TERMINAL_PROMPT=0 FORGEJO_TOKEN_FILE=\"$2\" FORGEJO_USERNAME=\"$3\"; printf 'protocol=https\\nhost=%s\\n\\n' \"$4\" | git credential fill >/dev/null",
                         "flotilla-forgejo-git-preflight",
-                        GIT_CONFIG_PATH,
+                        &git_config_path,
                         token_file,
                         username,
                         host,
@@ -184,11 +199,36 @@ impl CredentialStore {
         for name in credential_refs {
             let spec = self.spec(name).await?;
             match spec.consumer {
-                CredentialConsumer::Codex if !environment.contains_key("CODEX_HOME") => fragments.push(codex_home_fragment(name)),
+                CredentialConsumer::Codex if !environment.contains_key("CODEX_HOME") => {
+                    fragments.push(codex_home_fragment(name, format!("credential-delivery-pending:{name}")))
+                }
                 _ => {}
             }
         }
         Ok(fragments)
+    }
+
+    pub(crate) async fn vessel_config_fragments_for_runner(
+        &self,
+        credential_refs: &BTreeSet<String>,
+        environment: &BTreeMap<String, String>,
+        runner: &dyn CommandRunner,
+    ) -> Result<Vec<Fragment>, String> {
+        let mut codex_credentials = Vec::new();
+        for name in credential_refs {
+            let spec = self.spec(name).await?;
+            if matches!(spec.consumer, CredentialConsumer::Codex) && !environment.contains_key("CODEX_HOME") {
+                codex_credentials.push(name);
+            }
+        }
+        if codex_credentials.is_empty() {
+            return Ok(Vec::new());
+        }
+        let paths = self.delivery_paths(runner).await?;
+        Ok(codex_credentials
+            .into_iter()
+            .map(|name| codex_home_fragment(name, paths.credential_dir(name).join("codex").to_string_lossy()))
+            .collect())
     }
 
     pub(crate) async fn held_credentials(&self) -> Result<BTreeSet<String>, String> {
@@ -282,6 +322,23 @@ impl CredentialStore {
                 ));
             }
         }
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let delivery_paths = if specs.iter().any(|(_, spec)| {
+            matches!(
+                spec.consumer,
+                CredentialConsumer::Gh
+                    | CredentialConsumer::GithubApp { .. }
+                    | CredentialConsumer::Forgejo { .. }
+                    | CredentialConsumer::ClaudeOauth { .. }
+                    | CredentialConsumer::Codex
+            )
+        }) {
+            Some(self.delivery_paths(&*runner).await?)
+        } else {
+            None
+        };
         let mut env = BTreeMap::new();
         let mut new_git_config_fragments = BTreeMap::new();
         let mut git_config_owner = None;
@@ -311,13 +368,14 @@ impl CredentialStore {
                 self.materials.lock().await.remove(&cache_key);
                 return Err(error);
             }
-            let delivered = match self.prepare_adapter(name, spec, material, Arc::clone(&runner), already_prepared).await {
-                Ok(delivered) => delivered,
-                Err(message) => {
-                    self.materials.lock().await.remove(&cache_key);
-                    return Err(bounded_adapter_error(name, spec.consumer.adapter_name(), &message.replace(material, "[redacted]")));
-                }
-            };
+            let delivered =
+                match self.prepare_adapter(name, spec, material, Arc::clone(&runner), already_prepared, delivery_paths.as_ref()).await {
+                    Ok(delivered) => delivered,
+                    Err(message) => {
+                        self.materials.lock().await.remove(&cache_key);
+                        return Err(bounded_adapter_error(name, spec.consumer.adapter_name(), &message.replace(material, "[redacted]")));
+                    }
+                };
             env.extend(delivered.env);
             if let Some(git_credential) = delivered.git_credential {
                 git_config_owner.get_or_insert_with(|| (name.clone(), spec.consumer.adapter_name().to_string(), cache_key.clone()));
@@ -344,15 +402,16 @@ impl CredentialStore {
                 Ok(gitconfig) => gitconfig,
                 Err(error) => return Err(format!("compose shared Git config: {error}")),
             };
-            if let Err(error) = runner.write_file(Path::new(GIT_CONFIG_PATH), &gitconfig.contents).await {
+            let delivery_paths = delivery_paths.as_ref().expect("Git credential adapters resolve delivery paths");
+            if let Err(error) = runner.write_file(&delivery_paths.git_config, &gitconfig.contents).await {
                 let (name, adapter, cache_key) = git_config_owner.expect("Git config fragments have an owner");
                 self.materials.lock().await.remove(&cache_key);
                 return Err(bounded_adapter_error(&name, &adapter, &format!("write shared Git config: {error}")));
             }
-            env.insert("GIT_CONFIG_GLOBAL".to_string(), GIT_CONFIG_PATH.to_string());
+            env.insert("GIT_CONFIG_GLOBAL".to_string(), delivery_paths.git_config.to_string_lossy().into_owned());
             env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
             for pending in pending_git_preflights {
-                if let Err(message) = pending.preflight.run(&*runner, &pending.material).await {
+                if let Err(message) = pending.preflight.run(&*runner, &pending.material, &delivery_paths.git_config).await {
                     self.materials.lock().await.remove(&pending.cache_key);
                     return Err(bounded_adapter_error(
                         &pending.credential_name,
@@ -622,7 +681,14 @@ impl CredentialStore {
         let runtime_dir =
             self.env.get("XDG_RUNTIME_DIR").map(|value| PathBuf::from(value.trim())).filter(|value| !value.as_os_str().is_empty());
         let base = runner.writable_scratch_base(runtime_dir.as_deref(), &self.state_dir).await?;
-        Ok(base.join("credentials").join(safe_component(credential_name)).join("claude").to_string_lossy().into_owned())
+        Ok(base.join("credentials").join(safe_component(credential_name)).join("claude-preflight").to_string_lossy().into_owned())
+    }
+
+    async fn delivery_paths(&self, runner: &dyn CommandRunner) -> Result<CredentialDeliveryPaths, String> {
+        let runtime_dir =
+            self.env.get("XDG_RUNTIME_DIR").map(|value| PathBuf::from(value.trim())).filter(|value| !value.as_os_str().is_empty());
+        let base = runner.writable_config_base(runtime_dir.as_deref(), &self.state_dir).await?;
+        Ok(CredentialDeliveryPaths::new(base))
     }
 
     async fn prepare_adapter(
@@ -632,6 +698,7 @@ impl CredentialStore {
         material: &str,
         runner: Arc<dyn CommandRunner>,
         already_prepared: bool,
+        delivery_paths: Option<&CredentialDeliveryPaths>,
     ) -> Result<AdapterDelivery, String> {
         let mut env = BTreeMap::new();
         let mut git_credential = None;
@@ -673,6 +740,7 @@ impl CredentialStore {
                 });
             }
             CredentialConsumer::Forgejo { api_url, username } => {
+                let delivery_paths = delivery_paths.expect("Forgejo adapter resolves delivery paths");
                 let server_url = api_url.trim_end_matches('/');
                 let parsed_url = Url::parse(server_url).map_err(|error| format!("invalid Forgejo server URL: {error}"))?;
                 if parsed_url.scheme() != "https" {
@@ -683,8 +751,9 @@ impl CredentialStore {
                     Some(port) => format!("https://{host}:{port}"),
                     None => format!("https://{host}"),
                 };
-                let path = format!("/run/flotilla/credentials/{}/token", safe_component(name));
-                let helper_path = format!("/run/flotilla/credentials/{}/git-credential-forgejo", safe_component(name));
+                let credential_dir = delivery_paths.credential_dir(name);
+                let path = credential_dir.join("token").to_string_lossy().into_owned();
+                let helper_path = credential_dir.join("git-credential-forgejo").to_string_lossy().into_owned();
                 if !already_prepared {
                     runner.write_file(Path::new(&path), material).await.map_err(|error| format!("write token file: {error}"))?;
                     runner
@@ -747,12 +816,14 @@ impl CredentialStore {
             // token) is delivered per-process through `CLAUDE_CODE_OAUTH_TOKEN`
             // — no login transformation exists or is needed, and one mint
             // serves N crews (ADR 0022 amendment). The credential-specific
-            // config directory below isolates the
-            // preflight from ambient authentication, but is not delivered to
-            // the crew. The Claude AgentAdapter owns the contained invocation's
-            // mutable config path and exports it in the launch plan. See
+            // preflight config directory isolates its probe from ambient
+            // authentication. Delivery also offers a credential-specific
+            // mutable config path for contained crews; the trusted Claude
+            // adapter removes that override so host settings, skills, and MCP
+            // configuration remain ambient. See
             // docs/research/2026-07-28-multi-crew-agent-config-seeding.md.
             CredentialConsumer::ClaudeOauth { .. } => {
+                let delivery_paths = delivery_paths.expect("Claude OAuth adapter resolves delivery paths");
                 if !runner.exists("claude", &["--version"]).await {
                     return Err("consumer binary is unavailable".to_string());
                 }
@@ -813,10 +884,14 @@ impl CredentialStore {
                     probe?;
                 }
                 env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), material.to_string());
+                env.insert(
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    delivery_paths.credential_dir(name).join("claude").to_string_lossy().into_owned(),
+                );
             }
             CredentialConsumer::Codex => {
-                let codex_home_fragment = codex_home_fragment(name);
-                let codex_home = codex_home_fragment.value;
+                let delivery_paths = delivery_paths.expect("Codex adapter resolves delivery paths");
+                let codex_home = delivery_paths.credential_dir(name).join("codex").to_string_lossy().into_owned();
                 if !already_prepared {
                     runner
                         .run("mkdir", &["-p", &codex_home], Path::new("/"), &ChannelLabel::Noop)
@@ -865,12 +940,8 @@ fn git_credential_fragment(credential_name: &str, adapter: &str, credential_url:
         .build()
 }
 
-fn codex_home_fragment(credential_name: &str) -> Fragment {
-    agent_environment_fragment(
-        "CODEX_HOME",
-        format!("/run/flotilla/credentials/{}/codex", safe_component(credential_name)),
-        format!("credential/codex {credential_name}"),
-    )
+fn codex_home_fragment(credential_name: &str, path: impl Into<String>) -> Fragment {
+    agent_environment_fragment("CODEX_HOME", path, format!("credential/codex {credential_name}"))
 }
 
 async fn api_key_preflight(runner: &dyn CommandRunner, url: &str, headers: &[(&str, &str)]) -> Result<(), String> {
@@ -1269,12 +1340,14 @@ interactions:
 
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0, "CODEX_HOME");
+        assert_eq!(delivered[0].1, "/tmp/flotilla-test-state/credentials/model-api/codex");
         assert!(!delivered.iter().any(|(name, value)| name == "OPENAI_API_KEY" || value == secret));
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, input)| {
             cmd == "sh" && args.iter().any(|arg| arg == "CODEX_HOME=\"$1\" codex login --with-api-key") && input == secret.as_bytes()
         }));
         assert!(calls.iter().any(|(cmd, args, _)| cmd == "sh" && args.iter().any(|arg| arg.contains("codex login status"))));
+        assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.starts_with("/run/flotilla")));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
     }
 
@@ -1314,26 +1387,30 @@ interactions:
         );
         let delivered = store.prepare("env-a", &credential_refs, runner.clone()).await.expect("prepare claude-oauth credential");
 
-        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered.len(), 2);
         assert!(
             delivered.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == secret),
             "the OAuth token must be delivered under CLAUDE_CODE_OAUTH_TOKEN"
         );
-        assert!(delivered.iter().all(|(name, _)| name != "CLAUDE_CONFIG_DIR"));
+        assert!(delivered
+            .iter()
+            .any(|(name, value)| { name == "CLAUDE_CONFIG_DIR" && value == "/tmp/flotilla-test-state/credentials/claude-max/claude" }));
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls
             .iter()
-            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude"]));
+            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight"]));
         assert!(calls.iter().any(|(cmd, args, input)| {
             cmd == "sh"
                 && args.iter().any(|arg| arg.contains("unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN"))
                 && args.iter().any(|arg| arg.contains("CLAUDE_CODE_OAUTH_TOKEN=\"$token\"") && arg.contains("claude -p"))
                 && args.iter().any(|arg| arg.contains("claude -p ok 2>&1") && arg.contains("printf '%s\\n' \"$output\" >&2"))
-                && args.iter().any(|arg| arg == "/tmp/flotilla-test-state/credentials/claude-max/claude")
+                && args.iter().any(|arg| arg == "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight")
                 && input == secret.as_bytes()
         }));
         assert!(
-            calls.iter().any(|(cmd, args, _)| cmd == "rm" && args == &["-rf", "/tmp/flotilla-test-state/credentials/claude-max/claude"]),
+            calls
+                .iter()
+                .any(|(cmd, args, _)| cmd == "rm" && args == &["-rf", "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight"]),
             "the preflight scratch directory must not outlive the probe"
         );
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
@@ -1356,9 +1433,9 @@ interactions:
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls
             .iter()
-            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/run/user/1000/flotilla/credentials/claude-max/claude"]));
+            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/run/user/1000/flotilla/credentials/claude-max/claude-preflight"]));
         assert!(calls.iter().any(|(cmd, args, _)| {
-            cmd == "sh" && args.iter().any(|arg| arg == "/run/user/1000/flotilla/credentials/claude-max/claude")
+            cmd == "sh" && args.iter().any(|arg| arg == "/run/user/1000/flotilla/credentials/claude-max/claude-preflight")
         }));
         assert!(
             calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.starts_with("/run/flotilla")),
@@ -1383,7 +1460,7 @@ interactions:
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls
             .iter()
-            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude"]));
+            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight"]));
     }
 
     #[tokio::test]
@@ -1394,7 +1471,7 @@ interactions:
             ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
             ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000-removed".to_string()),
         ])));
-        let runner = Arc::new(RecordingRunner::with_runtime_dir_checks([false]));
+        let runner = Arc::new(RecordingRunner::with_runtime_dir_checks([false, false]));
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
         let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
 
@@ -1403,10 +1480,10 @@ interactions:
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls
             .iter()
-            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude"]));
-        assert!(calls
-            .iter()
-            .all(|(cmd, args, _)| { cmd != "mkdir" || args != &["-p", "/run/user/1000-removed/flotilla/credentials/claude-max/claude"] }));
+            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight"]));
+        assert!(calls.iter().all(|(cmd, args, _)| {
+            cmd != "mkdir" || args != &["-p", "/run/user/1000-removed/flotilla/credentials/claude-max/claude-preflight"]
+        }));
     }
 
     #[tokio::test]
@@ -1417,7 +1494,7 @@ interactions:
             ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
             ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
         ])));
-        let runner = Arc::new(RecordingRunner::with_runtime_dir_checks([true, false]));
+        let runner = Arc::new(RecordingRunner::with_runtime_dir_checks([true, true, false, false]));
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
         let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
         let credential_refs = BTreeSet::from(["claude-max".to_string()]);
@@ -1428,10 +1505,10 @@ interactions:
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls
             .iter()
-            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/run/user/1000/flotilla/credentials/claude-max/claude"]));
+            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/run/user/1000/flotilla/credentials/claude-max/claude-preflight"]));
         assert!(calls
             .iter()
-            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude"]));
+            .any(|(cmd, args, _)| cmd == "mkdir" && args == &["-p", "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight"]));
     }
 
     #[tokio::test]
@@ -1474,8 +1551,8 @@ interactions:
 
         assert_eq!(alice.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-alice".to_string()));
         assert_eq!(bob.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-bob".to_string()));
-        assert!(!alice.contains_key("CLAUDE_CONFIG_DIR"));
-        assert!(!bob.contains_key("CLAUDE_CONFIG_DIR"));
+        assert_eq!(alice.get("CLAUDE_CONFIG_DIR"), Some(&"/tmp/flotilla-test-state/credentials/claude-alice/claude".to_string()));
+        assert_eq!(bob.get("CLAUDE_CONFIG_DIR"), Some(&"/tmp/flotilla-test-state/credentials/claude-bob/claude".to_string()));
 
         let error = store
             .prepare("env-c", &BTreeSet::from(["claude-alice".to_string(), "claude-bob".to_string()]), runner.clone())
@@ -1700,12 +1777,12 @@ interactions:
 
         assert_eq!(delivered, vec![
             ("GH_TOKEN".to_string(), secret.to_string()),
-            ("GIT_CONFIG_GLOBAL".to_string(), "/run/flotilla/credentials/gitconfig".to_string()),
+            ("GIT_CONFIG_GLOBAL".to_string(), "/tmp/flotilla-test-state/credentials/gitconfig".to_string()),
             ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
         ]);
         let writes = runner.writes.lock().expect("writes lock");
         assert_eq!(writes.as_slice(), &[(
-            PathBuf::from("/run/flotilla/credentials/gitconfig"),
+            PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
             "# fragment: credential/gh github\n[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n".to_string()
         )]);
         let calls = runner.calls.lock().expect("calls lock");
@@ -1715,6 +1792,7 @@ interactions:
         assert!(calls.iter().any(|(cmd, args, input)| {
             cmd == "sh" && args.iter().any(|arg| arg.contains("GIT_CONFIG_GLOBAL")) && input == secret.as_bytes()
         }));
+        assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.starts_with("/run/flotilla")));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
     }
 
@@ -1750,7 +1828,7 @@ interactions:
             .into_iter()
             .collect();
 
-        assert_eq!(delivered.get("GIT_CONFIG_GLOBAL"), Some(&"/run/flotilla/credentials/gitconfig".to_string()));
+        assert_eq!(delivered.get("GIT_CONFIG_GLOBAL"), Some(&"/tmp/flotilla-test-state/credentials/gitconfig".to_string()));
         assert_eq!(delivered.get("GIT_TERMINAL_PROMPT"), Some(&"0".to_string()));
         assert!(!delivered
             .keys()
@@ -1759,12 +1837,13 @@ interactions:
         let gitconfig = writes
             .iter()
             .rev()
-            .find(|(path, _)| path == Path::new("/run/flotilla/credentials/gitconfig"))
+            .find(|(path, _)| path == Path::new("/tmp/flotilla-test-state/credentials/gitconfig"))
             .map(|(_, content)| content)
             .expect("staged shared Git config");
         assert!(gitconfig.contains("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential"));
-        assert!(gitconfig
-            .contains("[credential \"https://forgejo.lab\"]\n\thelper = !/run/flotilla/credentials/lab-forgejo/git-credential-forgejo"));
+        assert!(gitconfig.contains(
+            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo"
+        ));
         assert!(gitconfig.contains("# fragment: credential/gh github"));
         assert!(gitconfig.contains("# fragment: credential/forgejo lab-forgejo"));
         let calls = runner.calls.lock().expect("calls lock");
@@ -1813,12 +1892,13 @@ interactions:
         let gitconfig = writes
             .iter()
             .rev()
-            .find(|(path, _)| path == Path::new("/run/flotilla/credentials/gitconfig"))
+            .find(|(path, _)| path == Path::new("/tmp/flotilla-test-state/credentials/gitconfig"))
             .map(|(_, content)| content)
             .expect("staged shared Git config");
         assert!(gitconfig.contains("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential"));
-        assert!(gitconfig
-            .contains("[credential \"https://forgejo.lab\"]\n\thelper = !/run/flotilla/credentials/lab-forgejo/git-credential-forgejo"));
+        assert!(gitconfig.contains(
+            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo"
+        ));
     }
 
     #[tokio::test]
@@ -1847,14 +1927,14 @@ interactions:
         assert_eq!(delivered, vec![
             ("FORGEJO_API_URL".to_string(), "https://forgejo.lab/api/v1".to_string()),
             ("FORGEJO_SERVER_URL".to_string(), "https://forgejo.lab".to_string()),
-            ("FORGEJO_TOKEN_FILE".to_string(), "/run/flotilla/credentials/lab-forgejo/token".to_string()),
+            ("FORGEJO_TOKEN_FILE".to_string(), "/tmp/flotilla-test-state/credentials/lab-forgejo/token".to_string()),
             ("FORGEJO_USERNAME".to_string(), "flotilla-crew".to_string()),
-            ("GIT_CONFIG_GLOBAL".to_string(), "/run/flotilla/credentials/gitconfig".to_string()),
+            ("GIT_CONFIG_GLOBAL".to_string(), "/tmp/flotilla-test-state/credentials/gitconfig".to_string()),
             ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
         ]);
         let writes = runner.writes.lock().expect("writes lock");
-        assert_eq!(writes[0], (PathBuf::from("/run/flotilla/credentials/lab-forgejo/token"), secret.to_string()));
-        assert_eq!(writes[1].0, PathBuf::from("/run/flotilla/credentials/lab-forgejo/git-credential-forgejo"));
+        assert_eq!(writes[0], (PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/token"), secret.to_string()));
+        assert_eq!(writes[1].0, PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo"));
         assert!(writes[1].1.contains("[ \"$protocol\" = https ]"));
         assert!(writes[1].1.contains("[ \"$host\" = forgejo.lab ]"));
         assert!(writes[1].1.contains("$FORGEJO_USERNAME"));
@@ -1862,21 +1942,24 @@ interactions:
         assert_eq!(
             writes[2],
             (
-                PathBuf::from("/run/flotilla/credentials/gitconfig"),
-                "# fragment: credential/forgejo lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/run/flotilla/credentials/lab-forgejo/git-credential-forgejo\n".to_string()
+                PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
+                "# fragment: credential/forgejo lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo\n".to_string()
             )
         );
         let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls.iter().any(|(cmd, args, _)| cmd == "chmod" && args == &["0600", "/run/flotilla/credentials/lab-forgejo/token"]));
         assert!(calls
             .iter()
-            .any(|(cmd, args, _)| { cmd == "chmod" && args == &["0700", "/run/flotilla/credentials/lab-forgejo/git-credential-forgejo"] }));
+            .any(|(cmd, args, _)| cmd == "chmod" && args == &["0600", "/tmp/flotilla-test-state/credentials/lab-forgejo/token"]));
+        assert!(calls.iter().any(|(cmd, args, _)| {
+            cmd == "chmod" && args == &["0700", "/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo"]
+        }));
         assert!(calls.iter().any(|(cmd, args, input)| {
             cmd == "curl"
                 && args == &["--config", "-"]
                 && String::from_utf8_lossy(input).contains("https://forgejo.lab/api/v1/user")
                 && String::from_utf8_lossy(input).contains(secret)
         }));
+        assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.starts_with("/run/flotilla")));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
     }
 
@@ -1947,7 +2030,7 @@ interactions:
             .collect();
 
         assert_eq!(delivered.get("FORGEJO_SERVER_URL"), Some(&"https://forgejo.lab:3000".to_string()));
-        assert_eq!(delivered.get("GIT_CONFIG_GLOBAL"), Some(&"/run/flotilla/credentials/gitconfig".to_string()));
+        assert_eq!(delivered.get("GIT_CONFIG_GLOBAL"), Some(&"/tmp/flotilla-test-state/credentials/gitconfig".to_string()));
         let writes = runner.writes.lock().expect("writes lock");
         assert!(
             writes[1].1.contains("[ \"$host\" = forgejo.lab:3000 ]"),
