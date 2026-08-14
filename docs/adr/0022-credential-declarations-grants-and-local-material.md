@@ -161,3 +161,18 @@ bookkeeping is the operator's login inventory**.
 implementations of the same delivery interface; a future model-API proxy
 (per-crew attribution at the proxy, no material in vessels) must slot in
 without reshaping `CredentialSpec`.
+
+## Amendment (2026-08-14): trusted crews use deliverable material proactively
+
+The #1140 credential-health ruling narrows the migration rule that trusted
+stance inherits ambient identity. When a consumer has a long-lived material
+form that its adapter can deliver, trusted crews receive that material just as
+contained crews do. In particular, Claude Code receives the operator's
+subscription `claude setup-token` per process as `CLAUDE_CODE_OAUTH_TOKEN`;
+the token supplies authentication while the trusted adapter continues to use
+ambient Claude configuration for shared settings, skills, and MCP servers.
+
+Ambient identity inheritance remains only for consumers with no deliverable
+material form. A missing grant or unavailable material for a consumer with a
+deliverable form is therefore a named preflight refusal, not permission to
+start a crew and discover stale ambient authentication interactively.

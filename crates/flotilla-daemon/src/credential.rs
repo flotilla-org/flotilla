@@ -816,10 +816,11 @@ impl CredentialStore {
             // token) is delivered per-process through `CLAUDE_CODE_OAUTH_TOKEN`
             // — no login transformation exists or is needed, and one mint
             // serves N crews (ADR 0022 amendment). The credential-specific
-            // config directory below isolates the
-            // preflight from ambient authentication, but is not delivered to
-            // the crew. The Claude AgentAdapter owns the contained invocation's
-            // mutable config path and exports it in the launch plan. See
+            // preflight config directory isolates its probe from ambient
+            // authentication. Delivery also offers a credential-specific
+            // mutable config path for contained crews; the trusted Claude
+            // adapter removes that override so host settings, skills, and MCP
+            // configuration remain ambient. See
             // docs/research/2026-07-28-multi-crew-agent-config-seeding.md.
             CredentialConsumer::ClaudeOauth { .. } => {
                 let delivery_paths = delivery_paths.expect("Claude OAuth adapter resolves delivery paths");
