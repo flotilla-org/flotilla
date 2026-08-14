@@ -32,6 +32,9 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Crew convoys open PRs as the flotilla-crew GitHub App; the action's
+          # human-actor guard would otherwise refuse to review them.
+          allowed_bots: "flotilla-crew"
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
