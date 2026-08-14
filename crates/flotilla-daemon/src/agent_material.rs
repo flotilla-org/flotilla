@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::providers::{
     discovery::EnvVars,
-    environment::{ProvisionedMount, ProvisionedMountMode},
+    environment::{runner::CONTAINED_CODEX_HOME, ProvisionedMount, ProvisionedMountMode},
 };
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{api_version, Environment, MaterialPoolSpec, MaterialPoolUnitSpec, Resource, ResourceBackend};
@@ -22,7 +22,7 @@ use crate::{
 
 const CODEX_ADAPTER_ID: &str = "codex";
 const CODEX_POOL_REF: &str = "codex-login";
-pub(crate) const CONTAINER_CODEX_HOME: &str = "/run/flotilla/codex";
+pub(crate) const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentMaterialPreflight {

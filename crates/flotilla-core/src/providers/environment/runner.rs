@@ -11,6 +11,12 @@ use crate::providers::{
     FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
 
+/// Persistent writable base reserved inside provisioned containers. Unlike a
+/// user's home, this location is known before container creation, so writable
+/// material mounts and post-create runner writes can share one path contract.
+pub const CONTAINED_WRITABLE_CONFIG_BASE: &str = "/tmp/flotilla";
+pub const CONTAINED_CODEX_HOME: &str = "/tmp/flotilla/codex";
+
 /// A `CommandRunner` decorator that executes all commands inside a Docker container
 /// via `docker exec`. Absolute working directories are forwarded as `-w`; relative
 /// paths use the container's configured working directory. The host-side cwd is `/`.
@@ -40,6 +46,27 @@ impl DockerEnvironmentRunner {
     fn docker_exec_prefix(&self) -> Vec<&str> {
         vec!["exec", &self.container_name]
     }
+
+    async fn writable_base(&self, purpose: &str) -> Result<PathBuf, String> {
+        let base = self
+            .run(
+                "sh",
+                &[
+                    "-c",
+                    "if [ -n \"${HOME:-}\" ] && [ -d \"$HOME\" ] && [ -w \"$HOME\" ]; then printf '%s' \"$HOME\"; elif [ -d /tmp ] && [ -w /tmp ]; then printf /tmp; else exit 1; fi",
+                    purpose,
+                ],
+                Path::new("/"),
+                &ChannelLabel::Noop,
+            )
+            .await
+            .map_err(|error| format!("find writable directory in container: {error}"))?;
+        let base = base.trim();
+        if base.is_empty() {
+            return Err("find writable directory in container: probe returned an empty path".to_string());
+        }
+        Ok(PathBuf::from(base).join("flotilla"))
+    }
 }
 
 #[async_trait]
@@ -68,24 +95,14 @@ impl CommandRunner for DockerEnvironmentRunner {
     }
 
     async fn writable_scratch_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
-        let scratch = self
-            .run(
-                "sh",
-                &[
-                    "-c",
-                    "if [ -n \"${HOME:-}\" ] && [ -d \"$HOME\" ] && [ -w \"$HOME\" ]; then printf '%s' \"$HOME\"; elif [ -d /tmp ] && [ -w /tmp ]; then printf /tmp; else exit 1; fi",
-                    "flotilla-scratch-base",
-                ],
-                Path::new("/"),
-                &ChannelLabel::Noop,
-            )
+        self.writable_base("flotilla-scratch-base").await
+    }
+
+    async fn writable_config_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
+        self.run("sh", &["-c", "test -d /tmp && test -w /tmp", "flotilla-config-base"], Path::new("/"), &ChannelLabel::Noop)
             .await
-            .map_err(|error| format!("find writable scratch directory in container: {error}"))?;
-        let scratch = scratch.trim();
-        if scratch.is_empty() {
-            return Err("find writable scratch directory in container: probe returned an empty path".to_string());
-        }
-        Ok(PathBuf::from(scratch).join("flotilla"))
+            .map_err(|error| format!("find writable config directory in container: {error}"))?;
+        Ok(PathBuf::from(CONTAINED_WRITABLE_CONFIG_BASE))
     }
 
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
@@ -113,9 +130,18 @@ mod tests {
     use std::{future, path::Path, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
+    use uuid::Uuid;
 
     use super::DockerEnvironmentRunner;
-    use crate::providers::{testing::MockRunner, ChannelLabel, CommandOutput, CommandRunner};
+    use crate::providers::{testing::MockRunner, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
+
+    struct DockerContainer(String);
+
+    impl Drop for DockerContainer {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker").args(["rm", "-f", &self.0]).output();
+        }
+    }
 
     struct InvalidWorkdirHangingRunner;
 
@@ -177,6 +203,69 @@ mod tests {
         assert_eq!(calls[0].0, "docker");
         assert!(calls[0].1.starts_with(&["exec".to_string(), "-w".to_string(), "/".to_string(), "my-container".to_string()]));
         assert!(calls[0].1.iter().all(|arg| arg != "/run/user/1000" && arg != "/host/state"));
+    }
+
+    #[tokio::test]
+    async fn writable_config_base_is_resolved_inside_the_container() {
+        let inner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
+        let runner = DockerEnvironmentRunner::new("my-container".into(), inner.clone());
+
+        let config =
+            runner.writable_config_base(Some(Path::new("/run/user/1000")), Path::new("/host/state")).await.expect("container config base");
+
+        assert_eq!(config, Path::new("/tmp/flotilla"));
+        let calls = inner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].1.iter().any(|arg| arg == "flotilla-config-base"));
+        assert!(calls[0].1.iter().all(|arg| arg != "/run/user/1000" && arg != "/host/state"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker and the busybox:latest image"]
+    async fn persistent_delivery_paths_work_in_a_real_non_root_container() {
+        let container = DockerContainer(format!("flotilla-non-root-delivery-{}", Uuid::new_v4()));
+        ProcessCommandRunner
+            .run(
+                "docker",
+                &["run", "-d", "--name", &container.0, "--user", "65534:65534", "-e", "HOME=/tmp", "busybox:latest", "sleep", "infinity"],
+                Path::new("/"),
+                &ChannelLabel::Noop,
+            )
+            .await
+            .expect("start non-root test container");
+        let runner = DockerEnvironmentRunner::new(container.0.clone(), Arc::new(ProcessCommandRunner));
+        let base = runner
+            .writable_config_base(Some(Path::new("/run/user/65534")), Path::new("/host/state"))
+            .await
+            .expect("resolve container config base");
+        let git_config = base.join("credentials/gitconfig");
+        let agent_environment = base.join("agent-environment");
+
+        runner.write_file(&git_config, "[credential]\n\thelper = test\n").await.expect("write Git config as non-root user");
+        runner
+            .write_file(&agent_environment, &format!("export GIT_CONFIG_GLOBAL='{}'\n", git_config.display()))
+            .await
+            .expect("write agent environment as non-root user");
+
+        let agent_environment_arg = agent_environment.to_string_lossy();
+        let observed = runner
+            .run(
+                "sh",
+                &[
+                    "-c",
+                    ". \"$1\"; test -f \"$GIT_CONFIG_GLOBAL\"; printf '%s\\n%s' \"$GIT_CONFIG_GLOBAL\" \"$1\"",
+                    "flotilla-verify-delivery",
+                    &agent_environment_arg,
+                ],
+                Path::new("/"),
+                &ChannelLabel::Noop,
+            )
+            .await
+            .expect("resolve exported delivery paths");
+
+        assert_eq!(observed, format!("{}\n{}", git_config.display(), agent_environment.display()));
+        assert!(!git_config.starts_with("/run/flotilla"));
+        assert!(!agent_environment.starts_with("/run/flotilla"));
     }
 
     #[tokio::test]

@@ -292,6 +292,17 @@ pub trait CommandRunner: Send + Sync {
         Ok(fallback.to_path_buf())
     }
 
+    /// Choose a Flotilla-owned writable base for files that must persist for
+    /// the lifetime of this runner's execution environment.
+    ///
+    /// This is deliberately distinct from [`Self::writable_scratch_base`]:
+    /// callers must not attach scratch-probe cleanup to paths returned here.
+    /// The default filesystem policy is shared, while namespace-crossing
+    /// runners may resolve the base in their own environment.
+    async fn writable_config_base(&self, preferred: Option<&Path>, fallback: &Path) -> Result<PathBuf, String> {
+        self.writable_scratch_base(preferred, fallback).await
+    }
+
     /// Ensure `path` exists with `content` if absent, returning the resulting
     /// file contents. Existing files are preserved.
     async fn ensure_file(&self, _path: &Path, content: &str) -> Result<String, String> {
