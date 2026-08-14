@@ -20,7 +20,7 @@ pub(super) const PEER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::f
 pub(super) struct PeerConnection {
     daemon: Arc<InProcessDaemon>,
     shutdown_rx: watch::Receiver<bool>,
-    peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
+    inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     peer_manager: Arc<Mutex<PeerManager>>,
     peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
     client_count: Arc<AtomicUsize>,
@@ -31,13 +31,13 @@ impl PeerConnection {
     pub(super) fn new(
         daemon: Arc<InProcessDaemon>,
         shutdown_rx: watch::Receiver<bool>,
-        peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
+        inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
         peer_manager: Arc<Mutex<PeerManager>>,
         peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
         client_count: Arc<AtomicUsize>,
         client_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
-        Self { daemon, shutdown_rx, peer_data_tx, peer_manager, peer_connected_tx, client_count, client_notify }
+        Self { daemon, shutdown_rx, inbound_peer_tx, peer_manager, peer_connected_tx, client_count, client_notify }
     }
 
     pub(super) async fn run(
@@ -88,6 +88,7 @@ impl PeerConnection {
         let peer_node = NodeInfo::new(node_id.clone(), display_name);
         let (generation, displaced_generation) = {
             let mut pm = self.peer_manager.lock().await;
+            pm.learn_node_info(&peer_node);
             match pm.activate_connection_with_session(
                 node_id.clone(),
                 Arc::new(SocketPeerSender { tx: tokio::sync::Mutex::new(Some(outbound_tx.clone())) }),
@@ -139,7 +140,7 @@ impl PeerConnection {
                             idle_deadline.as_mut().reset(tokio::time::Instant::now() + PEER_IDLE_TIMEOUT);
                             match msg {
                                 Message::Peer(peer_msg) => {
-                                    if let Err(e) = self.peer_data_tx.send(InboundPeerEnvelope {
+                                    if let Err(e) = self.inbound_peer_tx.send(InboundPeerEnvelope {
                                         msg: *peer_msg,
                                         connection_generation: generation,
                                         connection_peer: node_id.clone(),

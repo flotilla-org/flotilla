@@ -142,6 +142,16 @@ impl HostRegistry {
                     .map(|_| state.node_id.clone())
             })
             .collect::<Vec<_>>();
+        drop(hosts);
+        matches.extend(
+            self.topology_routes
+                .read()
+                .await
+                .iter()
+                .filter(|route| route.connected || !route.fallbacks.is_empty())
+                .filter(|route| HostName::new(route.target.display_name.clone()) == *host)
+                .map(|route| route.target.node_id.clone()),
+        );
         matches.sort();
         matches.dedup();
         match matches.as_slice() {
@@ -208,6 +218,15 @@ impl HostRegistry {
             .collect();
         host_names_by_node.insert(self.local_node.node_id.clone(), local_host_name);
 
+        let routes = self.topology_routes.read().await;
+        for route in routes.iter() {
+            host_names_by_node.entry(route.target.node_id.clone()).or_insert_with(|| HostName::new(route.target.display_name.clone()));
+            host_names_by_node.entry(route.next_hop.node_id.clone()).or_insert_with(|| HostName::new(route.next_hop.display_name.clone()));
+            for fallback in &route.fallbacks {
+                host_names_by_node.entry(fallback.node_id.clone()).or_insert_with(|| HostName::new(fallback.display_name.clone()));
+            }
+        }
+
         let mut target_nodes: Vec<_> =
             host_names_by_node.iter().filter_map(|(node, host)| (host == target_host).then_some(node.clone())).collect();
         target_nodes.sort();
@@ -219,7 +238,6 @@ impl HostRegistry {
             _ => return Err(format!("host name '{target_host}' matches multiple routed nodes")),
         };
 
-        let routes = self.topology_routes.read().await;
         let Some(route) = routes.iter().find(|route| route.target.node_id == *target_node) else {
             return Ok(None);
         };

@@ -543,7 +543,6 @@ trait DaemonTestCompat {
     async fn set_peer_host_summaries(&self, summaries: HashMap<HostName, HostSummary>);
     async fn publish_peer_connection_status(&self, host: &HostName, status: PeerConnectionState);
     async fn publish_peer_summary(&self, host: &HostName, summary: HostSummary);
-    async fn set_peer_providers(&self, repo_path: &Path, peers: Vec<(HostName, ProviderData)>, overlay_version: u64);
     async fn add_virtual_repo(
         &self,
         identity: RepoIdentity,
@@ -580,16 +579,6 @@ impl DaemonTestCompat for Arc<InProcessDaemon> {
     async fn publish_peer_summary(&self, host: &HostName, mut summary: HostSummary) {
         summary.node = test_node(host.as_str());
         InProcessDaemon::publish_peer_summary(self.as_ref(), summary).await;
-    }
-
-    async fn set_peer_providers(&self, repo_path: &Path, peers: Vec<(HostName, ProviderData)>, overlay_version: u64) {
-        InProcessDaemon::set_peer_providers(
-            self.as_ref(),
-            repo_path,
-            peers.into_iter().map(|(host, data)| (test_node(host.as_str()), data)).collect(),
-            overlay_version,
-        )
-        .await;
     }
 
     async fn add_virtual_repo(
@@ -4046,18 +4035,6 @@ async fn fetch_checkout_status_accepts_identity_context_repo() {
     assert!(matches!(result, CommandValue::CheckoutStatus(_)), "expected checkout status result via identity context repo, got {result:?}");
 }
 
-/// replay_since must include peer provider data, just like get_state and live
-/// broadcasts. A late-subscribing or reconnecting client should see the same
-/// merged view (local + peer checkouts with correct host attribution) as a
-/// client that was connected from the start.
-
-/// Unknown-seq fallback should include peer checkouts with correct host attribution,
-/// not just local provider data.
-
-/// Delta replay path should include peer checkout changes in the replayed
-/// deltas, and the full snapshot (used for issue metadata in replay_since)
-/// should reflect the peer-merged view.
-
 #[tokio::test]
 async fn add_and_remove_repo_updates_state_and_emits_events() {
     let temp = tempfile::tempdir().unwrap();
@@ -4207,15 +4184,6 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
     assert_eq!(daemon.preferred_local_path_for_identity(&identity).await, Some(canonical_repo.clone()));
     assert_eq!(daemon.tracked_repo_paths().await, vec![canonical_repo]);
 }
-
-/// Regression test: after poll_snapshots stores merged (local + peer) data
-/// in last_snapshot, get_state must not re-attribute peer checkouts to the
-/// local host. The bug: normalize_local_provider_hosts stamps ALL checkouts
-/// in the merged base with the local host, then merge_provider_data adds
-/// the real peer checkouts again — duplicating them.
-
-/// After poll_snapshots stores merged data, a second set_peer_providers call
-/// should not duplicate peer checkouts via the normalize-then-merge path.
 
 #[tokio::test]
 async fn execute_on_untracked_repo_returns_error_without_started_event() {

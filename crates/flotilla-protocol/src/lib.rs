@@ -39,7 +39,7 @@ pub use host_summary::{
 pub use leaf::{Leaf, LeafAddress, LeafFire, LeafKind, LeafOperator, WaitSubscriptionRequest};
 pub use lifecycle::LifecycleAuthority;
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
-pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
+pub use peer::{CommandPeerEvent, GoodbyeReason, PeerWireMessage, RoutedPeerMessage};
 pub use placement::{PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate};
 pub use provisioning_target::ProvisioningTarget;
 pub use repository::{RepositoryKey, UNKNOWN_REPOSITORY_LABEL};
@@ -48,8 +48,8 @@ pub use view_address::ViewAddress;
 
 /// Stable mesh identity for a daemon node.
 ///
-/// This is the routing key for peer discovery, vector clocks, replay cursors,
-/// and event attribution. `HostName` remains only for display metadata and
+/// This is the routing key for peer discovery, replay cursors, and event
+/// attribution. `HostName` remains only for display metadata and
 /// legacy execution/path contexts that are not mesh identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
