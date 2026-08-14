@@ -13,7 +13,7 @@ use toml_edit::{value, DocumentMut, Item, Table};
 
 use crate::{
     path_context::ExecutionEnvironmentPath,
-    providers::{discovery::EnvironmentBag, ChannelLabel, CommandRunner},
+    providers::{discovery::EnvironmentBag, terminal::TerminalEnvVars, ChannelLabel, CommandRunner},
 };
 
 pub const TRUSTED_IMPLICIT_STANCE: &str = "trusted-implicit";
@@ -389,6 +389,17 @@ impl Default for CapabilityTable {
 pub trait AgentAdapter: Send + Sync {
     fn id(&self) -> &'static str;
     async fn prepare(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String>;
+    /// Prepare an invocation with the environment selected for this particular
+    /// crew process. Credential-backed paths are deliberately resolved here,
+    /// rather than from the environment in which adapter discovery happened.
+    async fn prepare_with_environment(
+        &self,
+        cwd: &ExecutionEnvironmentPath,
+        brief: &TerminalBrief,
+        _environment: &TerminalEnvVars,
+    ) -> Result<(), String> {
+        self.prepare(cwd, brief).await
+    }
     async fn cleanup(&self, _cwd: &ExecutionEnvironmentPath, _brief: &TerminalBrief) -> Result<(), String> {
         Ok(())
     }
@@ -421,7 +432,7 @@ enum AdapterFlavor {
     /// present. Managed sessions seed the first two into Claude's mutable state
     /// and carry the documented bypass-consent setting alongside Flotilla's
     /// hooks in the invocation-only `--settings` overlay.
-    ClaudeCode { state_config: Option<ClaudeStateConfig> },
+    ClaudeCode { state_config: Option<ClaudeStateConfig>, state_lock: Arc<Mutex<()>> },
     /// Codex gates on a persisted per-project trust level, so the workspace has
     /// to be marked trusted in its config before launch.
     Codex { trust_config: Option<CodexTrustConfig> },
@@ -486,9 +497,21 @@ impl AgentAdapter for CliAgentAdapter {
     }
 
     async fn prepare(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String> {
+        self.prepare_with_environment(cwd, brief, &Vec::new()).await
+    }
+
+    async fn prepare_with_environment(
+        &self,
+        cwd: &ExecutionEnvironmentPath,
+        brief: &TerminalBrief,
+        environment: &TerminalEnvVars,
+    ) -> Result<(), String> {
         match &self.flavor {
-            AdapterFlavor::ClaudeCode { state_config } => {
-                if let Some(state_config) = state_config {
+            AdapterFlavor::ClaudeCode { state_config, state_lock } => {
+                let invocation_state = environment.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, config_dir)| {
+                    ClaudeStateConfig { path: PathBuf::from(config_dir).join(".claude.json"), lock: Arc::clone(state_lock) }
+                });
+                if let Some(state_config) = invocation_state.as_ref().or(state_config.as_ref()) {
                     seed_claude_headless_state(&*self.runner, cwd.as_path(), state_config).await?;
                 }
                 let mut settings = crate::agents::claude_code_hook_settings();
@@ -667,11 +690,13 @@ impl AgentAdapterRegistry {
         let mut registry = Self::default();
         if let Some(binary) = env.find_binary("claude") {
             let state_path = env.find_env_var("CLAUDE_CONFIG_DIR").map(|config_dir| PathBuf::from(config_dir).join(".claude.json"));
+            let state_lock = Arc::new(Mutex::new(()));
             registry.insert(Arc::new(CliAgentAdapter {
                 binary: binary.as_path().display().to_string(),
                 runner: Arc::clone(&runner),
                 flavor: AdapterFlavor::ClaudeCode {
-                    state_config: state_path.map(|path| ClaudeStateConfig { path, lock: Arc::new(Mutex::new(())) }),
+                    state_config: state_path.map(|path| ClaudeStateConfig { path, lock: Arc::clone(&state_lock) }),
+                    state_lock,
                 },
             }));
         }
@@ -1215,15 +1240,19 @@ mod tests {
         let claude_config = temp.path().join("claude-config");
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::create_dir_all(&claude_config).expect("Claude config");
-        let env = EnvironmentBag::new()
-            .with(EnvironmentAssertion::env_var("CLAUDE_CONFIG_DIR", claude_config.display().to_string()))
-            .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
+        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
         let claude = registry.get("claude-code").expect("claude adapter");
         let brief =
             flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
 
-        claude.prepare(&ExecutionEnvironmentPath::new(&workspace), &brief).await.expect("prepare claude workspace");
+        claude
+            .prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                claude_config.display().to_string(),
+            )])
+            .await
+            .expect("prepare claude workspace");
 
         // The launch command names this path relatively, so it must resolve
         // against the session's working directory.
