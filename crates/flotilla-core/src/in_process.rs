@@ -3500,11 +3500,6 @@ async fn resolve_workflow_credentials(
     let all_repositories = repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<BTreeSet<_>>();
 
     for vessel in &mut workflow.vessels {
-        if vessel.stance != flotilla_resources::Stance::Contained {
-            // Uncontained crews retain their existing ambient behavior during
-            // the staged migration described by ADR 0022.
-            continue;
-        }
         let vessel_repositories = vessel
             .repository_refs
             .as_ref()
@@ -3549,13 +3544,13 @@ async fn validate_workflow_credentials(
         .map(|spec| (spec.metadata.name, spec.spec.consumer))
         .collect::<BTreeMap<_, _>>();
     let capabilities = CapabilityTable::seeded();
-    for vessel in workflow.vessels.iter().filter(|vessel| vessel.stance == flotilla_resources::Stance::Contained) {
+    for vessel in &workflow.vessels {
         for crew in &vessel.crew {
             let CrewSource::Agent { selector, .. } = &crew.source else {
                 continue;
             };
             let requirement = capabilities.resolve_selector(selector)?;
-            let Some(delivery_slot) = requirement.contained_credential_delivery_slot() else {
+            let Some(delivery_slot) = requirement.credential_delivery_slot() else {
                 continue;
             };
             let has_granted_credential =
@@ -3574,18 +3569,13 @@ async fn validate_workflow_credentials(
                 names => format!("one of credentials `{}`", names.join("`, `")),
             };
             return Err(format!(
-                "contained agent adapter `{}` requires {credential}, but no matching CredentialGrant selected it",
-                requirement.adapter
+                "{} agent adapter `{}` requires {credential}, but no matching CredentialGrant selected it",
+                vessel.stance, requirement.adapter
             ));
         }
     }
 
-    let required = workflow
-        .vessels
-        .iter()
-        .filter(|vessel| vessel.stance == flotilla_resources::Stance::Contained)
-        .flat_map(|vessel| vessel.credential_refs.iter().cloned())
-        .collect::<BTreeSet<_>>();
+    let required = workflow.vessels.iter().flat_map(|vessel| vessel.credential_refs.iter().cloned()).collect::<BTreeSet<_>>();
     let ambient_dependent_vessels = ambient_credential_dependent_vessels(&capabilities, &specs, workflow)?;
     if required.is_empty() && ambient_dependent_vessels.is_empty() {
         return Ok(());
@@ -3671,7 +3661,7 @@ fn ambient_credential_dependent_vessels<'workflow>(
             let Some(scope) = requirement.ambient_credential_scope() else {
                 continue;
             };
-            let delivery_slot = requirement.contained_credential_delivery_slot();
+            let delivery_slot = requirement.credential_delivery_slot();
             let has_delivered_credential = delivery_slot.is_some_and(|slot| {
                 vessel.credential_refs.iter().any(|name| specs.get(name).is_some_and(|consumer| consumer.delivery_slot() == slot))
             });

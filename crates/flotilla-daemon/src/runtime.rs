@@ -7594,7 +7594,11 @@ mod tests {
                             CrewSpec::builder()
                                 .role("reviewer".to_string())
                                 .source(CrewSource::Agent {
-                                    selector: Selector::for_capability("review"),
+                                    selector: Selector {
+                                        capability: "review".to_string(),
+                                        adapter: Some("codex".to_string()),
+                                        model: None,
+                                    },
                                     prompt: Some("Review the coder's work.".to_string()),
                                     brief_template: None,
                                 })
@@ -7749,7 +7753,7 @@ mod tests {
             .find(|session| session.spec.role == "reviewer")
             .expect("reviewer session");
         let reviewer_id = reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).expect("reviewer identity").id.clone();
-        assert_eq!(reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.adapter.as_str()), Some("claude-code"));
+        assert_eq!(reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.adapter.as_str()), Some("codex"));
         let delivered = pool.delivered.lock().await;
         assert!(delivered.iter().any(|(session, text, submit)| {
             session.ends_with("-reviewer") && text == "handoff from coder@implement\n\nReview commit abc123" && *submit
