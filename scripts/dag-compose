@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Compose generated portfolio facts into the legacy DAG board template."""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import re
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+BOARD_DATA = re.compile(r'(?P<open>id="board-data">).*?(?P<close></script>)', re.DOTALL)
+COLUMN_TITLES = {
+    "landed": "Landed (context)",
+    "flight": "In flight now",
+    "ready": "Ready / unblocked",
+    "grill": "Needs grill",
+    "waiting": "Waiting / blocked",
+    "design": "Needs design",
+    "parked": "Parked / later",
+}
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"could not read {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise SystemExit(f"expected a JSON object in {path}")
+    return value
+
+
+def node_id(reference: str) -> str:
+    return reference.rsplit("#", 1)[-1]
+
+
+def fact_suffix(ticket: dict[str, Any]) -> list[str]:
+    lines = []
+    for pull_request in ticket.get("pullRequests") or []:
+        if str(pull_request.get("state", "")).lower() != "open":
+            continue
+        number = node_id(str(pull_request.get("ref") or "?"))
+        state = html.escape(str(pull_request.get("state") or "unknown"))
+        ci = html.escape(str(pull_request.get("ci") or "unknown"))
+        lines.append(f"PR #{html.escape(number)} · {state} · CI {ci}")
+    for convoy in ticket.get("convoys") or []:
+        name = html.escape(str(convoy.get("name") or "unknown convoy"))
+        host = html.escape(str(convoy.get("host") or "unknown host"))
+        phase = html.escape(str(convoy.get("phase") or "Unknown"))
+        lines.append(f"⚓ {name} · {host} · {phase}")
+    return lines
+
+
+def card_detail(authored_ticket: dict[str, Any], generated_ticket: dict[str, Any] | None) -> str:
+    parts = []
+    if authored_ticket.get("detail"):
+        parts.append(str(authored_ticket["detail"]))
+    if generated_ticket:
+        parts.extend(fact_suffix(generated_ticket))
+    return "<br>".join(parts)
+
+
+def ticket_status(authored_ticket: dict[str, Any], generated_ticket: dict[str, Any] | None) -> str:
+    generated_status = generated_ticket.get("status") if generated_ticket else None
+    if generated_status == "landed":
+        return "landed"
+    if generated_status == "at-sea":
+        return "flight"
+    return str(authored_ticket.get("stage") or "design")
+
+
+def compose_data(generated: dict[str, Any], authored: dict[str, Any]) -> dict[str, Any]:
+    authored_tickets = authored.get("tickets") or {}
+    generated_tickets = {ticket["ref"]: ticket for ticket in generated.get("tickets") or []}
+    curated_refs = set(authored_tickets)
+
+    tickets = []
+    for reference, annotation in authored_tickets.items():
+        generated_ticket = generated_tickets.get(reference)
+        identifier = node_id(reference)
+        ticket = {
+            "id": identifier,
+            "status": ticket_status(annotation, generated_ticket),
+            "group": annotation.get("group"),
+            "dag": annotation.get("dagLabel"),
+        }
+        if annotation.get("shape"):
+            ticket["shape"] = annotation["shape"]
+        if not identifier.isdigit():
+            ticket["external"] = True
+
+        title = annotation.get("title")
+        if not title and generated_ticket:
+            title = f"#{identifier} {html.escape(str(generated_ticket.get('title') or ''))}".rstrip()
+        if title:
+            ticket["card"] = {
+                "title": title,
+                "detail": card_detail(annotation, generated_ticket),
+            }
+        tickets.append(ticket)
+
+    edges = []
+    seen_edges = set()
+
+    def add_edge(edge: dict[str, Any]) -> None:
+        normalized = {**edge, "from": node_id(str(edge["from"])), "to": node_id(str(edge["to"]))}
+        identity = json.dumps(normalized, sort_keys=True, ensure_ascii=False)
+        if identity not in seen_edges:
+            seen_edges.add(identity)
+            edges.append(normalized)
+
+    for edge in authored.get("edges") or []:
+        add_edge(edge)
+    for edge in generated.get("dependencyEdges") or []:
+        if edge.get("from") in curated_refs and edge.get("to") in curated_refs:
+            add_edge(edge)
+
+    stages = authored.get("stages") or []
+    columns = [
+        {"id": stage, "title": COLUMN_TITLES.get(stage, str(stage).replace("-", " ").title())}
+        if isinstance(stage, str)
+        else stage
+        for stage in stages
+    ]
+    groups = [{"id": name, **group} for name, group in (authored.get("groups") or {}).items()]
+    as_of = generated.get("asOf")
+
+    return {
+        "repo": authored.get("repo", "flotilla-org/flotilla"),
+        "snapshot": str(as_of)[:10] if as_of else "unknown",
+        "pulse": authored.get("pulse", ""),
+        "groups": groups,
+        "tickets": tickets,
+        "edges": edges,
+        "columns": columns,
+        "landed": authored.get("landedRollups") or [],
+        "notes": authored.get("notes") or [],
+    }
+
+
+def render(template: str, board: dict[str, Any]) -> str:
+    payload = json.dumps(board, indent=2, ensure_ascii=False).replace("<", "\\u003c")
+    rendered, replacements = BOARD_DATA.subn(lambda match: f"{match.group('open')}{payload}{match.group('close')}", template)
+    if replacements != 1:
+        raise SystemExit(f"expected exactly one board-data element in the template, found {replacements}")
+    return rendered
+
+
+def write_text(path: Path, content: str) -> None:
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--generated", type=Path, default=Path("~/dev/flotilla-tickets-dag.generated.json"))
+    parser.add_argument("--authored", type=Path, default=SCRIPT_DIR / "flotilla-tickets-dag.authored.json")
+    parser.add_argument("--template", type=Path, default=SCRIPT_DIR / "flotilla-tickets-dag.template.html")
+    parser.add_argument("--output", type=Path, default=Path("~/dev/flotilla-tickets-dag.html"))
+    arguments = parser.parse_args()
+
+    generated = read_json(arguments.generated)
+    authored = read_json(arguments.authored)
+    try:
+        template = arguments.template.expanduser().read_text(encoding="utf-8")
+    except OSError as error:
+        raise SystemExit(f"could not read {arguments.template}: {error}") from error
+    write_text(arguments.output, render(template, compose_data(generated, authored)))
+
+
+if __name__ == "__main__":
+    main()
