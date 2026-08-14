@@ -299,7 +299,11 @@ mod tests {
     }
 
     fn setup_real_clone_repo() -> (TempDir, PathBuf, PathBuf) {
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        // Fixed under /tmp rather than the ambient TMPDIR: WorkspaceMappingRunner
+        // rewrites any path prefixed with the WORKSPACE_ROOT sentinel ("/workspace"),
+        // so a fixture rooted under a TMPDIR pointed inside a `/workspace` checkout
+        // (as recommended for the Codex sandbox) would collide with that sentinel.
+        let dir = tempfile::Builder::new().prefix("flotilla-clone-fixture-").tempdir_in("/tmp").expect("failed to create tempdir");
         let base = dir.path().canonicalize().expect("failed to canonicalize tempdir");
         let remote = base.join("origin.git");
         let reference = base.join("reference");
