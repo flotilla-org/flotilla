@@ -214,15 +214,21 @@ impl CredentialStore {
         environment: &BTreeMap<String, String>,
         runner: &dyn CommandRunner,
     ) -> Result<Vec<Fragment>, String> {
-        let paths = self.delivery_paths(runner).await?;
-        let mut fragments = Vec::new();
+        let mut codex_credentials = Vec::new();
         for name in credential_refs {
             let spec = self.spec(name).await?;
             if matches!(spec.consumer, CredentialConsumer::Codex) && !environment.contains_key("CODEX_HOME") {
-                fragments.push(codex_home_fragment(name, paths.credential_dir(name).join("codex").to_string_lossy()));
+                codex_credentials.push(name);
             }
         }
-        Ok(fragments)
+        if codex_credentials.is_empty() {
+            return Ok(Vec::new());
+        }
+        let paths = self.delivery_paths(runner).await?;
+        Ok(codex_credentials
+            .into_iter()
+            .map(|name| codex_home_fragment(name, paths.credential_dir(name).join("codex").to_string_lossy()))
+            .collect())
     }
 
     pub(crate) async fn held_credentials(&self) -> Result<BTreeSet<String>, String> {

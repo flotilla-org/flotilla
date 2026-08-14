@@ -14,8 +14,8 @@ use crate::providers::{
 /// Persistent writable base reserved inside provisioned containers. Unlike a
 /// user's home, this location is known before container creation, so writable
 /// material mounts and post-create runner writes can share one path contract.
-pub const CONTAINED_WRITABLE_CONFIG_BASE: &str = "/tmp/flotilla";
-pub const CONTAINED_CODEX_HOME: &str = "/tmp/flotilla/codex";
+pub const CONTAINED_WRITABLE_CONFIG_BASE: &str = "/tmp/flotilla-config";
+pub const CONTAINED_CODEX_HOME: &str = "/tmp/flotilla-codex";
 
 /// A `CommandRunner` decorator that executes all commands inside a Docker container
 /// via `docker exec`. Absolute working directories are forwarded as `-w`; relative
@@ -127,12 +127,12 @@ impl CommandRunner for DockerEnvironmentRunner {
 
 #[cfg(test)]
 mod tests {
-    use std::{future, path::Path, sync::Arc, time::Duration};
+    use std::{future, os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
     use uuid::Uuid;
 
-    use super::DockerEnvironmentRunner;
+    use super::{DockerEnvironmentRunner, CONTAINED_CODEX_HOME};
     use crate::providers::{testing::MockRunner, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
 
     struct DockerContainer(String);
@@ -213,7 +213,7 @@ mod tests {
         let config =
             runner.writable_config_base(Some(Path::new("/run/user/1000")), Path::new("/host/state")).await.expect("container config base");
 
-        assert_eq!(config, Path::new("/tmp/flotilla"));
+        assert_eq!(config, Path::new("/tmp/flotilla-config"));
         let calls = inner.calls();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].1.iter().any(|arg| arg == "flotilla-config-base"));
@@ -224,10 +224,28 @@ mod tests {
     #[ignore = "requires Docker and the busybox:latest image"]
     async fn persistent_delivery_paths_work_in_a_real_non_root_container() {
         let container = DockerContainer(format!("flotilla-non-root-delivery-{}", Uuid::new_v4()));
+        let codex_home = tempfile::tempdir().expect("Codex home mount source");
+        std::fs::set_permissions(codex_home.path(), std::fs::Permissions::from_mode(0o777))
+            .expect("make Codex mount writable to test user");
+        let codex_mount = format!("{}:{CONTAINED_CODEX_HOME}:rw", codex_home.path().display());
         ProcessCommandRunner
             .run(
                 "docker",
-                &["run", "-d", "--name", &container.0, "--user", "65534:65534", "-e", "HOME=/tmp", "busybox:latest", "sleep", "infinity"],
+                &[
+                    "run",
+                    "-d",
+                    "--name",
+                    &container.0,
+                    "--user",
+                    "65534:65534",
+                    "-e",
+                    "HOME=/tmp",
+                    "-v",
+                    &codex_mount,
+                    "busybox:latest",
+                    "sleep",
+                    "infinity",
+                ],
                 Path::new("/"),
                 &ChannelLabel::Noop,
             )
@@ -264,6 +282,10 @@ mod tests {
             .expect("resolve exported delivery paths");
 
         assert_eq!(observed, format!("{}\n{}", git_config.display(), agent_environment.display()));
+        runner
+            .run("sh", &["-c", "test -w \"$1\"", "flotilla-verify-codex-home", CONTAINED_CODEX_HOME], Path::new("/"), &ChannelLabel::Noop)
+            .await
+            .expect("Codex home mount is writable as non-root user");
         assert!(!git_config.starts_with("/run/flotilla"));
         assert!(!agent_environment.starts_with("/run/flotilla"));
     }
