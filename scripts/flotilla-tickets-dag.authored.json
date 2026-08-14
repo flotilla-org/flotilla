@@ -27,230 +27,269 @@
       "stage": "design",
       "group": "trackA",
       "shape": "stadium",
-      "dagLabel": "MAP #1046 substrate"
+      "dagLabel": "MAP #1046 substrate",
+      "title": "MAP #1046 substrate solidification"
     },
     "flotilla-org/flotilla#1124": {
       "detail": "PR #1130 merged — contained crews can register adapters",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1124 interior discovery<br>MERGED #1130"
+      "dagLabel": "#1124 interior discovery<br>MERGED #1130",
+      "title": "#1124 interior adapter discovery"
     },
     "flotilla-org/flotilla#1087": {
       "detail": "PR #1134 merged after warm-crew rebase — locally-built images usable",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1087 pull policies<br>MERGED #1134"
+      "dagLabel": "#1087 pull policies<br>MERGED #1134",
+      "title": "#1087 docker placement pull policies"
     },
     "flotilla-org/flotilla#1088": {
       "detail": "advice-not-schema project-side; digest testimony; steward staleness; step-results deleted. Enactment #1143, fog → #1142",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1088 image sourcing<br>RULED (all four)"
+      "dagLabel": "#1088 image sourcing<br>RULED (all four)",
+      "title": "#1088 image sourcing RULED"
     },
     "flotilla-org/flotilla#1050": {
       "detail": "ADR 0022 (PR #1138): declarations replicate / material local, stance-first grants, crew identity. Enactment #1139, operator setup #1140",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1050 credentials<br>RULED — ADR 0022"
+      "dagLabel": "#1050 credentials<br>RULED — ADR 0022",
+      "title": "#1050 credential scoping RULED"
     },
     "flotilla-org/flotilla#1051": {
       "detail": "jsonl + flotilla logs; flotilla fleet view; fact history = evidence (ADR 0023, PR #1144). Enactment #1145 #1146",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1051 ops visibility<br>RULED"
+      "dagLabel": "#1051 ops visibility<br>RULED",
+      "title": "#1051 ops visibility RULED"
     },
     "flotilla-org/flotilla#1125": {
       "detail": "PR #1157 merged 27 Jul eve — attach via send-keys one hop at a time, exec wrapped, quoting tested. Crew survived session loss + relaunch",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1125 send-keys hops<br>convoy dispatched"
+      "dagLabel": "#1125 send-keys hops<br>convoy dispatched",
+      "title": "#1125 send-keys attach chains"
     },
     "flotilla-org/flotilla#1114": {
       "detail": "PR #1137 merged; verify kiwi launchd install (operator step from the PR)",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1114 sweeper<br>MERGED #1137"
+      "dagLabel": "#1114 sweeper<br>MERGED #1137",
+      "title": "#1114 sweeper + incremental split"
     },
     "flotilla-org/flotilla#1111": {
       "detail": "instrumented by #1116; remaining: recovery, not just logging. Trigger was full disk",
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#1111 zombie daemon"
+      "dagLabel": "#1111 zombie daemon",
+      "title": "#1111 daemon serves nothing yet lives"
     },
     "flotilla-org/flotilla#917": {
       "detail": "durable fix for glibc-skew binary distribution and image regen",
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#917 artifact pipeline"
+      "dagLabel": "#917 artifact pipeline",
+      "title": "#917 CI-built artifacts + deploy-to-fleet"
     },
     "flotilla-org/flotilla#911": {
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#911 protocol fingerprint"
+      "dagLabel": "#911 protocol fingerprint",
+      "title": "#911 version=intent, fingerprint=fact"
     },
     "flotilla-org/flotilla#625": {
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#625 host/env model"
+      "dagLabel": "#625 host/env model",
+      "title": "#625 availability + wakeability"
     },
     "flotilla-org/flotilla#742": {
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#742 merge classes"
+      "dagLabel": "#742 merge classes",
+      "title": "#742 remaining replication merge classes"
     },
     "flotilla-org/flotilla#958": {
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#958 full-id refs"
+      "dagLabel": "#958 full-id refs",
+      "title": "#958 attach resolves mesh-wide"
     },
     "flotilla-org/flotilla#979": {
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#979 extraction/rename"
+      "dagLabel": "#979 extraction/rename",
+      "title": "#979 repo extraction (generative) + rename (identity-preserving)"
     },
     "flotilla-org/flotilla#903": {
       "detail": "PR #1169 merged 27 Jul night — suppressed categories labelled, admission errors hint leader dispatch",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#903 follower legibility<br>MERGED #1169"
+      "dagLabel": "#903 follower legibility<br>MERGED #1169",
+      "title": "#903 'disabled: follower mode'"
     },
     "flotilla-org/flotilla#835": {
       "stage": "waiting",
       "group": "trackA",
-      "dagLabel": "#835 searchlight convergence"
+      "dagLabel": "#835 searchlight convergence",
+      "title": "#835 reconcile-on-connect"
     },
     "flotilla-org/flotilla#1060": {
       "detail": "andamento#44 merged 27 Jul — configurable sidebar region stacks; check region form defaults became THE sizing mechanism when #1097 enactment starts",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackB",
-      "dagLabel": "#1060 regions<br>convoy dispatched"
+      "dagLabel": "#1060 regions<br>convoy dispatched",
+      "title": "#1060 regions — sidebar as ordered blocks"
     },
     "flotilla-org/flotilla#1095": {
       "detail": "andamento#46 merged 27 Jul night — governor shepherded after crew reaped by #1163",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackB",
-      "dagLabel": "#1095 hover<br>MERGED a#46"
+      "dagLabel": "#1095 hover<br>MERGED a#46",
+      "title": "#1095 hover detail surface"
     },
     "flotilla-org/flotilla#a42": {
       "detail": "andamento#45 merged 27 Jul eve",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackB",
-      "dagLabel": "andamento#42 template parse cache"
+      "dagLabel": "andamento#42 template parse cache",
+      "title": "<a href=\"https://github.com/flotilla-org/andamento/issues/42\">andamento 42</a> cache effective-template parsing"
     },
     "flotilla-org/flotilla#1097": {
       "detail": "Relocated to andamento#58 (file-where-enacted ruling) and ENACTED same day via andamento#59. Ruled 27 Jul; #1060 landed the gate.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackB",
-      "dagLabel": "#1097 variables<br>RULED — after #1060"
+      "dagLabel": "#1097 variables<br>RULED — after #1060",
+      "title": "#1097 node-scoped variables enactment"
     },
     "flotilla-org/flotilla#1061": {
       "detail": "andamento#47 merged 28 Jul — crew delivered cross-repo despite flotilla-project mis-target; convoy landed vacuously (deliverable invisible to gate — #1155-domain lesson)",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackB",
-      "dagLabel": "#1061 rule capture<br>MERGED a#47"
+      "dagLabel": "#1061 rule capture<br>MERGED a#47",
+      "title": "#1061 capture validity + optional levels"
     },
     "flotilla-org/flotilla#1096": {
       "stage": "design",
       "group": "trackB",
-      "dagLabel": "#1096 tab order vs rail"
+      "dagLabel": "#1096 tab order vs rail",
+      "title": "#1096 zellij tab order decoupled from visual order"
     },
     "flotilla-org/flotilla#a7": {
       "stage": "design",
       "group": "trackB",
-      "dagLabel": "andamento#7 title templates"
+      "dagLabel": "andamento#7 title templates",
+      "title": "<a href=\"https://github.com/flotilla-org/andamento/issues/7\">andamento 7</a> tab title templates + hover panel"
     },
     "flotilla-org/flotilla#a25": {
       "stage": "design",
       "group": "trackB",
-      "dagLabel": "andamento#25 inspect re-cut"
+      "dagLabel": "andamento#25 inspect re-cut",
+      "title": "<a href=\"https://github.com/flotilla-org/andamento/issues/25\">andamento 25</a> inspect/config oddities sweep"
     },
     "flotilla-org/flotilla#944": {
       "stage": "design",
       "group": "trackB",
-      "dagLabel": "#944 vessel detail view"
+      "dagLabel": "#944 vessel detail view",
+      "title": "#944 vessel view != one-row table"
     },
     "flotilla-org/flotilla#943": {
       "detail": "review against the #1056 rulings — likely partly ruled already",
       "stage": "design",
       "group": "trackB",
-      "dagLabel": "#943 fact semantics"
+      "dagLabel": "#943 fact semantics",
+      "title": "#943 identity vs display vs path"
     },
     "flotilla-org/flotilla#921": {
       "stage": "design",
       "group": "trackB",
-      "dagLabel": "#921 grouping sanity"
+      "dagLabel": "#921 grouping sanity",
+      "title": "#921 grouping structure"
     },
     "flotilla-org/flotilla#922": {
       "stage": "design",
       "group": "trackB",
-      "dagLabel": "#922 convoy-open granularity"
+      "dagLabel": "#922 convoy-open granularity",
+      "title": "#922 what opening materializes"
     },
     "flotilla-org/flotilla#920": {
       "stage": "design",
       "group": "trackB",
-      "dagLabel": "#920 ready-signal scope"
+      "dagLabel": "#920 ready-signal scope",
+      "title": "#920 'ready to go' for issue latents"
     },
     "flotilla-org/flotilla#866": {
       "stage": "waiting",
       "group": "trackB",
-      "dagLabel": "#866 retire stage-5 Presentation"
+      "dagLabel": "#866 retire stage-5 Presentation",
+      "title": "#866 Presentation retirement"
     },
     "flotilla-org/flotilla#z10": {
       "statusAtAuthoring": "ready",
       "stage": "ready",
       "group": "trackB",
-      "dagLabel": "zellij#10 screen-thread O(scrollback)"
+      "dagLabel": "zellij#10 screen-thread O(scrollback)",
+      "title": "<a href=\"https://forgejo.lab.flotilla.work/fork-issues/zellij/issues/10\">zellij 10</a> saturation fix"
     },
     "flotilla-org/flotilla#z9": {
       "stage": "waiting",
       "group": "trackB",
-      "dagLabel": "zellij#9 tab context<br>(held: layout pass)"
+      "dagLabel": "zellij#9 tab context<br>(held: layout pass)",
+      "title": "<a href=\"https://forgejo.lab.flotilla.work/fork-issues/zellij/issues/9\">zellij 9</a> atomic tab context"
     },
     "flotilla-org/flotilla#650": {
       "detail": "first independent actually existing is the track goal",
       "stage": "design",
       "group": "trackC",
-      "dagLabel": "#650 Governor v1"
+      "dagLabel": "#650 Governor v1",
+      "title": "#650 PersistentAgent + Governor"
     },
     "flotilla-org/flotilla#1115": {
       "stage": "design",
       "group": "trackC",
-      "dagLabel": "#1115 Quartermaster v1"
+      "dagLabel": "#1115 Quartermaster v1",
+      "title": "#1115 deterministic admission floor, judgment above, operator escalation always"
     },
     "flotilla-org/flotilla#1071": {
       "detail": "Ruled: convoy start --pr N, explicit CR binding, shepherd brief template, loop-v0 (no lifecycle smuggling). Fog: adopt-as-input-sugar. Dispatch next round",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackC",
-      "dagLabel": "#1071 PR adoption slice 1<br>GRILLED — ready"
+      "dagLabel": "#1071 PR adoption slice 1<br>GRILLED — ready",
+      "title": "#1071 convoy adopts existing branch/PR as cargo"
     },
     "flotilla-org/flotilla#939": {
       "stage": "design",
       "group": "trackC",
-      "dagLabel": "#939 primed prefixes"
+      "dagLabel": "#939 primed prefixes",
+      "title": "#939 prime/freeze/fork sessions"
     },
     "flotilla-org/flotilla#940": {
       "stage": "design",
       "group": "trackC",
-      "dagLabel": "#940 build-optimizer steward"
+      "dagLabel": "#940 build-optimizer steward",
+      "title": "#940 trace-driven maintenance"
     },
     "flotilla-org/flotilla#838": {
       "stage": "design",
       "group": "trackC",
-      "dagLabel": "#838 token-burn plane"
+      "dagLabel": "#838 token-burn plane",
+      "title": "#838 burn detection/remediation"
     },
     "flotilla-org/flotilla#988": {
       "stage": "parked",
@@ -267,64 +306,75 @@
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "cleat#177 seat verbs<br>convoy: cleat-seat-control"
+      "dagLabel": "cleat#177 seat verbs<br>convoy: cleat-seat-control",
+      "title": "<a href=\"https://github.com/flotilla-org/cleat/issues/177\">cleat 177</a> seat management: watch fallback, --take, banner, identity"
     },
     "flotilla-org/flotilla#1113": {
       "detail": "PR #1159 merged 27 Jul eve — ADR 0021 lifecycle re-cut enacted (Landing/Landed/Anchored; Completed deleted). Crew survived session loss + relaunch. Resolves #1026",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1113 lifecycle re-cut<br>convoy dispatched"
+      "dagLabel": "#1113 lifecycle re-cut<br>convoy dispatched",
+      "title": "#1113 convoy lifecycle enactment"
     },
     "flotilla-org/flotilla#1026": {
       "detail": "resolved by the #1113 reconciler condition (ruled); stays open until enactment lands",
       "stage": "waiting",
       "group": "trackD",
-      "dagLabel": "#1026 idle crews never Done"
+      "dagLabel": "#1026 idle crews never Done",
+      "title": "#1026 merged PRs, convoy stays Active"
     },
     "flotilla-org/flotilla#1010": {
       "detail": "superseded by cleat 177; remaining flotilla-side: ghost-server orphaned panes",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1010 attach noise<br>superseded"
+      "dagLabel": "#1010 attach noise<br>superseded",
+      "title": "#1010 zellij attach contention"
     },
     "flotilla-org/flotilla#1128": {
       "detail": "needs the cleat 177 attach-failure exit contract first — not actually ready",
       "stage": "waiting",
       "group": "trackD",
-      "dagLabel": "#1128 seat-race errors"
+      "dagLabel": "#1128 seat-race errors",
+      "title": "#1128 distinguish seat races from unrelated attach failures"
     },
     "flotilla-org/flotilla#1081": {
       "detail": "all code pieces landed; ops staged (zellij project, feta docker placement). Gated on #1155 target split + #1139 adapters + #1140 grants (crew must push rjwittams/zellij). First payload: STACK.md doc ticket, then zellij#8",
       "stage": "waiting",
       "group": "trackD",
-      "dagLabel": "#1081 fork tracer<br>UNBLOCKED"
+      "dagLabel": "#1081 fork tracer<br>UNBLOCKED",
+      "title": "#1081 fork convoy tracer"
     },
     "flotilla-org/flotilla#1086": {
       "stage": "design",
       "group": "trackD",
-      "dagLabel": "#1086 fork workflow"
+      "dagLabel": "#1086 fork workflow",
+      "title": "#1086 per-repo verification + fork-work template"
     },
     "flotilla-org/flotilla#1094": {
       "stage": "design",
       "group": "trackD",
-      "dagLabel": "#1094 bunk management"
+      "dagLabel": "#1094 bunk management",
+      "title": "#1094 runtime crew/pane expansion, policy-directed"
     },
     "flotilla-org/flotilla#928": {
       "stage": "design",
       "group": "trackD",
-      "dagLabel": "#928 cycle-time program"
+      "dagLabel": "#928 cycle-time program",
+      "title": "#928 remaining cycle-time threads"
     },
     "flotilla-org/flotilla#1080": {
       "stage": "design",
       "group": "trackD",
-      "dagLabel": "#1080 prototype lifecycle"
+      "dagLabel": "#1080 prototype lifecycle",
+      "title": "#1080 prototype artifact cleanup + home outside the code repo"
     },
     "flotilla-org/flotilla#633": {
       "stage": "waiting",
       "group": "trackD",
-      "dagLabel": "#633 dogfood acceptance day"
+      "dagLabel": "#633 dogfood acceptance day",
+      "title": "#633 M1 dogfood pass"
     },
     "flotilla-org/flotilla#1103": {
       "stage": "parked",
@@ -336,33 +386,38 @@
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1129 name resolution<br>MERGED #1132"
+      "dagLabel": "#1129 name resolution<br>MERGED #1132",
+      "title": "#1129 project-ref normalization"
     },
     "flotilla-org/flotilla#1077": {
       "detail": "PR #1170 merged 27 Jul night — governor shepherded after crew reaped by #1163",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1077 snapshot re-send<br>MERGED #1170"
+      "dagLabel": "#1077 snapshot re-send<br>MERGED #1170",
+      "title": "#1077 skip unchanged project-scoped snapshots"
     },
     "flotilla-org/flotilla#1014": {
       "detail": "PR #1133 merged",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1014 supervisors<br>MERGED #1133"
+      "dagLabel": "#1014 supervisors<br>MERGED #1133",
+      "title": "#1014 supervisor pruning"
     },
     "flotilla-org/flotilla#1017": {
       "detail": "PR #1167 merged 27 Jul eve",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1017 name collision"
+      "dagLabel": "#1017 name collision",
+      "title": "#1017 multi-repo generated-name collision"
     },
     "flotilla-org/flotilla#1091": {
       "stage": "design",
       "group": "dogfood",
-      "dagLabel": "#1091 board hardening"
+      "dagLabel": "#1091 board hardening",
+      "title": "#1091 DAG board: split generated state from authored judgment"
     },
     "flotilla-org/flotilla#945": {
       "stage": "parked",
@@ -414,514 +469,595 @@
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1135 free-space floor<br>MERGED #1141"
+      "dagLabel": "#1135 free-space floor<br>MERGED #1141",
+      "title": "#1135 admission free-space floor"
     },
     "flotilla-org/flotilla#1139": {
       "detail": "PR #1156 merged 27 Jul night — ADR 0022 enactment (CredentialSpec, grants, gh/forgejo adapters, preflight). Crew survived session loss, relaunch, and warm rebase over two merges",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1139 credential enactment<br>convoy dispatched"
+      "dagLabel": "#1139 credential enactment<br>convoy dispatched",
+      "title": "#1139 CredentialSpec + adapters + preflight"
     },
     "flotilla-org/flotilla#1140": {
       "detail": "Codex pool live: 2 slots minted via device-auth on feta, N=3 concurrency verified, CODEX_HOME write confirmed. Design fully walked+ruled (conch lease, mint-vessel, waiting+mint-on-exhaustion, not host-locked, proxy-compatible). Remaining = unbuilt code; ADR 0022 amendment carried",
       "stage": "waiting",
       "group": "trackA",
-      "dagLabel": "#1140 creds + seeding<br>POOL BOOTSTRAPPED"
+      "dagLabel": "#1140 creds + seeding<br>POOL BOOTSTRAPPED",
+      "title": "#1140 machine account + host tokens"
     },
     "flotilla-org/flotilla#1143": {
       "detail": "PR #1174 merged 27 Jul night — image testimony stamped, step-results deleted",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1143 digest stamping<br>MERGED #1174"
+      "dagLabel": "#1143 digest stamping<br>MERGED #1174",
+      "title": "#1143 image testimony + step-result deletion"
     },
     "flotilla-org/flotilla#1142": {
       "detail": "graduated fog from #1088 — grill on map #1046",
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#1142 project ops repo<br>(brainstorm)"
+      "dagLabel": "#1142 project ops repo<br>(brainstorm)",
+      "title": "#1142 repo-vs-resources / project ops repo"
     },
     "flotilla-org/flotilla#1145": {
       "detail": "PR #1171 merged 27 Jul night — structured daemon logs + mesh-aware logs verb",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1145 jsonl logging<br>MERGED #1171"
+      "dagLabel": "#1145 jsonl logging<br>MERGED #1171",
+      "title": "#1145 structured logging + mesh logs verb"
     },
     "flotilla-org/flotilla#1146": {
       "detail": "PR #1173 merged 27 Jul late — governor rebased (credential+health heartbeat merge) and fixed final review findings after crew idled",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1146 fleet view<br>MERGED #1173"
+      "dagLabel": "#1146 fleet view<br>MERGED #1173",
+      "title": "#1146 flotilla fleet + TUI hosts dashboard"
     },
     "flotilla-org/flotilla#1147": {
       "detail": "D-track tracer: coder+reviewer roles, HandedBack loop, claude-review suppressed via label. Waits on the contained chain (#1134, #1143)",
       "stage": "waiting",
       "group": "trackD",
-      "dagLabel": "#1147 implement-review tracer<br>first live loop"
+      "dagLabel": "#1147 implement-review tracer<br>first live loop",
+      "title": "#1147 first implement-review convoy"
     },
     "flotilla-org/flotilla#1148": {
       "detail": "ruled: loop-until-settle mirroring pr-shepherd; persistent convoy artifact, forge post = one emission destination; schema after #1147 findings",
       "stage": "waiting",
       "group": "trackD",
-      "dagLabel": "#1148 review as cargo"
+      "dagLabel": "#1148 review as cargo",
+      "title": "#1148 review record as cargo"
     },
     "flotilla-org/flotilla#1149": {
       "detail": "hints never state; native collection + federated query; turn messaging mandatory. Rides #1147/#1148",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1149 event substrate<br>RULED"
+      "dagLabel": "#1149 event substrate<br>RULED",
+      "title": "#1149 convoy events RULED"
     },
     "flotilla-org/flotilla#1150": {
       "detail": "automates the #1134 manual resume; state-driven, no event plumbing; waits on #1113 enactment",
       "stage": "design",
       "group": "trackD",
-      "dagLabel": "#1150 wake to rebase"
+      "dagLabel": "#1150 wake to rebase",
+      "title": "#1150 conflict → message warm crew"
     },
     "flotilla-org/flotilla#1155": {
       "detail": "PR #1162 merged 27 Jul eve — source_ref/target_ref split on main. Crew reaped mid-shepherd by #1163; governor shepherded the PR home. Fork tracer code chain COMPLETE",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1155 source_ref / target_ref split"
+      "dagLabel": "#1155 source_ref / target_ref split",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1155\">#1155</a> split source_ref from declared target_ref"
     },
     "flotilla-org/flotilla#1153": {
       "detail": "PR #1182 merged 28 Jul — session liveness observed, restart recovery. Convoy settled itself post-merge (teardown of attached session observed, branch preserved)",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1153 session liveness<br>MERGED #1182"
+      "dagLabel": "#1153 session liveness<br>MERGED #1182",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1153\">#1153</a> daemon restart leaves work Running, sessions gone"
     },
     "flotilla-org/flotilla#1154": {
       "detail": "PR #1168 merged 27 Jul eve — untouched checkouts pass the teardown gate",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1154 teardown gate false positive"
+      "dagLabel": "#1154 teardown gate false positive",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1154\">#1154</a> Landed gate false-positives on untouched multi-repo checkouts"
     },
     "flotilla-org/flotilla#1158": {
       "detail": "Robert 27 Jul: teardown owns terminals, extract pre-scoped (ADR 0021), containment boundary (ADR 0022), vessel-scoped blast radius (#1153). RULED: multi-cleat attach = presentation manager; TUI keeps limited in-a-pinch attach; cleat stays per-server. Still open: who starts it, docker placement, cleat#179 interplay",
       "stage": "design",
       "group": "trackD",
-      "dagLabel": "#1158 cleat daemon per vessel"
+      "dagLabel": "#1158 cleat daemon per vessel",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1158\">#1158</a> cleat daemon per vessel as the usual"
     },
     "flotilla-org/flotilla#1163": {
       "detail": "PR #1164 v4 rebuilt on main after #1162/#1168 superseded probe shape; carries evidence-only latch + git-first BaseComparison + 30s decision-edge TTL. All checks green, review clean — awaiting merge, then feta deploy/bounce",
       "statusAtAuthoring": "at-sea",
       "stage": "flight",
       "group": "dogfood",
-      "dagLabel": "#1163 landing gate stale evidence<br>#1164 v4 GREEN"
+      "dagLabel": "#1163 landing gate stale evidence<br>#1164 v4 GREEN",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1163\">#1163</a> Landing gate trusts stale/absent CR evidence"
     },
     "flotilla-org/flotilla#1165": {
       "detail": "Fixed in #1180 (reconciler-robustness convoy, batched with #1166) — merged 28 Jul",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1165 reclaim hot-loop<br>MERGED #1180"
+      "dagLabel": "#1165 reclaim hot-loop<br>MERGED #1180",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1165\">#1165</a> refused reclaim hot-loops, no backoff"
     },
     "flotilla-org/flotilla#1166": {
       "detail": "Fixed in #1180 — level-triggered re-drive of dropped actuations; provisioning + deletion paths. Merged 28 Jul",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1166 lost actuations<br>MERGED #1180"
+      "dagLabel": "#1166 lost actuations<br>MERGED #1180",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1166\">#1166</a> provisioning actuations lost under load never re-driven"
     },
     "flotilla-org/flotilla#1175": {
       "detail": "Fixed in #1178 — injectable disk measurement. Merged 28 Jul",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1175 disk probe<br>MERGED #1178"
+      "dagLabel": "#1175 disk probe<br>MERGED #1178",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1175\">#1175</a> admission disk probe not injectable"
     },
     "flotilla-org/flotilla#1176": {
       "detail": "GRILLED to contract + dispatched: injectable Clock + contract battery (5 properties, write-counting backend, direct-step driving) + 2 enrollees (checkout reconciler, convoy landing path). Supervisor out of scope; equivalence/adversarial = later slices",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1176 liveness harness slice 1<br>MERGED #1214"
+      "dagLabel": "#1176 liveness harness slice 1<br>MERGED #1214",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1176\">#1176</a> reconciler liveness harness (Brainstorm)"
     },
     "flotilla-org/flotilla#1177": {
       "detail": "Fixed in #1179 — remote host self-reports preserved through replica aggregation. Merged 28 Jul",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1177 fleet remote health<br>MERGED #1179"
+      "dagLabel": "#1177 fleet remote health<br>MERGED #1179",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1177\">#1177</a> remote self-reported health not aggregated"
     },
     "flotilla-org/flotilla#1172": {
       "detail": "Fixed in #1178 (env-independent-tests convoy, batched with #1175) — merged 28 Jul",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1172 env-dependent tests<br>MERGED #1178"
+      "dagLabel": "#1172 env-dependent tests<br>MERGED #1178",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1172\">#1172</a> host-env-dependent tests"
     },
     "flotilla-org/flotilla#1181": {
       "detail": "feta suspended mid-provisioning: inhibitor acquire/die loop every 30s for hours, WARN-only, no escalation. Wants diagnosis + degraded-condition surfacing in fleet view",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1181 sleep inhibitor silent failure<br>MERGED #1212"
+      "dagLabel": "#1181 sleep inhibitor silent failure<br>MERGED #1212",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1181\">#1181</a> systemd-inhibit exits 1, host slept under crew"
     },
     "flotilla-org/flotilla#1183": {
       "detail": "From the mis-location incident: name hosts on surfaces, record placement decisions, tunnel cleat sockets Tender-style. Brainstorm",
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#1183 location legibility<br>+ mesh verbs"
+      "dagLabel": "#1183 location legibility<br>+ mesh verbs",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1183\">#1183</a> vessel location legibility + routed verbs"
     },
     "flotilla-org/flotilla#1184": {
       "detail": "Ruled: 20GiB floor is project/repo/task-scoped, not global; daemon knob demoted to host-protective minimum. Feature",
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#1184 scoped disk floor"
+      "dagLabel": "#1184 scoped disk floor",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1184\">#1184</a> free-space floor → workload requirement"
     },
     "flotilla-org/flotilla#1185": {
       "detail": "Predicates+scoring over host facts; decision recorded; schema laid for Quartermaster to become the decider. Brainstorm",
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#1185 selector placement<br>(Quartermaster)"
+      "dagLabel": "#1185 selector placement<br>(Quartermaster)",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1185\">#1185</a> host-agnostic placement policies"
     },
     "flotilla-org/flotilla#1186": {
       "detail": "comte/beaufort/brie revival: agentless Host flavor, probed health, remote-runner actuation; salvage Plane-A inventory pre-deletion. Brainstorm",
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#1186 agentless hosts"
+      "dagLabel": "#1186 agentless hosts",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1186\">#1186</a> ssh-only hosts in Plane B"
     },
     "flotilla-org/flotilla#1187": {
       "detail": "PR #1193 merged 28 Jul after 3-round governor review: reconcile-at-boot, no-op-on-equal, loud overwrite, ownership label converged. Builtin case of #1192 manifest loop",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1187 stale builtin templates<br>MERGED #1193"
+      "dagLabel": "#1187 stale builtin templates<br>MERGED #1193",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1187\">#1187</a> stale builtins downgrade containment"
     },
     "flotilla-org/flotilla#1188": {
       "detail": "Fully ruled: owner-store convoys, placed-on-me replica watch + local actuation, single-writer fact merge (#1179 pattern), owner-only phase decisions, act-on-last-known + destructive freeze offline. Body is the contract; substantial cargo — dispatch when wanted",
       "statusAtAuthoring": "ready",
       "stage": "ready",
       "group": "dogfood",
-      "dagLabel": "#1188 federation slice<br>GRILLED — contract ready"
+      "dagLabel": "#1188 federation slice<br>GRILLED — contract ready",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1188\">#1188</a> contained placement on remote host"
     },
     "flotilla-org/flotilla#1189": {
       "detail": "PR #1194 merged 28 Jul — exec output collection fixed, crew delivered in 37min, evidence-backed landing, zero governor intervention. Containment wall down pending deploy",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1189 docker probe exec<br>MERGED #1194"
+      "dagLabel": "#1189 docker probe exec<br>MERGED #1194",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1189\">#1189</a> docker probe output never read"
     },
     "flotilla-org/flotilla#1190": {
       "detail": "Daily-driver blackout: aggregator died decoding stale replica cache (source_ref), restart budget exhausted silently, TUI rendered peers-only. Recovered by clearing peers/ cache. Wants: budget-exhaustion as degraded condition, drop bad cache objects, named decode errors",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1190 aggregator dead, peers-only render<br>MERGED #1206"
+      "dagLabel": "#1190 aggregator dead, peers-only render<br>MERGED #1206",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1190\">#1190</a> aggregator crash-loop = empty local projections"
     },
     "flotilla-org/flotilla#1191": {
       "detail": "Plane-A-coupled observation; view-materialized projects render empty. Wants view-path self-sufficiency + cold-start equivalence test",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1191 observed-checkout coverage<br>MERGED #1204"
+      "dagLabel": "#1191 observed-checkout coverage<br>MERGED #1204",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1191\">#1191</a> untracked project repos unobserved"
     },
     "flotilla-org/flotilla#1192": {
       "detail": "RULED: k8s manifest pattern, project-map home, level-triggered loop (not boot hook), drift-visible-not-corrected, ownership labels. First slice cuttable on demand. Fog: layout conventions, managed-kind set, role indirection for template names",
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#1192 durable project definitions"
+      "dagLabel": "#1192 durable project definitions",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1192\">#1192</a> projects as fleet-wide declarative definitions"
     },
     "flotilla-org/flotilla#a48": {
       "detail": "Empty projects invisible = indistinguishable from data loss; extended #1190 diagnosis",
       "statusAtAuthoring": "ready",
       "stage": "ready",
       "group": "trackB",
-      "dagLabel": "andamento#48 render empty projects"
+      "dagLabel": "andamento#48 render empty projects",
+      "title": "<a href=\"https://github.com/flotilla-org/andamento/issues/48\">andamento#48</a> existence renders; emptiness is a state"
     },
     "flotilla-org/flotilla#1195": {
       "detail": "attach broke on weeks-stale feta cargo-bin CLI. Wants wire-generation handshake + daemon-advertised paired CLI; #1183 tunneled verbs dissolve the class",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1195 paired-CLI resolution"
+      "dagLabel": "#1195 paired-CLI resolution",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1195\">#1195</a> cross-host verbs resolve stale binaries"
     },
     "flotilla-org/flotilla#a49": {
       "detail": "Contract: reproduce-first, rendered evidence in PR. Dispatch after a#50 fixtures exist (in-process snapshots make evidence cheap)",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackB",
-      "dagLabel": "andamento#49 hover panel gone"
+      "dagLabel": "andamento#49 hover panel gone",
+      "title": "<a href=\"https://github.com/flotilla-org/andamento/issues/49\">andamento#49</a> hover detail regression"
     },
     "flotilla-org/flotilla#1196": {
       "detail": "First #1192 slice dispatched: additive level-triggered apply loop, ownership+last-applied labels, drift-skip+WARN, no prune. Retires category-3 loss",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1196 manifest apply loop<br>MERGED #1205"
+      "dagLabel": "#1196 manifest apply loop<br>MERGED #1205",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1196\">#1196</a> manifest reconciler slice 1"
     },
     "flotilla-org/flotilla#a50": {
       "detail": "HELD: three dispatch attempts failed on #1218 (clone retry non-idempotence). Re-dispatch after that fix lands",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackB",
-      "dagLabel": "andamento#50 in-process render tests"
+      "dagLabel": "andamento#50 in-process render tests",
+      "title": "<a href=\"https://github.com/flotilla-org/andamento/issues/50\">andamento#50</a> headless frame-snapshot harness"
     },
     "flotilla-org/flotilla#a51": {
       "detail": "Direction captured: rail-owned style types decouple renderer; modes = backends. Ghostty-windows-as-PM for tiling users; kitty enhancement compatible with zellij fork plumbing, not tied to it",
       "stage": "design",
       "group": "trackB",
-      "dagLabel": "andamento#51 standalone rail<br>(surface-agnostic)"
+      "dagLabel": "andamento#51 standalone rail<br>(surface-agnostic)",
+      "title": "<a href=\"https://github.com/flotilla-org/andamento/issues/51\">andamento#51</a> rail modes: zellij/plain/wheelhouse/kitty"
     },
     "flotilla-org/flotilla#1199": {
       "detail": "#1198 flip inert for stored projects (create-if-missing). #1187 disease, project edition; wants #1193 pattern with generator-owned-fields-only reconcile. Hand-patched kiwi interim",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1199 project specs not reconciled<br>MERGED #1207"
+      "dagLabel": "#1199 project specs not reconciled<br>MERGED #1207",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1199\">#1199</a> whole-repo projects stuck on old generator"
     },
     "flotilla-org/flotilla#1201": {
       "detail": "Contained smoke corpse strangled all feta provisioning (budget exhaustion, silent). Wants host-uid containers, per-checkout isolation; second live validation of #1190 degraded-condition AC",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1201 root-owned debris kills checkout controller<br>MERGED #1210"
+      "dagLabel": "#1201 root-owned debris kills checkout controller<br>MERGED #1210",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1201\">#1201</a> container uid/gid + controller isolation"
     },
     "flotilla-org/flotilla#1202": {
       "detail": "docker-crew-smoke work row 'running' post-delete; #1182 recovery resurrects purged orphan session every boot. Teardown must clean records; recovery must check owning resource",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1202 zombie work records<br>MERGED #1208"
+      "dagLabel": "#1202 zombie work records<br>MERGED #1208",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1202\">#1202</a> work/session records survive deletion"
     },
     "flotilla-org/flotilla#1200": {
       "detail": "Per-crew HOME floor + narrow overrides + per-crew TMPDIR; same-uid = collision not security boundary; ADR 0022 correction (codex takes OPENAI_API_KEY ambient). Feeds #1140 adapter redesign",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1200 seeding research PR"
+      "dagLabel": "#1200 seeding research PR",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/pull/1200\">PR #1200</a> multi-crew config seeding research"
     },
     "flotilla-org/flotilla#1209": {
       "detail": "Merged + deployed same evening: host names, PlacementDecision records, delete verb — first production use adopted the andamento manifests into managed state on both stores",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1209 legibility slice 1<br>MERGED #1217"
+      "dagLabel": "#1209 legibility slice 1<br>MERGED #1217",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1209\">#1209</a> host names + decision records + delete verb"
     },
     "flotilla-org/flotilla#1215": {
       "detail": "Contained vessels have /run/flotilla.sock (Phase-D plumbing alive) but image lacks flotilla binary. Direction: bind-mount host paired CLI (#1195 principle). Next containment wall after #1140",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1215 vessel CLI missing"
+      "dagLabel": "#1215 vessel CLI missing",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1215\">#1215</a> socket mounted, no client"
     },
     "flotilla-org/flotilla#1216": {
       "detail": "Ruled: loop is convoy state machine, not agent discipline. Absorbs #1203 + #1150 triggers. Brainstorm — grill next",
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#1216 review round-trip<br>(state machine)"
+      "dagLabel": "#1216 review round-trip<br>(state machine)",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1216\">#1216</a> turns/re-engagement/budgets as lifecycle"
     },
     "flotilla-org/flotilla#1211": {
       "detail": "ADR 0022 amendment merged (exec-vs-TUI nuance preserved after review catch)",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "PR #1211 ADR 0022 amendment"
+      "dagLabel": "PR #1211 ADR 0022 amendment",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1211\">#1211</a> subscriptions primary, lease-located material"
     },
     "flotilla-org/flotilla#1218": {
       "detail": "Attempt 5 failed post-#1220 with dir vanishing after: CONCURRENT duplicate clone actuations racing in one run (re-drive while in flight), transient error latching convoy Failed. Wants single-flight guard + no-latch-on-transient. a#50 = reproducer, still held",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1218 clone single-flight<br>REOPENED — convoy round 2"
+      "dagLabel": "#1218 clone single-flight<br>REOPENED — convoy round 2",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1218\">#1218</a> fresh-clone self-collision on retry"
     },
     "flotilla-org/flotilla#1223": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1223\">PR #1223 sweep-unit PATH (hand-made, green)</a>"
     },
     "flotilla-org/flotilla#1224": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1224\">#1224 placement: viable-losers invisible + prefer-local hardcode</a>"
     },
     "flotilla-org/flotilla#1225": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1225\">#1225 capability shed must be loud</a>"
     },
     "flotilla-org/flotilla#1232": {
       "stage": "design",
       "group": "trackD",
-      "dagLabel": "#1232 declarative convoy workflow<br>design"
+      "dagLabel": "#1232 declarative convoy workflow<br>design",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1232\">#1232 declarative convoy workflow (argocd-ish) BRAINSTORM</a>"
     },
     "flotilla-org/flotilla#1233": {
       "stage": "design",
       "group": "trackD",
-      "dagLabel": "#1233 state events into convoys BRAINSTORM<br>design"
+      "dagLabel": "#1233 state events into convoys BRAINSTORM<br>design",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1233\">#1233 state events into convoys BRAINSTORM</a>"
     },
     "flotilla-org/flotilla#1235": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1235 codex slot lease into contained<br>CLOSED"
+      "dagLabel": "#1235 codex slot lease into contained<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1235\">#1235 codex slot lease into contained vessels (seeding slice 1)</a>"
     },
     "flotilla-org/flotilla#1236": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1236 policy re-registration stomps<br>CLOSED"
+      "dagLabel": "#1236 policy re-registration stomps<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1236\">#1236 policy re-registration stomps operator fields</a>"
     },
     "flotilla-org/flotilla#1237": {
       "statusAtAuthoring": "ready",
       "stage": "ready",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1237\">#1237 convoy start message regression</a>"
     },
     "flotilla-org/flotilla#1238": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1238\">#1238 decode quarantine + crash-loop visibility</a>"
     },
     "flotilla-org/flotilla#1239": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1239\">#1239 peer fd leak / accept spin</a>"
     },
     "flotilla-org/flotilla#1246": {
       "detail": "CLOSED 1 Aug: r5 (interior launch + cross-host attach) + r6 (full contract unaided, contained completion via #1304/#1313). Docker e2e tracer DONE.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1246 containment smoke round 4<br>CLOSED"
+      "dagLabel": "#1246 containment smoke round 4<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1246\">#1246 containment smoke round 4</a>"
     },
     "flotilla-org/flotilla#1247": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1247 remote placement env lookup<br>CLOSED"
+      "dagLabel": "#1247 remote placement env lookup<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1247\">#1247 remote placement env lookup (admitting-side, from #1222)</a>"
     },
     "flotilla-org/flotilla#1250": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1250\">PR #1250 ADR 0024 + research (hand-made, shepherding)</a>"
     },
     "flotilla-org/flotilla#1251": {
       "detail": "PR #1279 merged 31 Jul — ownership tables + single write path, PlacementPolicy enrolled. Crew completion stranded by #1296; settled by hand.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1251 field ownership @ write path (slice 1)<br>CLOSED"
+      "dagLabel": "#1251 field ownership @ write path (slice 1)<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1251\">#1251 field ownership @ write path (slice 1)</a>"
     },
     "flotilla-org/flotilla#1252": {
       "detail": "PR #1280 merged 31 Jul — transition vocabulary + the week's three bugs as failing sequences.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1252 harness transition vocabulary + bug<br>CLOSED"
+      "dagLabel": "#1252 harness transition vocabulary + bug<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1252\">#1252 harness transition vocabulary + bug sequences (slice 2)</a>"
     },
     "flotilla-org/flotilla#1253": {
       "stage": "waiting",
       "group": "dogfood",
-      "dagLabel": "#1253 differential oracles (slice 3)<br>waiting"
+      "dagLabel": "#1253 differential oracles (slice 3)<br>waiting",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1253\">#1253 differential oracles (slice 3)</a>"
     },
     "flotilla-org/flotilla#1254": {
       "stage": "waiting",
       "group": "dogfood",
-      "dagLabel": "#1254 proptest-state-machine (slice 4)<br>waiting"
+      "dagLabel": "#1254 proptest-state-machine (slice 4)<br>waiting",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1254\">#1254 proptest-state-machine (slice 4)</a>"
     },
     "flotilla-org/flotilla#1255": {
       "stage": "waiting",
       "group": "dogfood",
-      "dagLabel": "#1255 per-read authority assertion (slice 5)<br>waiting"
+      "dagLabel": "#1255 per-read authority assertion (slice 5)<br>waiting",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1255\">#1255 per-read authority assertion (slice 5)</a>"
     },
     "flotilla-org/flotilla#1256": {
       "stage": "waiting",
       "group": "dogfood",
-      "dagLabel": "#1256 convoy table as data + monitor fold<br>waiting"
+      "dagLabel": "#1256 convoy table as data + monitor fold<br>waiting",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1256\">#1256 convoy table as data + monitor fold (slice 6)</a>"
     },
     "flotilla-org/flotilla#1257": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1257 follower replication broken<br>CLOSED"
+      "dagLabel": "#1257 follower replication broken<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1257\">#1257 follower replication broken (P0; forcing function for follower retirement?)</a>"
     },
     "flotilla-org/flotilla#1258": {
       "detail": "#1273 merged; issue closed. Workflows land lab-side per forks-first ruling.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1258 per-repo CI publishing, feta+comte<br>CLOSED"
+      "dagLabel": "#1258 per-repo CI publishing, feta+comte<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1258\">#1258 per-repo CI publishing, feta+comte runners (rel slice 1)</a>"
     },
     "flotilla-org/flotilla#1259": {
       "stage": "waiting",
       "group": "trackA",
-      "dagLabel": "#1259 release pin + updater pull loop<br>waiting"
+      "dagLabel": "#1259 release pin + updater pull loop<br>waiting",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1259\">#1259 release pin + updater pull loop (rel slice 2)</a>"
     },
     "flotilla-org/flotilla#1260": {
       "stage": "waiting",
       "group": "trackA",
-      "dagLabel": "#1260 crew image baked per release<br>waiting"
+      "dagLabel": "#1260 crew image baked per release<br>waiting",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1260\">#1260 crew image baked per release (rel slice 3)</a>"
     },
     "flotilla-org/flotilla#1262": {
       "detail": "CLOSED 2 Aug: destination reached via reframe. ADR 0027 adopted (PR #1319); contracts #1321/#1322 filed; steps 3-4 deliberately unticketed (wait on transcript corpus).",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "MAP #1262 substrate<br>CLOSED — ADR 0027"
+      "dagLabel": "MAP #1262 substrate<br>CLOSED — ADR 0027",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1262\">MAP #1262 workflow + state-event substrate</a>"
     },
     "flotilla-org/flotilla#1263": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1263 R: workflow-model prior art<br>CLOSED"
+      "dagLabel": "#1263 R: workflow-model prior art<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1263\">#1263 R: workflow-model prior art (crewed steps)</a>"
     },
     "flotilla-org/flotilla#1264": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1264 R: eventing/subscription prior art<br>CLOSED"
+      "dagLabel": "#1264 R: eventing/subscription prior art<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1264\">#1264 R: eventing/subscription prior art</a>"
     },
     "flotilla-org/flotilla#1265": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1265 G: event vocabulary<br>CLOSED"
+      "dagLabel": "#1265 G: event vocabulary<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1265\">#1265 G: event vocabulary</a>"
     },
     "flotilla-org/flotilla#1266": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1266 G: subscription surface<br>CLOSED"
+      "dagLabel": "#1266 G: subscription surface<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1266\">#1266 G: subscription surface</a>"
     },
     "flotilla-org/flotilla#1267": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1267 G: wake semantics<br>CLOSED"
+      "dagLabel": "#1267 G: wake semantics<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1267\">#1267 G: wake semantics</a>"
     },
     "flotilla-org/flotilla#1268": {
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1268 G: workflow model core<br>CLOSED"
+      "dagLabel": "#1268 G: workflow model core<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1268\">#1268 G: workflow model core</a>"
     },
     "flotilla-org/flotilla#1269": {
       "detail": "PR #1282 merged; closed — superseded by the #1285 reframe (verb surface + turn log).",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1269 P: three proving scenarios as data<br>CLOSED"
+      "dagLabel": "#1269 P: three proving scenarios as data<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1269\">#1269 P: three proving scenarios as data</a>"
     },
     "flotilla-org/flotilla#1270": {
       "detail": "CLOSED 2 Aug: grill ran (turn ruling, dispositions, 4 vocab fixes); ADR 0027 on main + contracts #1321/#1322 = both exit halves.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1270 map exit grill<br>CLOSED"
+      "dagLabel": "#1270 map exit grill<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1270\">#1270 G: ADR cut + contracts (exit)</a>"
     },
     "flotilla-org/flotilla#1278": {
       "detail": "PR #1281 merged 31 Jul — interior cleat; tool-in-environment generalization (#1284 follow-up filed).",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1278 contained agent launches host-side<br>CLOSED"
+      "dagLabel": "#1278 contained agent launches host-side<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1278\">#1278 contained agent launches host-side (round-4 wall)</a>"
     },
     "flotilla-org/flotilla#1286": {
       "detail": "PR #1288 merged 1 Aug — resource get/list/watch via client+CLI, cursor-addressed. Already load-bearing (convoy listing, board pulses).",
@@ -929,14 +1065,16 @@
       "stage": "landed",
       "group": "trackD",
       "shape": "box",
-      "dagLabel": "MAP #1262 workflow"
+      "dagLabel": "MAP #1262 workflow",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1286\">#1286 unified resource reads (step 0)</a>"
     },
     "flotilla-org/flotilla#1293": {
       "detail": "Brainstorm: briefs accrete forge conditionals (shepherd.md post-#1291). Facts-not-procedure; agents resolve. Feeds #1270 ADR.",
       "stage": "design",
       "group": "trackD",
       "shape": "stadium",
-      "dagLabel": "MAP #1262 workflow"
+      "dagLabel": "MAP #1262 workflow",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1293\">#1293 workflow vs site content split</a>"
     },
     "flotilla-org/flotilla#1295": {
       "detail": "PR #1301 merged; verified: bounce heals unassisted, ritual memory retired.",
@@ -944,7 +1082,8 @@
       "stage": "landed",
       "group": "dogfood",
       "shape": "box",
-      "dagLabel": "stability"
+      "dagLabel": "stability",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1295\">#1295 stale reverse socket partitions mesh</a>"
     },
     "flotilla-org/flotilla#1296": {
       "detail": "PR #1304 merged; verified: five stranded crews completed, convoys land unaided.",
@@ -952,7 +1091,8 @@
       "stage": "landed",
       "group": "dogfood",
       "shape": "box",
-      "dagLabel": "stability"
+      "dagLabel": "stability",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1296\">#1296 crew complete never routes to authority</a>"
     },
     "flotilla-org/flotilla#1297": {
       "detail": "PRs #1300+#1307 merged: reconcile backoff + abandon reaps sessions AND checkout worktrees (~105G leak class closed).",
@@ -960,7 +1100,8 @@
       "stage": "landed",
       "group": "dogfood",
       "shape": "box",
-      "dagLabel": "stability"
+      "dagLabel": "stability",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1297\">#1297 abandon leaks TerminalSessions</a>"
     },
     "flotilla-org/flotilla#1294": {
       "detail": "Quick-win from #1291 review; needs coordinated manifest reapply on kiwi at deploy.",
@@ -968,7 +1109,8 @@
       "stage": "ready",
       "group": "dogfood",
       "shape": "box",
-      "dagLabel": "stability"
+      "dagLabel": "stability",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1294\">#1294 Forgejo server_url rename</a>"
     },
     "flotilla-org/flotilla#labforks": {
       "detail": "LIVE 31 Jul: lab/ org seeded (andamento/cleat/flotilla), cheddar runner proven (isolated VLAN, Debian 12 floor), flotilla-crew identity + contained-only grant, PR delivery plumbing merged (#1291). Next: Forgejo workflow wrappers + claude-review port, phase-1 promotion flow.",
@@ -976,7 +1118,8 @@
       "stage": "flight",
       "group": "trackA",
       "shape": "stadium",
-      "dagLabel": "#917 releases"
+      "dagLabel": "#917 releases",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/917\">lab forks runway</a>"
     },
     "flotilla-org/flotilla#1308": {
       "detail": "PR #1313 merged: socket parent-dir mount; r6 proved it. Exposed #1315 config skew.",
@@ -984,7 +1127,8 @@
       "stage": "landed",
       "group": "dogfood",
       "shape": "box",
-      "dagLabel": "stability"
+      "dagLabel": "stability",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1308\">#1308 contained socket survives restarts</a>"
     },
     "flotilla-org/flotilla#1309": {
       "detail": "PR #1312 merged: poison events skip-and-record instead of wedging replication. Store-reset rule extended to event history.",
@@ -992,7 +1136,8 @@
       "stage": "landed",
       "group": "dogfood",
       "shape": "box",
-      "dagLabel": "stability"
+      "dagLabel": "stability",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1309\">#1309 event-replay quarantine</a>"
     },
     "flotilla-org/flotilla#1310": {
       "detail": "PR #1311 merged: unparseable environments remain reclaimable; parse failure = visible degraded condition.",
@@ -1000,7 +1145,8 @@
       "stage": "landed",
       "group": "dogfood",
       "shape": "box",
-      "dagLabel": "stability"
+      "dagLabel": "stability",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1310\">#1310 teardown without metadata parse</a>"
     },
     "flotilla-org/flotilla#1315": {
       "detail": "#1313 moved the socket; hosts.toml pinned the old path — third distinct cause of \"closed before hello\". Convoy peer-socket-derivation active.",
@@ -1008,7 +1154,8 @@
       "stage": "flight",
       "group": "dogfood",
       "shape": "box",
-      "dagLabel": "stability"
+      "dagLabel": "stability",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1315\">#1315 derive peer socket path</a>"
     },
     "flotilla-org/flotilla#1316": {
       "detail": "PR #1317 merged: worktree git metadata exposed to contained vessels. Unblocks real contained delivery work.",
@@ -1016,7 +1163,8 @@
       "stage": "landed",
       "group": "dogfood",
       "shape": "box",
-      "dagLabel": "stability"
+      "dagLabel": "stability",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1316\">#1316 git inside contained checkouts</a>"
     },
     "flotilla-org/flotilla#c182": {
       "detail": "Ruled: plain build = functional or loud build-time failure. PR #183 in review (CLAUDE.md point addressed). Flake #184 fixed via first cleat crew (PR #185 merged).",
@@ -1024,187 +1172,218 @@
       "stage": "flight",
       "group": "trackA",
       "shape": "box",
-      "dagLabel": "stability"
+      "dagLabel": "stability",
+      "title": "<a href=\"https://github.com/flotilla-org/cleat/issues/182\">cleat#182 ghostty-vt default</a>"
     },
     "flotilla-org/flotilla#1320": {
       "detail": "CLOSED 2 Aug: workflow green FIRST TIME EVER (PR #1323). Crew also added PR trigger; #1331 path-filtered + cached it. Fixture schema drift (host_name->host/link) fixed en route.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1320 compose CI red<br>CLOSED"
+      "dagLabel": "#1320 compose CI red<br>CLOSED",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1320\">#1320 Compose integration permanently red</a>"
     },
     "flotilla-org/flotilla#1321": {
       "detail": "Runs 1+2 complete; run 3 = wait-based driver once deployed engine proves out. May retire into workflow-declared exits instead.",
       "stage": "waiting",
       "group": "trackD",
-      "dagLabel": "#1321 Bosun-over-verbs<br>step 1"
+      "dagLabel": "#1321 Bosun-over-verbs<br>step 1",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1321\">#1321 Bosun-over-verbs experiment</a>"
     },
     "flotilla-org/flotilla#1322": {
       "detail": "THE LEAF ENGINE SHIPPED: grilled (6 rulings + observation amendments) and all 3 slices merged within 24h — #1365 core+wait, #1366 CR observer, #1374 ReconcilerWake. ADR carry due.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1322 flotilla wait<br>step 2"
+      "dagLabel": "#1322 flotilla wait<br>step 2",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1322\">#1322 flotilla wait (level-triggered select)</a>"
     },
     "flotilla-org/flotilla#1327": {
       "detail": "CLOSED 2 Aug: ETXTBSY flake (merged #1319 red) -> ruling: extend CommandRunner, don't bypass. #1328 stopgap, then #1329: spawn_long_lived + CommandProcess, stub harness deleted, DI threaded to production (two crews + review round).",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1327\">#1327 ssh_transport stub harness -> injected seams</a>"
     },
     "flotilla-org/flotilla#1332": {
       "detail": "CLOSED 2 Aug: ~230G leaked on feta. Root cause (via review): fresh-clone checkouts vessel-owned, invisible to CONVOY_LABEL cleanup. #1333 relabels + unwedges missing-Clone. Salvaged PR after feta slept mid-delivery.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1332\">#1332 convoy delete orphaned checkouts</a>"
     },
     "flotilla-org/flotilla#1334": {
       "detail": "CLOSED 2 Aug: feta suspended under two active crews (inhibitor watches local-authority convoys only). Ruled: vessels-union-convoys-homed-here, err toward holding. #1336 shipped same day.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1334\">#1334 sleep inhibition keyed on wrong side</a>"
     },
     "flotilla-org/flotilla#1335": {
       "detail": "re-diagnosed (never suspend-related: NO github spec/grant existed + GH_TOKEN-only adapter) -> landed via PR #1349 w/ gitconfig-fragment-file model (no numbered-env slots, Robert ruling).",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1335\">#1335 gh adapter: wire git credentials</a>"
     },
     "flotilla-org/flotilla#1337": {
       "detail": "landed via PR #1338 — the Bosun run 1 target (merged 2 Aug, 0 rounds).",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1337\">#1337 vessel teardown stale checkout-cleanup claim</a>"
     },
     "flotilla-org/flotilla#1339": {
       "detail": "landed via PR #1345 (crew on feta), merged 3 Aug 13:03Z.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1339\">#1339 remove stale vessel-label checkout secondary watch</a>"
     },
     "flotilla-org/flotilla#1340": {
       "detail": "CLOSED 3 Aug: 4 rulings recorded; ADR 0021 already ruled the skeleton — incidents were a bug (#1341). Carry: ADR 0028.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "#1340 grill"
+      "dagLabel": "#1340 grill",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1340\">#1340 GRILL: turn-exit vs convoy-exit</a>"
     },
     "flotilla-org/flotilla#1341": {
       "detail": "landed via PR #1346 (crew impl + round crew expected-vs-observed + governor final points). Vacuous settlement dead; artifact-less convoys still claim-settle per ADR 0028.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "dogfood",
-      "dagLabel": "#1341 vacuous settle"
+      "dagLabel": "#1341 vacuous settle",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1341\">#1341 vacuous settlement over empty/local checkout list</a>"
     },
     "flotilla-org/flotilla#1342": {
       "detail": "landed via PR #1352. NOT yet deployed — feta records still carry pre-push latched landed=true until bump.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1342\">#1342 no-CR early return keyed on spec ref</a>"
     },
     "flotilla-org/flotilla#1343": {
       "detail": "PR #1373: True latches only against Unknown; Landed never un-Lands.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1343\">#1343 evidence latch scope</a>"
     },
     "flotilla-org/flotilla#1344": {
       "detail": "MERGED 3 Aug 12:00Z — ADR 0028 adopted (amends 0021+0027); review tension reconciled via episode ladder.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
       "group": "trackD",
-      "dagLabel": "ADR 0028"
+      "dagLabel": "ADR 0028",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1344\">#1344 PR: ADR 0028 — world-terminal exits, vessel-as-cache, leaf engine</a>"
     },
     "flotilla-org/flotilla#1347": {
       "detail": "landed via PR #1350 same day. Ruling: flotilla advertises want, porthole holds (porthole#112); polkit workaround deferred (fleet#1) — exercising sleep recovery deliberately.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1347\">#1347 sleep-inhibitor failure as host condition</a>"
     },
     "flotilla-org/flotilla#1348": {
       "detail": "landed via PR #1353 (crew, 0 review rounds). App minting adapter in; spec+grant application awaits next bump.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "trackA"
+      "group": "trackA",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1348\">#1348 GithubApp consumer: mint installation tokens</a>"
     },
     "flotilla-org/flotilla#1351": {
       "detail": "Robert ruling: general contribution/composition model, not per-file hacks. First instance landed in PR #1349. Grill queued.",
       "stage": "design",
-      "group": "trackA"
+      "group": "trackA",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1351\">#1351 config fragments + composition model</a>"
     },
     "flotilla-org/flotilla#1355": {
       "detail": "landed via PR #1358",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1355\">#1355 checkout records not replicated to peers</a>"
     },
     "flotilla-org/flotilla#1356": {
       "detail": "landed via PR #1359 (contained crew — first bot-identity delivery)",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1356\">#1356 daemon file logging silent since ~2 Aug</a>"
     },
     "flotilla-org/flotilla#1357": {
       "detail": "landed via PR #1360",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1357\">#1357 failed spawn unlinks live daemon socket</a>"
     },
     "flotilla-org/flotilla#1362": {
       "detail": "PR #1365, same-day grill-to-merge.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "trackD"
+      "group": "trackD",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1362\">#1362 leaf engine slice 1: evaluator + blocking wait</a>"
     },
     "flotilla-org/flotilla#1363": {
       "detail": "PR #1366 w/ binding-vs-browsing riders (GC, coalesced writes, thin history).",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "trackD"
+      "group": "trackD",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1363\">#1363 leaf engine slice 2: CR observer + refresher</a>"
     },
     "flotilla-org/flotilla#1364": {
       "detail": "PR #1374 after 2 review rounds (fetch gating, bound_repository regression test).",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "trackD"
+      "group": "trackD",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1364\">#1364 leaf engine slice 3: ReconcilerWake</a>"
     },
     "flotilla-org/flotilla#1367": {
       "detail": "PR #1370 -> SIX autonomous Landing->Landed settlements in ~15s of deploy. First machine-observed settlements ever.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "dogfood"
+      "group": "dogfood",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1367\">#1367 authority-side observation</a>"
     },
     "flotilla-org/flotilla#1371": {
       "detail": "Spike measured: mirrored-attr surface, +64% incremental check, SHAPE works. Reject recommendation CONTESTED (circularity + reflection trajectory); ruling awaits Robert reading the research.",
       "stage": "grill",
-      "group": "trackA"
+      "group": "trackA",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1371\">#1371 facet spike (PR #1372, parked)</a>"
     },
     "flotilla-org/flotilla#1384": {
       "detail": "CLOSED: rounds DO NOT EXIST (emergent); declarations frozen at rules (exits + standing wakes); episode escalation the only bound; manager role = the agentic residue; applicative-first/monadic-later.",
       "statusAtAuthoring": "landed",
       "stage": "landed",
-      "group": "trackD"
+      "group": "trackD",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1384\">#1384 GRILL: exit tables + TurnDelivery</a>"
     },
     "flotilla-org/flotilla#1391": {
       "detail": "AMENDED mid-flight: no implicit default — exit-table ABSENCE = standing convoy; stock templates get explicit transcribed tables.",
       "statusAtAuthoring": "at-sea",
       "stage": "flight",
-      "group": "trackD"
+      "group": "trackD",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1391\">#1391 exit tables (crew: exit-tables)</a>"
     },
     "flotilla-org/flotilla#1392": {
       "detail": "blocked on #1391; its e2e test IS Bosun run 3 (self-shepherding loop).",
       "stage": "waiting",
-      "group": "trackD"
+      "group": "trackD",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1392\">#1392 TurnDelivery + wake rules + escalation ladder</a>"
     },
     "flotilla-org/flotilla#1394": {
       "detail": "VEHICLE RULED: independent = standing convoy (no exit table) + ensure loop. A-encoding + backpressure/livelock open, gated on #1385 observations. Practical unknowns recorded (vessel class, andamento presentation, brief lifecycle).",
       "stage": "grill",
-      "group": "trackC"
+      "group": "trackC",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1394\">#1394 Quartermaster brainstorm</a>"
     },
     "flotilla-org/flotilla#1396": {
       "detail": "blocked on #1391; fleet independents = ensure entries in the fleet project (project-map).",
       "stage": "waiting",
-      "group": "trackC"
+      "group": "trackC",
+      "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1396\">#1396 ensured convoys (the ensure loop)</a>"
     }
   },
   "edges": [
