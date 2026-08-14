@@ -40,9 +40,13 @@ pub fn install_default_provider() {
 }
 
 /// Returns a Reqwest client builder after installing the selected provider.
+///
+/// A User-Agent is always set: api.github.com rejects requests without one
+/// as 403 Forbidden, which presents as an opaque authorization failure at
+/// call sites like the GitHub App installation-token mint.
 pub fn client_builder() -> reqwest::ClientBuilder {
     install_default_provider();
-    reqwest::Client::builder()
+    reqwest::Client::builder().user_agent(concat!("flotilla/", env!("CARGO_PKG_VERSION")))
 }
 
 /// Builds a Reqwest client with the selected provider installed.
@@ -105,5 +109,30 @@ mod tests {
 
         assert!(providers_match(&expected, &crypto_provider()));
         assert!(!providers_match(&modified, &expected));
+    }
+
+    /// api.github.com rejects requests without a User-Agent as 403 Forbidden,
+    /// so every client built here must send one.
+    #[tokio::test]
+    async fn built_client_always_sends_a_user_agent() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 4096];
+            let read = stream.read(&mut buf).expect("read request head");
+            let head = String::from_utf8_lossy(&buf[..read]).to_string();
+            stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n").expect("write response");
+            head
+        });
+
+        client().get(format!("http://{addr}/")).send().await.expect("request test server");
+        let head = server.join().expect("join test server").to_ascii_lowercase();
+        assert!(
+            head.contains(&format!("user-agent: flotilla/{}", env!("CARGO_PKG_VERSION"))),
+            "request must carry the flotilla User-Agent, got:\n{head}"
+        );
     }
 }
