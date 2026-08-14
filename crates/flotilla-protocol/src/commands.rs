@@ -9,8 +9,7 @@ use crate::{
     qualified_path::QualifiedPath,
     query::{
         CrewCommandContext, CrewListResponse, DispatchQueueResponse, FleetHealthResponse, FleetListResponse, FleetReplicaSnapshot,
-        HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoDetailResponse, RepoProvidersResponse,
-        RepoWorkResponse,
+        HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoProvidersResponse,
     },
     AttachableSetId, IssueRef, RepoIdentity,
 };
@@ -622,13 +621,7 @@ pub enum CommandAction {
         id: String,
     },
     // Query commands — read-only operations dispatched through execute()
-    QueryRepoDetail {
-        repo: RepoSelector,
-    },
     QueryRepoProviders {
-        repo: RepoSelector,
-    },
-    QueryRepoWork {
         repo: RepoSelector,
     },
     QueryHostList {},
@@ -704,9 +697,7 @@ impl CommandAction {
     pub fn is_query(&self) -> bool {
         matches!(
             self,
-            CommandAction::QueryRepoDetail { .. }
-                | CommandAction::QueryRepoProviders { .. }
-                | CommandAction::QueryRepoWork { .. }
+            CommandAction::QueryRepoProviders { .. }
                 | CommandAction::QueryHostList {}
                 | CommandAction::QueryProjectList {}
                 | CommandAction::QueryDispatchQueue { .. }
@@ -772,9 +763,7 @@ impl Command {
             CommandAction::QueryIssues { .. } => "query issues",
             CommandAction::QueryIssueFetchByIds { .. } => "query issue fetch by ids",
             CommandAction::QueryIssueOpenInBrowser { .. } => "query issue open in browser",
-            CommandAction::QueryRepoDetail { .. } => "query repo detail",
             CommandAction::QueryRepoProviders { .. } => "query repo providers",
-            CommandAction::QueryRepoWork { .. } => "query repo work",
             CommandAction::QueryHostList {} => "query host list",
             CommandAction::QueryProjectList {} => "query project list",
             CommandAction::QueryDispatchQueue { .. } => "query dispatch queue",
@@ -888,9 +877,7 @@ pub enum CommandValue {
     CheckoutPathResolved {
         path: PathBuf,
     },
-    RepoDetail(Box<RepoDetailResponse>),
     RepoProviders(Box<RepoProvidersResponse>),
-    RepoWork(Box<RepoWorkResponse>),
     HostList(Box<HostListResponse>),
     ProjectList(Box<ProjectListResponse>),
     DispatchQueue(Box<DispatchQueueResponse>),
@@ -987,8 +974,7 @@ mod tests {
         arg::Arg,
         query::{
             CrewListMember, CrewListResponse, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness,
-            HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoProvidersResponse,
-            RepoWorkResponse,
+            HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, RepoProvidersResponse,
         },
         test_helpers::assert_json_roundtrip,
         AttachableSetId, HostEnvironment, HostProviderStatus, HostSummary, NodeId, NodeInfo, PeerConnectionState, RepoIdentity, SystemInfo,
@@ -1246,19 +1232,7 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::QueryRepoDetail { repo: RepoSelector::Path(PathBuf::from("/repo")) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
                 action: CommandAction::QueryRepoProviders { repo: RepoSelector::Path(PathBuf::from("/repo")) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryRepoWork { repo: RepoSelector::Path(PathBuf::from("/repo")) },
             },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },
@@ -1446,14 +1420,6 @@ mod tests {
             CommandValue::Cancelled,
             CommandValue::AttachCommandResolved { plan: crate::ResolvedAttachPlan::shell_command("bash --login"), binding: None },
             CommandValue::CheckoutPathResolved { path: PathBuf::from("/repos/project/wt-1") },
-            CommandValue::RepoDetail(Box::new(RepoDetailResponse {
-                path: PathBuf::from("/repo"),
-                slug: Some("owner/repo".into()),
-                upstream: None,
-                provider_health: Default::default(),
-                work_items: vec![],
-                errors: vec![],
-            })),
             CommandValue::RepoProviders(Box::new(RepoProvidersResponse {
                 path: PathBuf::from("/repo"),
                 slug: Some("owner/repo".into()),
@@ -1461,11 +1427,6 @@ mod tests {
                 repo_discovery: vec![],
                 providers: vec![],
                 unmet_requirements: vec![],
-            })),
-            CommandValue::RepoWork(Box::new(RepoWorkResponse {
-                path: PathBuf::from("/repo"),
-                slug: Some("owner/repo".into()),
-                work_items: vec![],
             })),
             CommandValue::HostList(Box::new(HostListResponse {
                 hosts: vec![HostListEntry {
@@ -1478,7 +1439,6 @@ mod tests {
                     reconnect: None,
                     has_summary: true,
                     repo_count: 1,
-                    work_item_count: 3,
                 }],
             })),
             CommandValue::ProjectList(Box::new(crate::ProjectListResponse { projects: vec![] })),
@@ -1513,7 +1473,6 @@ mod tests {
                 }),
                 visible_environments: vec![],
                 repo_count: 1,
-                work_item_count: 3,
             })),
             CommandValue::HostProviders(Box::new(HostProvidersResponse {
                 environment_id: EnvironmentId::host(HostId::new("desktop-host")),
@@ -1870,19 +1829,7 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::QueryRepoDetail { repo: RepoSelector::Path(PathBuf::from("/tmp")) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
                 action: CommandAction::QueryRepoProviders { repo: RepoSelector::Path(PathBuf::from("/tmp")) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryRepoWork { repo: RepoSelector::Path(PathBuf::from("/tmp")) },
             },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },

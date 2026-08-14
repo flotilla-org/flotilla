@@ -9,7 +9,6 @@ use tokio::sync::RwLock;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct HostCounts {
     pub(crate) repo_count: usize,
-    pub(crate) work_item_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -717,7 +716,6 @@ fn build_host_status(
         summary,
         visible_environments: vec![],
         repo_count: counts.repo_count,
-        work_item_count: counts.work_item_count,
     }
 }
 
@@ -749,7 +747,6 @@ fn build_host_list_entry_from_state(
         reconnect: None,
         has_summary: state.summary.is_some(),
         repo_count: counts.repo_count,
-        work_item_count: counts.work_item_count,
     }
 }
 
@@ -1280,8 +1277,8 @@ mod tests {
             .await;
 
         let counts = HashMap::from([
-            (first_environment_id.clone(), HostCounts { repo_count: 1, work_item_count: 2 }),
-            (second_environment_id.clone(), HostCounts { repo_count: 3, work_item_count: 5 }),
+            (first_environment_id.clone(), HostCounts { repo_count: 1 }),
+            (second_environment_id.clone(), HostCounts { repo_count: 3 }),
         ]);
         let hosts = registry.list_hosts(&counts).await;
 
@@ -1289,8 +1286,8 @@ mod tests {
             hosts.hosts.iter().find(|entry| entry.environment_id.as_ref() == Some(&first_environment_id)).expect("first entry");
         let second_entry =
             hosts.hosts.iter().find(|entry| entry.environment_id.as_ref() == Some(&second_environment_id)).expect("second entry");
-        assert_eq!((first_entry.repo_count, first_entry.work_item_count), (1, 2));
-        assert_eq!((second_entry.repo_count, second_entry.work_item_count), (3, 5));
+        assert_eq!(first_entry.repo_count, 1);
+        assert_eq!(second_entry.repo_count, 3);
     }
 
     #[tokio::test]

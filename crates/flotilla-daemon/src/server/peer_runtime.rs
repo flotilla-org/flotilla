@@ -9,8 +9,7 @@ use flotilla_core::{
     daemon::DaemonHandle, in_process::InProcessDaemon, path_context::ExecutionEnvironmentPath, step::RemoteStepBatchRequest,
 };
 use flotilla_protocol::{
-    ConfigLabel, DaemonEvent, NodeId, NodeInfo, PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RepositoryKey,
-    RoutedPeerMessage,
+    ConfigLabel, NodeId, NodeInfo, PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RepositoryKey, RoutedPeerMessage,
 };
 use futures::future::join_all;
 use tokio::sync::{mpsc, Mutex};
@@ -476,13 +475,7 @@ impl PeerRuntime {
                                             crate::peer::synthetic_repo_path(&origin, &updated_repo_id, host_repo_root.as_deref());
                                         if let Err(e) =
                                             peer_daemon
-                                                .add_virtual_repo(
-                                                    updated_repo_id.clone(),
-                                                    repository_key,
-                                                    synthetic.clone(),
-                                                    peers,
-                                                    overlay_version,
-                                                )
+                                                .add_virtual_repo(updated_repo_id.clone(), repository_key, synthetic.clone())
                                                 .await
                                         {
                                             warn!(repo = %updated_repo_id, err = %e, "failed to add virtual repo");
@@ -697,9 +690,7 @@ impl PeerRuntime {
                         }
                     }
                     event = event_rx.recv() => {
-                        let repo_path = match event {
-                            Ok(DaemonEvent::RepoSnapshot(snapshot)) => snapshot.repo.clone(),
-                            Ok(DaemonEvent::RepoDelta(delta)) => delta.repo.clone(),
+                        let repo_path: Option<std::path::PathBuf> = match event {
                             Ok(_) => None,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 warn!(skipped = n, "outbound peer event subscriber lagged");

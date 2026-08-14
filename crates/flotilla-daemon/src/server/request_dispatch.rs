@@ -56,11 +56,6 @@ impl<'a> RequestDispatcher<'a> {
                 Err(e) => Message::error_response(id, e),
             },
 
-            Request::GetState { repo } => match self.daemon.get_state(&RepoSelector::Path(repo)).await {
-                Ok(snapshot) => Message::ok_response(id, Response::GetState(Box::new(snapshot))),
-                Err(e) => Message::error_response(id, e),
-            },
-
             Request::Execute { command } => {
                 if command.action.is_query() {
                     // Query commands: execute synchronously (local or remote)

@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
-    AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CommitInfo, CorrelationKey, Issue, IssueChangeset, IssueRef,
-    IssueSource, IssueState, RepoIdentity, TerminalStatus, WorkingTreeStatus, Workspace,
+    AheadBehind, ChangeRequest, ChangeRequestStatus, Checkout, CommitInfo, Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
+    RepoIdentity, TerminalStatus, WorkingTreeStatus, Workspace,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -283,26 +283,25 @@ impl CommandRunner for DiscoveryMockRunner {
 }
 /// Build a `DiscoveryRuntime` that uses no-op env and a minimal fake runner
 /// (only responds to `git --version`). Avoids probing ambient host tools.
-pub fn fake_discovery(follower: bool) -> super::DiscoveryRuntime {
-    minimal_discovery_runtime(
-        follower,
-        std::sync::Arc::new(DiscoveryMockRunner::builder().on_run("git", &["--version"], Ok("git version 2.43.0".into())).build()),
-    )
+pub fn fake_discovery(_legacy_mode: bool) -> super::DiscoveryRuntime {
+    minimal_discovery_runtime(std::sync::Arc::new(
+        DiscoveryMockRunner::builder().on_run("git", &["--version"], Ok("git version 2.43.0".into())).build(),
+    ))
 }
 
 /// Build a `DiscoveryRuntime` whose local environment runs entirely through
 /// the given (typically mock) command runner.
-pub fn fake_discovery_with_runner(follower: bool, runner: std::sync::Arc<dyn CommandRunner>) -> super::DiscoveryRuntime {
-    minimal_discovery_runtime(follower, runner)
+pub fn fake_discovery_with_runner(_legacy_mode: bool, runner: std::sync::Arc<dyn CommandRunner>) -> super::DiscoveryRuntime {
+    minimal_discovery_runtime(runner)
 }
 
 /// Build a `DiscoveryRuntime` that allows real git commands while still
 /// avoiding ambient host-tool probes like gh, Codex, Claude, or cmux.
-pub fn git_process_discovery(follower: bool) -> super::DiscoveryRuntime {
-    minimal_discovery_runtime(follower, std::sync::Arc::new(crate::providers::ProcessCommandRunner))
+pub fn git_process_discovery(_legacy_mode: bool) -> super::DiscoveryRuntime {
+    minimal_discovery_runtime(std::sync::Arc::new(crate::providers::ProcessCommandRunner))
 }
 
-fn minimal_discovery_runtime(follower: bool, runner: std::sync::Arc<dyn CommandRunner>) -> super::DiscoveryRuntime {
+fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> super::DiscoveryRuntime {
     super::DiscoveryRuntime {
         runner,
         env: std::sync::Arc::new(TestEnvVars::default()),
@@ -314,7 +313,6 @@ fn minimal_discovery_runtime(follower: bool, runner: std::sync::Arc<dyn CommandR
         ))],
         repo_detectors: super::detectors::default_repo_detectors(),
         factories: super::FactoryRegistry::default_all(),
-        observer_polling: if follower { super::ObserverPolling::Disabled } else { super::ObserverPolling::Enabled },
         attachable_store: OnceLock::new(),
         host_scoped_providers: Default::default(),
     }
@@ -514,8 +512,7 @@ impl FakeVcsStateBuilder {
 
     /// Add a [`Checkout`] directly without going through the builder DSL.
     ///
-    /// Useful when the test needs full control over `correlation_keys` and
-    /// `association_keys` (e.g. to replicate an existing fixture exactly).
+    /// Useful when a test needs full control over the checkout fixture.
     pub fn checkout_raw(mut self, path: impl Into<PathBuf>, checkout: Checkout) -> Self {
         self.checkouts.push((path.into(), checkout));
         self
@@ -548,14 +545,11 @@ pub struct CheckoutBuilder {
     branch: String,
     path: Option<PathBuf>,
     is_main: bool,
-    correlation_keys: Vec<CorrelationKey>,
-    association_keys: Vec<AssociationKey>,
 }
 
 impl CheckoutBuilder {
     fn new(parent: FakeVcsStateBuilder, branch: String) -> Self {
-        let correlation_keys = vec![CorrelationKey::Branch(branch.clone())];
-        Self { parent, branch, path: None, is_main: false, correlation_keys, association_keys: Vec::new() }
+        Self { parent, branch, path: None, is_main: false }
     }
 
     /// Override the checkout path. Without this, the path defaults to
@@ -570,16 +564,6 @@ impl CheckoutBuilder {
         self
     }
 
-    pub fn correlation_key(mut self, key: CorrelationKey) -> Self {
-        self.correlation_keys.push(key);
-        self
-    }
-
-    pub fn association_key(mut self, key: AssociationKey) -> Self {
-        self.association_keys.push(key);
-        self
-    }
-
     pub fn build(mut self) -> FakeVcsStateBuilder {
         let path = self.path.unwrap_or_else(|| self.parent.root.join(self.branch.replace('/', "-")));
         let checkout = Checkout {
@@ -589,8 +573,6 @@ impl CheckoutBuilder {
             remote_ahead_behind: None,
             working_tree: None,
             last_commit: None,
-            correlation_keys: self.correlation_keys,
-            association_keys: self.association_keys,
             host_name: None,
             environment_id: None,
         };
@@ -730,8 +712,6 @@ impl CheckoutManager for FakeCheckoutManager {
             remote_ahead_behind: None,
             working_tree: None,
             last_commit: None,
-            correlation_keys: vec![CorrelationKey::Branch(branch.to_string())],
-            association_keys: vec![],
             host_name: None,
             environment_id: None,
         };
@@ -785,7 +765,7 @@ impl PresentationManager for FakePresentationManager {
     async fn create_workspace(&self, config: &crate::providers::types::WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
         let mut store = self.workspaces.lock().await;
         let ws_ref = format!("workspace:{}", store.len() + 1);
-        let workspace = Workspace { name: config.name.clone(), correlation_keys: vec![], attachable_set_id: None };
+        let workspace = Workspace { name: config.name.clone(), attachable_set_id: None };
         store.push((ws_ref.clone(), workspace.clone()));
         Ok((ws_ref, workspace))
     }
@@ -1332,19 +1312,9 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
             terminal_pools: terminal_pool_factories,
             environment_providers: vec![],
         },
-        observer_polling: super::ObserverPolling::Enabled,
         attachable_store,
         host_scoped_providers: Default::default(),
     }
-}
-
-/// Build a follower-mode discovery runtime with deterministic injected
-/// providers. Provider construction remains enabled while observer polling is
-/// disabled, matching production follower behavior.
-pub fn fake_discovery_with_provider_set_for_follower(providers: FakeDiscoveryProviders) -> DiscoveryRuntime {
-    let mut runtime = fake_discovery_with_provider_set(providers);
-    runtime.observer_polling = super::ObserverPolling::Disabled;
-    runtime
 }
 
 fn fixed_available_space_probe() -> Arc<dyn crate::admission::AvailableSpaceProbe> {

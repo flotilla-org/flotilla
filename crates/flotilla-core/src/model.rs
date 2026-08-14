@@ -1,22 +1,9 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
-use flotilla_protocol::qualified_path::HostId;
 pub use flotilla_protocol::{CategoryLabels, EnvironmentId, RepoLabels};
 
-use crate::{
-    attachable::SharedAttachableStore,
-    data::DataStore,
-    providers::{
-        registry::{ProviderRegistry, ProviderSet},
-        types::RepoCriteria,
-    },
-    refresh::{ExternalPolling, RefreshSchedule, RepoRefreshHandle},
-};
+use crate::providers::registry::{ProviderRegistry, ProviderSet};
+
 pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
     fn labels<T: ?Sized>(set: &ProviderSet<T>) -> CategoryLabels {
         set.preferred_with_desc()
@@ -35,126 +22,62 @@ pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
     }
 }
 
-/// Provider name + implementation key pair for host summary reporting.
 pub struct ProviderNameEntry {
     pub display_name: String,
     pub implementation: String,
 }
 
 pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<String, Vec<ProviderNameEntry>> {
-    let mut names: HashMap<String, Vec<ProviderNameEntry>> = HashMap::new();
-
-    fn collect_names<T: ?Sized>(names: &mut HashMap<String, Vec<ProviderNameEntry>>, set: &ProviderSet<T>) {
-        if let Some((first_desc, _)) = set.iter().next() {
-            let slug = first_desc.category.slug().to_string();
-            let list: Vec<ProviderNameEntry> = set
+    let mut names = HashMap::new();
+    fn collect<T: ?Sized>(names: &mut HashMap<String, Vec<ProviderNameEntry>>, set: &ProviderSet<T>) {
+        if let Some((first, _)) = set.iter().next() {
+            let entries = set
                 .iter()
-                .map(|(d, _)| ProviderNameEntry { display_name: d.display_name.clone(), implementation: d.implementation.clone() })
-                .collect();
-            if !list.is_empty() {
-                names.insert(slug, list);
+                .map(|(desc, _)| ProviderNameEntry { display_name: desc.display_name.clone(), implementation: desc.implementation.clone() })
+                .collect::<Vec<_>>();
+            if !entries.is_empty() {
+                names.insert(first.category.slug().to_string(), entries);
             }
         }
     }
-    collect_names(&mut names, &registry.vcs);
-    collect_names(&mut names, &registry.checkout_managers);
-    collect_names(&mut names, &registry.change_requests);
-    collect_names(&mut names, &registry.issue_trackers);
-    collect_names(&mut names, &registry.cloud_agents);
-    collect_names(&mut names, &registry.ai_utilities);
-    collect_names(&mut names, &registry.presentation_managers);
-    collect_names(&mut names, &registry.terminal_pools);
-    collect_names(&mut names, &registry.environment_providers);
+    collect(&mut names, &registry.vcs);
+    collect(&mut names, &registry.checkout_managers);
+    collect(&mut names, &registry.change_requests);
+    collect(&mut names, &registry.issue_trackers);
+    collect(&mut names, &registry.cloud_agents);
+    collect(&mut names, &registry.ai_utilities);
+    collect(&mut names, &registry.presentation_managers);
+    collect(&mut names, &registry.terminal_pools);
+    collect(&mut names, &registry.environment_providers);
     names
 }
 
-/// Repo display name (directory basename).
 pub fn repo_name(path: &Path) -> String {
-    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string_lossy().to_string())
+    path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
-/// Domain data for a single repository — no UI concerns.
 pub struct RepoModel {
     pub registry: Arc<ProviderRegistry>,
-    pub data: DataStore,
     pub labels: RepoLabels,
-    pub refresh_handle: RepoRefreshHandle,
     pub environment_id: Option<EnvironmentId>,
 }
 
 impl RepoModel {
-    pub fn new(
-        repo_root: PathBuf,
-        registry: ProviderRegistry,
-        repo_slug: Option<String>,
-        environment_id: Option<EnvironmentId>,
-        host_id: Option<HostId>,
-        attachable_store: SharedAttachableStore,
-        agent_state_store: crate::agents::SharedAgentStateStore,
-    ) -> Self {
-        Self::new_with_external_polling(
-            repo_root,
-            registry,
-            repo_slug,
-            environment_id,
-            host_id,
-            attachable_store,
-            agent_state_store,
-            ExternalPolling::Enabled,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_external_polling(
-        repo_root: PathBuf,
-        registry: ProviderRegistry,
-        repo_slug: Option<String>,
-        environment_id: Option<EnvironmentId>,
-        host_id: Option<HostId>,
-        attachable_store: SharedAttachableStore,
-        agent_state_store: crate::agents::SharedAgentStateStore,
-        external_polling: ExternalPolling,
-    ) -> Self {
+    pub fn new(registry: ProviderRegistry, environment_id: Option<EnvironmentId>) -> Self {
         let labels = labels_from_registry(&registry);
-        let registry = Arc::new(registry);
-        let criteria = RepoCriteria { repo_slug };
-        let refresh_schedule = RefreshSchedule::for_repo(&repo_root, Duration::from_secs(10), Duration::from_secs(60));
-        let refresh_handle = RepoRefreshHandle::spawn_with_schedule_and_external_polling(
-            repo_root,
-            registry.clone(),
-            criteria,
-            environment_id.clone(),
-            host_id,
-            attachable_store,
-            agent_state_store,
-            refresh_schedule,
-            external_polling,
-        );
-        Self { registry, data: DataStore::default(), labels, refresh_handle, environment_id }
+        Self { registry: Arc::new(registry), labels, environment_id }
     }
 
-    /// Create a model for a virtual (remote-only) repo.
-    ///
-    /// Uses an empty `ProviderRegistry` and an idle refresh handle that
-    /// never polls — provider data for virtual repos arrives via PeerData
-    /// messages rather than local filesystem scanning.
     pub fn new_virtual() -> Self {
-        let registry = ProviderRegistry::new();
-        let labels = RepoLabels {
-            checkouts: CategoryLabels::new("Checkouts", "checkout", "CO"),
-            change_requests: CategoryLabels::new("Change Requests", "CR", "CR"),
-            issues: CategoryLabels::new("Issues", "issue", "I"),
-            cloud_agents: CategoryLabels::new("Sessions", "session", "S"),
-        };
         Self {
-            registry: Arc::new(registry),
-            data: DataStore::default(),
-            labels,
-            refresh_handle: RepoRefreshHandle::idle(),
+            registry: Arc::new(ProviderRegistry::new()),
+            labels: RepoLabels {
+                checkouts: CategoryLabels::new("Checkouts", "checkout", "CO"),
+                change_requests: CategoryLabels::new("Change Requests", "CR", "CR"),
+                issues: CategoryLabels::new("Issues", "issue", "I"),
+                cloud_agents: CategoryLabels::new("Sessions", "session", "S"),
+            },
             environment_id: None,
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

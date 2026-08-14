@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
-    AssociationKey, Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
+    Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
 };
 
 use crate::providers::{
@@ -47,7 +47,6 @@ fn parse_issue(source: &IssueSource, v: &serde_json::Value, fetched_at: DateTime
     let id = number.to_string();
     let as_of = v["updated_at"].as_str().and_then(|value| value.parse::<DateTime<Utc>>().ok()).unwrap_or(fetched_at);
     let reference = IssueRef { source: source.clone(), id: id.clone() };
-    let association_keys = vec![AssociationKey::IssueRef("github".to_string(), id)];
     Some(
         Issue::builder()
             .reference(reference)
@@ -57,7 +56,6 @@ fn parse_issue(source: &IssueSource, v: &serde_json::Value, fetched_at: DateTime
             .labels(labels)
             .as_of(as_of)
             .observed_at(fetched_at)
-            .association_keys(association_keys)
             .provider_name("github".into())
             .provider_display_name("GitHub".into())
             .build(),

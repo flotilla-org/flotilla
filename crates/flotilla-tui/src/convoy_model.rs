@@ -4,7 +4,7 @@
 //! ([`flotilla_protocol::result_set`]). This adapter model is intentionally
 //! surface-owned and may evolve with consumer-side view requirements.
 
-use flotilla_protocol::{result_set as wire, CheckoutRef, HostName, PlacementDecision, PrincipalRef, RepoKey, ResourceRef};
+use flotilla_protocol::{result_set as wire, HostName, PlacementDecision, PrincipalRef, RepoKey, ResourceRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConvoyId(String);
@@ -146,7 +146,6 @@ pub struct VesselSummary {
     pub placement_decision: Option<PlacementDecision>,
     pub crew: Vec<ProcessSummary>,
     pub host: Option<HostName>,
-    pub checkout: Option<CheckoutRef>,
     pub workspace_ref: Option<String>,
     pub materialize_ref: Option<String>,
     pub completion_target: Option<WorkCompletionTarget>,
@@ -226,8 +225,6 @@ fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSumm
         placement_decision: vessel.placement_decision.clone(),
         crew,
         host: Some(vessel.host.clone()),
-        // The convoys query does not yet expose checkout allocation.
-        checkout: None,
         workspace_ref: vessel.attach.clone(),
         materialize_ref: vessel.materialize.clone(),
         completion_target: vessel.complete_work.then(|| WorkCompletionTarget {

@@ -1,6 +1,5 @@
 pub mod channel_transport;
 pub mod manager;
-pub mod merge;
 pub mod ssh_transport;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -12,7 +11,6 @@ pub use manager::{
     InboundPeerEnvelope, OverlayUpdate, PeerManager, PendingPeerSend, PendingResyncRequest, PerRepoPeerState, ReversePathHop,
     ReversePathKey, RouteHop, RouteState,
 };
-pub use merge::merge_provider_data;
 pub(crate) use ssh_transport::{peer_resource_socket_path, reverse_peer_resource_socket_path};
 pub use ssh_transport::{SshTransport, SshTransportPaths};
 pub use transport::{PeerConnectionStatus, PeerSender, PeerTransport};

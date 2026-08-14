@@ -17,8 +17,6 @@ pub async fn write_message_line(writer: &mut (impl AsyncWrite + Unpin), msg: &Me
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
     use crate::{Message, Request};
 
@@ -51,7 +49,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_message_line_request() {
-        let msg = Message::Request { id: 42, request: Request::GetState { repo: PathBuf::from("/tmp/my-repo") } };
+        let msg = Message::Request { id: 42, request: Request::ListRepos };
         let mut buf = Vec::new();
         write_message_line(&mut buf, &msg).await.expect("write should succeed");
 
@@ -60,7 +58,7 @@ mod tests {
         match parsed {
             Message::Request { id, request } => {
                 assert_eq!(id, 42);
-                assert_eq!(request, Request::GetState { repo: PathBuf::from("/tmp/my-repo") });
+                assert_eq!(request, Request::ListRepos);
             }
             other => panic!("expected Request, got {other:?}"),
         }

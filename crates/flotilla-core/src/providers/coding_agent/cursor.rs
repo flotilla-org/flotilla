@@ -86,6 +86,7 @@ struct CursorAgent {
     created_at: String,
     #[serde(default)]
     source: CursorSource,
+    #[cfg(test)]
     #[serde(default)]
     target: CursorTarget,
 }
@@ -96,6 +97,7 @@ struct CursorSource {
     repository: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default, Deserialize)]
 struct CursorTarget {
     #[serde(default, rename = "branchName")]
@@ -112,6 +114,7 @@ impl CursorAgent {
         }
     }
 
+    #[cfg(test)]
     fn branch(&self) -> Option<&str> {
         if self.target.branch_name.is_empty() {
             None
@@ -185,10 +188,6 @@ impl super::CloudAgentService for CursorCodingAgent {
             .into_iter()
             .filter(|a| a.repo_slug().is_some_and(|r| r == *slug))
             .map(|a| {
-                let mut correlation_keys = vec![CorrelationKey::SessionRef(provider_name.clone(), a.id.clone())];
-                if let Some(branch) = a.branch() {
-                    correlation_keys.push(CorrelationKey::Branch(branch.to_string()));
-                }
                 let title = if a.name.is_empty() { a.id.clone() } else { a.name.clone() };
 
                 (a.id.clone(), CloudAgentSession {
@@ -197,7 +196,6 @@ impl super::CloudAgentService for CursorCodingAgent {
                     model: None,
                     // Cursor API has no updatedAt; createdAt is the best proxy.
                     updated_at: if a.created_at.is_empty() { None } else { Some(a.created_at) },
-                    correlation_keys,
                     provider_name: provider_name.clone(),
                     provider_display_name: "Cursor".into(),
                     item_noun: "Agent".into(),

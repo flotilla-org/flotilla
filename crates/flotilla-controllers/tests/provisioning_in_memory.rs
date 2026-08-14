@@ -241,7 +241,6 @@ impl PresentationManager for FakePresentationManager {
         self.created.lock().expect("created lock").push(config.clone());
         Ok((format!("workspace:{}", self.created.lock().expect("created lock").len()), Workspace {
             name: config.name.clone(),
-            correlation_keys: Vec::new(),
             attachable_set_id: None,
         }))
     }

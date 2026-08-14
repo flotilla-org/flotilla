@@ -179,7 +179,6 @@ mod tests {
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"checkout"));
         assert!(values.contains(&"providers"));
-        assert!(values.contains(&"work"));
     }
 
     #[test]

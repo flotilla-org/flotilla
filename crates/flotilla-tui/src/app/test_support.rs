@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle};
 use flotilla_protocol::{
     qualified_path::HostId, Command, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, NodeInfo, ProvisioningTarget,
-    RepoInfo, RepoLabels, RepoSnapshot, StatusResponse, StreamKey, TopologyResponse,
+    RepoInfo, RepoLabels, StatusResponse, StreamKey, TopologyResponse,
 };
 use tokio::sync::{broadcast, Semaphore};
 use tui_input::Input;
@@ -70,10 +70,6 @@ impl StubDaemon {
 impl DaemonHandle for StubDaemon {
     fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
         self.tx.subscribe()
-    }
-
-    async fn get_state(&self, _repo: &flotilla_protocol::RepoSelector) -> Result<RepoSnapshot, String> {
-        Err("stub".into())
     }
 
     async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {

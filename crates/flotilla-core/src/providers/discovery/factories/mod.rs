@@ -88,8 +88,8 @@ mod tests {
     }
 
     #[test]
-    fn follower_runtime_constructs_external_providers() {
-        let runtime = super::super::DiscoveryRuntime::for_process(true);
+    fn process_runtime_constructs_external_providers() {
+        let runtime = super::super::DiscoveryRuntime::for_process();
         let reg = &runtime.factories;
         assert!(!reg.vcs.is_empty());
         assert!(!reg.checkout_managers.is_empty());
@@ -99,6 +99,5 @@ mod tests {
         assert!(!reg.ai_utilities.is_empty());
         assert!(!reg.presentation_managers.is_empty());
         assert!(!reg.terminal_pools.is_empty());
-        assert!(runtime.is_follower());
     }
 }

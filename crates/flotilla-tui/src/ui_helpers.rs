@@ -384,8 +384,6 @@ mod tests {
             remote_ahead_behind: None,
             working_tree: None,
             last_commit: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
             host_name: None,
             environment_id: None,
         };
@@ -401,8 +399,6 @@ mod tests {
             remote_ahead_behind: None,
             working_tree: Some(WorkingTreeStatus { modified: 2, staged: 1, untracked: 4 }),
             last_commit: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
             host_name: None,
             environment_id: None,
         };
@@ -418,8 +414,6 @@ mod tests {
             remote_ahead_behind: None,
             working_tree: Some(WorkingTreeStatus { modified: 1, staged: 0, untracked: 0 }),
             last_commit: None,
-            correlation_keys: vec![],
-            association_keys: vec![],
             host_name: None,
             environment_id: None,
         };

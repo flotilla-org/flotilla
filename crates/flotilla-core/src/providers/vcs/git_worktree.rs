@@ -126,11 +126,7 @@ impl GitCheckoutManager {
         branch: &str,
         is_main: bool,
         default_branch: &str,
-        issue_links: Vec<AssociationKey>,
     ) -> (ExecutionEnvironmentPath, Checkout) {
-        let host_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), path.as_path());
-        let correlation_keys = vec![CorrelationKey::Branch(branch.to_string()), CorrelationKey::CheckoutPath(host_path.into())];
-
         let trunk_ref = format!("HEAD...{default_branch}");
         let remote_ref = format!("HEAD...origin/{branch}");
         let raw = path.as_path();
@@ -167,8 +163,6 @@ impl GitCheckoutManager {
             remote_ahead_behind: remote_ab,
             working_tree: wt_status,
             last_commit: commit,
-            correlation_keys,
-            association_keys: issue_links,
             host_name: None,
             environment_id: None,
         })
@@ -195,14 +189,11 @@ impl super::CheckoutManager for GitCheckoutManager {
         let ee_entries: Vec<(ExecutionEnvironmentPath, String)> =
             entries.into_iter().map(|(path, branch)| (ExecutionEnvironmentPath::new(path), branch)).collect();
 
-        let branches: Vec<_> = ee_entries.iter().map(|(_, branch)| branch.clone()).collect();
-        let mut issue_links = super::read_branch_issue_links_batch(root, &branches, &*self.runner).await;
         let mut futures = Vec::with_capacity(ee_entries.len());
         for (index, (path, branch)) in ee_entries.iter().enumerate() {
             // The first worktree in porcelain output is always the main worktree.
             let is_main = index == 0;
-            let links = issue_links.remove(branch).unwrap_or_default();
-            futures.push(self.enrich_checkout(path, branch, is_main, &default_branch, links));
+            futures.push(self.enrich_checkout(path, branch, is_main, &default_branch));
         }
         Ok(futures::future::join_all(futures).await)
     }
@@ -261,8 +252,7 @@ impl super::CheckoutManager for GitCheckoutManager {
             }
         }
         // A newly created worktree is never the main worktree.
-        let issue_links = super::read_branch_issue_links(root, branch, &*self.runner).await;
-        Ok(self.enrich_checkout(&wt_path, branch, false, &default_branch, issue_links).await)
+        Ok(self.enrich_checkout(&wt_path, branch, false, &default_branch).await)
     }
 
     async fn remove_checkout(&self, repo_root: &ExecutionEnvironmentPath, branch: &str) -> Result<(), String> {

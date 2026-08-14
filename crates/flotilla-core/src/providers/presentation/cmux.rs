@@ -58,7 +58,7 @@ impl CmuxPresentationManager {
                 let ws_ref = ws["id"].as_str()?.to_string();
                 let name = ws["title"].as_str().unwrap_or("").to_string();
 
-                Some((ws_ref, Workspace { name, correlation_keys: vec![], attachable_set_id: None }))
+                Some((ws_ref, Workspace { name, attachable_set_id: None }))
             })
             .collect())
     }
@@ -224,7 +224,7 @@ impl super::PresentationManager for CmuxPresentationManager {
         };
 
         info!(workspace = %config.name, %ws_uuid, "cmux: workspace ready");
-        Ok((ws_uuid, Workspace { name: config.name.clone(), correlation_keys: vec![], attachable_set_id: None }))
+        Ok((ws_uuid, Workspace { name: config.name.clone(), attachable_set_id: None }))
     }
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
@@ -275,7 +275,6 @@ mod tests {
         let (ws_ref, ws) = &workspaces[0];
         assert_eq!(ws_ref, "CBC42D5B-AFAE-46BA-A5DB-386D13DA5A40");
         assert_eq!(ws.name, "Main");
-        assert!(ws.correlation_keys.is_empty());
     }
 
     #[tokio::test]
@@ -290,8 +289,6 @@ mod tests {
         assert_eq!(workspaces.len(), 2);
         assert_eq!(workspaces[0].0, "CBC42D5B-AFAE-46BA-A5DB-386D13DA5A40");
         assert_eq!(workspaces[1].0, "367CC5E4-0C9B-4559-9D97-D6358900ECCA");
-        assert!(workspaces[0].1.correlation_keys.is_empty());
-        assert!(workspaces[1].1.correlation_keys.is_empty());
     }
 
     #[tokio::test]

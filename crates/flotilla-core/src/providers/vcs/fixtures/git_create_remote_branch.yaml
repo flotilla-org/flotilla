@@ -3,15 +3,6 @@ rounds:
   - channel: command
     cmd: git
     args:
-    - config
-    - '--get-regexp'
-    - ^branch\..*\.flotilla\.issues\.
-    cwd: '{repo}'
-    stderr: ''
-    exit_code: 1
-  - channel: command
-    cmd: git
-    args:
     - fetch
     - origin
     - feature/remote-only

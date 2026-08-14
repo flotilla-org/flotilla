@@ -389,7 +389,7 @@ fn issue_url_reference(token: &str) -> Option<IssueRef> {
 mod tests {
     use std::{collections::HashMap, sync::Mutex};
 
-    use flotilla_protocol::{AssociationKey, IssueSource};
+    use flotilla_protocol::IssueSource;
     use flotilla_resources::{
         single_agent_contained_workflow_spec, ConvoyIssue, ConvoySpec, InputValue, IssueSnapshot, ProjectSpec, RepositoryKey, Stance,
         VirtualClock,
@@ -438,7 +438,6 @@ mod tests {
             labels: labels.iter().map(|label| (*label).to_string()).collect(),
             as_of: "2026-08-04T12:00:00Z".parse().expect("timestamp"),
             observed_at: Some("2026-08-04T12:01:00Z".parse().expect("timestamp")),
-            association_keys: Vec::<AssociationKey>::new(),
             provider_name: "fake".to_string(),
             provider_display_name: "Fake".to_string(),
         }

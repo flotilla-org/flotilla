@@ -518,9 +518,8 @@ hostname = "desktop.local"
 }
 
 #[test]
-fn parse_daemon_config_follower() {
+fn parse_daemon_config_identity_and_admission() {
     let toml = r#"
-follower = true
 machine_id = "my-machine"
 host_name = "my-desktop"
 
@@ -528,7 +527,6 @@ host_name = "my-desktop"
 free_space_floor_gib = 50
 "#;
     let config: DaemonConfig = toml::from_str(toml).unwrap();
-    assert!(config.follower);
     assert_eq!(config.machine_id, Some("my-machine".into()));
     assert_eq!(config.host_name, Some("my-desktop".into()));
     assert_eq!(config.admission.free_space_floor_gib, 50);
@@ -538,7 +536,6 @@ free_space_floor_gib = 50
 #[test]
 fn parse_daemon_config_defaults() {
     let config: DaemonConfig = toml::from_str("").unwrap();
-    assert!(!config.follower);
     assert_eq!(config.machine_id, None);
     assert_eq!(config.host_name, None);
     assert_eq!(config.admission.free_space_floor_gib, 20);
@@ -617,7 +614,6 @@ fn load_daemon_config_missing_file_returns_default() {
     let dir = tempdir().unwrap();
     let store = ConfigStore::with_base(dir.path());
     let config = store.load_daemon_config().unwrap();
-    assert!(!config.follower);
     assert_eq!(config.host_name, None);
     assert_eq!(config.manifests, None);
 }
@@ -626,10 +622,9 @@ fn load_daemon_config_missing_file_returns_default() {
 fn load_daemon_config_from_file() {
     let dir = tempdir().unwrap();
     let base = dir.path();
-    std::fs::write(base.join("daemon.toml"), "follower = true\nmachine_id = \"my-machine\"\nhost_name = \"my-host\"\n").unwrap();
+    std::fs::write(base.join("daemon.toml"), "machine_id = \"my-machine\"\nhost_name = \"my-host\"\n").unwrap();
     let store = ConfigStore::with_base(base);
     let config = store.load_daemon_config().unwrap();
-    assert!(config.follower);
     assert_eq!(config.machine_id, Some("my-machine".into()));
     assert_eq!(config.host_name, Some("my-host".into()));
 }

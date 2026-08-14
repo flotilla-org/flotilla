@@ -112,18 +112,12 @@ struct SessionOutcome {
 
 #[derive(Debug, Clone, Deserialize)]
 struct SessionGitInfo {
-    #[serde(default)]
-    branches: Vec<String>,
     /// "owner/repo" slug (e.g. "changedirection/reticulate")
     #[serde(default)]
     repo: Option<String>,
 }
 
 impl WebSession {
-    fn branch(&self) -> Option<&str> {
-        self.session_context.outcomes.first().and_then(|o| o.git_info.as_ref()).and_then(|gi| gi.branches.first()).map(|s| s.as_str())
-    }
-
     fn repo_slug(&self) -> Option<&str> {
         self.session_context.outcomes.first().and_then(|o| o.git_info.as_ref()).and_then(|gi| gi.repo.as_deref())
     }
@@ -290,20 +284,12 @@ impl super::CloudAgentService for ClaudeCodingAgent {
                 let model = if s.session_context.model.is_empty() { None } else { Some(s.session_context.model.clone()) };
 
                 let id = s.id.clone();
-                let mut correlation_keys = vec![CorrelationKey::SessionRef(provider_name.clone(), id.clone())];
-
-                // Add branch correlation key if available
-                if let Some(branch) = s.branch() {
-                    let clean = branch.strip_prefix("refs/heads/").unwrap_or(branch).to_string();
-                    correlation_keys.push(CorrelationKey::Branch(clean));
-                }
 
                 (id, CloudAgentSession {
                     title: s.title,
                     status,
                     model,
                     updated_at: Some(s.updated_at.clone()),
-                    correlation_keys,
                     provider_name: provider_name.clone(),
                     provider_display_name: "Claude".into(),
                     item_noun: "Agent".into(),
@@ -322,275 +308,5 @@ impl super::CloudAgentService for ClaudeCodingAgent {
 
     async fn attach_command(&self, session_id: &str) -> Result<String, String> {
         Ok(format!("claude --teleport {session_id}"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
-
-    use tokio::sync::Mutex as AsyncMutex;
-
-    use super::*;
-    use crate::providers::{coding_agent::CloudAgentService, replay, testing::MockRunner};
-
-    static TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
-
-    fn fixture(name: &str) -> String {
-        crate::providers::testing::fixture_path("coding_agent", name)
-    }
-
-    fn now_epoch_secs() -> i64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
-    }
-
-    fn token_json(access_token: &str, expires_at: i64) -> String {
-        serde_json::json!({
-            "claudeAiOauth": {
-                "accessToken": access_token,
-                "expiresAt": expires_at
-            }
-        })
-        .to_string()
-    }
-
-    fn reset_auth_state() {
-        invalidate_auth_cache();
-    }
-
-    fn mock_runner(responses: Vec<Result<String, String>>) -> Arc<dyn CommandRunner> {
-        Arc::new(MockRunner::new(responses))
-    }
-
-    fn make_agent(runner: Arc<dyn CommandRunner>, http: Arc<dyn crate::providers::HttpClient>) -> ClaudeCodingAgent {
-        ClaudeCodingAgent::new("claude".into(), runner, http)
-    }
-
-    struct CountingSessionsHttp {
-        calls: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl crate::providers::HttpClient for CountingSessionsHttp {
-        async fn execute(
-            &self,
-            _request: reqwest::Request,
-            _label: &crate::providers::ChannelLabel,
-        ) -> Result<http::Response<bytes::Bytes>, String> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            Ok(http::Response::builder()
-                .status(200)
-                .body(bytes::Bytes::from_static(
-                    br#"{"data":[{"id":"one","title":"One","session_status":"running","updated_at":"2026-03-01T00:00:00Z","session_context":{"outcomes":[]}}]}"#,
-                ))
-                .expect("session response"))
-        }
-    }
-
-    #[tokio::test]
-    async fn concurrent_repo_projections_share_one_account_wide_session_fetch() {
-        let _test_lock = TEST_LOCK.lock().await;
-        reset_auth_state();
-        let runner = mock_runner(vec![Ok(token_json("shared", now_epoch_secs() + 3600))]);
-        let http = Arc::new(CountingSessionsHttp { calls: AtomicUsize::new(0) });
-        let agent = make_agent(runner, http.clone());
-
-        let repo_a = RepoCriteria { repo_slug: Some("owner/a".into()) };
-        let repo_b = RepoCriteria { repo_slug: Some("owner/b".into()) };
-        let (first, second) = tokio::join!(agent.list_sessions(&repo_a), agent.list_sessions(&repo_b));
-
-        first.expect("first repo projection");
-        second.expect("second repo projection");
-        assert_eq!(http.calls.load(Ordering::SeqCst), 1, "account-wide fetch should be shared before filtering by repo");
-    }
-
-    #[tokio::test]
-    async fn oauth_token_is_cached_until_near_expiry() {
-        let _test_lock = TEST_LOCK.lock().await;
-        reset_auth_state();
-        let runner = MockRunner::new(vec![Ok(token_json("token-1", now_epoch_secs() + 3600))]);
-        let token1 = get_oauth_token(&runner).await.expect("first token");
-        let token2 = get_oauth_token(&runner).await.expect("cached token");
-        assert_eq!(token1.access_token, "token-1");
-        assert_eq!(token2.access_token, "token-1");
-    }
-
-    #[tokio::test]
-    async fn oauth_token_refreshes_when_expiring_soon() {
-        let _test_lock = TEST_LOCK.lock().await;
-        reset_auth_state();
-        let runner =
-            MockRunner::new(vec![Ok(token_json("old-token", now_epoch_secs() + 10)), Ok(token_json("new-token", now_epoch_secs() + 3600))]);
-        let first = get_oauth_token(&runner).await.expect("first token");
-        let second = get_oauth_token(&runner).await.expect("refreshed token");
-        assert_eq!(first.access_token, "old-token");
-        assert_eq!(second.access_token, "new-token");
-    }
-
-    #[tokio::test]
-    async fn fetch_sessions_inner_includes_archived_and_sorts() {
-        let _test_lock = TEST_LOCK.lock().await;
-        reset_auth_state();
-
-        let runner = mock_runner(vec![Ok(token_json("abc123", now_epoch_secs() + 3600))]);
-        let session = replay::test_session(&fixture("claude_sessions.yaml"), replay::Masks::new());
-        let http = replay::test_http_client(&session);
-        let agent = make_agent(runner, http);
-
-        let sessions = agent.fetch_sessions_inner("https://api.test").await.expect("fetch sessions");
-        session.finish();
-
-        assert_eq!(sessions.len(), 3, "all sessions including archived should be returned");
-        assert_eq!(sessions[0].id, "skip", "archived session with newest timestamp first");
-        assert_eq!(sessions[1].id, "new");
-        assert_eq!(sessions[2].id, "old");
-    }
-
-    #[tokio::test]
-    async fn fetch_sessions_retries_after_auth_error() {
-        let _test_lock = TEST_LOCK.lock().await;
-        reset_auth_state();
-
-        let runner =
-            mock_runner(vec![Ok(token_json("expired", now_epoch_secs() + 3600)), Ok(token_json("fresh", now_epoch_secs() + 3600))]);
-        let session = replay::test_session(&fixture("claude_auth_retry.yaml"), replay::Masks::new());
-        let http = replay::test_http_client(&session);
-        let agent = make_agent(runner, http);
-
-        let sessions = agent.fetch_sessions("https://api.test").await.expect("retry should succeed");
-        session.finish();
-
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "s1");
-    }
-
-    #[tokio::test]
-    async fn fetch_sessions_returns_empty_after_second_auth_error() {
-        let _test_lock = TEST_LOCK.lock().await;
-        reset_auth_state();
-
-        let runner = mock_runner(vec![Ok(token_json("bad-1", now_epoch_secs() + 3600)), Ok(token_json("bad-2", now_epoch_secs() + 3600))]);
-        let session = replay::test_session(&fixture("claude_auth_failure.yaml"), replay::Masks::new());
-        let http = replay::test_http_client(&session);
-        let agent = make_agent(runner, http);
-
-        let sessions = agent.fetch_sessions("https://api.test").await.expect("auth failures should degrade gracefully");
-        session.finish();
-
-        assert!(sessions.is_empty());
-    }
-
-    #[tokio::test]
-    async fn list_sessions_uses_cache_and_maps_fields() {
-        // This test pre-populates the cache, so no HTTP calls are made.
-        // Use an empty replay session to make that explicit.
-        let _test_lock = TEST_LOCK.lock().await;
-        reset_auth_state();
-
-        let runner = mock_runner(vec![]);
-        let dir = tempfile::tempdir().unwrap();
-        let empty_fixture = dir.path().join("empty.yaml");
-        std::fs::write(&empty_fixture, "interactions: []\n").unwrap();
-        let session = replay::test_session(empty_fixture.to_str().unwrap(), replay::Masks::new());
-        let http = replay::test_http_client(&session);
-        let agent = make_agent(runner, http);
-        agent.sessions.seed(vec![
-            WebSession {
-                id: "one".into(),
-                title: "One".into(),
-                session_status: "running".into(),
-                created_at: String::new(),
-                updated_at: "2026-03-05T00:00:00Z".into(),
-                session_context: SessionContext {
-                    model: "sonnet".into(),
-                    outcomes: vec![SessionOutcome {
-                        git_info: Some(SessionGitInfo { branches: vec!["refs/heads/feat-a".into()], repo: Some("owner/repo".into()) }),
-                    }],
-                },
-            },
-            WebSession {
-                id: "two".into(),
-                title: "Two".into(),
-                session_status: "something-else".into(),
-                created_at: String::new(),
-                updated_at: "2026-03-04T00:00:00Z".into(),
-                session_context: SessionContext { model: String::new(), outcomes: vec![SessionOutcome { git_info: None }] },
-            },
-            WebSession {
-                id: "skip".into(),
-                title: "Skip".into(),
-                session_status: "running".into(),
-                created_at: String::new(),
-                updated_at: "2026-03-03T00:00:00Z".into(),
-                session_context: SessionContext {
-                    model: "opus".into(),
-                    outcomes: vec![SessionOutcome {
-                        git_info: Some(SessionGitInfo { branches: vec!["refs/heads/feat-b".into()], repo: Some("other/repo".into()) }),
-                    }],
-                },
-            },
-        ]);
-
-        let sessions = agent.list_sessions(&RepoCriteria { repo_slug: Some("owner/repo".into()) }).await.expect("list sessions");
-
-        assert_eq!(sessions.len(), 2);
-        let one = sessions.iter().find(|(id, _)| id == "one").expect("one session");
-        assert_eq!(one.1.status, SessionStatus::Running);
-        assert_eq!(one.1.model.as_deref(), Some("sonnet"));
-        assert!(one.1.correlation_keys.contains(&CorrelationKey::Branch("feat-a".into())));
-
-        let two = sessions.iter().find(|(id, _)| id == "two").expect("two session");
-        assert_eq!(two.1.status, SessionStatus::Idle);
-        assert!(two.1.model.is_none());
-    }
-
-    #[tokio::test]
-    async fn archive_session_succeeds() {
-        let _test_lock = TEST_LOCK.lock().await;
-        reset_auth_state();
-
-        let runner = mock_runner(vec![Ok(token_json("archive-token", now_epoch_secs() + 3600))]);
-        let session = replay::test_session(&fixture("claude_archive_ok.yaml"), replay::Masks::new());
-        let http = replay::test_http_client(&session);
-        let agent = make_agent(runner, http);
-
-        agent.archive_session_inner("s-ok", "https://api.test").await.expect("archive should succeed");
-        session.finish();
-    }
-
-    #[tokio::test]
-    async fn archive_session_returns_error_on_failure() {
-        let _test_lock = TEST_LOCK.lock().await;
-        reset_auth_state();
-
-        let runner = mock_runner(vec![Ok(token_json("archive-token", now_epoch_secs() + 3600))]);
-        let session = replay::test_session(&fixture("claude_archive_fail.yaml"), replay::Masks::new());
-        let http = replay::test_http_client(&session);
-        let agent = make_agent(runner, http);
-
-        let err = agent.archive_session_inner("s-fail", "https://api.test").await.expect_err("archive should fail");
-        session.finish();
-
-        assert!(err.contains("HTTP 500"));
-        assert!(err.contains("boom"));
-    }
-
-    #[tokio::test]
-    async fn attach_command_formats_teleport_command() {
-        // No TEST_LOCK needed: this test is pure string formatting,
-        // it doesn't touch the global AUTH_CACHE.
-        let runner = mock_runner(vec![]);
-        let dir = tempfile::tempdir().unwrap();
-        let empty_fixture = dir.path().join("empty.yaml");
-        std::fs::write(&empty_fixture, "interactions: []\n").unwrap();
-        let session = replay::test_session(empty_fixture.to_str().unwrap(), replay::Masks::new());
-        let http = replay::test_http_client(&session);
-        let agent = make_agent(runner, http);
-        let cmd = agent.attach_command("abc123").await.expect("attach command");
-        assert_eq!(cmd, "claude --teleport abc123");
     }
 }

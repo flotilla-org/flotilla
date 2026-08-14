@@ -235,8 +235,6 @@ mod tests {
                 remote_ahead_behind: None,
                 working_tree: None,
                 last_commit: None,
-                correlation_keys: Vec::new(),
-                association_keys: Vec::new(),
                 host_name: None,
                 environment_id: None,
             })]

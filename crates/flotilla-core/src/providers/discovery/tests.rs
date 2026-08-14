@@ -231,12 +231,6 @@ fn environment_bag_assertions_accessor() {
     assert!(matches!(bag.assertions()[0], EnvironmentAssertion::BinaryAvailable { ref name, .. } if name == "git"));
 }
 
-#[test]
-fn discovery_runtime_is_follower_checks_factories() {
-    assert!(!DiscoveryRuntime::for_process(false).is_follower());
-    assert!(DiscoveryRuntime::for_process(true).is_follower());
-}
-
 struct CountingPresentationManager(Arc<std::sync::atomic::AtomicUsize>);
 
 #[async_trait]

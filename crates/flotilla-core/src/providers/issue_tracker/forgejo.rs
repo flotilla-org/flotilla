@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
-    AssociationKey, Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
+    Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
 };
 
 use crate::providers::{http_execute, run, CommandRunner, HttpClient};
@@ -137,7 +137,6 @@ fn parse_issue(source: &IssueSource, value: &serde_json::Value, fetched_at: Date
             .labels(labels)
             .as_of(as_of)
             .observed_at(fetched_at)
-            .association_keys(vec![AssociationKey::IssueRef("forgejo".into(), id)])
             .provider_name("forgejo".into())
             .provider_display_name("Forgejo".into())
             .build(),

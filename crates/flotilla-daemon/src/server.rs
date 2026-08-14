@@ -308,7 +308,6 @@ pub struct DaemonServer {
     socket_path: PathBuf,
     socket_discovery_path: PathBuf,
     idle_timeout: Duration,
-    follower: bool,
     client_count: Arc<AtomicUsize>,
     client_notify: Arc<Notify>,
     shutdown_tx: watch::Sender<bool>,
@@ -372,7 +371,6 @@ impl DaemonServer {
             socket_path,
             socket_discovery_path,
             idle_timeout,
-            follower: daemon_config.follower,
             client_count: Arc::new(AtomicUsize::new(0)),
             client_notify: Arc::new(Notify::new()),
             shutdown_tx,
@@ -442,43 +440,27 @@ impl DaemonServer {
 
         remote_command_router.resume_pending_crew_completions().await;
 
-        // Spawn idle timeout watcher (disabled for follower-mode daemons
-        // which serve peer connections and should stay up indefinitely)
-        if !self.follower {
-            let idle_client_count = Arc::clone(&client_count);
-            let idle_shutdown_tx = shutdown_tx.clone();
-            let idle_notify = Arc::clone(&client_notify);
-            tokio::spawn(async move {
-                loop {
-                    // Wait until zero active connections.
-                    loop {
-                        if idle_client_count.load(Ordering::SeqCst) == 0 {
-                            break;
-                        }
-                        idle_notify.notified().await;
-                    }
-
-                    info!(timeout_secs = idle_timeout.as_secs(), "no active connections, waiting before shutdown");
-
-                    // Race: timeout vs client count change
-                    tokio::select! {
-                        () = tokio::time::sleep(idle_timeout) => {
-                            if idle_client_count.load(Ordering::SeqCst) == 0 {
-                                info!("idle timeout reached, shutting down");
-                                let _ = idle_shutdown_tx.send(true);
-                                return;
-                            }
-                            // Client connected during the sleep — loop back
-                        }
-                        () = idle_notify.notified() => {
-                            // Client count changed — loop back to re-check
-                        }
-                    }
+        let idle_client_count = Arc::clone(&client_count);
+        let idle_shutdown_tx = shutdown_tx.clone();
+        let idle_notify = Arc::clone(&client_notify);
+        tokio::spawn(async move {
+            loop {
+                while idle_client_count.load(Ordering::SeqCst) != 0 {
+                    idle_notify.notified().await;
                 }
-            });
-        } else {
-            info!("follower mode: idle timeout disabled");
-        }
+                info!(timeout_secs = idle_timeout.as_secs(), "no active connections, waiting before shutdown");
+                tokio::select! {
+                    () = tokio::time::sleep(idle_timeout) => {
+                        if idle_client_count.load(Ordering::SeqCst) == 0 {
+                            info!("idle timeout reached, shutting down");
+                            let _ = idle_shutdown_tx.send(true);
+                            return;
+                        }
+                    }
+                    () = idle_notify.notified() => {}
+                }
+            }
+        });
 
         let peer_manager = self.peer_manager;
         let (_peer_runtime_handle, peer_connected_tx) = spawn_peer_networking_runtime(
