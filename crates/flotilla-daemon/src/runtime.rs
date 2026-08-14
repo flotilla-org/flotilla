@@ -60,7 +60,7 @@ use crate::{
     resource_manifest::ResourceManifestReconciler,
     sleep_inhibitor,
     supervisor::{supervise, ControllerSupervision, RestartBudgetExhausted},
-    vessel_config::{compose, ComposedFile, Fragment, TargetId, AGENT_ENVIRONMENT_PATH},
+    vessel_config::{compose, ComposedFile, Fragment, TargetId},
     Aggregator, AggregatorResolvers,
 };
 
@@ -81,6 +81,14 @@ fn compose_agent_environment(fragments: impl IntoIterator<Item = Fragment>) -> R
         return Ok(None);
     }
     compose(TargetId::AgentEnvironment, fragments).map(Some).map_err(|error| format!("compose shared agent environment: {error}"))
+}
+
+async fn stage_agent_environment(runner: &dyn CommandRunner, fallback: &Path, contents: &str) -> Result<PathBuf, String> {
+    let config_base =
+        runner.writable_config_base(None, fallback).await.map_err(|error| format!("resolve agent environment path: {error}"))?;
+    let path = config_base.join("agent-environment");
+    runner.write_file(&path, contents).await.map_err(|error| format!("stage composed agent environment: {error}"))?;
+    Ok(path)
 }
 
 struct DaemonConvoyTeardownRuntime {
@@ -1868,20 +1876,23 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .as_deref()
             .map(|registry| registry.fragments(&spec.required_agent_adapters, &spec.env))
             .unwrap_or_default();
-        let agent_environment = match compose_agent_environment(credential_config_fragments.into_iter().chain(agent_material_fragments)) {
-            Ok(composed) => composed,
-            Err(error) => {
-                return Err(discard_uncreated_environment(
-                    self.state.credential_store.as_deref(),
-                    self.state.agent_material.as_deref(),
-                    name,
-                    error,
-                )
-                .await
-                .into())
-            }
-        };
-        if let Some(composed) = &agent_environment {
+        let agent_environment_claims =
+            match compose_agent_environment(credential_config_fragments.iter().cloned().chain(agent_material_fragments.iter().cloned())) {
+                Ok(composed) => composed,
+                Err(error) => {
+                    return Err(discard_uncreated_environment(
+                        self.state.credential_store.as_deref(),
+                        self.state.agent_material.as_deref(),
+                        name,
+                        error,
+                    )
+                    .await
+                    .into())
+                }
+            };
+        let creation_agent_environment = compose_agent_environment(agent_material_fragments.iter().cloned())
+            .expect("agent material fragments already composed successfully with credential claims");
+        if let Some(composed) = &creation_agent_environment {
             for (name, value) in &composed.environment {
                 if !environment_variables.iter().any(|(existing, _)| existing == name) {
                     environment_variables.push((name.clone(), value.clone()));
@@ -1961,19 +1972,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             }
         };
         let image_ref = handle.image().as_str().to_string();
-        if let Some(composed) = &agent_environment {
-            if let Err(error) = handle.runner().write_file(Path::new(AGENT_ENVIRONMENT_PATH), &composed.contents).await {
-                return Err(discard_failed_environment(
-                    &handle,
-                    self.state.credential_store.as_deref(),
-                    self.state.agent_material.as_deref(),
-                    name,
-                    format!("stage composed agent environment: {error}"),
-                )
-                .await
-                .into());
-            }
-        }
+        drop(agent_environment_claims);
         let image_digest = match handle.image_digest() {
             Some(digest) => digest.to_string(),
             None => {
@@ -2006,6 +2005,41 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             )
             .await
             .into());
+        }
+        let resolved_credential_fragments = match &self.state.credential_store {
+            Some(store) => match store.vessel_config_fragments_for_runner(&credential_refs, &spec.env, &*handle.runner()).await {
+                Ok(fragments) => fragments,
+                Err(error) => {
+                    return Err(discard_failed_environment(
+                        &handle,
+                        self.state.credential_store.as_deref(),
+                        self.state.agent_material.as_deref(),
+                        name,
+                        error,
+                    )
+                    .await
+                    .into())
+                }
+            },
+            None => Vec::new(),
+        };
+        let resolved_agent_environment =
+            compose_agent_environment(resolved_credential_fragments.into_iter().chain(agent_material_fragments.iter().cloned()))
+                .expect("resolved fragments preserve the successfully checked agent environment claims");
+        if let Some(composed) = &resolved_agent_environment {
+            if let Err(error) =
+                stage_agent_environment(&*handle.runner(), self.state.config.state_dir().as_path(), &composed.contents).await
+            {
+                return Err(discard_failed_environment(
+                    &handle,
+                    self.state.credential_store.as_deref(),
+                    self.state.agent_material.as_deref(),
+                    name,
+                    error,
+                )
+                .await
+                .into());
+            }
         }
         for delivery in &material_deliveries {
             let args = delivery.preflight.args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -3484,6 +3518,51 @@ mod tests {
     }
 
     struct CredentialInteriorRunner(DiscoveryMockRunner);
+
+    #[derive(Default)]
+    struct PersistentPathRecordingRunner {
+        writes: StdMutex<Vec<(PathBuf, String)>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for PersistentPathRecordingRunner {
+        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            Ok(String::new())
+        }
+
+        async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            true
+        }
+
+        async fn writable_config_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
+            Ok(PathBuf::from("/home/crew/flotilla"))
+        }
+
+        async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+            self.writes.lock().expect("writes lock").push((path.to_path_buf(), content.to_string()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_environment_is_staged_at_the_runner_writable_config_base() {
+        let runner = PersistentPathRecordingRunner::default();
+
+        let path = stage_agent_environment(&runner, Path::new("/host/state"), "export CODEX_HOME='/mounted/codex'\n")
+            .await
+            .expect("stage agent environment");
+
+        assert_eq!(path, Path::new("/home/crew/flotilla/agent-environment"));
+        assert_eq!(runner.writes.lock().expect("writes lock").as_slice(), &[(
+            PathBuf::from("/home/crew/flotilla/agent-environment"),
+            "export CODEX_HOME='/mounted/codex'\n".to_string()
+        )]);
+        assert!(!path.starts_with("/run/flotilla"));
+    }
 
     #[async_trait]
     impl CommandRunner for CredentialInteriorRunner {
@@ -7228,12 +7307,13 @@ mod tests {
         // Credential preflight runs through the contained runner, so its
         // scratch directory must be inside the container user's writable
         // world rather than derived from daemon-host paths (#1508).
-        let preflight_config_dir = PathBuf::from("/home/crew/flotilla/credentials/claude-max/claude");
+        let preflight_config_dir = PathBuf::from("/home/crew/flotilla/credentials/claude-max/claude-preflight");
+        let crew_config_dir = PathBuf::from("/home/crew/flotilla/credentials/claude-max/claude");
         let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
             DiscoveryMockRunner::builder()
                 .tool_exists("claude", true)
                 .on_run("mkdir", &["-p", &preflight_config_dir.to_string_lossy()], Ok(String::new()))
-                .on_run("mkdir", &["-p", "/run/flotilla/claude"], Ok(String::new()))
+                .on_run("mkdir", &["-p", &crew_config_dir.to_string_lossy()], Ok(String::new()))
                 .build(),
         ));
         let bag = EnvironmentBag::new()
@@ -7316,7 +7396,10 @@ mod tests {
             "the contained Claude process must receive its OAuth token"
         );
         assert!(
-            launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == "/run/flotilla/claude"),
+            launch
+                .env_vars
+                .iter()
+                .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == crew_config_dir.to_str().expect("UTF-8 path")),
             "the contained Claude process must receive the config directory owned by its adapter"
         );
     }

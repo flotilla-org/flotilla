@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use flotilla_protocol::arg::{flatten, Arg};
 use flotilla_resources::{TerminalAttentionState, TerminalBrief};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use toml_edit::{value, DocumentMut, Item, Table};
 
@@ -428,8 +427,6 @@ pub trait AgentAdapter: Send + Sync {
 /// relative to the session's working directory. It lives under `.flotilla/`
 /// alongside the brief so it inherits the same git exclusion and teardown.
 pub const CLAUDE_MANAGED_SETTINGS_PATH: &str = ".flotilla/claude-settings.json";
-const CONTAINED_CLAUDE_CONFIG_DIR: &str = "/run/flotilla/claude";
-const HOST_DIRECT_CLAUDE_OAUTH_CONFIG_ROOT: &str = "/run/flotilla/claude-oauth";
 
 struct CliAgentAdapter {
     binary: String,
@@ -504,24 +501,16 @@ impl CliAgentAdapter {
     }
 
     fn claude_invocation_config_dir(&self, environment: &TerminalEnvVars) -> Option<PathBuf> {
-        let AdapterFlavor::ClaudeCode { contained, .. } = &self.flavor else {
+        let AdapterFlavor::ClaudeCode { .. } = &self.flavor else {
             return None;
         };
         let oauth_token = environment.iter().find(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN").map(|(_, value)| value.as_str());
-        if *contained {
-            return oauth_token.map(|_| PathBuf::from(CONTAINED_CLAUDE_CONFIG_DIR));
+        if oauth_token.is_some() {
+            if let Some((_, config_dir)) = environment.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR") {
+                return Some(PathBuf::from(config_dir));
+            }
         }
-        if let Some((_, config_dir)) = environment.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR") {
-            return Some(PathBuf::from(config_dir));
-        }
-        oauth_token.map(|token| {
-            // Host-direct OAuth identities still need separate supervisor and
-            // mutable-state homes. Key the ephemeral directory without putting
-            // credential material or a reversible account identifier in paths.
-            let digest = Sha256::digest(token.as_bytes());
-            let account_key = digest[..16].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-            PathBuf::from(HOST_DIRECT_CLAUDE_OAUTH_CONFIG_ROOT).join(account_key)
-        })
+        None
     }
 }
 
@@ -545,6 +534,11 @@ impl AgentAdapter for CliAgentAdapter {
             AdapterFlavor::ClaudeCode { state_config, state_lock, contained } => {
                 if *contained && !environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
                     return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
+                }
+                if environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
+                    && !environment.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+                {
+                    return Err("Claude Code OAuth requires seam-resolved environment `CLAUDE_CONFIG_DIR`".to_string());
                 }
                 let invocation_state = if let Some(config_dir) = self.claude_invocation_config_dir(environment) {
                     let config_dir_string = config_dir.display().to_string();
@@ -592,6 +586,12 @@ impl AgentAdapter for CliAgentAdapter {
             && !env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
         {
             return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
+        }
+        if matches!(&self.flavor, AdapterFlavor::ClaudeCode { .. })
+            && env.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
+            && !env.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+        {
+            return Err("Claude Code OAuth requires seam-resolved environment `CLAUDE_CONFIG_DIR`".to_string());
         }
         if let Some(config_dir) = self.claude_invocation_config_dir(&env) {
             env.retain(|(name, _)| name != "CLAUDE_CONFIG_DIR");
@@ -797,9 +797,8 @@ mod tests {
 
     use crate::{
         agent_adapter::{
-            append_convoy_work_context, build_crew_brief, build_crew_brief_with_options, AgentAdapterRegistry, AgentLaunchPlan,
-            AgentLaunchRequest, CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefRenderOptions, CrewBriefTemplateOverride,
-            CrewBriefTemplateResolver, CONTAINED_CLAUDE_CONFIG_DIR,
+            append_convoy_work_context, build_crew_brief, build_crew_brief_with_options, AgentAdapterRegistry, AgentLaunchRequest,
+            CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefRenderOptions, CrewBriefTemplateOverride, CrewBriefTemplateResolver,
         },
         path_context::ExecutionEnvironmentPath,
         providers::{
@@ -1350,7 +1349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contained_claude_owns_ephemeral_config_without_accepting_a_config_input() {
+    async fn contained_claude_uses_the_seam_resolved_invocation_config() {
         let workspace = ExecutionEnvironmentPath::new("/workspace");
         let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok("/workspace\n".to_string()), Err("not a checkout".to_string())]));
         let env = EnvironmentBag::new()
@@ -1360,7 +1359,10 @@ mod tests {
         let claude = registry.get("claude-code").expect("Claude adapter");
         let brief =
             flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
-        let invocation_environment = vec![("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string())];
+        let invocation_environment = vec![
+            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string()),
+            ("CLAUDE_CONFIG_DIR".to_string(), "/home/crew/flotilla/credentials/claude-max/claude".to_string()),
+        ];
 
         claude.prepare_with_environment(&workspace, &brief, &invocation_environment).await.expect("prepare contained Claude");
         let plan = claude
@@ -1368,8 +1370,15 @@ mod tests {
             .expect("contained launch plan");
 
         assert!(plan.env.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == "redacted-test-token"));
-        assert!(plan.env.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == CONTAINED_CLAUDE_CONFIG_DIR));
-        assert!(runner.calls().iter().any(|(command, args)| command == "mkdir" && args == &["-p", CONTAINED_CLAUDE_CONFIG_DIR]));
+        assert!(plan
+            .env
+            .iter()
+            .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == "/home/crew/flotilla/credentials/claude-max/claude"));
+        assert!(runner
+            .calls()
+            .iter()
+            .any(|(command, args)| { command == "mkdir" && args == &["-p", "/home/crew/flotilla/credentials/claude-max/claude"] }));
+        assert!(runner.calls().iter().flat_map(|(_, args)| args).all(|arg| !arg.starts_with("/run/flotilla")));
     }
 
     #[tokio::test]
@@ -1431,36 +1440,51 @@ mod tests {
     }
 
     #[test]
-    fn host_direct_claude_oauth_accounts_get_distinct_adapter_owned_config_dirs() {
+    fn host_direct_claude_oauth_accounts_keep_distinct_seam_resolved_config_dirs() {
         let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(MockRunner::new(Vec::new())));
         let claude = registry.get("claude-code").expect("Claude adapter");
         let brief =
             flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
-        let launch = |token: &str| {
+        let launch = |token: &str, config_dir: &str| {
             claude
                 .launch(&AgentLaunchRequest {
                     role: "coder".into(),
                     model: None,
                     brief: brief.clone(),
-                    environment: vec![("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.to_string())],
+                    environment: vec![
+                        ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.to_string()),
+                        ("CLAUDE_CONFIG_DIR".to_string(), config_dir.to_string()),
+                    ],
                 })
                 .expect("host-direct OAuth launch")
         };
 
-        let alice = launch("token-alice");
-        let bob = launch("token-bob");
-        let config_dir = |plan: &AgentLaunchPlan| {
-            plan.env
-                .iter()
-                .find(|(name, _)| name == "CLAUDE_CONFIG_DIR")
-                .map(|(_, value)| value.clone())
-                .expect("adapter-owned Claude config")
-        };
+        let alice = launch("token-alice", "/state/flotilla/credentials/alice/claude");
+        let bob = launch("token-bob", "/state/flotilla/credentials/bob/claude");
 
-        assert_ne!(config_dir(&alice), config_dir(&bob));
-        assert!(config_dir(&alice).starts_with("/run/flotilla/claude-oauth/"));
-        assert!(config_dir(&bob).starts_with("/run/flotilla/claude-oauth/"));
+        assert!(alice.env.contains(&("CLAUDE_CONFIG_DIR".to_string(), "/state/flotilla/credentials/alice/claude".to_string())));
+        assert!(bob.env.contains(&("CLAUDE_CONFIG_DIR".to_string(), "/state/flotilla/credentials/bob/claude".to_string())));
+    }
+
+    #[test]
+    fn host_direct_claude_oauth_rejects_a_token_without_a_seam_resolved_config_dir() {
+        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
+        let registry = AgentAdapterRegistry::discover(&env, Arc::new(MockRunner::new(Vec::new())));
+        let claude = registry.get("claude-code").expect("Claude adapter");
+        let brief =
+            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
+
+        let error = claude
+            .launch(&AgentLaunchRequest {
+                role: "coder".into(),
+                model: None,
+                brief,
+                environment: vec![("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "token-alice".to_string())],
+            })
+            .expect_err("OAuth identities must never share ambient Claude state");
+
+        assert!(error.contains("CLAUDE_CONFIG_DIR"), "unexpected error: {error}");
     }
 
     #[test]
