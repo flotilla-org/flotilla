@@ -22,17 +22,18 @@ use flotilla_protocol::{
     commands::{AttachMode, RepositoryIdentityChange},
     qualified_path::{HostId, QualifiedPath},
     result_set::{CheckoutRow, ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
-    AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CrewAttention, CrewCommandContext,
-    CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse, DispatchQueueRow, EnvironmentId, EvidenceFreshness,
-    ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedLeafFiring, ExplainedSettlement,
-    ExplainedSubscription, ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse,
-    FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
-    HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
-    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
-    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary,
-    ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
-    ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse,
-    TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CredentialAttention,
+    CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse,
+    DispatchQueueRow, EnvironmentId, EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition,
+    ExplainedCrewDelivery, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, FleetHealthResponse,
+    FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus,
+    FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
+    NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef,
+    ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoIdentity, RepoInfo,
+    RepoProvidersResponse, RepoSummary, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse,
+    ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus,
+    StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY,
+    TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -867,11 +868,18 @@ fn accumulate_fleet_health_counts(counts: &mut HashMap<HostName, (usize, HashSet
     }
 }
 
-/// One attention line per expired or near-expiry credential scope on a host,
+/// One attention entry per expired or near-expiry credential scope on a host,
 /// derived from the `credential_expiry` capability its heartbeat publishes.
-fn host_credential_attention(status: &ResourceHostStatus, now: DateTime<Utc>, warning_window: chrono::Duration) -> Vec<String> {
+fn host_credential_attention(
+    status: &ResourceHostStatus,
+    now: DateTime<Utc>,
+    warning_window: chrono::Duration,
+) -> Vec<CredentialAttention> {
     let Ok(expiry) = status.credential_expiry() else {
-        return vec!["credential expiry capability is unreadable".to_string()];
+        return vec![CredentialAttention {
+            severity: CredentialAttentionSeverity::Unreadable,
+            message: "credential expiry capability is unreadable".to_string(),
+        }];
     };
     let mut attention = Vec::new();
     for (scope, entry) in expiry {
@@ -881,9 +889,15 @@ fn host_credential_attention(status: &ResourceHostStatus, now: DateTime<Utc>, wa
             format!("credential `{scope}`")
         };
         if let Some(expired_at) = entry.expired_at(now) {
-            attention.push(format!("{label} expired on {}", expired_at.format("%Y-%m-%d")));
+            attention.push(CredentialAttention {
+                severity: CredentialAttentionSeverity::Expired,
+                message: format!("{label} expired on {}", expired_at.format("%Y-%m-%d")),
+            });
         } else if let Some(expires_at) = entry.expires_within(now, warning_window) {
-            attention.push(format!("{label} expires on {}", expires_at.format("%Y-%m-%d")));
+            attention.push(CredentialAttention {
+                severity: CredentialAttentionSeverity::Expiring,
+                message: format!("{label} expires on {}", expires_at.format("%Y-%m-%d")),
+            });
         }
     }
     attention

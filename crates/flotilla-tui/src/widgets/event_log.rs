@@ -2,7 +2,9 @@ use std::{any::Any, collections::HashMap};
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{FleetHostRow, FleetHostStaleness, FleetObservationAgreement, PeerConnectionState, SleepInhibitionHealth};
+use flotilla_protocol::{
+    CredentialAttentionSeverity, FleetHostRow, FleetHostStaleness, FleetObservationAgreement, PeerConnectionState, SleepInhibitionHealth,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
@@ -390,15 +392,18 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
         let degraded = !host.degraded_conditions.is_empty();
         let disagreement = host.observation_agreement == FleetObservationAgreement::Disagree;
         let inhibition_failed = matches!(host.sleep_inhibition, SleepInhibitionHealth::Failed { .. });
-        let credential_expired = host.credential_attention.iter().any(|attention| attention.contains("expired"));
-        let icon = if degraded || disagreement || inhibition_failed || credential_expired {
+        let credential_alert = host
+            .credential_attention
+            .iter()
+            .any(|attention| matches!(attention.severity, CredentialAttentionSeverity::Expired | CredentialAttentionSeverity::Unreadable));
+        let icon = if degraded || disagreement || inhibition_failed || credential_alert {
             "⚠"
         } else if host.staleness == FleetHostStaleness::Current {
             "●"
         } else {
             "○"
         };
-        let style = if degraded || disagreement || inhibition_failed || credential_expired {
+        let style = if degraded || disagreement || inhibition_failed || credential_alert {
             Style::default().fg(theme.warning)
         } else if host.staleness == FleetHostStaleness::Current {
             Style::default().fg(theme.status_ok)
@@ -437,8 +442,10 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
             SleepInhibitionHealth::Acquiring { .. } => "acquiring",
             SleepInhibitionHealth::Failed { .. } => "FAILED",
         };
-        let credentials = if credential_expired {
+        let credentials = if host.credential_attention.iter().any(|attention| attention.severity == CredentialAttentionSeverity::Expired) {
             "EXPIRED"
+        } else if host.credential_attention.iter().any(|attention| attention.severity == CredentialAttentionSeverity::Unreadable) {
+            "unreadable"
         } else if host.credential_attention.is_empty() {
             "-"
         } else {

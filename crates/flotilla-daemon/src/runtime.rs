@@ -5770,7 +5770,10 @@ mod tests {
 
         let health = daemon.fleet_health_internal().await.expect("fleet health");
         let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
-        assert_eq!(local.credential_attention, vec!["ambient claude login expired on 2020-02-01".to_string()]);
+        assert_eq!(local.credential_attention, vec![flotilla_protocol::CredentialAttention {
+            severity: flotilla_protocol::CredentialAttentionSeverity::Expired,
+            message: "ambient claude login expired on 2020-02-01".to_string(),
+        }]);
     }
 
     #[tokio::test]
