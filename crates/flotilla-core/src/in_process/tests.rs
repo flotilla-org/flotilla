@@ -115,6 +115,7 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
 #[tokio::test]
 async fn resource_host_routing_falls_back_to_unregistered_canonical_ref() {
     let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-host\"\n").expect("daemon config");
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),

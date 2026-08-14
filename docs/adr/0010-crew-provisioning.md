@@ -77,7 +77,9 @@ the resolver gets smarter.
 - **Realization is walls-first**: the vessel/environment provides the
   sandbox — docker walls, or on host-direct a wrapper sandbox *we* control
   (à la agent-seatbelt-sandbox) — because in-harness permission/escalation
-  implementations are idiosyncratic. Harness flags are fallback only.
+  implementations are idiosyncratic. Harness flags are fallback only. For the
+  Docker case, see `docs/crew-image.md` for what the curated image bakes in
+  and how a placement names it.
 - **Floor-of-confinement semantics**: stance declares minimum confinement.
   Under-realization (the pair environment×harness cannot achieve the stance)
   is a **loud resolution failure**, never a silent downgrade — a convoy

@@ -2362,7 +2362,18 @@ mod tests {
         ])
         .expect("replica snapshot cli should parse");
 
+        // FLOTILLA_DAEMON_SOCKET takes precedence over --socket (contained crew
+        // delivery relies on that), so a live ambient value would otherwise route
+        // this test at the real host daemon instead of the intentionally-missing
+        // socket under test. Isolate it for the duration of the assertion.
+        let ambient_socket = std::env::var_os("FLOTILLA_DAEMON_SOCKET");
+        std::env::remove_var("FLOTILLA_DAEMON_SOCKET");
+
         let err = run_replica_snapshot(&cli).await.expect_err("missing socket should fail");
+
+        if let Some(value) = ambient_socket {
+            std::env::set_var("FLOTILLA_DAEMON_SOCKET", value);
+        }
 
         assert!(err.to_string().contains("cannot connect to daemon"), "unexpected error: {err}");
         std::fs::remove_dir_all(&test_dir).expect("remove test dir");

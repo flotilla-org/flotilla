@@ -718,8 +718,10 @@ mod tests {
     async fn machine_scoped_dir_falls_back_to_etc_machine_id() {
         let base = std::path::Path::new("/tmp/flotilla-test");
         let runner = ProcessCommandRunner;
-        // This test only works on Linux with /etc/machine-id
-        if std::path::Path::new("/etc/machine-id").exists() {
+        // This test only works on Linux with a populated /etc/machine-id; some
+        // containers ship the file empty until systemd-machine-id-setup runs,
+        // which read_etc_machine_id() correctly treats as absent.
+        if read_etc_machine_id().is_some() {
             let dir = machine_scoped_state_dir(base, None, &runner).await.unwrap();
             assert!(dir.starts_with(base));
             assert_ne!(dir, *base);
