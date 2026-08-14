@@ -342,6 +342,9 @@ impl CapabilityTable {
                 ("code".into(), AgentRequirement { adapter: "codex".into(), model: None }),
                 ("review".into(), AgentRequirement { adapter: "claude-code".into(), model: Some("opus".into()) }),
                 ("code-review".into(), AgentRequirement { adapter: "claude-code".into(), model: Some("opus".into()) }),
+                // The most judgment-concentrated, lowest-volume role in the
+                // fleet gets the strongest planner available (ADR 0030).
+                ("governor".into(), AgentRequirement { adapter: CLAUDE_CODE_ADAPTER_ID.into(), model: Some("fable".into()) }),
             ]),
         }
     }
