@@ -379,6 +379,16 @@ impl AgentRequirement {
             _ => None,
         }
     }
+
+    /// Ambient-login scope this adapter falls back to when no credential is
+    /// delivered, named as it appears under the Host `credential_expiry`
+    /// capability. `None` for adapters with no ambient authentication path.
+    pub fn ambient_credential_scope(&self) -> Option<&'static str> {
+        match self.adapter.as_str() {
+            CLAUDE_CODE_ADAPTER_ID => Some(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE),
+            _ => None,
+        }
+    }
 }
 
 impl Default for CapabilityTable {

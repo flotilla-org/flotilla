@@ -44,17 +44,18 @@ use flotilla_resources::{
     watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
     ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase,
-    Demand as ResourceDemand, Environment as ResourceEnvironment, HoldAct, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
-    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
-    PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec,
-    ProjectSpec, ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
-    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
-    WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending,
+    CrewSource, CrewWorkPhase, Demand as ResourceDemand, Environment as ResourceEnvironment, HoldAct, Host as ResourceHost,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta,
+    InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation,
+    Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ReadResourceObject, Repository, RepositoryKey, RepositorySpec,
+    Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState,
+    TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch,
+    TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
+    WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -864,6 +865,28 @@ fn accumulate_fleet_health_counts(counts: &mut HashMap<HostName, (usize, HashSet
             convoys.insert(row.convoy.clone());
         }
     }
+}
+
+/// One attention line per expired or near-expiry credential scope on a host,
+/// derived from the `credential_expiry` capability its heartbeat publishes.
+fn host_credential_attention(status: &ResourceHostStatus, now: DateTime<Utc>, warning_window: chrono::Duration) -> Vec<String> {
+    let Ok(expiry) = status.credential_expiry() else {
+        return vec!["credential expiry capability is unreadable".to_string()];
+    };
+    let mut attention = Vec::new();
+    for (scope, entry) in expiry {
+        let label = if scope == flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE {
+            "ambient claude login".to_string()
+        } else {
+            format!("credential `{scope}`")
+        };
+        if let Some(expired_at) = entry.expired_at(now) {
+            attention.push(format!("{label} expired on {}", expired_at.format("%Y-%m-%d")));
+        } else if let Some(expires_at) = entry.expires_within(now, warning_window) {
+            attention.push(format!("{label} expires on {}", expires_at.format("%Y-%m-%d")));
+        }
+    }
+    attention
 }
 
 fn fleet_observation_agreement(
@@ -3549,12 +3572,18 @@ async fn validate_workflow_credentials(
         .filter(|vessel| vessel.stance == flotilla_resources::Stance::Contained)
         .flat_map(|vessel| vessel.credential_refs.iter().cloned())
         .collect::<BTreeSet<_>>();
-    if required.is_empty() {
+    let ambient_dependent_vessels = ambient_credential_dependent_vessels(&capabilities, &specs, workflow)?;
+    if required.is_empty() && ambient_dependent_vessels.is_empty() {
         return Ok(());
     }
-    let placement = placement.ok_or_else(|| {
-        format!("workflow requires credential `{}`, but no placement is available", required.first().expect("required is non-empty"))
-    })?;
+    let Some(placement) = placement else {
+        if let Some(first) = required.first() {
+            return Err(format!("workflow requires credential `{first}`, but no placement is available"));
+        }
+        // Ambient-dependent vessels without a placement have no target host to
+        // check expiry against; admission proceeds as before.
+        return Ok(());
+    };
     let target_host = placement_target_host(backend, namespace, placement).await?;
     let host = backend
         .clone()
@@ -3563,22 +3592,82 @@ async fn validate_workflow_credentials(
         .await
         .map_err(|error| format!("placement `{}` target host is not ready: {error}", placement.metadata.name))?;
     let host_label = target_host.display_name;
-    let mut status =
-        host.status.ok_or_else(|| format!("placement `{}` host `{host_label}` has no observed status", placement.metadata.name))?;
+    let Some(mut status) = host.status else {
+        if required.is_empty() {
+            return Ok(());
+        }
+        return Err(format!("placement `{}` host `{host_label}` has no observed status", placement.metadata.name));
+    };
     status.apply_heartbeat_readiness(Utc::now());
-    if !status.ready {
-        return Err(format!("placement `{}` host `{host_label}` is not ready", placement.metadata.name));
+    if !required.is_empty() {
+        if !status.ready {
+            return Err(format!("placement `{}` host `{host_label}` is not ready", placement.metadata.name));
+        }
+        let held = status.held_credentials().map_err(|error| {
+            format!("placement `{}` host `{host_label}` has invalid held-credential capability: {error}", placement.metadata.name)
+        })?;
+        if let Some(missing) = required.iter().find(|credential| !held.contains(*credential)) {
+            return Err(format!(
+                "workflow requires credential `{missing}`, which placement `{}` host `{host_label}` does not hold",
+                placement.metadata.name
+            ));
+        }
     }
-    let held = status.held_credentials().map_err(|error| {
-        format!("placement `{}` host `{host_label}` has invalid held-credential capability: {error}", placement.metadata.name)
+    let expiry = status.credential_expiry().map_err(|error| {
+        format!("placement `{}` host `{host_label}` has invalid credential expiry capability: {error}", placement.metadata.name)
     })?;
-    if let Some(missing) = required.iter().find(|credential| !held.contains(*credential)) {
-        return Err(format!(
-            "workflow requires credential `{missing}`, which placement `{}` host `{host_label}` does not hold",
-            placement.metadata.name
-        ));
+    let now = Utc::now();
+    for credential in &required {
+        if let Some(expired_at) = expiry.get(credential).and_then(|entry| entry.expired_at(now)) {
+            return Err(format!(
+                "credential `{credential}` expired on host `{host_label}` on {} — refresh its material before dispatching",
+                expired_at.format("%Y-%m-%d")
+            ));
+        }
+    }
+    for (vessel, scope) in &ambient_dependent_vessels {
+        if let Some(expired_at) = expiry.get(*scope).and_then(|entry| entry.expired_at(now)) {
+            return Err(format!(
+                "vessel `{vessel}` depends on the ambient claude login on host `{host_label}`, which expired on {} — \
+                 log in again on that host or grant a delivered claude credential",
+                expired_at.format("%Y-%m-%d")
+            ));
+        }
     }
     Ok(())
+}
+
+/// Vessels whose agent crews will authenticate through a host's ambient login
+/// rather than delivered material: non-contained vessels with a crew on an
+/// ambient-capable adapter and no granted credential covering that adapter's
+/// delivery slot. Returns `(vessel name, ambient scope)` pairs, the scope
+/// being the entry name under the Host `credential_expiry` capability.
+fn ambient_credential_dependent_vessels<'workflow>(
+    capabilities: &CapabilityTable,
+    specs: &BTreeMap<String, CredentialConsumer>,
+    workflow: &'workflow WorkflowTemplateSpec,
+) -> Result<Vec<(&'workflow str, &'static str)>, String> {
+    let mut vessels = Vec::new();
+    for vessel in workflow.vessels.iter().filter(|vessel| vessel.stance != flotilla_resources::Stance::Contained) {
+        for crew in &vessel.crew {
+            let CrewSource::Agent { selector, .. } = &crew.source else {
+                continue;
+            };
+            let requirement = capabilities.resolve_selector(selector)?;
+            let Some(scope) = requirement.ambient_credential_scope() else {
+                continue;
+            };
+            let delivery_slot = requirement.contained_credential_delivery_slot();
+            let has_delivered_credential = delivery_slot.is_some_and(|slot| {
+                vessel.credential_refs.iter().any(|name| specs.get(name).is_some_and(|consumer| consumer.delivery_slot() == slot))
+            });
+            if !has_delivered_credential {
+                vessels.push((vessel.name.as_str(), scope));
+                break;
+            }
+        }
+    }
+    Ok(vessels)
 }
 
 /// Write dispatch-time agent choices into the workflow spec that is about to
@@ -5825,6 +5914,8 @@ impl InProcessDaemon {
             accumulate_fleet_health_counts(&mut counts, &entry.rows);
         }
 
+        let warning_window_days = self.config.load_daemon_config().unwrap_or_default().credentials.warning_window_days;
+        let credential_warning_window = chrono::Duration::days(i64::from(warning_window_days));
         let mut rows = Vec::with_capacity(host_rows.len());
         for (host, (is_local, configured, link)) in host_rows {
             let status = statuses.get(&host);
@@ -5861,6 +5952,8 @@ impl InProcessDaemon {
                 .filter(|condition| condition.value == ConditionValue::False)
                 .map(|condition| format!("{}: {}", condition.condition_type, condition.message))
                 .collect();
+            let credential_attention =
+                status.map(|status| host_credential_attention(status, now, credential_warning_window)).unwrap_or_default();
 
             rows.push(
                 FleetHostRow::builder()
@@ -5883,6 +5976,7 @@ impl InProcessDaemon {
                     .staleness(staleness)
                     .observation_agreement(observation_agreement)
                     .degraded_conditions(degraded_conditions)
+                    .credential_attention(credential_attention)
                     .build(),
             );
         }

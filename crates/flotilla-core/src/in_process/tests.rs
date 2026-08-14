@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_resources::{
-    CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
+    CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase,
     Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Selector,
@@ -472,4 +472,116 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
     validate_workflow_credentials(&backend, "flotilla", &with_grant, Some(&placement))
         .await
         .expect("matching held OAuth grant admits contained Claude");
+}
+
+async fn set_host_credential_expiry(backend: &ResourceBackend, host_ref: &str, expiry: BTreeMap<String, CredentialExpiry>) {
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.get(host_ref).await.expect("host resource");
+    let mut status = host.status.expect("host status");
+    status.capabilities.insert(flotilla_resources::CREDENTIAL_EXPIRY_CAPABILITY.to_string(), serde_json::json!(expiry));
+    hosts.update_status(host_ref, &host.metadata.resource_version, &status).await.expect("update host status");
+}
+
+#[tokio::test]
+async fn dispatch_against_an_expired_credential_is_refused_with_the_credential_and_host_named() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    backend
+        .clone()
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&test_meta("claude-max"), &CredentialSpecSpec {
+            consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
+            source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
+            lifecycle: CredentialLifecycle::Static,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("create Claude credential declaration");
+    let mut workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder()
+            .name("work".to_string())
+            .stance(Stance::Contained)
+            .crew(vec![CrewSpec::builder()
+                .role("coder".to_string())
+                .source(CrewSource::Agent {
+                    selector: Selector { capability: "code".to_string(), adapter: Some("claude-code".to_string()), model: None },
+                    prompt: None,
+                    brief_template: None,
+                })
+                .build()])
+            .build()])
+        .build();
+    workflow.vessels[0].credential_refs = BTreeSet::from(["claude-max".to_string()]);
+    create_docker_placement(&backend, "docker-claude", "host-a", BTreeSet::from(["claude-max".to_string()])).await;
+    let placement = backend.using::<PlacementPolicy>("flotilla").get("docker-claude").await.expect("get placement");
+
+    let near_expiry = CredentialExpiry::builder().refresh_expires_at(Utc::now() + chrono::Duration::days(3)).build();
+    set_host_credential_expiry(&backend, "host-a", BTreeMap::from([("claude-max".to_string(), near_expiry)])).await;
+    validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect("near-expiry material still admits dispatch");
+
+    let expired = CredentialExpiry::builder()
+        .expires_at("2020-01-01T00:00:00Z".parse().expect("timestamp"))
+        .refresh_expires_at("2020-02-01T00:00:00Z".parse().expect("timestamp"))
+        .build();
+    set_host_credential_expiry(&backend, "host-a", BTreeMap::from([("claude-max".to_string(), expired)])).await;
+    let error = validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect_err("expired credential must refuse dispatch");
+    assert_eq!(error, "credential `claude-max` expired on host `host-a` on 2020-02-01 — refresh its material before dispatching");
+}
+
+#[tokio::test]
+async fn dispatch_of_an_ambient_claude_crew_is_refused_when_the_host_login_expired() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder()
+            .name("work".to_string())
+            .stance(Stance::Trusted)
+            .crew(vec![CrewSpec::builder()
+                .role("shepherd".to_string())
+                .source(CrewSource::Agent {
+                    selector: Selector { capability: "review".to_string(), adapter: None, model: None },
+                    prompt: None,
+                    brief_template: None,
+                })
+                .build()])
+            .build()])
+        .build();
+    create_docker_placement(&backend, "host-direct-feta", "feta", BTreeSet::new()).await;
+    let placement = backend.using::<PlacementPolicy>("flotilla").get("host-direct-feta").await.expect("get placement");
+
+    validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect("a host without expiry metadata admits ambient claude crews");
+
+    let refreshable = CredentialExpiry::builder()
+        .expires_at(Utc::now() - chrono::Duration::hours(1))
+        .refresh_expires_at(Utc::now() + chrono::Duration::days(30))
+        .build();
+    set_host_credential_expiry(
+        &backend,
+        "feta",
+        BTreeMap::from([(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE.to_string(), refreshable)]),
+    )
+    .await;
+    validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect("a live refresh chain admits ambient claude crews");
+
+    let expired = CredentialExpiry::builder().refresh_expires_at("2026-07-30T00:00:00Z".parse().expect("timestamp")).build();
+    set_host_credential_expiry(
+        &backend,
+        "feta",
+        BTreeMap::from([(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE.to_string(), expired)]),
+    )
+    .await;
+    let error = validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect_err("expired ambient login must refuse dispatch");
+    assert_eq!(
+        error,
+        "vessel `work` depends on the ambient claude login on host `feta`, which expired on 2026-07-30 — \
+         log in again on that host or grant a delivered claude credential"
+    );
 }
