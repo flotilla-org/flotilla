@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Flotilla — active ticket DAG</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, "Helvetica Neue", sans-serif;
+    margin: 1.5rem 2rem; max-width: 1600px;
+    background: light-dark(#fafafa, #14171a); color: light-dark(#1c1e21, #d7dade);
+  }
+  h1 { font-size: 1.3rem; margin-bottom: 0.2rem; }
+  .sub { color: light-dark(#666, #9aa0a6); font-size: 0.85rem; margin-bottom: 1rem; }
+  .legend { display: flex; gap: 1.2rem; flex-wrap: wrap; font-size: 0.8rem; margin: 0.6rem 0 1rem; }
+  .legend span { display: inline-flex; align-items: center; gap: 0.35rem; }
+  .chip { width: 0.9rem; height: 0.9rem; border-radius: 3px; display: inline-block; border: 1px solid rgba(0,0,0,0.25); }
+  .dag-wrap { background: light-dark(#fff, #1b1f23); border: 1px solid light-dark(#e0e0e0, #2c3237); border-radius: 8px; position: relative; }
+  .dag-controls { position: absolute; top: 0.5rem; right: 0.6rem; z-index: 5; display: flex; gap: 0.3rem; align-items: center; }
+  .dag-controls button {
+    width: 1.7rem; height: 1.7rem; border-radius: 6px; border: 1px solid light-dark(#ccc, #3a4148);
+    background: light-dark(#f5f5f5, #262c31); color: inherit; font-size: 0.95rem; cursor: pointer; line-height: 1;
+  }
+  .dag-controls button:hover { background: light-dark(#e8e8e8, #2f363c); }
+  .dag-controls .hint { font-size: 0.7rem; color: light-dark(#999, #7d8288); margin-right: 0.4rem; }
+  #dag-viewport { overflow: hidden; height: 62vh; min-height: 380px; cursor: grab; border-radius: 8px; }
+  #dag-viewport.panning { cursor: grabbing; }
+  #dag-canvas { transform-origin: 0 0; width: fit-content; }
+  .board-wrap { overflow-x: auto; margin-top: 1.5rem; }
+  .board { display: flex; gap: 0.8rem; align-items: flex-start; min-width: 900px; }
+  .col { flex: 1 1 0; min-width: 170px; background: light-dark(#f1f2f4, #1b1f23); border: 1px solid light-dark(#e0e0e0, #2c3237); border-radius: 8px; padding: 0.5rem; }
+  .col h3 { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; margin: 0.1rem 0.2rem 0.5rem; color: light-dark(#666, #9aa0a6); display: flex; justify-content: space-between; }
+  .col h3 .count { font-weight: 400; }
+  .card { background: light-dark(#fff, #23282d); border: 1px solid light-dark(#e4e4e4, #31373d); border-left: 4px solid var(--edge, #999); border-radius: 6px; padding: 0.4rem 0.55rem; margin-bottom: 0.5rem; font-size: 0.78rem; line-height: 1.35; }
+  .card:last-child { margin-bottom: 0; }
+  .card .t { font-weight: 600; }
+  .card .d { color: light-dark(#5b6066, #a6adb5); margin-top: 0.1rem; }
+  .col.landed  .card { --edge: #7bbf5e; }
+  .col.flight  .card { --edge: #3aa89b; }
+  .col.ready   .card { --edge: #4d8fd1; }
+  .col.waiting .card { --edge: #d9a93f; }
+  .col.design  .card { --edge: #9a6fc0; }
+  .col.grill   .card { --edge: #c2572e; }
+  a { color: light-dark(#0b62c4, #6cb2ff); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .note { font-size: 0.8rem; color: light-dark(#666, #9aa0a6); margin-top: 1.2rem; }
+</style>
+</head>
+<body>
+<h1>Flotilla — active ticket DAG</h1>
+<div class="sub" id="pulse"></div>
+
+<div class="legend">
+  <span><span class="chip" style="background:#b7e1a1"></span> landed this week (context)</span>
+  <span><span class="chip" style="background:#8fd7d0"></span> in flight now</span>
+  <span><span class="chip" style="background:#a8cdf0"></span> ready / unblocked</span>
+  <span><span class="chip" style="background:#f6d58c"></span> blocked on an edge</span>
+  <span><span class="chip" style="background:#d9c2ee"></span> needs design / grill first</span>
+  <span><span class="chip" style="background:#d4d7db"></span> parked / later phase</span>
+  <span>⬅ solid = blocks &nbsp;·&nbsp; dashed = informs / resolves</span>
+</div>
+
+<div class="dag-wrap">
+  <div class="dag-controls">
+    <span class="hint">drag to pan · wheel to zoom</span>
+    <button id="zin" title="zoom in">+</button>
+    <button id="zout" title="zoom out">−</button>
+    <button id="zfit" title="fit">⤢</button>
+  </div>
+  <div id="dag-viewport"><div id="dag-canvas"></div></div>
+</div>
+
+<div class="board-wrap"><div class="board" id="board"></div></div>
+
+<p class="note" id="notes"></p>
+
+<script type="application/json" id="board-data">{"__placeholder__": "composed by dag-compose from the generated + authored layers"}</script>
+
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+
+const DATA = JSON.parse(document.getElementById("board-data").textContent);
+const GH = `https://github.com/${DATA.repo}`;
+const link = (n) => `<a href="${GH}/issues/${n}">#${n}</a>`;
+const linkify = (s) => s.replace(/#(\d+)/g, (_, n) => link(n));
+
+// ---- pulse ----
+document.getElementById("pulse").innerHTML =
+  `Snapshot ${DATA.snapshot} · ${linkify(DATA.pulse)} · repo <a href="${GH}/issues">${DATA.repo}</a>`;
+
+// ---- mermaid source from data ----
+const DAG_CLASS = { landed: "done", flight: "flight", ready: "ready", waiting: "blocked", design: "design", parked: "parked" };
+const lines = [
+  "flowchart LR",
+  "  classDef done fill:#b7e1a1,stroke:#5a8f42,color:#1d3311",
+  "  classDef flight fill:#8fd7d0,stroke:#2e8a80,color:#0b2926",
+  "  classDef ready fill:#a8cdf0,stroke:#3572a8,color:#0d2337",
+  "  classDef blocked fill:#f6d58c,stroke:#b08a2e,color:#332600",
+  "  classDef design fill:#d9c2ee,stroke:#8256ad,color:#26113a",
+  "  classDef parked fill:#d4d7db,stroke:#7d8288,color:#26292c",
+];
+for (const g of DATA.groups) {
+  lines.push(`  subgraph ${g.id} ["${g.title}"]`);
+  for (const t of DATA.tickets.filter((t) => t.group === g.id && t.dag)) {
+    const body = t.shape === "stadium" ? `(["${t.dag}"])` : `["${t.dag}"]`;
+    lines.push(`    n${t.id}${body}:::${DAG_CLASS[t.status]}`);
+  }
+  lines.push("  end");
+}
+for (const e of DATA.edges) {
+  const arrow = e.style === "dashed" ? (e.label ? `-.${e.label}.->` : "-.->") : "-->";
+  lines.push(`  n${e.from} ${arrow} n${e.to}`);
+}
+for (const t of DATA.tickets.filter((t) => t.dag && !t.external)) {
+  lines.push(`  click n${t.id} "${GH}/issues/${t.id}" _blank`);
+}
+
+// ---- render + pan/zoom ----
+const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({ startOnLoad: false, theme: dark ? "dark" : "default", flowchart: { curve: "basis", useMaxWidth: false }, securityLevel: "loose" });
+const canvas = document.getElementById("dag-canvas");
+const viewport = document.getElementById("dag-viewport");
+const { svg } = await mermaid.render("dag", lines.join("\n"));
+canvas.innerHTML = svg;
+const svgEl = canvas.querySelector("svg");
+svgEl.style.maxWidth = "none";
+
+let scale = 1, tx = 0, ty = 0;
+const apply = () => { canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`; };
+const zoomAt = (mx, my, factor) => {
+  const ns = Math.min(8, Math.max(0.15, scale * factor));
+  const k = ns / scale;
+  tx = mx - k * (mx - tx);
+  ty = my - k * (my - ty);
+  scale = ns;
+  apply();
+};
+const fit = () => {
+  const vw = viewport.clientWidth, vh = viewport.clientHeight;
+  const w = svgEl.getBoundingClientRect().width / scale, h = svgEl.getBoundingClientRect().height / scale;
+  scale = Math.min(vw / w, vh / h, 1.6) * 0.97;
+  tx = (vw - w * scale) / 2;
+  ty = (vh - h * scale) / 2;
+  apply();
+};
+viewport.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const r = viewport.getBoundingClientRect();
+  zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.0015));
+}, { passive: false });
+
+let panning = null, moved = false;
+viewport.addEventListener("pointerdown", (e) => {
+  panning = { x: e.clientX, y: e.clientY, tx, ty };
+  moved = false;
+  viewport.classList.add("panning");
+  viewport.setPointerCapture(e.pointerId);
+});
+viewport.addEventListener("pointermove", (e) => {
+  if (!panning) return;
+  const dx = e.clientX - panning.x, dy = e.clientY - panning.y;
+  if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+  tx = panning.tx + dx; ty = panning.ty + dy;
+  apply();
+});
+viewport.addEventListener("pointerup", () => { panning = null; viewport.classList.remove("panning"); });
+viewport.addEventListener("click", (e) => { if (moved) { e.preventDefault(); e.stopPropagation(); } }, true);
+
+const center = () => [viewport.clientWidth / 2, viewport.clientHeight / 2];
+document.getElementById("zin").onclick = () => zoomAt(...center(), 1.25);
+document.getElementById("zout").onclick = () => zoomAt(...center(), 0.8);
+document.getElementById("zfit").onclick = fit;
+fit();
+
+// ---- kanban from data ----
+const board = document.getElementById("board");
+const card = (titleHtml, detailHtml) =>
+  `<div class="card"><span class="t">${titleHtml}</span>${detailHtml ? `<div class="d">${detailHtml}</div>` : ""}</div>`;
+for (const col of DATA.columns) {
+  let cards = [];
+  if (col.id === "landed") {
+    for (const l of DATA.landed) {
+      cards.push(l.rollup
+        ? card(l.rollup, l.refs.map(link).join(" · "))
+        : card(`${link(l.ref)} ${l.title}`, linkify(l.detail)));
+    }
+  } else {
+    for (const t of DATA.tickets) {
+      if (!t.card) continue;
+      const c = t.card.column ?? t.status;
+      if (c !== col.id) continue;
+      cards.push(card(linkify(t.card.title), linkify(t.card.detail ?? "")));
+    }
+  }
+  const count = col.count ?? String(cards.length);
+  board.insertAdjacentHTML("beforeend",
+    `<div class="col ${col.id}"><h3>${col.title} <span class="count">${count}</span></h3>${cards.join("\n")}</div>`);
+}
+
+// ---- notes ----
+document.getElementById("notes").innerHTML = DATA.notes.map(linkify).join("<br>\n");
+</script>
+</body>
+</html>
