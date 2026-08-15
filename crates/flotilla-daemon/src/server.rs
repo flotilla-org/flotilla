@@ -595,7 +595,8 @@ fn publish_socket_path(discovery_path: &Path, socket_path: &Path) -> Result<(), 
         discovery_path.parent().ok_or_else(|| format!("daemon socket discovery path has no parent: {}", discovery_path.display()))?;
     std::fs::create_dir_all(parent).map_err(|error| format!("failed to create daemon socket discovery directory: {error}"))?;
     let temporary_path = parent.join(format!(".socket-path-{}.tmp", uuid::Uuid::new_v4()));
-    std::fs::write(&temporary_path, format!("{}\n", socket_path.display()))
+    let advertised_path = socket_path.strip_prefix(parent).unwrap_or(socket_path);
+    std::fs::write(&temporary_path, format!("{}\n", advertised_path.display()))
         .map_err(|error| format!("failed to write daemon socket discovery file at {}: {error}", temporary_path.display()))?;
     if let Err(error) = std::fs::rename(&temporary_path, discovery_path) {
         let _ = std::fs::remove_file(&temporary_path);

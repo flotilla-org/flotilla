@@ -4306,7 +4306,7 @@ mod tests {
         assert!(opts.tokens.is_empty(), "tool environment belongs to the tool description");
         assert_eq!(opts.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), vec!["flotilla", "cleat"]);
         assert_eq!(opts.tools[0].executable.as_path(), Path::new(ENVIRONMENT_FLOTILLA_PATH));
-        assert_eq!(opts.tools[0].assets[1].environment_path.as_path(), Path::new(ENVIRONMENT_DAEMON_SOCKET_PATH));
+        assert_eq!(opts.tools[0].assets[2].environment_path.as_path(), Path::new(ENVIRONMENT_DAEMON_SOCKET_PATH));
         assert_eq!(
             opts.tools[0].environment[1],
             EnvironmentVariableUpdate::set("FLOTILLA_CONTAINED_HOST_DAEMON", "1", "the contained host-daemon requirement",),

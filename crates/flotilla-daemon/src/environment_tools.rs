@@ -19,7 +19,10 @@ use flotilla_core::{
 };
 use tokio::sync::OnceCell;
 
+pub(crate) const ENVIRONMENT_FLOTILLA_DIRECTORY: &str = "/opt/flotilla/bin";
 pub(crate) const ENVIRONMENT_FLOTILLA_PATH: &str = "/usr/local/bin/flotilla";
+const FLOTILLA_LAUNCHER_NAME: &str = "contained-flotilla-launcher";
+const FLOTILLA_LAUNCHER: &str = "#!/bin/sh\nexec /opt/flotilla/bin/flotilla \"$@\"\n";
 #[cfg(test)]
 pub(crate) const ENVIRONMENT_DAEMON_SOCKET_PATH: &str = "/run/flotilla-daemon/flotilla.sock";
 pub(crate) const ENVIRONMENT_CLEAT_PATH: &str = "/usr/local/bin/cleat";
@@ -125,10 +128,25 @@ impl EnvironmentToolFactory for FlotillaCliTool {
             self.binary_path.as_ref().map_err(|error| format!("flotilla CLI unavailable for environment provisioning: {error}"))?;
         let daemon_socket_path =
             self.daemon_socket_path.as_ref().map_err(|error| format!("flotilla CLI unavailable for environment provisioning: {error}"))?;
+        let binary_directory =
+            binary_path.as_path().parent().ok_or_else(|| format!("flotilla CLI binary has no parent directory: {binary_path}"))?;
+        let launcher_path = daemon_socket_path
+            .as_path()
+            .parent()
+            .ok_or_else(|| format!("daemon socket has no parent directory: {daemon_socket_path}"))?
+            .join(FLOTILLA_LAUNCHER_NAME);
+        ensure_flotilla_launcher(&launcher_path).await?;
         let environment_socket_path = contained_daemon_socket_path(daemon_socket_path.as_path());
         Ok(EnvironmentTool::new("flotilla", ENVIRONMENT_FLOTILLA_PATH)
             .with_asset(EnvironmentToolAsset::new(
-                binary_path.as_path().to_path_buf(),
+                binary_directory.to_path_buf(),
+                ENVIRONMENT_FLOTILLA_DIRECTORY,
+                EnvironmentToolAssetKind::Directory,
+                EnvironmentToolAssetAccess::ReadOnly,
+                "the flotilla CLI",
+            ))
+            .with_asset(EnvironmentToolAsset::new(
+                launcher_path,
                 ENVIRONMENT_FLOTILLA_PATH,
                 EnvironmentToolAssetKind::File,
                 EnvironmentToolAssetAccess::ReadOnly,
@@ -148,6 +166,29 @@ impl EnvironmentToolFactory for FlotillaCliTool {
             ))
             .with_environment(EnvironmentVariableUpdate::set(CONTAINED_DAEMON_REQUIRED_ENV, "1", "the contained host-daemon requirement")))
     }
+}
+
+async fn ensure_flotilla_launcher(path: &Path) -> Result<(), String> {
+    let current = tokio::fs::read(path).await.ok();
+    if current.as_deref() != Some(FLOTILLA_LAUNCHER.as_bytes()) {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| format!("create flotilla CLI launcher directory {}: {error}", parent.display()))?;
+        }
+        tokio::fs::write(path, FLOTILLA_LAUNCHER)
+            .await
+            .map_err(|error| format!("write flotilla CLI launcher {}: {error}", path.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .map_err(|error| format!("make flotilla CLI launcher executable at {}: {error}", path.display()))?;
+    }
+    Ok(())
 }
 
 struct CleatTool {
@@ -341,6 +382,26 @@ mod tests {
         let error = adjacent_flotilla_binary(&daemon_binary).expect_err("non-executable flotilla binary should be rejected");
 
         assert_eq!(error, format!("flotilla binary is not executable: {}", flotilla_binary.display()));
+    }
+
+    #[tokio::test]
+    async fn flotilla_cli_uses_a_directory_mount_for_upgrade_visibility() {
+        let temp = TempDir::new().expect("tempdir");
+        let socket_path = temp.path().join("flotilla.sock");
+        let tool = FlotillaCliTool {
+            binary_path: Ok(DaemonHostPath::new("/opt/flotilla/bin/flotilla")),
+            daemon_socket_path: Ok(DaemonHostPath::new(socket_path)),
+        }
+        .prepare("contained-work")
+        .await
+        .expect("prepare flotilla CLI");
+
+        assert_eq!(tool.executable.as_path(), Path::new("/usr/local/bin/flotilla"));
+        assert_eq!(tool.assets[0].host_path.as_path(), Path::new("/opt/flotilla/bin"));
+        assert_eq!(tool.assets[0].environment_path.as_path(), Path::new("/opt/flotilla/bin"));
+        assert_eq!(tool.assets[0].kind, EnvironmentToolAssetKind::Directory);
+        assert_eq!(tool.assets[1].environment_path.as_path(), Path::new("/usr/local/bin/flotilla"));
+        assert_eq!(fs::read_to_string(tool.assets[1].host_path.as_path()).expect("read launcher"), FLOTILLA_LAUNCHER);
     }
 
     #[tokio::test]

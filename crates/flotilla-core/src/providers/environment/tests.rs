@@ -570,6 +570,47 @@ async fn create_delivers_tool_assets_and_applies_tool_environment() {
 }
 
 #[tokio::test]
+async fn create_mounts_the_flotilla_binary_directory_so_atomic_replacements_stay_visible() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let image = ImageId::new("ubuntu:22.04");
+    let tool = EnvironmentTool::new("flotilla", "/usr/local/bin/flotilla")
+        .with_asset(EnvironmentToolAsset::new(
+            "/host/flotilla/bin",
+            "/opt/flotilla/bin",
+            EnvironmentToolAssetKind::Directory,
+            EnvironmentToolAssetAccess::ReadOnly,
+            "the flotilla CLI",
+        ))
+        .with_asset(EnvironmentToolAsset::new(
+            "/host/flotilla/launcher",
+            "/usr/local/bin/flotilla",
+            EnvironmentToolAssetKind::File,
+            EnvironmentToolAssetAccess::ReadOnly,
+            "the flotilla CLI launcher",
+        ));
+    let opts = CreateOpts {
+        tokens: Vec::new(),
+        working_directory: None,
+        provisioned_mounts: Vec::new(),
+        tools: vec![tool],
+        image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
+    };
+
+    provider.create(EnvironmentId::new("upgrade-visible"), &image, opts).await.expect("create environment");
+
+    let args = &runner.calls()[0].1;
+    assert!(args.contains(&"/host/flotilla/bin:/opt/flotilla/bin:ro".to_string()), "binary parent must be the bind source: {args:?}");
+    assert!(
+        !args.contains(&"/host/flotilla/bin/flotilla:/opt/flotilla/bin/flotilla:ro".to_string()),
+        "binary inode must not be pinned: {args:?}"
+    );
+}
+
+#[tokio::test]
 async fn create_uses_requested_mount_modes_in_docker_arguments() {
     use flotilla_protocol::ImageId;
 
