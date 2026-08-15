@@ -476,6 +476,91 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
 }
 
 #[tokio::test]
+async fn remote_placement_uses_fresh_host_capabilities_over_a_stale_local_row() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("kiwi-root"));
+    let now = Utc::now();
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let stale =
+        hosts.create(&test_meta("feta-host"), &HostSpec { display_name: "feta".to_string() }).await.expect("create stale local host row");
+    hosts
+        .update_status(&stale.metadata.name, &stale.metadata.resource_version, &HostStatus {
+            heartbeat_at: Some(now),
+            ready: true,
+            ..HostStatus::default()
+        })
+        .await
+        .expect("write stale null-capability host status");
+
+    let feta = ResourceBackend::InMemory(InMemoryBackend::default());
+    let feta_hosts = feta.using::<ResourceHost>("flotilla");
+    let fresh = feta_hosts
+        .create(&test_meta("feta-host"), &HostSpec { display_name: "feta".to_string() })
+        .await
+        .expect("create fresh feta self-report");
+    feta_hosts
+        .update_status(&fresh.metadata.name, &fresh.metadata.resource_version, &HostStatus {
+            capabilities: [(
+                flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(),
+                serde_json::json!(BTreeSet::from(["claude-max".to_string()])),
+            )]
+            .into_iter()
+            .collect(),
+            heartbeat_at: Some(now - chrono::Duration::seconds(1)),
+            ready: true,
+            daemon_generation: Some("fresh-feta-generation".to_string()),
+            daemon_started_at: Some(now - chrono::Duration::minutes(1)),
+            ..HostStatus::default()
+        })
+        .await
+        .expect("write fresh feta capabilities");
+    backend
+        .replica_writer::<ResourceHost>(NodeId::new("feta-root"), "flotilla")
+        .replace(&feta_hosts.list().await.expect("list feta self-report"), Utc::now())
+        .await
+        .expect("replicate fresh feta self-report to kiwi");
+
+    let sources = backend.including_replicas::<ResourceHost>("flotilla").list().await.expect("list host sources");
+    assert_eq!(sources.items.len(), 2, "reproduction requires the stale and fresh rows to coexist");
+
+    let placement = backend
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &test_meta("feta-docker"),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
+                    host_ref: "feta-host".to_string(),
+                    image: "crew:latest".to_string(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::new(),
+                    default_cwd: None,
+                    env: BTreeMap::new(),
+                    checkout: flotilla_resources::DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                })
+                .build(),
+        )
+        .await
+        .expect("create feta placement");
+    let mut workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder().name("work".to_string()).stance(Stance::Contained).crew(Vec::new()).build()])
+        .build();
+    workflow.vessels[0].credential_refs = BTreeSet::from(["claude-max".to_string()]);
+
+    validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect("kiwi-to-feta admission should use feta's fresh self-report");
+
+    workflow.vessels[0].credential_refs.insert("github-crew-pr".to_string());
+    let error = validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect_err("a real missing credential should still refuse admission");
+    assert_eq!(
+        error,
+        "workflow requires credential `github-crew-pr`, which placement `feta-docker` host `feta` generation `fresh-feta-generation` does not hold"
+    );
+}
+
+#[tokio::test]
 async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     backend

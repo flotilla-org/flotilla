@@ -1180,7 +1180,7 @@ fn canonical_placement_host_ref_from_sources(
     hosts: &[ReadResourceObject<ResourceHost>],
     host_ref: &str,
 ) -> Result<Option<PlacementTargetHost>, String> {
-    let exact = hosts.iter().find(|host| host.object.metadata.name == host_ref);
+    let exact = authoritative_host_source(hosts.iter().filter(|host| host.object.metadata.name == host_ref));
     let resolved = if let Some(host) = exact {
         host
     } else {
@@ -1199,6 +1199,46 @@ fn canonical_placement_host_ref_from_sources(
         resolved.object.spec.display_name.clone()
     };
     Ok(Some(PlacementTargetHost { reference: resolved.object.metadata.name.clone(), display_name }))
+}
+
+/// Select the target daemon's self-report over a locally materialized peer-summary row.
+///
+/// The transitional peer-summary path writes a ready local Host observation with
+/// adapter and pool capabilities, but it has no daemon identity fields. Resource
+/// replication separately brings in the full self-report. Among self-reports, a
+/// later daemon start supersedes an earlier generation and heartbeat breaks ties.
+fn authoritative_host_source<'a>(
+    sources: impl Iterator<Item = &'a ReadResourceObject<ResourceHost>>,
+) -> Option<&'a ReadResourceObject<ResourceHost>> {
+    sources.max_by_key(|source| {
+        let status = source.object.status.as_ref();
+        (
+            status.and_then(|status| status.daemon_generation.as_ref()).is_some(),
+            status.and_then(|status| status.daemon_started_at),
+            status.and_then(|status| status.heartbeat_at),
+            source.object.metadata.creation_timestamp,
+        )
+    })
+}
+
+async fn authoritative_placement_host(
+    backend: &ResourceBackend,
+    namespace: &str,
+    target_host: &PlacementTargetHost,
+    placement_name: &str,
+) -> Result<ResourceObject<ResourceHost>, String> {
+    let sources = backend
+        .including_replicas::<ResourceHost>(namespace)
+        .list()
+        .await
+        .map_err(|error| format!("placement `{placement_name}` target host is not ready: {error}"))?;
+    authoritative_host_source(sources.items.iter().filter(|source| source.object.metadata.name == target_host.reference))
+        .map(|source| source.object.clone())
+        .ok_or_else(|| format!("placement `{placement_name}` target host is not ready: resource not found: {}", target_host.reference))
+}
+
+fn host_generation(status: Option<&ResourceHostStatus>) -> &str {
+    status.and_then(|status| status.daemon_generation.as_deref()).unwrap_or("unknown")
 }
 
 fn check_placement_capacity(target_host: &PlacementTargetHost, capacity: Option<(u64, Option<u64>)>) -> Result<(), String> {
@@ -3586,30 +3626,32 @@ async fn validate_workflow_credentials(
         return Ok(());
     };
     let target_host = placement_target_host(backend, namespace, placement).await?;
-    let host = backend
-        .clone()
-        .using::<ResourceHost>(namespace)
-        .get(&target_host.reference)
-        .await
-        .map_err(|error| format!("placement `{}` target host is not ready: {error}", placement.metadata.name))?;
+    let host = authoritative_placement_host(backend, namespace, &target_host, &placement.metadata.name).await?;
     let host_label = target_host.display_name;
+    let generation = host_generation(host.status.as_ref()).to_string();
     let Some(mut status) = host.status else {
         if required.is_empty() {
             return Ok(());
         }
-        return Err(format!("placement `{}` host `{host_label}` has no observed status", placement.metadata.name));
+        return Err(format!(
+            "placement `{}` host `{host_label}` generation `{generation}` has no observed status",
+            placement.metadata.name
+        ));
     };
     status.apply_heartbeat_readiness(Utc::now());
     if !required.is_empty() {
         if !status.ready {
-            return Err(format!("placement `{}` host `{host_label}` is not ready", placement.metadata.name));
+            return Err(format!("placement `{}` host `{host_label}` generation `{generation}` is not ready", placement.metadata.name));
         }
         let held = status.held_credentials().map_err(|error| {
-            format!("placement `{}` host `{host_label}` has invalid held-credential capability: {error}", placement.metadata.name)
+            format!(
+                "placement `{}` host `{host_label}` generation `{generation}` has invalid held-credential capability: {error}",
+                placement.metadata.name
+            )
         })?;
         if let Some(missing) = required.iter().find(|credential| !held.contains(*credential)) {
             return Err(format!(
-                "workflow requires credential `{missing}`, which placement `{}` host `{host_label}` does not hold",
+                "workflow requires credential `{missing}`, which placement `{}` host `{host_label}` generation `{generation}` does not hold",
                 placement.metadata.name
             ));
         }
@@ -3754,21 +3796,21 @@ async fn placement_agent_adapters(
         Ok((docker.agent_adapters.clone(), format!("image `{}`", docker.image)))
     } else if placement.spec.host_direct.is_some() {
         let target_host = placement_target_host(backend, namespace, placement).await?;
-        let host = backend
-            .clone()
-            .using::<ResourceHost>(namespace)
-            .get(&target_host.reference)
-            .await
-            .map_err(|error| format!("placement `{}` target host is not ready: {error}", placement.metadata.name))?;
+        let host = authoritative_placement_host(backend, namespace, &target_host, &placement.metadata.name).await?;
         let host_label = target_host.display_name;
-        let mut status =
-            host.status.ok_or_else(|| format!("placement `{}` host `{host_label}` has no observed status", placement.metadata.name))?;
+        let generation = host_generation(host.status.as_ref()).to_string();
+        let mut status = host.status.ok_or_else(|| {
+            format!("placement `{}` host `{host_label}` generation `{generation}` has no observed status", placement.metadata.name)
+        })?;
         status.apply_heartbeat_readiness(Utc::now());
         if !status.ready {
-            return Err(format!("placement `{}` host `{host_label}` is not ready", placement.metadata.name));
+            return Err(format!("placement `{}` host `{host_label}` generation `{generation}` is not ready", placement.metadata.name));
         }
         let available_adapters = status.agent_adapters().map_err(|error| {
-            format!("placement `{}` host `{}` has invalid agent adapter capabilities: {error}", placement.metadata.name, host_label)
+            format!(
+                "placement `{}` host `{}` generation `{generation}` has invalid agent adapter capabilities: {error}",
+                placement.metadata.name, host_label
+            )
         })?;
         Ok((available_adapters, format!("host `{host_label}`")))
     } else {

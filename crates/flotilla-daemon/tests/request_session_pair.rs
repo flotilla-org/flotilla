@@ -26,9 +26,11 @@ use flotilla_protocol::{
     PeerConnectionState, PrincipalRef, RepoSelector, ResourceRef, SurfaceCharacter, SurfaceDeclaration,
 };
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, Host, HostSpec, HostStatus, InputMeta, PlacementPolicy, PlacementPolicySpec, Regard, Resource,
-    ResourceError, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
+    CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
+    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host, HostSpec, HostStatus, InputMeta, PlacementPolicy,
+    PlacementPolicySpec, Regard, Resource, ResourceError, ResourceProvenance, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate,
+    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
 };
 
 fn test_config_store(config_dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -654,6 +656,142 @@ async fn convoy_start_stays_on_admitting_store_when_placement_membership_is_stal
         ),
         "placement host must not become the convoy authority"
     );
+}
+
+#[tokio::test]
+async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
+    let leader = empty_daemon_named("kiwi").await;
+    let follower = empty_daemon_named("feta").await;
+    seed_host_capacity(&follower, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
+    follower.set_local_placement_capabilities(&BTreeSet::from(["claude-code".to_string()]), &["cleat".to_string()]).await;
+    let remote_host_id = follower.local_host_id().expect("follower host identity").to_string();
+    let follower_hosts = follower.resource_backend().using::<Host>("flotilla");
+    let remote_host = follower_hosts.get(&remote_host_id).await.expect("feta self-report");
+    let mut remote_status = remote_host.status.expect("feta status");
+    remote_status.capabilities.extend([
+        (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["claude-code"])),
+        (HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["claude-max"])),
+    ]);
+    remote_status.heartbeat_at = Some(Utc::now());
+    remote_status.daemon_generation = Some("feta-fresh-generation".to_string());
+    remote_status.daemon_started_at = Some(Utc::now() - chrono::Duration::minutes(1));
+    follower_hosts
+        .update_status(&remote_host_id, &remote_host.metadata.resource_version, &remote_status)
+        .await
+        .expect("publish feta credential self-report");
+
+    let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
+    let namespace = "flotilla";
+    let placement_policy = format!("host-direct-{remote_host_id}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sources = topology
+                .leader
+                .resource_backend()
+                .including_replicas::<Host>(namespace)
+                .list()
+                .await
+                .expect("list kiwi host view")
+                .items
+                .into_iter()
+                .filter(|source| source.object.metadata.name == remote_host_id)
+                .collect::<Vec<_>>();
+            let stale_local =
+                sources.iter().any(|source| {
+                    matches!(source.provenance, ResourceProvenance::Local)
+                        && source.object.status.as_ref().is_some_and(|status| {
+                            status.held_credentials().expect("decode local held credentials").is_empty() && status.ready
+                        })
+                });
+            let fresh_replica = sources.iter().any(|source| {
+                matches!(source.provenance, ResourceProvenance::Replica { .. })
+                    && source.object.status.as_ref().is_some_and(|status| {
+                        status.daemon_generation.as_deref() == Some("feta-fresh-generation")
+                            && status.held_credentials().expect("decode replica held credentials").contains("claude-max")
+                    })
+            });
+            if stale_local
+                && fresh_replica
+                && topology.leader.resource_backend().using::<PlacementPolicy>(namespace).get(&placement_policy).await.is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("kiwi should reproduce the stale local and fresh feta Host rows");
+
+    seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
+    let workflows = topology.leader.resource_backend().using::<WorkflowTemplate>(namespace);
+    let workflow = workflows.get("remote-workflow").await.expect("remote workflow");
+    let mut workflow_spec = workflow.spec;
+    let flotilla_resources::CrewSource::Agent { selector, .. } = &mut workflow_spec.vessels[0].crew[0].source else {
+        panic!("remote workflow crew should be an agent");
+    };
+    selector.adapter = Some("claude-code".to_string());
+    workflows
+        .update(&InputMeta::from(&workflow.metadata), &workflow.metadata.resource_version, &workflow_spec)
+        .await
+        .expect("select claude-code for the remote workflow");
+    topology
+        .leader
+        .resource_backend()
+        .definitions::<CredentialSpec>(namespace)
+        .create(&InputMeta::builder().name("claude-max".to_string()).build(), &CredentialSpecSpec {
+            consumer: CredentialConsumer::ClaudeOauth { account_email: "crew@example.com".to_string() },
+            source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+            lifecycle: CredentialLifecycle::Static,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("create Claude credential declaration");
+    topology
+        .leader
+        .resource_backend()
+        .definitions::<CredentialGrant>(namespace)
+        .create(
+            &InputMeta::builder().name("claude-max-trusted".to_string()).build(),
+            &CredentialGrantSpec::builder()
+                .selector(
+                    CredentialGrantSelector::builder()
+                        .stance(flotilla_resources::Stance::Trusted)
+                        .projects(BTreeSet::from(["flotilla".to_string()]))
+                        .build(),
+                )
+                .credentials(BTreeSet::from(["claude-max".to_string()]))
+                .build(),
+        )
+        .await
+        .expect("grant Claude credential to trusted workflow");
+
+    let mut events = topology.leader.subscribe();
+    let command_id = topology
+        .client
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(
+                    ConvoyStartIntent::builder()
+                        .project_ref("flotilla".to_string())
+                        .name("kiwi-to-feta".to_string())
+                        .branch("fix/kiwi-to-feta".to_string())
+                        .placement_policy(placement_policy)
+                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                        .build(),
+                ),
+            },
+        })
+        .await
+        .expect("dispatch kiwi-to-feta convoy start");
+
+    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted {
+        name: "kiwi-to-feta".to_string(),
+        attach_plan: None,
+        binding: None
+    });
 }
 
 #[tokio::test]
