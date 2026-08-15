@@ -31,6 +31,7 @@ pub enum PeerWireMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GoodbyeReason {
     Superseded,
+    Shutdown,
 }
 
 /// Targeted peer control messages that are routed hop-by-hop rather than flooded.

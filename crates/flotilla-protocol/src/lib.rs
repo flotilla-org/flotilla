@@ -183,7 +183,7 @@ pub use snapshot::{CategoryLabels, ProviderError, RepoInfo, RepoKey, RepoLabels,
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 const BUILD_ID_SEPARATOR: &str = "\u{1f}flotilla-build:";
 
@@ -240,6 +240,8 @@ pub struct QueryCursor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum Request {
+    /// Ask this daemon process to finish active work and exit cleanly.
+    Shutdown,
     ListRepos,
     Execute {
         command: Command,
@@ -293,6 +295,7 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
+    Shutdown,
     ListRepos(Vec<RepoInfo>),
     Execute {
         command_id: u64,

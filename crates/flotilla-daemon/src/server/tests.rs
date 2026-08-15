@@ -63,6 +63,7 @@ use super::{
     AcceptErrorBackoff, BoundSocketGuard, DaemonServer, PeerConnectionEvent, ACCEPT_ERROR_INITIAL_BACKOFF, ACCEPT_ERROR_MAX_BACKOFF,
     CONNECTION_PREFACE_TIMEOUT, HELLO_HANDSHAKE_TIMEOUT,
 };
+use crate::peer::{ConnectionDirection, ConnectionMeta};
 
 #[tokio::test]
 async fn socket_guard_does_not_unlink_replacement_listener() {
@@ -613,11 +614,12 @@ async fn empty_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {
 }
 
 async fn spawn_test_client_handler(
-) -> (tempfile::TempDir, tokio::net::UnixStream, tokio::task::JoinHandle<()>, Arc<AtomicUsize>, watch::Sender<bool>) {
+) -> (tempfile::TempDir, tokio::net::UnixStream, tokio::task::JoinHandle<()>, Arc<AtomicUsize>, mpsc::UnboundedReceiver<()>) {
     let (tmp, daemon) = empty_daemon().await;
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_request_tx, shutdown_request_rx) = mpsc::unbounded_channel();
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
     let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
@@ -627,10 +629,12 @@ async fn spawn_test_client_handler(
     let pm = Arc::clone(&peer_manager);
     let count_ref = Arc::clone(&client_count);
     let handle = tokio::spawn(async move {
+        let _shutdown_tx = shutdown_tx;
         let remote_command_router = empty_remote_command_router(&daemon_for_task, &pm);
         handle_client(
             server_stream,
             daemon_for_task,
+            shutdown_request_tx,
             shutdown_rx,
             peer_data_tx,
             pm,
@@ -643,7 +647,7 @@ async fn spawn_test_client_handler(
         )
         .await;
     });
-    (tmp, client_stream, handle, client_count, shutdown_tx)
+    (tmp, client_stream, handle, client_count, shutdown_request_rx)
 }
 
 async fn empty_daemon_named(host_name: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
@@ -723,7 +727,8 @@ impl PeerSender for CapturePeerSender {
         Ok(())
     }
 
-    async fn retire(&self, _reason: flotilla_protocol::GoodbyeReason) -> Result<(), String> {
+    async fn retire(&self, reason: flotilla_protocol::GoodbyeReason) -> Result<(), String> {
+        self.0.lock().expect("capture sender lock").push(PeerWireMessage::Goodbye { reason });
         Ok(())
     }
 }
@@ -3086,6 +3091,7 @@ async fn handle_client_forwards_peer_link_state_and_registers_peer() {
     let (peer_data_tx, mut peer_data_rx) = mpsc::channel(16);
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_request_tx, _shutdown_request_rx) = mpsc::unbounded_channel();
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
     let (peer_connected_tx, mut peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
@@ -3102,6 +3108,7 @@ async fn handle_client_forwards_peer_link_state_and_registers_peer() {
         handle_client(
             server_stream,
             daemon_for_task,
+            shutdown_request_tx,
             shutdown_rx,
             peer_data_tx,
             pm,
@@ -3266,6 +3273,7 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_request_tx, _shutdown_request_rx) = mpsc::unbounded_channel();
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
     let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
@@ -3280,6 +3288,7 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
         handle_client(
             server_stream,
             daemon_for_task,
+            shutdown_request_tx,
             shutdown_rx,
             peer_data_tx,
             pm,
@@ -3355,6 +3364,7 @@ async fn handle_client_session_dispatches_request_messages() {
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_request_tx, _shutdown_request_rx) = mpsc::unbounded_channel();
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
     let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
@@ -3369,6 +3379,7 @@ async fn handle_client_session_dispatches_request_messages() {
         handle_client_session(
             server_session,
             daemon_for_task,
+            shutdown_request_tx,
             shutdown_rx,
             peer_data_tx,
             pm,
@@ -3395,11 +3406,39 @@ async fn handle_client_session_dispatches_request_messages() {
 }
 
 #[tokio::test]
+async fn shutdown_request_is_acknowledged_before_the_connection_closes() {
+    let (_tmp, client_stream, handle, client_count, mut shutdown_requests) = spawn_test_client_handler().await;
+    let (read_half, write_half) = client_stream.into_split();
+    let mut reader = BufReader::new(read_half).lines();
+    let mut writer = BufWriter::new(write_half);
+
+    flotilla_protocol::framing::write_message_line(&mut writer, &current_client_hello()).await.expect("write client hello");
+    let hello = reader.next_line().await.expect("read hello").expect("hello payload");
+    assert!(matches!(serde_json::from_str::<Message>(&hello).expect("parse hello"), Message::Hello { .. }));
+
+    flotilla_protocol::framing::write_message_line(&mut writer, &Message::Request { id: 7, request: Request::Shutdown })
+        .await
+        .expect("write shutdown request");
+    let response = reader.next_line().await.expect("read response").expect("shutdown response payload");
+    match ok_response(serde_json::from_str(&response).expect("parse shutdown response"), 7) {
+        Response::Shutdown => {}
+        other => panic!("expected shutdown response, got {other:?}"),
+    }
+    assert_eq!(shutdown_requests.recv().await, Some(()), "server should begin shutdown only after acknowledging the request");
+
+    let eof = reader.next_line().await.expect("read shutdown EOF");
+    assert!(eof.is_none(), "shutdown requester should receive a clean EOF");
+    handle.await.expect("join shutdown connection");
+    assert_eq!(client_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn handle_client_session_streams_daemon_events_to_request_clients() {
     let (_tmp, daemon) = empty_daemon().await;
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_request_tx, _shutdown_request_rx) = mpsc::unbounded_channel();
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
     let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
@@ -3414,6 +3453,7 @@ async fn handle_client_session_streams_daemon_events_to_request_clients() {
         handle_client_session(
             server_session,
             daemon_for_task,
+            shutdown_request_tx,
             shutdown_rx,
             peer_data_tx,
             pm,
@@ -3469,6 +3509,7 @@ async fn assert_client_hello_rejected(protocol_version: u32, display_name: Strin
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_request_tx, _shutdown_request_rx) = mpsc::unbounded_channel();
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
     let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
@@ -3483,6 +3524,7 @@ async fn assert_client_hello_rejected(protocol_version: u32, display_name: Strin
         handle_client(
             server_stream,
             daemon_for_task,
+            shutdown_request_tx,
             shutdown_rx,
             peer_data_tx,
             pm,
@@ -3612,6 +3654,42 @@ async fn live_daemon_reaps_partial_peer_dial_churn() {
     server_task.await.expect("join daemon server").expect("daemon server should stop cleanly");
 }
 
+#[tokio::test]
+async fn live_daemon_sends_goodbye_before_shutdown_completes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket_dir = TestSocketDir::new();
+    let socket_path = socket_dir.socket_path("graceful-goodbye.sock");
+    let config = test_config_store(tmp.path().join("config"));
+    let server = DaemonServer::new(Vec::new(), config, fake_discovery(false), socket_path.clone(), StdDuration::from_secs(60))
+        .await
+        .expect("create daemon server");
+    let captured = Arc::new(StdMutex::new(Vec::new()));
+    server.peer_manager.lock().await.activate_connection(
+        NodeId::new("peer"),
+        Arc::new(CapturePeerSender(Arc::clone(&captured))),
+        ConnectionMeta {
+            direction: ConnectionDirection::Outbound,
+            config_label: None,
+            expected_peer: Some(NodeId::new("peer")),
+            config_backed: false,
+        },
+    );
+    let shutdown_tx = server.shutdown_tx.clone();
+    let server_task = tokio::spawn(server.run());
+    while !socket_path.exists() {
+        tokio::task::yield_now().await;
+    }
+
+    shutdown_tx.send(true).expect("request daemon shutdown");
+    server_task.await.expect("join daemon server").expect("daemon server should stop cleanly");
+
+    assert!(captured
+        .lock()
+        .expect("capture sender lock")
+        .iter()
+        .any(|message| { matches!(message, PeerWireMessage::Goodbye { reason: flotilla_protocol::GoodbyeReason::Shutdown }) }));
+}
+
 #[test]
 fn accept_errors_back_off_exponentially_and_reset_after_success() {
     let mut backoff = AcceptErrorBackoff::default();
@@ -3632,6 +3710,7 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_request_tx, _shutdown_request_rx) = mpsc::unbounded_channel();
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
     let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
@@ -3646,6 +3725,7 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
         handle_client_session(
             server_session,
             daemon_for_task,
+            shutdown_request_tx,
             shutdown_rx,
             peer_data_tx,
             pm,
@@ -3881,6 +3961,7 @@ async fn handle_client_relays_outbound_peer_messages() {
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_request_tx, _shutdown_request_rx) = mpsc::unbounded_channel();
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
     let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
@@ -3896,6 +3977,7 @@ async fn handle_client_relays_outbound_peer_messages() {
         handle_client(
             server_stream,
             daemon,
+            shutdown_request_tx,
             shutdown_rx,
             peer_data_tx,
             pm,
@@ -3961,6 +4043,7 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_request_tx, _shutdown_request_rx) = mpsc::unbounded_channel();
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
     let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
@@ -3981,6 +4064,8 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
     let notify_b = Arc::clone(&client_notify);
     let shutdown_rx_a = shutdown_rx.clone();
     let shutdown_rx_b = shutdown_rx.clone();
+    let shutdown_request_tx_a = shutdown_request_tx.clone();
+    let shutdown_request_tx_b = shutdown_request_tx;
     let peer_connected_tx_a = peer_connected_tx.clone();
     let peer_connected_tx_b = peer_connected_tx.clone();
 
@@ -3989,6 +4074,7 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
         handle_client(
             server_stream_a,
             daemon_a,
+            shutdown_request_tx_a,
             shutdown_rx_a,
             tx_a,
             pm_a,
@@ -4006,6 +4092,7 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
         handle_client(
             server_stream_b,
             daemon_b,
+            shutdown_request_tx_b,
             shutdown_rx_b,
             tx_b,
             pm_b,

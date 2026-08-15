@@ -143,6 +143,7 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
     // because from_session_stateful sends Hello and blocks waiting for the reply.
     let (client_session, server_session) = flotilla_transport::message::message_session_pair();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_request_tx, _shutdown_request_rx) = mpsc::unbounded_channel();
     let client_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
     let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
@@ -156,6 +157,7 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
         handle_client_session(
             server_session,
             leader_for_client,
+            shutdown_request_tx,
             shutdown_rx,
             leader_inbound_peer_tx_for_client,
             leader_peer_manager_for_client,

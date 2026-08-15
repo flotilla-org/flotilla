@@ -31,6 +31,7 @@ impl<'a> RequestDispatcher<'a> {
 
     pub(super) async fn dispatch(&self, id: u64, request: Request) -> Message {
         match request {
+            Request::Shutdown => Message::ok_response(id, Response::Shutdown),
             Request::ListRepos => match self.daemon.list_repos().await {
                 Ok(repos) => Message::ok_response(id, Response::ListRepos(repos)),
                 Err(e) => Message::error_response(id, e),

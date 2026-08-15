@@ -24,12 +24,13 @@ use std::{
 use flotilla_core::{
     agents::SharedAgentStateStore, config::ConfigStore, in_process::InProcessDaemon, providers::discovery::DiscoveryRuntime,
 };
-use flotilla_protocol::{ConfigLabel, ConnectionRole, EnvironmentId, HostName, Message, NodeId, PROTOCOL_VERSION};
+use flotilla_protocol::{ConfigLabel, ConnectionRole, EnvironmentId, GoodbyeReason, HostName, Message, NodeId, PROTOCOL_VERSION};
 use flotilla_resources::{ResourceBackend, SqliteBackend};
 use flotilla_transport::message::{unix_message_session_with_prefix, MessageSession};
 use tokio::{
     net::UnixListener,
     sync::{mpsc, watch, Mutex, Notify},
+    task::JoinSet,
 };
 use tracing::{error, info, warn};
 
@@ -309,6 +310,8 @@ pub struct DaemonServer {
     idle_timeout: Duration,
     client_count: Arc<AtomicUsize>,
     client_notify: Arc<Notify>,
+    shutdown_request_tx: mpsc::UnboundedSender<()>,
+    shutdown_request_rx: Option<mpsc::UnboundedReceiver<()>>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     /// Channel for inbound peer wire messages tagged with connection authority.
@@ -360,6 +363,7 @@ impl DaemonServer {
         let peer_manager = build_peer_manager(&daemon, &config, &socket_path)?;
         sync_peer_query_state(&peer_manager, &daemon).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_request_tx, shutdown_request_rx) = mpsc::unbounded_channel();
         let (inbound_peer_tx, inbound_peer_rx) = mpsc::channel(256);
 
         let agent_state_store = Arc::clone(daemon.agent_state_store());
@@ -372,6 +376,8 @@ impl DaemonServer {
             idle_timeout,
             client_count: Arc::new(AtomicUsize::new(0)),
             client_notify: Arc::new(Notify::new()),
+            shutdown_request_tx,
+            shutdown_request_rx: Some(shutdown_request_rx),
             shutdown_tx,
             shutdown_rx,
             inbound_peer_tx,
@@ -430,6 +436,8 @@ impl DaemonServer {
         let client_count = self.client_count;
         let shutdown_tx = self.shutdown_tx;
         let mut shutdown_rx = self.shutdown_rx;
+        let shutdown_request_tx = self.shutdown_request_tx;
+        let mut shutdown_request_rx = self.shutdown_request_rx.take().expect("shutdown request receiver available once");
         let idle_timeout = self.idle_timeout;
         let client_notify = self.client_notify;
         let inbound_peer_tx = self.inbound_peer_tx;
@@ -440,7 +448,7 @@ impl DaemonServer {
         remote_command_router.resume_pending_crew_completions().await;
 
         let idle_client_count = Arc::clone(&client_count);
-        let idle_shutdown_tx = shutdown_tx.clone();
+        let idle_shutdown_request_tx = shutdown_request_tx.clone();
         let idle_notify = Arc::clone(&client_notify);
         tokio::spawn(async move {
             loop {
@@ -452,7 +460,7 @@ impl DaemonServer {
                     () = tokio::time::sleep(idle_timeout) => {
                         if idle_client_count.load(Ordering::SeqCst) == 0 {
                             info!("idle timeout reached, shutting down");
-                            let _ = idle_shutdown_tx.send(true);
+                            let _ = idle_shutdown_request_tx.send(());
                             return;
                         }
                     }
@@ -462,7 +470,7 @@ impl DaemonServer {
         });
 
         let peer_manager = self.peer_manager;
-        let (_peer_runtime_handle, peer_connected_tx) = spawn_peer_networking_runtime(
+        let (peer_runtime_handle, peer_connected_tx) = spawn_peer_networking_runtime(
             Arc::clone(&daemon),
             Arc::clone(&peer_manager),
             inbound_peer_rx,
@@ -478,6 +486,7 @@ impl DaemonServer {
         // Accept loop
         let mut accept_error_backoff = AcceptErrorBackoff::default();
         let mut accept_retry_at = None;
+        let mut connection_tasks = JoinSet::new();
         loop {
             tokio::select! {
                 accept_result = listener.accept(), if accept_retry_at.is_none() => {
@@ -494,10 +503,12 @@ impl DaemonServer {
                             let peer_connected_tx = peer_connected_tx.clone();
                             let agent_state_store = Arc::clone(&agent_state_store);
 
-                            tokio::spawn(async move {
+                            let shutdown_request_tx = shutdown_request_tx.clone();
+                            connection_tasks.spawn(async move {
                                 handle_client(
                                     stream,
                                     daemon,
+                                    shutdown_request_tx,
                                     shutdown_rx,
                                     inbound_peer_tx,
                                     peer_manager,
@@ -537,6 +548,10 @@ impl DaemonServer {
                         break;
                     }
                 }
+                Some(()) = shutdown_request_rx.recv() => {
+                    info!("graceful shutdown request received");
+                    break;
+                }
                 _ = tokio::signal::ctrl_c() => {
                     info!("received SIGINT — shutting down");
                     break;
@@ -545,6 +560,28 @@ impl DaemonServer {
                     info!("received SIGTERM — shutting down");
                     break;
                 }
+            }
+        }
+
+        // Stop peer reconnect loops deliberately and tell every connected peer
+        // why the transport is closing before connection tasks see shutdown.
+        let peer_senders = peer_manager.lock().await.active_peer_senders();
+        for (peer, sender) in peer_senders {
+            if let Err(error) = sender.retire(GoodbyeReason::Shutdown).await {
+                warn!(%peer, %error, "failed to send shutdown goodbye to peer");
+            }
+        }
+        peer_manager.lock().await.disconnect_all().await;
+        peer_runtime_handle.abort();
+        let _ = peer_runtime_handle.await;
+
+        // SIGINT/SIGTERM enter the common path without having touched the
+        // channel. Broadcasting here closes client, peer, handshake, and HTTP
+        // connection handlers after any request they are currently serving.
+        let _ = shutdown_tx.send(true);
+        while let Some(result) = connection_tasks.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "daemon connection task failed while draining");
             }
         }
 
@@ -588,7 +625,8 @@ fn spawn_peer_networking_runtime(
 async fn handle_client(
     mut stream: tokio::net::UnixStream,
     daemon: Arc<InProcessDaemon>,
-    shutdown_rx: watch::Receiver<bool>,
+    shutdown_request_tx: mpsc::UnboundedSender<()>,
+    mut shutdown_rx: watch::Receiver<bool>,
     inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     peer_manager: Arc<Mutex<PeerManager>>,
     remote_command_router: RemoteCommandRouter,
@@ -605,8 +643,13 @@ async fn handle_client(
             return;
         }
         Ok(Ok(_)) if first_byte[0].is_ascii_uppercase() => {
-            if let Err(error) = resource_http::serve_resource_http(stream, first_byte[0], daemon.resource_backend().clone()).await {
-                warn!(%error, "resource HTTP connection failed");
+            tokio::select! {
+                result = resource_http::serve_resource_http(stream, first_byte[0], daemon.resource_backend().clone()) => {
+                    if let Err(error) = result {
+                        warn!(%error, "resource HTTP connection failed");
+                    }
+                }
+                _ = shutdown_rx.changed() => {}
             }
             return;
         }
@@ -619,6 +662,7 @@ async fn handle_client(
     handle_client_session(
         unix_message_session_with_prefix(stream, first_byte.to_vec()),
         daemon,
+        shutdown_request_tx,
         shutdown_rx,
         inbound_peer_tx,
         peer_manager,
@@ -636,6 +680,7 @@ async fn handle_client(
 async fn handle_client_session(
     session: MessageSession,
     daemon: Arc<InProcessDaemon>,
+    shutdown_request_tx: mpsc::UnboundedSender<()>,
     mut shutdown_rx: watch::Receiver<bool>,
     inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     peer_manager: Arc<Mutex<PeerManager>>,
@@ -714,9 +759,17 @@ async fn handle_client_session(
                     Some(surface) => surface,
                     None => flotilla_protocol::SurfaceDeclaration::focal_for_namespace(daemon.provisioning_namespace().await),
                 };
-                ClientConnection::new(daemon, shutdown_rx, remote_command_router, client_count, client_notify, agent_state_store)
-                    .run_stateful(Arc::clone(&session), session_id, surface)
-                    .await;
+                ClientConnection::new(
+                    daemon,
+                    shutdown_request_tx,
+                    shutdown_rx,
+                    remote_command_router,
+                    client_count,
+                    client_notify,
+                    agent_state_store,
+                )
+                .run_stateful(Arc::clone(&session), session_id, surface)
+                .await;
             } else {
                 // Peer path (ConnectionRole::Peer or None) — existing behavior.
                 PeerConnection::new(daemon, shutdown_rx, inbound_peer_tx, peer_manager, peer_connected_tx, client_count, client_notify)
