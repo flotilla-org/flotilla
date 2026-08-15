@@ -1037,7 +1037,14 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
                 }
             }
             Ok(ref event @ DaemonEvent::CommandFinished { command_id: id, ref result, .. }) if id == command_id => {
-                write_finished_command(&mut std::io::stdout().lock(), event, result, format)?;
+                match format {
+                    OutputFormat::Human => {
+                        println!("{}", format_event_human(event));
+                    }
+                    OutputFormat::Json => {
+                        println!("{}", flotilla_protocol::output::json_pretty(&result));
+                    }
+                }
                 let result = result.clone();
                 return match result {
                     CommandValue::Error { .. } => Ok(result),
@@ -1056,20 +1063,6 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
             }
         }
     }
-}
-
-fn write_finished_command(
-    output: &mut dyn std::io::Write,
-    event: &DaemonEvent,
-    result: &CommandValue,
-    format: OutputFormat,
-) -> Result<(), String> {
-    match format {
-        OutputFormat::Human => writeln!(output, "{}", format_event_human(event)),
-        OutputFormat::Json => writeln!(output, "{}", flotilla_protocol::output::json_pretty(result)),
-    }
-    .map_err(|error| format!("write command result: {error}"))?;
-    output.flush().map_err(|error| format!("flush command result: {error}"))
 }
 
 async fn run_query_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<CommandValue, String> {
