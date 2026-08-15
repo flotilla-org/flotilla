@@ -23,8 +23,27 @@ const FAILED_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 const ACQUISITION_CONFIRMATION: Duration = Duration::from_millis(250);
 const KDE_INHIBITION_ENFORCEMENT_DELAY: Duration = Duration::from_millis(5_250);
 const KDE_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(target_os = "linux")]
+const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const FAILURE_THRESHOLD: u32 = 3;
 const INHIBITOR_REASON: &str = "Flotilla vessel crew is active";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SleepCapability {
+    Available,
+    Unavailable,
+}
+
+fn effective_inhibition_required(workload_requires_inhibition: bool, sleep_capability: SleepCapability) -> bool {
+    workload_requires_inhibition && sleep_capability == SleepCapability::Available
+}
+
+#[async_trait]
+trait SleepCapabilityProbe: Send {
+    async fn detect(&mut self) -> Result<SleepCapability, String>;
+}
+
+struct SystemSleepCapabilityProbe;
 
 #[async_trait]
 trait SleepInhibitor: Send {
@@ -37,20 +56,29 @@ pub(super) async fn run(
     hosts: TypedResolver<Host>,
     host_id: String,
 ) -> Result<(), ResourceError> {
-    run_with_inhibitor(convoys, vessels, hosts, host_id, SystemSleepInhibitor::default()).await
+    run_with_inhibitor(convoys, vessels, hosts, host_id, SystemSleepInhibitor::default(), SystemSleepCapabilityProbe).await
 }
 
-async fn run_with_inhibitor<I: SleepInhibitor>(
+async fn run_with_inhibitor<I: SleepInhibitor, P: SleepCapabilityProbe>(
     convoys: ReplicaReadResolver<Convoy>,
     vessels: TypedResolver<Vessel>,
     hosts: TypedResolver<Host>,
     host_id: String,
     mut inhibitor: I,
+    mut capability_probe: P,
 ) -> Result<(), ResourceError> {
     let mut health = InhibitionHealthTracker::default();
+    let sleep_capability = match capability_probe.detect().await {
+        Ok(capability) => capability,
+        Err(error) => {
+            warn!(%error, "could not determine host sleep capability; conservatively enabling sleep inhibition");
+            SleepCapability::Available
+        }
+    };
+    info!(?sleep_capability, "determined host sleep capability");
     // Hold while the federated view is being established. Sleeping during an
     // unknown replica state is more expensive than briefly holding needlessly.
-    maintain_and_publish(&mut inhibitor, true, &mut health, &hosts, &host_id).await?;
+    maintain_and_publish(&mut inhibitor, effective_inhibition_required(true, sleep_capability), &mut health, &hosts, &host_id).await?;
 
     // Overlay watches cannot resume from a list cursor. Start the watch first,
     // then list, so events racing with the snapshot remain queued for us.
@@ -61,7 +89,14 @@ async fn run_with_inhibitor<I: SleepInhibitor>(
     let listed_vessels = vessels.list().await?;
     let mut active_vessels = ActiveVessels::from_objects(&listed_vessels.items);
     let mut vessel_watch = vessels.watch(WatchStart::resuming_from(&listed_vessels)).await?;
-    maintain_and_publish(&mut inhibitor, active_convoys.required() || active_vessels.required(), &mut health, &hosts, &host_id).await?;
+    maintain_and_publish(
+        &mut inhibitor,
+        effective_inhibition_required(active_convoys.required() || active_vessels.required(), sleep_capability),
+        &mut health,
+        &hosts,
+        &host_id,
+    )
+    .await?;
 
     let recheck = tokio::time::sleep(health.recheck_interval());
     tokio::pin!(recheck);
@@ -74,7 +109,7 @@ async fn run_with_inhibitor<I: SleepInhibitor>(
                         active_convoys.apply(event, &host_id);
                         maintain_and_publish(
                             &mut inhibitor,
-                            active_convoys.required() || active_vessels.required(),
+                            effective_inhibition_required(active_convoys.required() || active_vessels.required(), sleep_capability),
                             &mut health,
                             &hosts,
                             &host_id,
@@ -82,11 +117,11 @@ async fn run_with_inhibitor<I: SleepInhibitor>(
                         recheck.as_mut().reset(tokio::time::Instant::now() + health.recheck_interval());
                     }
                     Some(Err(error)) => {
-                        maintain_and_publish(&mut inhibitor, true, &mut health, &hosts, &host_id).await?;
+                        maintain_and_publish(&mut inhibitor, effective_inhibition_required(true, sleep_capability), &mut health, &hosts, &host_id).await?;
                         return Err(error);
                     }
                     None => {
-                        maintain_and_publish(&mut inhibitor, true, &mut health, &hosts, &host_id).await?;
+                        maintain_and_publish(&mut inhibitor, effective_inhibition_required(true, sleep_capability), &mut health, &hosts, &host_id).await?;
                         return Err(ResourceError::other("sleep inhibitor convoy watch ended"));
                     }
                 }
@@ -97,7 +132,7 @@ async fn run_with_inhibitor<I: SleepInhibitor>(
                         active_vessels.apply(event);
                         maintain_and_publish(
                             &mut inhibitor,
-                            active_convoys.required() || active_vessels.required(),
+                            effective_inhibition_required(active_convoys.required() || active_vessels.required(), sleep_capability),
                             &mut health,
                             &hosts,
                             &host_id,
@@ -105,11 +140,11 @@ async fn run_with_inhibitor<I: SleepInhibitor>(
                         recheck.as_mut().reset(tokio::time::Instant::now() + health.recheck_interval());
                     }
                     Some(Err(error)) => {
-                        maintain_and_publish(&mut inhibitor, true, &mut health, &hosts, &host_id).await?;
+                        maintain_and_publish(&mut inhibitor, effective_inhibition_required(true, sleep_capability), &mut health, &hosts, &host_id).await?;
                         return Err(error);
                     }
                     None => {
-                        maintain_and_publish(&mut inhibitor, true, &mut health, &hosts, &host_id).await?;
+                        maintain_and_publish(&mut inhibitor, effective_inhibition_required(true, sleep_capability), &mut health, &hosts, &host_id).await?;
                         return Err(ResourceError::other("sleep inhibitor vessel watch ended"));
                     }
                 }
@@ -117,7 +152,7 @@ async fn run_with_inhibitor<I: SleepInhibitor>(
             _ = &mut recheck => {
                 maintain_and_publish(
                     &mut inhibitor,
-                    active_convoys.required() || active_vessels.required(),
+                    effective_inhibition_required(active_convoys.required() || active_vessels.required(), sleep_capability),
                     &mut health,
                     &hosts,
                     &host_id,
@@ -435,6 +470,49 @@ async fn command_output_with_timeout(mut command: Command, timeout: Duration, de
         .map_err(|error| format!("{description}: {error}"))
 }
 
+#[async_trait]
+impl SleepCapabilityProbe for SystemSleepCapabilityProbe {
+    async fn detect(&mut self) -> Result<SleepCapability, String> {
+        platform_sleep_capability().await
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn platform_sleep_capability() -> Result<SleepCapability, String> {
+    let mut virtualization = Command::new("systemd-detect-virt");
+    virtualization.args(["--container", "--quiet"]);
+    match command_output_with_timeout(virtualization, CAPABILITY_PROBE_TIMEOUT, "detect container virtualization").await {
+        Ok(output) if output.status.success() => return Ok(classify_linux_sleep_capability(true, None)),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "container virtualization probe unavailable; checking kernel sleep states"),
+    }
+
+    match tokio::fs::read_to_string("/sys/power/state").await {
+        Ok(states) => Ok(classify_linux_sleep_capability(false, Some(&states))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(classify_linux_sleep_capability(false, None)),
+        Err(error) => Err(format!("read /sys/power/state: {error}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_linux_sleep_capability(container_detected: bool, kernel_sleep_states: Option<&str>) -> SleepCapability {
+    if container_detected || kernel_sleep_states.is_none_or(|states| states.split_whitespace().next().is_none()) {
+        SleepCapability::Unavailable
+    } else {
+        SleepCapability::Available
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn platform_sleep_capability() -> Result<SleepCapability, String> {
+    Ok(SleepCapability::Available)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn platform_sleep_capability() -> Result<SleepCapability, String> {
+    Ok(SleepCapability::Unavailable)
+}
+
 #[cfg(target_os = "linux")]
 fn platform_inhibitor_commands(daemon_pid: u32) -> Result<Vec<InhibitorCommand>, String> {
     let payload = || vec!["tail".to_string(), format!("--pid={daemon_pid}"), "-f".to_string(), "/dev/null".to_string()];
@@ -497,6 +575,33 @@ mod tests {
         results: VecDeque<Result<SleepInhibitionHealth, String>>,
     }
 
+    struct FailingRecordingInhibitor {
+        states: mpsc::UnboundedSender<bool>,
+    }
+
+    struct FixedSleepCapabilityProbe(Result<SleepCapability, String>);
+
+    impl FixedSleepCapabilityProbe {
+        fn available() -> Self {
+            Self(Ok(SleepCapability::Available))
+        }
+
+        fn unavailable() -> Self {
+            Self(Ok(SleepCapability::Unavailable))
+        }
+
+        fn failing() -> Self {
+            Self(Err("sleep capability probe failed".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl SleepCapabilityProbe for FixedSleepCapabilityProbe {
+        async fn detect(&mut self) -> Result<SleepCapability, String> {
+            self.0.clone()
+        }
+    }
+
     #[async_trait]
     impl SleepInhibitor for RecordingInhibitor {
         async fn maintain(&mut self, required: bool) -> Result<SleepInhibitionHealth, String> {
@@ -509,6 +614,14 @@ mod tests {
     impl SleepInhibitor for ScriptedInhibitor {
         async fn maintain(&mut self, _required: bool) -> Result<SleepInhibitionHealth, String> {
             self.results.pop_front().expect("scripted inhibitor result")
+        }
+    }
+
+    #[async_trait]
+    impl SleepInhibitor for FailingRecordingInhibitor {
+        async fn maintain(&mut self, required: bool) -> Result<SleepInhibitionHealth, String> {
+            self.states.send(required).map_err(|_| "test receiver closed".to_string())?;
+            Err("polkit denied".to_string())
         }
     }
 
@@ -581,6 +694,7 @@ mod tests {
             hosts.clone(),
             "test-host".to_string(),
             RecordingInhibitor { states: tx },
+            FixedSleepCapabilityProbe::available(),
         ));
 
         assert!(next_state(&mut rx).await, "uncertain startup must hold");
@@ -607,6 +721,7 @@ mod tests {
             hosts,
             "test-host".to_string(),
             RecordingInhibitor { states: tx },
+            FixedSleepCapabilityProbe::available(),
         ));
         assert!(next_state(&mut rx).await);
         assert!(next_state(&mut rx).await);
@@ -648,6 +763,7 @@ mod tests {
             hosts,
             "test-host".to_string(),
             RecordingInhibitor { states: tx },
+            FixedSleepCapabilityProbe::available(),
         ));
 
         assert!(next_state(&mut rx).await);
@@ -669,6 +785,7 @@ mod tests {
             hosts,
             "test-host".to_string(),
             RecordingInhibitor { states: tx },
+            FixedSleepCapabilityProbe::available(),
         ));
 
         assert!(next_state(&mut rx).await);
@@ -691,6 +808,7 @@ mod tests {
             hosts,
             "test-host".to_string(),
             RecordingInhibitor { states: tx },
+            FixedSleepCapabilityProbe::available(),
         ));
 
         assert!(next_state(&mut rx).await);
@@ -736,6 +854,7 @@ mod tests {
             hosts,
             "test-host".to_string(),
             RecordingInhibitor { states: tx },
+            FixedSleepCapabilityProbe::available(),
         ));
 
         assert!(next_state(&mut rx).await);
@@ -760,6 +879,89 @@ mod tests {
 
         assert!(tracker.observe(Err("polkit denied".to_string())).changed.is_none(), "identical failures should stay deduplicated");
         assert_eq!(tracker.recheck_interval(), FAILED_RETRY_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn active_work_does_not_require_inhibition_when_the_host_cannot_sleep() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let hosts = backend.using::<Host>(NAMESPACE);
+        create_host(&hosts).await;
+        create_convoy(&backend.using::<Convoy>(NAMESPACE), "active", ConvoyPhase::Active, Some("test-host")).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let task = tokio::spawn(run_with_inhibitor(
+            backend.including_replicas::<Convoy>(NAMESPACE),
+            backend.using::<Vessel>(NAMESPACE),
+            hosts.clone(),
+            "test-host".to_string(),
+            RecordingInhibitor { states: tx },
+            FixedSleepCapabilityProbe::unavailable(),
+        ));
+
+        assert!(!next_state(&mut rx).await, "incapable host must not inhibit during startup");
+        assert!(!next_state(&mut rx).await, "active work must not inhibit an incapable host");
+        let status = hosts.get("test-host").await.expect("get host").status.expect("host status");
+        assert_eq!(status.sleep_inhibition, SleepInhibitionHealth::NotRequired);
+        assert!(status.conditions.iter().all(|condition| condition.condition_type != "SleepInhibition"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn capability_probe_failure_conservatively_requires_inhibition() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let hosts = backend.using::<Host>(NAMESPACE);
+        create_host(&hosts).await;
+        create_convoy(&backend.using::<Convoy>(NAMESPACE), "active", ConvoyPhase::Active, Some("test-host")).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let task = tokio::spawn(run_with_inhibitor(
+            backend.including_replicas::<Convoy>(NAMESPACE),
+            backend.using::<Vessel>(NAMESPACE),
+            hosts.clone(),
+            "test-host".to_string(),
+            RecordingInhibitor { states: tx },
+            FixedSleepCapabilityProbe::failing(),
+        ));
+
+        assert!(next_state(&mut rx).await, "uncertain startup must inhibit when capability detection fails");
+        assert!(next_state(&mut rx).await, "active work must inhibit when capability detection fails");
+        assert_eq!(
+            hosts.get("test-host").await.expect("get host").status.expect("host status").sleep_inhibition,
+            SleepInhibitionHealth::Held
+        );
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sleep_capable_host_with_failing_inhibitor_becomes_degraded() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let hosts = backend.using::<Host>(NAMESPACE);
+        create_host(&hosts).await;
+        create_convoy(&backend.using::<Convoy>(NAMESPACE), "active", ConvoyPhase::Active, Some("test-host")).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let task = tokio::spawn(run_with_inhibitor(
+            backend.including_replicas::<Convoy>(NAMESPACE),
+            backend.using::<Vessel>(NAMESPACE),
+            hosts.clone(),
+            "test-host".to_string(),
+            FailingRecordingInhibitor { states: tx },
+            FixedSleepCapabilityProbe::available(),
+        ));
+
+        assert!(next_state(&mut rx).await);
+        assert!(next_state(&mut rx).await);
+        tokio::time::advance(ACQUISITION_RETRY_INTERVAL).await;
+        assert!(next_state(&mut rx).await);
+        tokio::task::yield_now().await;
+
+        let status = hosts.get("test-host").await.expect("get host").status.expect("host status");
+        assert_eq!(status.sleep_inhibition, SleepInhibitionHealth::Failed {
+            consecutive_failures: FAILURE_THRESHOLD,
+            message: "polkit denied".to_string()
+        });
+        assert!(status.conditions.iter().any(|condition| condition.condition_type == "SleepInhibition"));
+        task.abort();
     }
 
     #[tokio::test]
@@ -850,5 +1052,14 @@ mod tests {
         for command in [&commands[0], &commands[2]] {
             assert!(command.args.iter().any(|arg| arg == "--pid=42"));
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_sleep_capability_classifies_containers_and_kernel_states() {
+        assert_eq!(classify_linux_sleep_capability(true, Some("freeze mem disk")), SleepCapability::Unavailable);
+        assert_eq!(classify_linux_sleep_capability(false, None), SleepCapability::Unavailable);
+        assert_eq!(classify_linux_sleep_capability(false, Some("  \n")), SleepCapability::Unavailable);
+        assert_eq!(classify_linux_sleep_capability(false, Some("freeze mem disk")), SleepCapability::Available);
     }
 }
