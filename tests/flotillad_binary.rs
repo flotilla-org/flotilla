@@ -9,7 +9,7 @@ fn installed_package_exposes_flotillad_binary() {
 }
 
 #[test]
-fn binaries_report_their_wire_generation() {
+fn binaries_report_their_wire_generation_and_protocol_version() {
     for binary in [env!("CARGO_BIN_EXE_flotilla"), env!("CARGO_BIN_EXE_flotillad")] {
         let output = Command::new(binary).arg("--version").output().expect("binary version should run");
 
@@ -18,6 +18,11 @@ fn binaries_report_their_wire_generation() {
         assert!(
             stdout.contains(&format!("wire={}", flotilla_client::BUILD_ID)),
             "{} should report its wire generation, got {stdout:?}",
+            binary
+        );
+        assert!(
+            stdout.contains(&format!("proto={}", flotilla_protocol::PROTOCOL_VERSION)),
+            "{} should report its peer protocol version, got {stdout:?}",
             binary
         );
     }
