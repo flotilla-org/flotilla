@@ -11,6 +11,26 @@ use crate::providers::{
     FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
 
+const REMOTE_WRITABLE_BASE_SCRIPT: &str = "if [ -n \"${XDG_RUNTIME_DIR:-}\" ] \
+                                               && [ -d \"$XDG_RUNTIME_DIR\" ] \
+                                               && [ -w \"$XDG_RUNTIME_DIR\" ] \
+                                               && mkdir -p \"$XDG_RUNTIME_DIR/flotilla\"; then \
+                                               base=$XDG_RUNTIME_DIR/flotilla; \
+                                           elif [ -n \"${XDG_STATE_HOME:-}\" ] \
+                                               && mkdir -p \"$XDG_STATE_HOME/flotilla\" 2>/dev/null \
+                                               && [ -d \"$XDG_STATE_HOME/flotilla\" ] \
+                                               && [ -w \"$XDG_STATE_HOME/flotilla\" ]; then \
+                                               base=$XDG_STATE_HOME/flotilla; \
+                                           elif [ -n \"${HOME:-}\" ] \
+                                               && mkdir -p \"$HOME/.local/state/flotilla\" 2>/dev/null \
+                                               && [ -d \"$HOME/.local/state/flotilla\" ] \
+                                               && [ -w \"$HOME/.local/state/flotilla\" ]; then \
+                                               base=$HOME/.local/state/flotilla; \
+                                           else \
+                                               exit 1; \
+                                           fi; \
+                                           printf '%s' \"$base\"";
+
 /// Command runner that executes commands on a remote host over SSH.
 ///
 /// This is intentionally narrow: it shells out to `ssh` for direct-environment
@@ -61,25 +81,7 @@ impl SshCommandRunner {
 
     async fn writable_base(&self, purpose: &str) -> Result<PathBuf, String> {
         let base = self
-            .run(
-                "sh",
-                &[
-                    "-c",
-                    "if [ -n \"${XDG_RUNTIME_DIR:-}\" ] && [ -d \"$XDG_RUNTIME_DIR\" ] && [ -w \"$XDG_RUNTIME_DIR\" ]; then \
-                         base=$XDG_RUNTIME_DIR; \
-                     elif [ -n \"${XDG_STATE_HOME:-}\" ]; then \
-                         base=$XDG_STATE_HOME; \
-                     elif [ -n \"${HOME:-}\" ]; then \
-                         base=$HOME/.local/state; \
-                     else \
-                         exit 1; \
-                     fi; \
-                     mkdir -p \"$base/flotilla\" && test -d \"$base/flotilla\" && test -w \"$base/flotilla\" && printf '%s' \"$base/flotilla\"",
-                    purpose,
-                ],
-                Path::new("/"),
-                &ChannelLabel::Noop,
-            )
+            .run("sh", &["-c", REMOTE_WRITABLE_BASE_SCRIPT, purpose], Path::new("/"), &ChannelLabel::Noop)
             .await
             .map_err(|error| format!("find writable directory on SSH host: {error}"))?;
         let base = base.trim();
@@ -150,7 +152,7 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::SshCommandRunner;
+    use super::{SshCommandRunner, REMOTE_WRITABLE_BASE_SCRIPT};
     use crate::providers::{ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
 
     struct RecordingRunner {
@@ -326,6 +328,33 @@ mod tests {
             let script = args.last().expect("remote execution script");
             script.contains("XDG_RUNTIME_DIR") && script.contains("XDG_STATE_HOME") && script.contains("HOME")
         }));
+    }
+
+    #[tokio::test]
+    async fn unusable_remote_state_home_falls_through_to_home() {
+        let home = tempfile::tempdir().expect("remote home");
+        let home_assignment = format!("HOME={}", home.path().display());
+
+        let base = ProcessCommandRunner
+            .run(
+                "env",
+                &[
+                    "-u",
+                    "XDG_RUNTIME_DIR",
+                    "XDG_STATE_HOME=/proc/flotilla-unwritable",
+                    &home_assignment,
+                    "sh",
+                    "-c",
+                    REMOTE_WRITABLE_BASE_SCRIPT,
+                    "flotilla-ssh-config-base",
+                ],
+                Path::new("/"),
+                &ChannelLabel::Noop,
+            )
+            .await
+            .expect("fall through unusable XDG state home");
+
+        assert_eq!(Path::new(base.trim()), home.path().join(".local/state/flotilla"));
     }
 
     #[tokio::test]
