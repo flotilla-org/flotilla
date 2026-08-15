@@ -482,16 +482,24 @@ async fn platform_sleep_capability() -> Result<SleepCapability, String> {
     let mut virtualization = Command::new("systemd-detect-virt");
     virtualization.args(["--container", "--quiet"]);
     match command_output_with_timeout(virtualization, CAPABILITY_PROBE_TIMEOUT, "detect container virtualization").await {
-        Ok(output) if output.status.success() => return Ok(SleepCapability::Unavailable),
+        Ok(output) if output.status.success() => return Ok(classify_linux_sleep_capability(true, None)),
         Ok(_) => {}
         Err(error) => warn!(%error, "container virtualization probe unavailable; checking kernel sleep states"),
     }
 
     match tokio::fs::read_to_string("/sys/power/state").await {
-        Ok(states) if states.split_whitespace().next().is_none() => Ok(SleepCapability::Unavailable),
-        Ok(_) => Ok(SleepCapability::Available),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SleepCapability::Unavailable),
+        Ok(states) => Ok(classify_linux_sleep_capability(false, Some(&states))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(classify_linux_sleep_capability(false, None)),
         Err(error) => Err(format!("read /sys/power/state: {error}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_linux_sleep_capability(container_detected: bool, kernel_sleep_states: Option<&str>) -> SleepCapability {
+    if container_detected || kernel_sleep_states.is_none_or(|states| states.split_whitespace().next().is_none()) {
+        SleepCapability::Unavailable
+    } else {
+        SleepCapability::Available
     }
 }
 
@@ -571,12 +579,26 @@ mod tests {
         states: mpsc::UnboundedSender<bool>,
     }
 
-    struct FixedSleepCapabilityProbe(SleepCapability);
+    struct FixedSleepCapabilityProbe(Result<SleepCapability, String>);
+
+    impl FixedSleepCapabilityProbe {
+        fn available() -> Self {
+            Self(Ok(SleepCapability::Available))
+        }
+
+        fn unavailable() -> Self {
+            Self(Ok(SleepCapability::Unavailable))
+        }
+
+        fn failing() -> Self {
+            Self(Err("sleep capability probe failed".to_string()))
+        }
+    }
 
     #[async_trait]
     impl SleepCapabilityProbe for FixedSleepCapabilityProbe {
         async fn detect(&mut self) -> Result<SleepCapability, String> {
-            Ok(self.0)
+            self.0.clone()
         }
     }
 
@@ -672,7 +694,7 @@ mod tests {
             hosts.clone(),
             "test-host".to_string(),
             RecordingInhibitor { states: tx },
-            FixedSleepCapabilityProbe(SleepCapability::Available),
+            FixedSleepCapabilityProbe::available(),
         ));
 
         assert!(next_state(&mut rx).await, "uncertain startup must hold");
@@ -699,7 +721,7 @@ mod tests {
             hosts,
             "test-host".to_string(),
             RecordingInhibitor { states: tx },
-            FixedSleepCapabilityProbe(SleepCapability::Available),
+            FixedSleepCapabilityProbe::available(),
         ));
         assert!(next_state(&mut rx).await);
         assert!(next_state(&mut rx).await);
@@ -741,7 +763,7 @@ mod tests {
             hosts,
             "test-host".to_string(),
             RecordingInhibitor { states: tx },
-            FixedSleepCapabilityProbe(SleepCapability::Available),
+            FixedSleepCapabilityProbe::available(),
         ));
 
         assert!(next_state(&mut rx).await);
@@ -763,7 +785,7 @@ mod tests {
             hosts,
             "test-host".to_string(),
             RecordingInhibitor { states: tx },
-            FixedSleepCapabilityProbe(SleepCapability::Available),
+            FixedSleepCapabilityProbe::available(),
         ));
 
         assert!(next_state(&mut rx).await);
@@ -786,7 +808,7 @@ mod tests {
             hosts,
             "test-host".to_string(),
             RecordingInhibitor { states: tx },
-            FixedSleepCapabilityProbe(SleepCapability::Available),
+            FixedSleepCapabilityProbe::available(),
         ));
 
         assert!(next_state(&mut rx).await);
@@ -832,7 +854,7 @@ mod tests {
             hosts,
             "test-host".to_string(),
             RecordingInhibitor { states: tx },
-            FixedSleepCapabilityProbe(SleepCapability::Available),
+            FixedSleepCapabilityProbe::available(),
         ));
 
         assert!(next_state(&mut rx).await);
@@ -873,7 +895,7 @@ mod tests {
             hosts.clone(),
             "test-host".to_string(),
             RecordingInhibitor { states: tx },
-            FixedSleepCapabilityProbe(SleepCapability::Unavailable),
+            FixedSleepCapabilityProbe::unavailable(),
         ));
 
         assert!(!next_state(&mut rx).await, "incapable host must not inhibit during startup");
@@ -881,6 +903,32 @@ mod tests {
         let status = hosts.get("test-host").await.expect("get host").status.expect("host status");
         assert_eq!(status.sleep_inhibition, SleepInhibitionHealth::NotRequired);
         assert!(status.conditions.iter().all(|condition| condition.condition_type != "SleepInhibition"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn capability_probe_failure_conservatively_requires_inhibition() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let hosts = backend.using::<Host>(NAMESPACE);
+        create_host(&hosts).await;
+        create_convoy(&backend.using::<Convoy>(NAMESPACE), "active", ConvoyPhase::Active, Some("test-host")).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let task = tokio::spawn(run_with_inhibitor(
+            backend.including_replicas::<Convoy>(NAMESPACE),
+            backend.using::<Vessel>(NAMESPACE),
+            hosts.clone(),
+            "test-host".to_string(),
+            RecordingInhibitor { states: tx },
+            FixedSleepCapabilityProbe::failing(),
+        ));
+
+        assert!(next_state(&mut rx).await, "uncertain startup must inhibit when capability detection fails");
+        assert!(next_state(&mut rx).await, "active work must inhibit when capability detection fails");
+        assert_eq!(
+            hosts.get("test-host").await.expect("get host").status.expect("host status").sleep_inhibition,
+            SleepInhibitionHealth::Held
+        );
         task.abort();
     }
 
@@ -898,7 +946,7 @@ mod tests {
             hosts.clone(),
             "test-host".to_string(),
             FailingRecordingInhibitor { states: tx },
-            FixedSleepCapabilityProbe(SleepCapability::Available),
+            FixedSleepCapabilityProbe::available(),
         ));
 
         assert!(next_state(&mut rx).await);
@@ -1004,5 +1052,14 @@ mod tests {
         for command in [&commands[0], &commands[2]] {
             assert!(command.args.iter().any(|arg| arg == "--pid=42"));
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_sleep_capability_classifies_containers_and_kernel_states() {
+        assert_eq!(classify_linux_sleep_capability(true, Some("freeze mem disk")), SleepCapability::Unavailable);
+        assert_eq!(classify_linux_sleep_capability(false, None), SleepCapability::Unavailable);
+        assert_eq!(classify_linux_sleep_capability(false, Some("  \n")), SleepCapability::Unavailable);
+        assert_eq!(classify_linux_sleep_capability(false, Some("freeze mem disk")), SleepCapability::Available);
     }
 }
