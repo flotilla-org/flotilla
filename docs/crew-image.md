@@ -133,6 +133,7 @@ populate that writable home and run a dependency-backed test:
 
 ```bash
 docker run --rm --user 12345:12345 "$IMAGE" sh -c '
+  set -eu
   test "$CARGO_HOME" = /tmp/flotilla-config/cargo
   mkdir -p /tmp/cargo-smoke/src
   printf "[package]\nname = \"cargo-smoke\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nanyhow = \"1\"\n" > /tmp/cargo-smoke/Cargo.toml
