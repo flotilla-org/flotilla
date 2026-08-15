@@ -547,6 +547,40 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
         .expect("delivered OAuth admits trusted Claude despite an expired ambient login");
 }
 
+#[tokio::test]
+async fn ambient_only_adapter_is_refused_when_the_host_login_expired() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder()
+            .name("work".to_string())
+            .stance(Stance::Trusted)
+            .crew(vec![CrewSpec::builder()
+                .role("coder".to_string())
+                .source(CrewSource::Agent { selector: Selector::for_capability("ambient-only"), prompt: None, brief_template: None })
+                .build()])
+            .build()])
+        .build();
+    create_docker_placement(&backend, "ambient-host", "host-a", BTreeSet::new()).await;
+    let placement = backend.using::<PlacementPolicy>("flotilla").get("ambient-host").await.expect("get placement");
+    let expired = CredentialExpiry::builder().refresh_expires_at("2020-02-01T00:00:00Z".parse().expect("timestamp")).build();
+    set_host_credential_expiry(
+        &backend,
+        "host-a",
+        BTreeMap::from([(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE.to_string(), expired)]),
+    )
+    .await;
+    let capabilities = CapabilityTable::seeded().with_ambient_only_test_requirement("ambient-only");
+
+    let error = validate_workflow_credentials_with_capabilities(&backend, "flotilla", &workflow, Some(&placement), &capabilities)
+        .await
+        .expect_err("expired ambient-only authentication must refuse dispatch");
+
+    assert_eq!(
+        error,
+        "vessel `work` depends on the ambient claude login on host `host-a`, which expired on 2020-02-01 — log in again on that host or grant a delivered claude credential"
+    );
+}
+
 async fn set_host_credential_expiry(backend: &ResourceBackend, host_ref: &str, expiry: BTreeMap<String, CredentialExpiry>) {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
     let host = hosts.get(host_ref).await.expect("host resource");

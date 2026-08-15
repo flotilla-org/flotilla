@@ -326,9 +326,23 @@ pub struct AgentLaunchPlan {
 pub struct AgentRequirement {
     pub adapter: String,
     pub model: Option<String>,
+    credential_policy: AgentCredentialPolicy,
 }
 
 const CLAUDE_CODE_ADAPTER_ID: &str = "claude-code";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentCredentialPolicy {
+    None,
+    DeliveredWithAmbientFallback {
+        slot: &'static str,
+        scope: &'static str,
+    },
+    #[cfg(test)]
+    AmbientOnly {
+        scope: &'static str,
+    },
+}
 
 pub struct CapabilityTable {
     requirements: BTreeMap<String, AgentRequirement>,
@@ -338,19 +352,29 @@ impl CapabilityTable {
     pub fn seeded() -> Self {
         Self {
             requirements: BTreeMap::from([
-                ("coding".into(), AgentRequirement { adapter: "codex".into(), model: None }),
-                ("code".into(), AgentRequirement { adapter: "codex".into(), model: None }),
-                ("review".into(), AgentRequirement { adapter: "claude-code".into(), model: Some("opus".into()) }),
-                ("code-review".into(), AgentRequirement { adapter: "claude-code".into(), model: Some("opus".into()) }),
+                ("coding".into(), AgentRequirement::new("codex", None)),
+                ("code".into(), AgentRequirement::new("codex", None)),
+                ("review".into(), AgentRequirement::new("claude-code", Some("opus".into()))),
+                ("code-review".into(), AgentRequirement::new("claude-code", Some("opus".into()))),
                 // The most judgment-concentrated, lowest-volume role in the
                 // fleet gets the strongest planner available (ADR 0030).
-                ("governor".into(), AgentRequirement { adapter: CLAUDE_CODE_ADAPTER_ID.into(), model: Some("fable".into()) }),
+                ("governor".into(), AgentRequirement::new(CLAUDE_CODE_ADAPTER_ID, Some("fable".into()))),
             ]),
         }
     }
 
     pub fn resolve(&self, capability: &str) -> Result<&AgentRequirement, String> {
         self.requirements.get(capability).ok_or_else(|| format!("unknown agent capability `{capability}`"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ambient_only_test_requirement(mut self, capability: &str) -> Self {
+        self.requirements.insert(capability.to_string(), AgentRequirement {
+            adapter: "ambient-only-test".to_string(),
+            model: None,
+            credential_policy: AgentCredentialPolicy::AmbientOnly { scope: flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE },
+        });
+        self
     }
 
     /// Resolve a workflow selector to its effective requirement.
@@ -364,21 +388,39 @@ impl CapabilityTable {
     /// check that matters (adapter availability) happens at placement.
     pub fn resolve_selector(&self, selector: &flotilla_resources::Selector) -> Result<AgentRequirement, String> {
         if let Some(adapter) = &selector.adapter {
-            return Ok(AgentRequirement { adapter: adapter.clone(), model: selector.model.clone() });
+            return Ok(AgentRequirement::new(adapter, selector.model.clone()));
         }
         let seeded = self.resolve(&selector.capability)?;
-        Ok(AgentRequirement { adapter: seeded.adapter.clone(), model: selector.model.clone().or_else(|| seeded.model.clone()) })
+        Ok(AgentRequirement {
+            adapter: seeded.adapter.clone(),
+            model: selector.model.clone().or_else(|| seeded.model.clone()),
+            credential_policy: seeded.credential_policy,
+        })
     }
 }
 
 impl AgentRequirement {
+    fn new(adapter: impl Into<String>, model: Option<String>) -> Self {
+        let adapter = adapter.into();
+        let credential_policy = match adapter.as_str() {
+            CLAUDE_CODE_ADAPTER_ID => AgentCredentialPolicy::DeliveredWithAmbientFallback {
+                slot: "claude",
+                scope: flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
+            },
+            _ => AgentCredentialPolicy::None,
+        };
+        Self { adapter, model, credential_policy }
+    }
+
     /// Credential delivery slot supported by this adapter. A session must
     /// never fall through to ambient or interactive login when its adapter has
     /// a deliverable material form.
     pub fn credential_delivery_slot(&self) -> Option<&'static str> {
-        match self.adapter.as_str() {
-            CLAUDE_CODE_ADAPTER_ID => Some("claude"),
-            _ => None,
+        match self.credential_policy {
+            AgentCredentialPolicy::DeliveredWithAmbientFallback { slot, .. } => Some(slot),
+            AgentCredentialPolicy::None => None,
+            #[cfg(test)]
+            AgentCredentialPolicy::AmbientOnly { .. } => None,
         }
     }
 
@@ -386,9 +428,11 @@ impl AgentRequirement {
     /// delivered, named as it appears under the Host `credential_expiry`
     /// capability. `None` for adapters with no ambient authentication path.
     pub fn ambient_credential_scope(&self) -> Option<&'static str> {
-        match self.adapter.as_str() {
-            CLAUDE_CODE_ADAPTER_ID => Some(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE),
-            _ => None,
+        match self.credential_policy {
+            AgentCredentialPolicy::DeliveredWithAmbientFallback { scope, .. } => Some(scope),
+            AgentCredentialPolicy::None => None,
+            #[cfg(test)]
+            AgentCredentialPolicy::AmbientOnly { scope } => Some(scope),
         }
     }
 }
