@@ -7,6 +7,13 @@ The daemon's canonical structured log is
 `~/.local/state/flotilla/log/flotillad.jsonl` when `XDG_STATE_HOME` is unset.
 Older size-rotated generations use numeric suffixes such as
 `flotillad.jsonl.1` through `flotillad.jsonl.4` with the default configuration.
+
+Stop a running daemon with `flotilla daemon stop`. The command is idempotent
+when no daemon socket exists and asks a live daemon to finish active requests,
+retire peer connections, close its socket, and exit cleanly. Deploy and install
+scripts should use this command before replacing the `flotilla`/`flotillad`
+binary pair; do not use `pkill` for daemon restarts.
+
 For example, show warnings from the peer subsystem with:
 
 ```bash

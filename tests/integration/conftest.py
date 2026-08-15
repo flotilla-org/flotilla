@@ -123,12 +123,12 @@ def start_daemon(service: str, compose_file: str = COMPOSE_FILE):
 
 
 def stop_daemon(service: str, compose_file: str = COMPOSE_FILE):
-    """Stop the recorded flotillad process, if it is still running."""
+    """Gracefully stop the recorded flotillad process, if it is still running."""
     result = docker_exec(
         service,
         "if test -f ~/.config/flotilla/flotillad.pid; then "
         "pid=$(cat ~/.config/flotilla/flotillad.pid); "
-        'kill "$pid" 2>/dev/null || true; '
+        'flotilla daemon stop || exit 1; '
         "for attempt in $(seq 1 50); do "
         'state=$(ps -o stat= -p "$pid" 2>/dev/null || true); '
         "case \"$state\" in ''|Z*) exit 0 ;; esac; sleep 0.1; "

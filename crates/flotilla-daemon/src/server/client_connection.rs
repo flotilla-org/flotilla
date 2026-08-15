@@ -30,6 +30,7 @@ fn event_subscribed(event: &DaemonEvent, subscriptions: &QuerySubscriptions, ses
 
 pub(super) struct ClientConnection {
     daemon: Arc<InProcessDaemon>,
+    shutdown_request_tx: tokio::sync::mpsc::UnboundedSender<()>,
     shutdown_rx: watch::Receiver<bool>,
     remote_command_router: RemoteCommandRouter,
     client_count: Arc<AtomicUsize>,
@@ -40,13 +41,14 @@ pub(super) struct ClientConnection {
 impl ClientConnection {
     pub(super) fn new(
         daemon: Arc<InProcessDaemon>,
+        shutdown_request_tx: tokio::sync::mpsc::UnboundedSender<()>,
         shutdown_rx: watch::Receiver<bool>,
         remote_command_router: RemoteCommandRouter,
         client_count: Arc<AtomicUsize>,
         client_notify: Arc<Notify>,
         agent_state_store: SharedAgentStateStore,
     ) -> Self {
-        Self { daemon, shutdown_rx, remote_command_router, client_count, client_notify, agent_state_store }
+        Self { daemon, shutdown_request_tx, shutdown_rx, remote_command_router, client_count, client_notify, agent_state_store }
     }
 
     /// Run a stateful client session that began with a Hello handshake.
@@ -55,7 +57,7 @@ impl ClientConnection {
     /// the loop starts by awaiting the next message.
     pub(super) async fn run_stateful(self, session: Arc<MessageSession>, client_session_id: uuid::Uuid, surface: SurfaceDeclaration) {
         let (event_task, request_dispatcher, mut shutdown_rx) = self.start_session(&session, client_session_id, surface);
-        request_loop(&session, &request_dispatcher, &mut shutdown_rx).await;
+        request_loop(&session, &request_dispatcher, &self.shutdown_request_tx, &mut shutdown_rx).await;
         self.finish_session(event_task, client_session_id).await;
     }
 
@@ -124,7 +126,12 @@ impl ClientConnection {
 /// Extracted as a free function to avoid borrow conflicts between the
 /// `RequestDispatcher` (which borrows fields of `ClientConnection`) and the
 /// mutable `shutdown_rx` receiver.
-async fn request_loop(session: &Arc<MessageSession>, request_dispatcher: &RequestDispatcher<'_>, shutdown_rx: &mut watch::Receiver<bool>) {
+async fn request_loop(
+    session: &Arc<MessageSession>,
+    request_dispatcher: &RequestDispatcher<'_>,
+    shutdown_request_tx: &tokio::sync::mpsc::UnboundedSender<()>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
     loop {
         tokio::select! {
             message_result = session.read() => {
@@ -132,8 +139,14 @@ async fn request_loop(session: &Arc<MessageSession>, request_dispatcher: &Reques
                     Ok(Some(msg)) => {
                         match msg {
                             Message::Request { id, request } => {
+                                let shutdown_requested = matches!(request, flotilla_protocol::Request::Shutdown);
                                 let response = request_dispatcher.dispatch(id, request).await;
                                 if session.write(response).await.is_err() {
+                                    break;
+                                }
+                                if shutdown_requested {
+                                    info!("graceful shutdown requested by client");
+                                    let _ = shutdown_request_tx.send(());
                                     break;
                                 }
                             }

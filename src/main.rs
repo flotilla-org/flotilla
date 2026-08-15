@@ -74,6 +74,8 @@ fn binary_version() -> &'static str {
 enum SubCommand {
     /// Run the daemon server
     Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonSubCommand>,
         /// Idle timeout in seconds (0 = no timeout)
         #[arg(long, default_value = "300")]
         timeout: u64,
@@ -216,6 +218,12 @@ enum SubCommand {
         #[arg(value_enum)]
         shell: CompletionShell,
     },
+}
+
+#[derive(clap::Subcommand)]
+enum DaemonSubCommand {
+    /// Gracefully stop the running daemon
+    Stop,
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -533,7 +541,8 @@ async fn main() -> Result<()> {
             };
             run_tui(cli, Some(address)).await
         }
-        Some(SubCommand::Daemon { timeout }) => run_daemon(&cli, timeout).await,
+        Some(SubCommand::Daemon { command: Some(DaemonSubCommand::Stop), .. }) => run_daemon_stop(&cli).await,
+        Some(SubCommand::Daemon { command: None, timeout }) => run_daemon(&cli, timeout).await,
         Some(SubCommand::Status) => run_status(&cli, format).await,
         Some(SubCommand::Watch) => run_watch(&cli, format).await,
         Some(SubCommand::Wait { leaves, namespace, fresher_than, timeout }) => {
@@ -881,6 +890,28 @@ async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
             status.code().map(|code| code.to_string()).unwrap_or_else(|| "signal".to_string())
         ))
     }
+}
+
+async fn run_daemon_stop(cli: &Cli) -> Result<()> {
+    let socket_path = cli.socket_path();
+    if !socket_path.exists() {
+        println!("Daemon is not running.");
+        return Ok(());
+    }
+    let daemon = flotilla_tui::socket::SocketDaemon::connect(&socket_path)
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!("cannot connect to daemon at {}: {error}", socket_path.display()))?;
+    daemon.shutdown().await.map_err(|error| color_eyre::eyre::eyre!("could not stop daemon: {error}"))?;
+    drop(daemon);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while socket_path.exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| color_eyre::eyre::eyre!("daemon accepted shutdown but did not exit within 30s"))?;
+    println!("Daemon stopped.");
+    Ok(())
 }
 
 fn resolve_flotillad_binary() -> Result<PathBuf> {
@@ -1941,8 +1972,8 @@ mod tests {
         client_dirs_from, confirm_command, daemon_paths_from, default_project_landing, format_human_resource_value,
         host_daemon_socket_required, provisioning_target_for_environment, replace_host_ids, run_replica_snapshot, select_host_target,
         select_startup_repo_roots, should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from,
-        Cli, CliPaths, CommandValue, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceStatusPatchArgs,
-        ResourceSubCommand, ResourceWatchArgs, SubCommand,
+        Cli, CliPaths, CommandValue, DaemonSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs,
+        ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
 
     #[test]
@@ -2459,6 +2490,15 @@ mod tests {
             .expect("paired overrides should parse")
             .client_paths()
             .is_ok());
+    }
+
+    #[test]
+    fn daemon_stop_is_a_nested_daemon_command() {
+        let cli = Cli::try_parse_from(["flotilla", "daemon", "stop"]).expect("daemon stop should parse");
+        assert!(matches!(cli.command, Some(SubCommand::Daemon { command: Some(DaemonSubCommand::Stop), .. })));
+
+        let foreground = Cli::try_parse_from(["flotilla", "daemon", "--timeout", "0"]).expect("foreground daemon should still parse");
+        assert!(matches!(foreground.command, Some(SubCommand::Daemon { command: None, timeout: 0 })));
     }
 
     #[test]

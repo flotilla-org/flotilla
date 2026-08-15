@@ -581,7 +581,7 @@ impl PeerManager {
             }
             PeerWireMessage::Routed(msg) => self.handle_routed(env.connection_peer, env.connection_generation, msg),
             PeerWireMessage::Goodbye { reason } => match reason {
-                GoodbyeReason::Superseded => {
+                GoodbyeReason::Superseded | GoodbyeReason::Shutdown => {
                     self.reconnect_suppressed_until
                         .insert(env.connection_peer.clone(), Instant::now() + Self::GOODBYE_RECONNECT_SUPPRESSION);
                     HandleResult::ReconnectSuppressed { peer: env.connection_peer }

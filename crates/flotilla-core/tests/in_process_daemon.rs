@@ -55,9 +55,10 @@ use flotilla_resources::{
     CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host as ResourceHost,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, LifecycleAuthority,
     ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy,
-    RegardSource, Repository, RepositoryRelation, RepositorySpec, ResourceBackend, ResourceError, Stance, TypedResolver, WatchEvent,
-    WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
-    REPO_KEY_LABEL, REPO_LABEL,
+    RegardSource, Repository, RepositoryRelation, RepositorySpec, ResourceBackend, ResourceError, SqliteBackend, Stance, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatusPatch, TypedResolver, WatchEvent, WatchStart,
+    WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL,
+    REPO_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::Notify;
@@ -3746,6 +3747,80 @@ async fn daemon_uses_persisted_local_environment_id() {
     let restarted =
         InProcessDaemon::new(vec![repo], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
     assert_eq!(restarted.local_environment_id().as_str(), "test-local-environment-id");
+}
+
+#[tokio::test]
+async fn daemon_restart_preserves_standing_convoy_and_terminal_session() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config = test_config_store(temp.path().join("config"));
+    let database_path = temp.path().join("resources.sqlite");
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&database_path).expect("open resource store"));
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::local(),
+        backend.clone(),
+    )
+    .await;
+
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    convoys
+        .create(
+            &InputMeta::builder().name("standing-convoy".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("standing".to_string()).build(),
+        )
+        .await
+        .expect("create standing convoy");
+    apply_status_patch(&convoys, "standing-convoy", &flotilla_resources::ConvoyStatusPatch::RollUpPhase {
+        phase: ConvoyPhase::Active,
+        started_at: Some(chrono::Utc::now()),
+        finished_at: None,
+    })
+    .await
+    .expect("mark convoy active");
+
+    let terminals = backend.clone().using::<TerminalSession>("flotilla");
+    terminals
+        .create(
+            &InputMeta::builder().name("standing-cleat-session".to_string()).build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("host-direct-test".to_string())
+                .role("coder".to_string())
+                .source(TerminalSessionSource::Tool { command: "cleat attach standing".to_string() })
+                .cwd("/workspace".to_string())
+                .pool("cleat".to_string())
+                .build(),
+        )
+        .await
+        .expect("create terminal session");
+    apply_status_patch(&terminals, "standing-cleat-session", &TerminalSessionStatusPatch::MarkRunning {
+        session_id: "cleat-standing".to_string(),
+        pid: None,
+        started_at: chrono::Utc::now(),
+        crew: None,
+        launch_command: "cleat attach standing".to_string(),
+        delivered_message_id: None,
+    })
+    .await
+    .expect("mark terminal running");
+
+    drop(daemon);
+    drop(convoys);
+    drop(terminals);
+    drop(backend);
+
+    let restarted_backend = ResourceBackend::Sqlite(SqliteBackend::open(&database_path).expect("reopen resource store"));
+    let _restarted =
+        InProcessDaemon::new_with_resource_backend(Vec::new(), config, fake_discovery(false), HostName::local(), restarted_backend.clone())
+            .await;
+
+    let convoy =
+        restarted_backend.clone().using::<ResourceConvoy>("flotilla").get("standing-convoy").await.expect("standing convoy after restart");
+    assert_eq!(convoy.status.expect("convoy status").phase, ConvoyPhase::Active);
+    let terminal =
+        restarted_backend.using::<TerminalSession>("flotilla").get("standing-cleat-session").await.expect("terminal session after restart");
+    assert_eq!(terminal.status.expect("terminal status").phase, TerminalSessionPhase::Running);
 }
 
 #[tokio::test]
