@@ -40,6 +40,17 @@ if require_sha TEST_SHA main >/dev/null 2>&1; then
   exit 1
 fi
 
+fake_flotilla="$(mktemp "${TMPDIR:-/tmp}/fake-flotilla.XXXXXX")"
+printf '#!/bin/sh\nprintf "flotilla 0.1.0 (wire=test, proto=20)\\n"\n' >"$fake_flotilla"
+chmod 0755 "$fake_flotilla"
+test "$(read_protocol_version "$fake_flotilla")" = 20
+printf '#!/bin/sh\nprintf "flotilla 0.1.0 (wire=test)\\n"\n' >"$fake_flotilla"
+if read_protocol_version "$fake_flotilla" >/dev/null 2>&1; then
+  echo 'accepted a binary that did not report its protocol version' >&2
+  exit 1
+fi
+rm -f "$fake_flotilla"
+
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/fleet-candidate-test.XXXXXX")"
 trap 'rm -rf "$test_root"' EXIT
 bundle="$test_root/bundle"
@@ -74,7 +85,7 @@ for path in sorted(bundle.rglob("*")):
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "size_bytes": path.stat().st_size,
         })
-(bundle / "manifest.json").write_text(json.dumps({"platform": target, "files": files}))
+(bundle / "manifest.json").write_text(json.dumps({"platform": target, "peer_protocol_version": 20, "files": files}))
 PY
 "$bundle/install.sh" "$prefix" >/dev/null
 cmp "$bundle/bin/cleat" "$prefix/bin/cleat"

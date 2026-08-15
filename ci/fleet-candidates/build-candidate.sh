@@ -37,6 +37,18 @@ sha256_file() {
   fi
 }
 
+read_protocol_version() {
+  local binary="$1"
+  local version
+  version="$("$binary" --version)"
+  if [[ "$version" =~ proto=([0-9]+) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return
+  fi
+  printf '%s --version did not report a peer protocol version: %s\n' "$binary" "$version" >&2
+  return 1
+}
+
 main() {
 flotilla_sha="$(require_sha FLEET_FLOTILLA_SHA "${FLEET_FLOTILLA_SHA:-}")"
 cleat_sha="$(require_sha FLEET_CLEAT_SHA "${FLEET_CLEAT_SHA:-}")"
@@ -135,12 +147,15 @@ chmod 0755 "$bundle/install.sh"
 wire_generation="${flotilla_sha:0:12}"
 "$bundle/bin/flotilla" --version | grep -F "wire=$wire_generation"
 "$bundle/bin/flotillad" --version | grep -F "wire=$wire_generation"
+protocol_version="$(read_protocol_version "$bundle/bin/flotilla")"
+test "$(read_protocol_version "$bundle/bin/flotillad")" = "$protocol_version"
 "$bundle/bin/cleat" launch --help | grep -q -- --tag
 
 export FLEET_BUNDLE="$bundle"
 export FLEET_PLATFORM="$platform"
 export FLEET_FLOTILLA_SHA="$flotilla_sha"
 export FLEET_CLEAT_SHA="$cleat_sha"
+export FLEET_PROTOCOL_VERSION="$protocol_version"
 python3 - <<'PY'
 import hashlib
 import json
@@ -169,6 +184,7 @@ manifest = {
         "cleat": os.environ["FLEET_CLEAT_SHA"],
     },
     "build_profile": "release",
+    "peer_protocol_version": int(os.environ["FLEET_PROTOCOL_VERSION"]),
     "signed": False,
     "files": files,
 }

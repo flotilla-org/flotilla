@@ -67,7 +67,9 @@ struct Cli {
 
 fn binary_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
-    VERSION.get_or_init(|| format!("{} (wire={})", env!("CARGO_PKG_VERSION"), flotilla_client::BUILD_ID))
+    VERSION.get_or_init(|| {
+        format!("{} (wire={}, proto={})", env!("CARGO_PKG_VERSION"), flotilla_client::BUILD_ID, flotilla_protocol::PROTOCOL_VERSION)
+    })
 }
 
 #[derive(clap::Subcommand)]
