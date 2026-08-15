@@ -53,14 +53,24 @@ impl SpawnLockGuard {
 /// Sends a `Hello` with `ConnectionRole::Client` and a fresh `session_id`,
 /// then waits for the server's Hello reply.
 async fn do_client_hello(session: &MessageSession) -> Result<Option<String>, String> {
-    do_client_hello_with_surface(session, None).await
+    do_client_hello_with_surface(session, None, WireGenerationPolicy::RequireMatch).await
 }
 
 async fn do_client_hello_with_declared_surface(session: &MessageSession, surface: SurfaceDeclaration) -> Result<Option<String>, String> {
-    do_client_hello_with_surface(session, Some(surface)).await
+    do_client_hello_with_surface(session, Some(surface), WireGenerationPolicy::RequireMatch).await
 }
 
-async fn do_client_hello_with_surface(session: &MessageSession, surface: Option<SurfaceDeclaration>) -> Result<Option<String>, String> {
+#[derive(Clone, Copy)]
+enum WireGenerationPolicy {
+    RequireMatch,
+    AllowMismatchForShutdown,
+}
+
+async fn do_client_hello_with_surface(
+    session: &MessageSession,
+    surface: Option<SurfaceDeclaration>,
+    wire_generation_policy: WireGenerationPolicy,
+) -> Result<Option<String>, String> {
     let session_id = uuid::Uuid::new_v4();
     session
         .write(Message::Hello {
@@ -85,7 +95,9 @@ async fn do_client_hello_with_surface(session: &MessageSession, surface: Option<
         }
         Some(Message::Hello { display_name, .. }) => {
             let daemon_generation = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
-            if !flotilla_protocol::wire_generations_match(daemon_generation, BUILD_ID) {
+            if !flotilla_protocol::wire_generations_match(daemon_generation, BUILD_ID)
+                && matches!(wire_generation_policy, WireGenerationPolicy::RequireMatch)
+            {
                 return Err(format!(
                     "wire generation mismatch: client built {} speaks proto {PROTOCOL_VERSION}; daemon built {daemon_generation} speaks \
                      proto {PROTOCOL_VERSION} — rebuild/reinstall the CLI",
@@ -96,6 +108,43 @@ async fn do_client_hello_with_surface(session: &MessageSession, surface: Option<
         }
         Some(other) => Err(format!("expected Hello reply, got: {other:?}")),
         None => Err("connection closed before Hello reply".into()),
+    }
+}
+
+/// Stop an existing daemon through the same-protocol deployment seam.
+///
+/// Normal client sessions still require an identical wire generation. This
+/// path permits a build mismatch only long enough to send the typed shutdown
+/// request and receive its typed acknowledgement. Protocol mismatches remain
+/// rejected by the Hello handshake.
+pub async fn shutdown_existing(socket_path: &Path) -> Result<(), String> {
+    let session = connect_unix_message_session(socket_path).await?;
+    tokio::time::timeout(
+        HELLO_HANDSHAKE_TIMEOUT,
+        do_client_hello_with_surface(&session, None, WireGenerationPolicy::AllowMismatchForShutdown),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "daemon at {} accepted the connection but did not complete the Hello handshake within {}s",
+            socket_path.display(),
+            HELLO_HANDSHAKE_TIMEOUT.as_secs()
+        )
+    })??;
+
+    const REQUEST_ID: u64 = 1;
+    const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+    session.write(Message::Request { id: REQUEST_ID, request: Request::Shutdown }).await?;
+    let response = tokio::time::timeout(SHUTDOWN_ACK_TIMEOUT, session.read())
+        .await
+        .map_err(|_| format!("daemon did not acknowledge shutdown within {}s", SHUTDOWN_ACK_TIMEOUT.as_secs()))??;
+    match response {
+        Some(Message::Response { id: REQUEST_ID, response }) => match into_success_response(*response)? {
+            Response::Shutdown => Ok(()),
+            other => Err(format!("unexpected shutdown response: {other:?}")),
+        },
+        Some(other) => Err(format!("expected shutdown response, got: {other:?}")),
+        None => Err("connection closed before shutdown acknowledgement".into()),
     }
 }
 

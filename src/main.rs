@@ -906,11 +906,9 @@ async fn run_daemon_stop(cli: &Cli) -> Result<()> {
         println!("Daemon is not running.");
         return Ok(());
     }
-    let daemon = flotilla_tui::socket::SocketDaemon::connect(&socket_path)
+    flotilla_tui::socket::shutdown_existing(&socket_path)
         .await
-        .map_err(|error| color_eyre::eyre::eyre!("cannot connect to daemon at {}: {error}", socket_path.display()))?;
-    daemon.shutdown().await.map_err(|error| color_eyre::eyre::eyre!("could not stop daemon: {error}"))?;
-    drop(daemon);
+        .map_err(|error| color_eyre::eyre::eyre!("could not stop daemon at {}: {error}", socket_path.display()))?;
     tokio::time::timeout(Duration::from_secs(30), async {
         while socket_path.exists() {
             tokio::time::sleep(Duration::from_millis(25)).await;
