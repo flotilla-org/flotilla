@@ -5,14 +5,15 @@ use std::{
     sync::Arc,
 };
 
-use chrono::{DateTime, Utc};
+use async_trait::async_trait;
+use chrono::{DateTime, Duration, Utc};
 use flotilla_core::providers::{
     discovery::{EnvVars, EnvironmentBag},
     ChannelLabel, CommandRunner, HttpClient, ReqwestHttpClient,
 };
 use flotilla_resources::{
-    CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Repository,
-    RepositoryKey, ResourceBackend, ResourceError, AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
+    Clock, CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Repository,
+    RepositoryKey, ResourceBackend, ResourceError, SystemClock, AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,72 @@ struct GithubAppTokenRequest {
 #[derive(Deserialize)]
 struct GithubAppTokenResponse {
     token: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct GithubAppToken {
+    value: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+struct GithubAppMintRequest {
+    installation_id: u64,
+    app_id_path: String,
+    private_key_path: String,
+    repositories: Vec<String>,
+}
+
+#[async_trait]
+trait GithubAppTokenMinter: Send + Sync {
+    async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, String>;
+}
+
+struct RealGithubAppTokenMinter {
+    env: Arc<dyn EnvVars>,
+    http: Arc<dyn HttpClient>,
+    clock: Arc<dyn Clock>,
+}
+
+#[async_trait]
+impl GithubAppTokenMinter for RealGithubAppTokenMinter {
+    async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, String> {
+        let app_id = tokio::fs::read_to_string(expand_path(&*self.env, &request.app_id_path))
+            .await
+            .map_err(|error| format!("read host-local App id: {error}"))?;
+        let private_key = tokio::fs::read(expand_path(&*self.env, &request.private_key_path))
+            .await
+            .map_err(|error| format!("read host-local private key: {error}"))?;
+        let now = self.clock.now().timestamp();
+        let claims = GithubAppJwtClaims { iat: now - 60, exp: now + 9 * 60, iss: app_id.trim().to_string() };
+        if claims.iss.is_empty() {
+            return Err("host-local App id is empty".to_string());
+        }
+        let key = EncodingKey::from_rsa_pem(&private_key).map_err(|error| format!("decode host-local private key: {error}"))?;
+        let jwt =
+            jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &key).map_err(|error| format!("sign GitHub App JWT: {error}"))?;
+        let url = format!("https://api.github.com/app/installations/{}/access_tokens", request.installation_id);
+        let http_request = flotilla_resources::tls::client()
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&GithubAppTokenRequest { repositories: request.repositories.clone() })
+            .build()
+            .map_err(|error| format!("build installation token request: {error}"))?;
+        let label = ChannelLabel::http_from_url(&url);
+        let response = self.http.execute(http_request, &label).await.map_err(|error| format!("mint installation token: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("mint installation token: GitHub returned HTTP {}", response.status()));
+        }
+        let response: GithubAppTokenResponse =
+            serde_json::from_slice(response.body()).map_err(|error| format!("decode installation token response: {error}"))?;
+        if response.token.trim().is_empty() {
+            return Err("installation token response was empty".to_string());
+        }
+        Ok(GithubAppToken { value: response.token, expires_at: response.expires_at })
+    }
 }
 
 /// Metadata-only view of the ambient claude credentials file. Deliberately
@@ -61,12 +128,30 @@ pub(crate) struct CredentialStore {
     env: Arc<dyn EnvVars>,
     host_bag: EnvironmentBag,
     host_runner: Arc<dyn CommandRunner>,
-    http: Arc<dyn HttpClient>,
+    clock: Arc<dyn Clock>,
+    github_app_minter: Arc<dyn GithubAppTokenMinter>,
     state_dir: PathBuf,
     prepared: Mutex<BTreeSet<(String, String)>>,
     materials: Mutex<BTreeMap<(String, String), String>>,
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
+    github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
+}
+
+const GITHUB_APP_REFRESH_MARGIN: Duration = Duration::minutes(5);
+
+#[derive(Clone)]
+struct GithubAppDelivery {
+    request: GithubAppMintRequest,
+    runner: Arc<dyn CommandRunner>,
+    token_file: PathBuf,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct ResolvedMaterial {
+    value: String,
+    github_app: Option<(GithubAppMintRequest, DateTime<Utc>)>,
 }
 
 #[derive(Default)]
@@ -107,6 +192,7 @@ struct PendingGitPreflight {
 
 enum GitCredentialPreflight {
     Gh,
+    GithubApp { token_file: String },
     Forgejo { host: String, token_file: String, username: String },
 }
 
@@ -132,6 +218,22 @@ impl GitCredentialPreflight {
                     .map(|_| ())
                     .map_err(|error| format!("Git credential preflight failed: {error}"))
             }
+            Self::GithubApp { token_file } => runner
+                .run(
+                    "sh",
+                    &[
+                        "-c",
+                        "unset GH_TOKEN GITHUB_TOKEN; export GITHUB_TOKEN_FILE=\"$1\" GIT_CONFIG_GLOBAL=\"$2\" GIT_TERMINAL_PROMPT=0; printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill >/dev/null",
+                        "flotilla-github-app-git-preflight",
+                        token_file,
+                        &git_config_path,
+                    ],
+                    Path::new("/"),
+                    &ChannelLabel::Noop,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("Git credential preflight failed: {error}")),
             Self::Forgejo { host, token_file, username } => runner
                 .run(
                     "sh",
@@ -175,18 +277,36 @@ impl CredentialStore {
         http: Arc<dyn HttpClient>,
         state_dir: PathBuf,
     ) -> Self {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let github_app_minter = Arc::new(RealGithubAppTokenMinter { env: Arc::clone(&env), http, clock: Arc::clone(&clock) });
+        Self::new_with_github_app_minter(backend, namespace, env, host_bag, host_runner, clock, github_app_minter, state_dir)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_github_app_minter(
+        backend: ResourceBackend,
+        namespace: &str,
+        env: Arc<dyn EnvVars>,
+        host_bag: EnvironmentBag,
+        host_runner: Arc<dyn CommandRunner>,
+        clock: Arc<dyn Clock>,
+        github_app_minter: Arc<dyn GithubAppTokenMinter>,
+        state_dir: PathBuf,
+    ) -> Self {
         Self {
             backend,
             namespace: namespace.to_string(),
             env,
             host_bag,
             host_runner,
-            http,
+            clock,
+            github_app_minter,
             state_dir,
             prepared: Mutex::new(BTreeSet::new()),
             materials: Mutex::new(BTreeMap::new()),
             git_config_fragments: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
+            github_app_deliveries: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -353,17 +473,17 @@ impl CredentialStore {
             // Issued material is minted once per environment and evicted with
             // that environment. Refreshable material is resolved for every
             // preparation; static material follows the same environment cache.
-            let material = if spec.lifecycle == CredentialLifecycle::Refreshable {
+            let resolved = if spec.lifecycle == CredentialLifecycle::Refreshable {
                 self.resolve_for_adapter(name, spec, credential_scopes.get(name)).await?
             } else if let Some(material) = cached_material {
-                material
+                ResolvedMaterial { value: material, github_app: None }
             } else {
                 let material = self.resolve_for_adapter(name, spec, credential_scopes.get(name)).await?;
-                self.materials.lock().await.insert(cache_key.clone(), material.clone());
+                self.materials.lock().await.insert(cache_key.clone(), material.value.clone());
                 material
             };
             let already_prepared = spec.lifecycle != CredentialLifecycle::Refreshable && self.prepared.lock().await.contains(&cache_key);
-            let material = material.trim_end();
+            let material = resolved.value.trim_end();
             if let Err(error) = validate_scalar_material(name, spec.consumer.adapter_name(), material) {
                 self.materials.lock().await.remove(&cache_key);
                 return Err(error);
@@ -377,6 +497,15 @@ impl CredentialStore {
                     }
                 };
             env.extend(delivered.env);
+            if let Some((request, expires_at)) = resolved.github_app {
+                let paths = delivery_paths.as_ref().expect("GitHub App adapter resolves delivery paths");
+                self.github_app_deliveries.lock().await.insert(cache_key.clone(), GithubAppDelivery {
+                    request,
+                    runner: Arc::clone(&runner),
+                    token_file: github_app_token_file(paths, name),
+                    expires_at,
+                });
+            }
             if let Some(git_credential) = delivered.git_credential {
                 git_config_owner.get_or_insert_with(|| (name.clone(), spec.consumer.adapter_name().to_string(), cache_key.clone()));
                 new_git_config_fragments.insert(name.clone(), git_credential.fragment);
@@ -458,7 +587,7 @@ impl CredentialStore {
                 .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("remove stale writable cache: {error}")))?;
         }
         let material = self.resolve_for_adapter(&name, &spec, None).await?;
-        let material = material.trim_end();
+        let material = material.value.trim_end();
         validate_scalar_material(&name, "docker-registry", material)?;
         let config_dir = self.state_dir.join("credential-runtime").join(format!("{}-{}", safe_component(&name), uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&config_dir)
@@ -501,11 +630,49 @@ impl CredentialStore {
         self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
         self.git_config_fragments.lock().await.remove(environment_ref);
+        self.github_app_deliveries.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
         let config_dir = self.registry_configs.lock().await.remove(environment_ref);
         if let Some(config_dir) = config_dir {
             remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
         }
         Ok(())
+    }
+
+    /// Re-mint and atomically replace GitHub App files that are approaching
+    /// expiry. The daemon calls this from its host-side periodic loop; vessels
+    /// receive only the resulting file and never the App signing material.
+    pub(crate) async fn refresh_due_github_app_tokens(&self) -> Vec<String> {
+        let refresh_before = self.clock.now() + GITHUB_APP_REFRESH_MARGIN;
+        let due = self
+            .github_app_deliveries
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, delivery)| delivery.expires_at <= refresh_before)
+            .map(|(key, delivery)| (key.clone(), delivery.clone()))
+            .collect::<Vec<_>>();
+        let mut errors = Vec::new();
+        for (key, delivery) in due {
+            let token = match self.github_app_minter.mint(&delivery.request).await {
+                Ok(token) => token,
+                Err(error) => {
+                    errors.push(format!("credential `{}` adapter `github-app`: {error}", key.1));
+                    continue;
+                }
+            };
+            if let Err(error) = validate_scalar_material(&key.1, "github-app", token.value.trim_end()) {
+                errors.push(error);
+                continue;
+            }
+            if let Err(error) = write_github_app_token_file(&*delivery.runner, &delivery.token_file, token.value.trim_end()).await {
+                errors.push(bounded_adapter_error(&key.1, "github-app", &error));
+                continue;
+            }
+            if let Some(current) = self.github_app_deliveries.lock().await.get_mut(&key) {
+                current.expires_at = token.expires_at;
+            }
+        }
+        errors
     }
 
     async fn spec(&self, name: &str) -> Result<CredentialSpecSpec, String> {
@@ -563,7 +730,7 @@ impl CredentialStore {
         name: &str,
         spec: &CredentialSpecSpec,
         repository_scope: Option<&BTreeSet<RepositoryKey>>,
-    ) -> Result<String, String> {
+    ) -> Result<ResolvedMaterial, String> {
         let result = match (&spec.consumer, &spec.source) {
             (CredentialConsumer::GithubApp { installation_id }, CredentialSource::GithubApp { app_id_path, private_key_path }) => {
                 if spec.lifecycle != CredentialLifecycle::Refreshable {
@@ -576,55 +743,22 @@ impl CredentialStore {
                 let repository_scope = repository_scope
                     .filter(|scope| !scope.is_empty())
                     .ok_or_else(|| "grant resolved to an empty repository scope".to_string())?;
-                self.mint_github_app_token(*installation_id, app_id_path, private_key_path, repository_scope).await
+                let request = GithubAppMintRequest {
+                    installation_id: *installation_id,
+                    app_id_path: app_id_path.clone(),
+                    private_key_path: private_key_path.clone(),
+                    repositories: self.github_repository_names(repository_scope).await?,
+                };
+                self.github_app_minter
+                    .mint(&request)
+                    .await
+                    .map(|token| ResolvedMaterial { value: token.value, github_app: Some((request, token.expires_at)) })
             }
             (CredentialConsumer::GithubApp { .. }, _) => Err("github-app consumer requires a github-app source".to_string()),
             (_, CredentialSource::GithubApp { .. }) => Err("github-app source requires a github-app consumer".to_string()),
-            _ => self.resolve(name, spec).await,
+            _ => self.resolve(name, spec).await.map(|value| ResolvedMaterial { value, github_app: None }),
         };
         result.map_err(|error| bounded_adapter_error(name, spec.consumer.adapter_name(), &error))
-    }
-
-    async fn mint_github_app_token(
-        &self,
-        installation_id: u64,
-        app_id_path: &str,
-        private_key_path: &str,
-        repository_scope: &BTreeSet<RepositoryKey>,
-    ) -> Result<String, String> {
-        let app_id =
-            tokio::fs::read_to_string(self.expand_path(app_id_path)).await.map_err(|error| format!("read host-local App id: {error}"))?;
-        let private_key =
-            tokio::fs::read(self.expand_path(private_key_path)).await.map_err(|error| format!("read host-local private key: {error}"))?;
-        let now = chrono::Utc::now().timestamp();
-        let claims = GithubAppJwtClaims { iat: now - 60, exp: now + 9 * 60, iss: app_id.trim().to_string() };
-        if claims.iss.is_empty() {
-            return Err("host-local App id is empty".to_string());
-        }
-        let key = EncodingKey::from_rsa_pem(&private_key).map_err(|error| format!("decode host-local private key: {error}"))?;
-        let jwt =
-            jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &key).map_err(|error| format!("sign GitHub App JWT: {error}"))?;
-        let repositories = self.github_repository_names(repository_scope).await?;
-        let url = format!("https://api.github.com/app/installations/{installation_id}/access_tokens");
-        let request = flotilla_resources::tls::client()
-            .post(&url)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(&GithubAppTokenRequest { repositories })
-            .build()
-            .map_err(|error| format!("build installation token request: {error}"))?;
-        let label = ChannelLabel::http_from_url(&url);
-        let response = self.http.execute(request, &label).await.map_err(|error| format!("mint installation token: {error}"))?;
-        if !response.status().is_success() {
-            return Err(format!("mint installation token: GitHub returned HTTP {}", response.status()));
-        }
-        let response: GithubAppTokenResponse =
-            serde_json::from_slice(response.body()).map_err(|error| format!("decode installation token response: {error}"))?;
-        if response.token.trim().is_empty() {
-            return Err("installation token response was empty".to_string());
-        }
-        Ok(response.token)
     }
 
     async fn github_repository_names(&self, repository_scope: &BTreeSet<RepositoryKey>) -> Result<Vec<String>, String> {
@@ -662,9 +796,7 @@ impl CredentialStore {
     }
 
     fn expand_path(&self, path: &str) -> PathBuf {
-        path.strip_prefix("~/")
-            .and_then(|relative| self.env.get("HOME").map(|home| PathBuf::from(home).join(relative)))
-            .unwrap_or_else(|| PathBuf::from(path))
+        expand_path(&*self.env, path)
     }
 
     // The preflight scratch dir must keep the `claude -p` probe blind to
@@ -723,20 +855,58 @@ impl CredentialStore {
                 });
             }
             CredentialConsumer::GithubApp { .. } => {
+                let delivery_paths = delivery_paths.expect("GitHub App adapter resolves delivery paths");
+                let credential_dir = delivery_paths.credential_dir(name);
+                let token_file = github_app_token_file(delivery_paths, name);
+                write_github_app_token_file(&*runner, &token_file, material).await?;
+                let token_file = token_file.to_string_lossy().into_owned();
+                let gh_path = runner
+                    .run("sh", &["-c", "command -v gh"], Path::new("/"), &ChannelLabel::Noop)
+                    .await
+                    .map_err(|error| format!("locate gh binary: {error}"))?;
+                let gh_path = gh_path.trim();
+                if gh_path.is_empty() {
+                    return Err("locate gh binary: command returned an empty path".to_string());
+                }
+                let path = runner
+                    .run("sh", &["-c", "printf '%s' \"$PATH\""], Path::new("/"), &ChannelLabel::Noop)
+                    .await
+                    .map_err(|error| format!("read executable search path: {error}"))?;
+                let gh_wrapper = credential_dir.join("gh");
+                let gh_wrapper_contents = format!(
+                    "#!/bin/sh\nGH_TOKEN=$(cat \"$GITHUB_TOKEN_FILE\") || exit $?\nexport GH_TOKEN\nexec {} \"$@\"\n",
+                    shell_single_quote(gh_path)
+                );
+                write_executable(&*runner, &gh_wrapper, &gh_wrapper_contents, "gh token-file wrapper").await?;
+                let git_helper = credential_dir.join("git-credential-github-app");
+                let git_helper_contents = "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nprotocol=\nhost=\nwhile IFS='=' read -r key value; do\n  case \"$key\" in\n    protocol) protocol=$value ;;\n    host) host=$value ;;\n  esac\ndone\n[ \"$protocol\" = https ] || exit 0\n[ \"$host\" = github.com ] || exit 0\nprintf 'username=x-access-token\\n'\nprintf 'password='\ncat \"$GITHUB_TOKEN_FILE\"\nprintf '\\n'\n";
+                write_executable(&*runner, &git_helper, git_helper_contents, "GitHub App Git credential helper").await?;
+                let gh_wrapper_path = gh_wrapper.to_string_lossy().into_owned();
                 runner
-                    .run_with_input(
+                    .run(
                         "sh",
-                        &["-c", "IFS= read -r token; GH_TOKEN=\"$token\" gh api installation/repositories --silent"],
+                        &[
+                            "-c",
+                            "unset GH_TOKEN GITHUB_TOKEN; GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories --silent",
+                            "flotilla-github-app-preflight",
+                            &token_file,
+                            &gh_wrapper_path,
+                        ],
                         Path::new("/"),
                         &ChannelLabel::Noop,
-                        material.as_bytes(),
                     )
                     .await
                     .map_err(|error| format!("installation authentication preflight failed: {error}"))?;
-                env.insert("GH_TOKEN".to_string(), material.to_string());
+                env.insert("GITHUB_TOKEN_FILE".to_string(), token_file.clone());
+                env.insert("PATH".to_string(), format!("{}:{path}", credential_dir.to_string_lossy()));
                 git_credential = Some(GitCredentialContribution {
-                    fragment: git_credential_fragment(name, "github-app", "https://github.com", "!gh auth git-credential"),
-                    preflight: Some(GitCredentialPreflight::Gh),
+                    fragment: git_credential_fragment(
+                        name,
+                        "github-app",
+                        "https://github.com",
+                        format!("!{}", git_helper.to_string_lossy()),
+                    ),
+                    preflight: Some(GitCredentialPreflight::GithubApp { token_file }),
                 });
             }
             CredentialConsumer::Forgejo { server_url, username } => {
@@ -944,6 +1114,40 @@ fn codex_home_fragment(credential_name: &str, path: impl Into<String>) -> Fragme
     agent_environment_fragment("CODEX_HOME", path, format!("credential/codex {credential_name}"))
 }
 
+fn github_app_token_file(paths: &CredentialDeliveryPaths, credential_name: &str) -> PathBuf {
+    paths.credential_dir(credential_name).join("token")
+}
+
+async fn write_github_app_token_file(runner: &dyn CommandRunner, path: &Path, token: &str) -> Result<(), String> {
+    runner.write_file(path, token).await.map_err(|error| format!("write token file: {error}"))?;
+    let path = path.to_string_lossy();
+    runner
+        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Noop)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("protect token file: {error}"))
+}
+
+async fn write_executable(runner: &dyn CommandRunner, path: &Path, contents: &str, context: &str) -> Result<(), String> {
+    runner.write_file(path, contents).await.map_err(|error| format!("write {context}: {error}"))?;
+    let path = path.to_string_lossy();
+    runner
+        .run("chmod", &["0700", &path], Path::new("/"), &ChannelLabel::Noop)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("protect {context}: {error}"))
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn expand_path(env: &dyn EnvVars, path: &str) -> PathBuf {
+    path.strip_prefix("~/")
+        .and_then(|relative| env.get("HOME").map(|home| PathBuf::from(home).join(relative)))
+        .unwrap_or_else(|| PathBuf::from(path))
+}
+
 async fn api_key_preflight(runner: &dyn CommandRunner, url: &str, headers: &[(&str, &str)]) -> Result<(), String> {
     let mut config = "silent\nshow-error\nfail\n".to_string();
     for (name, value) in headers {
@@ -1021,7 +1225,7 @@ mod tests {
         CommandOutput,
     };
     use flotilla_protocol::NodeId;
-    use flotilla_resources::{CredentialPlacementRequirements, InMemoryBackend, InputMeta, RepositorySpec};
+    use flotilla_resources::{CredentialPlacementRequirements, InMemoryBackend, InputMeta, RepositorySpec, VirtualClock};
 
     use super::*;
 
@@ -1039,6 +1243,19 @@ mod tests {
     impl EnvVars for RotatingTokenEnv {
         fn get(&self, key: &str) -> Option<String> {
             (key == "TEST_CLAUDE_TOKEN").then(|| self.0.lock().expect("rotating token lock").pop_front()).flatten()
+        }
+    }
+
+    struct FakeGithubAppTokenMinter {
+        tokens: StdMutex<VecDeque<GithubAppToken>>,
+        requests: StdMutex<Vec<GithubAppMintRequest>>,
+    }
+
+    #[async_trait]
+    impl GithubAppTokenMinter for FakeGithubAppTokenMinter {
+        async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, String> {
+            self.requests.lock().expect("GitHub App requests lock").push(request.clone());
+            self.tokens.lock().expect("GitHub App tokens lock").pop_front().ok_or_else(|| "no fake token available".to_string())
         }
     }
 
@@ -1061,7 +1278,13 @@ mod tests {
     impl CommandRunner for RecordingRunner {
         async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
             self.calls.lock().expect("calls lock").push((cmd.to_string(), args.iter().map(|arg| (*arg).to_string()).collect(), Vec::new()));
-            Ok(String::new())
+            if cmd == "sh" && args.contains(&"command -v gh") {
+                Ok("/usr/bin/gh\n".to_string())
+            } else if cmd == "sh" && args.contains(&"printf '%s' \"$PATH\"") {
+                Ok("/usr/bin:/bin".to_string())
+            } else {
+                Ok(String::new())
+            }
         }
 
         async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
@@ -1249,19 +1472,114 @@ interactions:
         let first = store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("first preparation");
         let second = store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("second preparation");
 
-        assert!(first.contains(&("GH_TOKEN".to_string(), "installation-token-one".to_string())));
-        assert!(second.contains(&("GH_TOKEN".to_string(), "installation-token-two".to_string())));
+        let first = first.into_iter().collect::<BTreeMap<_, _>>();
+        let second = second.into_iter().collect::<BTreeMap<_, _>>();
+        assert!(!first.contains_key("GH_TOKEN") && !second.contains_key("GH_TOKEN"));
+        assert_eq!(first.get("GITHUB_TOKEN_FILE"), second.get("GITHUB_TOKEN_FILE"));
+        assert_eq!(first.get("PATH"), second.get("PATH"));
+        let writes = runner.writes.lock().expect("writes lock");
+        assert!(writes.iter().any(|(_, contents)| contents.contains("installation-token-one")));
+        assert!(writes.iter().any(|(_, contents)| contents.contains("installation-token-two")));
+        drop(writes);
         let calls = runner.calls.lock().expect("calls lock");
         assert_eq!(
             calls
                 .iter()
                 .filter(|(command, args, _)| {
-                    command == "sh" && args.iter().any(|arg| arg.contains("gh api installation/repositories --silent"))
+                    command == "sh" && args.iter().any(|arg| arg.contains("api installation/repositories --silent"))
                 })
                 .count(),
             2,
         );
         session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn github_app_delivery_rotates_the_file_before_expiry_without_restarting_the_environment() {
+        let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        let clock = Arc::new(VirtualClock::new(now));
+        let minter = Arc::new(FakeGithubAppTokenMinter {
+            tokens: StdMutex::new(VecDeque::from([
+                GithubAppToken { value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) },
+                GithubAppToken { value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) },
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        });
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
+        let repository_key = repository_spec.key();
+        backend
+            .clone()
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name("flotilla".to_string()).build(), &repository_spec)
+            .await
+            .expect("create repository");
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp { installation_id: 9876 },
+                source: CredentialSource::GithubApp {
+                    app_id_path: "/host-only/github-app.id".to_string(),
+                    private_key_path: "/host-only/github-app.pem".to_string(),
+                },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create credential declaration");
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new_with_github_app_minter(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            clock.clone(),
+            minter.clone(),
+            PathBuf::from("/state"),
+        );
+        let refs = BTreeSet::from(["github-app".to_string()]);
+        let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
+
+        let environment = store
+            .prepare_scoped("standing-vessel", &refs, &scopes, runner.clone())
+            .await
+            .expect("prepare standing vessel")
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert!(!environment.contains_key("GH_TOKEN"), "the installation token must not be baked into the vessel environment");
+        let token_file = environment.get("GITHUB_TOKEN_FILE").expect("token file environment variable");
+        assert!(token_file.ends_with("/credentials/github-app/token"));
+        assert_eq!(environment.get("PATH"), Some(&"/state/credentials/github-app:/usr/bin:/bin".to_string()));
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 1);
+
+        clock.advance(Duration::minutes(54));
+        assert!(store.refresh_due_github_app_tokens().await.is_empty());
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 1, "fresh material must not be re-minted");
+
+        clock.advance(Duration::minutes(1));
+        assert!(store.refresh_due_github_app_tokens().await.is_empty());
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 2, "material is re-minted at the refresh margin");
+        let token_writes =
+            runner.writes.lock().expect("writes lock").iter().filter(|(path, _)| path.ends_with("token")).cloned().collect::<Vec<_>>();
+        assert_eq!(token_writes.len(), 2);
+        assert!(token_writes[0].1.contains("installation-token-one"));
+        assert!(token_writes[1].1.contains("installation-token-two"));
+        assert_eq!(token_writes[0].0, token_writes[1].0, "rotation replaces the file observed by the standing vessel");
+        let writes = runner.writes.lock().expect("writes lock");
+        let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
+        assert!(gh_wrapper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
+        let git_helper =
+            writes.iter().find(|(path, _)| path.ends_with("git-credential-github-app")).expect("GitHub App Git credential helper");
+        assert!(git_helper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
+        drop(writes);
+        let calls = runner.calls.lock().expect("calls lock");
+        assert!(calls.iter().any(|(command, args, _)| {
+            command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
+        }));
+        assert!(calls.iter().any(|(command, args, _)| { command == "sh" && args.iter().any(|arg| arg.contains("git credential fill")) }));
     }
 
     #[tokio::test]
