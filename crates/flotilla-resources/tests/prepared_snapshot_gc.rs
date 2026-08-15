@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use flotilla_resources::{
-    reconcile, Convoy, ConvoySpec, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, PreparedSnapshotGarbageCollector,
+    Convoy, ConvoySpec, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, PreparedSnapshotGarbageCollector,
     ResourceBackend, ResourceError, WorkflowTemplate, WorkflowTemplateSpec, PLACEMENT_SNAPSHOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND,
-    PREPARED_SNAPSHOT_LABEL, PREPARED_SNAPSHOT_PENDING_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
+    PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
 };
 
 fn prepared_meta(name: &str, kind: &str) -> InputMeta {
@@ -91,69 +91,4 @@ async fn sweep_removes_unreferenced_legacy_snapshots() {
     let result = PreparedSnapshotGarbageCollector::new(backend, "flotilla").collect(None).await.expect("sweep legacy snapshots");
     assert_eq!(result.workflows_deleted, 1);
     assert_eq!(result.placements_deleted, 1);
-}
-
-#[tokio::test]
-async fn pending_convoy_claim_protects_snapshots_without_bootstrapping_early() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let workflow_name = "workflow-snapshot-012345abcdef";
-    let convoys = backend.clone().using::<Convoy>("flotilla");
-    convoys
-        .create(
-            &InputMeta::builder()
-                .name("preparing".to_string())
-                .annotations(BTreeMap::from([
-                    (WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name.to_string()),
-                    (PREPARED_SNAPSHOT_PENDING_ANNOTATION.to_string(), "true".to_string()),
-                ]))
-                .build(),
-            &ConvoySpec::builder().workflow_ref("logical-workflow".to_string()).build(),
-        )
-        .await
-        .expect("create pending convoy claim");
-    backend
-        .clone()
-        .using::<WorkflowTemplate>("flotilla")
-        .create(&prepared_meta(workflow_name, WORKFLOW_SNAPSHOT_KIND), &WorkflowTemplateSpec::builder().vessels(Vec::new()).build())
-        .await
-        .expect("create prepared workflow");
-
-    let collector = PreparedSnapshotGarbageCollector::new(backend, "flotilla");
-    let result = collector.collect(None).await.expect("collect during preparation");
-    assert_eq!(result.workflows_deleted, 0);
-    let convoy = convoys.get("preparing").await.expect("get pending convoy claim");
-    let outcome = reconcile(&convoy, None, chrono::Utc::now());
-    assert!(outcome.patch.is_none());
-    assert!(outcome.events.is_empty());
-
-    let recovered = collector.recover_pending_claims().await.expect("recover completed pending claim");
-    assert_eq!(recovered.completed, 1);
-    assert_eq!(recovered.discarded, 0);
-    let convoy = convoys.get("preparing").await.expect("get recovered convoy");
-    assert!(!convoy.metadata.annotations.contains_key(PREPARED_SNAPSHOT_PENDING_ANNOTATION));
-}
-
-#[tokio::test]
-async fn recovery_discards_pending_claim_whose_snapshot_was_not_materialized() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let convoys = backend.clone().using::<Convoy>("flotilla");
-    convoys
-        .create(
-            &InputMeta::builder()
-                .name("interrupted".to_string())
-                .annotations(BTreeMap::from([
-                    (WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), "workflow-snapshot-012345abcdef".to_string()),
-                    (PREPARED_SNAPSHOT_PENDING_ANNOTATION.to_string(), "true".to_string()),
-                ]))
-                .build(),
-            &ConvoySpec::builder().workflow_ref("logical-workflow".to_string()).build(),
-        )
-        .await
-        .expect("create interrupted claim");
-
-    let recovered =
-        PreparedSnapshotGarbageCollector::new(backend, "flotilla").recover_pending_claims().await.expect("recover interrupted claim");
-    assert_eq!(recovered.completed, 0);
-    assert_eq!(recovered.discarded, 1);
-    assert!(matches!(convoys.get("interrupted").await, Err(ResourceError::NotFound { .. })));
 }

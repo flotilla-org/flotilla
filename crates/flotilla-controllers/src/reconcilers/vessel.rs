@@ -7,7 +7,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_core::agent_adapter::{
-    append_convoy_work_context, build_crew_brief_with_options, CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefTemplateResolver,
+    append_convoy_work_context, build_crew_brief_with_options, required_agent_adapters, CrewAssignment, CrewBriefMember,
+    CrewBriefTemplateResolver,
 };
 use flotilla_protocol::PlacementDecision;
 use flotilla_resources::{
@@ -313,18 +314,10 @@ impl Reconciler for VesselReconciler {
             Some((vessel_index, requirement)) => (vessel_index, requirement),
             None => return Ok(VesselDeps::failed(format!("vessel {} missing from convoy snapshot", obj.spec.vessel_name))),
         };
-        let capabilities = CapabilityTable::seeded();
-        let mut required_agent_adapters = BTreeSet::new();
-        for process in &requirement.crew {
-            if let CrewSource::Agent { selector, .. } = &process.source {
-                match capabilities.resolve_selector(selector) {
-                    Ok(agent) => {
-                        required_agent_adapters.insert(agent.adapter);
-                    }
-                    Err(message) => return Ok(VesselDeps::failed(message)),
-                }
-            }
-        }
+        let required_adapters = match required_agent_adapters(&requirement.crew) {
+            Ok(adapters) => adapters,
+            Err(message) => return Ok(VesselDeps::failed(message)),
+        };
         let effective_stance = strategy.effective_stance();
         if effective_stance < requirement.stance {
             return Ok(VesselDeps::failed(format!(
@@ -444,7 +437,7 @@ impl Reconciler for VesselReconciler {
                                     host_ref: host_ref.clone(),
                                     image: image.clone(),
                                     declared_agent_adapters: declared_agent_adapters.clone(),
-                                    required_agent_adapters: required_agent_adapters.clone(),
+                                    required_agent_adapters: required_adapters.clone(),
                                     pull_policy: *pull_policy,
                                     mounts: Vec::new(),
                                     env: environment_with_credentials(
@@ -801,7 +794,7 @@ impl Reconciler for VesselReconciler {
                                     host_ref: host_ref.clone(),
                                     image: image.clone(),
                                     declared_agent_adapters: declared_agent_adapters.clone(),
-                                    required_agent_adapters: required_agent_adapters.clone(),
+                                    required_agent_adapters: required_adapters.clone(),
                                     pull_policy: *pull_policy,
                                     mounts,
                                     env: environment_with_credentials(

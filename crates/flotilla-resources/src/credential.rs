@@ -29,7 +29,7 @@ pub struct CredentialSpecSpec {
 pub enum CredentialConsumer {
     Gh,
     GithubApp { installation_id: u64 },
-    Forgejo { api_url: String, username: String },
+    Forgejo { server_url: String, username: String },
     Claude,
     ClaudeOauth { account_email: String },
     Codex,

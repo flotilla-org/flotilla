@@ -57,13 +57,12 @@ pub use clone::{Clone, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use convoy::{
     bound_change_request_record_name, controller_patches, convoy_sanctions_checkout_reclaim, evaluate_landing_settlement,
     expected_change_request_leaves, expected_checkout_refs, external_patches, instantiate_exit, instantiate_turn_delivery,
-    pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending, provisioning_patches, reconcile, select_convoy_children,
-    BoundChangeRequest, Convoy, ConvoyAttention, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec,
-    ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewWorkPhase, CrewWorkState, InputValue, InstantiatedExit,
-    InstantiatedExitEntry, InstantiatedTurnDelivery, IssueSnapshot, PlacementStatus, ReconcileOutcome, SettlementEvaluation,
-    SettlementMode, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung, TurnDeliveryStatus,
-    UnmetSettlementExpectation, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION,
-    PREPARED_SNAPSHOT_PENDING_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
+    pinned_placement_ref, pinned_workflow_ref, provisioning_patches, reconcile, select_convoy_children, BoundChangeRequest, Convoy,
+    ConvoyAttention, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
+    ConvoyStatusPatch, ConvoyTeardownRuntime, CrewWorkPhase, CrewWorkState, InputValue, InstantiatedExit, InstantiatedExitEntry,
+    InstantiatedTurnDelivery, IssueSnapshot, PlacementStatus, ReconcileOutcome, SettlementEvaluation, SettlementMode, TargetMismatch,
+    TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation, WorkCompletionAuthority,
+    WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use convoy_ensure::{ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch};
 pub use credential::{
@@ -103,8 +102,8 @@ pub use placement_policy::{
     HostDirectPlacementPolicySpec, PlacementPolicy, PlacementPolicySpec,
 };
 pub use prepared_snapshot::{
-    content_hash, PreparedSnapshotGarbageCollector, PreparedSnapshotGcResult, PreparedSnapshotRecoveryResult, PLACEMENT_SNAPSHOT_KIND,
-    PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
+    content_hash, PreparedSnapshotGarbageCollector, PreparedSnapshotGcResult, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
+    WORKFLOW_SNAPSHOT_KIND,
 };
 pub use presentation::{Presentation, PresentationPhase, PresentationSpec, PresentationStatus, PresentationStatusPatch};
 pub use principal_attention::{

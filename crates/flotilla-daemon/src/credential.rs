@@ -739,9 +739,9 @@ impl CredentialStore {
                     preflight: Some(GitCredentialPreflight::Gh),
                 });
             }
-            CredentialConsumer::Forgejo { api_url, username } => {
+            CredentialConsumer::Forgejo { server_url, username } => {
                 let delivery_paths = delivery_paths.expect("Forgejo adapter resolves delivery paths");
-                let server_url = api_url.trim_end_matches('/');
+                let server_url = server_url.trim_end_matches('/');
                 let parsed_url = Url::parse(server_url).map_err(|error| format!("invalid Forgejo server URL: {error}"))?;
                 if parsed_url.scheme() != "https" {
                     return Err("Forgejo server URL must use HTTPS".to_string());
@@ -1908,7 +1908,10 @@ interactions:
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("lab-forgejo".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Forgejo { api_url: "https://forgejo.lab".to_string(), username: "flotilla-crew".to_string() },
+                consumer: CredentialConsumer::Forgejo {
+                    server_url: "https://forgejo.lab".to_string(),
+                    username: "flotilla-crew".to_string(),
+                },
                 source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
@@ -1963,12 +1966,12 @@ interactions:
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
     }
 
-    async fn create_forgejo_spec(backend: &ResourceBackend, name: &str, api_url: &str, source_env: &str) {
+    async fn create_forgejo_spec(backend: &ResourceBackend, name: &str, server_url: &str, source_env: &str) {
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name(name.to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Forgejo { api_url: api_url.to_string(), username: "flotilla-crew".to_string() },
+                consumer: CredentialConsumer::Forgejo { server_url: server_url.to_string(), username: "flotilla-crew".to_string() },
                 source: CredentialSource::Env { name: source_env.to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
