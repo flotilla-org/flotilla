@@ -11,8 +11,8 @@ use super::{
 /// to the appropriate per-hop resolver which mutates the `ResolutionContext`:
 /// - `RunCommand`: pushes a `Command` action directly
 /// - `AttachTerminal`: delegates to `TerminalHopResolver`
-/// - `EnterEnvironment`: delegates to `EnvironmentHopResolver` (wrap or enter based on strategy)
-/// - `RemoteToHost`: delegates to `RemoteHopResolver` (wrap or enter based on strategy)
+/// - `EnterEnvironment`: delegates to `EnvironmentHopResolver` to wrap the current actions
+/// - `RemoteToHost`: delegates to `RemoteHopResolver` to wrap the current actions
 pub struct HopResolver {
     pub remote: Arc<dyn RemoteHopResolver>,
     pub environment: Arc<dyn EnvironmentHopResolver>,
