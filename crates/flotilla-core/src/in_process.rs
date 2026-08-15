@@ -46,17 +46,17 @@ use flotilla_resources::{
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
     ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase,
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending,
-    CrewSource, CrewWorkPhase, Demand as ResourceDemand, Environment as ResourceEnvironment, HoldAct, Host as ResourceHost,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta,
-    InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation,
-    Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ReadResourceObject, Repository, RepositoryKey, RepositorySpec,
-    Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState,
-    TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch,
-    TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
-    WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandKind, DemandSpec, Environment as ResourceEnvironment, EnvironmentPhase,
+    HoldAct, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
+    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
+    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ReadResourceObject,
+    Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
+    SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
+    WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -1780,10 +1780,34 @@ pub const DEFAULT_PROVISIONING_NAMESPACE: &str = "flotilla";
 const FLEET_REPLICA_FRESH_SECS: i64 = 90;
 const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 const ENSURE_BACKOFF_RESET_AFTER: ChronoDuration = ChronoDuration::minutes(10);
+const ENSURE_HOLD_ATTENTION_PREFIX: &str = "reclaim-refusal-";
+const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
 
 fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
     let exponent = restart_count.min(5);
     ChronoDuration::seconds((30_i64.saturating_mul(1_i64 << exponent)).min(15 * 60))
+}
+
+/// Verifies the provider backing of a terminal standing convoy before the
+/// ensure controller may reclaim it. Implementations must fail closed: `Ok`
+/// means the backing was positively observed dead, while any live, unknown,
+/// or uninspectable state is an error that holds teardown.
+#[async_trait]
+pub trait StandingConvoyBackingInspector: Send + Sync {
+    async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandingTeardownEvidence {
+    None,
+    BackingVerifiedDead,
+}
+
+#[async_trait]
+impl StandingConvoyBackingInspector for InProcessDaemon {
+    async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
+        self.verify_standing_convoy_resource_backing_dead(convoy).await
+    }
 }
 
 impl InProcessDaemon {
@@ -4121,11 +4145,19 @@ impl InProcessDaemon {
     /// Tests call this directly with an in-memory backend and virtual clock;
     /// the daemon runtime invokes the same pass on its resync cadence.
     pub async fn reconcile_convoy_ensures_once(&self, namespace: &str) -> Result<Vec<String>, String> {
+        self.reconcile_convoy_ensures_once_with_backing_inspector(namespace, self).await
+    }
+
+    pub async fn reconcile_convoy_ensures_once_with_backing_inspector(
+        &self,
+        namespace: &str,
+        backing_inspector: &dyn StandingConvoyBackingInspector,
+    ) -> Result<Vec<String>, String> {
         let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace).list().await.map_err(|e| e.to_string())?;
         let mut changes = Vec::new();
         let mut errors = Vec::new();
         for ensure in ensures {
-            match self.reconcile_convoy_ensure(namespace, &ensure).await {
+            match self.reconcile_convoy_ensure(namespace, &ensure, backing_inspector).await {
                 Ok(Some(change)) => changes.push(change),
                 Ok(None) => {}
                 Err(error) => errors.push(format!("ConvoyEnsure/{}: {error}", ensure.metadata.name)),
@@ -4140,7 +4172,12 @@ impl InProcessDaemon {
         }
     }
 
-    async fn reconcile_convoy_ensure(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<Option<String>, String> {
+    async fn reconcile_convoy_ensure(
+        &self,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
+        backing_inspector: &dyn StandingConvoyBackingInspector,
+    ) -> Result<Option<String>, String> {
         let now = self.clock.now();
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = match convoys.get(&ensure.metadata.name).await {
@@ -4150,12 +4187,13 @@ impl InProcessDaemon {
             Err(error) => return Err(error.to_string()),
         };
         let status = ensure.status.clone().unwrap_or_default();
-        let dead = convoy
+        let terminal = convoy
             .as_ref()
             .and_then(|convoy| convoy.status.as_ref())
             .is_some_and(|status| matches!(status.phase, ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned));
 
-        if convoy.is_some() && !dead {
+        if convoy.is_some() && !terminal {
+            self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
             if status.convoy_ref.as_deref() != Some(&ensure.metadata.name) || status.retry_at.is_some() || status.last_failure.is_some() {
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
                     convoy_ref: ensure.metadata.name.clone(),
@@ -4173,8 +4211,34 @@ impl InProcessDaemon {
             return Ok(None);
         }
 
-        if status.retry_at.is_none() && (dead || status.convoy_ref.is_some()) {
-            let failure = if dead { "ensured convoy entered a terminal failure phase" } else { "ensured convoy was reaped" };
+        if convoy.is_none() {
+            if status.retry_at.is_some_and(|retry_at| retry_at > now) {
+                return Ok(None);
+            }
+            return self.restart_absent_ensured_convoy(namespace, ensure, &status, now).await;
+        }
+
+        let convoy = convoy.expect("terminal branch requires an existing convoy");
+        let operator_forced = convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned);
+        if !operator_forced {
+            if let Err(reason) = backing_inspector.verify_backing_dead(&convoy).await {
+                let failure = format!("standing convoy teardown held: {reason}");
+                self.raise_ensure_attention(&convoy, &failure).await?;
+                if status.retry_at.is_some() || status.last_failure.as_deref() != Some(&failure) {
+                    self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Holding {
+                        convoy_ref: ensure.metadata.name.clone(),
+                        failure,
+                    })
+                    .await?;
+                    return Ok(Some(format!("ConvoyEnsure/{} held for operator attention", ensure.metadata.name)));
+                }
+                return Ok(None);
+            }
+        }
+        self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+
+        if status.retry_at.is_none() {
+            let failure = "ensured convoy entered a terminal failure phase";
             let retry_at = now + ensure_retry_delay(status.restart_count);
             self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::BackingOff {
                 retry_at,
@@ -4188,11 +4252,10 @@ impl InProcessDaemon {
         }
 
         let restart = async {
-            if convoy.is_some() {
-                // A terminal failure cannot self-heal while its checkout gate
-                // remains armed, so restart is the one forced ensure teardown.
-                self.reap_ensured_convoy(namespace, &ensure.metadata.name, true).await?;
-            }
+            // Standing convoys have no landing table, so verified-dead backing
+            // is their automatic reclaim evidence. This still runs the
+            // teardown gate and never uses the operator force bypass.
+            self.reap_ensured_convoy(namespace, &ensure.metadata.name, false, StandingTeardownEvidence::BackingVerifiedDead).await?;
             self.start_ensured_convoy(namespace, ensure).await
         }
         .await;
@@ -4206,17 +4269,104 @@ impl InProcessDaemon {
                 Ok(Some(format!("started Convoy/{}", ensure.metadata.name)))
             }
             Err(error) => {
-                let latest = self.resource_backend.clone().using::<ConvoyEnsure>(namespace).get(&ensure.metadata.name).await.ok();
-                let restart_count =
-                    latest.as_ref().and_then(|value| value.status.as_ref()).map_or(status.restart_count, |s| s.restart_count);
-                let retry_at = now + ensure_retry_delay(restart_count);
-                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::BackingOff {
+                let retry_at = now + ensure_retry_delay(status.restart_count);
+                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Retrying {
                     retry_at,
                     failure: error.clone(),
                 })
                 .await?;
                 Err(format!("start failed; retry at {retry_at}: {error}"))
             }
+        }
+    }
+
+    async fn restart_absent_ensured_convoy(
+        &self,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
+        status: &flotilla_resources::ConvoyEnsureStatus,
+        now: DateTime<Utc>,
+    ) -> Result<Option<String>, String> {
+        match self.start_ensured_convoy(namespace, ensure).await {
+            Ok(()) => {
+                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
+                    convoy_ref: ensure.metadata.name.clone(),
+                    observed_at: now,
+                })
+                .await?;
+                self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+                Ok(Some(format!("started Convoy/{}", ensure.metadata.name)))
+            }
+            Err(error) => {
+                let retry_at = now + ensure_retry_delay(status.restart_count);
+                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Retrying {
+                    retry_at,
+                    failure: error.clone(),
+                })
+                .await?;
+                Err(format!("start failed; retry at {retry_at}: {error}"))
+            }
+        }
+    }
+
+    async fn verify_standing_convoy_resource_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
+        let environments = self
+            .resource_backend
+            .using::<ResourceEnvironment>(&convoy.metadata.namespace)
+            .list()
+            .await
+            .map_err(|error| format!("could not inspect backing environments: {error}"))?
+            .items
+            .into_iter()
+            .filter(|environment| environment.metadata.labels.get(CONVOY_LABEL) == Some(&convoy.metadata.name))
+            .collect::<Vec<_>>();
+        if environments.is_empty() {
+            return Err("no backing environment evidence is available".to_string());
+        }
+        let not_dead = environments
+            .iter()
+            .filter(|environment| environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Failed))
+            .map(|environment| {
+                let phase = environment.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending);
+                format!("Environment/{} is {phase:?}", environment.metadata.name)
+            })
+            .collect::<Vec<_>>();
+        if not_dead.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("backing is not verified dead: {}", not_dead.join(", ")))
+        }
+    }
+
+    async fn raise_ensure_attention(&self, convoy: &ResourceObject<ResourceConvoy>, reason: &str) -> Result<(), String> {
+        let demands = self.resource_backend.clone().using::<ResourceDemand>(&convoy.metadata.namespace);
+        let name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{}", convoy.metadata.name);
+        let target = ResourceRef::new(
+            api_version(ResourceConvoy::API_PATHS),
+            ResourceConvoy::API_PATHS.kind,
+            &convoy.metadata.namespace,
+            &convoy.metadata.name,
+        );
+        let meta = InputMeta::builder()
+            .name(name)
+            .annotations(BTreeMap::from([(RECLAIM_REFUSAL_REASON_ANNOTATION.to_string(), reason.to_string())]))
+            .build();
+        let spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, convoy.spec.dispatching_principal_ref.clone());
+        match demands.create(&meta, &spec).await {
+            Ok(_) => Ok(()),
+            Err(ResourceError::Conflict { .. }) => {
+                let current = demands.get(&meta.name).await.map_err(|error| error.to_string())?;
+                demands.update(&meta, &current.metadata.resource_version, &spec).await.map(|_| ()).map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    async fn clear_ensure_attention(&self, namespace: &str, convoy_name: &str) -> Result<(), String> {
+        let name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{convoy_name}");
+        match self.resource_backend.clone().using::<ResourceDemand>(namespace).delete(&name).await {
+            Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -4294,7 +4444,13 @@ impl InProcessDaemon {
         .await
     }
 
-    async fn reap_ensured_convoy(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
+    async fn reap_ensured_convoy(
+        &self,
+        namespace: &str,
+        name: &str,
+        force: bool,
+        standing_evidence: StandingTeardownEvidence,
+    ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = match convoys.get(name).await {
             Ok(convoy) => convoy,
@@ -4304,11 +4460,23 @@ impl InProcessDaemon {
         if convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).map(String::as_str) != Some(name) {
             return Err(format!("refusing to reap Convoy/{name}: it is not owned by ConvoyEnsure/{name}"));
         }
-        self.reap_convoy_internal(namespace, name, force).await
+        self.reap_convoy_internal_with_standing_evidence(namespace, name, force, standing_evidence).await
     }
 
     async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
-        self.verify_convoy_teardown_gate(namespace, name, force).await?;
+        self.reap_convoy_internal_with_standing_evidence(namespace, name, force, StandingTeardownEvidence::None).await
+    }
+
+    async fn reap_convoy_internal_with_standing_evidence(
+        &self,
+        namespace: &str,
+        name: &str,
+        force: bool,
+        standing_evidence: StandingTeardownEvidence,
+    ) -> Result<(), String> {
+        if standing_evidence == StandingTeardownEvidence::None {
+            self.verify_convoy_teardown_gate(namespace, name, force).await?;
+        }
         self.cascade_convoy_children(namespace, name).await?;
         self.resource_backend.clone().using::<ResourceConvoy>(namespace).delete(name).await.map_err(|error| error.to_string())
     }
@@ -4982,7 +5150,7 @@ impl InProcessDaemon {
             ensure.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
                 && !ensures.contains_key(&ensure.metadata.name)
         }) {
-            self.reap_ensured_convoy(&namespace, &stale.metadata.name, false).await?;
+            self.reap_ensured_convoy(&namespace, &stale.metadata.name, false, StandingTeardownEvidence::None).await?;
             convoy_ensures.delete(&stale.metadata.name).await.map_err(|error| error.to_string())?;
             changes.push(format!("deleted ConvoyEnsure/{}", stale.metadata.name));
         }

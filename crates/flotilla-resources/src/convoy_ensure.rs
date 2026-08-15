@@ -48,6 +48,8 @@ pub struct ConvoyEnsureStatus {
 pub enum ConvoyEnsureStatusPatch {
     Running { convoy_ref: String, observed_at: DateTime<Utc> },
     BackingOff { retry_at: DateTime<Utc>, failure: String },
+    Retrying { retry_at: DateTime<Utc>, failure: String },
+    Holding { convoy_ref: String, failure: String },
     ResetBackoff,
 }
 
@@ -65,6 +67,17 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                 status.restart_count = status.restart_count.saturating_add(1);
                 status.running_since = None;
                 status.retry_at = Some(*retry_at);
+                status.last_failure = Some(failure.clone());
+            }
+            Self::Retrying { retry_at, failure } => {
+                status.running_since = None;
+                status.retry_at = Some(*retry_at);
+                status.last_failure = Some(failure.clone());
+            }
+            Self::Holding { convoy_ref, failure } => {
+                status.convoy_ref = Some(convoy_ref.clone());
+                status.running_since = None;
+                status.retry_at = None;
                 status.last_failure = Some(failure.clone());
             }
             Self::ResetBackoff => status.restart_count = 0,

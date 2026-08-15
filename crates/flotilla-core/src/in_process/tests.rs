@@ -1,14 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use chrono::TimeZone;
 use flotilla_resources::{
-    CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
-    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase,
-    Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Selector,
-    Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    ConvoyEnsureStatus, ConvoyStatus, CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
+    CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
+    CrewWorkPhase, Environment as ResourceEnvironment, EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec,
+    EnvironmentStatus as ResourceEnvironmentStatus, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Selector, Stance, TerminalAttention,
+    TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
-    TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
-    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, VirtualClock, WorkflowTemplateSpec,
+    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -16,6 +18,226 @@ use crate::providers::discovery::test_support::fake_discovery;
 
 fn test_meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
+}
+
+async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<VirtualClock>, tempfile::TempDir) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"standing-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let now = Utc.with_ymd_and_hms(2026, 8, 15, 12, 0, 0).single().expect("timestamp");
+    let clock = Arc::new(VirtualClock::new(now));
+    let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::local(),
+        backend.clone(),
+        clock.clone(),
+    )
+    .await;
+    let repository_spec = RepositorySpec::remote("https://github.com/acme/standing").expect("repository spec");
+    let repository_key = repository_spec.key();
+    backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository_spec).await.expect("repository");
+    backend
+        .definitions::<Project>("flotilla")
+        .create(
+            &test_meta("standing-project"),
+            &ProjectSpec::builder()
+                .display_name("Standing Project".to_string())
+                .default_workflow_ref("quartermaster".to_string())
+                .repositories(vec![ProjectRepositorySpec {
+                    repo: repository_key.clone(),
+                    alias: Some("app".to_string()),
+                    roles: BTreeSet::from([ProjectRepositoryRole::Code]),
+                    subpath: None,
+                    default_branch: Some("main".to_string()),
+                }])
+                .build(),
+        )
+        .await
+        .expect("project");
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &test_meta("quartermaster"),
+            &WorkflowTemplateSpec::builder()
+                .vessels(vec![VesselRequirement::builder()
+                    .name("work".to_string())
+                    .stance(Stance::Trusted)
+                    .repository_refs(vec![repository_key.clone()])
+                    .crew(Vec::new())
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("standing workflow");
+    backend
+        .definitions::<ConvoyEnsure>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("quartermaster".to_string())
+                .annotations(BTreeMap::from([
+                    (MATERIALIZED_PROJECT_ANNOTATION.to_string(), "standing-project".to_string()),
+                    (SOURCE_REPOSITORY_ANNOTATION.to_string(), repository_key.to_string()),
+                    (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
+                    (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), "ops/quartermaster.md".to_string()),
+                ]))
+                .build(),
+            &ConvoyEnsureSpec {
+                project_ref: "standing-project".to_string(),
+                workflow_ref: "quartermaster".to_string(),
+                placement_policy: None,
+                stance: Some(Stance::Trusted),
+                repositories: vec![repository_key],
+                presents_as: Some("fleet".to_string()),
+            },
+        )
+        .await
+        .expect("ensure declaration");
+    (daemon, backend, clock, temp)
+}
+
+#[tokio::test]
+async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts_after_verified_death() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let first = convoys.get("quartermaster").await.expect("standing convoy");
+    let now = clock.now();
+    convoys
+        .update_status(&first.metadata.name, &first.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Failed,
+            message: Some("provider registry unavailable".to_string()),
+            started_at: Some(now),
+            finished_at: Some(now),
+            observed_workflow_ref: Some("quartermaster".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("fail convoy after resolution loss");
+    let environments = backend.using::<ResourceEnvironment>("flotilla");
+    let environment = environments
+        .create(
+            &InputMeta::builder()
+                .name("quartermaster-work".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "quartermaster".to_string())]))
+                .build(),
+            &ResourceEnvironmentSpec {
+                host_direct: None,
+                docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    host_ref: "local".to_string(),
+                    image: "standing:latest".to_string(),
+                    declared_agent_adapters: BTreeSet::new(),
+                    required_agent_adapters: BTreeSet::new(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: BTreeMap::new(),
+                }),
+            },
+        )
+        .await
+        .expect("backing environment");
+    environments
+        .update_status(&environment.metadata.name, &environment.metadata.resource_version, &ResourceEnvironmentStatus {
+            phase: EnvironmentPhase::Ready,
+            ready: true,
+            docker_container_id: Some("live-container".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("mark backing live");
+
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("hold live backing"), vec![
+        "ConvoyEnsure/quartermaster held for operator attention"
+    ]);
+    clock.advance(ChronoDuration::hours(1));
+    assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("continue holding").is_empty());
+    assert!(convoys.get("quartermaster").await.is_ok(), "failed convoy and its live container must survive");
+    let held = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("held ensure");
+    assert_eq!(held.status.as_ref().expect("status").restart_count, 0);
+    assert!(
+        held.status.as_ref().expect("status").last_failure.as_deref().is_some_and(|failure| failure.contains("not verified dead")),
+        "unexpected ensure status: {:?}",
+        held.status
+    );
+    assert_eq!(backend.using::<ResourceDemand>("flotilla").list().await.expect("attention demands").items.len(), 1);
+
+    let environment = environments.get("quartermaster-work").await.expect("backing environment");
+    environments
+        .update_status(&environment.metadata.name, &environment.metadata.resource_version, &ResourceEnvironmentStatus {
+            phase: EnvironmentPhase::Failed,
+            ready: false,
+            message: Some("Docker container live-container is not running".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("verify backing dead");
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("record crash backoff");
+    clock.advance(ChronoDuration::seconds(30));
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart dead backing"), vec!["started Convoy/quartermaster"]);
+    assert_eq!(backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 1);
+}
+
+#[tokio::test]
+async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_retry_survives_restart() {
+    let (daemon, backend, clock, temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
+    let ensures = backend.using::<ConvoyEnsure>("flotilla");
+    let ensure = ensures.get("quartermaster").await.expect("ensure");
+    ensures
+        .update_status(&ensure.metadata.name, &ensure.metadata.resource_version, &ConvoyEnsureStatus {
+            convoy_ref: Some("quartermaster".to_string()),
+            restart_count: 7,
+            running_since: Some(clock.now()),
+            retry_at: None,
+            last_failure: None,
+        })
+        .await
+        .expect("seed crash budget");
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    convoys.delete("quartermaster").await.expect("operator reap");
+
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("prompt resurrection"), vec!["started Convoy/quartermaster"]);
+    assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 7);
+
+    backend.using::<WorkflowTemplate>("flotilla").delete("quartermaster").await.expect("temporary resolution loss");
+    convoys.delete("quartermaster").await.expect("second operator reap");
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("unresolved workflow schedules retry");
+    let retrying = ensures.get("quartermaster").await.expect("retrying ensure");
+    assert_eq!(retrying.status.as_ref().expect("status").restart_count, 7);
+    let retry_at = retrying.status.as_ref().expect("status").retry_at.expect("durable retry time");
+
+    let repository_key = backend.using::<Repository>("flotilla").list().await.expect("repositories").items[0].spec.key();
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &test_meta("quartermaster"),
+            &WorkflowTemplateSpec::builder()
+                .vessels(vec![VesselRequirement::builder()
+                    .name("work".to_string())
+                    .stance(Stance::Trusted)
+                    .repository_refs(vec![repository_key])
+                    .crew(Vec::new())
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("restore workflow resolution");
+    let restarted_daemon = InProcessDaemon::new_with_resource_backend_and_clock(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::local(),
+        backend.clone(),
+        clock.clone(),
+    )
+    .await;
+    assert!(restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("retry not due").is_empty());
+    clock.set(retry_at);
+    assert_eq!(restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("past-due retry"), vec![
+        "started Convoy/quartermaster"
+    ]);
+    assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 7);
 }
 
 #[test]
