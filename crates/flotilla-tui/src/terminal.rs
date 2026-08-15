@@ -58,6 +58,17 @@ pub fn exec_attach_plan(plan: &ResolvedAttachPlan) -> Result<Infallible, String>
     Err(format!("could not exec {program} attach hop: {error}"))
 }
 
+/// Run the single resolved attach command on platforms without process
+/// replacement, then terminate with the command's exit status.
+#[cfg(not(unix))]
+pub fn exec_attach_plan(plan: &ResolvedAttachPlan) -> Result<Infallible, String> {
+    install_panic_hook();
+    restore_terminal();
+    let (program, args) = attach_argv(plan)?;
+    let status = Command::new(&program).args(args).status().map_err(|error| format!("could not start {program} attach hop: {error}"))?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 /// Temporarily leave the TUI to inspect a terminal session, then restore it.
 ///
 /// This deliberately does not stamp Presentation Manager metadata: the pane
