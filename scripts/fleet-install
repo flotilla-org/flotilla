@@ -15,6 +15,7 @@ readonly PLATFORM="linux-x86_64-gnu2.36"
 AUTH_HEADER_FILE=""
 WORK_DIR=""
 READ_ONLY=0
+INSTALL_LOCK_FD=""
 
 die() {
   printf 'fleet-install: %s\n' "$*" >&2
@@ -48,6 +49,12 @@ make_work_dir() {
     mkdir -p "$FLEET_ROOT"
     WORK_DIR="$(mktemp -d "$FLEET_ROOT/.fleet-install.XXXXXX")"
   fi
+}
+
+acquire_install_lock() {
+  mkdir -p "$FLEET_ROOT"
+  exec {INSTALL_LOCK_FD}>"$FLEET_ROOT/.install.lock"
+  flock -n "$INSTALL_LOCK_FD" || die 'another fleet-install mutation is already running'
 }
 
 prepare_auth() {
@@ -360,6 +367,7 @@ switch_to() {
 install_generation() {
   local generation="$1"
   require_generation "$generation"
+  acquire_install_lock
   mkdir -p "$RELEASES_DIR"
   local old="$(current_generation)"
   printf 'fleet-install: %s -> %s\n' "${old:-<none>}" "$generation"
@@ -386,7 +394,7 @@ install_generation() {
   [[ "$actual" == "$expected" ]] || die "archive digest mismatch for $generation: expected $expected, got $actual"
   mkdir -p "$unpack"
   extract_and_verify "$archive" "$unpack" "$outer"
-  mv "$unpack/release" "$RELEASES_DIR/$generation"
+  mv -T "$unpack/release" "$RELEASES_DIR/$generation"
   chmod -R a-w "$RELEASES_DIR/$generation"
   ensure_launchers_and_path
   switch_to "$generation"
@@ -410,6 +418,7 @@ show_status() {
 }
 
 rollback() {
+  acquire_install_lock
   [[ -L "$CURRENT_LINK" ]] || die 'no current generation to roll back'
   [[ -L "$PREVIOUS_LINK" ]] || die 'no previous generation to roll back to'
   local current previous

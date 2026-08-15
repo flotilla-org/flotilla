@@ -32,7 +32,7 @@ make_generation() {
   local bundle="$test_root/bundle-$generation/fleet-candidate-linux-x86_64-gnu2.36"
   mkdir -p "$directory" "$bundle/bin" "$bundle/lib"
   for name in flotilla flotillad cleat; do
-    printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then exit "${STOP_FAIL:-0}"; fi\nprintf "%s from %s\\n"\n' "$name" "$generation" >"$bundle/bin/$name"
+    printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\nprintf "%s from %s\\n"\n' "$name" "$generation" >"$bundle/bin/$name"
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty\n' >"$bundle/lib/libghostty-vt.so.0"
@@ -184,8 +184,9 @@ fi
 grep -Fq 'flotilla daemon stop' "$test_root/daemon.out" || fail 'daemon refusal omitted recovery instruction'
 test "$(basename "$(readlink -f "$test_root/home/.local/opt/flotilla-fleet/current")")" = "$generation_one" || fail 'failed daemon preflight switched current'
 
-run_installer latest >"$test_root/latest.out"
+DAEMON_RUNNING=1 STOP_FAIL=0 run_installer latest >"$test_root/latest.out"
 grep -Fq "$generation_one -> $generation_two" "$test_root/latest.out" || fail 'latest did not print the exact transition'
+grep -Fq 'daemon stop requested' "$test_root/latest.out" || fail 'running daemon was not stopped before switching'
 test "$(basename "$(readlink -f "$test_root/home/.local/opt/flotilla-fleet/current")")" = "$generation_two" || fail 'latest did not select newest promoted generation'
 test "$(basename "$(readlink -f "$test_root/home/.local/opt/flotilla-fleet/previous")")" = "$generation_one" || fail 'switch did not record previous generation'
 
