@@ -65,6 +65,11 @@ struct RealGithubAppTokenMinter {
     clock: Arc<dyn Clock>,
 }
 
+struct GithubAppMinting {
+    clock: Arc<dyn Clock>,
+    minter: Arc<dyn GithubAppTokenMinter>,
+}
+
 #[async_trait]
 impl GithubAppTokenMinter for RealGithubAppTokenMinter {
     async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, String> {
@@ -142,6 +147,7 @@ const GITHUB_APP_REFRESH_MARGIN: Duration = Duration::minutes(5);
 
 #[derive(Clone)]
 struct GithubAppDelivery {
+    generation: uuid::Uuid,
     request: GithubAppMintRequest,
     runner: Arc<dyn CommandRunner>,
     token_file: PathBuf,
@@ -279,18 +285,24 @@ impl CredentialStore {
     ) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let github_app_minter = Arc::new(RealGithubAppTokenMinter { env: Arc::clone(&env), http, clock: Arc::clone(&clock) });
-        Self::new_with_github_app_minter(backend, namespace, env, host_bag, host_runner, clock, github_app_minter, state_dir)
+        Self::new_with_github_app_minter(
+            backend,
+            namespace,
+            env,
+            host_bag,
+            host_runner,
+            GithubAppMinting { clock, minter: github_app_minter },
+            state_dir,
+        )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn new_with_github_app_minter(
         backend: ResourceBackend,
         namespace: &str,
         env: Arc<dyn EnvVars>,
         host_bag: EnvironmentBag,
         host_runner: Arc<dyn CommandRunner>,
-        clock: Arc<dyn Clock>,
-        github_app_minter: Arc<dyn GithubAppTokenMinter>,
+        github_app: GithubAppMinting,
         state_dir: PathBuf,
     ) -> Self {
         Self {
@@ -299,8 +311,8 @@ impl CredentialStore {
             env,
             host_bag,
             host_runner,
-            clock,
-            github_app_minter,
+            clock: github_app.clock,
+            github_app_minter: github_app.minter,
             state_dir,
             prepared: Mutex::new(BTreeSet::new()),
             materials: Mutex::new(BTreeMap::new()),
@@ -488,6 +500,8 @@ impl CredentialStore {
                 self.materials.lock().await.remove(&cache_key);
                 return Err(error);
             }
+            let mut github_app_deliveries =
+                if resolved.github_app.is_some() { Some(self.github_app_deliveries.lock().await) } else { None };
             let delivered =
                 match self.prepare_adapter(name, spec, material, Arc::clone(&runner), already_prepared, delivery_paths.as_ref()).await {
                     Ok(delivered) => delivered,
@@ -499,12 +513,16 @@ impl CredentialStore {
             env.extend(delivered.env);
             if let Some((request, expires_at)) = resolved.github_app {
                 let paths = delivery_paths.as_ref().expect("GitHub App adapter resolves delivery paths");
-                self.github_app_deliveries.lock().await.insert(cache_key.clone(), GithubAppDelivery {
-                    request,
-                    runner: Arc::clone(&runner),
-                    token_file: github_app_token_file(paths, name),
-                    expires_at,
-                });
+                github_app_deliveries.as_mut().expect("GitHub App delivery holds the write lock").insert(
+                    cache_key.clone(),
+                    GithubAppDelivery {
+                        generation: uuid::Uuid::new_v4(),
+                        request,
+                        runner: Arc::clone(&runner),
+                        token_file: github_app_token_file(paths, name),
+                        expires_at,
+                    },
+                );
             }
             if let Some(git_credential) = delivered.git_credential {
                 git_config_owner.get_or_insert_with(|| (name.clone(), spec.consumer.adapter_name().to_string(), cache_key.clone()));
@@ -664,13 +682,15 @@ impl CredentialStore {
                 errors.push(error);
                 continue;
             }
-            if let Err(error) = write_github_app_token_file(&*delivery.runner, &delivery.token_file, token.value.trim_end()).await {
+            let mut deliveries = self.github_app_deliveries.lock().await;
+            let Some(current) = deliveries.get_mut(&key).filter(|current| current.generation == delivery.generation) else {
+                continue;
+            };
+            if let Err(error) = write_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
                 errors.push(bounded_adapter_error(&key.1, "github-app", &error));
                 continue;
             }
-            if let Some(current) = self.github_app_deliveries.lock().await.get_mut(&key) {
-                current.expires_at = token.expires_at;
-            }
+            current.expires_at = token.expires_at;
         }
         errors
     }
@@ -1216,7 +1236,13 @@ fn validate_scalar_material(name: &str, adapter: &str, material: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Mutex as StdMutex};
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex as StdMutex,
+        },
+    };
 
     use async_trait::async_trait;
     use flotilla_core::providers::{
@@ -1249,6 +1275,29 @@ mod tests {
     struct FakeGithubAppTokenMinter {
         tokens: StdMutex<VecDeque<GithubAppToken>>,
         requests: StdMutex<Vec<GithubAppMintRequest>>,
+    }
+
+    struct BlockingGithubAppTokenMinter {
+        now: DateTime<Utc>,
+        calls: AtomicUsize,
+        refresh_started: tokio::sync::Notify,
+        release_refresh: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl GithubAppTokenMinter for BlockingGithubAppTokenMinter {
+        async fn mint(&self, _request: &GithubAppMintRequest) -> Result<GithubAppToken, String> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(GithubAppToken { value: "initial-token".to_string(), expires_at: self.now + Duration::hours(1) }),
+                1 => {
+                    self.refresh_started.notify_one();
+                    self.release_refresh.notified().await;
+                    Ok(GithubAppToken { value: "stale-refresh-token".to_string(), expires_at: self.now + Duration::hours(2) })
+                }
+                2 => Ok(GithubAppToken { value: "reprepared-token".to_string(), expires_at: self.now + Duration::hours(2) }),
+                call => Err(format!("unexpected mint call {call}")),
+            }
+        }
     }
 
     #[async_trait]
@@ -1535,8 +1584,7 @@ interactions:
             Arc::new(TestEnv::default()),
             EnvironmentBag::new(),
             runner.clone(),
-            clock.clone(),
-            minter.clone(),
+            GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
             PathBuf::from("/state"),
         );
         let refs = BTreeSet::from(["github-app".to_string()]);
@@ -1580,6 +1628,66 @@ interactions:
             command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
         }));
         assert!(calls.iter().any(|(command, args, _)| { command == "sh" && args.iter().any(|arg| arg.contains("git credential fill")) }));
+    }
+
+    #[tokio::test]
+    async fn stale_in_flight_refresh_cannot_overwrite_a_reprepared_delivery() {
+        let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        let clock = Arc::new(VirtualClock::new(now));
+        let minter = Arc::new(BlockingGithubAppTokenMinter {
+            now,
+            calls: AtomicUsize::new(0),
+            refresh_started: tokio::sync::Notify::new(),
+            release_refresh: tokio::sync::Notify::new(),
+        });
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
+        let repository_key = repository_spec.key();
+        backend
+            .clone()
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name("flotilla".to_string()).build(), &repository_spec)
+            .await
+            .expect("create repository");
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp { installation_id: 9876 },
+                source: CredentialSource::GithubApp {
+                    app_id_path: "/host-only/github-app.id".to_string(),
+                    private_key_path: "/host-only/github-app.pem".to_string(),
+                },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create credential declaration");
+        let runner = Arc::new(RecordingRunner::default());
+        let store = Arc::new(CredentialStore::new_with_github_app_minter(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
+            PathBuf::from("/state"),
+        ));
+        let refs = BTreeSet::from(["github-app".to_string()]);
+        let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
+        store.prepare_scoped("standing-vessel", &refs, &scopes, runner.clone()).await.expect("initial preparation");
+        clock.advance(Duration::minutes(55));
+
+        let refresh_store = Arc::clone(&store);
+        let refresh = tokio::spawn(async move { refresh_store.refresh_due_github_app_tokens().await });
+        minter.refresh_started.notified().await;
+        store.prepare_scoped("standing-vessel", &refs, &scopes, runner.clone()).await.expect("replacement preparation");
+        minter.release_refresh.notify_one();
+        assert!(refresh.await.expect("refresh task").is_empty());
+
+        let token_writes =
+            runner.writes.lock().expect("writes lock").iter().filter(|(path, _)| path.ends_with("token")).cloned().collect::<Vec<_>>();
+        assert_eq!(token_writes.iter().map(|(_, token)| token.as_str()).collect::<Vec<_>>(), ["initial-token", "reprepared-token"]);
     }
 
     #[tokio::test]
