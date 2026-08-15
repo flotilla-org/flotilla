@@ -1034,6 +1034,14 @@ mod tests {
         }
     }
 
+    struct RotatingTokenEnv(StdMutex<VecDeque<String>>);
+
+    impl EnvVars for RotatingTokenEnv {
+        fn get(&self, key: &str) -> Option<String> {
+            (key == "TEST_CLAUDE_TOKEN").then(|| self.0.lock().expect("rotating token lock").pop_front()).flatten()
+        }
+    }
+
     type RecordedCall = (String, Vec<String>, Vec<u8>);
 
     #[derive(Default)]
@@ -1564,6 +1572,48 @@ interactions:
             .await
             .expect_err("ANTHROPIC_API_KEY outranks CLAUDE_CODE_OAUTH_TOKEN, so mixing them would silently drop the OAuth identity");
         assert!(error.contains("multiple granted credentials use this adapter"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn rotating_named_claude_oauth_material_reuses_the_stable_config_directory() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("claude-max".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
+                source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create refreshable Claude credential declaration");
+        let env = Arc::new(RotatingTokenEnv(StdMutex::new(VecDeque::from([
+            "token-before-rotation".to_string(),
+            "token-after-rotation".to_string(),
+        ]))));
+        let runner = Arc::new(RecordingRunner::default());
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/bin/claude"));
+        let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
+        let credential_refs = BTreeSet::from(["claude-max".to_string()]);
+
+        let before: BTreeMap<_, _> =
+            store.prepare("env-a", &credential_refs, runner.clone()).await.expect("prepare before rotation").into_iter().collect();
+        let after: BTreeMap<_, _> =
+            store.prepare("env-a", &credential_refs, runner.clone()).await.expect("prepare after rotation").into_iter().collect();
+
+        assert_eq!(before.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-before-rotation".to_string()));
+        assert_eq!(after.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&"token-after-rotation".to_string()));
+        assert_eq!(before.get("CLAUDE_CONFIG_DIR"), after.get("CLAUDE_CONFIG_DIR"));
+        assert_eq!(after.get("CLAUDE_CONFIG_DIR"), Some(&"/tmp/flotilla-test-state/credentials/claude-max/claude".to_string()));
+        let calls = runner.calls.lock().expect("calls lock");
+        assert!(calls.iter().all(|(command, args, _)| {
+            command != "rm" || args == &["-rf".to_string(), "/tmp/flotilla-test-state/credentials/claude-max/claude-preflight".to_string()]
+        }));
+        assert!(calls
+            .iter()
+            .flat_map(|(_, args, _)| args)
+            .all(|arg| !arg.contains("token-before-rotation") && !arg.contains("token-after-rotation")));
     }
 
     struct DeadTokenRunner {

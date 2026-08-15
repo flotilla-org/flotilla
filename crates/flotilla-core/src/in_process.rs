@@ -3571,6 +3571,16 @@ async fn validate_workflow_credentials(
     workflow: &WorkflowTemplateSpec,
     placement: Option<&ResourceObject<PlacementPolicy>>,
 ) -> Result<(), String> {
+    validate_workflow_credentials_with_capabilities(backend, namespace, workflow, placement, &CapabilityTable::seeded()).await
+}
+
+async fn validate_workflow_credentials_with_capabilities(
+    backend: &ResourceBackend,
+    namespace: &str,
+    workflow: &WorkflowTemplateSpec,
+    placement: Option<&ResourceObject<PlacementPolicy>>,
+    capabilities: &CapabilityTable,
+) -> Result<(), String> {
     let specs = backend
         .clone()
         .definitions::<CredentialSpec>(namespace)
@@ -3580,7 +3590,6 @@ async fn validate_workflow_credentials(
         .into_iter()
         .map(|spec| (spec.metadata.name, spec.spec.consumer))
         .collect::<BTreeMap<_, _>>();
-    let capabilities = CapabilityTable::seeded();
     for vessel in &workflow.vessels {
         for crew in &vessel.crew {
             let CrewSource::Agent { selector, .. } = &crew.source else {
@@ -3613,7 +3622,7 @@ async fn validate_workflow_credentials(
     }
 
     let required = workflow.vessels.iter().flat_map(|vessel| vessel.credential_refs.iter().cloned()).collect::<BTreeSet<_>>();
-    let ambient_dependent_vessels = ambient_credential_dependent_vessels(&capabilities, &specs, workflow)?;
+    let ambient_dependent_vessels = ambient_credential_dependent_vessels(capabilities, &specs, workflow)?;
     if required.is_empty() && ambient_dependent_vessels.is_empty() {
         return Ok(());
     }
@@ -3685,6 +3694,8 @@ async fn validate_workflow_credentials(
 /// ambient-capable adapter and no granted credential covering that adapter's
 /// delivery slot. Returns `(vessel name, ambient scope)` pairs, the scope
 /// being the entry name under the Host `credential_expiry` capability.
+/// The seeded adapters currently pair ambient Claude scope with a delivery
+/// slot, so this is forward-provisioned for an ambient-only adapter.
 fn ambient_credential_dependent_vessels<'workflow>(
     capabilities: &CapabilityTable,
     specs: &BTreeMap<String, CredentialConsumer>,

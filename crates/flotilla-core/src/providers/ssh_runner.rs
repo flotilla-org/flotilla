@@ -1,4 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -7,6 +10,26 @@ use crate::providers::{
     atomic_write_script, helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner,
     FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
+
+const REMOTE_WRITABLE_BASE_SCRIPT: &str = "if [ -n \"${XDG_RUNTIME_DIR:-}\" ] \
+                                               && [ -d \"$XDG_RUNTIME_DIR\" ] \
+                                               && [ -w \"$XDG_RUNTIME_DIR\" ] \
+                                               && mkdir -p \"$XDG_RUNTIME_DIR/flotilla\"; then \
+                                               base=$XDG_RUNTIME_DIR/flotilla; \
+                                           elif [ -n \"${XDG_STATE_HOME:-}\" ] \
+                                               && mkdir -p \"$XDG_STATE_HOME/flotilla\" 2>/dev/null \
+                                               && [ -d \"$XDG_STATE_HOME/flotilla\" ] \
+                                               && [ -w \"$XDG_STATE_HOME/flotilla\" ]; then \
+                                               base=$XDG_STATE_HOME/flotilla; \
+                                           elif [ -n \"${HOME:-}\" ] \
+                                               && mkdir -p \"$HOME/.local/state/flotilla\" 2>/dev/null \
+                                               && [ -d \"$HOME/.local/state/flotilla\" ] \
+                                               && [ -w \"$HOME/.local/state/flotilla\" ]; then \
+                                               base=$HOME/.local/state/flotilla; \
+                                           else \
+                                               exit 1; \
+                                           fi; \
+                                           printf '%s' \"$base\"";
 
 /// Command runner that executes commands on a remote host over SSH.
 ///
@@ -55,6 +78,18 @@ impl SshCommandRunner {
         let ssh_args = self.ssh_shell_args(&script);
         self.runner.run("ssh", &ssh_args, Path::new("/"), label).await
     }
+
+    async fn writable_base(&self, purpose: &str) -> Result<PathBuf, String> {
+        let base = self
+            .run("sh", &["-c", REMOTE_WRITABLE_BASE_SCRIPT, purpose], Path::new("/"), &ChannelLabel::Noop)
+            .await
+            .map_err(|error| format!("find writable directory on SSH host: {error}"))?;
+        let base = base.trim();
+        if base.is_empty() {
+            return Err("find writable directory on SSH host: probe returned an empty path".to_string());
+        }
+        Ok(PathBuf::from(base))
+    }
 }
 
 #[async_trait]
@@ -77,6 +112,14 @@ impl CommandRunner for SshCommandRunner {
 
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
         self.execute(cmd, args, Path::new("/"), &ChannelLabel::Noop).await.is_ok()
+    }
+
+    async fn writable_scratch_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
+        self.writable_base("flotilla-ssh-scratch-base").await
+    }
+
+    async fn writable_config_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
+        self.writable_base("flotilla-ssh-config-base").await
     }
 
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
@@ -109,8 +152,8 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::SshCommandRunner;
-    use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
+    use super::{SshCommandRunner, REMOTE_WRITABLE_BASE_SCRIPT};
+    use crate::providers::{ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
 
     struct RecordingRunner {
         calls: Mutex<Vec<(String, Vec<String>, PathBuf)>>,
@@ -261,6 +304,86 @@ mod tests {
         assert_eq!(args[4], "sh");
         assert_eq!(args[5], "-lc");
         assert_eq!(args[6], "cd '/' && exec 'cleat' '--version'");
+    }
+
+    #[tokio::test]
+    async fn writable_bases_are_derived_from_the_remote_environment() {
+        let inner = std::sync::Arc::new(RecordingRunner::with_run_results(vec![
+            Ok("/remote/runtime/flotilla".into()),
+            Ok("/remote/runtime/flotilla".into()),
+        ]));
+        let runner = SshCommandRunner::new("alice@feta.local", false, inner.clone());
+
+        let scratch =
+            runner.writable_scratch_base(Some(Path::new("/local/runtime")), Path::new("/local/state")).await.expect("remote scratch base");
+        let config =
+            runner.writable_config_base(Some(Path::new("/local/runtime")), Path::new("/local/state")).await.expect("remote config base");
+
+        assert_eq!(scratch, Path::new("/remote/runtime/flotilla"));
+        assert_eq!(config, Path::new("/remote/runtime/flotilla"));
+        let calls = inner.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains("/local/runtime") && !arg.contains("/local/state")));
+        assert!(calls.iter().all(|(_, args, _)| {
+            let script = args.last().expect("remote execution script");
+            script.contains("XDG_RUNTIME_DIR") && script.contains("XDG_STATE_HOME") && script.contains("HOME")
+        }));
+    }
+
+    #[tokio::test]
+    async fn unusable_remote_state_home_falls_through_to_home() {
+        let home = tempfile::tempdir().expect("remote home");
+        let home_assignment = format!("HOME={}", home.path().display());
+
+        let base = ProcessCommandRunner
+            .run(
+                "env",
+                &[
+                    "-u",
+                    "XDG_RUNTIME_DIR",
+                    "XDG_STATE_HOME=/proc/flotilla-unwritable",
+                    &home_assignment,
+                    "sh",
+                    "-c",
+                    REMOTE_WRITABLE_BASE_SCRIPT,
+                    "flotilla-ssh-config-base",
+                ],
+                Path::new("/"),
+                &ChannelLabel::Noop,
+            )
+            .await
+            .expect("fall through unusable XDG state home");
+
+        assert_eq!(Path::new(base.trim()), home.path().join(".local/state/flotilla"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires batch-mode SSH access to localhost"]
+    async fn writable_bases_resolve_in_a_real_ssh_environment() {
+        let runner = SshCommandRunner::new("localhost", false, std::sync::Arc::new(ProcessCommandRunner));
+
+        let remote_base = runner
+            .writable_scratch_base(Some(Path::new("/daemon-only/runtime")), Path::new("/daemon-only/state"))
+            .await
+            .expect("resolve scratch base over real SSH");
+        let config_base = runner
+            .writable_config_base(Some(Path::new("/daemon-only/runtime")), Path::new("/daemon-only/state"))
+            .await
+            .expect("resolve config base over real SSH");
+
+        assert_eq!(config_base, remote_base);
+        assert!(remote_base.is_absolute());
+        assert!(!remote_base.starts_with("/daemon-only"));
+        eprintln!("real SSH writable base: {}", remote_base.display());
+        runner
+            .run(
+                "test",
+                &["-d", &remote_base.to_string_lossy(), "-a", "-w", &remote_base.to_string_lossy()],
+                Path::new("/"),
+                &ChannelLabel::Noop,
+            )
+            .await
+            .expect("selected remote base is writable");
     }
 
     #[tokio::test]
