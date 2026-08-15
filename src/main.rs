@@ -599,7 +599,9 @@ async fn main() -> Result<()> {
         let already_reexecuted = std::env::var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV).ok();
         if should_reexec_for_incompatible_daemon(&message, already_reexecuted.as_deref()) {
             std::env::set_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV, flotilla_tui::socket::BUILD_ID);
-            reexec_current_process()?;
+            if let Err(reexec_error) = reexec_current_process() {
+                return Err(color_eyre::eyre::eyre!(incompatible_daemon_reexec_failure(&message, &reexec_error)));
+            }
         }
     }
     result
@@ -607,6 +609,10 @@ async fn main() -> Result<()> {
 
 fn should_reexec_for_incompatible_daemon(error: &str, already_reexecuted_build: Option<&str>) -> bool {
     flotilla_tui::socket::reconnect::is_incompatible_daemon_error(error) && already_reexecuted_build != Some(flotilla_tui::socket::BUILD_ID)
+}
+
+fn incompatible_daemon_reexec_failure(incompatibility: &str, reexec_error: &dyn std::fmt::Display) -> String {
+    format!("{incompatibility}; re-exec could not reach a matching build: {reexec_error}")
 }
 
 fn reexec_current_process() -> Result<()> {
@@ -1972,10 +1978,11 @@ mod tests {
 
     use super::{
         client_dirs_from, confirm_command, daemon_paths_from, default_project_landing, format_human_resource_value,
-        host_daemon_socket_required, provisioning_target_for_environment, replace_host_ids, run_replica_snapshot, select_host_target,
-        select_startup_repo_roots, should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from,
-        Cli, CliPaths, CommandValue, DaemonSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs,
-        ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
+        host_daemon_socket_required, incompatible_daemon_reexec_failure, provisioning_target_for_environment, replace_host_ids,
+        run_replica_snapshot, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
+        should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, Cli, CliPaths, CommandValue, DaemonSubCommand,
+        ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceStatusPatchArgs, ResourceSubCommand,
+        ResourceWatchArgs, SubCommand,
     };
 
     #[test]
@@ -2059,6 +2066,17 @@ mod tests {
         assert!(should_reexec_for_incompatible_daemon(mismatch, None));
         assert!(!should_reexec_for_incompatible_daemon(mismatch, Some(flotilla_tui::socket::BUILD_ID)));
         assert!(!should_reexec_for_incompatible_daemon("daemon unavailable", None));
+    }
+
+    #[test]
+    fn failed_incompatible_daemon_reexec_names_both_builds_and_protocols() {
+        let mismatch = "daemon protocol version mismatch: client built cli-old speaks proto 19; daemon built daemon-new speaks proto 20";
+
+        let message = incompatible_daemon_reexec_failure(mismatch, &std::io::Error::from_raw_os_error(libc::ENOENT));
+
+        assert!(message.contains("client built cli-old speaks proto 19"), "{message}");
+        assert!(message.contains("daemon built daemon-new speaks proto 20"), "{message}");
+        assert!(message.contains("re-exec could not reach a matching build"), "{message}");
     }
 
     #[test]

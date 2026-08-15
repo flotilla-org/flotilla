@@ -563,7 +563,7 @@ fn parse_remote_socket_path(stdout: &[u8]) -> Result<PathBuf, String> {
 
 fn remote_socket_path_command() -> String {
     format!(
-        "path=$(cat \"$HOME/.config/flotilla/{DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH}\") || exit; printf '{REMOTE_SOCKET_PATH_PREFIX}%s\\n' \"$path\""
+        "discovery=\"$HOME/.config/flotilla/{DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH}\"; path=$(cat \"$discovery\") || exit; case \"$path\" in /*) ;; *) path=\"$(dirname \"$discovery\")/$path\" ;; esac; printf '{REMOTE_SOCKET_PATH_PREFIX}%s\\n' \"$path\""
     )
 }
 
@@ -800,6 +800,7 @@ mod tests {
     fn remote_socket_path_command_uses_shared_discovery_contract() {
         let command = remote_socket_path_command();
         assert!(command.contains("$HOME/.config/flotilla/run/socket-path"));
+        assert!(command.contains("dirname"), "relative advertisements must be resolved beside the discovery file: {command}");
         assert!(command.contains(REMOTE_SOCKET_PATH_PREFIX));
     }
 

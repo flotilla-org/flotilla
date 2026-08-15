@@ -100,6 +100,18 @@ fn daemon_publishes_its_actual_socket_path_for_remote_dialers() {
     assert_eq!(std::fs::read_dir(tmp.path().join("config/run")).expect("read discovery directory").count(), 1);
 }
 
+#[test]
+fn daemon_publishes_a_container_portable_socket_path_when_it_shares_the_discovery_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let run_directory = tmp.path().join("config/run");
+    let discovery_path = run_directory.join("socket-path");
+    let socket_path = run_directory.join("flotilla.sock");
+
+    publish_socket_path(&discovery_path, &socket_path).expect("publish socket path");
+
+    assert_eq!(std::fs::read_to_string(discovery_path).expect("read discovery file"), "flotilla.sock\n");
+}
+
 #[tokio::test]
 async fn daemon_discovery_path_is_independent_of_its_config_and_socket_paths() {
     let tmp = tempfile::tempdir().expect("tempdir");
