@@ -69,6 +69,7 @@ use crate::{
 /// wedge can hide in.
 const LIVENESS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 const MANIFEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+const ENVIRONMENT_ADOPTION_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 const BUILTIN_MANAGED_BY_VALUE: &str = "builtin";
@@ -744,52 +745,98 @@ async fn reconcile_provisioned_environments(state: &Arc<ControllerRuntimeState>,
         handles.insert((handle.id().clone(), container_id), handle);
     }
 
-    for environment in environments {
-        let spec = environment.spec.docker.as_ref().expect("candidate filtering requires a local Docker spec");
+    let reconciliations = environments.into_iter().map(|environment| {
         let env_id = EnvironmentId::new(environment.metadata.name.clone());
-        let Some(container_id) = environment.status.as_ref().and_then(|status| status.docker_container_id.clone()) else {
-            fail_unavailable_environment(state, namespace, &env_id, "ready Docker environment has no container identity").await?;
-            continue;
-        };
-        let Some(handle) = handles.remove(&(env_id.clone(), container_id.clone())) else {
-            fail_unavailable_environment(state, namespace, &env_id, &format!("Docker container {container_id} is not running")).await?;
-            continue;
-        };
-        match handle.status().await {
-            Ok(flotilla_protocol::EnvironmentStatus::Running) => {}
-            Ok(status) => {
-                fail_unavailable_environment(
-                    state,
-                    namespace,
-                    &env_id,
-                    &format!("Docker container {container_id} is not running (status: {status:?})"),
-                )
-                .await?;
-                continue;
-            }
-            Err(error) => {
-                fail_unavailable_environment(
-                    state,
-                    namespace,
-                    &env_id,
-                    &format!("Docker container {container_id} liveness check failed: {error}"),
-                )
-                .await?;
-                continue;
+        let container_id = environment.status.as_ref().and_then(|status| status.docker_container_id.clone());
+        let handle = container_id.as_ref().and_then(|container_id| handles.remove(&(env_id.clone(), container_id.clone())));
+        (environment, env_id, container_id, handle)
+    });
+    let results = futures::future::join_all(reconciliations.map(|(environment, env_id, container_id, handle)| {
+        let state = Arc::clone(state);
+        let namespace = namespace.to_string();
+        async move {
+            match tokio::time::timeout(
+                ENVIRONMENT_ADOPTION_TIMEOUT,
+                reconcile_provisioned_environment(&state, &namespace, environment, env_id.clone(), container_id, handle),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    fail_unavailable_environment(
+                        &state,
+                        &namespace,
+                        &env_id,
+                        &format!("environment adoption timed out after {}s", ENVIRONMENT_ADOPTION_TIMEOUT.as_secs()),
+                    )
+                    .await
+                }
             }
         }
+    }))
+    .await;
+    let errors = results.into_iter().filter_map(Result::err).collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
 
-        if state.daemon.environment_registry_for_environment(&env_id).is_none() {
+async fn reconcile_provisioned_environment(
+    state: &Arc<ControllerRuntimeState>,
+    namespace: &str,
+    environment: ResourceObject<Environment>,
+    env_id: EnvironmentId,
+    container_id: Option<String>,
+    handle: Option<EnvironmentHandle>,
+) -> Result<(), String> {
+    let spec = environment.spec.docker.as_ref().expect("candidate filtering requires a local Docker spec");
+    let Some(container_id) = container_id else {
+        return fail_unavailable_environment(state, namespace, &env_id, "ready Docker environment has no container identity").await;
+    };
+    let Some(handle) = handle else {
+        return fail_unavailable_environment(state, namespace, &env_id, &format!("Docker container {container_id} is not running")).await;
+    };
+    match handle.status().await {
+        Ok(flotilla_protocol::EnvironmentStatus::Running) => {}
+        Ok(status) => {
+            return fail_unavailable_environment(
+                state,
+                namespace,
+                &env_id,
+                &format!("Docker container {container_id} is not running (status: {status:?})"),
+            )
+            .await
+        }
+        Err(error) => {
+            return fail_unavailable_environment(
+                state,
+                namespace,
+                &env_id,
+                &format!("Docker container {container_id} liveness check failed: {error}"),
+            )
+            .await
+        }
+    }
+
+    if state.daemon.environment_registry_for_environment(&env_id).is_none() {
+        let adoption = async {
             let (bag, registry) = probe_provisioned_environment(state, &env_id, &handle).await?;
             verify_declared_agent_adapters(spec, &registry)?;
             state
                 .daemon
                 .register_provisioned_environment(env_id.clone(), Arc::clone(&handle), bag, Some(registry))
                 .map_err(|error| format!("register adopted environment {env_id}: {error}"))?;
-            info!(environment = %env_id, container = %container_id, "restored provisioned environment registration");
+            Ok::<(), String>(())
         }
-        state.provisioned_environments.lock().await.insert(container_id, ActiveProvisionedEnvironment { handle });
+        .await;
+        if let Err(error) = adoption {
+            return fail_unavailable_environment(state, namespace, &env_id, &format!("environment adoption failed: {error}")).await;
+        }
+        info!(environment = %env_id, container = %container_id, "restored provisioned environment registration");
     }
+    state.provisioned_environments.lock().await.insert(container_id, ActiveProvisionedEnvironment { handle });
     Ok(())
 }
 
@@ -5722,7 +5769,12 @@ mod tests {
         assert_eq!(error, "image `contained-image` declares agent adapter `missing-adapter`, but interior discovery did not find it");
     }
 
-    async fn create_ready_docker_environment(daemon: &InProcessDaemon, name: &str, container_id: &str) {
+    async fn create_ready_docker_environment(
+        daemon: &InProcessDaemon,
+        name: &str,
+        container_id: &str,
+        declared_agent_adapters: BTreeSet<String>,
+    ) {
         let host_ref = daemon.local_host_id().expect("local host identity").to_string();
         let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
         environments
@@ -5731,7 +5783,7 @@ mod tests {
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
                     host_ref,
                     image: "contained-image".to_string(),
-                    declared_agent_adapters: BTreeSet::new(),
+                    declared_agent_adapters,
                     required_agent_adapters: BTreeSet::new(),
                     pull_policy: Default::default(),
                     mounts: Vec::new(),
@@ -5783,7 +5835,7 @@ mod tests {
             env_vars: HashMap::from([("HOME".to_string(), "/home/crew".to_string())]),
             destroyed: Arc::new(AtomicBool::new(false)),
         });
-        create_ready_docker_environment(&first, env_id.as_str(), "test-interior").await;
+        create_ready_docker_environment(&first, env_id.as_str(), "test-interior", BTreeSet::new()).await;
         first
             .register_provisioned_environment(env_id.clone(), Arc::clone(&handle), EnvironmentBag::new(), Some(passthrough_registry()))
             .expect("initial provision registration");
@@ -5830,7 +5882,7 @@ mod tests {
         )
         .await;
         let env_id = EnvironmentId::new("env-dead");
-        create_ready_docker_environment(&daemon, env_id.as_str(), "missing-container").await;
+        create_ready_docker_environment(&daemon, env_id.as_str(), "missing-container", BTreeSet::new()).await;
         let state = Arc::new(ControllerRuntimeState::new(
             Arc::clone(&daemon),
             config,
@@ -5848,6 +5900,51 @@ mod tests {
         assert_eq!(status.phase, EnvironmentPhase::Failed);
         assert_eq!(status.message.as_deref(), Some("Docker container missing-container is not running"));
         assert!(daemon.environment_registry_for_environment(&env_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_environment_readoption_does_not_block_a_live_sibling() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"isolated-environment-readoption-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            flotilla_protocol::HostName::new("udder"),
+        )
+        .await;
+        let bad_id = EnvironmentId::new("env-bad");
+        let good_id = EnvironmentId::new("env-good");
+        create_ready_docker_environment(&daemon, bad_id.as_str(), "test-interior", BTreeSet::from(["missing-adapter".to_string()])).await;
+        create_ready_docker_environment(&daemon, good_id.as_str(), "test-interior", BTreeSet::new()).await;
+        let handle = |id: EnvironmentId| {
+            Arc::new(TestInteriorEnvironment {
+                id,
+                image: ImageId::new("contained-image"),
+                runner: Arc::new(DiscoveryMockRunner::builder().build()),
+                env_vars: HashMap::new(),
+                destroyed: Arc::new(AtomicBool::new(false)),
+            }) as EnvironmentHandle
+        };
+        let state = Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            adoption_registry(vec![handle(bad_id.clone()), handle(good_id.clone())]),
+            None,
+            daemon.local_host_id().expect("local host identity").to_string(),
+            None,
+            "host-direct-test".to_string(),
+        ));
+
+        reconcile_provisioned_environments(&state, NAMESPACE).await.expect("fail one environment without aborting its sibling");
+
+        let bad = daemon.resource_backend().using::<Environment>(NAMESPACE).get(bad_id.as_str()).await.expect("bad environment");
+        assert_eq!(bad.status.expect("bad environment status").phase, EnvironmentPhase::Failed);
+        assert!(daemon.environment_registry_for_environment(&bad_id).is_none());
+        assert!(daemon.environment_registry_for_environment(&good_id).is_some(), "live sibling should still be adopted");
     }
 
     #[tokio::test]
