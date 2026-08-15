@@ -172,6 +172,15 @@ run_installer "$generation_one" >/dev/null
 after_manifest="$(sha256sum "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json")"
 [[ "$before_manifest" == "$after_manifest" ]] || fail 'exact-generation reinstall mutated the release'
 
+exec 9>"$test_root/home/.local/opt/flotilla-fleet/.install.lock"
+flock -n 9
+if run_installer "$generation_one" >"$test_root/locked.out" 2>&1; then
+  fail 'concurrent mutation lock was ignored'
+fi
+flock -u 9
+exec 9>&-
+grep -Fq 'another fleet-install mutation is already running' "$test_root/locked.out" || fail 'concurrent mutation error was unclear'
+
 if FAIL_ARTIFACT_FOR="$generation_two" run_installer "$generation_two" >"$test_root/interrupted.out" 2>&1; then
   fail 'interrupted download was accepted'
 fi
