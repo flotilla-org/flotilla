@@ -11,8 +11,13 @@ Older size-rotated generations use numeric suffixes such as
 Stop a running daemon with `flotilla daemon stop`. The command is idempotent
 when no daemon socket exists and asks a live daemon to finish active requests,
 retire peer connections, close its socket, and exit cleanly. Deploy and install
-scripts should use this command before replacing the `flotilla`/`flotillad`
-binary pair; do not use `pkill` for daemon restarts.
+scripts may replace the CLI first, then use this command before replacing the
+daemon: shutdown is the one typed RPC admitted between different builds when
+both speak the same `PROTOCOL_VERSION`, and it waits for acknowledgement before
+reporting success. All other RPCs still require matching build identities. A
+cross-protocol stop is refused with a protocol-version mismatch, so deploys
+that cross a protocol bump must retain the old CLI until its daemon has stopped.
+Do not use `pkill` for daemon restarts.
 
 For example, show warnings from the peer subsystem with:
 

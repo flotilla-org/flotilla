@@ -3590,13 +3590,68 @@ async fn handle_client_rejects_client_hello_with_version_mismatch() {
 }
 
 #[tokio::test]
-async fn handle_client_rejects_client_hello_with_wire_generation_mismatch() {
-    assert_client_hello_rejected(
-        PROTOCOL_VERSION,
-        flotilla_protocol::hello_display_name("client", "stale-client-generation"),
-        "wire generation",
-    )
-    .await;
+async fn wire_generation_mismatched_client_can_request_shutdown() {
+    let (_tmp, client_stream, handle, client_count, mut shutdown_requests) = spawn_test_client_handler().await;
+    let (read_half, write_half) = client_stream.into_split();
+    let mut reader = BufReader::new(read_half).lines();
+    let mut writer = BufWriter::new(write_half);
+
+    let hello = Message::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        node_id: NodeId::new("newer-client"),
+        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation"),
+        session_id: uuid::Uuid::nil(),
+        connection_role: Some(flotilla_protocol::ConnectionRole::Client),
+        surface: None,
+    };
+    flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write client hello");
+    let hello = reader.next_line().await.expect("read hello").expect("hello payload");
+    assert!(matches!(serde_json::from_str::<Message>(&hello).expect("parse hello"), Message::Hello { .. }));
+
+    flotilla_protocol::framing::write_message_line(&mut writer, &Message::Request { id: 7, request: Request::Shutdown })
+        .await
+        .expect("write shutdown request");
+    let response = reader.next_line().await.expect("read response").expect("shutdown response payload");
+    assert!(matches!(ok_response(serde_json::from_str(&response).expect("parse shutdown response"), 7), Response::Shutdown));
+    assert_eq!(shutdown_requests.recv().await, Some(()), "server should begin shutdown only after acknowledging the request");
+
+    let eof = reader.next_line().await.expect("read shutdown EOF");
+    assert!(eof.is_none(), "shutdown requester should receive a clean EOF");
+    handle.await.expect("join shutdown connection");
+    assert_eq!(client_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn wire_generation_mismatched_client_cannot_request_rich_rpc() {
+    let (_tmp, client_stream, handle, _client_count, mut shutdown_requests) = spawn_test_client_handler().await;
+    let (read_half, write_half) = client_stream.into_split();
+    let mut reader = BufReader::new(read_half).lines();
+    let mut writer = BufWriter::new(write_half);
+
+    let hello = Message::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        node_id: NodeId::new("newer-client"),
+        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation"),
+        session_id: uuid::Uuid::nil(),
+        connection_role: Some(flotilla_protocol::ConnectionRole::Client),
+        surface: None,
+    };
+    flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write client hello");
+    let _hello = reader.next_line().await.expect("read hello").expect("hello payload");
+
+    flotilla_protocol::framing::write_message_line(&mut writer, &Message::Request { id: 8, request: Request::ListRepos })
+        .await
+        .expect("write rich request");
+    let response = reader.next_line().await.expect("read response").expect("error response payload");
+    match serde_json::from_str::<Message>(&response).expect("parse response") {
+        Message::Response { id: 8, response } => match *response {
+            ResponseResult::Err { message } => assert!(message.contains("only daemon shutdown"), "unexpected error: {message}"),
+            other => panic!("expected error response, got {other:?}"),
+        },
+        other => panic!("expected response, got {other:?}"),
+    }
+    assert!(shutdown_requests.try_recv().is_err(), "rich request must not initiate shutdown");
+    handle.await.expect("join restricted connection");
 }
 
 #[tokio::test(start_paused = true)]

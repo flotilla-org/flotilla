@@ -752,8 +752,9 @@ async fn handle_client_session(
                         expected = BUILD_ID,
                         got = client_generation,
                         %node_id,
-                        "rejecting client with wire generation mismatch"
+                        "restricting client with wire generation mismatch to shutdown"
                     );
+                    run_shutdown_only_session(&session, &shutdown_request_tx, &mut shutdown_rx).await;
                     return;
                 }
                 let surface = match surface {
@@ -781,6 +782,36 @@ async fn handle_client_session(
         other => {
             warn!(msg = ?other, "rejecting connection without Hello handshake");
         }
+    }
+}
+
+/// Serve the stable deployment seam available to same-protocol clients from a
+/// different build. No other request crosses the wire-generation gate.
+async fn run_shutdown_only_session(
+    session: &MessageSession,
+    shutdown_request_tx: &mpsc::UnboundedSender<()>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
+    tokio::select! {
+        message = session.read() => {
+            match message {
+                Ok(Some(Message::Request { id, request: flotilla_protocol::Request::Shutdown })) => {
+                    if session.write(Message::ok_response(id, flotilla_protocol::Response::Shutdown)).await.is_ok() {
+                        info!("graceful shutdown requested by same-protocol client from a different build");
+                        let _ = shutdown_request_tx.send(());
+                    }
+                }
+                Ok(Some(Message::Request { id, .. })) => {
+                    let _ = session
+                        .write(Message::error_response(id, "wire generation mismatch: only daemon shutdown is available across builds"))
+                        .await;
+                }
+                Ok(Some(other)) => warn!(msg = ?other, "unexpected message from shutdown-only client"),
+                Ok(None) => {}
+                Err(error) => warn!(%error, "failed to read request from shutdown-only client"),
+            }
+        }
+        _ = shutdown_rx.changed() => {}
     }
 }
 
