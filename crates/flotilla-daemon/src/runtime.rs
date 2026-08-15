@@ -763,13 +763,7 @@ async fn reconcile_provisioned_environments(state: &Arc<ControllerRuntimeState>,
             {
                 Ok(result) => result,
                 Err(_) => {
-                    fail_unavailable_environment(
-                        &state,
-                        &namespace,
-                        &env_id,
-                        &format!("environment adoption timed out after {}s", ENVIRONMENT_ADOPTION_TIMEOUT.as_secs()),
-                    )
-                    .await
+                    Err(format!("environment {env_id} adoption timed out after {}s; will retry", ENVIRONMENT_ADOPTION_TIMEOUT.as_secs()))
                 }
             }
         }
@@ -800,7 +794,7 @@ async fn reconcile_provisioned_environment(
     };
     match handle.status().await {
         Ok(flotilla_protocol::EnvironmentStatus::Running) => {}
-        Ok(status) => {
+        Ok(status @ (flotilla_protocol::EnvironmentStatus::Stopped | flotilla_protocol::EnvironmentStatus::Failed(_))) => {
             return fail_unavailable_environment(
                 state,
                 namespace,
@@ -809,14 +803,11 @@ async fn reconcile_provisioned_environment(
             )
             .await
         }
+        Ok(status) => {
+            return Err(format!("Docker container {container_id} for environment {env_id} is not ready (status: {status:?}); will retry"))
+        }
         Err(error) => {
-            return fail_unavailable_environment(
-                state,
-                namespace,
-                &env_id,
-                &format!("Docker container {container_id} liveness check failed: {error}"),
-            )
-            .await
+            return Err(format!("Docker container {container_id} liveness check failed for environment {env_id}: {error}; will retry"))
         }
     }
 
@@ -836,7 +827,7 @@ async fn reconcile_provisioned_environment(
         }
         info!(environment = %env_id, container = %container_id, "restored provisioned environment registration");
     }
-    state.provisioned_environments.lock().await.insert(container_id, ActiveProvisionedEnvironment { handle });
+    state.provisioned_environments.lock().await.entry(container_id).or_insert(ActiveProvisionedEnvironment { handle });
     Ok(())
 }
 
@@ -3897,6 +3888,47 @@ mod tests {
         }
     }
 
+    struct TestUncertainEnvironment {
+        id: EnvironmentId,
+        status_error: String,
+    }
+
+    #[async_trait]
+    impl ProvisionedEnvironment for TestUncertainEnvironment {
+        fn id(&self) -> &EnvironmentId {
+            &self.id
+        }
+
+        fn image(&self) -> &ImageId {
+            static IMAGE: std::sync::LazyLock<ImageId> = std::sync::LazyLock::new(|| ImageId::new("contained-image"));
+            &IMAGE
+        }
+
+        fn container_name(&self) -> Option<&str> {
+            Some("uncertain-container")
+        }
+
+        fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
+            Vec::new()
+        }
+
+        async fn status(&self) -> Result<flotilla_protocol::EnvironmentStatus, String> {
+            Err(self.status_error.clone())
+        }
+
+        async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+            Ok(HashMap::new())
+        }
+
+        fn runner(&self) -> Arc<dyn CommandRunner> {
+            Arc::new(DiscoveryMockRunner::builder().build())
+        }
+
+        async fn destroy(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn clone_runtime_single_flights_concurrent_requests_for_the_same_target() {
         let temp = TempDir::new().expect("tempdir");
@@ -5899,6 +5931,42 @@ mod tests {
         let status = environment.status.expect("environment status");
         assert_eq!(status.phase, EnvironmentPhase::Failed);
         assert_eq!(status.message.as_deref(), Some("Docker container missing-container is not running"));
+        assert!(daemon.environment_registry_for_environment(&env_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn transient_environment_liveness_error_remains_ready_for_retry() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"transient-environment-readoption-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            flotilla_protocol::HostName::new("udder"),
+        )
+        .await;
+        let env_id = EnvironmentId::new("env-transient");
+        create_ready_docker_environment(&daemon, env_id.as_str(), "uncertain-container", BTreeSet::new()).await;
+        let handle: EnvironmentHandle =
+            Arc::new(TestUncertainEnvironment { id: env_id.clone(), status_error: "Docker daemon temporarily unavailable".to_string() });
+        let state = Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            adoption_registry(vec![handle]),
+            None,
+            daemon.local_host_id().expect("local host identity").to_string(),
+            None,
+            "host-direct-test".to_string(),
+        ));
+
+        let error = reconcile_provisioned_environments(&state, NAMESPACE).await.expect_err("uncertain liveness should request a retry");
+
+        assert!(error.contains("temporarily unavailable") && error.contains("will retry"));
+        let environment = daemon.resource_backend().using::<Environment>(NAMESPACE).get(env_id.as_str()).await.expect("environment record");
+        assert_eq!(environment.status.expect("environment status").phase, EnvironmentPhase::Ready);
         assert!(daemon.environment_registry_for_environment(&env_id).is_none());
     }
 
