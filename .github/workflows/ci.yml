@@ -33,7 +33,9 @@ jobs:
           scripts/test-prune-target.sh
           scripts/test-cargo-sweep-mtime.sh
       - name: Test fleet candidate workflow contract
-        run: ci/fleet-candidates/test-workflow.sh
+        run: |
+          ci/fleet-candidates/test-workflow.sh
+          scripts/test-fleet-install.sh
       - name: Check Rust formatting
         run: cargo +nightly-2026-03-12 fmt --check
 
