@@ -4287,6 +4287,7 @@ impl InProcessDaemon {
         status: &flotilla_resources::ConvoyEnsureStatus,
         now: DateTime<Utc>,
     ) -> Result<Option<String>, String> {
+        self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
         match self.start_ensured_convoy(namespace, ensure).await {
             Ok(()) => {
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
@@ -4294,7 +4295,6 @@ impl InProcessDaemon {
                     observed_at: now,
                 })
                 .await?;
-                self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
                 Ok(Some(format!("started Convoy/{}", ensure.metadata.name)))
             }
             Err(error) => {

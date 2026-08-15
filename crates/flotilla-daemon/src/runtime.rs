@@ -757,7 +757,10 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
             .collect::<HashMap<_, _>>();
         for environment in environments {
             let Some(container_id) = environment.status.as_ref().and_then(|status| status.docker_container_id.as_ref()) else {
-                continue;
+                return Err(format!(
+                    "backing is not verifiable: Environment/{} has no Docker container identity",
+                    environment.metadata.name
+                ));
             };
             let key = (EnvironmentId::new(environment.metadata.name.clone()), container_id.clone());
             let Some(handle) = handles.get(&key) else {
@@ -4766,6 +4769,17 @@ mod tests {
         let refusal = state.verify_backing_dead(&convoy).await.expect_err("live Docker backing must hold standing teardown");
 
         assert!(refusal.contains("backing is live") && refusal.contains("test-interior"), "unexpected refusal: {refusal}");
+
+        let environment = environments.get("quartermaster-work").await.expect("environment");
+        environments
+            .update_status(&environment.metadata.name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
+                phase: EnvironmentPhase::Failed,
+                ..Default::default()
+            })
+            .await
+            .expect("remove container identity");
+        let refusal = state.verify_backing_dead(&convoy).await.expect_err("missing container identity must hold standing teardown");
+        assert!(refusal.contains("no Docker container identity"), "unexpected refusal: {refusal}");
     }
 
     #[tokio::test]
