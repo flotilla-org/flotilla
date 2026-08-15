@@ -3,7 +3,7 @@
 Contained vessels use the curated image at:
 
 ```text
-forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-07-26.1
+forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-15.1
 ```
 
 The explicit release tag is the deployment contract. Do not point placement
@@ -95,7 +95,7 @@ From the repository root, a builder with amd64 and arm64 workers can publish
 the release with:
 
 ```bash
-IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-07-26.1
+IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-15.1
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   --file .flotilla/Dockerfile.crew \
@@ -119,10 +119,28 @@ Pull the published image rather than relying on the local build cache, then
 run both adapter entry points:
 
 ```bash
-IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-07-26.1
+IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-15.1
 docker pull "$IMAGE"
 docker run --rm "$IMAGE" claude --version
 docker run --rm "$IMAGE" codex --version
+docker run --rm "$IMAGE" python3 --version
+```
+
+Cargo's installed toolchain remains on the read-only image layer, while its
+runtime registry, cache, and additional tool proxies live beneath
+`/tmp/flotilla-config/cargo`. Verify that an arbitrary non-root runtime user can
+populate that writable home and run a dependency-backed test:
+
+```bash
+docker run --rm --user 12345:12345 "$IMAGE" sh -c '
+  set -eu
+  test "$CARGO_HOME" = /tmp/flotilla-config/cargo
+  mkdir -p /tmp/cargo-smoke/src
+  printf "[package]\nname = \"cargo-smoke\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nanyhow = \"1\"\n" > /tmp/cargo-smoke/Cargo.toml
+  printf "#[test]\nfn dependency_is_usable() { assert_eq!(anyhow::anyhow!(\"smoke\").to_string(), \"smoke\"); }\n" > /tmp/cargo-smoke/src/lib.rs
+  cargo test --manifest-path /tmp/cargo-smoke/Cargo.toml
+  test -d "$CARGO_HOME/registry/cache"
+'
 ```
 
 Until the image bakes cleat, run its version check against a provisioned
