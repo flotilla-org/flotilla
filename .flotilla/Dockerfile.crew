@@ -66,10 +66,17 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         jq \
         less \
         openssh-client \
+        python3 \
         ripgrep \
         unzip \
         zsh \
     && rm -rf /var/lib/apt/lists/*
+
+# Cargo's registry/cache and rustup-installed proxies must be writable by the
+# host-mapped runtime user. Keep the baked toolchain on the read-only image
+# layer and route only Cargo's mutable home through Flotilla's writable base.
+ENV CARGO_HOME=/tmp/flotilla-config/cargo
+ENV PATH="/tmp/flotilla-config/cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # 4. Agent adapters. Keep this fastest-moving layer last.
 ARG CLAUDE_CODE_VERSION=2.1.220
@@ -86,7 +93,8 @@ ENV SHELL=/bin/zsh
 # Build-time smoke check: declaring these adapters in a PlacementPolicy is a
 # promise that both entry points are executable in the image.
 RUN claude --version \
-    && codex --version
+    && codex --version \
+    && python3 --version
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
