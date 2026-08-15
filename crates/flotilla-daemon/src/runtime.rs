@@ -1274,6 +1274,11 @@ fn spawn_heartbeat_task_with_credentials(
         let health = health.clone();
         let runtime_health = runtime_health.clone();
         async move {
+            if let Some(store) = credential_store.as_ref().as_ref() {
+                for error in store.refresh_due_github_app_tokens().await {
+                    warn!(%error, "failed to refresh GitHub App credential delivery");
+                }
+            }
             if let Err(err) =
                 apply_host_heartbeat_with_credentials(&daemon, &namespace, &profile, credential_store.as_deref(), &health, &runtime_health)
                     .await
