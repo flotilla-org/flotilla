@@ -175,18 +175,6 @@ impl SocketDaemon {
         from_session_stateful_bounded(socket_path, session, None).await
     }
 
-    /// Ask the connected daemon to shut down gracefully.
-    ///
-    /// Success means the daemon accepted the request. The server sends this
-    /// acknowledgement before it closes listeners and drains active work.
-    pub async fn shutdown(&self) -> Result<(), String> {
-        let result = send_request(&self.session, &self.pending, &self.next_id, Request::Shutdown).await?;
-        match into_success_response(result)? {
-            Response::Shutdown => Ok(()),
-            other => Err(format!("unexpected shutdown response: {other:?}")),
-        }
-    }
-
     pub async fn connect_with_surface(socket_path: &Path, surface: SurfaceDeclaration) -> Result<Arc<Self>, String> {
         let session = connect_unix_message_session(socket_path).await?;
         from_session_stateful_bounded(socket_path, session, Some(&surface)).await
