@@ -22,7 +22,7 @@ use flotilla_core::{
         inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
     },
     config::ConfigStore,
-    in_process::InProcessDaemon,
+    in_process::{InProcessDaemon, StandingConvoyBackingInspector},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
     providers::{
@@ -507,11 +507,6 @@ impl DaemonRuntime {
 
         if options.start_controllers {
             tasks.push(spawn_dispatch_reconciler_task(Arc::clone(&daemon), options.namespace.clone(), options.controller_resync_interval));
-            tasks.push(spawn_convoy_ensure_reconciler_task(
-                Arc::clone(&daemon),
-                options.namespace.clone(),
-                options.controller_resync_interval,
-            ));
             let local_repo_root = daemon.tracked_repo_paths().await.into_iter().next().map(ExecutionEnvironmentPath::new);
             let state = Arc::new(
                 ControllerRuntimeState::new(
@@ -529,6 +524,11 @@ impl DaemonRuntime {
             if let Err(error) = reconcile_provisioned_environments(&state, &options.namespace).await {
                 warn!(%error, "failed to restore provisioned environments during startup; periodic reconciliation will retry");
             }
+            tasks.push(spawn_convoy_ensure_reconciler_task(
+                Arc::clone(&state),
+                options.namespace.clone(),
+                options.controller_resync_interval,
+            ));
             tasks.push(spawn_provisioned_environment_reconciliation_task(
                 Arc::clone(&state),
                 options.namespace.clone(),
@@ -705,6 +705,84 @@ impl ControllerRuntimeState {
 
 struct ActiveProvisionedEnvironment {
     handle: EnvironmentHandle,
+}
+
+#[async_trait]
+impl StandingConvoyBackingInspector for ControllerRuntimeState {
+    async fn verify_backing_dead(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
+        let environments = self
+            .daemon
+            .resource_backend()
+            .using::<Environment>(&convoy.metadata.namespace)
+            .list()
+            .await
+            .map_err(|error| format!("could not inspect backing environments: {error}"))?
+            .items
+            .into_iter()
+            .filter(|environment| environment.metadata.labels.get(flotilla_resources::CONVOY_LABEL) == Some(&convoy.metadata.name))
+            .collect::<Vec<_>>();
+        if environments.is_empty() {
+            return Err("no backing environment evidence is available".to_string());
+        }
+        if let Some(environment) = environments.iter().find(|environment| environment.spec.docker.is_none()) {
+            return Err(format!("Environment/{} has no inspectable Docker backing", environment.metadata.name));
+        }
+        if let Some(environment) = environments
+            .iter()
+            .find(|environment| environment.spec.docker.as_ref().is_some_and(|spec| spec.host_ref != self.local_host_ref))
+        {
+            return Err(format!(
+                "Environment/{} is backed by remote host {}",
+                environment.metadata.name,
+                environment.spec.docker.as_ref().expect("Docker environment checked above").host_ref
+            ));
+        }
+        let (_, provider) = self
+            .local_registry
+            .environment_providers
+            .get("docker")
+            .or_else(|| self.local_registry.environment_providers.preferred_with_desc())
+            .ok_or_else(|| "Docker environment provider unavailable for standing-convoy liveness check".to_string())?;
+        let listed = provider.list().await.map_err(|error| format!("Docker backing liveness check failed: {error}"))?;
+        let handles = listed
+            .into_iter()
+            .filter_map(|handle| {
+                let container = handle.container_name()?.to_string();
+                Some(((handle.id().clone(), container), handle))
+            })
+            .collect::<HashMap<_, _>>();
+        for environment in environments {
+            let Some(container_id) = environment.status.as_ref().and_then(|status| status.docker_container_id.as_ref()) else {
+                return Err(format!(
+                    "backing is not verifiable: Environment/{} has no Docker container identity",
+                    environment.metadata.name
+                ));
+            };
+            let key = (EnvironmentId::new(environment.metadata.name.clone()), container_id.clone());
+            let Some(handle) = handles.get(&key) else {
+                continue;
+            };
+            match handle.status().await {
+                Ok(flotilla_protocol::EnvironmentStatus::Running) => {
+                    return Err(format!("backing is live: Docker container {container_id} for Environment/{}", environment.metadata.name))
+                }
+                Ok(flotilla_protocol::EnvironmentStatus::Stopped | flotilla_protocol::EnvironmentStatus::Failed(_)) => {}
+                Ok(status) => {
+                    return Err(format!(
+                        "backing is not verified dead: Docker container {container_id} for Environment/{} is {status:?}",
+                        environment.metadata.name
+                    ))
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "backing is not verifiable: Docker container {container_id} for Environment/{}: {error}",
+                        environment.metadata.name
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 async fn reconcile_provisioned_environments(state: &Arc<ControllerRuntimeState>, namespace: &str) -> Result<(), String> {
@@ -1268,12 +1346,12 @@ fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, namespace: Strin
     })
 }
 
-fn spawn_convoy_ensure_reconciler_task(daemon: Arc<InProcessDaemon>, namespace: String, interval: Duration) -> JoinHandle<()> {
+fn spawn_convoy_ensure_reconciler_task(state: Arc<ControllerRuntimeState>, namespace: String, interval: Duration) -> JoinHandle<()> {
     spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
-        let daemon = Arc::clone(&daemon);
+        let state = Arc::clone(&state);
         let namespace = namespace.clone();
         async move {
-            if let Err(error) = daemon.reconcile_convoy_ensures_once(&namespace).await {
+            if let Err(error) = state.daemon.reconcile_convoy_ensures_once_with_backing_inspector(&namespace, &*state).await {
                 warn!(%error, "standing convoy ensure reconciliation pass failed");
             }
         }
@@ -4610,6 +4688,94 @@ mod tests {
             .expect("restart teardown should rediscover and destroy the container");
 
         assert!(destroyed.load(Ordering::SeqCst), "the restarted daemon must destroy the still-running lease holder");
+    }
+
+    #[tokio::test]
+    async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_phase() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"standing-backing-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            HostName::new("dinghy"),
+        )
+        .await;
+        let convoy = daemon
+            .resource_backend()
+            .using::<Convoy>(NAMESPACE)
+            .create(&empty_meta("quartermaster"), &ConvoySpec::builder().workflow_ref("standing".to_string()).build())
+            .await
+            .expect("convoy");
+        let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
+        let environment = environments
+            .create(
+                &empty_meta_with_labels("quartermaster-work", BTreeMap::from([(CONVOY_LABEL.to_string(), "quartermaster".to_string())])),
+                &flotilla_resources::EnvironmentSpec {
+                    host_direct: None,
+                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                        host_ref: "host-test".to_string(),
+                        image: "contained-image".to_string(),
+                        declared_agent_adapters: BTreeSet::new(),
+                        required_agent_adapters: BTreeSet::new(),
+                        pull_policy: Default::default(),
+                        mounts: Vec::new(),
+                        env: BTreeMap::new(),
+                    }),
+                },
+            )
+            .await
+            .expect("environment");
+        environments
+            .update_status(&environment.metadata.name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
+                phase: EnvironmentPhase::Failed,
+                ready: false,
+                docker_container_id: Some("test-interior".to_string()),
+                message: Some("provider registry unavailable".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("failed daemon-side environment phase");
+        let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+            id: EnvironmentId::new("quartermaster-work"),
+            image: ImageId::new("contained-image"),
+            runner: Arc::new(DiscoveryMockRunner::builder().build()),
+            env_vars: HashMap::new(),
+            destroyed: Arc::new(AtomicBool::new(false)),
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.environment_providers.insert(
+            "docker",
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
+            Arc::new(AdoptionEnvironmentProvider { handles: vec![handle] }),
+        );
+        let state = ControllerRuntimeState::new(
+            daemon,
+            config,
+            Arc::new(registry),
+            Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+            "host-test".to_string(),
+            None,
+            "host-direct-host-test".to_string(),
+        );
+
+        let refusal = state.verify_backing_dead(&convoy).await.expect_err("live Docker backing must hold standing teardown");
+
+        assert!(refusal.contains("backing is live") && refusal.contains("test-interior"), "unexpected refusal: {refusal}");
+
+        let environment = environments.get("quartermaster-work").await.expect("environment");
+        environments
+            .update_status(&environment.metadata.name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
+                phase: EnvironmentPhase::Failed,
+                ..Default::default()
+            })
+            .await
+            .expect("remove container identity");
+        let refusal = state.verify_backing_dead(&convoy).await.expect_err("missing container identity must hold standing teardown");
+        assert!(refusal.contains("no Docker container identity"), "unexpected refusal: {refusal}");
     }
 
     #[tokio::test]
