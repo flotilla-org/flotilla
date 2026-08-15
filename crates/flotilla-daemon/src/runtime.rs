@@ -39,13 +39,13 @@ use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, ChangeRequest, ChangeRequestStatus, Checkout,
     CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy, ConvoyReconciler, ConvoyTeardownRuntime,
     CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec,
-    Environment, EnvironmentSpec, EnvironmentWaitReason, ForgeIdentity, Host, HostCondition, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta,
-    PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, Resource, ResourceBackend,
-    ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG,
-    CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS,
-    SLEEP_INHIBITION_CONDITION_TYPE,
+    Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, EnvironmentWaitReason, ForgeIdentity, Host, HostCondition,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
+    InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, Resource,
+    ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement,
+    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV,
+    CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
+    REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -529,6 +529,14 @@ impl DaemonRuntime {
                 .with_credential_store(credential_store)
                 .with_agent_material(agent_material),
             );
+            if let Err(error) = reconcile_provisioned_environments(&state, &options.namespace).await {
+                warn!(%error, "failed to restore provisioned environments during startup; periodic reconciliation will retry");
+            }
+            tasks.push(spawn_provisioned_environment_reconciliation_task(
+                Arc::clone(&state),
+                options.namespace.clone(),
+                options.controller_resync_interval,
+            ));
             tasks.extend(spawn_controller_loops(
                 state,
                 &options.namespace,
@@ -700,6 +708,111 @@ impl ControllerRuntimeState {
 
 struct ActiveProvisionedEnvironment {
     handle: EnvironmentHandle,
+}
+
+async fn reconcile_provisioned_environments(state: &Arc<ControllerRuntimeState>, namespace: &str) -> Result<(), String> {
+    let environments = state
+        .daemon
+        .resource_backend()
+        .using::<Environment>(namespace)
+        .list()
+        .await
+        .map_err(|error| format!("list environments for adoption: {error}"))?
+        .items
+        .into_iter()
+        .filter(|environment| {
+            environment.spec.docker.as_ref().is_some_and(|spec| spec.host_ref == state.local_host_ref)
+                && environment.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Ready)
+        })
+        .collect::<Vec<_>>();
+    if environments.is_empty() {
+        return Ok(());
+    }
+
+    let (_, provider) = state
+        .local_registry
+        .environment_providers
+        .get("docker")
+        .or_else(|| state.local_registry.environment_providers.preferred_with_desc())
+        .ok_or_else(|| "docker environment provider unavailable during environment adoption".to_string())?;
+    let listed = provider.list().await?;
+    let mut handles = HashMap::new();
+    for handle in listed {
+        let Some(container_id) = handle.container_name().map(ToString::to_string) else {
+            continue;
+        };
+        handles.insert((handle.id().clone(), container_id), handle);
+    }
+
+    for environment in environments {
+        let spec = environment.spec.docker.as_ref().expect("candidate filtering requires a local Docker spec");
+        let env_id = EnvironmentId::new(environment.metadata.name.clone());
+        let Some(container_id) = environment.status.as_ref().and_then(|status| status.docker_container_id.clone()) else {
+            fail_unavailable_environment(state, namespace, &env_id, "ready Docker environment has no container identity").await?;
+            continue;
+        };
+        let Some(handle) = handles.remove(&(env_id.clone(), container_id.clone())) else {
+            fail_unavailable_environment(state, namespace, &env_id, &format!("Docker container {container_id} is not running")).await?;
+            continue;
+        };
+        match handle.status().await {
+            Ok(flotilla_protocol::EnvironmentStatus::Running) => {}
+            Ok(status) => {
+                fail_unavailable_environment(
+                    state,
+                    namespace,
+                    &env_id,
+                    &format!("Docker container {container_id} is not running (status: {status:?})"),
+                )
+                .await?;
+                continue;
+            }
+            Err(error) => {
+                fail_unavailable_environment(
+                    state,
+                    namespace,
+                    &env_id,
+                    &format!("Docker container {container_id} liveness check failed: {error}"),
+                )
+                .await?;
+                continue;
+            }
+        }
+
+        if state.daemon.environment_registry_for_environment(&env_id).is_none() {
+            let (bag, registry) = probe_provisioned_environment(state, &env_id, &handle).await?;
+            verify_declared_agent_adapters(spec, &registry)?;
+            state
+                .daemon
+                .register_provisioned_environment(env_id.clone(), Arc::clone(&handle), bag, Some(registry))
+                .map_err(|error| format!("register adopted environment {env_id}: {error}"))?;
+            info!(environment = %env_id, container = %container_id, "restored provisioned environment registration");
+        }
+        state.provisioned_environments.lock().await.insert(container_id, ActiveProvisionedEnvironment { handle });
+    }
+    Ok(())
+}
+
+async fn fail_unavailable_environment(
+    state: &Arc<ControllerRuntimeState>,
+    namespace: &str,
+    env_id: &EnvironmentId,
+    message: &str,
+) -> Result<(), String> {
+    let registered_container = state.daemon.environment_container_name(env_id);
+    state.daemon.remove_provisioned_environment(env_id);
+    if let Some(container_id) = registered_container {
+        state.provisioned_environments.lock().await.remove(&container_id);
+    }
+    flotilla_resources::apply_status_patch(
+        &state.daemon.resource_backend().using::<Environment>(namespace),
+        env_id.as_str(),
+        &EnvironmentStatusPatch::MarkFailed { message: message.to_string() },
+    )
+    .await
+    .map_err(|error| format!("mark unavailable environment {env_id} failed: {error}"))?;
+    warn!(environment = %env_id, %message, "provisioned environment backing is unavailable");
+    Ok(())
 }
 
 async fn probe_local_provider_registry(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Result<Arc<ProviderRegistry>, String> {
@@ -1087,6 +1200,22 @@ fn spawn_adopted_checkout_reconciliation_task(daemon: Arc<InProcessDaemon>, name
         async move {
             if let Err(error) = daemon.reconcile_adopted_checkouts(&namespace).await {
                 warn!(%error, "failed to reconcile adopted checkout observations");
+            }
+        }
+    })
+}
+
+fn spawn_provisioned_environment_reconciliation_task(
+    state: Arc<ControllerRuntimeState>,
+    namespace: String,
+    interval: Duration,
+) -> JoinHandle<()> {
+    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || {
+        let state = Arc::clone(&state);
+        let namespace = namespace.clone();
+        async move {
+            if let Err(error) = reconcile_provisioned_environments(&state, &namespace).await {
+                warn!(%error, "failed to reconcile provisioned environment registrations");
             }
         }
     })
@@ -3864,6 +3993,29 @@ mod tests {
         }
     }
 
+    struct AdoptionEnvironmentProvider {
+        handles: Vec<EnvironmentHandle>,
+    }
+
+    #[async_trait]
+    impl EnvironmentProvider for AdoptionEnvironmentProvider {
+        async fn ensure_image(&self, _spec: &flotilla_protocol::EnvironmentSpec, _repo_root: &Path) -> Result<ImageId, String> {
+            Err("not used".to_string())
+        }
+
+        async fn create(&self, _id: EnvironmentId, _image: &ImageId, _opts: CreateOpts) -> Result<EnvironmentHandle, String> {
+            Err("not used".to_string())
+        }
+
+        async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
+            Ok(self.handles.clone())
+        }
+
+        async fn destroy(&self, _container_id: &str) -> Result<(), String> {
+            Err("not used".to_string())
+        }
+    }
+
     struct CapturingFailingEnvironmentProvider {
         create_opts: Mutex<Option<CreateOpts>>,
     }
@@ -5568,6 +5720,134 @@ mod tests {
         };
         let error = verify_declared_agent_adapters(&spec, &registry).expect_err("missing declared adapter should fail");
         assert_eq!(error, "image `contained-image` declares agent adapter `missing-adapter`, but interior discovery did not find it");
+    }
+
+    async fn create_ready_docker_environment(daemon: &InProcessDaemon, name: &str, container_id: &str) {
+        let host_ref = daemon.local_host_id().expect("local host identity").to_string();
+        let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
+        environments
+            .create(&empty_meta(name), &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    host_ref,
+                    image: "contained-image".to_string(),
+                    declared_agent_adapters: BTreeSet::new(),
+                    required_agent_adapters: BTreeSet::new(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: BTreeMap::new(),
+                }),
+            })
+            .await
+            .expect("create environment record");
+        flotilla_resources::apply_status_patch(&environments, name, &EnvironmentStatusPatch::MarkReady {
+            docker_container_id: Some(container_id.to_string()),
+            image_ref: Some("contained-image".to_string()),
+            image_digest: Some("sha256:test-interior".to_string()),
+        })
+        .await
+        .expect("mark environment ready");
+    }
+
+    fn adoption_registry(handles: Vec<EnvironmentHandle>) -> Arc<ProviderRegistry> {
+        let mut registry = ProviderRegistry::new();
+        registry.environment_providers.insert(
+            "docker",
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
+            Arc::new(AdoptionEnvironmentProvider { handles }),
+        );
+        Arc::new(registry)
+    }
+
+    #[tokio::test]
+    async fn fresh_daemon_readopts_running_environment_from_shared_store_and_backing() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"environment-readoption-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let backend = ResourceBackend::InMemory(Default::default());
+        let first = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            flotilla_protocol::HostName::new("udder"),
+            backend.clone(),
+        )
+        .await;
+        let env_id = EnvironmentId::new("env-governor-govern");
+        let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+            id: env_id.clone(),
+            image: ImageId::new("contained-image"),
+            runner: Arc::new(DiscoveryMockRunner::builder().build()),
+            env_vars: HashMap::from([("HOME".to_string(), "/home/crew".to_string())]),
+            destroyed: Arc::new(AtomicBool::new(false)),
+        });
+        create_ready_docker_environment(&first, env_id.as_str(), "test-interior").await;
+        first
+            .register_provisioned_environment(env_id.clone(), Arc::clone(&handle), EnvironmentBag::new(), Some(passthrough_registry()))
+            .expect("initial provision registration");
+        drop(first);
+
+        let restarted = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            flotilla_protocol::HostName::new("udder"),
+            backend,
+        )
+        .await;
+        assert!(restarted.environment_registry_for_environment(&env_id).is_none(), "fresh daemon starts without ephemeral registration");
+        let state = Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&restarted),
+            config,
+            adoption_registry(vec![handle]),
+            None,
+            restarted.local_host_id().expect("local host identity").to_string(),
+            None,
+            "host-direct-test".to_string(),
+        ));
+
+        reconcile_provisioned_environments(&state, NAMESPACE).await.expect("readopt running environment");
+
+        assert!(restarted.environment_registry_for_environment(&env_id).is_some(), "interior provider registry should be restored");
+        assert!(restarted.command_runner_for_environment(&env_id).is_some(), "environment runner should be restored for attach resolution");
+        assert!(state.provisioned_environments.lock().await.contains_key("test-interior"));
+    }
+
+    #[tokio::test]
+    async fn environment_readoption_marks_missing_container_failed() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"dead-environment-readoption-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            flotilla_protocol::HostName::new("udder"),
+        )
+        .await;
+        let env_id = EnvironmentId::new("env-dead");
+        create_ready_docker_environment(&daemon, env_id.as_str(), "missing-container").await;
+        let state = Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            adoption_registry(Vec::new()),
+            None,
+            daemon.local_host_id().expect("local host identity").to_string(),
+            None,
+            "host-direct-test".to_string(),
+        ));
+
+        reconcile_provisioned_environments(&state, NAMESPACE).await.expect("reconcile missing backing");
+
+        let environment = daemon.resource_backend().using::<Environment>(NAMESPACE).get(env_id.as_str()).await.expect("environment record");
+        let status = environment.status.expect("environment status");
+        assert_eq!(status.phase, EnvironmentPhase::Failed);
+        assert_eq!(status.message.as_deref(), Some("Docker container missing-container is not running"));
+        assert!(daemon.environment_registry_for_environment(&env_id).is_none());
     }
 
     #[tokio::test]
