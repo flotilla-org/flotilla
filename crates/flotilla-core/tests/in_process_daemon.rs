@@ -793,6 +793,63 @@ async fn resource_list_and_get_queries_return_wire_json() {
 }
 
 #[tokio::test]
+async fn resource_list_and_get_queries_return_local_non_replicated_resources() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    daemon
+        .resource_backend()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &InputMeta::builder().name("local-workflow".to_string()).build(),
+            &flotilla_resources::WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
+        .await
+        .expect("create workflow template");
+
+    let listed = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryResourceList {
+                    namespace: "flotilla".to_string(),
+                    kind: "workflowtemplates".to_string(),
+                    include_replicas: true,
+                },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("list query");
+    let CommandValue::ResourceRead(listed) = listed else { panic!("expected resource read") };
+    assert!(listed
+        .records
+        .iter()
+        .any(|record| { record.object.as_ref().is_some_and(|object| object["metadata"]["name"] == "local-workflow") }));
+
+    let fetched = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryResourceGet {
+                    namespace: "flotilla".to_string(),
+                    kind: "WorkflowTemplate".to_string(),
+                    name: "local-workflow".to_string(),
+                },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("get query");
+    let CommandValue::ResourceRead(fetched) = fetched else { panic!("expected resource read") };
+    assert_eq!(fetched.records[0].object.as_ref().expect("fetched object")["metadata"]["name"], "local-workflow");
+}
+
+#[tokio::test]
 async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon =
