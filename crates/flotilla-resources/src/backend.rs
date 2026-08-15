@@ -136,6 +136,14 @@ impl<T: Resource> ReplicaReadResolver<T> {
     }
 
     pub async fn get(&self, name: &str) -> Result<ReadResourceObject<T>, ResourceError> {
+        if T::REPLICATION_CLASS == crate::ReplicationClass::None {
+            return self
+                .backend
+                .using::<T>(&self.namespace)
+                .get(name)
+                .await
+                .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local });
+        }
         ensure_replication_enabled::<T>()?;
         if let ResourceBackend::Http(backend) = &self.backend {
             return backend.get_including_replicas_typed::<T>(&self.namespace, name).await;
@@ -163,6 +171,18 @@ impl<T: Resource> ReplicaReadResolver<T> {
     }
 
     pub async fn list(&self) -> Result<ReadResourceList<T>, ResourceError> {
+        if T::REPLICATION_CLASS == crate::ReplicationClass::None {
+            let items = self
+                .backend
+                .using::<T>(&self.namespace)
+                .list()
+                .await?
+                .items
+                .into_iter()
+                .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
+                .collect();
+            return Ok(ReadResourceList { items });
+        }
         ensure_replication_enabled::<T>()?;
         if let ResourceBackend::Http(backend) = &self.backend {
             return backend.list_including_replicas_typed::<T>(&self.namespace).await;

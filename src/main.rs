@@ -1013,7 +1013,13 @@ async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
 }
 
 async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) -> Result<()> {
+    use std::io::IsTerminal;
+
     reset_sigpipe();
+    let convoy_auto_attach = match &command.action {
+        CommandAction::ConvoyStart { intent } => intent.auto_attach,
+        _ => flotilla_protocol::ConvoyAutoAttach::Never,
+    };
     let daemon = connect_daemon(cli).await?;
     let result = match flotilla_tui::cli::run_command(&*daemon, command, format).await {
         Ok(result) => result,
@@ -1023,12 +1029,21 @@ async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) 
         std::process::exit(1);
     }
     if let CommandValue::ConvoyStarted { name, attach_plan: Some(plan), binding } = result {
-        if matches!(format, OutputFormat::Human) {
+        if should_exec_convoy_attach(format, std::io::stdin().is_terminal(), convoy_auto_attach) {
             stamp_pane_identity(&name, binding.as_ref()).await;
             return run_attach_plan(&plan);
         }
     }
     Ok(())
+}
+
+fn should_exec_convoy_attach(format: OutputFormat, stdin_is_terminal: bool, auto_attach: flotilla_protocol::ConvoyAutoAttach) -> bool {
+    matches!(format, OutputFormat::Human)
+        && match auto_attach {
+            flotilla_protocol::ConvoyAutoAttach::Default => stdin_is_terminal,
+            flotilla_protocol::ConvoyAutoAttach::Always => true,
+            flotilla_protocol::ConvoyAutoAttach::Never => false,
+        }
 }
 
 fn exit_command_error(message: String, format: OutputFormat) -> ! {
@@ -1925,10 +1940,34 @@ mod tests {
     use super::{
         client_dirs_from, confirm_command, daemon_paths_from, default_project_landing, format_human_resource_value,
         host_daemon_socket_required, provisioning_target_for_environment, replace_host_ids, run_replica_snapshot, select_host_target,
-        select_startup_repo_roots, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, Cli, CliPaths,
-        CommandValue, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceStatusPatchArgs,
+        select_startup_repo_roots, should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from,
+        Cli, CliPaths, CommandValue, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceStatusPatchArgs,
         ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
+
+    #[test]
+    fn default_convoy_start_does_not_auto_attach_non_interactively() {
+        assert!(!should_exec_convoy_attach(
+            flotilla_protocol::output::OutputFormat::Human,
+            false,
+            flotilla_protocol::ConvoyAutoAttach::Default,
+        ));
+        assert!(should_exec_convoy_attach(
+            flotilla_protocol::output::OutputFormat::Human,
+            true,
+            flotilla_protocol::ConvoyAutoAttach::Default,
+        ));
+        assert!(should_exec_convoy_attach(
+            flotilla_protocol::output::OutputFormat::Human,
+            false,
+            flotilla_protocol::ConvoyAutoAttach::Always,
+        ));
+        assert!(!should_exec_convoy_attach(
+            flotilla_protocol::output::OutputFormat::Json,
+            true,
+            flotilla_protocol::ConvoyAutoAttach::Always,
+        ));
+    }
 
     fn landing_repo(path: &str, name: &str, key: Option<&str>) -> RepoInfo {
         RepoInfo {
