@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly FLEET_OWNER="${FLEET_INSTALL_OWNER:-lab}"
+readonly FLEET_PACKAGE="${FLEET_INSTALL_PACKAGE:-flotilla-fleet}"
+readonly FLEET_API_URL="${FLEET_INSTALL_API_URL:-https://forgejo.lab.flotilla.work/api/v1}"
+readonly FLEET_PACKAGE_URL="${FLEET_INSTALL_PACKAGE_URL:-https://forgejo.lab.flotilla.work/api/packages}"
+readonly FLEET_ROOT="${FLEET_INSTALL_ROOT:-$HOME/.local/opt/flotilla-fleet}"
+readonly FLEET_BIN_DIR="${FLEET_INSTALL_BIN_DIR:-$HOME/.local/bin}"
+readonly FLEET_TOKEN_FILE="${FLEET_INSTALL_TOKEN_FILE:-$HOME/.config/flotilla/fleet-reader-token}"
+readonly RELEASES_DIR="$FLEET_ROOT/releases"
+readonly CURRENT_LINK="$FLEET_ROOT/current"
+readonly PREVIOUS_LINK="$FLEET_ROOT/previous"
+readonly PLATFORM="linux-x86_64-gnu2.36"
+AUTH_HEADER_FILE=""
+WORK_DIR=""
+READ_ONLY=0
+
+die() {
+  printf 'fleet-install: %s\n' "$*" >&2
+  exit 1
+}
+
+cleanup() {
+  [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
+}
+trap cleanup EXIT
+
+require_linux() {
+  local system="${FLEET_INSTALL_UNAME_S:-$(uname -s)}"
+  local machine="${FLEET_INSTALL_UNAME_M:-$(uname -m)}"
+  if [[ "$system" == Darwin ]]; then
+    die 'Darwin installation is not yet supported; follow #1553: https://github.com/flotilla-org/flotilla/issues/1553'
+  fi
+  [[ "$system-$machine" == Linux-x86_64 ]] || die "unsupported platform: $system-$machine (requires $PLATFORM)"
+}
+
+require_generation() {
+  local generation="$1"
+  [[ "$generation" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || die "invalid generation id: $generation"
+}
+
+make_work_dir() {
+  [[ -n "$WORK_DIR" ]] && return
+  if ((READ_ONLY)); then
+    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fleet-install.XXXXXX")"
+  else
+    mkdir -p "$FLEET_ROOT"
+    WORK_DIR="$(mktemp -d "$FLEET_ROOT/.fleet-install.XXXXXX")"
+  fi
+}
+
+prepare_auth() {
+  [[ -n "$AUTH_HEADER_FILE" ]] && return
+  [[ -f "$FLEET_TOKEN_FILE" && ! -L "$FLEET_TOKEN_FILE" ]] || die "package token is missing: $FLEET_TOKEN_FILE"
+  local mode
+  mode="$(stat -c '%a' "$FLEET_TOKEN_FILE")"
+  [[ "$mode" == 600 ]] || die "package token must have mode 0600: $FLEET_TOKEN_FILE (has $mode)"
+  make_work_dir
+  AUTH_HEADER_FILE="$WORK_DIR/authorization.header"
+  umask 077
+  local token
+  token="$(tr -d '\r\n' <"$FLEET_TOKEN_FILE")"
+  [[ -n "$token" ]] || die "package token is empty: $FLEET_TOKEN_FILE"
+  printf 'Authorization: token %s\n' "$token" >"$AUTH_HEADER_FILE"
+}
+
+download() {
+  local url="$1"
+  local destination="$2"
+  prepare_auth
+  curl --fail --silent --show-error --location --header "@$AUTH_HEADER_FILE" --output "$destination" "$url"
+}
+
+latest_generation() {
+  make_work_dir
+  local page=1
+  local all="$WORK_DIR/packages.jsonl"
+  : >"$all"
+  while true; do
+    local response="$WORK_DIR/packages-$page.json"
+    download "$FLEET_API_URL/packages/$FLEET_OWNER?type=generic&q=$FLEET_PACKAGE&limit=100&page=$page" "$response"
+    python3 - "$response" "$FLEET_PACKAGE" >>"$all" <<'PY'
+import json
+import sys
+
+packages = json.load(open(sys.argv[1]))
+if not isinstance(packages, list):
+    raise SystemExit("package listing is not an array")
+for package in packages:
+    if package.get("type") == "generic" and package.get("name") == sys.argv[2]:
+        print(json.dumps([package.get("created_at", ""), package.get("version", "")]))
+print(f"__COUNT__={len(packages)}")
+PY
+    local count
+    count="$(tail -n 1 "$all" | sed -n 's/^__COUNT__=//p')"
+    sed -i '$d' "$all"
+    [[ "$count" =~ ^[0-9]+$ ]] || die 'invalid package listing response'
+    (( count == 100 )) || break
+    ((page += 1))
+  done
+  python3 - "$all" <<'PY'
+import json
+import sys
+
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+rows = [row for row in rows if row[0] and row[1]]
+if not rows:
+    raise SystemExit("no promoted flotilla-fleet generations found")
+print(max(rows)[1])
+PY
+}
+
+fetch_generation_manifest() {
+  local generation="$1"
+  local destination="$2"
+  require_generation "$generation"
+  download "$FLEET_PACKAGE_URL/$FLEET_OWNER/generic/$FLEET_PACKAGE/$generation/manifest.json" "$destination"
+  python3 - "$destination" "$generation" <<'PY'
+import json
+import re
+import sys
+
+manifest = json.load(open(sys.argv[1]))
+generation = sys.argv[2]
+if manifest.get("schema_version") != 1 or manifest.get("kind") != "flotilla-fleet-generation":
+    raise SystemExit("unsupported generation manifest")
+if manifest.get("generation") != generation:
+    raise SystemExit("generation manifest identity mismatch")
+version = manifest.get("peer_protocol_version")
+if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+    raise SystemExit("generation manifest has invalid peer_protocol_version")
+entry = manifest.get("platforms", {}).get("linux-x86_64-gnu2.36")
+if not isinstance(entry, dict):
+    raise SystemExit("generation has no linux-x86_64-gnu2.36 artifact")
+artifact = entry.get("artifact")
+digest = entry.get("sha256")
+if not isinstance(artifact, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", artifact):
+    raise SystemExit("generation manifest has invalid artifact name")
+if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+    raise SystemExit("generation manifest has invalid artifact digest")
+PY
+}
+
+manifest_value() {
+  local manifest="$1"
+  local expression="$2"
+  python3 - "$manifest" "$expression" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1]))
+for part in sys.argv[2].split("."):
+    value = value[part]
+print(value)
+PY
+}
+
+platform_value() {
+  local manifest="$1"
+  local field="$2"
+  python3 - "$manifest" "$PLATFORM" "$field" <<'PY'
+import json
+import sys
+
+print(json.load(open(sys.argv[1]))["platforms"][sys.argv[2]][sys.argv[3]])
+PY
+}
+
+sha256_file() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+extract_and_verify() {
+  local archive="$1"
+  local destination="$2"
+  local generation_manifest="$3"
+  python3 - "$archive" "$destination" "$generation_manifest" <<'PY'
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tarfile
+from pathlib import Path, PurePosixPath
+
+archive, destination, outer_path = map(Path, sys.argv[1:])
+outer = json.loads(outer_path.read_text())
+with tarfile.open(archive, "r:gz") as bundle:
+    members = bundle.getmembers()
+    roots = set()
+    for member in members:
+        path = PurePosixPath(member.name)
+        if path.is_absolute() or ".." in path.parts or not path.parts:
+            raise SystemExit(f"unsafe archive path: {member.name}")
+        if not (member.isfile() or member.isdir()):
+            raise SystemExit(f"unsupported archive entry: {member.name}")
+        roots.add(path.parts[0])
+    if len(roots) != 1:
+        raise SystemExit("archive must contain exactly one bundle directory")
+    bundle.extractall(destination)
+
+root = destination / roots.pop()
+manifest_path = root / "manifest.json"
+manifest = json.loads(manifest_path.read_text())
+if (
+    manifest.get("schema_version") != 1
+    or manifest.get("kind") != "unsigned-fleet-candidate"
+    or manifest.get("platform") != "linux-x86_64-gnu2.36"
+):
+    raise SystemExit("candidate manifest platform or schema mismatch")
+if manifest.get("peer_protocol_version") != outer.get("peer_protocol_version"):
+    raise SystemExit("candidate and generation peer protocol versions differ")
+entries = manifest.get("files")
+if not isinstance(entries, list) or not entries:
+    raise SystemExit("candidate manifest has no files")
+expected = set()
+for entry in entries:
+    rel = entry.get("path")
+    if not isinstance(rel, str) or PurePosixPath(rel).is_absolute() or ".." in PurePosixPath(rel).parts:
+        raise SystemExit("candidate manifest contains an unsafe path")
+    path = root / rel
+    expected.add(rel)
+    if not path.is_file():
+        raise SystemExit(f"candidate file is missing: {rel}")
+    if path.stat().st_size != entry.get("size_bytes"):
+        raise SystemExit(f"candidate size mismatch: {rel}")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != entry.get("sha256"):
+        raise SystemExit(f"candidate checksum mismatch: {rel}")
+actual = {
+    str(path.relative_to(root))
+    for path in root.rglob("*")
+    if path.is_file() and path != manifest_path
+}
+if actual != expected:
+    raise SystemExit("candidate files do not match the manifest")
+for name in ("flotilla", "flotillad", "cleat"):
+    if f"bin/{name}" not in expected:
+        raise SystemExit(f"candidate is missing required binary: {name}")
+shutil.move(str(root), str(destination / "release"))
+PY
+}
+
+verify_installed_release() {
+  local release="$1"
+  local generation_manifest="$2"
+  python3 - "$release" "$generation_manifest" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path, PurePosixPath
+
+root, outer_path = map(Path, sys.argv[1:])
+manifest_path = root / "manifest.json"
+manifest = json.loads(manifest_path.read_text())
+outer = json.loads(outer_path.read_text())
+if (
+    manifest.get("schema_version") != 1
+    or manifest.get("kind") != "unsigned-fleet-candidate"
+    or manifest.get("platform") != "linux-x86_64-gnu2.36"
+):
+    raise SystemExit("installed candidate manifest platform or schema mismatch")
+if manifest.get("peer_protocol_version") != outer.get("peer_protocol_version"):
+    raise SystemExit("installed candidate and generation peer protocol versions differ")
+entries = manifest.get("files")
+if not isinstance(entries, list) or not entries:
+    raise SystemExit("installed candidate manifest has no files")
+expected = set()
+for entry in entries:
+    rel = entry.get("path")
+    if not isinstance(rel, str) or PurePosixPath(rel).is_absolute() or ".." in PurePosixPath(rel).parts:
+        raise SystemExit("installed candidate manifest contains an unsafe path")
+    path = root / rel
+    expected.add(rel)
+    if not path.is_file() or path.stat().st_size != entry.get("size_bytes"):
+        raise SystemExit(f"installed candidate file mismatch: {rel}")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != entry.get("sha256"):
+        raise SystemExit(f"installed candidate checksum mismatch: {rel}")
+actual = {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file() and path != manifest_path}
+if actual != expected:
+    raise SystemExit("installed candidate files do not match the manifest")
+PY
+}
+
+current_generation() {
+  [[ -L "$CURRENT_LINK" ]] || return 0
+  basename "$(readlink -f "$CURRENT_LINK")"
+}
+
+protocol_version() {
+  local link="$1"
+  [[ -f "$link/manifest.json" ]] || return 0
+  python3 - "$link/manifest.json" <<'PY'
+import json
+import sys
+try:
+    print(json.load(open(sys.argv[1])).get("peer_protocol_version", ""))
+except (OSError, ValueError):
+    pass
+PY
+}
+
+write_launcher() {
+  local name="$1"
+  local launcher="$FLEET_BIN_DIR/$name"
+  mkdir -p "$FLEET_BIN_DIR"
+  if [[ -e "$launcher" ]] && ! grep -Fq '# managed by fleet-install' "$launcher" 2>/dev/null; then
+    die "refusing to replace unmanaged launcher: $launcher"
+  fi
+  local temporary
+  temporary="$(mktemp "$FLEET_BIN_DIR/.$name.fleet-install.XXXXXX")"
+  printf '#!/usr/bin/env bash\n# managed by fleet-install\nexec %q/current/bin/%q "$@"\n' "$FLEET_ROOT" "$name" >"$temporary"
+  chmod 0755 "$temporary"
+  mv -f "$temporary" "$launcher"
+}
+
+ensure_launchers_and_path() {
+  local name resolved expected
+  for name in flotilla flotillad cleat; do
+    write_launcher "$name"
+    expected="$(readlink -f "$FLEET_BIN_DIR")/$name"
+    resolved="$(command -v "$name" || true)"
+    [[ -n "$resolved" ]] || die "$name is not reachable through PATH; add $FLEET_BIN_DIR before installing"
+    [[ "$(readlink -f "$resolved")" == "$expected" ]] || die "PATH shadows the fleet launcher for $name: $resolved; put $FLEET_BIN_DIR first"
+  done
+}
+
+daemon_preflight() {
+  pgrep -u "$(id -u)" -x flotillad >/dev/null 2>&1 || return 0
+  local cli
+  if [[ -x "$CURRENT_LINK/bin/flotilla" ]]; then
+    cli="$CURRENT_LINK/bin/flotilla"
+  else
+    cli="$(command -v flotilla || true)"
+  fi
+  [[ -n "$cli" ]] || die 'flotillad is running; install a usable flotilla command and run `flotilla daemon stop`'
+  if ! "$cli" daemon stop; then
+    die 'flotillad is running and could not be stopped; run `flotilla daemon stop`, then retry'
+  fi
+}
+
+atomic_link() {
+  local target="$1"
+  local link="$2"
+  local temporary="$FLEET_ROOT/.$(basename "$link").new.$$"
+  ln -s "$target" "$temporary"
+  mv -Tf "$temporary" "$link"
+}
+
+switch_to() {
+  local generation="$1"
+  local old="$(current_generation)"
+  [[ "$old" != "$generation" ]] || return 0
+  daemon_preflight
+  if [[ -n "$old" ]]; then
+    atomic_link "releases/$old" "$PREVIOUS_LINK"
+  fi
+  atomic_link "releases/$generation" "$CURRENT_LINK"
+}
+
+install_generation() {
+  local generation="$1"
+  require_generation "$generation"
+  mkdir -p "$RELEASES_DIR"
+  local old="$(current_generation)"
+  printf 'fleet-install: %s -> %s\n' "${old:-<none>}" "$generation"
+  if [[ -d "$RELEASES_DIR/$generation" ]]; then
+    make_work_dir
+    local installed_outer="$WORK_DIR/installed-manifest.json"
+    fetch_generation_manifest "$generation" "$installed_outer"
+    verify_installed_release "$RELEASES_DIR/$generation" "$installed_outer"
+    ensure_launchers_and_path
+    switch_to "$generation"
+    printf 'fleet-install: generation %s is installed\n' "$generation"
+    return
+  fi
+  make_work_dir
+  local outer="$WORK_DIR/manifest.json"
+  local archive="$WORK_DIR/artifact.tar.gz"
+  local unpack="$WORK_DIR/unpack"
+  fetch_generation_manifest "$generation" "$outer"
+  local artifact expected actual
+  artifact="$(platform_value "$outer" artifact)"
+  expected="$(platform_value "$outer" sha256)"
+  download "$FLEET_PACKAGE_URL/$FLEET_OWNER/generic/$FLEET_PACKAGE/$generation/$artifact" "$archive"
+  actual="$(sha256_file "$archive")"
+  [[ "$actual" == "$expected" ]] || die "archive digest mismatch for $generation: expected $expected, got $actual"
+  mkdir -p "$unpack"
+  extract_and_verify "$archive" "$unpack" "$outer"
+  mv "$unpack/release" "$RELEASES_DIR/$generation"
+  chmod -R a-w "$RELEASES_DIR/$generation"
+  ensure_launchers_and_path
+  switch_to "$generation"
+  printf 'fleet-install: generation %s is installed\n' "$generation"
+}
+
+show_status() {
+  make_work_dir
+  local current latest target_manifest current_version target_version
+  current="$(current_generation)"
+  latest="$(latest_generation)"
+  target_manifest="$WORK_DIR/latest-manifest.json"
+  fetch_generation_manifest "$latest" "$target_manifest"
+  current_version="$(protocol_version "$CURRENT_LINK")"
+  target_version="$(manifest_value "$target_manifest" peer_protocol_version)"
+  printf 'current: %s (peer protocol %s)\n' "${current:-<none>}" "${current_version:-unknown}"
+  printf 'latest:  %s (peer protocol %s)\n' "$latest" "$target_version"
+  if [[ -n "$current_version" && "$current_version" != "$target_version" ]]; then
+    printf 'warning: peer protocol changes from %s to %s; mixed generations may not peer\n' "$current_version" "$target_version"
+  fi
+}
+
+rollback() {
+  [[ -L "$CURRENT_LINK" ]] || die 'no current generation to roll back'
+  [[ -L "$PREVIOUS_LINK" ]] || die 'no previous generation to roll back to'
+  local current previous
+  current="$(current_generation)"
+  previous="$(basename "$(readlink -f "$PREVIOUS_LINK")")"
+  [[ -d "$RELEASES_DIR/$previous" ]] || die "previous generation is missing: $previous"
+  printf 'fleet-install: %s -> %s (rollback)\n' "$current" "$previous"
+  daemon_preflight
+  atomic_link "releases/$previous" "$CURRENT_LINK"
+  atomic_link "releases/$current" "$PREVIOUS_LINK"
+}
+
+usage() {
+  echo 'usage: fleet-install status | latest | <generation> | rollback' >&2
+  exit 2
+}
+
+main() {
+  [[ $# -eq 1 ]] || usage
+  require_linux
+  case "$1" in
+    status)
+      READ_ONLY=1
+      show_status
+      ;;
+    latest)
+      local generation
+      generation="$(latest_generation)"
+      install_generation "$generation"
+      ;;
+    rollback) rollback ;;
+    -h|--help) usage ;;
+    *) install_generation "$1" ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

@@ -29,3 +29,39 @@ The later trusted half must consume these exact bytes, sign the Darwin
 derivatives, run pristine-runtime proofs, publish the complete cohort, copy it
 offsite, and only then write an immutable completed generation. It must not
 rebuild either project.
+
+## Promoted generation consumer contract
+
+`scripts/fleet-install` consumes immutable versions of the Forgejo Generic
+Package `lab/flotilla-fleet`. Each version must contain the unchanged candidate
+archive and a `manifest.json` with this shape:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "flotilla-fleet-generation",
+  "generation": "20260815T220000Z-f0123456789ab-cabcdef012345",
+  "peer_protocol_version": 20,
+  "platforms": {
+    "linux-x86_64-gnu2.36": {
+      "artifact": "fleet-candidate-linux-x86_64-gnu2.36.tar.gz",
+      "sha256": "<64 lowercase hexadecimal characters>"
+    }
+  }
+}
+```
+
+The protocol value must be copied from the candidate manifest produced above;
+the consumer rejects disagreement between the generation and candidate
+manifests. On Linux, bootstrap the reviewed script to
+`~/.local/bin/fleet-install`, store the package-read token at
+`~/.config/flotilla/fleet-reader-token` with mode `0600`, and run one of:
+
+```sh
+fleet-install status
+fleet-install latest
+fleet-install <generation>
+fleet-install rollback
+```
+
+Darwin installation remains blocked on flotilla-org/flotilla#1553.
