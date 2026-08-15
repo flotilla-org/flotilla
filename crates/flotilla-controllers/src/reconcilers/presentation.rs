@@ -11,7 +11,7 @@ use flotilla_core::{
         builder::HopPlanBuilder,
         environment::{DockerEnvironmentHopResolver, NoopEnvironmentHopResolver},
         remote::ssh_resolver_from_config,
-        resolver::{AlwaysWrap, HopResolver},
+        resolver::HopResolver,
         terminal::NoopTerminalHopResolver,
         Hop, ResolutionContext, ResolvedAction,
     },
@@ -318,12 +318,7 @@ impl<R> PresentationReconciler<R> {
             } else {
                 Arc::new(NoopEnvironmentHopResolver)
             };
-        let hop_resolver = HopResolver {
-            remote: Arc::new(ssh_resolver),
-            environment: env_resolver,
-            terminal: Arc::new(NoopTerminalHopResolver),
-            strategy: Arc::new(AlwaysWrap),
-        };
+        let hop_resolver = HopResolver::new(Arc::new(ssh_resolver), env_resolver, Arc::new(NoopTerminalHopResolver));
         let target_host = self.hop_chain.target_host(host_ref);
         let mut plan = HopPlanBuilder::new(self.hop_chain.local_host()).build_for_prepared_command(&target_host, &attach_args);
         if environment.spec.docker.is_some() {
@@ -347,9 +342,6 @@ impl<R> PresentationReconciler<R> {
         }
         match resolved.0.into_iter().next() {
             Some(ResolvedAction::Command(args)) => Ok(arg::flatten(&args, 0)),
-            Some(other) => {
-                Err(format!("hop chain resolution produced a non-command action for session '{}': {other:?}", session.metadata.name))
-            }
             None => unreachable!("resolved action count checked above"),
         }
     }

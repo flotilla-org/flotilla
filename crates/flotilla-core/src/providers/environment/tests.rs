@@ -903,10 +903,7 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
     use crate::{
         attachable::AttachableId,
         hop_chain::{
-            environment::DockerEnvironmentHopResolver,
-            remote::RemoteHopResolver,
-            resolver::{AlwaysWrap, HopResolver},
-            terminal::TerminalHopResolver,
+            environment::DockerEnvironmentHopResolver, remote::RemoteHopResolver, resolver::HopResolver, terminal::TerminalHopResolver,
             Hop, HopPlan, ResolutionContext, ResolvedAction,
         },
     };
@@ -919,18 +916,11 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
     impl RemoteHopResolver for MockRemote {
         fn resolve_wrap(&self, host: &HostName, context: &mut ResolutionContext) -> Result<(), String> {
             let inner_action = context.actions.pop().ok_or("mock: no inner action")?;
-            let inner_args = match inner_action {
-                ResolvedAction::Command(args) => args,
-                other => return Err(format!("mock remote wrap: expected Command, got {other:?}")),
-            };
+            let ResolvedAction::Command(inner_args) = inner_action;
             let mut ssh_args = vec![Arg::Literal("ssh".into()), Arg::Quoted(host.as_str().to_string())];
             ssh_args.push(Arg::NestedCommand(inner_args));
             context.actions.push(ResolvedAction::Command(ssh_args));
             Ok(())
-        }
-
-        fn resolve_enter(&self, _host: &HostName, _context: &mut ResolutionContext) -> Result<(), String> {
-            unimplemented!("only wrap mode used in this test")
         }
     }
 
@@ -953,12 +943,7 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
     containers.insert(EnvironmentId::new("env1"), "container-abc".to_string());
     let docker_env = Arc::new(DockerEnvironmentHopResolver::new(containers));
 
-    let resolver = HopResolver {
-        remote: Arc::new(MockRemote),
-        environment: docker_env,
-        terminal: Arc::new(MockTerminal),
-        strategy: Arc::new(AlwaysWrap),
-    };
+    let resolver = HopResolver::new(Arc::new(MockRemote), docker_env, Arc::new(MockTerminal));
 
     // ── Build the HopPlan: RemoteToHost → EnterEnvironment → AttachTerminal ──
 
@@ -986,10 +971,7 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
     // Should produce a single Command action (all wrapped)
     assert_eq!(resolved.0.len(), 1, "three-hop wrap should produce exactly one Command action");
 
-    let outer_args = match &resolved.0[0] {
-        ResolvedAction::Command(args) => args,
-        other => panic!("expected Command, got {other:?}"),
-    };
+    let ResolvedAction::Command(outer_args) = &resolved.0[0];
 
     // Outermost: ssh <host> <NestedCommand(...)>
     assert_eq!(outer_args[0], Arg::Literal("ssh".into()), "outermost command should be ssh");

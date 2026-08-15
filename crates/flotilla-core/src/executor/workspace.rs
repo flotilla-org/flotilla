@@ -12,7 +12,7 @@ use crate::{
         builder::HopPlanBuilder,
         environment::{DockerEnvironmentHopResolver, NoopEnvironmentHopResolver},
         remote::ssh_resolver_from_config,
-        resolver::{HopResolver, ResolutionPurpose},
+        resolver::HopResolver,
         terminal::NoopTerminalHopResolver,
         Hop, ResolutionContext, ResolvedAction,
     },
@@ -347,8 +347,7 @@ pub(crate) fn resolve_prepared_commands_via_hop_chain(
         }
         _ => Arc::new(NoopEnvironmentHopResolver),
     };
-    let hop_resolver =
-        HopResolver::new(Arc::new(ssh_resolver), env_resolver, Arc::new(NoopTerminalHopResolver), ResolutionPurpose::CommandExecution);
+    let hop_resolver = HopResolver::new(Arc::new(ssh_resolver), env_resolver, Arc::new(NoopTerminalHopResolver));
     let plan_builder = HopPlanBuilder::new(local_host);
 
     let mut result = Vec::with_capacity(commands.len());
@@ -378,7 +377,6 @@ pub(crate) fn resolve_prepared_commands_via_hop_chain(
         }
         let command_string = match resolved.0.into_iter().next() {
             Some(ResolvedAction::Command(args)) => arg::flatten(&args, 0),
-            Some(_) => return Err(format!("hop chain resolution produced a non-Command action for role '{}'", cmd.role)),
             None => unreachable!("len checked above"),
         };
 

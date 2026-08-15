@@ -77,11 +77,8 @@ use crate::{
     executor,
     executor::checkout::{checkout_matches_scope, CheckoutResolutionScope},
     hop_chain::{
-        environment::{DockerEnvironmentHopResolver, NoopEnvironmentHopResolver},
-        remote::ssh_resolver_from_config,
-        resolver::{HopResolver, ResolutionPurpose},
-        terminal::NoopTerminalHopResolver,
-        Hop, HopPlan, ResolutionContext,
+        environment::DockerEnvironmentHopResolver, remote::ssh_resolver_from_config, resolver::HopResolver,
+        terminal::NoopTerminalHopResolver, Hop, HopPlan, ResolutionContext,
     },
     host_identity::{
         resolve_local_environment_state_dir, resolve_local_host_id, resolve_local_node_id, resolve_or_create_environment_id,
@@ -7409,23 +7406,9 @@ impl InProcessDaemon {
             AttachMode::Take => command.push(flotilla_protocol::arg::Arg::Literal("--take".to_string())),
         }
         command.push(flotilla_protocol::arg::Arg::Quoted(reference.to_string()));
-        let hop_resolver = HopResolver::new(
-            Arc::new(resolver),
-            Arc::new(NoopEnvironmentHopResolver),
-            Arc::new(NoopTerminalHopResolver),
-            ResolutionPurpose::Attach,
-        );
-        let plan = HopPlan(vec![Hop::RemoteToHost { host: next_hop.clone() }, Hop::RunCommand { command }]);
-        let mut context = ResolutionContext {
-            current_host: self.host_name.clone(),
-            current_environment: None,
-            working_directory: None,
-            actions: Vec::new(),
-            nesting_depth: 0,
-        };
-        hop_resolver
-            .resolve(&plan, &mut context)
-            .map(|resolved| ResolvedAttachPlan(resolved.0))
+        resolver
+            .one_hop_command_args(&next_hop, command)
+            .map(ResolvedAttachPlan::command)
             .map_err(|err| format!("unreachable next hop '{next_hop}' for host '{target_host}': {err}"))
     }
 
@@ -7465,7 +7448,6 @@ impl InProcessDaemon {
                 Arc::new(crate::hop_chain::remote::NoopRemoteHopResolver),
                 Arc::new(environment_resolver),
                 Arc::new(NoopTerminalHopResolver),
-                ResolutionPurpose::Attach,
             );
             let plan = HopPlan(vec![Hop::EnterEnvironment { env_id: environment_id, provider: "docker".to_string() }, Hop::RunCommand {
                 command: attach_args,

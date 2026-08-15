@@ -1,12 +1,9 @@
 //! Structured resolution of transport hops.
 //!
-//! Resolution is keyed by purpose rather than transport type. Interactive
-//! attaches use send-keys at every SSH or environment boundary: enter a real
-//! shell, wait for it to become ready, then type the next transient
-//! `flotilla attach`. Non-interactive command execution (workspace
-//! provisioning, probes, and command runners) wraps the inner command into
-//! the outer transport invocation. Both purposes use the same per-hop
-//! resolvers and quoting model.
+//! Command execution wraps an inner command into the local transport invocation.
+//! Interactive attach resolves only one level at a time, so it uses the same
+//! wrapping model for that level and lets `flotilla attach` at the next level
+//! resolve the following hop.
 
 pub mod builder;
 pub mod environment;
@@ -17,7 +14,7 @@ pub mod terminal;
 #[cfg(test)]
 mod tests;
 
-pub use flotilla_protocol::{arg::Arg, ResolvedAttachAction as ResolvedAction, SendKeyStep};
+pub use flotilla_protocol::{arg::Arg, ResolvedAttachAction as ResolvedAction};
 use flotilla_protocol::{EnvironmentId, HostName};
 
 use crate::{attachable::AttachableId, path_context::ExecutionEnvironmentPath};

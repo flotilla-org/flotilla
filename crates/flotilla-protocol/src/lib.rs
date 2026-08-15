@@ -29,7 +29,7 @@ pub mod test_support;
 
 use std::fmt;
 
-pub use attach_plan::{AttachExcursionId, ResolvedAttachAction, ResolvedAttachPlan, SendKeyStep, ATTACH_LEASE_PLACEHOLDER};
+pub use attach_plan::{ResolvedAttachAction, ResolvedAttachPlan};
 pub use environment::{EnvironmentId, EnvironmentInfo, EnvironmentKind, EnvironmentSpec, EnvironmentStatus, ImageId, ImageSource};
 pub use host::{HostName, HostPath, RepoIdentity};
 pub use host_summary::{
@@ -183,7 +183,7 @@ pub use snapshot::{CategoryLabels, ProviderError, RepoInfo, RepoKey, RepoLabels,
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 
 const BUILD_ID_SEPARATOR: &str = "\u{1f}flotilla-build:";
 
@@ -279,17 +279,6 @@ pub enum Request {
     SubscribeWait {
         subscription: WaitSubscriptionRequest,
     },
-    /// Register teardown for an interactive attach before launching it. The
-    /// actions are ordered innermost-to-outermost and belong to this socket
-    /// connection until finished.
-    BeginAttachExcursion {
-        excursion_id: AttachExcursionId,
-        cleanup_actions: Vec<Vec<arg::Arg>>,
-    },
-    /// Run and forget a registered attach teardown.
-    FinishAttachExcursion {
-        excursion_id: AttachExcursionId,
-    },
     GetStatus,
     GetTopology,
     AgentHook {
@@ -321,8 +310,6 @@ pub enum Response {
     WaitSubscribed {
         subscription_id: uuid::Uuid,
     },
-    BeginAttachExcursion,
-    FinishAttachExcursion,
     GetStatus(StatusResponse),
     GetTopology(TopologyResponse),
     AgentHook,

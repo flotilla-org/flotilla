@@ -1,17 +1,13 @@
 use flotilla_protocol::{arg::Arg, HostName};
 use tracing::warn;
 
-use super::{ResolutionContext, ResolvedAction, SendKeyStep};
+use super::{ResolutionContext, ResolvedAction};
 use crate::{config::HostsConfig, path_context::DaemonHostPath};
 
 /// Resolves a `Hop::RemoteToHost` into SSH-specific actions on the context.
 ///
-/// Two methods for the two combination strategies:
-/// - `resolve_wrap`: nest the inner command as an SSH argument
-/// - `resolve_enter`: open an SSH session, then type the inner command
 pub trait RemoteHopResolver: Send + Sync {
     fn resolve_wrap(&self, host: &HostName, context: &mut ResolutionContext) -> Result<(), String>;
-    fn resolve_enter(&self, host: &HostName, context: &mut ResolutionContext) -> Result<(), String>;
 }
 
 /// SSH-based remote hop resolver. Extracts the SSH wrapping knowledge previously
@@ -103,20 +99,6 @@ impl SshRemoteHopResolver {
         ]));
         Ok(ssh_args)
     }
-
-    fn route_cleanup_actions(&self, info: &SshInfo, context: &mut ResolutionContext) {
-        for action in &mut context.actions {
-            let ResolvedAction::Cleanup(command) = action else { continue };
-            let mut ssh_args = self.ssh_prefix_args(info, false);
-            ssh_args.push(Arg::NestedCommand(vec![
-                Arg::Literal("${SHELL:-/bin/sh}".into()),
-                Arg::Literal("-l".into()),
-                Arg::Literal("-c".into()),
-                Arg::NestedCommand(std::mem::take(command)),
-            ]));
-            *command = ssh_args;
-        }
-    }
 }
 
 impl RemoteHopResolver for SshRemoteHopResolver {
@@ -131,14 +113,9 @@ impl RemoteHopResolver for SshRemoteHopResolver {
     ///       NestedCommand([Literal("cd"), Quoted("/dir"), Literal("&&"), ...inner...])])]
     fn resolve_wrap(&self, host: &HostName, context: &mut ResolutionContext) -> Result<(), String> {
         let info = self.ssh_info(host)?;
-        self.route_cleanup_actions(&info, context);
-
         // Pop the inner action — must be a Command
         let inner_action = context.actions.pop().ok_or("resolve_wrap: no inner action on stack")?;
-        let inner_args = match inner_action {
-            ResolvedAction::Command(args) => args,
-            other => return Err(format!("resolve_wrap: expected Command on stack, got {other:?}")),
-        };
+        let ResolvedAction::Command(inner_args) = inner_action;
 
         // Build the innermost args, optionally prefixed with cd
         let shell_inner_args = if let Some(ref dir) = context.working_directory {
@@ -176,53 +153,6 @@ impl RemoteHopResolver for SshRemoteHopResolver {
         context.working_directory = None;
         Ok(())
     }
-
-    /// SendKeys case: convert inner Command to SendKeys, push SSH enter command.
-    ///
-    /// Produces two actions on the stack:
-    ///   1. Command: `ssh -t [multiplex] user@host` (bottom — runs first)
-    ///   2. SendKeys: Type(flattened inner command) + WaitForReady (top)
-    fn resolve_enter(&self, host: &HostName, context: &mut ResolutionContext) -> Result<(), String> {
-        let info = self.ssh_info(host)?;
-        self.route_cleanup_actions(&info, context);
-
-        // Pop the inner action — must be a Command
-        let inner_action = context.actions.pop().ok_or("resolve_enter: no inner action on stack")?;
-        let inner_args = match inner_action {
-            ResolvedAction::Command(args) => args,
-            other => return Err(format!("resolve_enter: expected Command on stack, got {other:?}")),
-        };
-
-        // Flatten inner command to a string for typing
-        let mut type_parts = Vec::new();
-        if let Some(ref dir) = context.working_directory {
-            type_parts.push(format!("cd {}", flotilla_protocol::arg::shell_quote(&dir.to_string())));
-            if !inner_args.is_empty() {
-                type_parts.push("&&".into());
-                type_parts.push(format!("exec {}", flotilla_protocol::arg::flatten(&inner_args, 0)));
-            }
-        } else if !inner_args.is_empty() {
-            type_parts.push(format!("exec {}", flotilla_protocol::arg::flatten(&inner_args, 0)));
-        }
-
-        let type_text = type_parts.join(" ");
-
-        // Push SendKeys for the inner command (if non-empty)
-        if !type_text.is_empty() {
-            context.actions.push(ResolvedAction::SendKeys {
-                hop: format!("remote host '{host}'"),
-                steps: vec![SendKeyStep::Type { text: type_text }, SendKeyStep::WaitForReady],
-            });
-        }
-
-        // Push SSH enter command (no remote command — just open the session)
-        let ssh_args = self.ssh_prefix_args(&info, true);
-        context.actions.push(ResolvedAction::Command(ssh_args));
-
-        // Working directory consumed
-        context.working_directory = None;
-        Ok(())
-    }
 }
 
 /// No-op remote hop resolver that always errors. Used when the hop plan
@@ -231,10 +161,6 @@ pub struct NoopRemoteHopResolver;
 
 impl RemoteHopResolver for NoopRemoteHopResolver {
     fn resolve_wrap(&self, host: &HostName, _context: &mut ResolutionContext) -> Result<(), String> {
-        Err(format!("no remote transport available to reach host: {host}"))
-    }
-
-    fn resolve_enter(&self, host: &HostName, _context: &mut ResolutionContext) -> Result<(), String> {
         Err(format!("no remote transport available to reach host: {host}"))
     }
 }
