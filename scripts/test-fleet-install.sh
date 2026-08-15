@@ -157,6 +157,7 @@ run_installer "$generation_one" >"$test_root/install-one.out"
 test "$(basename "$(readlink -f "$test_root/home/.local/opt/flotilla-fleet/current")")" = "$generation_one" || fail 'exact generation was not selected'
 test -x "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/bin/flotilla" || fail 'candidate binaries were not staged'
 test ! -w "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json" || fail 'selected generation is writable'
+test "$(stat -c '%a' "$test_root/home/.local/bin")" = 755 || fail 'credential umask leaked into the launcher directory'
 for name in flotilla flotillad cleat; do
   grep -Fq '# managed by fleet-install' "$test_root/home/.local/bin/$name" || fail "missing stable $name launcher"
 done

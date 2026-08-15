@@ -58,11 +58,10 @@ prepare_auth() {
   [[ "$mode" == 600 ]] || die "package token must have mode 0600: $FLEET_TOKEN_FILE (has $mode)"
   make_work_dir
   AUTH_HEADER_FILE="$WORK_DIR/authorization.header"
-  umask 077
   local token
   token="$(tr -d '\r\n' <"$FLEET_TOKEN_FILE")"
   [[ -n "$token" ]] || die "package token is empty: $FLEET_TOKEN_FILE"
-  printf 'Authorization: token %s\n' "$token" >"$AUTH_HEADER_FILE"
+  (umask 077 && printf 'Authorization: token %s\n' "$token" >"$AUTH_HEADER_FILE")
 }
 
 download() {
