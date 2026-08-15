@@ -1,4 +1,3 @@
-mod attach_excursions;
 mod client_connection;
 pub mod environment_sockets;
 mod peer_connection;

@@ -1,10 +1,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use flotilla_protocol::{
-    arg::Arg, commands::CommandValue, AttachExcursionId, Command, DaemonEvent, QueryCursor, RepoInfo, StatusResponse, StreamKey,
-    TopologyResponse,
-};
+use flotilla_protocol::{commands::CommandValue, Command, DaemonEvent, QueryCursor, RepoInfo, StatusResponse, StreamKey, TopologyResponse};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -87,17 +84,6 @@ pub trait DaemonHandle: Send + Sync {
     /// Replace the calling surface's current focal resource set.
     async fn observe_focus(&self, _surface_id: Uuid, _targets: Vec<flotilla_protocol::ResourceRef>) -> Result<(), String> {
         Ok(())
-    }
-
-    /// Give the daemon ownership of an attach excursion's compensating
-    /// actions. Socket daemons bind that ownership to the calling connection.
-    async fn begin_attach_excursion(&self, _excursion_id: AttachExcursionId, _cleanup_actions: Vec<Vec<Arg>>) -> Result<(), String> {
-        Err("attach excursions are unsupported by this daemon".to_string())
-    }
-
-    /// Complete an excursion and run its teardown innermost-to-outermost.
-    async fn finish_attach_excursion(&self, _excursion_id: AttachExcursionId) -> Result<(), String> {
-        Err("attach excursions are unsupported by this daemon".to_string())
     }
 
     /// Execute a query command synchronously. Returns the result directly

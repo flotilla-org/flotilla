@@ -12,7 +12,7 @@ use flotilla_transport::message::MessageSession;
 use tokio::sync::{watch, Notify};
 use tracing::{error, info, warn};
 
-use super::{attach_excursions::AttachExcursions, remote_commands::RemoteCommandRouter, request_dispatch::RequestDispatcher};
+use super::{remote_commands::RemoteCommandRouter, request_dispatch::RequestDispatcher};
 
 /// Named queries a client connection has subscribed to. Result-set events
 /// for other queries are not relayed to the connection.
@@ -35,7 +35,6 @@ pub(super) struct ClientConnection {
     client_count: Arc<AtomicUsize>,
     client_notify: Arc<Notify>,
     agent_state_store: SharedAgentStateStore,
-    attach_excursions: Arc<AttachExcursions>,
 }
 
 impl ClientConnection {
@@ -47,15 +46,7 @@ impl ClientConnection {
         client_notify: Arc<Notify>,
         agent_state_store: SharedAgentStateStore,
     ) -> Self {
-        Self {
-            daemon,
-            shutdown_rx,
-            remote_command_router,
-            client_count,
-            client_notify,
-            agent_state_store,
-            attach_excursions: Default::default(),
-        }
+        Self { daemon, shutdown_rx, remote_command_router, client_count, client_notify, agent_state_store }
     }
 
     /// Run a stateful client session that began with a Hello handshake.
@@ -108,21 +99,14 @@ impl ClientConnection {
             }
         });
 
-        let request_dispatcher = RequestDispatcher::with_attach_excursions(
-            &self.daemon,
-            &self.remote_command_router,
-            &self.agent_state_store,
-            Arc::clone(&self.attach_excursions),
-            session_id,
-            subscriptions,
-        );
+        let request_dispatcher =
+            RequestDispatcher::new(&self.daemon, &self.remote_command_router, &self.agent_state_store, session_id, subscriptions);
         (event_task, request_dispatcher, self.shutdown_rx.clone())
     }
 
     /// Common teardown: abort event relay, decrement client count.
     async fn finish_session(&self, event_task: tokio::task::JoinHandle<()>, session_id: uuid::Uuid) {
         event_task.abort();
-        self.attach_excursions.finish_all().await;
         self.daemon.unsubscribe_queries(session_id).await;
         self.daemon.unsubscribe_waits(session_id).await;
         if let Err(error) = self.daemon.disconnect_surface(session_id).await {

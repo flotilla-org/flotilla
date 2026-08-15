@@ -10,12 +10,8 @@ use crate::{
         Attachable, AttachableContent, BindingObjectKind, ProviderBinding, SharedAttachableStore, TerminalAttachable, TerminalPurpose,
     },
     hop_chain::{
-        builder::HopPlanBuilder,
-        environment::NoopEnvironmentHopResolver,
-        remote::NoopRemoteHopResolver,
-        resolver::{HopResolver, ResolutionPurpose},
-        terminal::PoolTerminalHopResolver,
-        ResolutionContext, ResolvedAction,
+        builder::HopPlanBuilder, environment::NoopEnvironmentHopResolver, remote::NoopRemoteHopResolver, resolver::HopResolver,
+        terminal::PoolTerminalHopResolver, ResolutionContext, ResolvedAction,
     },
     path_context::ExecutionEnvironmentPath,
     providers::terminal::{parse_managed_session_name, ManagedSessionMetadata, TerminalEnvVars, TerminalPool},
@@ -188,12 +184,8 @@ impl TerminalManager {
 
         let terminal_resolver =
             PoolTerminalHopResolver::new(Arc::clone(&self.pool), self.store.clone(), daemon_socket_path.map(|s| s.to_string()));
-        let hop_resolver = HopResolver::new(
-            Arc::new(NoopRemoteHopResolver),
-            Arc::new(NoopEnvironmentHopResolver),
-            Arc::new(terminal_resolver),
-            ResolutionPurpose::Attach,
-        );
+        let hop_resolver =
+            HopResolver::new(Arc::new(NoopRemoteHopResolver), Arc::new(NoopEnvironmentHopResolver), Arc::new(terminal_resolver));
 
         let mut context = ResolutionContext {
             current_host: self.local_host.clone(),
@@ -207,10 +199,8 @@ impl TerminalManager {
         resolved
             .0
             .into_iter()
-            .find_map(|action| match action {
-                ResolvedAction::Command(args) => Some(arg::flatten(&args, 0)),
-                _ => None,
-            })
+            .next()
+            .map(|ResolvedAction::Command(args)| arg::flatten(&args, 0))
             .ok_or_else(|| "hop chain resolution produced no Command action for attach".to_string())
     }
 

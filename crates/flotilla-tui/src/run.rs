@@ -181,26 +181,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         }
         if let Some(plan) = app.pending_attach_plan.take() {
             events.pause_terminal_input().await;
-            let prepared = crate::terminal::prepare_attach_plan(&plan);
-            let registration = match prepared.excursion_id {
-                Some(excursion_id) => app.daemon.begin_attach_excursion(excursion_id, prepared.cleanup_actions.clone()).await,
-                None => Ok(()),
-            };
-            let registered = registration.is_ok();
-            let (next_terminal, mut result) = match registration {
-                Err(error) => (terminal, Err(error)),
-                Ok(()) => crate::terminal::run_temporary_attach(&prepared),
-            };
-            if registered {
-                if let Some(excursion_id) = prepared.excursion_id {
-                    if let Err(error) = app.daemon.finish_attach_excursion(excursion_id).await {
-                        result = Err(match result {
-                            Ok(()) => error,
-                            Err(attach_error) => format!("{attach_error}; attach cleanup also failed: {error}"),
-                        });
-                    }
-                }
-            }
+            let (next_terminal, result) = crate::terminal::run_temporary_attach(&plan);
             terminal = next_terminal;
             terminal_title = None;
             events.resume_terminal_input();

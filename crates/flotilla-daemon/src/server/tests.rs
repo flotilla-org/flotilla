@@ -19,16 +19,14 @@ use flotilla_core::{
     },
 };
 use flotilla_protocol::{
-    arg::Arg,
     commands::DaemonLogQuery,
     qualified_path::QualifiedPath,
     result_set::{QueryChanges, QueryId, ResultDelta},
-    AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachBinding, AttachExcursionId, AttachableId, CheckoutTarget, Command,
-    CommandAction, CommandPeerEvent, CommandValue, ConfigLabel, ConvoyStartIntent, CrewCommandContext, DaemonEvent, EnvironmentId,
-    HostName, HostProviderStatus, HostSummary, Message, NodeId, NodeInfo, PeerConnectionState, PeerWireMessage, PreparedWorkspace,
-    QueryCursor, RepoIdentity, RepoSelector, Request, ResourceCursor, Response, ResponseResult, RoutedPeerMessage, StepAction,
-    StepExecutionContext, StepOutcome, StepStatus, StreamKey, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION,
-    TERMINAL_POOL_PROVIDER_CATEGORY,
+    AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachBinding, AttachableId, CheckoutTarget, Command, CommandAction,
+    CommandPeerEvent, CommandValue, ConfigLabel, ConvoyStartIntent, CrewCommandContext, DaemonEvent, EnvironmentId, HostName,
+    HostProviderStatus, HostSummary, Message, NodeId, NodeInfo, PeerConnectionState, PeerWireMessage, PreparedWorkspace, QueryCursor,
+    RepoIdentity, RepoSelector, Request, ResourceCursor, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext,
+    StepOutcome, StepStatus, StreamKey, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus, Host,
@@ -1742,6 +1740,12 @@ expected_host_name = "feta"
     let CommandValue::ConvoyStarted { attach_plan: Some(plan), .. } = result else {
         panic!("expected routed convoy attach result, got {result:?}");
     };
+    let [flotilla_protocol::ResolvedAttachAction::Command(args)] = plan.0.as_slice() else {
+        panic!("remote attach must be one executable next-hop command, got {plan:?}");
+    };
+    let command = flotilla_protocol::arg::flatten(args, 0);
+    assert!(command.starts_with("ssh -t "), "remote attach should exec one SSH hop: {command}");
+    assert!(command.contains("flotilla attach"), "the SSH remote command should recurse through flotilla attach: {command}");
     let rendered = format!("{plan:?}");
     assert!(rendered.contains("feta.example"), "attach should route through configured peer: {rendered}");
     assert!(rendered.contains("remote-session"), "attach should preserve the remote session reference: {rendered}");
@@ -3343,126 +3347,6 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
     drop(writer);
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     assert_eq!(client_count.load(Ordering::SeqCst), 0, "request client should be removed after disconnect");
-}
-
-#[tokio::test]
-async fn client_disconnect_finishes_attach_excursion_inside_out() {
-    let (tmp, client, handle, client_count, _shutdown_tx) = spawn_test_client_handler().await;
-    let order_path = tmp.path().join("attach-cleanup-order");
-    let (read_half, write_half) = client.into_split();
-    let mut reader = BufReader::new(read_half).lines();
-    let mut writer = BufWriter::new(write_half);
-
-    flotilla_protocol::framing::write_message_line(&mut writer, &current_client_hello()).await.expect("write client hello");
-    let _hello = reader.next_line().await.expect("read hello response").expect("hello response line");
-
-    let inner = format!("printf inner > '{}'", order_path.display());
-    let outer = format!("printf -- '->outer' >> '{}'", order_path.display());
-    let request = Message::Request {
-        id: 1,
-        request: Request::BeginAttachExcursion {
-            excursion_id: AttachExcursionId::new(),
-            cleanup_actions: vec![vec![Arg::Literal("sh".into()), Arg::Literal("-c".into()), Arg::Quoted(inner)], vec![
-                Arg::Literal("sh".into()),
-                Arg::Literal("-c".into()),
-                Arg::Quoted(outer),
-            ]],
-        },
-    };
-    flotilla_protocol::framing::write_message_line(&mut writer, &request).await.expect("register attach excursion");
-    let response = reader.next_line().await.expect("read response").expect("response line");
-    assert!(matches!(ok_response(serde_json::from_str(&response).expect("parse response"), 1), Response::BeginAttachExcursion));
-
-    drop(writer);
-    drop(reader);
-    tokio::time::timeout(Duration::from_secs(2), handle).await.expect("client disconnect cleanup timed out").expect("client handler");
-
-    assert_eq!(std::fs::read_to_string(order_path).expect("cleanup order marker"), "inner->outer");
-    assert_eq!(client_count.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-#[ignore = "requires Docker and the debian:trixie-slim image"]
-async fn client_disconnect_reaps_docker_exec_and_frees_interior_seat() {
-    struct ContainerCleanup(String);
-    impl Drop for ContainerCleanup {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("docker").args(["rm", "-f", &self.0]).status();
-        }
-    }
-
-    let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let container = format!("flotilla-attach-liveness-{suffix}");
-    let pid_file = format!("/tmp/flotilla-attach-{suffix}.pid");
-    let seat = format!("/tmp/flotilla-attach-{suffix}.seat");
-    let lease = format!("lease-{suffix}");
-    let started = tokio::process::Command::new("docker")
-        .args(["run", "-d", "--name", &container, "debian:trixie-slim", "sleep", "infinity"])
-        .status()
-        .await
-        .expect("start Docker liveness container");
-    assert!(started.success());
-    let _container_cleanup = ContainerCleanup(container.clone());
-
-    let (_tmp, client, handle, _client_count, _shutdown_tx) = spawn_test_client_handler().await;
-    let session = flotilla_transport::message::unix_message_session(client);
-    complete_client_hello(&session).await;
-    let cleanup = format!(
-        "pid=$(cat {pid_file} 2>/dev/null) || exit 0; \
-         if [ -r \"/proc/$pid/environ\" ] && tr '\\000' '\\n' < \"/proc/$pid/environ\" | \
-         grep -Fqx 'FLOTILLA_ATTACH_LEASE={lease}'; then kill -KILL \"$pid\" 2>/dev/null || true; fi; rm -f {pid_file}"
-    );
-    session
-        .write(Message::Request {
-            id: 1,
-            request: Request::BeginAttachExcursion {
-                excursion_id: AttachExcursionId::new(),
-                cleanup_actions: vec![vec![
-                    Arg::Literal("docker".into()),
-                    Arg::Literal("exec".into()),
-                    Arg::Quoted(container.clone()),
-                    Arg::Literal("sh".into()),
-                    Arg::Literal("-c".into()),
-                    Arg::Quoted(cleanup),
-                ]],
-            },
-        })
-        .await
-        .expect("register Docker cleanup");
-    assert!(matches!(ok_response(read_session_message(&session).await, 1), Response::BeginAttachExcursion));
-
-    let inner = format!("export FLOTILLA_ATTACH_LEASE={lease}; exec 9>{seat}; flock -n 9 || exit 1; echo $$ > {pid_file}; exec sleep 300");
-    let mut docker_exec =
-        tokio::process::Command::new("docker").args(["exec", &container, "sh", "-c", &inner]).spawn().expect("spawn Docker exec attach");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let status = tokio::process::Command::new("docker")
-                .args(["exec", &container, "test", "-s", &pid_file])
-                .status()
-                .await
-                .expect("probe interior PID");
-            if status.success() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("interior attach did not publish its PID");
-
-    drop(session);
-    tokio::time::timeout(Duration::from_secs(5), handle).await.expect("disconnect cleanup timed out").expect("client handler");
-    let exec_status = tokio::time::timeout(Duration::from_secs(2), docker_exec.wait())
-        .await
-        .expect("docker exec client lingered")
-        .expect("wait for Docker exec");
-    assert!(!exec_status.success(), "killed attach should not exit successfully");
-    let second = tokio::process::Command::new("docker")
-        .args(["exec", &container, "flock", "-n", &seat, "true"])
-        .status()
-        .await
-        .expect("attempt second attach");
-    assert!(second.success(), "second attach should acquire the released seat");
 }
 
 #[tokio::test]

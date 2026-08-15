@@ -1,7 +1,6 @@
 use std::{
     future::Future,
     path::{Path, PathBuf},
-    process::ExitStatus,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -1026,7 +1025,7 @@ async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) 
     if let CommandValue::ConvoyStarted { name, attach_plan: Some(plan), binding } = result {
         if matches!(format, OutputFormat::Human) {
             stamp_pane_identity(&name, binding.as_ref()).await;
-            return run_attach_plan(&*daemon, &plan).await;
+            return run_attach_plan(&plan);
         }
     }
     Ok(())
@@ -1090,7 +1089,7 @@ async fn run_attach(
                 if !transient {
                     stamp_pane_identity(reference, binding.as_ref()).await;
                 }
-                run_attach_plan(&*daemon, &plan).await
+                run_attach_plan(&plan)
             }
         },
         CommandValue::Error { message } => match format {
@@ -1380,61 +1379,8 @@ fn print_resource_watch_event(response: &flotilla_protocol::ResourceReadEnvelope
     }
 }
 
-async fn run_attach_plan(daemon: &dyn DaemonHandle, plan: &flotilla_protocol::ResolvedAttachPlan) -> Result<()> {
-    let prepared = flotilla_tui::terminal::prepare_attach_plan(plan);
-    if let Some(excursion_id) = prepared.excursion_id {
-        daemon
-            .begin_attach_excursion(excursion_id, prepared.cleanup_actions.clone())
-            .await
-            .map_err(|error| color_eyre::eyre::eyre!(error))?;
-    }
-    let attach_result = flotilla_tui::terminal::run_attach_plan(&prepared).map_err(|error| color_eyre::eyre::eyre!(error));
-    let cleanup_result = match prepared.excursion_id {
-        Some(excursion_id) => daemon.finish_attach_excursion(excursion_id).await.map_err(|error| color_eyre::eyre::eyre!(error)),
-        None => Ok(()),
-    };
-    let status = match (attach_result, cleanup_result) {
-        (Ok(status), Ok(())) => status,
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
-        (Err(attach_error), Err(cleanup_error)) => {
-            return Err(color_eyre::eyre::eyre!("{attach_error}; attach cleanup also failed: {cleanup_error}"));
-        }
-    };
-    terminate_with_attach_status(status)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum AttachExitDisposition {
-    Code(i32),
-    #[cfg(unix)]
-    Signal(i32),
-}
-
-fn attach_exit_disposition(status: ExitStatus) -> AttachExitDisposition {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return AttachExitDisposition::Signal(signal);
-        }
-    }
-    AttachExitDisposition::Code(status.code().unwrap_or(1))
-}
-
-fn terminate_with_attach_status(status: ExitStatus) -> ! {
-    match attach_exit_disposition(status) {
-        AttachExitDisposition::Code(code) => std::process::exit(code),
-        #[cfg(unix)]
-        AttachExitDisposition::Signal(signal) => {
-            // Match the old `exec` path: callers should observe the attach
-            // process's terminating signal, not a generic Flotilla error.
-            unsafe {
-                libc::signal(signal, libc::SIG_DFL);
-                libc::raise(signal);
-            }
-            std::process::exit(128 + signal)
-        }
-    }
+fn run_attach_plan(plan: &flotilla_protocol::ResolvedAttachPlan) -> Result<()> {
+    flotilla_tui::terminal::exec_attach_plan(plan).map(|never| match never {}).map_err(color_eyre::eyre::Report::msg)
 }
 
 async fn resolve_host_target(cli: &Cli, subject: &HostName) -> Result<(EnvironmentId, flotilla_protocol::NodeId)> {
@@ -1968,10 +1914,7 @@ fn uninstall_claude_code_hooks(path: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::{Path, PathBuf},
-        process::Command,
-    };
+    use std::path::{Path, PathBuf};
 
     use clap::Parser;
     use flotilla_protocol::{
@@ -1980,11 +1923,11 @@ mod tests {
     };
 
     use super::{
-        attach_exit_disposition, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing,
-        format_human_resource_value, host_daemon_socket_required, provisioning_target_for_environment, replace_host_ids,
-        run_replica_snapshot, select_host_target, select_startup_repo_roots, should_reexec_for_incompatible_daemon, show_startup_splash,
-        socket_path_from, AttachExitDisposition, Cli, CliPaths, CommandValue, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs,
-        ResourceListArgs, ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
+        client_dirs_from, confirm_command, daemon_paths_from, default_project_landing, format_human_resource_value,
+        host_daemon_socket_required, provisioning_target_for_environment, replace_host_ids, run_replica_snapshot, select_host_target,
+        select_startup_repo_roots, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, Cli, CliPaths,
+        CommandValue, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceStatusPatchArgs,
+        ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
 
     fn landing_repo(path: &str, name: &str, key: Option<&str>) -> RepoInfo {
@@ -2039,24 +1982,11 @@ mod tests {
     }
 
     #[test]
-    fn attach_exit_disposition_preserves_child_exit_code() {
-        let status = Command::new("sh").args(["-c", "exit 42"]).status().expect("run child");
-        assert_eq!(attach_exit_disposition(status), AttachExitDisposition::Code(42));
-    }
-
-    #[test]
     fn incompatible_daemon_reexecs_once_per_client_build() {
         let mismatch = "daemon protocol version mismatch: daemon has 18, client has 17";
         assert!(should_reexec_for_incompatible_daemon(mismatch, None));
         assert!(!should_reexec_for_incompatible_daemon(mismatch, Some(flotilla_tui::socket::BUILD_ID)));
         assert!(!should_reexec_for_incompatible_daemon("daemon unavailable", None));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn attach_exit_disposition_preserves_child_signal() {
-        let status = Command::new("sh").args(["-c", "kill -TERM $$"]).status().expect("run child");
-        assert_eq!(attach_exit_disposition(status), AttachExitDisposition::Signal(libc::SIGTERM));
     }
 
     #[test]
