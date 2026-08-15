@@ -444,10 +444,6 @@ impl DaemonRuntime {
             .await
             .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
-        flotilla_resources::PreparedSnapshotGarbageCollector::new(daemon.resource_backend(), &options.namespace)
-            .recover_pending_claims()
-            .await
-            .map_err(|error| format!("recover prepared convoy admissions: {error}"))?;
         let active_environments = daemon
             .resource_backend()
             .using::<Environment>(&options.namespace)

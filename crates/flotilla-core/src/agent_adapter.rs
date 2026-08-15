@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -369,6 +369,21 @@ impl CapabilityTable {
         let seeded = self.resolve(&selector.capability)?;
         Ok(AgentRequirement { adapter: seeded.adapter.clone(), model: selector.model.clone().or_else(|| seeded.model.clone()) })
     }
+}
+
+/// Resolve the distinct agent adapters required by crew process selectors.
+///
+/// Admission and vessel materialization share this primitive so selector
+/// overrides and capability errors cannot drift between the two paths.
+pub fn required_agent_adapters<'a>(crew: impl IntoIterator<Item = &'a flotilla_resources::CrewSpec>) -> Result<BTreeSet<String>, String> {
+    let capabilities = CapabilityTable::seeded();
+    let mut required = BTreeSet::new();
+    for process in crew {
+        if let flotilla_resources::CrewSource::Agent { selector, .. } = &process.source {
+            required.insert(capabilities.resolve_selector(selector)?.adapter);
+        }
+    }
+    Ok(required)
 }
 
 impl AgentRequirement {

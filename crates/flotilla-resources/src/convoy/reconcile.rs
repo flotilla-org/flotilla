@@ -21,7 +21,7 @@ use crate::{
         ReplicaLabelMappedWatch, SecondaryWatch,
     },
     labels::{LifecycleAuthority, CONVOY_LABEL, VESSEL_LABEL},
-    pinned_placement_ref, pinned_workflow_ref, prepared_snapshot_pending,
+    pinned_placement_ref, pinned_workflow_ref,
     presentation::{Presentation, PresentationSpec},
     resource::ResourceObject,
     status_patch::StatusPatch,
@@ -609,9 +609,6 @@ fn reconcile_internal(
     conditions: LifecycleConditions,
     now: DateTime<Utc>,
 ) -> InternalReconcileOutcome {
-    if prepared_snapshot_pending(convoy) {
-        return InternalReconcileOutcome { patch: None, actuations: Vec::new(), events: Vec::new() };
-    }
     let status = convoy.status.clone().unwrap_or_default();
 
     if status.phase.is_terminal() {

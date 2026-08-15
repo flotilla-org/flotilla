@@ -65,7 +65,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
-    agent_adapter::CapabilityTable,
+    agent_adapter::{required_agent_adapters, CapabilityTable},
     aggregator_projection::AggregatorProjectionState,
     checkout_integration::{
         checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout, inspect_checkout_integration,
@@ -3735,14 +3735,7 @@ fn apply_agent_overrides(workflow: &mut WorkflowTemplateSpec, overrides: &[floti
 }
 
 fn required_workflow_agent_adapters(workflow: &WorkflowTemplateSpec) -> Result<BTreeSet<String>, String> {
-    let capabilities = CapabilityTable::seeded();
-    let mut required_adapters = BTreeSet::new();
-    for crew in workflow.vessels.iter().flat_map(|vessel| &vessel.crew) {
-        if let CrewSource::Agent { selector, .. } = &crew.source {
-            required_adapters.insert(capabilities.resolve_selector(selector)?.adapter);
-        }
-    }
-    Ok(required_adapters)
+    required_agent_adapters(workflow.vessels.iter().flat_map(|vessel| &vessel.crew))
 }
 
 async fn placement_agent_adapters(

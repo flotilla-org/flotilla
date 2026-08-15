@@ -81,6 +81,8 @@ pub struct EnvironmentStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum EnvironmentWaitReason {
+    /// Capacity contention surfaced immediately by Vessel planning rather than
+    /// waiting for the generic provisioning-stuck threshold.
     MaterialPoolExhausted { pool_ref: String },
 }
 
