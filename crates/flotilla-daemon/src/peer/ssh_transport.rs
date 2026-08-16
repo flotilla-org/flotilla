@@ -288,6 +288,10 @@ impl SshTransport {
 
     async fn run_ssh_output(&self, destination: &str, command: String) -> Result<CommandOutput, String> {
         let binary = self.ssh_binary.to_string_lossy();
+        // ssh hands the command line to the remote user's login shell, which
+        // may be zsh or fish rather than POSIX sh. Pin the interpreter so the
+        // login shell only forwards one quoted argument.
+        let command = format!("sh -c {}", shell_quote(&command));
         self.command_runner
             .run_output(&binary, &["-T", "-o", "BatchMode=yes", destination, &command], Path::new("/"), &ChannelLabel::Noop)
             .await
@@ -562,8 +566,12 @@ fn parse_remote_socket_path(stdout: &[u8]) -> Result<PathBuf, String> {
 }
 
 fn remote_socket_path_command() -> String {
+    // The remote login shell may be zsh, where the lowercase `path` variable is
+    // an array tied to `PATH` — assigning it destroys command lookup for the
+    // rest of the line. Keep every variable here outside the set of zsh tied
+    // parameters (path, fpath, cdpath, manpath, ...).
     format!(
-        "discovery=\"$HOME/.config/flotilla/{DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH}\"; path=$(cat \"$discovery\") || exit; case \"$path\" in /*) ;; *) path=\"$(dirname \"$discovery\")/$path\" ;; esac; printf '{REMOTE_SOCKET_PATH_PREFIX}%s\\n' \"$path\""
+        "discovery=\"$HOME/.config/flotilla/{DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH}\"; sock=$(cat \"$discovery\") || exit; case \"$sock\" in /*) ;; *) sock=\"$(dirname \"$discovery\")/$sock\" ;; esac; printf '{REMOTE_SOCKET_PATH_PREFIX}%s\\n' \"$sock\""
     )
 }
 
@@ -804,6 +812,25 @@ mod tests {
         assert!(command.contains(REMOTE_SOCKET_PATH_PREFIX));
     }
 
+    #[test]
+    fn remote_socket_path_command_avoids_zsh_tied_parameters() {
+        // zsh ties the lowercase `path`, `fpath`, `cdpath`, and `manpath`
+        // arrays to their uppercase environment counterparts; assigning any of
+        // them clobbers the environment mid-command. On a zsh remote this made
+        // `dirname` unresolvable and derived `/flotilla.sock` (2026-08-16,
+        // kiwi→feta peering outage).
+        let command = remote_socket_path_command();
+        for tied in ["path=", "fpath=", "cdpath=", "manpath="] {
+            assert!(
+                !command.contains(&format!("; {tied}")) && !command.starts_with(tied),
+                "discovery command must not assign the zsh tied parameter `{tied}`: {command}"
+            );
+        }
+        for tied in ["$path", "$fpath", "$cdpath", "$manpath"] {
+            assert!(!command.contains(tied), "discovery command must not read the zsh tied parameter `{tied}`: {command}");
+        }
+    }
+
     #[tokio::test]
     async fn remote_socket_path_is_resolved_again_after_it_moves() {
         let events = Arc::new(StdMutex::new(Vec::new()));
@@ -823,7 +850,7 @@ mod tests {
         assert_eq!(commands[0], commands[1]);
         assert_eq!(commands[0].binary, "ssh");
         assert_eq!(&commands[0].args[..4], ["-T", "-o", "BatchMode=yes", "remote.example.invalid"]);
-        assert_eq!(commands[0].args[4], remote_socket_path_command());
+        assert_eq!(commands[0].args[4], format!("sh -c {}", shell_quote(&remote_socket_path_command())));
     }
 
     #[tokio::test]
@@ -838,7 +865,9 @@ mod tests {
         assert!(diagnosis.contains("peer closed before sending hello"));
         let command = runner.commands().pop().expect("diagnostic command");
         assert_eq!(&command.args[..4], ["-T", "-o", "BatchMode=yes", "remote.example.invalid"]);
-        assert!(command.args[4].contains("test -S '/remote/run/flotilla.sock'"));
+        assert!(command.args[4].starts_with("sh -c "), "remote commands must pin the POSIX interpreter: {}", command.args[4]);
+        assert!(command.args[4].contains("test -S "));
+        assert!(command.args[4].contains("/remote/run/flotilla.sock"));
     }
 
     fn test_transport(command_runner: Arc<dyn CommandRunner>) -> SshTransport {
@@ -1004,7 +1033,7 @@ mod tests {
         assert_eq!(*events.lock().expect("event lock"), ["command", "command", "spawn"]);
         let commands = runner.commands();
         assert_eq!(commands.len(), 2);
-        assert_eq!(commands[1].args[4], transport.remote_cleanup_command());
+        assert_eq!(commands[1].args[4], format!("sh -c {}", shell_quote(&transport.remote_cleanup_command())));
         let tunnel = runner.spawns().pop().expect("tunnel invocation");
         let (forward, reverse) = transport.resource_forward_specs();
         assert_eq!(tunnel, RecordedCommand {
