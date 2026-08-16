@@ -31,6 +31,9 @@ const INHIBITOR_REASON: &str = "Flotilla vessel crew is active";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SleepCapability {
     Available,
+    // macOS hosts are always sleep-capable, so the lib target never
+    // constructs this variant there.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Unavailable,
 }
 
