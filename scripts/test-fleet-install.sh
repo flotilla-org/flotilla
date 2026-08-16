@@ -255,10 +255,12 @@ cat >"$fake_bin/curl" <<'SH'
 set -euo pipefail
 destination=""
 url=""
+write_out=""
 while (($#)); do
   case "$1" in
     --output) destination="$2"; shift 2 ;;
     --header) shift 2 ;;
+    --write-out) write_out="$2"; shift 2 ;;
     --fail|--silent|--show-error|--location) shift ;;
     *) url="$1"; shift ;;
   esac
@@ -273,11 +275,20 @@ fi
 generation="$(basename "$(dirname "$url")")"
 file="$(basename "$url")"
 source="$FIXTURE_ROOT/$generation/$file"
+if [[ "${FAIL_MANIFEST_FOR:-}" == "$generation" && "$file" == generation.json ]]; then
+  [[ -z "$write_out" ]] || printf '503'
+  exit 0
+fi
+if [[ ! -f "$source" ]]; then
+  [[ -z "$write_out" ]] || printf '404'
+  exit 0
+fi
 if [[ "${FAIL_ARTIFACT_FOR:-}" == "$generation" && "$file" == *.tar.gz ]]; then
   printf 'interrupted' >"$destination"
   exit 56
 fi
 cp "$source" "$destination"
+[[ -z "$write_out" ]] || printf '200'
 SH
 chmod 0755 "$fake_bin/curl"
 
@@ -352,22 +363,43 @@ for name in flotilla flotillad cleat; do
   grep -Fq '# managed by fleet-install' "$test_root/home/.local/bin/$name" || fail "missing stable $name launcher"
 done
 
-status="$(run_installer status)"
+status="$(run_installer status 2>"$test_root/status.err")"
 grep -Fq "current: $generation_one (peer protocol 20)" <<<"$status" || fail 'status omitted current manifest protocol'
 grep -Fq "latest:  $generation_two (peer protocol 21)" <<<"$status" || fail 'status selected the wrong promoted generation'
 grep -Fq 'warning: peer protocol changes from 20 to 21' <<<"$status" || fail 'status omitted wire-bump warning'
+grep -Fq "skipping incomplete linux-x86_64-gnu2.36 generation $generation_incomplete" "$test_root/status.err" \
+  || fail 'latest did not explain why it skipped an incomplete generation'
+
+if run_installer "$generation_incomplete" >"$test_root/incomplete-exact.out" 2>&1; then
+  fail 'an explicitly requested incomplete generation was accepted'
+fi
+grep -Fq "generation $generation_incomplete is not complete for linux-x86_64-gnu2.36" \
+  "$test_root/incomplete-exact.out" || fail 'incomplete exact-generation error was unclear'
+
+if FAIL_MANIFEST_FOR="$generation_two" run_installer status >"$test_root/latest-fetch.out" 2>&1; then
+  fail 'latest silently downgraded after a promoted-generation fetch failure'
+fi
+grep -Fq "generation manifest request returned HTTP 503" "$test_root/latest-fetch.out" \
+  || fail 'latest hid the promoted-generation fetch failure'
+if grep -Fq "could not verify advertised generation $generation_two" "$test_root/latest-fetch.out"; then
+  fail 'fatal generation fetch was incorrectly treated as a skippable generation'
+fi
 
 before_manifest="$(file_sha256 "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json")"
 run_installer "$generation_one" >/dev/null
 after_manifest="$(file_sha256 "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json")"
 [[ "$before_manifest" == "$after_manifest" ]] || fail 'exact-generation reinstall mutated the release'
 
-mkdir "$test_root/home/.local/opt/flotilla-fleet/.install.lock"
+ln -s "$$-active-test-owner" "$test_root/home/.local/opt/flotilla-fleet/.install.lock"
 if run_installer "$generation_one" >"$test_root/locked.out" 2>&1; then
   fail 'concurrent mutation lock was ignored'
 fi
-rmdir "$test_root/home/.local/opt/flotilla-fleet/.install.lock"
+rm "$test_root/home/.local/opt/flotilla-fleet/.install.lock"
 grep -Fq 'another fleet-install mutation is already running' "$test_root/locked.out" || fail 'concurrent mutation error was unclear'
+
+ln -s '999999999-stale-test-owner' "$test_root/home/.local/opt/flotilla-fleet/.install.lock"
+run_installer "$generation_one" >"$test_root/stale-lock.out"
+test ! -L "$test_root/home/.local/opt/flotilla-fleet/.install.lock" || fail 'stale install lock was not reclaimed'
 
 if FAIL_ARTIFACT_FOR="$generation_two" run_installer "$generation_two" >"$test_root/interrupted.out" 2>&1; then
   fail 'interrupted download was accepted'

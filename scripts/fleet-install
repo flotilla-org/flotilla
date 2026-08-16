@@ -16,8 +16,10 @@ PLATFORM=""
 AUTH_HEADER_FILE=""
 WORK_DIR=""
 READ_ONLY=0
-INSTALL_LOCK_DIR=""
+INSTALL_LOCK_PATH=""
+INSTALL_LOCK_OWNER=""
 INSTALL_LOCK_HELD=0
+readonly GENERATION_INCOMPLETE_EXIT=20
 
 die() {
   printf 'fleet-install: %s\n' "$*" >&2
@@ -27,8 +29,17 @@ die() {
 cleanup() {
   [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
   if ((INSTALL_LOCK_HELD)); then
-    rm -f -- "$INSTALL_LOCK_DIR/pid"
-    rmdir "$INSTALL_LOCK_DIR" 2>/dev/null || true
+    python3 - "$INSTALL_LOCK_PATH" "$INSTALL_LOCK_OWNER" <<'PY'
+import os
+import sys
+
+path, owner = sys.argv[1:]
+try:
+    if os.path.islink(path) and os.readlink(path) == owner:
+        os.unlink(path)
+except FileNotFoundError:
+    pass
+PY
   fi
 }
 trap cleanup EXIT
@@ -60,11 +71,38 @@ make_work_dir() {
 
 acquire_install_lock() {
   mkdir -p "$FLEET_ROOT"
-  INSTALL_LOCK_DIR="$FLEET_ROOT/.install.lock"
-  mkdir "$INSTALL_LOCK_DIR" 2>/dev/null \
-    || die "another fleet-install mutation is already running, or a stale lock remains: $INSTALL_LOCK_DIR"
+  INSTALL_LOCK_PATH="$FLEET_ROOT/.install.lock"
+  INSTALL_LOCK_OWNER="$$-$(python3 - <<'PY'
+import secrets
+
+print(secrets.token_hex(8))
+PY
+)"
+  if ! ln -s "$INSTALL_LOCK_OWNER" "$INSTALL_LOCK_PATH" 2>/dev/null; then
+    local owner pid
+    owner="$(readlink "$INSTALL_LOCK_PATH" 2>/dev/null)" \
+      || die "fleet-install lock is malformed; inspect and remove it if safe: $INSTALL_LOCK_PATH"
+    pid="${owner%%-*}"
+    [[ "$pid" =~ ^[0-9]+$ ]] \
+      || die "fleet-install lock has an invalid owner; inspect and remove it if safe: $INSTALL_LOCK_PATH"
+    if kill -0 "$pid" 2>/dev/null; then
+      die "another fleet-install mutation is already running (pid $pid)"
+    fi
+    python3 - "$INSTALL_LOCK_PATH" "$owner" <<'PY'
+import os
+import sys
+
+path, stale_owner = sys.argv[1:]
+try:
+    if os.path.islink(path) and os.readlink(path) == stale_owner:
+        os.unlink(path)
+except FileNotFoundError:
+    pass
+PY
+    ln -s "$INSTALL_LOCK_OWNER" "$INSTALL_LOCK_PATH" 2>/dev/null \
+      || die "another fleet-install mutation acquired the lock while reclaiming a stale owner"
+  fi
   INSTALL_LOCK_HELD=1
-  printf '%s\n' "$$" >"$INSTALL_LOCK_DIR/pid"
 }
 
 prepare_auth() {
@@ -93,7 +131,28 @@ download() {
   local url="$1"
   local destination="$2"
   prepare_auth
+  # Never forward the package credential through an HTTP redirect.
   curl --fail --silent --show-error --header "@$AUTH_HEADER_FILE" --output "$destination" "$url"
+}
+
+download_generation_manifest() {
+  local url="$1"
+  local destination="$2"
+  prepare_auth
+  local http_status rc
+  if http_status="$(
+    curl --silent --show-error --header "@$AUTH_HEADER_FILE" --output "$destination" \
+      --write-out '%{http_code}' "$url"
+  )"; then
+    case "$http_status" in
+      200) return 0 ;;
+      404) return "$GENERATION_INCOMPLETE_EXIT" ;;
+      *) die "generation manifest request returned HTTP $http_status" ;;
+    esac
+  else
+    rc=$?
+  fi
+  return "$rc"
 }
 
 latest_generation() {
@@ -126,10 +185,18 @@ PY
   local candidate index=0
   while IFS= read -r candidate; do
     index=$((index + 1))
-    if fetch_generation_manifest "$candidate" "$WORK_DIR/latest-$index-generation.json" >/dev/null 2>&1; then
+    local result
+    if fetch_generation_manifest "$candidate" "$WORK_DIR/latest-$index-generation.json"; then
       printf '%s\n' "$candidate"
       return 0
+    else
+      result=$?
     fi
+    if ((result == GENERATION_INCOMPLETE_EXIT)); then
+      printf 'fleet-install: skipping incomplete %s generation %s\n' "$PLATFORM" "$candidate" >&2
+      continue
+    fi
+    die "could not verify advertised generation $candidate"
   done < <(python3 - "$all" <<'PY'
 import json
 import sys
@@ -147,7 +214,13 @@ fetch_generation_manifest() {
   local generation="$1"
   local destination="$2"
   require_generation "$generation"
-  download "$FLEET_PACKAGE_URL/$FLEET_OWNER/generic/$FLEET_PACKAGE/$generation/generation.json" "$destination"
+  local result
+  download_generation_manifest \
+    "$FLEET_PACKAGE_URL/$FLEET_OWNER/generic/$FLEET_PACKAGE/$generation/generation.json" "$destination" \
+    || {
+      result=$?
+      return "$result"
+    }
   python3 - "$destination" "$generation" "$PLATFORM" "$TRUSTED_APPLE_TEAM_ID" <<'PY'
 import json
 import re
@@ -178,9 +251,11 @@ if not isinstance(version, int) or isinstance(version, bool) or version < 1:
     raise SystemExit("generation manifest has invalid peer_protocol_version")
 entry = manifest.get("platforms", {}).get(platform)
 if not isinstance(entry, dict):
-    raise SystemExit(f"generation has no {platform} artifact")
+    print(f"generation has no {platform} artifact", file=sys.stderr)
+    raise SystemExit(20)
 if entry.get("state") != "installable-internal":
-    raise SystemExit(f"generation artifact for {platform} is not installable-internal")
+    print(f"generation artifact for {platform} is not installable-internal", file=sys.stderr)
+    raise SystemExit(20)
 artifact = entry.get("artifact")
 digest = entry.get("sha256")
 size = entry.get("size_bytes")
@@ -241,6 +316,21 @@ else:
     if central["certificate_sha256"] != signing["certificate_sha256"] or entry.get("signing") != signing:
         raise SystemExit("Darwin generation has inconsistent signing metadata")
 PY
+}
+
+require_generation_manifest() {
+  local generation="$1"
+  local destination="$2"
+  local result
+  if fetch_generation_manifest "$generation" "$destination"; then
+    return 0
+  else
+    result=$?
+  fi
+  if ((result == GENERATION_INCOMPLETE_EXIT)); then
+    die "generation $generation is not complete for $PLATFORM"
+  fi
+  die "could not fetch requested generation $generation"
 }
 
 manifest_value() {
@@ -578,7 +668,7 @@ install_generation() {
   if [[ -d "$RELEASES_DIR/$generation" ]]; then
     make_work_dir
     local installed_outer="$WORK_DIR/installed-generation.json"
-    fetch_generation_manifest "$generation" "$installed_outer"
+    require_generation_manifest "$generation" "$installed_outer"
     verify_installed_release "$RELEASES_DIR/$generation" "$installed_outer"
     ensure_launchers_and_path
     switch_to "$generation"
@@ -589,7 +679,7 @@ install_generation() {
   local outer="$WORK_DIR/generation.json"
   local archive="$WORK_DIR/artifact.tar.gz"
   local unpack="$WORK_DIR/unpack"
-  fetch_generation_manifest "$generation" "$outer"
+  require_generation_manifest "$generation" "$outer"
   local artifact expected expected_size actual actual_size
   artifact="$(platform_value "$outer" artifact)"
   expected="$(platform_value "$outer" sha256)"
@@ -615,7 +705,7 @@ show_status() {
   current="$(current_generation)"
   latest="$(latest_generation)"
   target_manifest="$WORK_DIR/latest-manifest.json"
-  fetch_generation_manifest "$latest" "$target_manifest"
+  require_generation_manifest "$latest" "$target_manifest"
   current_version="$(protocol_version "$CURRENT_LINK")"
   target_version="$(manifest_value "$target_manifest" peer_protocol_version)"
   printf 'current: %s (peer protocol %s)\n' "${current:-<none>}" "${current_version:-unknown}"
