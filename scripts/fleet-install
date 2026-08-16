@@ -11,11 +11,13 @@ readonly FLEET_TOKEN_FILE="${FLEET_INSTALL_TOKEN_FILE:-$HOME/.config/flotilla/fl
 readonly RELEASES_DIR="$FLEET_ROOT/releases"
 readonly CURRENT_LINK="$FLEET_ROOT/current"
 readonly PREVIOUS_LINK="$FLEET_ROOT/previous"
-readonly PLATFORM="linux-x86_64-gnu2.36"
+readonly TRUSTED_APPLE_TEAM_ID="973L4GV58R"
+PLATFORM=""
 AUTH_HEADER_FILE=""
 WORK_DIR=""
 READ_ONLY=0
-INSTALL_LOCK_FD=""
+INSTALL_LOCK_DIR=""
+INSTALL_LOCK_HELD=0
 
 die() {
   printf 'fleet-install: %s\n' "$*" >&2
@@ -24,16 +26,21 @@ die() {
 
 cleanup() {
   [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
+  if ((INSTALL_LOCK_HELD)); then
+    rm -f -- "$INSTALL_LOCK_DIR/pid"
+    rmdir "$INSTALL_LOCK_DIR" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
-require_linux() {
+host_platform() {
   local system="${FLEET_INSTALL_UNAME_S:-$(uname -s)}"
   local machine="${FLEET_INSTALL_UNAME_M:-$(uname -m)}"
-  if [[ "$system" == Darwin ]]; then
-    die 'Darwin installation is not yet supported; follow #1553: https://github.com/flotilla-org/flotilla/issues/1553'
-  fi
-  [[ "$system-$machine" == Linux-x86_64 ]] || die "unsupported platform: $system-$machine (requires $PLATFORM)"
+  case "$system-$machine" in
+    Linux-x86_64) printf 'linux-x86_64-gnu2.36\n' ;;
+    Darwin-arm64) printf 'darwin-aarch64\n' ;;
+    *) die "unsupported platform: $system-$machine" ;;
+  esac
 }
 
 require_generation() {
@@ -53,21 +60,32 @@ make_work_dir() {
 
 acquire_install_lock() {
   mkdir -p "$FLEET_ROOT"
-  exec {INSTALL_LOCK_FD}>"$FLEET_ROOT/.install.lock"
-  flock -n "$INSTALL_LOCK_FD" || die 'another fleet-install mutation is already running'
+  INSTALL_LOCK_DIR="$FLEET_ROOT/.install.lock"
+  mkdir "$INSTALL_LOCK_DIR" 2>/dev/null \
+    || die "another fleet-install mutation is already running, or a stale lock remains: $INSTALL_LOCK_DIR"
+  INSTALL_LOCK_HELD=1
+  printf '%s\n' "$$" >"$INSTALL_LOCK_DIR/pid"
 }
 
 prepare_auth() {
   [[ -n "$AUTH_HEADER_FILE" ]] && return
   [[ -f "$FLEET_TOKEN_FILE" && ! -L "$FLEET_TOKEN_FILE" ]] || die "package token is missing: $FLEET_TOKEN_FILE"
   local mode
-  mode="$(stat -c '%a' "$FLEET_TOKEN_FILE")"
+  mode="$(python3 - "$FLEET_TOKEN_FILE" <<'PY'
+import os
+import stat
+import sys
+
+print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))
+PY
+)"
   [[ "$mode" == 600 ]] || die "package token must have mode 0600: $FLEET_TOKEN_FILE (has $mode)"
   make_work_dir
   AUTH_HEADER_FILE="$WORK_DIR/authorization.header"
   local token
-  token="$(tr -d '\r\n' <"$FLEET_TOKEN_FILE")"
-  [[ -n "$token" ]] || die "package token is empty: $FLEET_TOKEN_FILE"
+  token="$(<"$FLEET_TOKEN_FILE")"
+  [[ -n "$token" && ! "$token" =~ [[:space:]] ]] \
+    || die "package token is empty or malformed: $FLEET_TOKEN_FILE"
   (umask 077 && printf 'Authorization: token %s\n' "$token" >"$AUTH_HEADER_FILE")
 }
 
@@ -75,7 +93,7 @@ download() {
   local url="$1"
   local destination="$2"
   prepare_auth
-  curl --fail --silent --show-error --location --header "@$AUTH_HEADER_FILE" --output "$destination" "$url"
+  curl --fail --silent --show-error --header "@$AUTH_HEADER_FILE" --output "$destination" "$url"
 }
 
 latest_generation() {
@@ -86,65 +104,142 @@ latest_generation() {
   while true; do
     local response="$WORK_DIR/packages-$page.json"
     download "$FLEET_API_URL/packages/$FLEET_OWNER?type=generic&q=$FLEET_PACKAGE&limit=100&page=$page" "$response"
-    python3 - "$response" "$FLEET_PACKAGE" >>"$all" <<'PY'
+    local count
+    count="$(python3 - "$response" "$FLEET_PACKAGE" "$all" <<'PY'
 import json
 import sys
 
 packages = json.load(open(sys.argv[1]))
 if not isinstance(packages, list):
     raise SystemExit("package listing is not an array")
-for package in packages:
-    if package.get("type") == "generic" and package.get("name") == sys.argv[2]:
-        print(json.dumps([package.get("created_at", ""), package.get("version", "")]))
-print(f"__COUNT__={len(packages)}")
+with open(sys.argv[3], "a") as output:
+    for package in packages:
+        if package.get("type") == "generic" and package.get("name") == sys.argv[2]:
+            print(json.dumps([package.get("created_at", ""), package.get("version", "")]), file=output)
+print(len(packages))
 PY
-    local count
-    count="$(tail -n 1 "$all" | sed -n 's/^__COUNT__=//p')"
-    sed -i '$d' "$all"
+)"
     [[ "$count" =~ ^[0-9]+$ ]] || die 'invalid package listing response'
     (( count == 100 )) || break
     ((page += 1))
   done
-  python3 - "$all" <<'PY'
+  local candidate index=0
+  while IFS= read -r candidate; do
+    index=$((index + 1))
+    if fetch_generation_manifest "$candidate" "$WORK_DIR/latest-$index-generation.json" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(python3 - "$all" <<'PY'
 import json
 import sys
 
 rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
 rows = [row for row in rows if row[0] and row[1]]
-if not rows:
-    raise SystemExit("no promoted flotilla-fleet generations found")
-print(max(rows)[1])
+for row in sorted(rows, reverse=True):
+    print(row[1])
 PY
+)
+  die "Forgejo has no completed $PLATFORM flotilla-fleet generations"
 }
 
 fetch_generation_manifest() {
   local generation="$1"
   local destination="$2"
   require_generation "$generation"
-  download "$FLEET_PACKAGE_URL/$FLEET_OWNER/generic/$FLEET_PACKAGE/$generation/manifest.json" "$destination"
-  python3 - "$destination" "$generation" <<'PY'
+  download "$FLEET_PACKAGE_URL/$FLEET_OWNER/generic/$FLEET_PACKAGE/$generation/generation.json" "$destination"
+  python3 - "$destination" "$generation" "$PLATFORM" "$TRUSTED_APPLE_TEAM_ID" <<'PY'
 import json
 import re
 import sys
 
 manifest = json.load(open(sys.argv[1]))
 generation = sys.argv[2]
-if manifest.get("schema_version") != 1 or manifest.get("kind") != "flotilla-fleet-generation":
+platform = sys.argv[3]
+trusted_team = sys.argv[4]
+identity = re.fullmatch(r"\d{8}T\d{6}Z-r\d+-f([0-9a-f]{12})-c([0-9a-f]{12})", generation)
+if identity is None:
+    raise SystemExit("invalid generation id")
+if manifest.get("schema_version") != 1 or manifest.get("kind") != "internal-promoted-fleet-generation":
     raise SystemExit("unsupported generation manifest")
 if manifest.get("generation") != generation:
     raise SystemExit("generation manifest identity mismatch")
+sources = manifest.get("sources")
+if (
+    not isinstance(sources, dict)
+    or set(sources) != {"flotilla", "cleat"}
+    or not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) for value in sources.values())
+    or sources["flotilla"][:12] != identity.group(1)
+    or sources["cleat"][:12] != identity.group(2)
+):
+    raise SystemExit("generation manifest has invalid source commits")
 version = manifest.get("peer_protocol_version")
 if not isinstance(version, int) or isinstance(version, bool) or version < 1:
     raise SystemExit("generation manifest has invalid peer_protocol_version")
-entry = manifest.get("platforms", {}).get("linux-x86_64-gnu2.36")
+entry = manifest.get("platforms", {}).get(platform)
 if not isinstance(entry, dict):
-    raise SystemExit("generation has no linux-x86_64-gnu2.36 artifact")
+    raise SystemExit(f"generation has no {platform} artifact")
+if entry.get("state") != "installable-internal":
+    raise SystemExit(f"generation artifact for {platform} is not installable-internal")
 artifact = entry.get("artifact")
 digest = entry.get("sha256")
-if not isinstance(artifact, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", artifact):
+size = entry.get("size_bytes")
+expected_artifact = (
+    "fleet-signed-darwin-aarch64.tar.gz"
+    if platform == "darwin-aarch64"
+    else "fleet-candidate-linux-x86_64-gnu2.36.tar.gz"
+)
+if artifact != expected_artifact:
     raise SystemExit("generation manifest has invalid artifact name")
 if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
     raise SystemExit("generation manifest has invalid artifact digest")
+if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+    raise SystemExit("generation manifest has invalid artifact size")
+if platform == "linux-x86_64-gnu2.36":
+    if entry.get("signed") is not False:
+        raise SystemExit("Linux generation has an unexpected signing state")
+else:
+    if entry.get("signed") is not True:
+        raise SystemExit("Darwin generation is not centrally signed")
+    source_generation = manifest.get("source_generation")
+    source_identity = re.fullmatch(
+        r"\d{8}T\d{6}Z-r\d+-f([0-9a-f]{12})-c([0-9a-f]{12})", source_generation or ""
+    )
+    if source_identity is None:
+        raise SystemExit("Darwin generation has an invalid source generation")
+    if sources["flotilla"][:12] != source_identity.group(1) or sources["cleat"][:12] != source_identity.group(2):
+        raise SystemExit("Darwin source generation does not match the recorded source commits")
+    if entry.get("source_artifact") != "fleet-candidate-darwin-aarch64.tar.gz":
+        raise SystemExit("Darwin generation has an invalid source artifact")
+    if not re.fullmatch(r"[0-9a-f]{64}", entry.get("source_artifact_sha256", "")):
+        raise SystemExit("Darwin generation has an invalid source artifact digest")
+    central = manifest.get("central_signing")
+    if not isinstance(central, dict):
+        raise SystemExit("Darwin generation has no central-signing record")
+    expected = {
+        "derivative_package": "lab-signing/flotilla-fleet-darwin-signed",
+        "derivative_version": source_generation,
+        "attestation": "darwin-signing-attestation.json",
+        "cms": "darwin-signing-attestation.cms",
+        "certificate": "darwin-signing-certificate.pem",
+    }
+    if any(central.get(field) != value for field, value in expected.items()):
+        raise SystemExit("Darwin generation has invalid central-signing linkage")
+    for field in ("attestation_sha256", "cms_sha256", "certificate_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", central.get(field, "")):
+            raise SystemExit(f"Darwin generation has invalid {field}")
+    signing = central.get("signing")
+    if not isinstance(signing, dict) or signing.get("team_id") != trusted_team:
+        raise SystemExit(f"Darwin generation is not signed by trusted Apple team {trusted_team}")
+    if not isinstance(signing.get("identity"), str) or not signing["identity"]:
+        raise SystemExit("Darwin generation has invalid signing identity")
+    if signing.get("options") != ["runtime", "timestamp=none"]:
+        raise SystemExit("Darwin generation has invalid signing options")
+    for field in ("certificate_sha256", "entitlements_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", signing.get(field, "")):
+            raise SystemExit(f"Darwin generation has invalid signing {field}")
+    if central["certificate_sha256"] != signing["certificate_sha256"] or entry.get("signing") != signing:
+        raise SystemExit("Darwin generation has inconsistent signing metadata")
 PY
 }
 
@@ -174,123 +269,211 @@ PY
 }
 
 sha256_file() {
-  sha256sum "$1" | awk '{print $1}'
+  python3 - "$1" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as source:
+    for block in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(block)
+print(digest.hexdigest())
+PY
+}
+
+file_size() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+print(os.path.getsize(sys.argv[1]))
+PY
 }
 
 extract_and_verify() {
   local archive="$1"
   local destination="$2"
   local generation_manifest="$3"
-  python3 - "$archive" "$destination" "$generation_manifest" <<'PY'
-import hashlib
-import json
-import os
+  python3 - "$archive" "$destination" "$PLATFORM" <<'PY'
 import shutil
 import sys
 import tarfile
 from pathlib import Path, PurePosixPath
 
-archive, destination, outer_path = map(Path, sys.argv[1:])
-outer = json.loads(outer_path.read_text())
+archive = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+platform = sys.argv[3]
+expected_root = "fleet-signed-darwin-aarch64" if platform == "darwin-aarch64" else f"fleet-candidate-{platform}"
 with tarfile.open(archive, "r:gz") as bundle:
     members = bundle.getmembers()
+    names = set()
     roots = set()
     for member in members:
         path = PurePosixPath(member.name)
-        if path.is_absolute() or ".." in path.parts or not path.parts:
-            raise SystemExit(f"unsafe archive path: {member.name}")
+        normalized = str(path)
+        if path.is_absolute() or ".." in path.parts or not path.parts or normalized in names:
+            raise SystemExit(f"unsafe or duplicate archive path: {member.name}")
         if not (member.isfile() or member.isdir()):
             raise SystemExit(f"unsupported archive entry: {member.name}")
+        names.add(normalized)
         roots.add(path.parts[0])
-    if len(roots) != 1:
-        raise SystemExit("archive must contain exactly one bundle directory")
-    bundle.extractall(destination)
-
-root = destination / roots.pop()
-manifest_path = root / "manifest.json"
-manifest = json.loads(manifest_path.read_text())
-if (
-    manifest.get("schema_version") != 1
-    or manifest.get("kind") != "unsigned-fleet-candidate"
-    or manifest.get("platform") != "linux-x86_64-gnu2.36"
-):
-    raise SystemExit("candidate manifest platform or schema mismatch")
-if manifest.get("peer_protocol_version") != outer.get("peer_protocol_version"):
-    raise SystemExit("candidate and generation peer protocol versions differ")
-entries = manifest.get("files")
-if not isinstance(entries, list) or not entries:
-    raise SystemExit("candidate manifest has no files")
-expected = set()
-for entry in entries:
-    rel = entry.get("path")
-    if not isinstance(rel, str) or PurePosixPath(rel).is_absolute() or ".." in PurePosixPath(rel).parts:
-        raise SystemExit("candidate manifest contains an unsafe path")
-    path = root / rel
-    expected.add(rel)
-    if not path.is_file():
-        raise SystemExit(f"candidate file is missing: {rel}")
-    if path.stat().st_size != entry.get("size_bytes"):
-        raise SystemExit(f"candidate size mismatch: {rel}")
-    if hashlib.sha256(path.read_bytes()).hexdigest() != entry.get("sha256"):
-        raise SystemExit(f"candidate checksum mismatch: {rel}")
-actual = {
-    str(path.relative_to(root))
-    for path in root.rglob("*")
-    if path.is_file() and path != manifest_path
-}
-if actual != expected:
-    raise SystemExit("candidate files do not match the manifest")
-for name in ("flotilla", "flotillad", "cleat"):
-    if f"bin/{name}" not in expected:
-        raise SystemExit(f"candidate is missing required binary: {name}")
-shutil.move(str(root), str(destination / "release"))
+    if roots != {expected_root}:
+        raise SystemExit(f"archive has an unexpected bundle directory: expected {expected_root}, got {sorted(roots)}")
+    for member in members:
+        target = destination.joinpath(*PurePosixPath(member.name).parts)
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=True)
+            target.chmod(member.mode & 0o777)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = bundle.extractfile(member)
+        if source is None:
+            raise SystemExit(f"archive entry cannot be read: {member.name}")
+        with source, target.open("wb") as output:
+            shutil.copyfileobj(source, output)
+        target.chmod(member.mode & 0o777)
+shutil.move(str(destination / expected_root), str(destination / "release"))
 PY
+  verify_release "$destination/release" "$generation_manifest"
+  cp "$generation_manifest" "$destination/release/.generation.json"
 }
 
-verify_installed_release() {
+verify_release() {
   local release="$1"
   local generation_manifest="$2"
-  python3 - "$release" "$generation_manifest" <<'PY'
+  python3 - "$release" "$generation_manifest" "$PLATFORM" <<'PY'
 import hashlib
 import json
+import os
+import re
 import sys
 from pathlib import Path, PurePosixPath
 
-root, outer_path = map(Path, sys.argv[1:])
+root = Path(sys.argv[1])
+outer_path = Path(sys.argv[2])
+platform = sys.argv[3]
 manifest_path = root / "manifest.json"
 manifest = json.loads(manifest_path.read_text())
 outer = json.loads(outer_path.read_text())
-if (
-    manifest.get("schema_version") != 1
-    or manifest.get("kind") != "unsigned-fleet-candidate"
-    or manifest.get("platform") != "linux-x86_64-gnu2.36"
-):
-    raise SystemExit("installed candidate manifest platform or schema mismatch")
-if manifest.get("peer_protocol_version") != outer.get("peer_protocol_version"):
-    raise SystemExit("installed candidate and generation peer protocol versions differ")
+expected_kind = "signed-fleet-derivative" if platform == "darwin-aarch64" else "unsigned-fleet-candidate"
+if manifest.get("schema_version") != 1 or manifest.get("kind") != expected_kind or manifest.get("platform") != platform:
+    raise SystemExit("release manifest platform or schema mismatch")
+if manifest.get("peer_protocol_version") != outer.get("peer_protocol_version") or manifest.get("sources") != outer.get("sources"):
+    raise SystemExit("release and generation metadata differ")
+if platform == "darwin-aarch64":
+    entry = outer["platforms"][platform]
+    if (
+        manifest.get("signed") is not True
+        or manifest.get("source_generation") != outer.get("source_generation")
+        or manifest.get("source_artifact_sha256") != entry.get("source_artifact_sha256")
+        or manifest.get("signing") != outer.get("central_signing", {}).get("signing")
+    ):
+        raise SystemExit("signed Darwin derivative does not match its completed generation")
+elif manifest.get("signed") is not False:
+    raise SystemExit("Linux candidate has an unexpected signing state")
 entries = manifest.get("files")
 if not isinstance(entries, list) or not entries:
-    raise SystemExit("installed candidate manifest has no files")
+    raise SystemExit("release manifest has no files")
 expected = set()
 for entry in entries:
     rel = entry.get("path")
-    if not isinstance(rel, str) or PurePosixPath(rel).is_absolute() or ".." in PurePosixPath(rel).parts:
-        raise SystemExit("installed candidate manifest contains an unsafe path")
+    relative = PurePosixPath(rel) if isinstance(rel, str) else None
+    if relative is None or relative.is_absolute() or ".." in relative.parts or not relative.parts or rel in expected:
+        raise SystemExit("release manifest contains an unsafe or duplicate path")
+    digest = entry.get("sha256")
+    size = entry.get("size_bytes")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise SystemExit(f"release manifest has an invalid digest: {rel}")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise SystemExit(f"release manifest has an invalid size: {rel}")
     path = root / rel
     expected.add(rel)
-    if not path.is_file() or path.stat().st_size != entry.get("size_bytes"):
-        raise SystemExit(f"installed candidate file mismatch: {rel}")
-    if hashlib.sha256(path.read_bytes()).hexdigest() != entry.get("sha256"):
-        raise SystemExit(f"installed candidate checksum mismatch: {rel}")
-actual = {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file() and path != manifest_path}
+    if not path.is_file() or path.stat().st_size != size:
+        raise SystemExit(f"release file mismatch: {rel}")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        raise SystemExit(f"release checksum mismatch: {rel}")
+actual = {
+    str(path.relative_to(root))
+    for path in root.rglob("*")
+    if path.is_file() and path not in {manifest_path, root / ".generation.json"}
+}
 if actual != expected:
-    raise SystemExit("installed candidate files do not match the manifest")
+    raise SystemExit("release files do not match the manifest")
+required = {"bin/flotilla", "bin/flotillad", "bin/cleat", "install.sh"}
+if not required.issubset(expected):
+    raise SystemExit("release is missing a required payload")
+for rel in ("bin/flotilla", "bin/flotillad", "bin/cleat"):
+    if not os.access(root / rel, os.X_OK):
+        raise SystemExit(f"release binary is not executable: {rel}")
+if platform == "darwin-aarch64":
+    allowed = required | {rel for rel in expected if rel.startswith("lib/") and rel.endswith(".dylib")}
+    if expected != allowed:
+        raise SystemExit("signed Darwin derivative contains an unexpected payload set")
 PY
+  if [[ "$PLATFORM" == darwin-aarch64 ]]; then
+    verify_darwin_signatures "$release" "$generation_manifest"
+  fi
+}
+
+verify_installed_release() {
+  verify_release "$1" "$2"
+}
+
+codesign_program() {
+  if [[ "${FLEET_INSTALL_TESTING:-0}" == 1 && -n "${FLEET_INSTALL_TEST_CODESIGN:-}" ]]; then
+    printf '%s\n' "$FLEET_INSTALL_TEST_CODESIGN"
+  else
+    printf '/usr/bin/codesign\n'
+  fi
+}
+
+verify_darwin_signatures() {
+  local release="$1"
+  local generation_manifest="$2"
+  local identity requirement codesign
+  identity="$(manifest_value "$generation_manifest" central_signing.signing.identity)"
+  requirement="=designated => anchor apple generic and certificate leaf[subject.OU] = \"$TRUSTED_APPLE_TEAM_ID\""
+  codesign="$(codesign_program)"
+  local targets=("$release"/lib/*.dylib "$release"/bin/flotilla "$release"/bin/flotillad "$release"/bin/cleat)
+  local path relative verification details entitlements
+  for path in "${targets[@]}"; do
+    [[ -f "$path" ]] || continue
+    relative="${path#"$release"/}"
+    verification="$WORK_DIR/codesign-verify-${relative//\//-}"
+    "$codesign" --verify --strict --verbose=2 --requirements "$requirement" "$path" \
+      >"$verification" 2>&1 \
+      || die "strict signature verification failed: $relative"
+    details="$WORK_DIR/codesign-details-${relative//\//-}"
+    "$codesign" -d --verbose=4 "$path" >"$details" 2>&1 \
+      || die "signature inspection failed: $relative"
+    grep -Fxq "Authority=$identity" "$details" \
+      || die "signed Darwin payload has an unexpected authority: $relative"
+    grep -Fxq "TeamIdentifier=$TRUSTED_APPLE_TEAM_ID" "$details" \
+      || die "signed Darwin payload has an unexpected team: $relative"
+    entitlements="$WORK_DIR/codesign-entitlements-${relative//\//-}.plist"
+    "$codesign" --display --entitlements - --xml "$path" >"$entitlements" 2>/dev/null \
+      || die "entitlements inspection failed: $relative"
+    python3 - "$entitlements" "$relative" <<'PY'
+import plistlib
+import sys
+
+content = open(sys.argv[1], "rb").read()
+try:
+    entitlements = plistlib.loads(content) if content.strip() else {}
+except plistlib.InvalidFileException as error:
+    raise SystemExit(f"signed Darwin payload has unreadable entitlements: {sys.argv[2]}: {error}")
+if entitlements != {}:
+    raise SystemExit(f"signed Darwin payload has unexpected entitlements: {sys.argv[2]}")
+PY
+  done
 }
 
 current_generation() {
   [[ -L "$CURRENT_LINK" ]] || return 0
-  basename "$(readlink -f "$CURRENT_LINK")"
+  local target
+  target="$(readlink "$CURRENT_LINK")"
+  [[ "$target" =~ ^releases/[^/]+$ ]] || die "current has an unsafe target: $target"
+  printf '%s\n' "${target#releases/}"
 }
 
 protocol_version() {
@@ -324,10 +507,23 @@ ensure_launchers_and_path() {
   local name resolved expected
   for name in flotilla flotillad cleat; do
     write_launcher "$name"
-    expected="$(readlink -f "$FLEET_BIN_DIR")/$name"
+    expected="$(python3 - "$FLEET_BIN_DIR/$name" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+)"
     resolved="$(command -v "$name" || true)"
     [[ -n "$resolved" ]] || die "$name is not reachable through PATH; add $FLEET_BIN_DIR before installing"
-    [[ "$(readlink -f "$resolved")" == "$expected" ]] || die "PATH shadows the fleet launcher for $name: $resolved; put $FLEET_BIN_DIR first"
+    resolved="$(python3 - "$resolved" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+)"
+    [[ "$resolved" == "$expected" ]] || die "PATH shadows the fleet launcher for $name: $resolved; put $FLEET_BIN_DIR first"
   done
 }
 
@@ -348,14 +544,21 @@ daemon_preflight() {
 atomic_link() {
   local target="$1"
   local link="$2"
-  local temporary="$FLEET_ROOT/.$(basename "$link").new.$$"
+  local temporary
+  temporary="$FLEET_ROOT/.$(basename "$link").new.$$"
   ln -s "$target" "$temporary"
-  mv -Tf "$temporary" "$link"
+  python3 - "$temporary" "$link" <<'PY'
+import os
+import sys
+
+os.replace(sys.argv[1], sys.argv[2])
+PY
 }
 
 switch_to() {
   local generation="$1"
-  local old="$(current_generation)"
+  local old
+  old="$(current_generation)"
   [[ "$old" != "$generation" ]] || return 0
   daemon_preflight
   if [[ -n "$old" ]]; then
@@ -369,11 +572,12 @@ install_generation() {
   require_generation "$generation"
   acquire_install_lock
   mkdir -p "$RELEASES_DIR"
-  local old="$(current_generation)"
+  local old
+  old="$(current_generation)"
   printf 'fleet-install: %s -> %s\n' "${old:-<none>}" "$generation"
   if [[ -d "$RELEASES_DIR/$generation" ]]; then
     make_work_dir
-    local installed_outer="$WORK_DIR/installed-manifest.json"
+    local installed_outer="$WORK_DIR/installed-generation.json"
     fetch_generation_manifest "$generation" "$installed_outer"
     verify_installed_release "$RELEASES_DIR/$generation" "$installed_outer"
     ensure_launchers_and_path
@@ -382,19 +586,23 @@ install_generation() {
     return
   fi
   make_work_dir
-  local outer="$WORK_DIR/manifest.json"
+  local outer="$WORK_DIR/generation.json"
   local archive="$WORK_DIR/artifact.tar.gz"
   local unpack="$WORK_DIR/unpack"
   fetch_generation_manifest "$generation" "$outer"
-  local artifact expected actual
+  local artifact expected expected_size actual actual_size
   artifact="$(platform_value "$outer" artifact)"
   expected="$(platform_value "$outer" sha256)"
+  expected_size="$(platform_value "$outer" size_bytes)"
   download "$FLEET_PACKAGE_URL/$FLEET_OWNER/generic/$FLEET_PACKAGE/$generation/$artifact" "$archive"
   actual="$(sha256_file "$archive")"
+  actual_size="$(file_size "$archive")"
+  [[ "$actual_size" == "$expected_size" ]] \
+    || die "archive size mismatch for $generation: expected $expected_size, got $actual_size"
   [[ "$actual" == "$expected" ]] || die "archive digest mismatch for $generation: expected $expected, got $actual"
   mkdir -p "$unpack"
   extract_and_verify "$archive" "$unpack" "$outer"
-  mv -T "$unpack/release" "$RELEASES_DIR/$generation"
+  mv "$unpack/release" "$RELEASES_DIR/$generation"
   chmod -R a-w "$RELEASES_DIR/$generation"
   ensure_launchers_and_path
   switch_to "$generation"
@@ -423,8 +631,15 @@ rollback() {
   [[ -L "$PREVIOUS_LINK" ]] || die 'no previous generation to roll back to'
   local current previous
   current="$(current_generation)"
-  previous="$(basename "$(readlink -f "$PREVIOUS_LINK")")"
+  local previous_target
+  previous_target="$(readlink "$PREVIOUS_LINK")"
+  [[ "$previous_target" =~ ^releases/[^/]+$ ]] || die "previous has an unsafe target: $previous_target"
+  previous="${previous_target#releases/}"
   [[ -d "$RELEASES_DIR/$previous" ]] || die "previous generation is missing: $previous"
+  [[ -f "$RELEASES_DIR/$previous/.generation.json" ]] \
+    || die "previous generation has no verified generation metadata: $previous"
+  make_work_dir
+  verify_installed_release "$RELEASES_DIR/$previous" "$RELEASES_DIR/$previous/.generation.json"
   printf 'fleet-install: %s -> %s (rollback)\n' "$current" "$previous"
   daemon_preflight
   atomic_link "releases/$previous" "$CURRENT_LINK"
@@ -438,7 +653,7 @@ usage() {
 
 main() {
   [[ $# -eq 1 ]] || usage
-  require_linux
+  PLATFORM="$(host_platform)"
   case "$1" in
     status)
       READ_ONLY=1
