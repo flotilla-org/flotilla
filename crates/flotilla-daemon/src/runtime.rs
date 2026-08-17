@@ -5801,6 +5801,8 @@ mod tests {
         let convoys = kiwi.resource_backend().using::<Convoy>(NAMESPACE);
         let convoy = convoys
             .create(&empty_meta("remote-placement"), &ConvoySpec {
+                role: String::new(),
+                generation: 1,
                 workflow_ref: workflow_name.to_string(),
                 dispatching_principal_ref: Default::default(),
                 inputs: BTreeMap::new(),
@@ -7299,26 +7301,38 @@ mod tests {
         backend
             .clone()
             .using::<Convoy>(NAMESPACE)
-            .create(&empty_meta("convoy-a"), &ConvoySpec {
-                workflow_ref: "wf-a".to_string(),
-                dispatching_principal_ref: Default::default(),
-                inputs: BTreeMap::new(),
-                placement_policy: Some(format!("host-direct-{host_id}")),
-                repositories: vec![ConvoyRepositorySpec {
-                    url: "https://github.com/flotilla-org/flotilla.git".to_string(),
-                    repo_ref: repository_key,
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: repository_spec.leaf_slug(),
-                    subpaths: Vec::new(),
-                }],
-                r#ref: Some("main".to_string()),
-                project_ref: None,
-                adopted_checkout_refs: BTreeMap::new(),
-                issues: Vec::new(),
-                change_request: None,
-                instruction: None,
-            })
+            .create(
+                &InputMeta::builder()
+                    .name("convoy-a".to_string())
+                    .labels(BTreeMap::from([
+                        (flotilla_resources::PROJECT_LABEL.to_string(), "test".to_string()),
+                        (flotilla_resources::ROLE_LABEL.to_string(), "convoy-a".to_string()),
+                        (flotilla_resources::GENERATION_LABEL.to_string(), "1".to_string()),
+                    ]))
+                    .build(),
+                &ConvoySpec {
+                    role: "convoy-a".to_string(),
+                    generation: 1,
+                    workflow_ref: "wf-a".to_string(),
+                    dispatching_principal_ref: Default::default(),
+                    inputs: BTreeMap::new(),
+                    placement_policy: Some(format!("host-direct-{host_id}")),
+                    repositories: vec![ConvoyRepositorySpec {
+                        url: "https://github.com/flotilla-org/flotilla.git".to_string(),
+                        repo_ref: repository_key,
+                        source_ref: "main".to_string(),
+                        target_ref: "main".to_string(),
+                        workspace_slug: repository_spec.leaf_slug(),
+                        subpaths: Vec::new(),
+                    }],
+                    r#ref: Some("main".to_string()),
+                    project_ref: Some("test".to_string()),
+                    adopted_checkout_refs: BTreeMap::new(),
+                    issues: Vec::new(),
+                    change_request: None,
+                    instruction: None,
+                },
+            )
             .await
             .expect("convoy create should succeed");
 
@@ -7399,7 +7413,7 @@ mod tests {
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::ConvoyWorkForceComplete {
-                    convoy: "convoy-a".to_string(),
+                    convoy: "convoy-a@test".to_string(),
                     work: "implement".to_string(),
                     message: Some(match completion_action {
                         CompletionAction::Delete => "https://github.com/flotilla-org/flotilla/pull/884".to_string(),
@@ -7464,6 +7478,21 @@ mod tests {
         Fut: std::future::Future<Output = bool>,
     {
         wait_until_with_timeout(Duration::from_secs(5), condition).await;
+    }
+
+    async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
+        backend
+            .clone()
+            .using::<Convoy>(NAMESPACE)
+            .list_matching_labels(&BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), role.to_string())]))
+            .await
+            .expect("list convoy by role")
+            .items
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("convoy role {role}"))
+            .metadata
+            .name
     }
 
     async fn wait_until_with_timeout<F, Fut>(timeout: Duration, mut condition: F)
@@ -8381,14 +8410,18 @@ mod tests {
             })
             .await
             .expect("create crew convoy");
-        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "crew-convoy".to_string() });
+        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated {
+            name: "crew-convoy@standalone".to_string()
+        });
 
         let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        let crew_record = convoy_record_name(&backend, "crew-convoy").await;
         wait_until(|| {
             let convoys = convoys.clone();
+            let crew_record = crew_record.clone();
             async move {
                 matches!(
-                    convoys.get("crew-convoy").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                    convoys.get(&crew_record).await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Active
                             && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
@@ -8439,7 +8472,7 @@ mod tests {
             ("reviewer", "latent"),
             ("watcher", "active")
         ]);
-        let initial_status = convoys.get("crew-convoy").await.expect("crew convoy").status.expect("convoy status");
+        let initial_status = convoys.get(&crew_record).await.expect("crew convoy").status.expect("convoy status");
         assert_eq!(initial_status.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
         // The reviewer is latent above and has no terminal session yet, so the
         // convoy status has to agree rather than report a crew member that was
@@ -8530,14 +8563,15 @@ mod tests {
         drop(delivered);
         wait_until(|| {
             let convoys = convoys.clone();
+            let crew_record = crew_record.clone();
             async move {
-                convoys.get("crew-convoy").await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
+                convoys.get(&crew_record).await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
                     status.phase == ConvoyPhase::Active && status.work.get("implement").is_some_and(|work| work.phase == WorkPhase::Running)
                 })
             }
         })
         .await;
-        let reopened = convoys.get("crew-convoy").await.expect("reopened convoy").status.expect("reopened status");
+        let reopened = convoys.get(&crew_record).await.expect("reopened convoy").status.expect("reopened status");
         assert_eq!(reopened.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
         assert_eq!(reopened.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::HandedBack);
 
@@ -8598,8 +8632,9 @@ mod tests {
         .await;
         wait_until(|| {
             let convoys = convoys.clone();
+            let crew_record = crew_record.clone();
             async move {
-                convoys.get("crew-convoy").await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
+                convoys.get(&crew_record).await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
                     status.phase == ConvoyPhase::Active
                         && status.work["implement"].phase == WorkPhase::Running
                         && status.crew_work["implement"]["coder"].phase == flotilla_resources::CrewWorkPhase::Working
@@ -8635,11 +8670,11 @@ mod tests {
             .expect("reviewer session after restart");
         let reviewer_id = reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).expect("revived reviewer identity").id.clone();
 
-        let attach = daemon.resolve_attach_command_internal("crew-convoy/implement/coder").await.expect("attach coder");
+        let attach = daemon.resolve_attach_command_internal("crew-convoy@standalone/implement/coder").await.expect("attach coder");
         let [flotilla_protocol::ResolvedAttachAction::Command(args)] = attach.plan.0.as_slice() else {
             panic!("expected one local attach command, got {:?}", attach.plan);
         };
-        assert!(flotilla_protocol::arg::flatten(args, 0).contains("attach terminal-crew-convoy-implement-coder"));
+        assert!(flotilla_protocol::arg::flatten(args, 0).contains(&format!("attach {}", revived_coder.metadata.name)));
 
         let mut rx = daemon.subscribe();
         let coder_recomplete_id = daemon
@@ -8675,7 +8710,14 @@ mod tests {
 
         let mut rx = daemon.subscribe();
         let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
-        let checkout = checkouts.get("adopted-checkout-crew-convoy").await.expect("adopted checkout");
+        let checkout = checkouts
+            .list()
+            .await
+            .expect("checkout list")
+            .items
+            .into_iter()
+            .find(|checkout| checkout.metadata.lifecycle_authority().ok().flatten() == Some(LifecycleAuthority::Adopted))
+            .expect("adopted checkout");
         let mut integration = checkout.status.expect("checkout status").integration;
         integration.landed = flotilla_resources::IntegrationCondition::builder()
             .value(flotilla_resources::ConditionValue::True)
@@ -8705,9 +8747,10 @@ mod tests {
         assert_eq!(wait_for_command_result(&mut rx, final_review_id).await, CommandValue::Ok);
         wait_until(|| {
             let convoys = convoys.clone();
+            let crew_record = crew_record.clone();
             async move {
                 convoys
-                    .get("crew-convoy")
+                    .get(&crew_record)
                     .await
                     .ok()
                     .and_then(|convoy| convoy.status)
@@ -8715,7 +8758,7 @@ mod tests {
             }
         })
         .await;
-        let completed = convoys.get("crew-convoy").await.expect("completed convoy").status.expect("completed status");
+        let completed = convoys.get(&crew_record).await.expect("completed convoy").status.expect("completed status");
         assert_eq!(completed.work["implement"].phase, WorkPhase::Complete);
         assert!(completed.crew_work["implement"].values().all(|state| state.phase == flotilla_resources::CrewWorkPhase::Done));
 
@@ -8850,14 +8893,18 @@ mod tests {
             })
             .await
             .expect("convoy create command should start");
-        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
+        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated {
+            name: "convoy-adopted@standalone".to_string()
+        });
 
         let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        let adopted_record = convoy_record_name(&backend, "convoy-adopted").await;
         wait_until(|| {
             let convoys = convoys.clone();
+            let adopted_record = adopted_record.clone();
             async move {
                 matches!(
-                    convoys.get("convoy-adopted").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                    convoys.get(&adopted_record).await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Active
                             && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
@@ -8873,7 +8920,7 @@ mod tests {
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::ConvoyWorkForceComplete {
-                    convoy: "convoy-adopted".to_string(),
+                    convoy: "convoy-adopted@standalone".to_string(),
                     work: "implement".to_string(),
                     message: Some("done".to_string()),
                 },
@@ -8886,9 +8933,10 @@ mod tests {
 
         wait_until(|| {
             let convoys = convoys.clone();
+            let adopted_record = adopted_record.clone();
             async move {
                 matches!(
-                    convoys.get("convoy-adopted").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                    convoys.get(&adopted_record).await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Landed
                             && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
@@ -8900,11 +8948,15 @@ mod tests {
         let checkout = backend
             .clone()
             .using::<ResourceCheckout>(NAMESPACE)
-            .get("adopted-checkout-convoy-adopted")
+            .list()
             .await
+            .expect("list adopted checkouts")
+            .items
+            .into_iter()
+            .find(|checkout| checkout.metadata.lifecycle_authority().ok().flatten() == Some(LifecycleAuthority::Adopted))
             .expect("adopted checkout should remain after completion");
         assert_eq!(checkout.metadata.lifecycle_authority().expect("authority should parse"), Some(LifecycleAuthority::Adopted));
-        assert!(backend.clone().using::<ResourceCheckout>(NAMESPACE).get("checkout-convoy-adopted-implement").await.is_err());
+        assert_eq!(backend.clone().using::<ResourceCheckout>(NAMESPACE).list().await.expect("checkout list").items.len(), 1);
 
         for handle in controller_handles {
             handle.abort();

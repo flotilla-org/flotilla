@@ -85,6 +85,7 @@ async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Ar
                 .build(),
             &ConvoyEnsureSpec {
                 project_ref: "standing-project".to_string(),
+                role: "quartermaster".to_string(),
                 workflow_ref: "quartermaster".to_string(),
                 placement_policy: None,
                 stance: Some(Stance::Trusted),
@@ -102,7 +103,16 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let first = convoys.get("quartermaster").await.expect("standing convoy");
+    let first_ref = backend
+        .using::<ConvoyEnsure>("flotilla")
+        .get("quartermaster")
+        .await
+        .expect("ensure")
+        .status
+        .expect("ensure status")
+        .convoy_ref
+        .expect("convoy ref");
+    let first = convoys.get(&first_ref).await.expect("standing convoy");
     let now = clock.now();
     convoys
         .update_status(&first.metadata.name, &first.metadata.resource_version, &ConvoyStatus {
@@ -120,7 +130,7 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
         .create(
             &InputMeta::builder()
                 .name("quartermaster-work".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "quartermaster".to_string())]))
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), first_ref.clone())]))
                 .build(),
             &ResourceEnvironmentSpec {
                 host_direct: None,
@@ -152,7 +162,7 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
     ]);
     clock.advance(ChronoDuration::hours(1));
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("continue holding").is_empty());
-    assert!(convoys.get("quartermaster").await.is_ok(), "failed convoy and its live container must survive");
+    assert!(convoys.get(&first_ref).await.is_ok(), "failed convoy and its live container must survive");
     let held = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("held ensure");
     assert_eq!(held.status.as_ref().expect("status").restart_count, 0);
     assert!(
@@ -174,7 +184,13 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
         .expect("verify backing dead");
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("record crash backoff");
     clock.advance(ChronoDuration::seconds(30));
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart dead backing"), vec!["started Convoy/quartermaster"]);
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart dead backing"), vec![
+        "started quartermaster@standing-project"
+    ]);
+    let generations = convoys.list().await.expect("standing generations").items;
+    assert_eq!(generations.len(), 2);
+    assert!(generations.iter().any(|convoy| convoy.metadata.name == first_ref && convoy.spec.generation == 1));
+    assert!(generations.iter().any(|convoy| convoy.spec.generation == 2));
     assert_eq!(backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 1);
 }
 
@@ -184,9 +200,10 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
     let ensures = backend.using::<ConvoyEnsure>("flotilla");
     let ensure = ensures.get("quartermaster").await.expect("ensure");
+    let first_ref = ensure.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("first convoy ref");
     ensures
         .update_status(&ensure.metadata.name, &ensure.metadata.resource_version, &ConvoyEnsureStatus {
-            convoy_ref: Some("quartermaster".to_string()),
+            convoy_ref: Some(first_ref.clone()),
             restart_count: 7,
             running_since: Some(clock.now()),
             retry_at: None,
@@ -195,13 +212,17 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
         .await
         .expect("seed crash budget");
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    convoys.delete("quartermaster").await.expect("operator reap");
+    convoys.delete(&first_ref).await.expect("operator reap");
 
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("prompt resurrection"), vec!["started Convoy/quartermaster"]);
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("prompt resurrection"), vec![
+        "started quartermaster@standing-project"
+    ]);
     assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 7);
 
     backend.using::<WorkflowTemplate>("flotilla").delete("quartermaster").await.expect("temporary resolution loss");
-    convoys.delete("quartermaster").await.expect("second operator reap");
+    let second_ref =
+        ensures.get("quartermaster").await.expect("ensure").status.and_then(|status| status.convoy_ref).expect("second convoy ref");
+    convoys.delete(&second_ref).await.expect("second operator reap");
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("unresolved workflow schedules retry");
     let retrying = ensures.get("quartermaster").await.expect("retrying ensure");
     assert_eq!(retrying.status.as_ref().expect("status").restart_count, 7);
@@ -235,7 +256,7 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
     assert!(restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("retry not due").is_empty());
     clock.set(retry_at);
     assert_eq!(restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("past-due retry"), vec![
-        "started Convoy/quartermaster"
+        "started quartermaster@standing-project"
     ]);
     assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 7);
 }

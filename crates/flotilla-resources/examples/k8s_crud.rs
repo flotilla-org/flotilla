@@ -40,6 +40,8 @@ fn updated_workflow_spec() -> WorkflowTemplateSpec {
 
 fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
     ConvoySpec {
+        role: String::new(),
+        generation: 1,
         workflow_ref: workflow_ref.to_string(),
         dispatching_principal_ref: Default::default(),
         inputs: [

@@ -27,6 +27,14 @@ pub const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapsho
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoySpec {
     pub workflow_ref: String,
+    /// Stable human-facing role within `project_ref`.
+    #[builder(default)]
+    #[serde(default)]
+    pub role: String,
+    /// Monotonic incarnation number within `{project_ref, role}`.
+    #[builder(default)]
+    #[serde(default)]
+    pub generation: u64,
     #[builder(default)]
     #[serde(default)]
     pub dispatching_principal_ref: PrincipalRef,

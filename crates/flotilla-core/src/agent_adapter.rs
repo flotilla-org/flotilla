@@ -1196,6 +1196,8 @@ mod tests {
             },
             spec: ConvoySpec {
                 workflow_ref: "workflow".to_string(),
+                role: "work".to_string(),
+                generation: 1,
                 dispatching_principal_ref: Default::default(),
                 inputs: BTreeMap::new(),
                 placement_policy: None,

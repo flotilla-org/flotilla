@@ -63,6 +63,20 @@ use flotilla_resources::{
 use futures::StreamExt;
 use tokio::sync::Notify;
 
+async fn admitted_convoy(backend: &ResourceBackend, role: &str) -> flotilla_resources::ResourceObject<ResourceConvoy> {
+    let selector = BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), role.to_string())]);
+    backend
+        .clone()
+        .using::<ResourceConvoy>("flotilla")
+        .list_matching_labels(&selector)
+        .await
+        .expect("list admitted convoy")
+        .items
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("admitted convoy role {role}"))
+}
+
 struct FixedRemoteHostDetector {
     owner: &'static str,
     repo: &'static str,
@@ -1467,18 +1481,18 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .expect("explicit reviewless override");
     let overridden_id = daemon.execute(start("overridden", "single-agent-contained")).await.expect("override dispatch command");
     assert_eq!(recv_command_finished(&mut events, overridden_id).await, CommandValue::ConvoyStarted {
-        name: "overridden".into(),
+        name: "overridden@zellij".into(),
         attach_plan: None,
         binding: None
     });
 
     let admitted_id = daemon.execute(start("reviewed", "implement-review")).await.expect("dispatch command");
     assert_eq!(recv_command_finished(&mut events, admitted_id).await, CommandValue::ConvoyStarted {
-        name: "reviewed".into(),
+        name: "reviewed@zellij".into(),
         attach_plan: None,
         binding: None
     });
-    let convoy = backend.using::<ResourceConvoy>("flotilla").get("reviewed").await.expect("reviewed convoy");
+    let convoy = admitted_convoy(&backend, "reviewed").await;
     assert_eq!(convoy.spec.workflow_ref, "implement-review");
     let workflow = backend.using::<WorkflowTemplate>("flotilla").get("implement-review").await.expect("implement-review workflow");
     assert_eq!(workflow.spec.vessels[0].crew.len(), 2);
@@ -1555,12 +1569,11 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
         .expect("PR adoption command accepted");
 
     assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::ConvoyStarted {
-        name: "convoy-adoption-of-an-existing-pr-1071".to_string(),
+        name: "convoy-adoption-of-an-existing-pr-1071@flotilla".to_string(),
         attach_plan: None,
         binding: None,
     });
-    let convoy =
-        backend.using::<ResourceConvoy>("flotilla").get("convoy-adoption-of-an-existing-pr-1071").await.expect("persisted adopted convoy");
+    let convoy = admitted_convoy(&backend, "convoy-adoption-of-an-existing-pr-1071").await;
     assert_eq!(convoy.spec.workflow_ref, "single-agent-shepherd");
     assert_eq!(convoy.spec.r#ref.as_deref(), Some("feat/existing-pr"));
     assert_eq!(
@@ -1744,8 +1757,8 @@ async fn bare_convoy_start_uses_priority_and_records_every_placement_candidate()
     })
     .await
     .expect("start command should finish");
-    assert_eq!(result, CommandValue::ConvoyStarted { name: "local-default".into(), attach_plan: None, binding: None });
-    let convoy = backend.using::<ResourceConvoy>("flotilla").get("local-default").await.expect("persisted convoy");
+    assert_eq!(result, CommandValue::ConvoyStarted { name: "local-default@flotilla".into(), attach_plan: None, binding: None });
+    let convoy = admitted_convoy(&backend, "local-default").await;
     assert_eq!(convoy.spec.placement_policy.as_deref(), Some("host-direct-b-remote"));
     let decision =
         convoy.status.and_then(|status| status.placement_decision).expect("admission should persist the complete placement decision");
@@ -1963,11 +1976,11 @@ async fn convoy_start_accepts_project_list_identifier() {
             .expect("convoy start command accepted");
 
         assert_eq!(recv_command_finished(&mut events, start_id).await, CommandValue::ConvoyStarted {
-            name: name.clone(),
+            name: format!("{name}@flotilla"),
             attach_plan: None,
             binding: None
         });
-        let convoy = backend.using::<ResourceConvoy>("flotilla").get(&name).await.expect("persisted convoy");
+        let convoy = admitted_convoy(&backend, &name).await;
         assert_eq!(convoy.spec.project_ref.as_deref(), Some("flotilla"));
     }
 }
@@ -2101,8 +2114,8 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     .await
     .expect("start command should finish");
 
-    assert_eq!(result, CommandValue::ConvoyStarted { name: "issue-732".into(), attach_plan: None, binding: None });
-    let persisted = backend.using::<ResourceConvoy>("flotilla").get("issue-732").await.expect("persisted convoy");
+    assert_eq!(result, CommandValue::ConvoyStarted { name: "issue-732@flotilla".into(), attach_plan: None, binding: None });
+    let persisted = admitted_convoy(&backend, "issue-732").await;
     assert_eq!(persisted.spec.project_ref.as_deref(), Some("flotilla"));
     assert_eq!(persisted.spec.workflow_ref, "single-agent-contained");
     assert_eq!(persisted.spec.dispatching_principal_ref, flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"));
@@ -2147,14 +2160,17 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .await
         .expect("default start command accepted");
     assert_eq!(recv_command_finished(&mut events, default_id).await, CommandValue::ConvoyStarted {
-        name: "default-regard".into(),
+        name: "default-regard@flotilla".into(),
         attach_plan: None,
         binding: None
     });
-    let default_convoy = backend.using::<ResourceConvoy>("flotilla").get("default-regard").await.expect("default convoy");
+    let default_convoy = admitted_convoy(&backend, "default-regard").await;
     let regards = backend.using::<Regard>("flotilla").list().await.expect("list default dispatcher regard");
-    let regard =
-        regards.items.iter().find(|regard| regard.spec.target.name == "default-regard").expect("default implicit dispatcher regard");
+    let regard = regards
+        .items
+        .iter()
+        .find(|regard| regard.spec.target.name == default_convoy.metadata.name)
+        .expect("default implicit dispatcher regard");
     assert_eq!(regard.spec.principal_ref, default_convoy.spec.dispatching_principal_ref);
     assert_eq!(regard.spec.source, RegardSource::Implicit { policy: "convoy-dispatch".to_string() });
     assert_eq!(regard.spec.expiry, RegardExpiryPolicy::Decaying { expires_after_seconds: 300 });
@@ -2198,8 +2214,8 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     })
     .await
     .expect("batch start should finish");
-    assert_eq!(batch_result, CommandValue::ConvoyStarted { name: "batch-732-733".into(), attach_plan: None, binding: None });
-    let batch = backend.using::<ResourceConvoy>("flotilla").get("batch-732-733").await.expect("batch convoy");
+    assert_eq!(batch_result, CommandValue::ConvoyStarted { name: "batch-732-733@flotilla".into(), attach_plan: None, binding: None });
+    let batch = admitted_convoy(&backend, "batch-732-733").await;
     assert_eq!(batch.spec.issues.iter().map(|issue| &issue.reference).collect::<Vec<_>>(), vec![&reference, &reference_two]);
     assert_eq!(batch.spec.instruction.as_deref(), Some("Fix both issues in one convoy."));
     let regards = backend.using::<Regard>("flotilla").list().await.expect("list batch dispatcher regards");
@@ -2245,11 +2261,11 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     .await
     .expect("offline fallback should finish");
     assert_eq!(fallback_result, CommandValue::ConvoyStarted {
-        name: "start-convoy-from-an-issue-732".into(),
+        name: "start-convoy-from-an-issue-732@flotilla".into(),
         attach_plan: None,
         binding: None,
     });
-    let fallback = backend.using::<ResourceConvoy>("flotilla").get("start-convoy-from-an-issue-732").await.expect("fallback convoy");
+    let fallback = admitted_convoy(&backend, "start-convoy-from-an-issue-732").await;
     assert_eq!(fallback.spec.r#ref.as_deref(), Some("start-convoy-from-an-issue-732"));
     assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
 
@@ -2306,7 +2322,11 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     })
     .await
     .expect("explicit workflow should not consult the missing default");
-    assert_eq!(explicit_result, CommandValue::ConvoyStarted { name: "explicit-workflow".into(), attach_plan: None, binding: None });
+    assert_eq!(explicit_result, CommandValue::ConvoyStarted {
+        name: "explicit-workflow@explicit-workflow".into(),
+        attach_plan: None,
+        binding: None,
+    });
 
     let wrong_namespace_id = daemon
         .execute(Command {
@@ -2470,10 +2490,80 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
     .await
     .expect("start command should finish");
 
-    assert_eq!(result, CommandValue::ConvoyStarted { name: "generated-convoy".into(), attach_plan: None, binding: None });
-    let persisted = backend.using::<ResourceConvoy>("flotilla").get("generated-convoy").await.expect("persisted convoy");
+    assert_eq!(result, CommandValue::ConvoyStarted { name: "generated-convoy@flotilla".into(), attach_plan: None, binding: None });
+    let persisted = admitted_convoy(&backend, "generated-convoy").await;
     assert_eq!(persisted.spec.r#ref.as_deref(), Some("fix/generated-convoy"));
     assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
+    drop(temp);
+}
+
+#[tokio::test]
+async fn convoy_admission_generates_records_and_enforces_one_live_role_generation() {
+    let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    let command = Command {
+        node_id: None,
+        provisioning_target: None,
+        context_repo: None,
+        action: CommandAction::ConvoyStart {
+            intent: Box::new(
+                ConvoyStartIntent::builder()
+                    .project_ref("flotilla".to_string())
+                    .name("governor".to_string())
+                    .branch("governor".to_string())
+                    .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                    .build(),
+            ),
+        },
+    };
+    let mut events = daemon.subscribe();
+
+    let first_id = daemon.execute(command.clone()).await.expect("first admission");
+    assert_eq!(recv_command_finished(&mut events, first_id).await, CommandValue::ConvoyStarted {
+        name: "governor@flotilla".to_string(),
+        attach_plan: None,
+        binding: None,
+    });
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let first = convoys.list().await.expect("list first generation").items.pop().expect("first generation");
+    assert!(first.metadata.name.starts_with("convoy-"));
+    assert_ne!(first.metadata.name, "governor");
+    assert_eq!(first.metadata.labels.get(flotilla_resources::PROJECT_LABEL).map(String::as_str), Some("flotilla"));
+    assert_eq!(first.metadata.labels.get(flotilla_resources::ROLE_LABEL).map(String::as_str), Some("governor"));
+    assert_eq!(first.metadata.labels.get(flotilla_resources::GENERATION_LABEL).map(String::as_str), Some("1"));
+
+    let duplicate_id = daemon.execute(command.clone()).await.expect("duplicate admission result");
+    assert_eq!(recv_command_finished(&mut events, duplicate_id).await, CommandValue::Error {
+        message: "live convoy governor@flotilla generation 1 already exists".to_string(),
+    });
+
+    convoys
+        .update_status(&first.metadata.name, &first.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+            phase: flotilla_resources::ConvoyPhase::Failed,
+            ..Default::default()
+        })
+        .await
+        .expect("settle first generation");
+    let second_id = daemon.execute(command).await.expect("second generation admission");
+    assert!(
+        matches!(recv_command_finished(&mut events, second_id).await, CommandValue::ConvoyStarted { name, .. } if name == "governor@flotilla")
+    );
+    let generations = convoys.list().await.expect("list generations").items;
+    assert_eq!(generations.len(), 2, "terminal history must be retained");
+    assert!(generations.iter().any(|convoy| convoy.spec.generation == 2));
+
+    let delete_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyDelete { namespace: None, name: "governor@flotilla".to_string(), force: true },
+        })
+        .await
+        .expect("delete by role address");
+    assert_eq!(recv_command_finished(&mut events, delete_id).await, CommandValue::Ok);
+    assert_eq!(convoys.list().await.expect("list after addressed delete").items.len(), 1);
     drop(temp);
 }
 
@@ -2639,7 +2729,7 @@ async fn convoy_start_worker_panic_finishes_the_command_and_allows_retry() {
 
     let retry_id = daemon.execute(command).await.expect("matching convoy start retry should be accepted");
     let retry_result = recv_command_finished(&mut events, retry_id).await;
-    assert_eq!(retry_result, CommandValue::ConvoyStarted { name: "retried-convoy".into(), attach_plan: None, binding: None });
+    assert_eq!(retry_result, CommandValue::ConvoyStarted { name: "retried-convoy@flotilla".into(), attach_plan: None, binding: None });
 
     drop(temp);
 }
@@ -2675,10 +2765,11 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
         .await
         .expect("convoy start should be accepted");
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let record_name = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if convoys.get("bootstrap-failure").await.is_ok() {
-                break;
+            let selector = BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "bootstrap-failure".to_string())]);
+            if let Some(convoy) = convoys.list_matching_labels(&selector).await.expect("list bootstrap convoy").items.into_iter().next() {
+                break convoy.metadata.name;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -2689,7 +2780,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
     let workflow = single_agent_contained_workflow_spec();
     apply_status_patch(
         &convoys,
-        "bootstrap-failure",
+        &record_name,
         &convoy_controller_patches::bootstrap(
             WorkflowSnapshot { exit: None, turn_delivery: workflow.turn_delivery, vessels: workflow.vessels },
             "single-agent-contained".into(),
@@ -2706,14 +2797,14 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
     let work_message = "agent adapter claude cannot realize contained stance";
     apply_status_patch(
         &convoys,
-        "bootstrap-failure",
+        &record_name,
         &convoy_controller_patches::roll_up_work("work".into(), WorkPhase::Failed, chrono::Utc::now(), Some(work_message.into())),
     )
     .await
     .expect("work failure patch");
     apply_status_patch(
         &convoys,
-        "bootstrap-failure",
+        &record_name,
         &convoy_controller_patches::fail_convoy(BTreeMap::new(), chrono::Utc::now(), Some("convoy bootstrap failed".into())),
     )
     .await

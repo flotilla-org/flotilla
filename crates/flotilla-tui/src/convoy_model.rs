@@ -162,6 +162,8 @@ pub struct ConvoySummary {
     pub id: ConvoyId,
     pub namespace: String,
     pub name: String,
+    #[builder(default)]
+    pub generation: u64,
     pub origin_host: Option<HostName>,
     pub workflow_ref: String,
     #[builder(default)]
@@ -191,6 +193,7 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
             id: ConvoyId::for_resource(&row.resource),
             namespace: row.resource.namespace.clone(),
             name: row.name.clone(),
+            generation: row.generation,
             origin_host: row.resource.host.clone(),
             workflow_ref: row.workflow_ref.clone(),
             dispatching_principal_ref: row.dispatching_principal_ref.clone(),
@@ -212,6 +215,16 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
     }
 }
 
+impl ConvoySummary {
+    pub fn address(&self) -> String {
+        self.project_ref.as_ref().map_or_else(|| self.name.clone(), |project| format!("{}@{project}", self.name))
+    }
+
+    pub fn display_name(&self) -> String {
+        self.project_ref.as_ref().map_or_else(|| self.name.clone(), |project| format!("{} @ {project}", self.name))
+    }
+}
+
 fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSummary {
     let crew = vessel
         .crew
@@ -228,7 +241,7 @@ fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSumm
         workspace_ref: vessel.attach.clone(),
         materialize_ref: vessel.materialize.clone(),
         completion_target: vessel.complete_work.then(|| WorkCompletionTarget {
-            convoy: row.name.clone(),
+            convoy: row.project_ref.as_ref().map_or_else(|| row.name.clone(), |project| format!("{}@{project}", row.name)),
             vessel: vessel.name.clone(),
             host: vessel.host.clone(),
         }),

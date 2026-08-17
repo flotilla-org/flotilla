@@ -367,6 +367,8 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let convoy = convoys
         .create(&controller_meta().name("convoy-multi").call(), &ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "wf".to_string(),
             dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),
