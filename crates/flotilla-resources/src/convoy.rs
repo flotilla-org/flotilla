@@ -965,28 +965,21 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     return;
                 };
                 let target_was_done = crew.get(target_role).is_some_and(|state| state.phase == CrewWorkPhase::Done);
-                let target_reopened = if let Some(target) = crew.get_mut(target_role) {
+                if let Some(target) = crew.get_mut(target_role) {
                     if matches!(target.phase, CrewWorkPhase::Pending | CrewWorkPhase::Done | CrewWorkPhase::HandedBack) {
                         // Hand-back continues the same crew process, preserving its original start.
                         target.phase = CrewWorkPhase::Working;
                         target.started_at.get_or_insert(*handed_off_at);
                         target.finished_at = None;
                         target.message = Some(message.clone());
-                        true
-                    } else {
-                        false
                     }
-                } else {
-                    false
-                };
+                }
                 if target_was_done && sender_role != target_role {
                     if let Some(sender) = crew.get_mut(sender_role) {
                         sender.phase = CrewWorkPhase::HandedBack;
                         sender.finished_at = Some(*handed_off_at);
                         sender.message = Some(message.clone());
                     }
-                }
-                if target_reopened && sender_role != target_role {
                     clear_pending_brief_for(status, vessel, sender_role);
                 }
             }

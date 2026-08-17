@@ -136,6 +136,35 @@ fn crew_handoff_clears_the_senders_pending_brief() {
 }
 
 #[test]
+fn kickoff_handoff_preserves_the_working_senders_pending_brief() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        crew_work: BTreeMap::from([(
+            "implement".to_string(),
+            BTreeMap::from([
+                ("coder".to_string(), crew_work(CrewWorkPhase::Working)),
+                ("reviewer".to_string(), crew_work(CrewWorkPhase::Pending)),
+            ]),
+        )]),
+        ..ConvoyStatus::default()
+    };
+    queue_pending_brief(&mut status, "coder");
+
+    external_patches::handoff_crew_work(
+        "implement".to_string(),
+        "coder".to_string(),
+        "reviewer".to_string(),
+        ts(20),
+        "please review".to_string(),
+    )
+    .apply(&mut status);
+
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.pending_brief().map(|brief| brief.role.as_str()), Some("coder"));
+}
+
+#[test]
 fn terminal_convoy_phase_clears_pending_brief() {
     let mut status = ConvoyStatus { phase: ConvoyPhase::Active, ..ConvoyStatus::default() };
     queue_pending_brief(&mut status, "coder");
