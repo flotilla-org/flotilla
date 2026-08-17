@@ -6,8 +6,9 @@ use flotilla_resources::{
     controller::{Actuation, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
     Convoy, ConvoyPhase, Environment, EnvironmentPhase, ReplicaReadResolver, ResourceBackend, ResourceError, ResourceObject,
     ResourceProvenance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
-    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
+    TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, ACTUATOR_HOST_REF_ANNOTATION,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION,
+    CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -57,6 +58,7 @@ pub struct TerminalSessionReconciler<R> {
     convoys: TypedResolver<Convoy>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     environments: TypedResolver<Environment>,
+    local_host_ref: Option<String>,
 }
 
 impl<R> TerminalSessionReconciler<R> {
@@ -66,7 +68,25 @@ impl<R> TerminalSessionReconciler<R> {
             convoys: backend.clone().using::<Convoy>(namespace),
             federated_convoys: None,
             environments: backend.using::<Environment>(namespace),
+            local_host_ref: None,
         }
+    }
+
+    pub fn with_local_host_ref(mut self, local_host_ref: impl Into<String>) -> Self {
+        self.local_host_ref = Some(local_host_ref.into());
+        self
+    }
+
+    fn actuates(&self, session: &ResourceObject<TerminalSession>) -> bool {
+        // Unannotated sessions are independent or predate actuator projection;
+        // their local authoritative store remains their actuator.
+        self.local_host_ref.as_ref().is_none_or(|local_host_ref| {
+            session
+                .metadata
+                .annotations
+                .get(ACTUATOR_HOST_REF_ANNOTATION)
+                .is_none_or(|actuator_host_ref| actuator_host_ref == local_host_ref)
+        })
     }
 
     pub fn with_federated_convoys(mut self, backend: &ResourceBackend, namespace: &str) -> Self {
@@ -138,6 +158,9 @@ where
     type Dependencies = TerminalDeps;
 
     async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+        if !self.actuates(obj) {
+            return Ok(TerminalDeps::None);
+        }
         let environment = match self.environments.get(&obj.spec.env_ref).await {
             Ok(environment) => environment,
             Err(ResourceError::NotFound { .. }) => return Ok(TerminalDeps::OwnerMissing),
@@ -277,6 +300,9 @@ where
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        if !self.actuates(obj) {
+            return Ok(());
+        }
         let mut errors = Vec::new();
         if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
             if let Err(error) = self.runtime.kill_session(session_id, &obj.spec).await {

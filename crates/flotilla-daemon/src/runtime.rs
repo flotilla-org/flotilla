@@ -1760,10 +1760,12 @@ fn spawn_controller_loops(
                     let namespace_string = namespace_string.clone();
                     let state = Arc::clone(&state);
                     async move {
+                        let local_host_ref = state.local_host_ref.clone();
                         ControllerLoop {
                             primary: backend.clone().using::<Environment>(&namespace_string),
                             secondaries: vec![],
-                            reconciler: EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state })),
+                            reconciler: EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }))
+                                .with_local_host_ref(local_host_ref),
                             resync_interval: controller_resync_interval,
                             backend,
                         }
@@ -1854,6 +1856,7 @@ fn spawn_controller_loops(
                     let namespace_string = namespace_string.clone();
                     let state = Arc::clone(&state);
                     async move {
+                        let local_host_ref = state.local_host_ref.clone();
                         ControllerLoop {
                             primary: backend.clone().using::<flotilla_resources::TerminalSession>(&namespace_string),
                             secondaries: vec![],
@@ -1862,6 +1865,7 @@ fn spawn_controller_loops(
                                 backend.clone(),
                                 &namespace_string,
                             )
+                            .with_local_host_ref(local_host_ref)
                             .with_federated_convoys(&backend, &namespace_string),
                             resync_interval: controller_resync_interval,
                             backend,

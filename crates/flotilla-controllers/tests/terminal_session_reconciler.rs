@@ -19,7 +19,8 @@ use flotilla_resources::{
     Convoy, ConvoyPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta,
     LifecycleAuthority, ResourceBackend, ResourceError, ResourceObject, StatusPatch, TerminalAttention, TerminalAttentionSource,
     TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
-    VirtualClock, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
+    VirtualClock, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
+    VESSEL_REF_LABEL,
 };
 
 mod common;
@@ -294,6 +295,75 @@ async fn repeated_runtime_probe_failure_becomes_visible_and_stops_retrying() {
 
     loop_task.abort();
     let _ = loop_task.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn foreign_actuator_runtime_failure_is_skipped_and_convoy_stays_active() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let convoy = convoys.get("demo").await.expect("convoy");
+    let mut convoy_status = convoy.status.expect("convoy status");
+    convoy_status.phase = ConvoyPhase::Active;
+    convoys.update_status("demo", &convoy.metadata.resource_version, &convoy_status).await.expect("mark convoy active");
+
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(
+            &InputMeta::builder()
+                .name("terminal-demo-work-coder".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "demo".to_string())]))
+                .annotations(BTreeMap::from([(ACTUATOR_HOST_REF_ANNOTATION.to_string(), "udder".to_string())]))
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("terminal should be created");
+    let mut running = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "cleat-demo-work-coder".to_string(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "cargo test".to_string(),
+        delivered_message_id: None,
+    }
+    .apply(&mut running);
+    sessions.update_status(&created.metadata.name, &created.metadata.resource_version, &running).await.expect("terminal should be running");
+
+    let runtime = Arc::new(UnavailableRunningRuntime::default());
+    let loop_task = tokio::spawn(
+        ControllerLoop {
+            primary: sessions.clone(),
+            secondaries: Vec::new(),
+            reconciler: TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla").with_local_host_ref("kiwi"),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    for _ in 0..6 {
+        tokio::time::advance(Duration::from_secs(60)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let terminal_status = sessions.get("terminal-demo-work-coder").await.expect("terminal remains").status.expect("terminal status");
+    assert_eq!(terminal_status.phase, TerminalSessionPhase::Running);
+    assert!(terminal_status.degraded.is_none());
+    assert_eq!(runtime.probes.load(Ordering::SeqCst), 0, "a non-actuator must never consult its local provider registry");
+    assert_eq!(convoys.get("demo").await.expect("convoy remains").status.expect("convoy status").phase, ConvoyPhase::Active);
+
+    loop_task.abort();
 }
 
 const GHOST_SESSION_NAME: &str = "terminal-deleted-convoy-work-coder";

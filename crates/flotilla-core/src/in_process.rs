@@ -2654,7 +2654,7 @@ impl InProcessDaemon {
         reconcile_registered_policy(&self.resource_backend, &namespace, &policy_name, &desired).await
     }
 
-    pub async fn remote_host_direct_placement_host(
+    pub async fn remote_placement_host(
         &self,
         namespace: &str,
         policy_name: Option<&str>,
@@ -2669,10 +2669,38 @@ impl InProcessDaemon {
             .get(policy_name)
             .await
             .map_err(|error| format!("placement policy {policy_name}: {error}"))?;
-        if policy.spec.host_direct.is_none() {
+        let target_host = placement_target_host(&self.resource_backend, namespace, &policy).await?;
+        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == target_host.reference) {
             return Ok(None);
         }
-        let target_host = placement_target_host(&self.resource_backend, namespace, &policy).await?;
+        Ok(Some(flotilla_protocol::qualified_path::HostId::new(target_host.reference)))
+    }
+
+    pub async fn convoy_start_placement_host(
+        &self,
+        namespace: &str,
+        intent: &flotilla_protocol::ConvoyStartIntent,
+    ) -> Result<Option<flotilla_protocol::qualified_path::HostId>, String> {
+        if intent.placement_policy.is_some() {
+            return self.remote_placement_host(namespace, intent.placement_policy.as_deref()).await;
+        }
+
+        let (project_namespace, project_ref) = resolve_project_ref(namespace, &intent.project_ref)?;
+        let project = self
+            .resource_backend
+            .clone()
+            .definitions::<Project>(&project_namespace)
+            .get(&project_ref)
+            .await
+            .map_err(|error| project_not_ready_error(&project_namespace, &project_ref, error))?;
+        let repositories = self.snapshot_project_repositories(&project_namespace, &project_ref).await?;
+        let (_, workflow) =
+            self.resolve_convoy_admission_workflow(&project_namespace, &project_ref, &project.spec, &repositories, intent, None).await?;
+        let placement = self.resolve_and_validate_convoy_placement(&project_namespace, &workflow, None).await?;
+        let Some(policy) = placement.selected else {
+            return Ok(None);
+        };
+        let target_host = placement_target_host(&self.resource_backend, &project_namespace, &policy).await?;
         if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == target_host.reference) {
             return Ok(None);
         }
@@ -4005,6 +4033,38 @@ impl InProcessDaemon {
         self.prepare_convoy_admission_with_preferences(namespace, intent, dispatching_principal_ref, None, None).await
     }
 
+    async fn resolve_convoy_admission_workflow(
+        &self,
+        namespace: &str,
+        project_ref: &str,
+        project: &ProjectSpec,
+        repositories: &[ConvoyRepositorySpec],
+        intent: &flotilla_protocol::ConvoyStartIntent,
+        stance: Option<flotilla_resources::Stance>,
+    ) -> Result<(String, WorkflowTemplateSpec), String> {
+        let workflow_ref = match intent.workflow_ref.as_deref() {
+            Some(workflow_ref) => required_admission_value(workflow_ref, "workflow")?.to_string(),
+            None if intent.change_request.is_some() => "single-agent-shepherd".to_string(),
+            None => project.default_workflow_ref.clone(),
+        };
+        let mut workflow = self
+            .resource_backend
+            .clone()
+            .using::<WorkflowTemplate>(namespace)
+            .get(&workflow_ref)
+            .await
+            .map_err(|error| format!("workflow template {workflow_ref}: {error}"))?;
+        if let Some(stance) = stance {
+            for vessel in &mut workflow.spec.vessels {
+                vessel.stance = stance;
+            }
+        }
+        apply_agent_overrides(&mut workflow.spec, &intent.agent_overrides)?;
+        validate_fork_workflow_admission(&self.resource_backend, namespace, repositories, &workflow_ref, &workflow.spec).await?;
+        resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), repositories, &mut workflow.spec).await?;
+        Ok((workflow_ref, workflow.spec))
+    }
+
     async fn prepare_convoy_admission_with_preferences(
         &self,
         namespace: &str,
@@ -4064,27 +4124,8 @@ impl InProcessDaemon {
                 issues.push(self.resolve_convoy_issue(namespace, &project, selector).await?);
             }
         }
-        let workflow_ref = match intent.workflow_ref.as_deref() {
-            Some(workflow_ref) => required_admission_value(workflow_ref, "workflow")?.to_string(),
-            None if change_request.is_some() => "single-agent-shepherd".to_string(),
-            None => project.spec.default_workflow_ref.clone(),
-        };
-        let mut workflow = self
-            .resource_backend
-            .clone()
-            .using::<WorkflowTemplate>(namespace)
-            .get(&workflow_ref)
-            .await
-            .map_err(|error| format!("workflow template {workflow_ref}: {error}"))?;
-        if let Some(stance) = stance {
-            for vessel in &mut workflow.spec.vessels {
-                vessel.stance = stance;
-            }
-        }
-        apply_agent_overrides(&mut workflow.spec, &intent.agent_overrides)?;
-        validate_fork_workflow_admission(&self.resource_backend, namespace, &repositories_snapshot, &workflow_ref, &workflow.spec).await?;
-        resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), &repositories_snapshot, &mut workflow.spec)
-            .await?;
+        let (workflow_ref, workflow) =
+            self.resolve_convoy_admission_workflow(namespace, project_ref, &project.spec, &repositories_snapshot, intent, stance).await?;
 
         let fallback_slug = change_request
             .as_ref()
@@ -4129,7 +4170,7 @@ impl InProcessDaemon {
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
-        let placement = self.resolve_and_validate_convoy_placement(namespace, &workflow.spec, intent.placement_policy.as_deref()).await?;
+        let placement = self.resolve_and_validate_convoy_placement(namespace, &workflow, intent.placement_policy.as_deref()).await?;
         let placement_policy = placement.selected.as_ref().map(|placement| placement.metadata.name.clone());
         let placement_decision = match placement.selected.as_ref() {
             Some(selected) => Some(PlacementDecision {
@@ -4156,7 +4197,7 @@ impl InProcessDaemon {
         Ok(ConvoyAdmission::builder()
             .name(name)
             .spec(spec)
-            .workflow(workflow.spec)
+            .workflow(workflow)
             .maybe_placement_policy(placement.selected.map(|placement| placement.spec))
             .maybe_placement_decision(placement_decision)
             .build())
