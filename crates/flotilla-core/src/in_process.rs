@@ -581,12 +581,19 @@ fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>,
 }
 
 fn fleet_row_attach_reference_keys(row: &FleetListRow) -> Vec<String> {
-    let mut refs = vec![row.convoy.clone(), row.vessel.clone(), row.crew.clone()];
+    let address = row.convoy.replace(" @ ", "@");
+    let mut refs = vec![address.clone(), row.vessel.clone(), row.crew.clone()];
+    if let Some(convoy_ref) = &row.convoy_ref {
+        refs.push(convoy_ref.clone());
+    }
     if let Some(session) = &row.session {
         refs.push(session.clone());
     }
     if row.crew != "-" {
-        refs.push(format!("{}/{}", row.convoy, row.crew));
+        refs.push(format!("{address}/{}", row.crew));
+        if let Some(convoy_ref) = &row.convoy_ref {
+            refs.push(format!("{convoy_ref}/{}", row.crew));
+        }
         if let Some((_task, role)) = row.crew.rsplit_once('/') {
             refs.push(role.to_string());
         }

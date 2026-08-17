@@ -47,6 +47,28 @@ fn convoy_role_addresses_reject_malformed_values() {
     assert_eq!(parse_role_address(""), Err("convoy role cannot be empty".to_string()));
 }
 
+#[test]
+fn remote_fleet_attach_references_use_the_canonical_role_address() {
+    let row = FleetListRow::builder()
+        .convoy("reviewer @ flotilla")
+        .convoy_ref("convoy-opaque")
+        .vessel("convoy-opaque-implement")
+        .crew("implement/coder")
+        .crew_state("running")
+        .host(HostName::new("remote"))
+        .namespace("flotilla")
+        .session("session-opaque")
+        .staleness(FleetStaleness::Fresh { last_sync: Utc::now() })
+        .build();
+
+    let references = fleet_row_attach_reference_keys(&row);
+    assert!(references.contains(&"reviewer@flotilla".to_string()));
+    assert!(references.contains(&"reviewer@flotilla/implement/coder".to_string()));
+    assert!(references.contains(&"convoy-opaque".to_string()));
+    assert!(!references.contains(&"reviewer @ flotilla".to_string()));
+    assert_eq!(fleet_row_attach_reference_label(&row), "reviewer @ flotilla/implement/coder (remote)");
+}
+
 #[tokio::test]
 async fn convoy_role_resolution_can_disambiguate_a_projectless_convoy() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
