@@ -110,7 +110,10 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::MarkCrewFailed { .. } => PatchKind::ConvoyMarkCrewFailed,
         ConvoyStatusPatch::HandoffCrewWork { .. } => PatchKind::ConvoyHandoffCrewWork,
         ConvoyStatusPatch::ResumeCrewWork { .. } => PatchKind::ConvoyResumeCrewWork,
-        ConvoyStatusPatch::RecordTurnDelivery { .. } => PatchKind::ConvoyRecordTurnDelivery,
+        ConvoyStatusPatch::SetPendingBrief { .. }
+        | ConvoyStatusPatch::ClearPendingBrief
+        | ConvoyStatusPatch::DeliverPendingBrief { .. }
+        | ConvoyStatusPatch::RecordTurnDelivery { .. } => PatchKind::ConvoyRecordTurnDelivery,
         ConvoyStatusPatch::RefuseTurnDelivery { .. } => PatchKind::ConvoyRefuseTurnDelivery,
         ConvoyStatusPatch::RollUpWork { .. } => PatchKind::ConvoyRollUpWork,
     }

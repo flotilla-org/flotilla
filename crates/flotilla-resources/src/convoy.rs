@@ -429,6 +429,14 @@ pub struct ConvoyStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct PendingBrief {
+    pub vessel: String,
+    pub role: String,
+    pub content: String,
+    pub queued_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct TargetMismatch {
     pub repo_ref: RepositoryKey,
     pub change_request_id: String,
@@ -449,6 +457,17 @@ pub struct WorkflowSnapshot {
 pub struct TurnDeliveryStatus {
     #[serde(default)]
     pub episodes: Vec<TurnDeliveryEpisode>,
+    /// The operator brief waiting for its target crew member's turn boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_brief: Option<PendingBrief>,
+}
+
+pub const PENDING_BRIEF_DELIVERY_SOURCE: &str = "operator";
+
+impl ConvoyStatus {
+    pub fn pending_brief(&self) -> Option<&PendingBrief> {
+        self.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).and_then(|delivery| delivery.pending_brief.as_ref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -684,6 +703,16 @@ pub enum ConvoyStatusPatch {
         role: String,
         resumed_at: DateTime<Utc>,
         prompt: String,
+    },
+    SetPendingBrief {
+        pending_brief: PendingBrief,
+    },
+    ClearPendingBrief,
+    DeliverPendingBrief {
+        vessel: String,
+        role: String,
+        delivered_at: DateTime<Utc>,
+        content: String,
     },
     RecordTurnDelivery {
         source: String,
@@ -937,6 +966,45 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.message = Some(prompt.clone());
                 }
             }
+            Self::SetPendingBrief { pending_brief } => {
+                status.turn_deliveries.entry(PENDING_BRIEF_DELIVERY_SOURCE.to_string()).or_default().pending_brief =
+                    Some(pending_brief.clone());
+            }
+            Self::ClearPendingBrief => {
+                if let Some(delivery) = status.turn_deliveries.get_mut(PENDING_BRIEF_DELIVERY_SOURCE) {
+                    delivery.pending_brief = None;
+                }
+                if status.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).is_some_and(|delivery| delivery.episodes.is_empty()) {
+                    status.turn_deliveries.remove(PENDING_BRIEF_DELIVERY_SOURCE);
+                }
+            }
+            Self::DeliverPendingBrief { vessel, role, delivered_at, content } => {
+                let matches_pending =
+                    status.pending_brief().is_some_and(|brief| brief.vessel == *vessel && brief.role == *role && brief.content == *content);
+                if !matches_pending {
+                    return;
+                }
+                if let Some(delivery) = status.turn_deliveries.get_mut(PENDING_BRIEF_DELIVERY_SOURCE) {
+                    delivery.pending_brief = None;
+                }
+                if status.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).is_some_and(|delivery| delivery.episodes.is_empty()) {
+                    status.turn_deliveries.remove(PENDING_BRIEF_DELIVERY_SOURCE);
+                }
+                status.phase = ConvoyPhase::Active;
+                status.finished_at = None;
+                if let Some(work) = status.work.get_mut(vessel) {
+                    work.phase = WorkPhase::Running;
+                    work.finished_at = None;
+                    work.completion_authority = WorkCompletionAuthority::CrewRollup;
+                }
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.phase = CrewWorkPhase::Working;
+                    state.started_at.get_or_insert(*delivered_at);
+                    state.finished_at = None;
+                    state.message = Some(content.clone());
+                    state.disposition = None;
+                }
+            }
             Self::RecordTurnDelivery { source, episode, vessel, role, prompt } => {
                 let delivery = status.turn_deliveries.entry(source.clone()).or_default();
                 if !delivery.episodes.iter().any(|existing| existing.head_sha == episode.head_sha) {
@@ -1117,6 +1185,18 @@ pub mod external_patches {
 
     pub fn resume_crew_work(vessel: String, role: String, resumed_at: DateTime<Utc>, prompt: String) -> ConvoyStatusPatch {
         ConvoyStatusPatch::ResumeCrewWork { vessel, role, resumed_at, prompt }
+    }
+
+    pub fn set_pending_brief(pending_brief: PendingBrief) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::SetPendingBrief { pending_brief }
+    }
+
+    pub fn clear_pending_brief() -> ConvoyStatusPatch {
+        ConvoyStatusPatch::ClearPendingBrief
+    }
+
+    pub fn deliver_pending_brief(vessel: String, role: String, delivered_at: DateTime<Utc>, content: String) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::DeliverPendingBrief { vessel, role, delivered_at, content }
     }
 
     pub fn record_turn_delivery(
