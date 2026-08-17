@@ -8574,6 +8574,17 @@ impl InProcessDaemon {
             let namespace = self.provisioning_namespace().await;
             let role = name.clone();
             let project_identity = project_ref.as_deref();
+            if let Err(message) = allocate_convoy_generation(&self.resource_backend, &namespace, project_identity, &role).await {
+                let result = flotilla_protocol::CommandValue::Error { message };
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    node_id: self.node_id.clone(),
+                    repo_identity: empty_identity,
+                    repo: None,
+                    result,
+                });
+                return Ok(id);
+            }
             let record_name = convoy_record_name();
             let name = &record_name;
             if let Err(message) = self.check_local_free_space_floor().await {
