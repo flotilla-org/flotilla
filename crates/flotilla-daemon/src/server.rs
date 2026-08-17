@@ -803,13 +803,16 @@ async fn run_shutdown_only_session(
             match message {
                 Ok(Some(Message::Request { id, request: flotilla_protocol::Request::Shutdown })) => {
                     if session.write(Message::ok_response(id, flotilla_protocol::Response::Shutdown)).await.is_ok() {
-                        info!("graceful shutdown requested by same-protocol client from a different build");
+                        info!("graceful shutdown requested by same-version client with a different protocol fingerprint");
                         let _ = shutdown_request_tx.send(());
                     }
                 }
                 Ok(Some(Message::Request { id, .. })) => {
                     let _ = session
-                        .write(Message::error_response(id, "wire generation mismatch: only daemon shutdown is available across builds"))
+                        .write(Message::error_response(
+                            id,
+                            "protocol fingerprint mismatch: only daemon shutdown is available",
+                        ))
                         .await;
                 }
                 Ok(Some(other)) => warn!(msg = ?other, "unexpected message from shutdown-only client"),
