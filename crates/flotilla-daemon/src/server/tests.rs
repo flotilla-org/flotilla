@@ -49,7 +49,7 @@ use super::{
     client_connection::QuerySubscriptions,
     handle_client, handle_client_session,
     peer_connection::PEER_IDLE_TIMEOUT,
-    peer_runtime::{forward_with_keepalive_for_test, send_link_state, ForwardResult},
+    peer_runtime::{forward_with_keepalive_for_test, retry_with_backoff_for_test, send_link_state, ForwardResult},
     publish_socket_path,
     remote_commands::{
         extract_command_repo_identity, ForwardedCommand, ForwardedCommandMap, ForwardedCommandState, PendingRemoteCancelMap,
@@ -64,6 +64,33 @@ use super::{
     CONNECTION_PREFACE_TIMEOUT, HELLO_HANDSHAKE_TIMEOUT,
 };
 use crate::peer::{ConnectionDirection, ConnectionMeta};
+
+#[tokio::test(start_paused = true)]
+async fn peer_reconnect_survives_sustained_failures_and_recovers() {
+    const OBSERVED_STALL_ATTEMPT: usize = 732;
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_dial = Arc::clone(&attempts);
+    let recovered_attempt = retry_with_backoff_for_test(
+        |_, _| async {},
+        move || {
+            let attempts = Arc::clone(&attempts_for_dial);
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt <= OBSERVED_STALL_ATTEMPT + 1 {
+                    Err("remote unavailable".to_string())
+                } else {
+                    Ok(attempt)
+                }
+            }
+        },
+        |_, _| async {},
+    )
+    .await;
+
+    assert_eq!(recovered_attempt, OBSERVED_STALL_ATTEMPT + 2);
+    assert_eq!(attempts.load(Ordering::SeqCst), OBSERVED_STALL_ATTEMPT + 2);
+}
 
 #[tokio::test]
 async fn socket_guard_does_not_unlink_replacement_listener() {
