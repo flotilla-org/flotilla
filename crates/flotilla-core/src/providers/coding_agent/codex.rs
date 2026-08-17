@@ -317,7 +317,7 @@ impl CodexCodingAgent {
             Ok(ids) => ids,
             Err(e) if is_auth_error(&e) => {
                 let fresh_auth = match self.refresh_auth() {
-                    Some(auth) => auth,
+                    Some(a) => a,
                     None => {
                         if !self.auth_warned.swap(true, Ordering::Relaxed) {
                             warn!(provider = "codex", "Codex fallback environment list failed: auth refresh failed");
