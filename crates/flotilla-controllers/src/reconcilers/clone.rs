@@ -26,7 +26,7 @@ impl<R> CloneReconciler<R> {
     }
 }
 
-pub enum CloneDeps {
+pub enum ClonePrepared {
     None,
     Ready { default_branch: Option<String> },
     Retrying(String),
@@ -38,28 +38,30 @@ where
     R: CloneRuntime + 'static,
 {
     type Resource = Clone;
-    type Dependencies = CloneDeps;
+    type Prepared = ClonePrepared;
 
-    async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         let repository = match self.repositories.get(&obj.spec.repo_ref.to_string()).await {
             Ok(repository) => repository,
-            Err(ResourceError::NotFound { .. }) => return Ok(CloneDeps::Failed(format!("repository {} not found", obj.spec.repo_ref))),
+            Err(ResourceError::NotFound { .. }) => return Ok(ClonePrepared::Failed(format!("repository {} not found", obj.spec.repo_ref))),
             Err(error) => return Err(error),
         };
         if let Err(message) = repository.spec.verify_key(&obj.spec.repo_ref) {
-            return Ok(CloneDeps::Failed(message));
+            return Ok(ClonePrepared::Failed(message));
         }
         let canonical_repo = match repository.spec.identity() {
             RepositoryIdentity::Remote { canonical_remote } => canonical_remote,
-            RepositoryIdentity::Local { .. } => return Ok(CloneDeps::Failed("clone repository must have a transport remote".to_string())),
+            RepositoryIdentity::Local { .. } => {
+                return Ok(ClonePrepared::Failed("clone repository must have a transport remote".to_string()))
+            }
         };
         let expected_name = format!("clone-{}", clone_key(canonical_repo, &obj.spec.env_ref));
         if obj.metadata.name != expected_name {
-            return Ok(CloneDeps::Failed(format!("clone name mismatch: expected {expected_name}")));
+            return Ok(ClonePrepared::Failed(format!("clone name mismatch: expected {expected_name}")));
         }
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(ClonePhase::Pending);
         if !matches!(phase, ClonePhase::Pending | ClonePhase::Cloning) {
-            return Ok(CloneDeps::None);
+            return Ok(ClonePrepared::None);
         }
 
         let result = if obj.metadata.labels.get("flotilla.work/discovered").map(String::as_str) == Some("true") {
@@ -68,32 +70,32 @@ where
             self.runtime.clone_and_inspect(&obj.spec.url, &obj.spec.path).await
         };
         Ok(match result {
-            Ok(default_branch) => CloneDeps::Ready { default_branch },
-            Err(err) if phase == ClonePhase::Pending => CloneDeps::Retrying(err),
-            Err(err) => CloneDeps::Failed(err),
+            Ok(default_branch) => ClonePrepared::Ready { default_branch },
+            Err(err) if phase == ClonePhase::Pending => ClonePrepared::Retrying(err),
+            Err(err) => ClonePrepared::Failed(err),
         })
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        deps: &Self::Dependencies,
+        prepared: &Self::Prepared,
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(ClonePhase::Pending);
         let patch = if matches!(phase, ClonePhase::Pending | ClonePhase::Cloning) {
-            match deps {
-                CloneDeps::Ready { default_branch } => Some(CloneStatusPatch::MarkReady { default_branch: default_branch.clone() }),
-                CloneDeps::Retrying(message) => Some(CloneStatusPatch::MarkRetrying { message: message.clone() }),
-                CloneDeps::Failed(message) => Some(CloneStatusPatch::MarkFailed { message: message.clone(), failed_at: now }),
-                CloneDeps::None => None,
+            match prepared {
+                ClonePrepared::Ready { default_branch } => Some(CloneStatusPatch::MarkReady { default_branch: default_branch.clone() }),
+                ClonePrepared::Retrying(message) => Some(CloneStatusPatch::MarkRetrying { message: message.clone() }),
+                ClonePrepared::Failed(message) => Some(CloneStatusPatch::MarkFailed { message: message.clone(), failed_at: now }),
+                ClonePrepared::None => None,
             }
         } else {
             None
         };
 
         let mut outcome = ReconcileOutcome::new(patch);
-        if matches!(deps, CloneDeps::Retrying(_)) {
+        if matches!(prepared, ClonePrepared::Retrying(_)) {
             outcome.requeue_after = Some(CLONE_RETRY_AFTER);
         }
         outcome

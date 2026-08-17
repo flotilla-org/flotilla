@@ -143,7 +143,7 @@ impl HostDetector for RunnerEchoHostDetector {
         runner: &dyn CommandRunner,
         _env: &dyn flotilla_core::providers::discovery::EnvVars,
     ) -> Vec<EnvironmentAssertion> {
-        match runner.run("probe-env", &[self.probe], Path::new("/"), &ChannelLabel::Noop).await {
+        match runner.run("probe-env", &[self.probe], Path::new("/"), &ChannelLabel::Default).await {
             Ok(value) => vec![EnvironmentAssertion::env_var(self.assertion_key, value.trim())],
             Err(_) => Vec::new(),
         }

@@ -113,7 +113,7 @@ impl GitRepositoryInspector {
 
     async fn git(&self, cwd: &Path, args: &[&str]) -> Result<String, String> {
         self.runner
-            .run("git", args, cwd, &ChannelLabel::Noop)
+            .run("git", args, cwd, &ChannelLabel::Default)
             .await
             .map(|output| output.trim().to_string())
             .map_err(|error| format!("git {} in {}: {error}", args.join(" "), cwd.display()))
@@ -174,7 +174,7 @@ impl GitRepositoryInspector {
         };
         let ssh_config = self
             .runner
-            .run("ssh", &["-G", host], cwd, &ChannelLabel::Noop)
+            .run("ssh", &["-G", host], cwd, &ChannelLabel::Default)
             .await
             .map_err(|_| format!("unrecognised remote host alias `{host}`"))?;
         let resolved = ssh_config
@@ -256,7 +256,12 @@ impl RepositoryInspector for GitRepositoryInspector {
         // repository.
         let grep = self
             .runner
-            .run_output("git", &["grep", "-Il", "-e", "^kind:[[:space:]]", &commit, "--"], &repository.checkout.path, &ChannelLabel::Noop)
+            .run_output(
+                "git",
+                &["grep", "-Il", "-e", "^kind:[[:space:]]", &commit, "--"],
+                &repository.checkout.path,
+                &ChannelLabel::Default,
+            )
             .await
             .map_err(|error| format!("git grep operational entries in {}: {error}", repository.checkout.path.display()))?;
         let paths = if grep.success || grep.stderr.trim().is_empty() {

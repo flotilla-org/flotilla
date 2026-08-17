@@ -75,7 +75,7 @@ async fn mismatched_clone_name_fails() {
         .await
         .expect("create should succeed");
     let reconciler = CloneReconciler::new(Arc::new(FakeCloneRuntime), backend.using("flotilla"));
-    let deps = reconciler.fetch_dependencies(&clone).await.expect("deps should load");
+    let deps = reconciler.prepare(&clone).await.expect("deps should load");
     let outcome = reconciler.reconcile(&clone, &deps, chrono::Utc::now());
 
     assert!(matches!(outcome.patch, Some(flotilla_resources::CloneStatusPatch::MarkFailed { .. })));
@@ -104,7 +104,7 @@ async fn alias_transport_uses_typed_repository_identity_for_clone_name() {
         .expect("clone should create");
     let reconciler = CloneReconciler::new(Arc::new(FakeCloneRuntime), backend.using("flotilla"));
 
-    let deps = reconciler.fetch_dependencies(&clone).await.expect("deps should load");
+    let deps = reconciler.prepare(&clone).await.expect("deps should load");
     let outcome = reconciler.reconcile(&clone, &deps, chrono::Utc::now());
 
     assert!(matches!(outcome.patch, Some(flotilla_resources::CloneStatusPatch::MarkReady { .. })));
@@ -133,7 +133,7 @@ async fn clone_failure_retries_once_before_marking_failed() {
         .expect("clone should create");
     let reconciler = CloneReconciler::new(Arc::new(FailingCloneRuntime), backend.using("flotilla"));
 
-    let deps = reconciler.fetch_dependencies(&clone).await.expect("first deps should load");
+    let deps = reconciler.prepare(&clone).await.expect("first deps should load");
     let outcome = reconciler.reconcile(&clone, &deps, chrono::Utc::now());
 
     assert!(matches!(
@@ -147,7 +147,7 @@ async fn clone_failure_retries_once_before_marking_failed() {
         flotilla_resources::apply_status_patch(&clones, &clone_name, &outcome.patch.expect("first failure should record retry state"))
             .await
             .expect("retry state should apply");
-    let repeated_deps = reconciler.fetch_dependencies(&retrying).await.expect("repeated deps should load");
+    let repeated_deps = reconciler.prepare(&retrying).await.expect("repeated deps should load");
     let repeated_outcome = reconciler.reconcile(&retrying, &repeated_deps, chrono::Utc::now());
 
     assert!(matches!(
@@ -180,12 +180,12 @@ async fn transient_clone_failure_remains_retryable_and_converges() {
     let reconciler =
         CloneReconciler::new(Arc::new(FailOnceCloneRuntime { failed: AtomicBool::new(false) }), backend.clone().using("flotilla"));
 
-    let failed_deps = reconciler.fetch_dependencies(&clone).await.expect("first deps should load");
+    let failed_deps = reconciler.prepare(&clone).await.expect("first deps should load");
     let failed_outcome = reconciler.reconcile(&clone, &failed_deps, chrono::Utc::now());
     let retry_patch = failed_outcome.patch.expect("transient failure should record retry state");
     let retrying = flotilla_resources::apply_status_patch(&clones, &clone_name, &retry_patch).await.expect("retry status should apply");
 
-    let recovered_deps = reconciler.fetch_dependencies(&retrying).await.expect("retry deps should load");
+    let recovered_deps = reconciler.prepare(&retrying).await.expect("retry deps should load");
     let recovered_outcome = reconciler.reconcile(&retrying, &recovered_deps, chrono::Utc::now());
 
     assert!(matches!(

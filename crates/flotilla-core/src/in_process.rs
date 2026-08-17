@@ -442,7 +442,7 @@ impl crate::providers::discovery::EnvVars for StaticEnvVars {
 }
 
 async fn load_env_vars(runner: &dyn CommandRunner, cwd: &Path) -> HashMap<String, String> {
-    let Ok(output) = runner.run("env", &[], cwd, &ChannelLabel::Noop).await else {
+    let Ok(output) = runner.run("env", &[], cwd, &ChannelLabel::Default).await else {
         return HashMap::new();
     };
 
@@ -465,7 +465,7 @@ async fn register_static_ssh_direct_environment(
 ) -> Result<(), String> {
     let fallback_env_id = static_ssh_environment_id(config_key);
     let runner = Arc::new(SshCommandRunner::new(environment.hostname.clone(), true, Arc::clone(&discovery.runner)));
-    tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, runner.run("true", &[], Path::new("/"), &ChannelLabel::Noop))
+    tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, runner.run("true", &[], Path::new("/"), &ChannelLabel::Default))
         .await
         .map_err(|_| format!("ssh preflight timed out for {}", environment.hostname))?
         .map_err(|err| format!("ssh preflight failed for {}: {err}", environment.hostname))?;
@@ -6855,7 +6855,7 @@ impl InProcessDaemon {
             let Ok(runner) = self.runner_for_resource_checkout(&checkout).await else {
                 continue;
             };
-            let output = runner.run_output("git", &["push", "-u", "origin", "HEAD"], Path::new(path), &ChannelLabel::Noop).await;
+            let output = runner.run_output("git", &["push", "-u", "origin", "HEAD"], Path::new(path), &ChannelLabel::Default).await;
             if let Ok(output) = output {
                 if !output.success {
                     warn!(checkout = %checkout.metadata.name, stderr = %output.stderr.trim(), "best-effort abandon archive push failed");
@@ -7237,7 +7237,7 @@ impl InProcessDaemon {
         let comment = format!("{}\n\n{}", body.trim(), reason);
         let runner = self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
         runner
-            .run("gh", &["pr", "comment", &bound.id, "-R", repository_name, "--body", &comment], Path::new("/"), &ChannelLabel::Noop)
+            .run("gh", &["pr", "comment", &bound.id, "-R", repository_name, "--body", &comment], Path::new("/"), &ChannelLabel::Default)
             .await
             .map(|_| ())
     }
@@ -7337,11 +7337,13 @@ impl InProcessDaemon {
     ) -> Result<ParsedFleetReplicaSnapshot, String> {
         let args = fleet_replica_ssh_args(remote, multiplex);
         let arg_refs: Vec<_> = args.iter().map(String::as_str).collect();
-        let output =
-            tokio::time::timeout(FLEET_REPLICA_REFRESH_TIMEOUT, runner.run_output("ssh", &arg_refs, Path::new("/"), &ChannelLabel::Noop))
-                .await
-                .map_err(|_| format!("replica snapshot timed out after {}s", FLEET_REPLICA_REFRESH_TIMEOUT.as_secs()))?
-                .map_err(|err| format!("replica snapshot ssh failed: {err}"))?;
+        let output = tokio::time::timeout(
+            FLEET_REPLICA_REFRESH_TIMEOUT,
+            runner.run_output("ssh", &arg_refs, Path::new("/"), &ChannelLabel::Default),
+        )
+        .await
+        .map_err(|_| format!("replica snapshot timed out after {}s", FLEET_REPLICA_REFRESH_TIMEOUT.as_secs()))?
+        .map_err(|err| format!("replica snapshot ssh failed: {err}"))?;
         if !output.success {
             let message = if output.stderr.trim().is_empty() { output.stdout.trim() } else { output.stderr.trim() };
             return Err(format!("replica snapshot command failed: {message}"));

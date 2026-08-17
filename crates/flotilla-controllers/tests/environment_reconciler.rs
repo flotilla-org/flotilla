@@ -44,7 +44,7 @@ async fn pool_exhaustion_stays_pending_with_a_legible_requeued_wait() {
         .expect("create environment");
     let reconciler = EnvironmentReconciler::new(Arc::new(WaitingDockerRuntime));
 
-    let deps = reconciler.fetch_dependencies(&environment).await.expect("fetch waiting state");
+    let deps = reconciler.prepare(&environment).await.expect("fetch waiting state");
     let outcome = reconciler.reconcile(&environment, &deps, chrono::Utc::now());
 
     assert_eq!(outcome.requeue_after, Some(Duration::from_secs(5)));
@@ -123,8 +123,8 @@ async fn foreign_environment_is_not_actuated_or_finalized() {
     let reconciler = EnvironmentReconciler::new(Arc::new(ForeignEnvironmentRuntime)).with_local_host_ref("kiwi");
 
     for environment in [&docker, &host_direct] {
-        let deps = reconciler.fetch_dependencies(environment).await.expect("foreign environment should be skipped");
-        assert!(reconciler.reconcile(environment, &deps, chrono::Utc::now()).patch.is_none());
+        let prepared = reconciler.prepare(environment).await.expect("foreign environment should be skipped");
+        assert!(reconciler.reconcile(environment, &prepared, chrono::Utc::now()).patch.is_none());
         reconciler.run_finalizer(environment).await.expect("foreign finalization should be skipped");
     }
 }

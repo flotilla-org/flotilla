@@ -231,7 +231,7 @@ impl SshTransport {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let child = self
             .command_runner
-            .spawn_long_lived(&binary, &arg_refs, Path::new("/"), &ChannelLabel::Noop)
+            .spawn_long_lived(&binary, &arg_refs, Path::new("/"), &ChannelLabel::Default)
             .await
             .map_err(|error| format!("failed to spawn ssh: {error}"))?;
 
@@ -293,7 +293,7 @@ impl SshTransport {
         // login shell only forwards one quoted argument.
         let command = format!("sh -c {}", shell_quote(&command));
         self.command_runner
-            .run_output(&binary, &["-T", "-o", "BatchMode=yes", destination, &command], Path::new("/"), &ChannelLabel::Noop)
+            .run_output(&binary, &["-T", "-o", "BatchMode=yes", destination, &command], Path::new("/"), &ChannelLabel::Default)
             .await
     }
 

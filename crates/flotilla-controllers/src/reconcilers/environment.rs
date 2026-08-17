@@ -70,7 +70,7 @@ impl<R> EnvironmentReconciler<R> {
     }
 }
 
-pub enum EnvironmentDeps {
+pub enum EnvironmentPrepared {
     None,
     Ready(DockerProvisioning),
     Waiting { message: String, reason: EnvironmentWaitReason },
@@ -82,32 +82,32 @@ where
     R: DockerEnvironmentRuntime + 'static,
 {
     type Resource = Environment;
-    type Dependencies = EnvironmentDeps;
+    type Prepared = EnvironmentPrepared;
 
-    async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         if !self.actuates(obj) {
-            return Ok(EnvironmentDeps::None);
+            return Ok(EnvironmentPrepared::None);
         }
         match obj.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending) {
             EnvironmentPhase::Pending => {
                 if let Some(spec) = &obj.spec.docker {
                     match self.docker.provision(&obj.metadata.name, spec).await {
-                        Ok(provisioning) => Ok(EnvironmentDeps::Ready(provisioning)),
-                        Err(DockerProvisioningError::Waiting { message, reason }) => Ok(EnvironmentDeps::Waiting { message, reason }),
-                        Err(DockerProvisioningError::Failed(message)) => Ok(EnvironmentDeps::Failed(message)),
+                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(provisioning)),
+                        Err(DockerProvisioningError::Waiting { message, reason }) => Ok(EnvironmentPrepared::Waiting { message, reason }),
+                        Err(DockerProvisioningError::Failed(message)) => Ok(EnvironmentPrepared::Failed(message)),
                     }
                 } else {
-                    Ok(EnvironmentDeps::None)
+                    Ok(EnvironmentPrepared::None)
                 }
             }
-            _ => Ok(EnvironmentDeps::None),
+            _ => Ok(EnvironmentPrepared::None),
         }
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        deps: &Self::Dependencies,
+        prepared: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         if !self.actuates(obj) {
@@ -117,23 +117,23 @@ where
             EnvironmentPhase::Pending if obj.spec.host_direct.is_some() => {
                 Some(EnvironmentStatusPatch::MarkReady { docker_container_id: None, image_ref: None, image_digest: None })
             }
-            EnvironmentPhase::Pending => match deps {
-                EnvironmentDeps::Ready(provisioning) => Some(EnvironmentStatusPatch::MarkReady {
+            EnvironmentPhase::Pending => match prepared {
+                EnvironmentPrepared::Ready(provisioning) => Some(EnvironmentStatusPatch::MarkReady {
                     docker_container_id: Some(provisioning.container_id.clone()),
                     image_ref: Some(provisioning.image_ref.clone()),
                     image_digest: Some(provisioning.image_digest.clone()),
                 }),
-                EnvironmentDeps::Waiting { message, reason } => {
+                EnvironmentPrepared::Waiting { message, reason } => {
                     Some(EnvironmentStatusPatch::MarkWaiting { message: message.clone(), reason: reason.clone() })
                 }
-                EnvironmentDeps::Failed(message) => Some(EnvironmentStatusPatch::MarkFailed { message: message.clone() }),
-                EnvironmentDeps::None => None,
+                EnvironmentPrepared::Failed(message) => Some(EnvironmentStatusPatch::MarkFailed { message: message.clone() }),
+                EnvironmentPrepared::None => None,
             },
             _ => None,
         };
 
         let mut outcome = ReconcileOutcome::new(patch);
-        if matches!(deps, EnvironmentDeps::Waiting { .. }) {
+        if matches!(prepared, EnvironmentPrepared::Waiting { .. }) {
             outcome.requeue_after = Some(Duration::from_secs(5));
         }
         outcome
