@@ -452,11 +452,10 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let repositories = backend.using::<flotilla_resources::Repository>("flotilla");
     for source in repositories.list().await.expect("list repositories").items {
         repositories
-            .update_status(
-                &source.metadata.name,
-                &source.metadata.resource_version,
-                &flotilla_resources::RepositoryStatus { default_branch: Some("main".to_string()), ..Default::default() },
-            )
+            .update_status(&source.metadata.name, &source.metadata.resource_version, &flotilla_resources::RepositoryStatus {
+                default_branch: Some("main".to_string()),
+                ..Default::default()
+            })
             .await
             .expect("resolve repository default branch");
     }
