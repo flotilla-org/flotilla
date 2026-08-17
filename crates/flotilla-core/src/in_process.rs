@@ -1570,6 +1570,10 @@ pub enum ConvoyResumeOutcome {
     Queued { displaced: Option<String> },
 }
 
+type ConvoyMessageKey = (String, String);
+type ConvoyMessageLock = Arc<Mutex<()>>;
+type WeakConvoyMessageLock = Weak<Mutex<()>>;
+
 fn crew_handoff_address_error(target: &str, vessel: &str) -> String {
     format!(
         "no such crew member in your vessel; crew messaging is intra-vessel and requires a different crew member (target `{target}`, vessel `{vessel}`)"
@@ -1785,6 +1789,8 @@ pub struct InProcessDaemon {
     active_commands: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     self_weak: Weak<InProcessDaemon>,
     pending_convoy_starts: Mutex<HashSet<ConvoyStartKey>>,
+    /// Serializes pending-brief state with its terminal-session delivery side effect.
+    convoy_message_locks: Mutex<HashMap<ConvoyMessageKey, WeakConvoyMessageLock>>,
     /// Unique identity for this daemon instance, generated at startup.
     /// Used in peer Hello handshake to detect remote daemon restarts.
     session_id: uuid::Uuid,
@@ -2016,6 +2022,7 @@ impl InProcessDaemon {
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             self_weak: self_weak.clone(),
             pending_convoy_starts: Mutex::new(HashSet::new()),
+            convoy_message_locks: Mutex::new(HashMap::new()),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
@@ -6582,6 +6589,8 @@ impl InProcessDaemon {
         let routing = self.resolve_crew_routing_context(requested).await?;
         let namespace = routing.command_context.namespace.as_deref().expect("resolved crew routing context has a namespace");
         let convoy_name = routing.command_context.convoy.as_deref().expect("resolved crew routing context has a convoy");
+        let message_lock = self.convoy_message_lock(namespace, convoy_name).await;
+        let _message_guard = message_lock.lock().await;
         let context = self.resolve_crew_context(requested).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
@@ -6978,6 +6987,8 @@ impl InProcessDaemon {
         if prompt.trim().is_empty() {
             return Err("convoy resume requires a non-empty prompt".to_string());
         }
+        let message_lock = self.convoy_message_lock(namespace, name).await;
+        let _message_guard = message_lock.lock().await;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{name}` has no status"))?;
@@ -7071,6 +7082,8 @@ impl InProcessDaemon {
     }
 
     pub async fn convoy_withdraw_pending_brief_internal(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {
+        let message_lock = self.convoy_message_lock(namespace, name).await;
+        let _message_guard = message_lock.lock().await;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{name}` has no status"))?;
@@ -7084,6 +7097,20 @@ impl InProcessDaemon {
                 .map_err(|err| err.to_string())?;
         }
         Ok(withdrawn)
+    }
+
+    async fn convoy_message_lock(&self, namespace: &str, name: &str) -> ConvoyMessageLock {
+        let key = (namespace.to_string(), name.to_string());
+        let mut locks = self.convoy_message_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&key).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        }
     }
 
     async fn deliver_standing_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {

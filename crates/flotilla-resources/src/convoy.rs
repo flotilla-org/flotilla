@@ -470,6 +470,15 @@ impl ConvoyStatus {
     }
 }
 
+fn clear_operator_pending_brief(status: &mut ConvoyStatus) {
+    if let Some(delivery) = status.turn_deliveries.get_mut(PENDING_BRIEF_DELIVERY_SOURCE) {
+        delivery.pending_brief = None;
+    }
+    if status.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).is_some_and(|delivery| delivery.episodes.is_empty()) {
+        status.turn_deliveries.remove(PENDING_BRIEF_DELIVERY_SOURCE);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct TurnDeliveryEpisode {
     pub head_sha: String,
@@ -971,12 +980,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     Some(pending_brief.clone());
             }
             Self::ClearPendingBrief => {
-                if let Some(delivery) = status.turn_deliveries.get_mut(PENDING_BRIEF_DELIVERY_SOURCE) {
-                    delivery.pending_brief = None;
-                }
-                if status.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).is_some_and(|delivery| delivery.episodes.is_empty()) {
-                    status.turn_deliveries.remove(PENDING_BRIEF_DELIVERY_SOURCE);
-                }
+                clear_operator_pending_brief(status);
             }
             Self::DeliverPendingBrief { vessel, role, delivered_at, content } => {
                 let matches_pending =
@@ -984,12 +988,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 if !matches_pending {
                     return;
                 }
-                if let Some(delivery) = status.turn_deliveries.get_mut(PENDING_BRIEF_DELIVERY_SOURCE) {
-                    delivery.pending_brief = None;
-                }
-                if status.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).is_some_and(|delivery| delivery.episodes.is_empty()) {
-                    status.turn_deliveries.remove(PENDING_BRIEF_DELIVERY_SOURCE);
-                }
+                clear_operator_pending_brief(status);
                 status.phase = ConvoyPhase::Active;
                 status.finished_at = None;
                 if let Some(work) = status.work.get_mut(vessel) {
