@@ -44,7 +44,7 @@ async fn pool_exhaustion_stays_pending_with_a_legible_requeued_wait() {
         .expect("create environment");
     let reconciler = EnvironmentReconciler::new(Arc::new(WaitingDockerRuntime));
 
-    let deps = reconciler.fetch_dependencies(&environment).await.expect("fetch waiting state");
+    let deps = reconciler.prepare(&environment).await.expect("fetch waiting state");
     let outcome = reconciler.reconcile(&environment, &deps, chrono::Utc::now());
 
     assert_eq!(outcome.requeue_after, Some(Duration::from_secs(5)));

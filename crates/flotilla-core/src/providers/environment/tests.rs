@@ -78,7 +78,7 @@ impl CommandRunner for RecordingRunner {
 async fn run_wraps_with_docker_exec() {
     let inner = Arc::new(RecordingRunner::new_ok(""));
     let env_runner = DockerEnvironmentRunner::new("test-container".to_string(), inner.clone());
-    let label = ChannelLabel::Noop;
+    let label = ChannelLabel::Default;
 
     env_runner.run("git", &["status"], Path::new("/workspace"), &label).await.ok();
 
@@ -94,7 +94,7 @@ async fn run_wraps_with_docker_exec() {
 async fn run_output_wraps_with_docker_exec() {
     let inner = Arc::new(RecordingRunner::new_ok("output"));
     let env_runner = DockerEnvironmentRunner::new("test-container".to_string(), inner.clone());
-    let label = ChannelLabel::Noop;
+    let label = ChannelLabel::Default;
 
     env_runner.run_output("git", &["status"], Path::new("/workspace"), &label).await.ok();
 
@@ -917,7 +917,7 @@ async fn environment_runner_transforms_commands_for_container() {
     // Simulate the exact check a discovery factory might perform: "cleat --version"
     let inner = Arc::new(RecordingRunner::new_ok("cleat 0.5.0"));
     let env_runner = DockerEnvironmentRunner::new("my-container".to_string(), inner.clone());
-    let label = ChannelLabel::Noop;
+    let label = ChannelLabel::Default;
 
     // This is the kind of command a binary-check probe would issue
     env_runner.run("cleat", &["--version"], Path::new("/"), &label).await.ok();

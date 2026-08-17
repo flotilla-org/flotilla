@@ -344,7 +344,7 @@ fn running_daemon_flotilla_binary() -> Result<DaemonHostPath, String> {
 
 async fn resolve_cleat_ghostty_library(runner: &dyn CommandRunner, cleat_binary_path: &DaemonHostPath) -> Result<DaemonHostPath, String> {
     let binary = cleat_binary_path.as_path().to_string_lossy().into_owned();
-    let output = runner.run_output("ldd", &[&binary], Path::new("/"), &ChannelLabel::Noop).await?;
+    let output = runner.run_output("ldd", &[&binary], Path::new("/"), &ChannelLabel::Default).await?;
     if !output.success {
         return Err(format!("inspect cleat runtime libraries: {}", output.stderr.trim()));
     }

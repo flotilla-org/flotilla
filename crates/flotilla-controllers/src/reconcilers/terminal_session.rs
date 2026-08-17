@@ -138,7 +138,7 @@ impl<R> TerminalSessionReconciler<R> {
     }
 }
 
-pub enum TerminalDeps {
+pub enum TerminalPrepared {
     None,
     Waiting,
     Running(TerminalRuntimeState),
@@ -155,19 +155,19 @@ where
     R: TerminalRuntime + 'static,
 {
     type Resource = TerminalSession;
-    type Dependencies = TerminalDeps;
+    type Prepared = TerminalPrepared;
 
-    async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         if !self.actuates(obj) {
-            return Ok(TerminalDeps::None);
+            return Ok(TerminalPrepared::None);
         }
         let environment = match self.environments.get(&obj.spec.env_ref).await {
             Ok(environment) => environment,
-            Err(ResourceError::NotFound { .. }) => return Ok(TerminalDeps::OwnerMissing),
+            Err(ResourceError::NotFound { .. }) => return Ok(TerminalPrepared::OwnerMissing),
             Err(err) => return Err(err),
         };
         if self.session_owner_missing(obj).await? {
-            return Ok(TerminalDeps::OwnerMissing);
+            return Ok(TerminalPrepared::OwnerMissing);
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
@@ -179,7 +179,7 @@ where
                 .ok_or_else(|| ResourceError::other("running terminal session has no session id"))?;
             let running = self.runtime.session_is_running(session_id, &obj.spec).await.map_err(ResourceError::other)?;
             if !running {
-                return Ok(TerminalDeps::Stopped);
+                return Ok(TerminalPrepared::Stopped);
             }
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(message), .. } = &obj.spec.source {
                 if obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()) != Some(message.id.as_str()) {
@@ -188,23 +188,23 @@ where
                     // message but before MarkMessageDelivered is persisted may redeliver it; losing
                     // a handoff is worse, and exactly-once requires acknowledgement by the agent.
                     self.runtime.deliver_message(session_id, &obj.spec, &message.text).await.map_err(ResourceError::other)?;
-                    return Ok(TerminalDeps::MessageDelivered(message.id.clone()));
+                    return Ok(TerminalPrepared::MessageDelivered(message.id.clone()));
                 }
             }
             if let Some(attention) = self.runtime.observe_attention(session_id, &obj.spec).await.map_err(ResourceError::other)? {
-                return Ok(TerminalDeps::Attention(attention));
+                return Ok(TerminalPrepared::Attention(attention));
             }
             if obj.status.as_ref().and_then(|status| status.attention.as_ref()).is_some_and(|attention| attention.is_stale_at(Utc::now())) {
-                return Ok(TerminalDeps::AttentionStale);
+                return Ok(TerminalPrepared::AttentionStale);
             }
-            return Ok(TerminalDeps::None);
+            return Ok(TerminalPrepared::None);
         }
         if phase != TerminalSessionPhase::Starting {
-            return Ok(TerminalDeps::None);
+            return Ok(TerminalPrepared::None);
         }
 
         if environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-            return Ok(TerminalDeps::Waiting);
+            return Ok(TerminalPrepared::Waiting);
         }
 
         let mut tags = [
@@ -223,25 +223,25 @@ where
             tags.push(TerminalSessionTag::new(CREDENTIAL_SCOPES_SESSION_TAG, encoded));
         }
         Ok(match self.runtime.ensure_session(&obj.metadata.name, &obj.spec, &tags).await {
-            Ok(state) => TerminalDeps::Running(state),
-            Err(err) => TerminalDeps::Failed(err),
+            Ok(state) => TerminalPrepared::Running(state),
+            Err(err) => TerminalPrepared::Failed(err),
         })
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        deps: &Self::Dependencies,
+        prepared: &Self::Prepared,
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
-        if matches!(deps, TerminalDeps::OwnerMissing) {
+        if matches!(prepared, TerminalPrepared::OwnerMissing) {
             return ReconcileOutcome::with_actuations(None, vec![Actuation::DeleteTerminalSession { name: obj.metadata.name.clone() }]);
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
         let patch = match phase {
-            TerminalSessionPhase::Starting => match deps {
-                TerminalDeps::Running(state) => Some(TerminalSessionStatusPatch::MarkRunning {
+            TerminalSessionPhase::Starting => match prepared {
+                TerminalPrepared::Running(state) => Some(TerminalSessionStatusPatch::MarkRunning {
                     session_id: state.session_id.clone(),
                     pid: state.pid,
                     started_at: state.started_at,
@@ -249,28 +249,30 @@ where
                     launch_command: state.launch_command.clone(),
                     delivered_message_id: state.delivered_message_id.clone(),
                 }),
-                TerminalDeps::Failed(message) => {
+                TerminalPrepared::Failed(message) => {
                     Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })
                 }
-                TerminalDeps::Waiting
-                | TerminalDeps::None
-                | TerminalDeps::Stopped
-                | TerminalDeps::MessageDelivered(_)
-                | TerminalDeps::Attention(_)
-                | TerminalDeps::AttentionStale
-                | TerminalDeps::OwnerMissing => None,
+                TerminalPrepared::Waiting
+                | TerminalPrepared::None
+                | TerminalPrepared::Stopped
+                | TerminalPrepared::MessageDelivered(_)
+                | TerminalPrepared::Attention(_)
+                | TerminalPrepared::AttentionStale
+                | TerminalPrepared::OwnerMissing => None,
             },
-            TerminalSessionPhase::Running if matches!(deps, TerminalDeps::Stopped) => Some(TerminalSessionStatusPatch::MarkStopped {
-                stopped_at: now,
-                inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
-                inner_exit_code: None,
-                message: None,
-            }),
-            TerminalSessionPhase::Running => match deps {
-                TerminalDeps::MessageDelivered(message_id) => {
+            TerminalSessionPhase::Running if matches!(prepared, TerminalPrepared::Stopped) => {
+                Some(TerminalSessionStatusPatch::MarkStopped {
+                    stopped_at: now,
+                    inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
+                    inner_exit_code: None,
+                    message: None,
+                })
+            }
+            TerminalSessionPhase::Running => match prepared {
+                TerminalPrepared::MessageDelivered(message_id) => {
                     Some(TerminalSessionStatusPatch::MarkMessageDelivered { message_id: message_id.clone() })
                 }
-                TerminalDeps::Attention(attention)
+                TerminalPrepared::Attention(attention)
                     if obj
                         .status
                         .as_ref()
@@ -279,7 +281,7 @@ where
                 {
                     Some(TerminalSessionStatusPatch::ObserveAttention { attention: attention.clone() })
                 }
-                TerminalDeps::AttentionStale => Some(TerminalSessionStatusPatch::ObserveAttention {
+                TerminalPrepared::AttentionStale => Some(TerminalSessionStatusPatch::ObserveAttention {
                     attention: TerminalAttention {
                         state: TerminalAttentionState::Unobservable,
                         as_of: now,

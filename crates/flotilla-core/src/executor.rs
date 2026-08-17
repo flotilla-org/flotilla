@@ -1174,7 +1174,7 @@ impl StepResolver for ExecutorStepResolver {
                         "git",
                         &["show", "HEAD:.flotilla/environment.yaml"],
                         self.repo.root.as_path(),
-                        &crate::providers::ChannelLabel::Noop,
+                        &crate::providers::ChannelLabel::Default,
                     )
                     .await
                     .map_err(|e| format!("failed to read .flotilla/environment.yaml from HEAD: {e}"))?;
@@ -1241,7 +1241,7 @@ impl ExecutorStepResolver {
     async fn resolve_reference_repo(&self) -> Option<DaemonHostPath> {
         let result = self
             .runner
-            .run("git", &["rev-parse", "--git-common-dir"], self.repo.root.as_path(), &crate::providers::ChannelLabel::Noop)
+            .run("git", &["rev-parse", "--git-common-dir"], self.repo.root.as_path(), &crate::providers::ChannelLabel::Default)
             .await;
         match result {
             Ok(path) => {
