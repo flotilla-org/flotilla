@@ -479,6 +479,12 @@ fn clear_operator_pending_brief(status: &mut ConvoyStatus) {
     }
 }
 
+fn clear_pending_brief_for(status: &mut ConvoyStatus, vessel: &str, role: &str) {
+    if status.pending_brief().is_some_and(|brief| brief.vessel == vessel && brief.role == role) {
+        clear_operator_pending_brief(status);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct TurnDeliveryEpisode {
     pub head_sha: String,
@@ -779,6 +785,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.phase = *phase;
                 status.message = Some(message.clone());
                 status.finished_at.get_or_insert(*finished_at);
+                if phase.is_terminal() {
+                    clear_operator_pending_brief(status);
+                }
             }
             Self::AdvanceWorkToReady { ready } => {
                 for (work, ready_at) in ready {
@@ -802,6 +811,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         state.finished_at.get_or_insert(*cancelled_at);
                     }
                 }
+                clear_operator_pending_brief(status);
             }
             Self::RollUpPhase { phase, started_at, finished_at } => {
                 // Derived Active roll-up is a continuation of the convoy voyage, not a new attempt.
@@ -820,6 +830,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     }
                     status.finished_at.get_or_insert(*finished_at);
                 }
+                if phase.is_terminal() {
+                    clear_operator_pending_brief(status);
+                }
             }
             Self::Settle { disposition, target_mismatches, finished_at } => {
                 let previous_phase = status.phase;
@@ -830,6 +843,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     status.finished_at = None;
                 }
                 status.finished_at.get_or_insert(*finished_at);
+                clear_operator_pending_brief(status);
             }
             Self::WorkLaunching { work, started_at, placement } => {
                 if let Some(state) = status.work.get_mut(work) {
@@ -909,6 +923,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(reason.clone());
                 }
+                clear_operator_pending_brief(status);
             }
             Self::MarkCrewCompleted { vessel, role, finished_at, message, disposition } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
@@ -940,6 +955,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(message.clone());
                 }
+                clear_pending_brief_for(status, vessel, role);
             }
             Self::HandoffCrewWork { vessel, sender_role, target_role, handed_off_at, message } => {
                 if let Some(work) = status.work.get_mut(vessel) {
@@ -949,21 +965,29 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     return;
                 };
                 let target_was_done = crew.get(target_role).is_some_and(|state| state.phase == CrewWorkPhase::Done);
-                if let Some(target) = crew.get_mut(target_role) {
+                let target_reopened = if let Some(target) = crew.get_mut(target_role) {
                     if matches!(target.phase, CrewWorkPhase::Pending | CrewWorkPhase::Done | CrewWorkPhase::HandedBack) {
                         // Hand-back continues the same crew process, preserving its original start.
                         target.phase = CrewWorkPhase::Working;
                         target.started_at.get_or_insert(*handed_off_at);
                         target.finished_at = None;
                         target.message = Some(message.clone());
+                        true
+                    } else {
+                        false
                     }
-                }
+                } else {
+                    false
+                };
                 if target_was_done && sender_role != target_role {
                     if let Some(sender) = crew.get_mut(sender_role) {
                         sender.phase = CrewWorkPhase::HandedBack;
                         sender.finished_at = Some(*handed_off_at);
                         sender.message = Some(message.clone());
                     }
+                }
+                if target_reopened && sender_role != target_role {
+                    clear_pending_brief_for(status, vessel, sender_role);
                 }
             }
             Self::ResumeCrewWork { vessel, role, resumed_at, prompt } => {
