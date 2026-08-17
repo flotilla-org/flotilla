@@ -226,6 +226,28 @@ async fn convoy_create_command_creates_convoy_resource() {
         convoy.spec.placement_policy.as_deref().is_some_and(|policy| policy.starts_with("host-direct-")),
         "convoy create should default to the seeded host-direct placement policy: {convoy:?}"
     );
+
+    let invalid_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "bad@role".into(),
+                workflow_ref: "scratch".into(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("execute invalid role");
+    assert_eq!(await_command_result(&mut rx, invalid_id).await, CommandValue::Error {
+        message: "convoy name `bad@role` must be a lowercase DNS label of at most 63 characters".into()
+    });
 }
 
 #[tokio::test]

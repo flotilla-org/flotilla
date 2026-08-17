@@ -8581,6 +8581,17 @@ impl InProcessDaemon {
             let namespace = self.provisioning_namespace().await;
             let role = name.clone();
             let project_identity = project_ref.as_deref();
+            if let Err(message) = validate_convoy_name(&role) {
+                let result = flotilla_protocol::CommandValue::Error { message };
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    node_id: self.node_id.clone(),
+                    repo_identity: empty_identity,
+                    repo: None,
+                    result,
+                });
+                return Ok(id);
+            }
             if let Err(message) = allocate_convoy_generation(&self.resource_backend, &namespace, project_identity, &role).await {
                 let result = flotilla_protocol::CommandValue::Error { message };
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
@@ -8761,6 +8772,7 @@ impl InProcessDaemon {
             } else {
                 Vec::new()
             };
+            let adopted_checkout_ref_to_cleanup = adopted_checkout.as_ref().map(|(_, checkout_ref)| checkout_ref.clone());
             let mut adopted_checkout_refs = BTreeMap::new();
             if let Some((repo_ref, checkout_ref)) = adopted_checkout {
                 if !repositories.iter().any(|repository| repository.repo_ref == repo_ref) {
@@ -8840,6 +8852,12 @@ impl InProcessDaemon {
             let generation = match allocate_convoy_generation(&self.resource_backend, &namespace, project_identity, &role).await {
                 Ok(generation) => generation,
                 Err(message) => {
+                    if let Some(checkout_ref) = adopted_checkout_ref_to_cleanup {
+                        if let Err(error) = self.resource_backend.clone().using::<ResourceCheckout>(&namespace).delete(&checkout_ref).await
+                        {
+                            warn!(%error, %checkout_ref, "failed to clean up adopted checkout after convoy identity conflict");
+                        }
+                    }
                     let result = flotilla_protocol::CommandValue::Error { message };
                     let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                         command_id: id,
