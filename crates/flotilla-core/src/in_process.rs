@@ -49,7 +49,7 @@ use flotilla_resources::{
     CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandKind, DemandSpec, Environment as ResourceEnvironment, EnvironmentPhase,
     HoldAct, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
     InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ReadResourceObject,
     Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
     SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
@@ -1564,6 +1564,32 @@ fn pending_crew_message(text: &str) -> TerminalCrewMessage {
     TerminalCrewMessage { id: uuid::Uuid::new_v4().to_string(), text: text.to_string() }
 }
 
+fn ensure_crew_work_is_defined(
+    convoy: &flotilla_resources::ResourceObject<ResourceConvoy>,
+    context: &ResolvedCrewContext,
+) -> Result<(), String> {
+    let known_agent = convoy
+        .status
+        .as_ref()
+        .and_then(|status| status.crew_work.get(&context.vessel))
+        .is_some_and(|crew| crew.contains_key(&context.caller_role));
+    if known_agent {
+        Ok(())
+    } else {
+        Err(format!("crew work for role `{}` is not defined on vessel `{}`", context.caller_role, context.vessel))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConvoyResumeOutcome {
+    Delivered,
+    Queued { displaced: Option<String> },
+}
+
+type ConvoyMessageKey = (String, String);
+type ConvoyMessageLock = Arc<Mutex<()>>;
+type WeakConvoyMessageLock = Weak<Mutex<()>>;
+
 fn crew_handoff_address_error(target: &str, vessel: &str) -> String {
     format!(
         "no such crew member in your vessel; crew messaging is intra-vessel and requires a different crew member (target `{target}`, vessel `{vessel}`)"
@@ -1779,6 +1805,8 @@ pub struct InProcessDaemon {
     active_commands: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     self_weak: Weak<InProcessDaemon>,
     pending_convoy_starts: Mutex<HashSet<ConvoyStartKey>>,
+    /// Serializes pending-brief state with its terminal-session delivery side effect.
+    convoy_message_locks: Mutex<HashMap<ConvoyMessageKey, WeakConvoyMessageLock>>,
     /// Unique identity for this daemon instance, generated at startup.
     /// Used in peer Hello handshake to detect remote daemon restarts.
     session_id: uuid::Uuid,
@@ -2010,6 +2038,7 @@ impl InProcessDaemon {
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             self_weak: self_weak.clone(),
             pending_convoy_starts: Mutex::new(HashSet::new()),
+            convoy_message_locks: Mutex::new(HashMap::new()),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
@@ -2715,6 +2744,7 @@ impl InProcessDaemon {
             flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyResume { namespace, name, .. }
+            | flotilla_protocol::CommandAction::ConvoyWithdrawPendingBrief { namespace, name }
             | flotilla_protocol::CommandAction::QueryExplainConvoy { namespace, name } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), name.as_str())
             }
@@ -6463,13 +6493,16 @@ impl InProcessDaemon {
 
     async fn resolve_crew_context(&self, requested: &CrewCommandContext) -> Result<ResolvedCrewContext, String> {
         let routing = self.resolve_crew_routing_context(requested).await?;
-        let CrewCommandContext { namespace, convoy, vessel_ref, role, .. } = routing.command_context;
-        let namespace = namespace.expect("routing context always has namespace");
-        let convoy = convoy.expect("routing context always has convoy");
-        let vessel_ref = vessel_ref.expect("routing context always has vessel ref");
-        let role = role.expect("routing context always has role");
-        let caller = match routing.session_name {
-            Some(name) => self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).get(&name).await.ok(),
+        self.resolve_crew_context_from_routing(&routing).await
+    }
+
+    async fn resolve_crew_context_from_routing(&self, routing: &CrewRoutingContext) -> Result<ResolvedCrewContext, String> {
+        let namespace = routing.command_context.namespace.as_ref().expect("routing context always has namespace").clone();
+        let convoy = routing.command_context.convoy.as_ref().expect("routing context always has convoy").clone();
+        let vessel_ref = routing.command_context.vessel_ref.as_ref().expect("routing context always has vessel ref").clone();
+        let role = routing.command_context.role.as_ref().expect("routing context always has role").clone();
+        let caller = match routing.session_name.as_ref() {
+            Some(name) => self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).get(name).await.ok(),
             None => None,
         };
         self.resolved_crew_context(namespace, convoy, vessel_ref, role, caller).await
@@ -6614,18 +6647,51 @@ impl InProcessDaemon {
         disposition: Option<String>,
     ) -> Result<(), String> {
         let routing = self.resolve_crew_routing_context(requested).await?;
-        self.apply_crew_work_patch(requested, |context| {
-            convoy_external_patches::mark_crew_completed(
-                context.vessel.clone(),
-                context.caller_role.clone(),
-                chrono::Utc::now(),
-                message,
-                disposition,
+        let namespace = routing.command_context.namespace.as_deref().expect("resolved crew routing context has a namespace");
+        let convoy_name = routing.command_context.convoy.as_deref().expect("resolved crew routing context has a convoy");
+        let message_lock = self.convoy_message_lock(namespace, convoy_name).await;
+        let _message_guard = message_lock.lock().await;
+        let context = self.resolve_crew_context_from_routing(&routing).await?;
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
+        ensure_crew_work_is_defined(&convoy, &context)?;
+        if let Some(pending) = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.pending_brief())
+            .filter(|pending| pending.vessel == context.vessel && pending.role == context.caller_role)
+        {
+            let session_name = routing.session_name.as_deref().ok_or_else(|| {
+                format!("pending brief target `{}/{}` has no intact terminal session", context.vessel, context.caller_role)
+            })?;
+            let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
+            let session = sessions.get(session_name).await.map_err(|err| err.to_string())?;
+            queue_pending_crew_message(&sessions, &session, &pending.content).await?;
+            apply_resource_status_patch(
+                &convoys,
+                convoy_name,
+                &convoy_external_patches::deliver_pending_brief(
+                    context.vessel,
+                    context.caller_role,
+                    chrono::Utc::now(),
+                    pending.content.clone(),
+                    message,
+                    disposition,
+                ),
             )
-        })
-        .await?;
+            .await
+            .map_err(|err| err.to_string())?;
+            self.clear_crew_completion_pending(namespace, session_name).await?;
+            return Ok(());
+        }
+        apply_resource_status_patch(
+            &convoys,
+            convoy_name,
+            &convoy_external_patches::mark_crew_completed(context.vessel, context.caller_role, chrono::Utc::now(), message, disposition),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
         if let Some(session_name) = routing.session_name {
-            let namespace = routing.command_context.namespace.as_deref().expect("resolved crew routing context has a namespace");
             self.clear_crew_completion_pending(namespace, &session_name).await?;
         }
         Ok(())
@@ -6826,14 +6892,7 @@ impl InProcessDaemon {
         let context = self.resolve_crew_context(requested).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
         let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
-        let known_agent = convoy
-            .status
-            .as_ref()
-            .and_then(|status| status.crew_work.get(&context.vessel))
-            .is_some_and(|crew| crew.contains_key(&context.caller_role));
-        if !known_agent {
-            return Err(format!("crew work for role `{}` is not defined on vessel `{}`", context.caller_role, context.vessel));
-        }
+        ensure_crew_work_is_defined(&convoy, &context)?;
         apply_resource_status_patch(&convoys, &context.convoy, &patch(&context)).await.map(|_| ()).map_err(|err| err.to_string())
     }
 
@@ -6977,19 +7036,24 @@ impl InProcessDaemon {
         prompt: &str,
         requested_vessel: Option<&str>,
         requested_role: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<ConvoyResumeOutcome, String> {
         if prompt.trim().is_empty() {
             return Err("convoy resume requires a non-empty prompt".to_string());
         }
+        let message_lock = self.convoy_message_lock(namespace, name).await;
+        let _message_guard = message_lock.lock().await;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{name}` has no status"))?;
+        if status.phase.is_terminal() {
+            return Err(format!("convoy `{name}` is in terminal phase `{:?}` and cannot accept a brief", status.phase));
+        }
         let candidates = status
             .crew_work
             .iter()
             .flat_map(|(vessel, crew)| crew.iter().map(move |(role, state)| (vessel, role, state)))
             .filter(|(vessel, role, state)| {
-                state.phase == flotilla_resources::CrewWorkPhase::Done
+                matches!(state.phase, flotilla_resources::CrewWorkPhase::Working | flotilla_resources::CrewWorkPhase::Done)
                     && requested_vessel.is_none_or(|requested| requested == vessel.as_str())
                     && requested_role.is_none_or(|requested| requested == role.as_str())
             })
@@ -7003,16 +7067,36 @@ impl InProcessDaemon {
                     (None, Some(role)) => format!(" for role `{role}`"),
                     (None, None) => String::new(),
                 };
-                return Err(format!("convoy `{name}` has no completed crew work{scope}"));
+                return Err(format!("convoy `{name}` has no active or completed crew work{scope}"));
             }
             [candidate] => candidate.clone(),
             _ => {
                 let matches = candidates.iter().map(|(vessel, role)| format!("{vessel}/{role}")).collect::<Vec<_>>().join(", ");
                 return Err(format!(
-                    "convoy `{name}` has multiple completed crew members ({matches}); select one with --vessel and --role"
+                    "convoy `{name}` has multiple active or completed crew members ({matches}); select one with --vessel and --role"
                 ));
             }
         };
+
+        let crew_phase = status
+            .crew_work
+            .get(&vessel)
+            .and_then(|crew| crew.get(&role))
+            .map(|state| state.phase)
+            .expect("selected candidate has crew work");
+        if crew_phase == flotilla_resources::CrewWorkPhase::Working {
+            let displaced = status.pending_brief().map(|brief| brief.content.clone());
+            apply_resource_status_patch(
+                &convoys,
+                name,
+                &convoy_external_patches::set_pending_brief(
+                    PendingBrief::builder().vessel(vessel).role(role).content(prompt.to_string()).queued_at(chrono::Utc::now()).build(),
+                ),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+            return Ok(ConvoyResumeOutcome::Queued { displaced });
+        }
 
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
         let session = sessions
@@ -7046,8 +7130,40 @@ impl InProcessDaemon {
             &convoy_external_patches::resume_crew_work(vessel, role, chrono::Utc::now(), prompt.to_string()),
         )
         .await
-        .map(|_| ())
+        .map(|_| ConvoyResumeOutcome::Delivered)
         .map_err(|err| err.to_string())
+    }
+
+    pub async fn convoy_withdraw_pending_brief_internal(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {
+        let message_lock = self.convoy_message_lock(namespace, name).await;
+        let _message_guard = message_lock.lock().await;
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
+        let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{name}` has no status"))?;
+        if status.phase.is_terminal() {
+            return Err(format!("convoy `{name}` is in terminal phase `{:?}` and cannot accept message changes", status.phase));
+        }
+        let withdrawn = status.pending_brief().map(|brief| brief.content.clone());
+        if withdrawn.is_some() {
+            apply_resource_status_patch(&convoys, name, &convoy_external_patches::clear_pending_brief())
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(withdrawn)
+    }
+
+    async fn convoy_message_lock(&self, namespace: &str, name: &str) -> ConvoyMessageLock {
+        let key = (namespace.to_string(), name.to_string());
+        let mut locks = self.convoy_message_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&key).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        }
     }
 
     async fn deliver_standing_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
@@ -8120,7 +8236,19 @@ impl InProcessDaemon {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
             let result = match self.convoy_resume_internal(&namespace, name, prompt, vessel.as_deref(), role.as_deref()).await {
-                Ok(()) => flotilla_protocol::CommandValue::Ok,
+                Ok(ConvoyResumeOutcome::Delivered) => flotilla_protocol::CommandValue::Ok,
+                Ok(ConvoyResumeOutcome::Queued { displaced }) => flotilla_protocol::CommandValue::ConvoyBriefQueued { displaced },
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ConvoyWithdrawPendingBrief { namespace, name } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
+            let result = match self.convoy_withdraw_pending_brief_internal(&namespace, name).await {
+                Ok(withdrawn) => flotilla_protocol::CommandValue::ConvoyBriefWithdrawn { withdrawn },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             self.finish_context_free_command(id, empty_identity, result);

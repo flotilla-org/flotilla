@@ -207,6 +207,7 @@ impl RemoteCommandRouter {
                         | CommandAction::ConvoyDelete { .. }
                         | CommandAction::ConvoyAbandon { .. }
                         | CommandAction::ConvoyResume { .. }
+                        | CommandAction::ConvoyWithdrawPendingBrief { .. }
                         | CommandAction::ConvoyWorkForceComplete { .. }
                         | CommandAction::CrewComplete { .. }
                         | CommandAction::CrewFail { .. }

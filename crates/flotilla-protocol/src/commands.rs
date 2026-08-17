@@ -534,6 +534,11 @@ pub enum CommandAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
     },
+    ConvoyWithdrawPendingBrief {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        name: String,
+    },
     CrewHandoff {
         context: CrewCommandContext,
         target: String,
@@ -746,6 +751,7 @@ impl Command {
             CommandAction::ConvoyDelete { .. } => "Deleting convoy...",
             CommandAction::ConvoyAbandon { .. } => "Abandoning convoy...",
             CommandAction::ConvoyResume { .. } => "Resuming convoy crew...",
+            CommandAction::ConvoyWithdrawPendingBrief { .. } => "Withdrawing pending convoy brief...",
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
             CommandAction::CrewComplete { .. } => "Completing crew work...",
             CommandAction::CrewFail { .. } => "Failing crew work...",
@@ -826,6 +832,14 @@ impl AttachBinding {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandValue {
     Ok,
+    ConvoyBriefQueued {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        displaced: Option<String>,
+    },
+    ConvoyBriefWithdrawn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        withdrawn: Option<String>,
+    },
     RepoTracked {
         path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1155,6 +1169,12 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
+                action: CommandAction::ConvoyWithdrawPendingBrief { namespace: Some("flotilla".into()), name: "convoy-a".into() },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
                 action: CommandAction::CrewHandoff {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     target: "reviewer".into(),
@@ -1371,6 +1391,8 @@ mod tests {
     fn command_value_roundtrip_covers_all_variants() {
         let cases = vec![
             CommandValue::Ok,
+            CommandValue::ConvoyBriefQueued { displaced: Some("older instruction".into()) },
+            CommandValue::ConvoyBriefWithdrawn { withdrawn: Some("latest instruction".into()) },
             CommandValue::RepoTracked {
                 path: PathBuf::from("/new/repo"),
                 resolved_from: None,

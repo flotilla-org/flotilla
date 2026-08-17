@@ -41,17 +41,20 @@ pub enum ConvoyVerb {
         #[arg(long)]
         reason: String,
     },
-    /// Re-task completed crew in an intact convoy vessel
+    /// Send a follow-up brief to convoy crew
     Resume {
         /// Convoy resource name
         name: String,
         /// Follow-up brief delivered to the existing crew session
-        #[arg(long)]
-        prompt: String,
-        /// Vessel name; inferred when exactly one completed crew member matches
+        #[arg(long, required_unless_present = "withdraw", conflicts_with = "withdraw")]
+        prompt: Option<String>,
+        /// Withdraw the brief waiting for the next turn boundary
+        #[arg(long, conflicts_with_all = ["prompt", "vessel", "role"])]
+        withdraw: bool,
+        /// Vessel name; inferred when exactly one active or completed crew member matches
         #[arg(long)]
         vessel: Option<String>,
-        /// Crew role; inferred when exactly one completed crew member matches
+        /// Crew role; inferred when exactly one active or completed crew member matches
         #[arg(long)]
         role: Option<String>,
     },
@@ -257,20 +260,20 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 })
             }
-            ConvoyVerb::Resume { name, prompt, vessel, role } => {
+            ConvoyVerb::Resume { name, prompt, withdraw, vessel, role } => {
                 if self.subject.is_some() {
                     return Err("convoy resume takes its name after `resume`".to_string());
                 }
-                if prompt.trim().is_empty() {
+                if prompt.as_ref().is_some_and(|prompt| prompt.trim().is_empty()) {
                     return Err("convoy resume requires a non-empty --prompt".to_string());
                 }
+                let action = match prompt {
+                    Some(prompt) => CommandAction::ConvoyResume { namespace: None, name, prompt, vessel, role },
+                    None if withdraw => CommandAction::ConvoyWithdrawPendingBrief { namespace: None, name },
+                    None => return Err("convoy resume requires --prompt or --withdraw".to_string()),
+                };
                 Ok(Resolved::NeedsContext {
-                    command: Command {
-                        node_id: None,
-                        provisioning_target: None,
-                        context_repo: None,
-                        action: CommandAction::ConvoyResume { namespace: None, name, prompt, vessel, role },
-                    },
+                    command: Command { node_id: None, provisioning_target: None, context_repo: None, action },
                     repo: RepoContext::None,
                     host: HostResolution::Local,
                 })
@@ -422,8 +425,14 @@ impl std::fmt::Display for ConvoyNoun {
             ConvoyVerb::Abandon { name, reason } => {
                 write!(f, " abandon {} --reason {}", quote_value(name), quote_value(reason))?;
             }
-            ConvoyVerb::Resume { name, prompt, vessel, role } => {
-                write!(f, " resume {} --prompt {}", quote_value(name), quote_value(prompt))?;
+            ConvoyVerb::Resume { name, prompt, withdraw, vessel, role } => {
+                write!(f, " resume {}", quote_value(name))?;
+                if let Some(prompt) = prompt {
+                    write!(f, " --prompt {}", quote_value(prompt))?;
+                }
+                if *withdraw {
+                    write!(f, " --withdraw")?;
+                }
                 if let Some(vessel) = vessel {
                     write!(f, " --vessel {}", quote_value(vessel))?;
                 }
@@ -644,6 +653,21 @@ mod tests {
     }
 
     #[test]
+    fn convoy_resume_withdraw_resolves_to_pending_brief_withdrawal() {
+        let resolved = parse(&["convoy", "resume", "convoy-a", "--withdraw"]).resolve().expect("resolve");
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyWithdrawPendingBrief { namespace: None, name: "convoy-a".into() },
+            },
+            repo: RepoContext::None,
+            host: HostResolution::Local,
+        });
+    }
+
+    #[test]
     fn convoy_start_agent_overrides_parse_in_bare_and_scoped_forms() {
         let resolved = parse(&["convoy", "start", "--project", "flotilla", "--agent", "claude-code:opus", "--agent", "review=codex"])
             .resolve()
@@ -680,6 +704,11 @@ mod tests {
             "--role",
             "coder",
         ]);
+    }
+
+    #[test]
+    fn round_trip_resume_withdraw() {
+        assert_round_trip::<ConvoyNoun>(&["convoy", "resume", "convoy-a", "--withdraw"]);
     }
 
     #[test]

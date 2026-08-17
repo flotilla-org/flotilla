@@ -60,9 +60,9 @@ pub use convoy::{
     pinned_placement_ref, pinned_workflow_ref, provisioning_patches, reconcile, select_convoy_children, BoundChangeRequest, Convoy,
     ConvoyAttention, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
     ConvoyStatusPatch, ConvoyTeardownRuntime, CrewWorkPhase, CrewWorkState, InputValue, InstantiatedExit, InstantiatedExitEntry,
-    InstantiatedTurnDelivery, IssueSnapshot, PlacementStatus, ReconcileOutcome, SettlementEvaluation, SettlementMode, TargetMismatch,
-    TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation, WorkCompletionAuthority,
-    WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
+    InstantiatedTurnDelivery, IssueSnapshot, PendingBrief, PlacementStatus, ReconcileOutcome, SettlementEvaluation, SettlementMode,
+    TargetMismatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation,
+    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use convoy_ensure::{ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch};
 pub use credential::{

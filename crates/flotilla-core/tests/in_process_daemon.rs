@@ -4916,3 +4916,163 @@ async fn cancel_nonexistent_command_returns_error() {
     assert!(result.is_err(), "cancelling a non-existent command should fail");
     assert!(result.unwrap_err().contains("no matching active command"), "error should mention no matching active command");
 }
+
+#[tokio::test]
+async fn convoy_resume_queues_a_brief_while_crew_is_working() {
+    let (_temp, _repo, daemon) = daemon_for_cwd().await;
+    let backend = daemon.resource_backend();
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &InputMeta::builder().name("busy-convoy".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            crew_work: BTreeMap::from([(
+                "work".to_string(),
+                BTreeMap::from([(
+                    "coder".to_string(),
+                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                )]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("mark crew working");
+
+    daemon
+        .convoy_resume_internal("flotilla", "busy-convoy", "Check the edge case", Some("work"), Some("coder"))
+        .await
+        .expect("queue brief for busy crew");
+
+    let convoy = convoys.get("busy-convoy").await.expect("read convoy");
+    let status = serde_json::to_value(convoy.status.expect("convoy status")).expect("serialize convoy status");
+    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["content"], "Check the edge case");
+    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["vessel"], "work");
+    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["role"], "coder");
+
+    let outcome = daemon
+        .convoy_resume_internal("flotilla", "busy-convoy", "Use the newer instruction", Some("work"), Some("coder"))
+        .await
+        .expect("replace pending brief");
+    assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: Some("Check the edge case".to_string()) });
+    let convoy = convoys.get("busy-convoy").await.expect("read updated convoy");
+    let status = serde_json::to_value(convoy.status.expect("convoy status")).expect("serialize convoy status");
+    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["content"], "Use the newer instruction");
+
+    let withdrawn = daemon.convoy_withdraw_pending_brief_internal("flotilla", "busy-convoy").await.expect("withdraw pending brief");
+    assert_eq!(withdrawn.as_deref(), Some("Use the newer instruction"));
+    assert!(convoys.get("busy-convoy").await.expect("read withdrawn convoy").status.expect("convoy status").pending_brief().is_none());
+
+    apply_status_patch(&convoys, "busy-convoy", &flotilla_resources::ConvoyStatusPatch::RollUpPhase {
+        phase: ConvoyPhase::Landed,
+        started_at: None,
+        finished_at: Some(chrono::Utc::now()),
+    })
+    .await
+    .expect("mark convoy terminal");
+    let error = daemon
+        .convoy_resume_internal("flotilla", "busy-convoy", "too late", Some("work"), Some("coder"))
+        .await
+        .expect_err("terminal convoy should refuse a brief");
+    assert!(error.contains("terminal phase `Landed`"), "unexpected refusal: {error}");
+}
+
+#[tokio::test]
+async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
+    let (_temp, _repo, daemon) = daemon_for_cwd().await;
+    let backend = daemon.resource_backend();
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &InputMeta::builder().name("turn-boundary".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            crew_work: BTreeMap::from([(
+                "work".to_string(),
+                BTreeMap::from([(
+                    "coder".to_string(),
+                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                )]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("mark crew working");
+    backend
+        .clone()
+        .using::<flotilla_resources::Vessel>("flotilla")
+        .create(&InputMeta::builder().name("work-vessel".to_string()).build(), &flotilla_resources::VesselSpec {
+            convoy_ref: "turn-boundary".to_string(),
+            vessel_name: "work".to_string(),
+            placement_policy_ref: "test".to_string(),
+            adopted_checkout_refs: BTreeMap::new(),
+        })
+        .await
+        .expect("create vessel");
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    sessions
+        .create(
+            &InputMeta::builder().name("coder-session".to_string()).build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("test-env".to_string())
+                .role("coder".to_string())
+                .source(TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: ".flotilla/briefs/coder.md".to_string(),
+                        content: "Initial turn".to_string(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "turn-boundary".to_string(),
+                        vessel_ref: "work-vessel".to_string(),
+                    }),
+                    message: None,
+                })
+                .cwd("/workspace".to_string())
+                .pool("cleat".to_string())
+                .build(),
+        )
+        .await
+        .expect("create crew session");
+    daemon
+        .convoy_resume_internal("flotilla", "turn-boundary", "Begin the follow-up turn", Some("work"), Some("coder"))
+        .await
+        .expect("queue pending brief");
+
+    daemon
+        .crew_complete_with_disposition_internal(
+            &flotilla_protocol::CrewCommandContext {
+                crew_id: None,
+                namespace: Some("flotilla".to_string()),
+                convoy: Some("turn-boundary".to_string()),
+                vessel_ref: Some("work-vessel".to_string()),
+                role: Some("coder".to_string()),
+            },
+            Some("first turn complete".to_string()),
+            Some("satisfied".to_string()),
+        )
+        .await
+        .expect("complete first turn");
+
+    let convoy = convoys.get("turn-boundary").await.expect("read convoy");
+    let status = convoy.status.expect("convoy status");
+    assert!(status.pending_brief().is_none());
+    assert_eq!(status.phase, ConvoyPhase::Active);
+    assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["work"]["coder"].disposition.as_deref(), Some("satisfied"));
+    let session = sessions.get("coder-session").await.expect("read crew session");
+    let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("crew session should be agent-backed") };
+    assert_eq!(message.expect("next turn message").text, "Begin the follow-up turn");
+}

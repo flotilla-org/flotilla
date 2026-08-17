@@ -644,6 +644,12 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
     use flotilla_protocol::commands::CommandValue;
     match result {
         CommandValue::Ok => "ok".to_string(),
+        CommandValue::ConvoyBriefQueued { displaced: Some(displaced) } => {
+            format!("pending brief replaced; displaced brief:\n{displaced}")
+        }
+        CommandValue::ConvoyBriefQueued { displaced: None } => "pending brief queued".to_string(),
+        CommandValue::ConvoyBriefWithdrawn { withdrawn: Some(withdrawn) } => format!("pending brief withdrawn:\n{withdrawn}"),
+        CommandValue::ConvoyBriefWithdrawn { withdrawn: None } => "no pending brief to withdraw".to_string(),
         CommandValue::RepoTracked { path, resolved_from, identity_change } => {
             let mut output = match resolved_from {
                 Some(original) => format!("repo tracked: {} (resolved from {})", path.display(), original.display()),
