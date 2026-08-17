@@ -1662,6 +1662,10 @@ fn convoy_address(role: &str, project: Option<&str>) -> String {
     project.map_or_else(|| role.to_string(), |project| format!("{role}@{project}"))
 }
 
+fn convoy_disambiguation_address(role: &str, project: Option<&str>) -> String {
+    format!("{role}@{}", project.unwrap_or_default())
+}
+
 async fn allocate_convoy_identity(
     backend: &ResourceBackend,
     namespace: &str,
@@ -1689,7 +1693,7 @@ async fn allocate_convoy_identity(
 
 fn parse_role_address(value: &str) -> Result<(&str, Option<&str>), String> {
     match value.split_once('@') {
-        Some((role, project)) if !role.is_empty() && !project.is_empty() && !project.contains('@') => Ok((role, Some(project))),
+        Some((role, project)) if !role.is_empty() && !project.contains('@') => Ok((role, Some(project))),
         Some(_) => Err(format!("invalid convoy address `{value}`: expected role@project")),
         None if value.is_empty() => Err("convoy role cannot be empty".to_string()),
         None => Ok((value, None)),
@@ -1725,7 +1729,7 @@ async fn resolve_local_convoy_name(backend: &ResourceBackend, namespace: &str, a
         candidates => {
             let addresses = candidates
                 .iter()
-                .filter_map(|convoy| convoy.spec.project_ref.as_ref().map(|project| format!("{}@{project}", convoy.spec.role)))
+                .map(|convoy| convoy_disambiguation_address(&convoy.spec.role, convoy.spec.project_ref.as_deref()))
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>()
@@ -2874,7 +2878,7 @@ impl InProcessDaemon {
             .filter(|row| {
                 row.resource.namespace == namespace
                     && row.name == role
-                    && project.is_none_or(|project| row.project_ref.as_deref() == Some(project))
+                    && project.is_none_or(|project| row.project_ref.as_deref().unwrap_or_default() == project)
                     && !row.phase.is_terminal()
             })
             .filter_map(|row| row.resource.host)
@@ -9325,13 +9329,13 @@ impl InProcessDaemon {
             .into_iter()
             .filter(|source| {
                 source.object.spec.role == role
-                    && project.is_none_or(|project| source.object.spec.project_ref.as_deref() == Some(project))
+                    && project.is_none_or(|project| source.object.spec.project_ref.as_deref().unwrap_or_default() == project)
                     && source.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
             })
             .collect::<Vec<_>>();
         let addresses = matching
             .iter()
-            .filter_map(|source| source.object.spec.project_ref.as_ref().map(|project| format!("{}@{project}", source.object.spec.role)))
+            .map(|source| convoy_disambiguation_address(&source.object.spec.role, source.object.spec.project_ref.as_deref()))
             .collect::<BTreeSet<_>>();
         if project.is_none() && addresses.len() > 1 {
             return Err(format!("convoy role `{role}` is ambiguous; use one of: {}", addresses.into_iter().collect::<Vec<_>>().join(", ")));

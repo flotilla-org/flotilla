@@ -20,40 +20,57 @@ fn test_meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
 }
 
+async fn create_identity_convoy(backend: &ResourceBackend, record: &str, role: &str, project: Option<&str>) {
+    let labels = BTreeMap::from([
+        (PROJECT_LABEL.to_string(), project.unwrap_or_default().to_string()),
+        (ROLE_LABEL.to_string(), role.to_string()),
+        (GENERATION_LABEL.to_string(), "1".to_string()),
+    ]);
+    let mut spec = ConvoySpec::builder().workflow_ref("review".to_string()).role(role.to_string()).generation(1).build();
+    spec.project_ref = project.map(str::to_string);
+    backend
+        .clone()
+        .using::<ResourceConvoy>("flotilla")
+        .create(&InputMeta::builder().name(record.to_string()).labels(labels).build(), &spec)
+        .await
+        .expect("convoy");
+}
+
 #[test]
 fn convoy_role_addresses_reject_malformed_values() {
     assert_eq!(parse_role_address("reviewer"), Ok(("reviewer", None)));
     assert_eq!(parse_role_address("reviewer@flotilla"), Ok(("reviewer", Some("flotilla"))));
-    for value in ["role@", "@project", "a@b@c"] {
+    assert_eq!(parse_role_address("reviewer@"), Ok(("reviewer", Some(""))));
+    for value in ["@project", "a@b@c"] {
         assert_eq!(parse_role_address(value), Err(format!("invalid convoy address `{value}`: expected role@project")));
     }
     assert_eq!(parse_role_address(""), Err("convoy role cannot be empty".to_string()));
 }
 
 #[tokio::test]
-async fn convoy_role_resolution_requires_a_project_when_the_role_is_ambiguous() {
+async fn convoy_role_resolution_can_disambiguate_a_projectless_convoy() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    for (record, project) in [("convoy-one", "alpha"), ("convoy-two", "beta")] {
-        let labels = BTreeMap::from([
-            (PROJECT_LABEL.to_string(), project.to_string()),
-            (ROLE_LABEL.to_string(), "reviewer".to_string()),
-            (GENERATION_LABEL.to_string(), "1".to_string()),
-        ]);
-        let spec = ConvoySpec::builder()
-            .workflow_ref("review".to_string())
-            .project_ref(project.to_string())
-            .role("reviewer".to_string())
-            .generation(1)
-            .build();
-        convoys.create(&InputMeta::builder().name(record.to_string()).labels(labels).build(), &spec).await.expect("convoy");
-    }
+    create_identity_convoy(&backend, "convoy-one", "reviewer", None).await;
+    create_identity_convoy(&backend, "convoy-two", "reviewer", Some("beta")).await;
 
     assert_eq!(
         resolve_local_convoy_name(&backend, "flotilla", "reviewer").await,
-        Err("convoy role `reviewer` is ambiguous; use one of: reviewer@alpha, reviewer@beta".to_string())
+        Err("convoy role `reviewer` is ambiguous; use one of: reviewer@, reviewer@beta".to_string())
     );
+    assert_eq!(resolve_local_convoy_name(&backend, "flotilla", "reviewer@").await, Ok("convoy-one".to_string()));
     assert_eq!(resolve_local_convoy_name(&backend, "flotilla", "reviewer@beta").await, Ok("convoy-two".to_string()));
+}
+
+#[tokio::test]
+async fn convoy_explain_rejects_projectless_and_project_bound_role_ambiguity() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    create_identity_convoy(&backend, "convoy-one", "reviewer", None).await;
+    create_identity_convoy(&backend, "convoy-two", "reviewer", Some("beta")).await;
+
+    assert_eq!(
+        daemon.explain_convoy_internal(None, "reviewer").await.expect_err("bare role must be ambiguous"),
+        "convoy role `reviewer` is ambiguous; use one of: reviewer@, reviewer@beta"
+    );
 }
 
 #[tokio::test]
