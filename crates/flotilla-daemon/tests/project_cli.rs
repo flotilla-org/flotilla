@@ -449,6 +449,28 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     assert_eq!(ensure.metadata.annotations.get(SOURCE_COMMIT_ANNOTATION).map(String::as_str), Some("ops-commit"));
     assert_eq!(ensure.metadata.annotations.get(PRESENTS_AS_ANNOTATION).map(String::as_str), Some("fleet"));
 
+    let repositories = backend.using::<flotilla_resources::Repository>("flotilla");
+    for source in repositories.list().await.expect("list repositories").items {
+        repositories
+            .update_status(
+                &source.metadata.name,
+                &source.metadata.resource_version,
+                &flotilla_resources::RepositoryStatus { default_branch: Some("main".to_string()), ..Default::default() },
+            )
+            .await
+            .expect("resolve repository default branch");
+    }
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("start ensured standing convoy");
+    let ensured_convoy_ref = ensures
+        .get(&ensure_name)
+        .await
+        .expect("reconciled ensure")
+        .status
+        .and_then(|status| status.convoy_ref)
+        .expect("ensured convoy ref");
+    let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
+    convoys.get(&ensured_convoy_ref).await.expect("ensured standing convoy record");
+
     workflows
         .update(
             &InputMeta::from(&scoped.metadata),
@@ -479,6 +501,10 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
         }
     );
     assert!(matches!(ensures.get(&ensure_name).await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+    assert!(
+        matches!(convoys.get(&ensured_convoy_ref).await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+        "removing the ops entry must tear down its live standing convoy"
+    );
 
     std::fs::remove_file(misleading_directory.join("this-is-a-workflow.md")).expect("remove workflow entry");
     assert_eq!(
