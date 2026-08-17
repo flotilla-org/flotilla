@@ -697,13 +697,7 @@ async fn convoy_start_routes_to_placement_host_when_presentation_membership_is_s
         .expect("list origin convoys");
     assert!(origin_convoys.items.is_empty(), "the origin must not own an always-on convoy record");
     let record_name = convoy_record_name(&topology.follower.resource_backend(), "remote-work").await;
-    topology
-        .follower
-        .resource_backend()
-        .using::<Convoy>(namespace)
-        .get(&record_name)
-        .await
-        .expect("placement host should own the convoy");
+    topology.follower.resource_backend().using::<Convoy>(namespace).get(&record_name).await.expect("placement host should own the convoy");
 }
 
 #[tokio::test]
