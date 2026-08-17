@@ -166,21 +166,20 @@ async fn stale_builtin_is_reconciled_before_contained_dispatch() {
         .name;
     let mut rx = daemon.subscribe();
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "must-remain-contained".into(),
-                workflow_ref: "single-agent-contained".into(),
-                inputs: Vec::new(),
-                repository_url: None,
-                r#ref: None,
-                project_ref: None,
-                placement_policy: Some(host_direct_policy.clone()),
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "must-remain-contained".into(),
+                    workflow_ref: "single-agent-contained".into(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: Some(host_direct_policy.clone()),
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("execute");
 
@@ -195,21 +194,20 @@ async fn convoy_create_command_creates_convoy_resource() {
 
     let mut rx = daemon.subscribe();
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "my-scratch".into(),
-                workflow_ref: "scratch".into(),
-                inputs: vec![("topic".into(), "first-convoy".into())],
-                repository_url: None,
-                r#ref: None,
-                project_ref: None,
-                placement_policy: None,
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "my-scratch".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: vec![("topic".into(), "first-convoy".into())],
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: None,
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("execute");
 
@@ -259,15 +257,14 @@ async fn workflow_template_apply_creates_then_updates() {
 
     // First apply: creates a new template.
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::WorkflowTemplateApply {
-                name: "custom".into(),
-                spec_yaml: "vessels:\n  - name: only\n    crew:\n      - role: shell\n        command: 'echo first'\n".into(),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::WorkflowTemplateApply {
+                    name: "custom".into(),
+                    spec_yaml: "vessels:\n  - name: only\n    crew:\n      - role: shell\n        command: 'echo first'\n".into(),
+                })
+                .build(),
+        )
         .await
         .expect("execute create");
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::WorkflowTemplateApplied { name: "custom".into() });
@@ -280,15 +277,14 @@ async fn workflow_template_apply_creates_then_updates() {
 
     // Second apply with the same name: updates the existing template.
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::WorkflowTemplateApply {
-                name: "custom".into(),
-                spec_yaml: "vessels:\n  - name: only\n    crew:\n      - role: shell\n        command: 'echo updated'\n".into(),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::WorkflowTemplateApply {
+                    name: "custom".into(),
+                    spec_yaml: "vessels:\n  - name: only\n    crew:\n      - role: shell\n        command: 'echo updated'\n".into(),
+                })
+                .build(),
+        )
         .await
         .expect("execute update");
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::WorkflowTemplateApplied { name: "custom".into() });
@@ -305,15 +301,14 @@ async fn workflow_template_apply_rejects_invalid_yaml() {
     let (daemon, _backend, _config, _runtime, _tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::WorkflowTemplateApply {
-                name: "broken".into(),
-                spec_yaml: "this is not: {valid yaml structure for: a workflow".into(),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::WorkflowTemplateApply {
+                    name: "broken".into(),
+                    spec_yaml: "this is not: {valid yaml structure for: a workflow".into(),
+                })
+                .build(),
+        )
         .await
         .expect("execute");
     let result = await_command_result(&mut rx, id).await;
@@ -326,21 +321,20 @@ async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
     let mut rx = daemon.subscribe();
 
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "sqlite-scratch".into(),
-                workflow_ref: "scratch".into(),
-                inputs: vec![("topic".into(), "embedded".into())],
-                repository_url: None,
-                r#ref: None,
-                project_ref: None,
-                placement_policy: None,
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "sqlite-scratch".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: vec![("topic".into(), "embedded".into())],
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: None,
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("execute");
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "sqlite-scratch".into() });

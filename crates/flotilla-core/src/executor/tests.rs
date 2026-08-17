@@ -383,11 +383,11 @@ fn repo_selector() -> RepoSelector {
 }
 
 fn local_command(action: CommandAction) -> Command {
-    Command { node_id: None, provisioning_target: None, context_repo: None, action }
+    Command::builder().action(action).build()
 }
 
 fn command_with_host(host: &str, action: CommandAction) -> Command {
-    Command { node_id: Some(NodeId::new(host)), provisioning_target: None, context_repo: None, action }
+    Command::builder().action(action).node_id(NodeId::new(host)).build()
 }
 
 fn local_host() -> HostName {
@@ -1313,12 +1313,11 @@ async fn remove_checkout_remote_node_ignores_local_duplicate_branch() {
 
     let config_base = config_base();
     let plan = build_plan(
-        Command {
-            node_id: Some(NodeId::new("remote-box")),
-            provisioning_target: None,
-            context_repo: Some(RepoSelector::Identity(repo_identity())),
-            action: remove_checkout_action("feat"),
-        },
+        Command::builder()
+            .action(remove_checkout_action("feat"))
+            .node_id(NodeId::new("remote-box"))
+            .context_repo(RepoSelector::Identity(repo_identity()))
+            .build(),
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::new(empty_registry()),
         Arc::new(data),
@@ -1347,16 +1346,15 @@ async fn fetch_checkout_status_targets_remote_node_when_command_is_remote() {
     let registry = empty_registry();
     let config_base = config_base();
     let plan = build_plan(
-        Command {
-            node_id: Some(NodeId::new("remote-box")),
-            provisioning_target: None,
-            context_repo: Some(RepoSelector::Identity(repo_identity())),
-            action: CommandAction::FetchCheckoutStatus {
+        Command::builder()
+            .action(CommandAction::FetchCheckoutStatus {
                 branch: "feat".to_string(),
                 checkout_path: Some(PathBuf::from("/repo/wt")),
                 change_request_id: None,
-            },
-        },
+            })
+            .node_id(NodeId::new("remote-box"))
+            .context_repo(RepoSelector::Identity(repo_identity()))
+            .build(),
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::new(registry),
         Arc::new(empty_data()),
@@ -2307,16 +2305,15 @@ async fn build_plan_remote_checkout_with_issue_links_suffixes_workspace_label_an
     let local = node_id("laptop-node");
 
     let plan = build_plan(
-        Command {
-            node_id: Some(node_id("feta-node")),
-            provisioning_target: Some(flotilla_protocol::ProvisioningTarget::Host { host: HostName::new("Build Box") }),
-            context_repo: None,
-            action: CommandAction::Checkout {
+        Command::builder()
+            .action(CommandAction::Checkout {
                 repo: repo_selector(),
                 target: CheckoutTarget::FreshBranch("feat-x".to_string()),
                 issue_ids: vec![("github".into(), "123".into())],
-            },
-        },
+            })
+            .node_id(node_id("feta-node"))
+            .provisioning_target(flotilla_protocol::ProvisioningTarget::Host { host: HostName::new("Build Box") })
+            .build(),
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::new(registry),
         Arc::new(empty_data()),
@@ -2356,7 +2353,7 @@ async fn build_plan_create_checkout_treats_local_host_as_local() {
     let local = local_node_id();
 
     let plan = build_plan(
-        Command { node_id: Some(local.clone()), provisioning_target: None, context_repo: None, action: fresh_checkout_action("feat-x") },
+        Command::builder().action(fresh_checkout_action("feat-x")).node_id(local.clone()).build(),
         RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         Arc::new(registry),
         Arc::new(data),
@@ -2853,19 +2850,19 @@ async fn build_plan_with_environment_prepends_lifecycle_steps() {
     let registry = empty_registry();
     let data = empty_data();
 
-    let cmd = Command {
-        node_id: Some(node_id("feta-node")),
-        provisioning_target: Some(flotilla_protocol::ProvisioningTarget::NewEnvironment {
-            host: HostName::new("feta"),
-            provider: "docker".to_string(),
-        }),
-        context_repo: Some(repo_selector()),
-        action: CommandAction::Checkout {
+    let cmd = Command::builder()
+        .action(CommandAction::Checkout {
             repo: repo_selector(),
             target: CheckoutTarget::FreshBranch("feature-x".to_string()),
             issue_ids: vec![],
-        },
-    };
+        })
+        .node_id(node_id("feta-node"))
+        .provisioning_target(flotilla_protocol::ProvisioningTarget::NewEnvironment {
+            host: HostName::new("feta"),
+            provider: "docker".to_string(),
+        })
+        .context_repo(repo_selector())
+        .build();
 
     let plan = build_plan(
         cmd,
@@ -2918,15 +2915,15 @@ async fn build_plan_with_environment_local_host_omits_suffix() {
     let registry = empty_registry();
     let data = empty_data();
 
-    let cmd = Command {
-        node_id: Some(local_node_id()),
-        provisioning_target: Some(flotilla_protocol::ProvisioningTarget::NewEnvironment {
+    let cmd = Command::builder()
+        .action(CommandAction::Checkout { repo: repo_selector(), target: CheckoutTarget::Branch("main".to_string()), issue_ids: vec![] })
+        .node_id(local_node_id())
+        .provisioning_target(flotilla_protocol::ProvisioningTarget::NewEnvironment {
             host: HostName::new("laptop"),
             provider: "docker".to_string(),
-        }),
-        context_repo: Some(repo_selector()),
-        action: CommandAction::Checkout { repo: repo_selector(), target: CheckoutTarget::Branch("main".to_string()), issue_ids: vec![] },
-    };
+        })
+        .context_repo(repo_selector())
+        .build();
 
     let plan = build_plan(
         cmd,
@@ -2966,19 +2963,19 @@ async fn build_plan_with_existing_environment_returns_3_steps() {
     let registry = empty_registry();
     let data = empty_data();
 
-    let cmd = Command {
-        node_id: Some(node_id("feta-node")),
-        provisioning_target: Some(flotilla_protocol::ProvisioningTarget::ExistingEnvironment {
-            host: HostName::new("feta"),
-            env_id: flotilla_protocol::EnvironmentId::new("env-abc"),
-        }),
-        context_repo: Some(repo_selector()),
-        action: CommandAction::Checkout {
+    let cmd = Command::builder()
+        .action(CommandAction::Checkout {
             repo: repo_selector(),
             target: CheckoutTarget::FreshBranch("feature-x".to_string()),
             issue_ids: vec![],
-        },
-    };
+        })
+        .node_id(node_id("feta-node"))
+        .provisioning_target(flotilla_protocol::ProvisioningTarget::ExistingEnvironment {
+            host: HostName::new("feta"),
+            env_id: flotilla_protocol::EnvironmentId::new("env-abc"),
+        })
+        .context_repo(repo_selector())
+        .build();
 
     let plan = build_plan(
         cmd,
@@ -3015,16 +3012,16 @@ async fn build_plan_with_host_target_returns_standard_checkout_plan() {
     let data = empty_data();
 
     // ProvisioningTarget::Host should fall through to the standard checkout plan
-    let cmd = Command {
-        node_id: Some(node_id("feta-node")),
-        provisioning_target: Some(flotilla_protocol::ProvisioningTarget::Host { host: HostName::new("feta") }),
-        context_repo: Some(repo_selector()),
-        action: CommandAction::Checkout {
+    let cmd = Command::builder()
+        .action(CommandAction::Checkout {
             repo: repo_selector(),
             target: CheckoutTarget::FreshBranch("feature-x".to_string()),
             issue_ids: vec![],
-        },
-    };
+        })
+        .node_id(node_id("feta-node"))
+        .provisioning_target(flotilla_protocol::ProvisioningTarget::Host { host: HostName::new("feta") })
+        .context_repo(repo_selector())
+        .build();
 
     let plan = build_plan(
         cmd,
@@ -3060,16 +3057,15 @@ async fn build_plan_with_no_provisioning_target_returns_standard_checkout_plan()
     let data = empty_data();
 
     // No provisioning_target should also produce the standard checkout plan
-    let cmd = Command {
-        node_id: Some(node_id("feta-node")),
-        provisioning_target: None,
-        context_repo: Some(repo_selector()),
-        action: CommandAction::Checkout {
+    let cmd = Command::builder()
+        .action(CommandAction::Checkout {
             repo: repo_selector(),
             target: CheckoutTarget::FreshBranch("feature-x".to_string()),
             issue_ids: vec![],
-        },
-    };
+        })
+        .node_id(node_id("feta-node"))
+        .context_repo(repo_selector())
+        .build();
 
     let plan = build_plan(
         cmd,

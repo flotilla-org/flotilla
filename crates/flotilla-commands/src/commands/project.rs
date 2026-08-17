@@ -123,21 +123,17 @@ mod tests {
             parse(&["project", "add", "/src/flotilla", "--name", "core", "--display-name", "Flotilla Core", "--remote", "origin"])
                 .resolve()
                 .expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ProjectAdd {
-                    target: "/src/flotilla".into(),
-                    name: Some("core".into()),
-                    display_name: Some("Flotilla Core".into()),
-                    remote: Some("origin".into()),
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ProjectAdd {
+                target: "/src/flotilla".into(),
+                name: Some("core".into()),
+                display_name: Some("Flotilla Core".into()),
+                remote: Some("origin".into()),
             },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]
@@ -155,11 +151,7 @@ mod tests {
     #[test]
     fn project_list_resolves_to_a_local_query() {
         let resolved = parse(&["project", "list"]).resolve().expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+        crate::test_utils::assert_needs_context(resolved, CommandAction::QueryProjectList {}, RepoContext::None, HostResolution::Local);
     }
 
     #[test]

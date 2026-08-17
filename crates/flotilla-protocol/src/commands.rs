@@ -1002,209 +1002,133 @@ mod tests {
     #[test]
     fn command_roundtrip_covers_all_variants() {
         let cases = vec![
-            Command {
-                node_id: Some(NodeId::new("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Refresh { repo: Some(RepoSelector::Query("flotilla".into())) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::TrackRepoPath { path: PathBuf::from("/repo") },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Path(PathBuf::from("/repo"))),
-                action: CommandAction::CreateWorkspaceFromPreparedTerminal {
+            Command::builder()
+                .action(CommandAction::Refresh { repo: Some(RepoSelector::Query("flotilla".into())) })
+                .node_id(NodeId::new("feta"))
+                .build(),
+            Command::builder().action(CommandAction::TrackRepoPath { path: PathBuf::from("/repo") }).build(),
+            Command::builder()
+                .action(CommandAction::CreateWorkspaceFromPreparedTerminal {
                     target_node_id: NodeId::new("desktop"),
                     branch: "feat-x".into(),
                     checkout_path: PathBuf::from("/remote/repo/feat-x"),
                     attachable_set_id: Some(AttachableSetId::new("set-1")),
                     commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::UntrackRepo { repo: RepoSelector::Query("owner/repo".into()) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Checkout {
+                })
+                .context_repo(RepoSelector::Path(PathBuf::from("/repo")))
+                .build(),
+            Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Query("owner/repo".into()) }).build(),
+            Command::builder()
+                .action(CommandAction::Checkout {
                     repo: RepoSelector::Path(PathBuf::from("/repo")),
                     target: CheckoutTarget::FreshBranch("feat-x".into()),
                     issue_ids: vec![("github".into(), "42".into())],
-                },
-            },
-            Command {
-                node_id: Some(NodeId::new("desktop")),
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Identity(repo_identity())),
-                action: CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/remote/repo/feat-x"), commands: vec![] },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-x".into()) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Path(PathBuf::from("/repo"))),
-                action: CommandAction::FetchCheckoutStatus {
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/remote/repo/feat-x"), commands: vec![] })
+                .node_id(NodeId::new("desktop"))
+                .context_repo(RepoSelector::Identity(repo_identity()))
+                .build(),
+            Command::builder().action(CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-x".into()) }).build(),
+            Command::builder()
+                .action(CommandAction::FetchCheckoutStatus {
                     branch: "feat-x".into(),
                     checkout_path: None,
                     change_request_id: Some("123".into()),
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Identity(repo_identity())),
-                action: CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/repo/wt"), label: "feat-x".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::SelectWorkspace { ws_ref: "ws://1".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a".into(), host: None, mode: AttachMode::Default },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::AttachTransient {
+                })
+                .context_repo(RepoSelector::Path(PathBuf::from("/repo")))
+                .build(),
+            Command::builder()
+                .action(CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/repo/wt"), label: "feat-x".into() })
+                .context_repo(RepoSelector::Identity(repo_identity()))
+                .build(),
+            Command::builder().action(CommandAction::SelectWorkspace { ws_ref: "ws://1".into() }).build(),
+            Command::builder()
+                .action(CommandAction::Attach { reference: "convoy-a".into(), host: None, mode: AttachMode::Default })
+                .build(),
+            Command::builder()
+                .action(CommandAction::AttachTransient {
                     reference: "terminal-scratch".into(),
                     host: Some(crate::HostName::new("feta")),
                     mode: AttachMode::Default,
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Query("owner/repo".into())),
-                action: CommandAction::OpenChangeRequest { id: "99".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Query("owner/repo".into())),
-                action: CommandAction::CloseChangeRequest { id: "99".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Query("owner/repo".into())),
-                action: CommandAction::MergeChangeRequest { id: "99".into(), confirmed: true },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Query("owner/repo".into())),
-                action: CommandAction::OpenIssue { id: "42".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Query("owner/repo".into())),
-                action: CommandAction::LinkIssuesToChangeRequest {
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::OpenChangeRequest { id: "99".into() })
+                .context_repo(RepoSelector::Query("owner/repo".into()))
+                .build(),
+            Command::builder()
+                .action(CommandAction::CloseChangeRequest { id: "99".into() })
+                .context_repo(RepoSelector::Query("owner/repo".into()))
+                .build(),
+            Command::builder()
+                .action(CommandAction::MergeChangeRequest { id: "99".into(), confirmed: true })
+                .context_repo(RepoSelector::Query("owner/repo".into()))
+                .build(),
+            Command::builder()
+                .action(CommandAction::OpenIssue { id: "42".into() })
+                .context_repo(RepoSelector::Query("owner/repo".into()))
+                .build(),
+            Command::builder()
+                .action(CommandAction::LinkIssuesToChangeRequest {
                     change_request_id: "99".into(),
                     issue_ids: vec!["42".into(), "43".into()],
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Query("owner/repo".into())),
-                action: CommandAction::ArchiveSession { session_id: "session-1".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Query("owner/repo".into())),
-                action: CommandAction::GenerateBranchName { issue_keys: vec!["ISSUE-1".into(), "ISSUE-2".into()] },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyWorkForceComplete {
+                })
+                .context_repo(RepoSelector::Query("owner/repo".into()))
+                .build(),
+            Command::builder()
+                .action(CommandAction::ArchiveSession { session_id: "session-1".into() })
+                .context_repo(RepoSelector::Query("owner/repo".into()))
+                .build(),
+            Command::builder()
+                .action(CommandAction::GenerateBranchName { issue_keys: vec!["ISSUE-1".into(), "ISSUE-2".into()] })
+                .context_repo(RepoSelector::Query("owner/repo".into()))
+                .build(),
+            Command::builder()
+                .action(CommandAction::ConvoyWorkForceComplete {
                     convoy: "convoy-a".into(),
                     work: "implement".into(),
                     message: Some("done".into()),
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: "failed-convoy".into(), force: false },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyResume {
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: "failed-convoy".into(), force: false })
+                .build(),
+            Command::builder()
+                .action(CommandAction::ConvoyResume {
                     namespace: Some("flotilla".into()),
                     name: "convoy-a".into(),
                     prompt: "Rebase onto main".into(),
                     vessel: Some("implement".into()),
                     role: Some("coder".into()),
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyWithdrawPendingBrief { namespace: Some("flotilla".into()), name: "convoy-a".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewHandoff {
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::ConvoyWithdrawPendingBrief { namespace: Some("flotilla".into()), name: "convoy-a".into() })
+                .build(),
+            Command::builder()
+                .action(CommandAction::CrewHandoff {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     target: "reviewer".into(),
                     message: "review this".into(),
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewComplete {
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::CrewComplete {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     message: Some("ready for review".into()),
                     disposition: Some("changes-pushed".into()),
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewFail {
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::CrewFail {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     message: "blocked".into(),
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyCreate {
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
                     name: "my-convoy".into(),
                     workflow_ref: "scratch".into(),
                     inputs: vec![("topic".into(), "convoy-create-cli".into())],
@@ -1213,161 +1137,110 @@ mod tests {
                     project_ref: Some("my-project".into()),
                     placement_policy: Some("host-direct-local".into()),
                     adopted_checkout: None,
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::WorkflowTemplateApply { name: "scratch".into(), spec_yaml: "vessels: []\n".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ProjectAdd {
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::WorkflowTemplateApply { name: "scratch".into(), spec_yaml: "vessels: []\n".into() })
+                .build(),
+            Command::builder()
+                .action(CommandAction::ProjectAdd {
                     target: "/src/flotilla".into(),
                     name: Some("my-project".into()),
                     display_name: Some("My Project".into()),
                     remote: Some("origin".into()),
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ProjectApply { name: "my-project".into(), spec_yaml: "repositories: []\n".into() },
-            },
-            Command {
-                node_id: Some(NodeId::new("feta")),
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Identity(repo_identity())),
-                action: CommandAction::TeleportSession {
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::ProjectApply { name: "my-project".into(), spec_yaml: "repositories: []\n".into() })
+                .build(),
+            Command::builder()
+                .action(CommandAction::TeleportSession {
                     session_id: "session-1".into(),
                     branch: Some("feat-x".into()),
                     checkout_key: Some(PathBuf::from("/repo/wt")),
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryRepoProviders { repo: RepoSelector::Path(PathBuf::from("/repo")) },
-            },
-            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
-            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryDispatchQueue { project: Some("widgets".to_string()) },
-            },
-            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetList {} },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryCrewList {
+                })
+                .node_id(NodeId::new("feta"))
+                .context_repo(RepoSelector::Identity(repo_identity()))
+                .build(),
+            Command::builder().action(CommandAction::QueryRepoProviders { repo: RepoSelector::Path(PathBuf::from("/repo")) }).build(),
+            Command::builder().action(CommandAction::QueryHostList {}).build(),
+            Command::builder().action(CommandAction::QueryProjectList {}).build(),
+            Command::builder().action(CommandAction::QueryDispatchQueue { project: Some("widgets".to_string()) }).build(),
+            Command::builder().action(CommandAction::QueryFleetList {}).build(),
+            Command::builder()
+                .action(CommandAction::QueryCrewList {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
-                },
-            },
-            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetReplicaSnapshot {} },
-            Command {
-                node_id: Some(NodeId::new("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryDaemonLogs {
+                })
+                .build(),
+            Command::builder().action(CommandAction::QueryFleetReplicaSnapshot {}).build(),
+            Command::builder()
+                .action(CommandAction::QueryDaemonLogs {
                     query: DaemonLogQuery {
                         since_seconds: Some(7200),
                         level: Some("warn".into()),
                         target: Some("flotilla_daemon::peer".into()),
                     },
-                },
-            },
-            Command {
-                node_id: Some(NodeId::new("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: "held-work".into() },
-            },
-            Command {
-                node_id: Some(NodeId::new("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryResourceList { namespace: "flotilla".into(), kind: "convoys".into(), include_replicas: false },
-            },
-            Command {
-                node_id: Some(NodeId::new("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryResourceGet {
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
+            Command::builder()
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: "held-work".into() })
+                .node_id(NodeId::new("feta"))
+                .build(),
+            Command::builder()
+                .action(CommandAction::QueryResourceList { namespace: "flotilla".into(), kind: "convoys".into(), include_replicas: false })
+                .node_id(NodeId::new("feta"))
+                .build(),
+            Command::builder()
+                .action(CommandAction::QueryResourceGet {
                     namespace: "flotilla".into(),
                     kind: "convoys".into(),
                     name: "resource-demo".into(),
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ResourceStatusPatch {
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
+            Command::builder()
+                .action(CommandAction::ResourceStatusPatch {
                     namespace: "flotilla".into(),
                     kind: "usages".into(),
                     name: "usage-account".into(),
                     status: serde_json::json!({"provider": "codex", "observed_at": "2026-08-08T18:00:00Z"}),
-                },
-            },
-            Command {
-                node_id: Some(NodeId::new("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ResourceWatch {
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::ResourceWatch {
                     namespace: "flotilla".into(),
                     kind: "convoys".into(),
                     name: None,
                     include_replicas: false,
                     replica_sources: false,
                     cursor: None,
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryHostStatus { target_environment_id: EnvironmentId::host(HostId::new("desktop-host")) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryHostProviders { target_environment_id: EnvironmentId::host(HostId::new("desktop-host")) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryIssues {
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
+            Command::builder()
+                .action(CommandAction::QueryHostStatus { target_environment_id: EnvironmentId::host(HostId::new("desktop-host")) })
+                .build(),
+            Command::builder()
+                .action(CommandAction::QueryHostProviders { target_environment_id: EnvironmentId::host(HostId::new("desktop-host")) })
+                .build(),
+            Command::builder()
+                .action(CommandAction::QueryIssues {
                     repo: RepoSelector::Query("test".into()),
                     params: crate::issue_query::IssueQuery::default(),
                     page: 1,
                     count: 50,
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryIssueFetchByIds {
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::QueryIssueFetchByIds {
                     repo: RepoSelector::Path(PathBuf::from("/repo")),
                     ids: vec!["1".into(), "2".into()],
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryIssueOpenInBrowser { repo: RepoSelector::Path(PathBuf::from("/repo")), id: "42".into() },
-            },
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::QueryIssueOpenInBrowser { repo: RepoSelector::Path(PathBuf::from("/repo")), id: "42".into() })
+                .build(),
         ];
 
         for cmd in cases {
@@ -1377,12 +1250,7 @@ mod tests {
 
     #[test]
     fn command_uses_snake_case_tag() {
-        let cmd = Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::SelectWorkspace { ws_ref: "x".into() },
-        };
+        let cmd = Command::builder().action(CommandAction::SelectWorkspace { ws_ref: "x".into() }).build();
         let json = serde_json::to_value(&cmd).expect("serialize");
         assert_eq!(json.get("action").and_then(|v| v.as_str()), Some("select_workspace"));
     }
@@ -1728,168 +1596,97 @@ mod tests {
     #[test]
     fn command_description_covers_all_variants() {
         let cases: Vec<Command> = vec![
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/tmp"), label: "ws".into() },
-            },
-            Command {
-                node_id: Some(NodeId::new("desktop")),
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Identity(repo_identity())),
-                action: CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/remote/repo/feat-x"), commands: vec![] },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Identity(repo_identity())),
-                action: CommandAction::CreateWorkspaceFromPreparedTerminal {
+            Command::builder()
+                .action(CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/tmp"), label: "ws".into() })
+                .build(),
+            Command::builder()
+                .action(CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/remote/repo/feat-x"), commands: vec![] })
+                .node_id(NodeId::new("desktop"))
+                .context_repo(RepoSelector::Identity(repo_identity()))
+                .build(),
+            Command::builder()
+                .action(CommandAction::CreateWorkspaceFromPreparedTerminal {
                     target_node_id: NodeId::new("desktop"),
                     branch: "feat-x".into(),
                     checkout_path: PathBuf::from("/remote/repo/feat-x"),
                     attachable_set_id: None,
                     commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::SelectWorkspace { ws_ref: "x".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Checkout {
+                })
+                .context_repo(RepoSelector::Identity(repo_identity()))
+                .build(),
+            Command::builder().action(CommandAction::SelectWorkspace { ws_ref: "x".into() }).build(),
+            Command::builder()
+                .action(CommandAction::Checkout {
                     repo: RepoSelector::Query("repo".into()),
                     target: CheckoutTarget::Branch("b".into()),
                     issue_ids: vec![],
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("b".into()) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::FetchCheckoutStatus { branch: "b".into(), checkout_path: None, change_request_id: None },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Path(PathBuf::from("/tmp"))),
-                action: CommandAction::OpenChangeRequest { id: "1".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Path(PathBuf::from("/tmp"))),
-                action: CommandAction::CloseChangeRequest { id: "1".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Path(PathBuf::from("/tmp"))),
-                action: CommandAction::MergeChangeRequest { id: "1".into(), confirmed: true },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Path(PathBuf::from("/tmp"))),
-                action: CommandAction::OpenIssue { id: "1".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Path(PathBuf::from("/tmp"))),
-                action: CommandAction::LinkIssuesToChangeRequest { change_request_id: "1".into(), issue_ids: vec![] },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Path(PathBuf::from("/tmp"))),
-                action: CommandAction::ArchiveSession { session_id: "s".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Path(PathBuf::from("/tmp"))),
-                action: CommandAction::GenerateBranchName { issue_keys: vec![] },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: "failed-convoy".into(), force: false },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Path(PathBuf::from("/tmp"))),
-                action: CommandAction::TeleportSession { session_id: "s".into(), branch: None, checkout_key: None },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::TrackRepoPath { path: PathBuf::from("/tmp") },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::UntrackRepo { repo: RepoSelector::Path(PathBuf::from("/tmp")) },
-            },
-            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryRepoProviders { repo: RepoSelector::Path(PathBuf::from("/tmp")) },
-            },
-            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
-            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryHostStatus { target_environment_id: EnvironmentId::host(HostId::new("desktop-host")) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryHostProviders { target_environment_id: EnvironmentId::host(HostId::new("desktop-host")) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryIssues {
+                })
+                .build(),
+            Command::builder().action(CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("b".into()) }).build(),
+            Command::builder()
+                .action(CommandAction::FetchCheckoutStatus { branch: "b".into(), checkout_path: None, change_request_id: None })
+                .build(),
+            Command::builder()
+                .action(CommandAction::OpenChangeRequest { id: "1".into() })
+                .context_repo(RepoSelector::Path(PathBuf::from("/tmp")))
+                .build(),
+            Command::builder()
+                .action(CommandAction::CloseChangeRequest { id: "1".into() })
+                .context_repo(RepoSelector::Path(PathBuf::from("/tmp")))
+                .build(),
+            Command::builder()
+                .action(CommandAction::MergeChangeRequest { id: "1".into(), confirmed: true })
+                .context_repo(RepoSelector::Path(PathBuf::from("/tmp")))
+                .build(),
+            Command::builder()
+                .action(CommandAction::OpenIssue { id: "1".into() })
+                .context_repo(RepoSelector::Path(PathBuf::from("/tmp")))
+                .build(),
+            Command::builder()
+                .action(CommandAction::LinkIssuesToChangeRequest { change_request_id: "1".into(), issue_ids: vec![] })
+                .context_repo(RepoSelector::Path(PathBuf::from("/tmp")))
+                .build(),
+            Command::builder()
+                .action(CommandAction::ArchiveSession { session_id: "s".into() })
+                .context_repo(RepoSelector::Path(PathBuf::from("/tmp")))
+                .build(),
+            Command::builder()
+                .action(CommandAction::GenerateBranchName { issue_keys: vec![] })
+                .context_repo(RepoSelector::Path(PathBuf::from("/tmp")))
+                .build(),
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: "failed-convoy".into(), force: false })
+                .build(),
+            Command::builder()
+                .action(CommandAction::TeleportSession { session_id: "s".into(), branch: None, checkout_key: None })
+                .context_repo(RepoSelector::Path(PathBuf::from("/tmp")))
+                .build(),
+            Command::builder().action(CommandAction::TrackRepoPath { path: PathBuf::from("/tmp") }).build(),
+            Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Path(PathBuf::from("/tmp")) }).build(),
+            Command::builder().action(CommandAction::Refresh { repo: None }).build(),
+            Command::builder().action(CommandAction::QueryRepoProviders { repo: RepoSelector::Path(PathBuf::from("/tmp")) }).build(),
+            Command::builder().action(CommandAction::QueryHostList {}).build(),
+            Command::builder().action(CommandAction::QueryProjectList {}).build(),
+            Command::builder()
+                .action(CommandAction::QueryHostStatus { target_environment_id: EnvironmentId::host(HostId::new("desktop-host")) })
+                .build(),
+            Command::builder()
+                .action(CommandAction::QueryHostProviders { target_environment_id: EnvironmentId::host(HostId::new("desktop-host")) })
+                .build(),
+            Command::builder()
+                .action(CommandAction::QueryIssues {
                     repo: RepoSelector::Query("test".into()),
                     params: crate::issue_query::IssueQuery::default(),
                     page: 1,
                     count: 50,
-                },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryIssueFetchByIds { repo: RepoSelector::Path(PathBuf::from("/repo")), ids: vec!["1".into()] },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryIssueOpenInBrowser { repo: RepoSelector::Path(PathBuf::from("/repo")), id: "42".into() },
-            },
+                })
+                .build(),
+            Command::builder()
+                .action(CommandAction::QueryIssueFetchByIds { repo: RepoSelector::Path(PathBuf::from("/repo")), ids: vec!["1".into()] })
+                .build(),
+            Command::builder()
+                .action(CommandAction::QueryIssueOpenInBrowser { repo: RepoSelector::Path(PathBuf::from("/repo")), id: "42".into() })
+                .build(),
         ];
         for cmd in cases {
             let desc = cmd.description();

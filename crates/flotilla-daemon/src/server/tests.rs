@@ -1300,14 +1300,14 @@ async fn dispatch_execute_remote_query_routes_through_peer_manager() {
     );
 
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(node("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::QueryHostStatus {
-                target_environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host")),
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::QueryHostStatus {
+                    target_environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host")),
+                })
+                .node_id(node("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch_execute should succeed");
 
@@ -1320,14 +1320,15 @@ async fn dispatch_execute_remote_query_routes_through_peer_manager() {
         PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { requester_node_id, target_node_id, command, .. }) => {
             assert_eq!(requester_node_id, daemon.node_id());
             assert_eq!(target_node_id, &node("feta"));
-            assert_eq!(command.as_ref(), &Command {
-                node_id: Some(node("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryHostStatus {
-                    target_environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host"))
-                }
-            });
+            assert_eq!(
+                command.as_ref(),
+                &Command::builder()
+                    .action(CommandAction::QueryHostStatus {
+                        target_environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host"))
+                    })
+                    .node_id(node("feta"))
+                    .build()
+            );
         }
         other => panic!("expected routed command request, got {other:?}"),
     }
@@ -1354,19 +1355,19 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
     let cursor = ResourceCursor::from_position("42", Some("generation-a".to_string()));
 
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(node("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceWatch {
-                namespace: "flotilla".into(),
-                kind: "convoys".into(),
-                name: Some("demo".into()),
-                include_replicas: false,
-                replica_sources: false,
-                cursor: Some(cursor.clone()),
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::ResourceWatch {
+                    namespace: "flotilla".into(),
+                    kind: "convoys".into(),
+                    name: Some("demo".into()),
+                    include_replicas: false,
+                    replica_sources: false,
+                    cursor: Some(cursor.clone()),
+                })
+                .node_id(node("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch_execute should succeed");
 
@@ -1379,19 +1380,20 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
         PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { requester_node_id, target_node_id, command, .. }) => {
             assert_eq!(requester_node_id, daemon.node_id());
             assert_eq!(target_node_id, &node("feta"));
-            assert_eq!(command.as_ref(), &Command {
-                node_id: Some(node("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ResourceWatch {
-                    namespace: "flotilla".into(),
-                    kind: "convoys".into(),
-                    name: Some("demo".into()),
-                    include_replicas: false,
-                    replica_sources: false,
-                    cursor: Some(cursor),
-                }
-            });
+            assert_eq!(
+                command.as_ref(),
+                &Command::builder()
+                    .action(CommandAction::ResourceWatch {
+                        namespace: "flotilla".into(),
+                        kind: "convoys".into(),
+                        name: Some("demo".into()),
+                        include_replicas: false,
+                        replica_sources: false,
+                        cursor: Some(cursor),
+                    })
+                    .node_id(node("feta"))
+                    .build()
+            );
         }
         other => panic!("expected routed command request, got {other:?}"),
     }
@@ -1423,12 +1425,11 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
     let remote_command_router = empty_remote_command_router(&daemon, &peer_manager);
 
     let message = remote_command_router
-        .dispatch_execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyDelete { namespace: Some("flotilla".to_string()), name: "stranded".to_string(), force: true },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".to_string()), name: "stranded".to_string(), force: true })
+                .build(),
+        )
         .await
         .expect_err("failed peer send should reject dispatch");
 
@@ -1495,16 +1496,15 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
     let router = empty_remote_command_router(&daemon, &peer_manager);
 
     let error = router
-        .dispatch_execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::CrewComplete {
-                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
-                message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
-                disposition: None,
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::CrewComplete {
+                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                    message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
+                    disposition: None,
+                })
+                .build(),
+        )
         .await
         .expect_err("partitioned completion should report that it was queued");
 
@@ -1518,16 +1518,15 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
     assert!(pending.last_error.contains("authority unreachable for stranded"));
 
     router
-        .dispatch_execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::CrewComplete {
-                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
-                message: Some("https://github.com/flotilla-org/flotilla/pull/1301".into()),
-                disposition: None,
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::CrewComplete {
+                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                    message: Some("https://github.com/flotilla-org/flotilla/pull/1301".into()),
+                    disposition: None,
+                })
+                .build(),
+        )
         .await
         .expect_err("corrected completion should remain queued during the partition");
     let pending = sessions
@@ -1580,16 +1579,15 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
     assert_eq!(delivered.lock().expect("delivered lock").len(), 1, "permanent authority rejection must not retry");
 
     router
-        .dispatch_execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::CrewComplete {
-                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
-                message: Some("https://github.com/flotilla-org/flotilla/pull/1302".into()),
-                disposition: None,
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::CrewComplete {
+                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                    message: Some("https://github.com/flotilla-org/flotilla/pull/1302".into()),
+                    disposition: None,
+                })
+                .build(),
+        )
         .await
         .expect("reachable authority should accept a fresh completion");
     let request_id = match delivered.lock().expect("delivered lock").get(1).expect("fresh completion") {
@@ -1612,14 +1610,11 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
     peer_manager.lock().await.register_sender(node("feta"), Arc::new(FailingPeerSender));
     let query_error = router
         .dispatch_query(
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryCrewList {
+            Command::builder()
+                .action(CommandAction::QueryCrewList {
                     context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
-                },
-            },
+                })
+                .build(),
             uuid::Uuid::nil(),
         )
         .await
@@ -1838,9 +1833,7 @@ async fn query_commands_return_directed_response_instead_of_remote_dispatch() {
 
     // Local query commands (host=None) execute directly and return QueryResult.
     let response = request_dispatcher
-        .dispatch(401, Request::Execute {
-            command: Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
-        })
+        .dispatch(401, Request::Execute { command: Command::builder().action(CommandAction::QueryHostList {}).build() })
         .await;
 
     match ok_response(response, 401) {
@@ -1892,18 +1885,16 @@ async fn request_dispatcher_forwards_daemon_log_query_through_peer_manager() {
             );
             request_dispatcher
                 .dispatch(402, Request::Execute {
-                    command: Command {
-                        node_id: Some(node("feta")),
-                        provisioning_target: None,
-                        context_repo: None,
-                        action: CommandAction::QueryDaemonLogs {
+                    command: Command::builder()
+                        .action(CommandAction::QueryDaemonLogs {
                             query: DaemonLogQuery {
                                 since_seconds: Some(7200),
                                 level: Some("warn".into()),
                                 target: Some("flotilla_daemon::peer".into()),
                             },
-                        },
-                    },
+                        })
+                        .node_id(node("feta"))
+                        .build(),
                 })
                 .await
         }
@@ -1997,16 +1988,14 @@ async fn remote_command_mutations_route_remote_step_requests() {
 
     let response = request_dispatcher
         .dispatch(402, Request::Execute {
-            command: Command {
-                node_id: Some(NodeId::new("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Checkout {
+            command: Command::builder()
+                .action(CommandAction::Checkout {
                     repo: RepoSelector::Identity(repo_identity.clone()),
                     target: CheckoutTarget::FreshBranch("feat-remote-step".into()),
                     issue_ids: vec![("github".into(), "123".into())],
-                },
-            },
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
         })
         .await;
 
@@ -2080,16 +2069,16 @@ async fn remote_command_remote_step_events_remap_to_presentation_command_id_and_
 
     let mut rx = daemon.subscribe();
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(NodeId::new("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Identity(repo_identity.clone()),
-                target: CheckoutTarget::FreshBranch("feat-remap".into()),
-                issue_ids: vec![("github".into(), "321".into())],
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Identity(repo_identity.clone()),
+                    target: CheckoutTarget::FreshBranch("feat-remap".into()),
+                    issue_ids: vec![("github".into(), "321".into())],
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch execute");
 
@@ -2183,16 +2172,16 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
 
     let mut rx = daemon.subscribe();
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(NodeId::new("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Path(repo.clone()),
-                target: CheckoutTarget::FreshBranch("feat-workspace-local".into()),
-                issue_ids: vec![],
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Path(repo.clone()),
+                    target: CheckoutTarget::FreshBranch("feat-workspace-local".into()),
+                    issue_ids: vec![],
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch execute");
 
@@ -2354,16 +2343,16 @@ async fn remote_checkout_failure_with_empty_response_still_stops_local_workspace
 
     let mut rx = daemon.subscribe();
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(NodeId::new("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Path(repo.clone()),
-                target: CheckoutTarget::FreshBranch("feat-workspace-failure".into()),
-                issue_ids: vec![],
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Path(repo.clone()),
+                    target: CheckoutTarget::FreshBranch("feat-workspace-failure".into()),
+                    issue_ids: vec![],
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch execute");
 
@@ -2460,14 +2449,14 @@ async fn dispatch_execute_remote_does_not_hold_peer_manager_lock_across_send() {
             &next_remote_command_id_for_task,
         );
         remote_command_router
-            .dispatch_execute(Command {
-                node_id: Some(NodeId::new("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryHostStatus {
-                    target_environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host")),
-                },
-            })
+            .dispatch_execute(
+                Command::builder()
+                    .action(CommandAction::QueryHostStatus {
+                        target_environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host")),
+                    })
+                    .node_id(NodeId::new("feta"))
+                    .build(),
+            )
             .await
     });
 
@@ -2594,16 +2583,16 @@ async fn cancel_active_remote_segment_routes_remote_step_cancel_and_finishes_com
 
     let mut rx = daemon.subscribe();
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(NodeId::new("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Identity(repo_identity.clone()),
-                target: CheckoutTarget::FreshBranch("feat-cancel-active-remote".into()),
-                issue_ids: vec![("github".into(), "123".into())],
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Identity(repo_identity.clone()),
+                    target: CheckoutTarget::FreshBranch("feat-cancel-active-remote".into()),
+                    issue_ids: vec![("github".into(), "123".into())],
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch execute");
 
@@ -2753,16 +2742,16 @@ async fn cancel_disconnect_of_active_remote_segment_finishes_pending_command() {
 
     let mut rx = daemon.subscribe();
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(NodeId::new("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Identity(repo_identity.clone()),
-                target: CheckoutTarget::FreshBranch("feat-cancel-disconnect".into()),
-                issue_ids: vec![],
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Identity(repo_identity.clone()),
+                    target: CheckoutTarget::FreshBranch("feat-cancel-disconnect".into()),
+                    issue_ids: vec![],
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch execute");
 
@@ -2827,12 +2816,9 @@ async fn handle_inbound_command_request_does_not_hold_peer_manager_lock_across_s
                         requester_node_id: NodeId::new("desktop"),
                         target_node_id: NodeId::new("relay"),
                         remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                        command: Box::new(Command {
-                            node_id: Some(NodeId::new("relay")),
-                            provisioning_target: None,
-                            context_repo: None,
-                            action: CommandAction::Refresh { repo: None },
-                        }),
+                        command: Box::new(
+                            Command::builder().action(CommandAction::Refresh { repo: None }).node_id(NodeId::new("relay")).build(),
+                        ),
                         session_id: None,
                     }),
                     connection_generation: generation,
@@ -2857,12 +2843,11 @@ async fn handle_inbound_command_request_does_not_hold_peer_manager_lock_across_s
 #[test]
 fn extract_command_repo_identity_uses_context_repo_for_prepare_terminal() {
     let identity = RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() };
-    let command = Command {
-        node_id: Some(NodeId::new("remote")),
-        provisioning_target: None,
-        context_repo: Some(RepoSelector::Identity(identity.clone())),
-        action: CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/tmp/repo.checkout"), commands: vec![] },
-    };
+    let command = Command::builder()
+        .action(CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/tmp/repo.checkout"), commands: vec![] })
+        .node_id(NodeId::new("remote"))
+        .context_repo(RepoSelector::Identity(identity.clone()))
+        .build();
 
     assert_eq!(extract_command_repo_identity(&command), Some(identity));
 }
@@ -2953,12 +2938,7 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
             7,
             NodeId::new("desktop"),
             NodeId::new("relay"),
-            Command {
-                node_id: Some(daemon.node_id().clone()),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Refresh { repo: None },
-            },
+            Command::builder().action(CommandAction::Refresh { repo: None }).node_id(daemon.node_id().clone()).build(),
             ready,
         )
         .await;
@@ -3058,16 +3038,14 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
             9,
             NodeId::new("desktop"),
             NodeId::new("relay"),
-            Command {
-                node_id: Some(daemon.node_id().clone()),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Checkout {
+            Command::builder()
+                .action(CommandAction::Checkout {
                     repo: RepoSelector::Identity(repo_identity.clone()),
                     target: CheckoutTarget::FreshBranch("feat-routed".into()),
                     issue_ids: vec![],
-                },
-            },
+                })
+                .node_id(daemon.node_id().clone())
+                .build(),
             ready,
         )
         .await;
