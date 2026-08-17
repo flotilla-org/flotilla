@@ -5052,7 +5052,7 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
         .expect("queue pending brief");
 
     daemon
-        .crew_complete_internal(
+        .crew_complete_with_disposition_internal(
             &flotilla_protocol::CrewCommandContext {
                 crew_id: None,
                 namespace: Some("flotilla".to_string()),
@@ -5061,6 +5061,7 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
                 role: Some("coder".to_string()),
             },
             Some("first turn complete".to_string()),
+            Some("satisfied".to_string()),
         )
         .await
         .expect("complete first turn");
@@ -5070,6 +5071,7 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
     assert!(status.pending_brief().is_none());
     assert_eq!(status.phase, ConvoyPhase::Active);
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["work"]["coder"].disposition.as_deref(), Some("satisfied"));
     let session = sessions.get("coder-session").await.expect("read crew session");
     let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("crew session should be agent-backed") };
     assert_eq!(message.expect("next turn message").text, "Begin the follow-up turn");

@@ -722,6 +722,8 @@ pub enum ConvoyStatusPatch {
         role: String,
         delivered_at: DateTime<Utc>,
         content: String,
+        completion_message: Option<String>,
+        disposition: Option<String>,
     },
     RecordTurnDelivery {
         source: String,
@@ -982,12 +984,21 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::ClearPendingBrief => {
                 clear_operator_pending_brief(status);
             }
-            Self::DeliverPendingBrief { vessel, role, delivered_at, content } => {
+            Self::DeliverPendingBrief { vessel, role, delivered_at, content, completion_message, disposition } => {
                 let matches_pending =
                     status.pending_brief().is_some_and(|brief| brief.vessel == *vessel && brief.role == *role && brief.content == *content);
                 if !matches_pending {
                     return;
                 }
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.phase = CrewWorkPhase::Done;
+                    state.finished_at = Some(*delivered_at);
+                    state.message = completion_message.clone();
+                    if disposition.is_some() {
+                        state.disposition = disposition.clone();
+                    }
+                }
+                enter_landing_if_completion_claims_settled(status);
                 clear_operator_pending_brief(status);
                 status.phase = ConvoyPhase::Active;
                 status.finished_at = None;
@@ -1001,7 +1012,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.started_at.get_or_insert(*delivered_at);
                     state.finished_at = None;
                     state.message = Some(content.clone());
-                    state.disposition = None;
                 }
             }
             Self::RecordTurnDelivery { source, episode, vessel, role, prompt } => {
@@ -1194,8 +1204,15 @@ pub mod external_patches {
         ConvoyStatusPatch::ClearPendingBrief
     }
 
-    pub fn deliver_pending_brief(vessel: String, role: String, delivered_at: DateTime<Utc>, content: String) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::DeliverPendingBrief { vessel, role, delivered_at, content }
+    pub fn deliver_pending_brief(
+        vessel: String,
+        role: String,
+        delivered_at: DateTime<Utc>,
+        content: String,
+        completion_message: Option<String>,
+        disposition: Option<String>,
+    ) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::DeliverPendingBrief { vessel, role, delivered_at, content, completion_message, disposition }
     }
 
     pub fn record_turn_delivery(

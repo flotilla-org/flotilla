@@ -1564,6 +1564,22 @@ fn pending_crew_message(text: &str) -> TerminalCrewMessage {
     TerminalCrewMessage { id: uuid::Uuid::new_v4().to_string(), text: text.to_string() }
 }
 
+fn ensure_crew_work_is_defined(
+    convoy: &flotilla_resources::ResourceObject<ResourceConvoy>,
+    context: &ResolvedCrewContext,
+) -> Result<(), String> {
+    let known_agent = convoy
+        .status
+        .as_ref()
+        .and_then(|status| status.crew_work.get(&context.vessel))
+        .is_some_and(|crew| crew.contains_key(&context.caller_role));
+    if known_agent {
+        Ok(())
+    } else {
+        Err(format!("crew work for role `{}` is not defined on vessel `{}`", context.caller_role, context.vessel))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyResumeOutcome {
     Delivered,
@@ -6436,13 +6452,16 @@ impl InProcessDaemon {
 
     async fn resolve_crew_context(&self, requested: &CrewCommandContext) -> Result<ResolvedCrewContext, String> {
         let routing = self.resolve_crew_routing_context(requested).await?;
-        let CrewCommandContext { namespace, convoy, vessel_ref, role, .. } = routing.command_context;
-        let namespace = namespace.expect("routing context always has namespace");
-        let convoy = convoy.expect("routing context always has convoy");
-        let vessel_ref = vessel_ref.expect("routing context always has vessel ref");
-        let role = role.expect("routing context always has role");
-        let caller = match routing.session_name {
-            Some(name) => self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).get(&name).await.ok(),
+        self.resolve_crew_context_from_routing(&routing).await
+    }
+
+    async fn resolve_crew_context_from_routing(&self, routing: &CrewRoutingContext) -> Result<ResolvedCrewContext, String> {
+        let namespace = routing.command_context.namespace.as_ref().expect("routing context always has namespace").clone();
+        let convoy = routing.command_context.convoy.as_ref().expect("routing context always has convoy").clone();
+        let vessel_ref = routing.command_context.vessel_ref.as_ref().expect("routing context always has vessel ref").clone();
+        let role = routing.command_context.role.as_ref().expect("routing context always has role").clone();
+        let caller = match routing.session_name.as_ref() {
+            Some(name) => self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).get(name).await.ok(),
             None => None,
         };
         self.resolved_crew_context(namespace, convoy, vessel_ref, role, caller).await
@@ -6591,9 +6610,10 @@ impl InProcessDaemon {
         let convoy_name = routing.command_context.convoy.as_deref().expect("resolved crew routing context has a convoy");
         let message_lock = self.convoy_message_lock(namespace, convoy_name).await;
         let _message_guard = message_lock.lock().await;
-        let context = self.resolve_crew_context(requested).await?;
+        let context = self.resolve_crew_context_from_routing(&routing).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
+        ensure_crew_work_is_defined(&convoy, &context)?;
         if let Some(pending) = convoy
             .status
             .as_ref()
@@ -6614,6 +6634,8 @@ impl InProcessDaemon {
                     context.caller_role,
                     chrono::Utc::now(),
                     pending.content.clone(),
+                    message,
+                    disposition,
                 ),
             )
             .await
@@ -6621,16 +6643,13 @@ impl InProcessDaemon {
             self.clear_crew_completion_pending(namespace, session_name).await?;
             return Ok(());
         }
-        self.apply_crew_work_patch(requested, |context| {
-            convoy_external_patches::mark_crew_completed(
-                context.vessel.clone(),
-                context.caller_role.clone(),
-                chrono::Utc::now(),
-                message,
-                disposition,
-            )
-        })
-        .await?;
+        apply_resource_status_patch(
+            &convoys,
+            convoy_name,
+            &convoy_external_patches::mark_crew_completed(context.vessel, context.caller_role, chrono::Utc::now(), message, disposition),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
         if let Some(session_name) = routing.session_name {
             self.clear_crew_completion_pending(namespace, &session_name).await?;
         }
@@ -6832,14 +6851,7 @@ impl InProcessDaemon {
         let context = self.resolve_crew_context(requested).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
         let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
-        let known_agent = convoy
-            .status
-            .as_ref()
-            .and_then(|status| status.crew_work.get(&context.vessel))
-            .is_some_and(|crew| crew.contains_key(&context.caller_role));
-        if !known_agent {
-            return Err(format!("crew work for role `{}` is not defined on vessel `{}`", context.caller_role, context.vessel));
-        }
+        ensure_crew_work_is_defined(&convoy, &context)?;
         apply_resource_status_patch(&convoys, &context.convoy, &patch(&context)).await.map(|_| ()).map_err(|err| err.to_string())
     }
 

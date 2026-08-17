@@ -811,6 +811,8 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                     role: "coder".to_string(),
                     delivered_at: ts(30),
                     content: "address review".to_string(),
+                    completion_message: Some("first turn complete".to_string()),
+                    disposition: Some("satisfied".to_string()),
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
