@@ -383,6 +383,14 @@ unreachable_status="$(DAEMON_RUNNING=1 run_installer status 2>"$test_root/unreac
 grep -Fq 'fleet:   unavailable (daemon query failed)' <<<"$unreachable_status" \
   || fail 'status did not degrade gracefully when the daemon query failed'
 
+for bad_payload in 'not json at all' '{"kind":"host_list","hosts":[]}' '{"kind":"fleet_health","hosts":"nope"}' '{"kind":"fleet_health","hosts":[{"is_local":true}]}'; do
+  invalid_status="$(DAEMON_RUNNING=1 FLEET_HOST_LIST_JSON="$bad_payload" run_installer status 2>"$test_root/invalid-status.err")"
+  grep -Fq 'fleet:   unavailable (invalid daemon response)' <<<"$invalid_status" \
+    || fail "status did not degrade gracefully on invalid daemon payload: $bad_payload"
+  grep -Fq "current: $generation_one" <<<"$invalid_status" \
+    || fail 'invalid daemon payload disturbed local status reporting'
+done
+
 if run_installer "$generation_incomplete" >"$test_root/incomplete-exact.out" 2>&1; then
   fail 'an explicitly requested incomplete generation was accepted'
 fi
