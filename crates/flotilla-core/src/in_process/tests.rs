@@ -77,7 +77,8 @@ async fn convoy_explain_rejects_projectless_and_project_bound_role_ambiguity() {
 async fn projectless_convoys_do_not_share_an_identity_bucket_with_a_project_named_standalone() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let (record, generation) = allocate_convoy_identity(&backend, "flotilla", None, "worker").await.expect("projectless identity");
+    let record = convoy_record_name();
+    let generation = allocate_convoy_generation(&backend, "flotilla", None, "worker").await.expect("projectless identity");
     let labels = BTreeMap::from([
         (PROJECT_LABEL.to_string(), String::new()),
         (ROLE_LABEL.to_string(), "worker".to_string()),
@@ -86,7 +87,7 @@ async fn projectless_convoys_do_not_share_an_identity_bucket_with_a_project_name
     let spec = ConvoySpec::builder().workflow_ref("work".to_string()).role("worker".to_string()).generation(generation).build();
     convoys.create(&InputMeta::builder().name(record).labels(labels).build(), &spec).await.expect("projectless convoy");
 
-    assert!(allocate_convoy_identity(&backend, "flotilla", Some("standalone"), "worker").await.is_ok());
+    assert!(allocate_convoy_generation(&backend, "flotilla", Some("standalone"), "worker").await.is_ok());
 }
 
 async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<VirtualClock>, tempfile::TempDir) {

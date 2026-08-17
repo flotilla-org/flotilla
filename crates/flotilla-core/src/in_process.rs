@@ -1666,12 +1666,7 @@ fn convoy_disambiguation_address(role: &str, project: Option<&str>) -> String {
     format!("{role}@{}", project.unwrap_or_default())
 }
 
-async fn allocate_convoy_identity(
-    backend: &ResourceBackend,
-    namespace: &str,
-    project: Option<&str>,
-    role: &str,
-) -> Result<(String, u64), String> {
+async fn allocate_convoy_generation(backend: &ResourceBackend, namespace: &str, project: Option<&str>, role: &str) -> Result<u64, String> {
     let mut selector = BTreeMap::from([(ROLE_LABEL.to_string(), role.to_string())]);
     selector.insert(PROJECT_LABEL.to_string(), project.unwrap_or_default().to_string());
     let generations =
@@ -1688,7 +1683,7 @@ async fn allocate_convoy_identity(
     }
     let generation =
         maximum.checked_add(1).ok_or_else(|| format!("convoy {} exhausted its generation counter", convoy_address(role, project)))?;
-    Ok((convoy_record_name(), generation))
+    Ok(generation)
 }
 
 fn parse_role_address(value: &str) -> Result<(&str, Option<&str>), String> {
@@ -4351,8 +4346,9 @@ impl InProcessDaemon {
         let mut admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
         self.check_remote_placement_free_space_floor(namespace, admission.placement_decision.as_ref()).await?;
         let _admission_guard = self.convoy_admission.lock().await;
-        (admission.name, admission.spec.generation) =
-            allocate_convoy_identity(&self.resource_backend, namespace, admission.spec.project_ref.as_deref(), &admission.spec.role)
+        admission.name = convoy_record_name();
+        admission.spec.generation =
+            allocate_convoy_generation(&self.resource_backend, namespace, admission.spec.project_ref.as_deref(), &admission.spec.role)
                 .await?;
         self.create_convoy_with_workflow_snapshot(
             namespace,
@@ -4669,8 +4665,9 @@ impl InProcessDaemon {
             annotations.insert(PRESENTS_AS_ANNOTATION.to_string(), presents_as.clone());
         }
         let _admission_guard = self.convoy_admission.lock().await;
-        (admission.name, admission.spec.generation) =
-            allocate_convoy_identity(&self.resource_backend, namespace, admission.spec.project_ref.as_deref(), &admission.spec.role)
+        admission.name = convoy_record_name();
+        admission.spec.generation =
+            allocate_convoy_generation(&self.resource_backend, namespace, admission.spec.project_ref.as_deref(), &admission.spec.role)
                 .await?;
         let workflow_value = serde_json::to_value(&admission.workflow).map_err(|error| error.to_string())?;
         let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
@@ -8566,7 +8563,6 @@ impl InProcessDaemon {
             adopted_checkout,
         } = &command.action
         {
-            let _admission = self.convoy_admission.lock().await;
             let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
@@ -8578,21 +8574,7 @@ impl InProcessDaemon {
             let namespace = self.provisioning_namespace().await;
             let role = name.clone();
             let project_identity = project_ref.as_deref();
-            let (record_name, generation) =
-                match allocate_convoy_identity(&self.resource_backend, &namespace, project_identity, &role).await {
-                    Ok(identity) => identity,
-                    Err(message) => {
-                        let result = flotilla_protocol::CommandValue::Error { message };
-                        let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                            command_id: id,
-                            node_id: self.node_id.clone(),
-                            repo_identity: empty_identity,
-                            repo: None,
-                            result,
-                        });
-                        return Ok(id);
-                    }
-                };
+            let record_name = convoy_record_name();
             let name = &record_name;
             if let Err(message) = self.check_local_free_space_floor().await {
                 let result = flotilla_protocol::CommandValue::Error { message };
@@ -8836,6 +8818,21 @@ impl InProcessDaemon {
                 return Ok(id);
             }
             let placement_policy = placement.selected.as_ref().map(|placement| placement.metadata.name.clone());
+            let _admission_guard = self.convoy_admission.lock().await;
+            let generation = match allocate_convoy_generation(&self.resource_backend, &namespace, project_identity, &role).await {
+                Ok(generation) => generation,
+                Err(message) => {
+                    let result = flotilla_protocol::CommandValue::Error { message };
+                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                        command_id: id,
+                        node_id: self.node_id.clone(),
+                        repo_identity: empty_identity,
+                        repo: None,
+                        result,
+                    });
+                    return Ok(id);
+                }
+            };
             let spec = ConvoySpec {
                 workflow_ref: workflow_ref.clone(),
                 role: role.clone(),
