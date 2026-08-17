@@ -41,11 +41,32 @@ pub struct DockerProvisioning {
 
 pub struct EnvironmentReconciler<R> {
     docker: Arc<R>,
+    local_host_ref: Option<String>,
 }
 
 impl<R> EnvironmentReconciler<R> {
     pub fn new(docker: Arc<R>) -> Self {
-        Self { docker }
+        Self { docker, local_host_ref: None }
+    }
+
+    pub fn with_local_host_ref(mut self, local_host_ref: impl Into<String>) -> Self {
+        self.local_host_ref = Some(local_host_ref.into());
+        self
+    }
+
+    fn actuates(&self, environment: &ResourceObject<Environment>) -> bool {
+        let Some(local_host_ref) = self.local_host_ref.as_deref() else {
+            return true;
+        };
+        // Unscoped environments predate placement projection; their local
+        // authoritative store remains their actuator.
+        environment
+            .spec
+            .host_direct
+            .as_ref()
+            .map(|spec| spec.host_ref.as_str())
+            .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
+            .is_none_or(|host_ref| host_ref == local_host_ref)
     }
 }
 
@@ -64,6 +85,9 @@ where
     type Dependencies = EnvironmentDeps;
 
     async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+        if !self.actuates(obj) {
+            return Ok(EnvironmentDeps::None);
+        }
         match obj.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending) {
             EnvironmentPhase::Pending => {
                 if let Some(spec) = &obj.spec.docker {
@@ -86,6 +110,9 @@ where
         deps: &Self::Dependencies,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
+        if !self.actuates(obj) {
+            return ReconcileOutcome::new(None);
+        }
         let patch = match obj.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending) {
             EnvironmentPhase::Pending if obj.spec.host_direct.is_some() => {
                 Some(EnvironmentStatusPatch::MarkReady { docker_container_id: None, image_ref: None, image_digest: None })
@@ -113,6 +140,9 @@ where
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        if !self.actuates(obj) {
+            return Ok(());
+        }
         if let Some(container_id) = obj.status.as_ref().and_then(|status| status.docker_container_id.as_deref()) {
             self.docker.destroy(&obj.metadata.name, container_id).await.map_err(ResourceError::other)?;
         }

@@ -397,10 +397,7 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
 
     let target = placement_target_host(&backend, "flotilla", &policy).await.expect("resolve display-name host reference");
     assert_eq!(target.reference, host_id);
-    assert_eq!(
-        daemon.remote_host_direct_placement_host("flotilla", Some("self-targeted")).await.expect("resolve host-direct routing"),
-        None
-    );
+    assert_eq!(daemon.remote_placement_host("flotilla", Some("self-targeted")).await.expect("resolve host-direct routing"), None);
     daemon
         .check_remote_placement_free_space_floor(
             "flotilla",
@@ -413,6 +410,138 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
         )
         .await
         .expect("healthy authoritative local capacity should admit self-targeted placement");
+}
+
+#[tokio::test]
+async fn default_remote_placement_routes_before_admission() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-host\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("kiwi"),
+        backend.clone(),
+    )
+    .await;
+    backend
+        .definitions::<Project>("flotilla")
+        .create(
+            &test_meta("andamento"),
+            &ProjectSpec::builder().display_name("Andamento".to_string()).default_workflow_ref("govern".to_string()).build(),
+        )
+        .await
+        .expect("project");
+    backend
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&test_meta("claude-max"), &CredentialSpecSpec {
+            consumer: CredentialConsumer::ClaudeOauth { account_email: "governor@example.com".to_string() },
+            source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
+            lifecycle: CredentialLifecycle::Static,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("credential declaration");
+    backend
+        .definitions::<CredentialGrant>("flotilla")
+        .create(
+            &test_meta("andamento-governor"),
+            &CredentialGrantSpec::builder()
+                .selector(
+                    CredentialGrantSelector::builder().stance(Stance::Trusted).projects(BTreeSet::from(["andamento".to_string()])).build(),
+                )
+                .credentials(BTreeSet::from(["claude-max".to_string()]))
+                .build(),
+        )
+        .await
+        .expect("credential grant");
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &test_meta("govern"),
+            &WorkflowTemplateSpec::builder()
+                .vessels(vec![VesselRequirement::builder()
+                    .name("work".to_string())
+                    .stance(Stance::Trusted)
+                    .crew(vec![CrewSpec::builder()
+                        .role("governor".to_string())
+                        .source(CrewSource::Agent {
+                            selector: Selector { capability: "code".to_string(), adapter: Some("claude-code".to_string()), model: None },
+                            prompt: None,
+                            brief_template: None,
+                        })
+                        .build()])
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("workflow");
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let host = hosts.create(&test_meta("udder-id"), &HostSpec { display_name: "udder".to_string() }).await.expect("remote host");
+    hosts
+        .update_status("udder-id", &host.metadata.resource_version, &HostStatus {
+            capabilities: [
+                (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["claude-code"])),
+                (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["claude-max"])),
+            ]
+            .into_iter()
+            .collect(),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            ..HostStatus::default()
+        })
+        .await
+        .expect("remote host capabilities");
+    backend
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &test_meta("docker-udder-id"),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
+                    host_ref: "udder-id".to_string(),
+                    image: "crew:latest".to_string(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::from(["claude-code".to_string()]),
+                    default_cwd: None,
+                    env: BTreeMap::new(),
+                    checkout: flotilla_resources::DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                })
+                .build(),
+        )
+        .await
+        .expect("remote placement");
+
+    let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("andamento".to_string()).build();
+    let (_, resolved_workflow) = daemon
+        .resolve_convoy_admission_workflow(
+            "flotilla",
+            "andamento",
+            &backend.definitions::<Project>("flotilla").get("andamento").await.expect("project").spec,
+            &[],
+            &intent,
+            None,
+        )
+        .await
+        .expect("resolve admission workflow");
+    assert_eq!(resolved_workflow.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
+    let placement = backend.using::<PlacementPolicy>("flotilla").get("docker-udder-id").await.expect("placement");
+    validate_workflow_agent_adapters(&backend, "flotilla", &resolved_workflow, Some(&placement))
+        .await
+        .expect("placement should provide agent adapter");
+    validate_workflow_credentials(&backend, "flotilla", &resolved_workflow, Some(&placement))
+        .await
+        .expect("placement should hold resolved credential");
+
+    let target = daemon
+        .convoy_start_placement_host("flotilla", &intent)
+        .await
+        .expect("resolve default placement")
+        .expect("default placement should be remote");
+
+    assert_eq!(target.as_str(), "udder-id");
+    assert!(matches!(backend.using::<ResourceConvoy>("flotilla").list().await, Ok(list) if list.items.is_empty()));
 }
 
 async fn placement_policy(backend: &ResourceBackend, name: &str, host_ref: &str) -> ResourceObject<PlacementPolicy> {
