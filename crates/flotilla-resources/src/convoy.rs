@@ -998,7 +998,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         state.disposition = disposition.clone();
                     }
                 }
-                enter_landing_if_completion_claims_settled(status);
                 clear_operator_pending_brief(status);
                 status.phase = ConvoyPhase::Active;
                 status.finished_at = None;
