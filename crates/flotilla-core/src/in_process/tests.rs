@@ -10,7 +10,7 @@ use flotilla_resources::{
     TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
     TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, VirtualClock, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -18,6 +18,58 @@ use crate::providers::discovery::test_support::fake_discovery;
 
 fn test_meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
+}
+
+#[test]
+fn convoy_role_addresses_reject_malformed_values() {
+    assert_eq!(parse_role_address("reviewer"), Ok(("reviewer", None)));
+    assert_eq!(parse_role_address("reviewer@flotilla"), Ok(("reviewer", Some("flotilla"))));
+    for value in ["role@", "@project", "a@b@c"] {
+        assert_eq!(parse_role_address(value), Err(format!("invalid convoy address `{value}`: expected role@project")));
+    }
+    assert_eq!(parse_role_address(""), Err("convoy role cannot be empty".to_string()));
+}
+
+#[tokio::test]
+async fn convoy_role_resolution_requires_a_project_when_the_role_is_ambiguous() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    for (record, project) in [("convoy-one", "alpha"), ("convoy-two", "beta")] {
+        let labels = BTreeMap::from([
+            (PROJECT_LABEL.to_string(), project.to_string()),
+            (ROLE_LABEL.to_string(), "reviewer".to_string()),
+            (GENERATION_LABEL.to_string(), "1".to_string()),
+        ]);
+        let spec = ConvoySpec::builder()
+            .workflow_ref("review".to_string())
+            .project_ref(project.to_string())
+            .role("reviewer".to_string())
+            .generation(1)
+            .build();
+        convoys.create(&InputMeta::builder().name(record.to_string()).labels(labels).build(), &spec).await.expect("convoy");
+    }
+
+    assert_eq!(
+        resolve_local_convoy_name(&backend, "flotilla", "reviewer").await,
+        Err("convoy role `reviewer` is ambiguous; use one of: reviewer@alpha, reviewer@beta".to_string())
+    );
+    assert_eq!(resolve_local_convoy_name(&backend, "flotilla", "reviewer@beta").await, Ok("convoy-two".to_string()));
+}
+
+#[tokio::test]
+async fn projectless_convoys_do_not_share_an_identity_bucket_with_a_project_named_standalone() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let (record, generation) = allocate_convoy_identity(&backend, "flotilla", None, "worker").await.expect("projectless identity");
+    let labels = BTreeMap::from([
+        (PROJECT_LABEL.to_string(), String::new()),
+        (ROLE_LABEL.to_string(), "worker".to_string()),
+        (GENERATION_LABEL.to_string(), generation.to_string()),
+    ]);
+    let spec = ConvoySpec::builder().workflow_ref("work".to_string()).role("worker".to_string()).generation(generation).build();
+    convoys.create(&InputMeta::builder().name(record).labels(labels).build(), &spec).await.expect("projectless convoy");
+
+    assert!(allocate_convoy_identity(&backend, "flotilla", Some("standalone"), "worker").await.is_ok());
 }
 
 async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<VirtualClock>, tempfile::TempDir) {

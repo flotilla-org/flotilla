@@ -8410,9 +8410,7 @@ mod tests {
             })
             .await
             .expect("create crew convoy");
-        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated {
-            name: "crew-convoy@standalone".to_string()
-        });
+        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "crew-convoy".to_string() });
 
         let convoys = backend.clone().using::<Convoy>(NAMESPACE);
         let crew_record = convoy_record_name(&backend, "crew-convoy").await;
@@ -8670,7 +8668,7 @@ mod tests {
             .expect("reviewer session after restart");
         let reviewer_id = reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).expect("revived reviewer identity").id.clone();
 
-        let attach = daemon.resolve_attach_command_internal("crew-convoy@standalone/implement/coder").await.expect("attach coder");
+        let attach = daemon.resolve_attach_command_internal("crew-convoy/implement/coder").await.expect("attach coder");
         let [flotilla_protocol::ResolvedAttachAction::Command(args)] = attach.plan.0.as_slice() else {
             panic!("expected one local attach command, got {:?}", attach.plan);
         };
@@ -8893,9 +8891,7 @@ mod tests {
             })
             .await
             .expect("convoy create command should start");
-        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated {
-            name: "convoy-adopted@standalone".to_string()
-        });
+        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
 
         let convoys = backend.clone().using::<Convoy>(NAMESPACE);
         let adopted_record = convoy_record_name(&backend, "convoy-adopted").await;
@@ -8920,7 +8916,7 @@ mod tests {
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::ConvoyWorkForceComplete {
-                    convoy: "convoy-adopted@standalone".to_string(),
+                    convoy: "convoy-adopted".to_string(),
                     work: "implement".to_string(),
                     message: Some("done".to_string()),
                 },

@@ -214,7 +214,7 @@ async fn convoy_create_command_creates_convoy_resource() {
         .expect("execute");
 
     let result = await_command_result(&mut rx, id).await;
-    assert_eq!(result, CommandValue::ConvoyCreated { name: "my-scratch@standalone".into() });
+    assert_eq!(result, CommandValue::ConvoyCreated { name: "my-scratch".into() });
 
     let convoys = backend.using::<Convoy>("flotilla");
     let convoy = convoys.get(&convoy_record_name(&backend, "my-scratch").await).await.expect("convoy should exist");
@@ -321,7 +321,7 @@ async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
         })
         .await
         .expect("execute");
-    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "sqlite-scratch@standalone".into() });
+    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "sqlite-scratch".into() });
 
     let convoys = backend.using::<Convoy>("flotilla");
     let record_name = convoy_record_name(&backend, "sqlite-scratch").await;

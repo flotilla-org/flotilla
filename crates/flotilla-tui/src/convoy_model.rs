@@ -241,7 +241,7 @@ fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSumm
         workspace_ref: vessel.attach.clone(),
         materialize_ref: vessel.materialize.clone(),
         completion_target: vessel.complete_work.then(|| WorkCompletionTarget {
-            convoy: row.project_ref.as_ref().map_or_else(|| row.name.clone(), |project| format!("{}@{project}", row.name)),
+            convoy: wire_convoy_address(row),
             vessel: vessel.name.clone(),
             host: vessel.host.clone(),
         }),
@@ -252,6 +252,10 @@ fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSumm
         image_ref: vessel.image_ref.clone(),
         image_digest: vessel.image_digest.clone(),
     }
+}
+
+fn wire_convoy_address(row: &wire::ConvoyRow) -> String {
+    row.project_ref.as_ref().map_or_else(|| row.name.clone(), |project| format!("{}@{project}", row.name))
 }
 
 #[cfg(test)]

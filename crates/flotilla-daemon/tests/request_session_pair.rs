@@ -247,9 +247,7 @@ async fn convoy_creation_attributes_provenance_and_regard_to_the_surface_princip
         })
         .await
         .expect("dispatch convoy creation");
-    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyCreated {
-        name: "alice-dispatch@standalone".to_string()
-    });
+    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyCreated { name: "alice-dispatch".to_string() });
 
     let backend = leader.resource_backend();
     let convoy =
