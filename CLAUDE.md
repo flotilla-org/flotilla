@@ -86,7 +86,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-resources` | Resource kinds, typed resolvers, lifecycle authority, and storage backends |
 | `flotilla-controllers` | Reconcilers for resource-driven control-plane behavior |
 | `flotilla-commands` | Resource-oriented command preparation and execution |
-| `flotilla-transport` | Shared HTTP-over-UDS transport helpers |
+| `flotilla-transport` | Framed message sessions over Unix sockets or in-memory channels for daemon client and peer connections |
 | `cleat` | Terminal I/O: PTY management, VT engine, session persistence |
 | `flotilla` (root) | Thin `src/main.rs` entry point |
 
