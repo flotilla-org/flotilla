@@ -30,10 +30,10 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus, Host,
-    HostSpec, HostStatus, HttpBackend, InMemoryBackend, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
-    ResourceBackend, ResourceError, ResourceList, ResourceProvenance, Selector, SqliteBackend, Stance, StatusPatch, TerminalAttentionState,
-    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
-    TerminalSessionStatusPatch, WatchEvent, WatchStart, WorkflowTemplate,
+    HostSpec, HostStatus, HttpBackend, InMemoryBackend, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ResourceBackend,
+    ResourceError, ResourceList, ResourceProvenance, Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalBrief,
+    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
+    WatchEvent, WatchStart,
 };
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
@@ -49,7 +49,7 @@ use super::{
     client_connection::QuerySubscriptions,
     handle_client, handle_client_session,
     peer_connection::PEER_IDLE_TIMEOUT,
-    peer_runtime::{forward_with_keepalive_for_test, send_link_state, ForwardResult},
+    peer_runtime::{forward_with_keepalive_for_test, retry_with_backoff_for_test, send_link_state, ForwardResult},
     publish_socket_path,
     remote_commands::{
         extract_command_repo_identity, ForwardedCommand, ForwardedCommandMap, ForwardedCommandState, PendingRemoteCancelMap,
@@ -64,6 +64,33 @@ use super::{
     CONNECTION_PREFACE_TIMEOUT, HELLO_HANDSHAKE_TIMEOUT,
 };
 use crate::peer::{ConnectionDirection, ConnectionMeta};
+
+#[tokio::test(start_paused = true)]
+async fn peer_reconnect_survives_sustained_failures_and_recovers() {
+    const OBSERVED_STALL_ATTEMPT: usize = 732;
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_dial = Arc::clone(&attempts);
+    let recovered_attempt = retry_with_backoff_for_test(
+        |_, _| async {},
+        move || {
+            let attempts = Arc::clone(&attempts_for_dial);
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt <= OBSERVED_STALL_ATTEMPT + 1 {
+                    Err("remote unavailable".to_string())
+                } else {
+                    Ok(attempt)
+                }
+            }
+        },
+        |_, _| async {},
+    )
+    .await;
+
+    assert_eq!(recovered_attempt, OBSERVED_STALL_ATTEMPT + 2);
+    assert_eq!(attempts.load(Ordering::SeqCst), OBSERVED_STALL_ATTEMPT + 2);
+}
 
 #[tokio::test]
 async fn socket_guard_does_not_unlink_replacement_listener() {
@@ -584,7 +611,7 @@ async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
 }
 
 use crate::peer::{
-    test_support::{ensure_test_connection_generation, wait_for_command_result, BlockingPeerSender, MockPeerSender},
+    test_support::{ensure_test_connection_generation, BlockingPeerSender, MockPeerSender},
     InboundPeerEnvelope, PeerConnectionStatus, PeerManager, PeerSender, PeerTransport,
 };
 
@@ -609,7 +636,11 @@ fn current_client_hello() -> Message {
     Message::Hello {
         protocol_version: PROTOCOL_VERSION,
         node_id: NodeId::new("client"),
-        display_name: flotilla_protocol::hello_display_name("client", env!("FLOTILLA_BUILD_ID")),
+        display_name: flotilla_protocol::hello_display_name(
+            "client",
+            "intentionally-different-client-build",
+            flotilla_protocol::PROTOCOL_FINGERPRINT,
+        ),
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
@@ -902,6 +933,8 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
     backend
         .using::<Convoy>("flotilla")
         .create(&InputMeta::builder().name("persisted".to_string()).build(), &ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "scratch".to_string(),
             dispatching_principal_ref: Default::default(),
             inputs: Default::default(),
@@ -1595,7 +1628,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
 }
 
 #[tokio::test]
-async fn dispatch_execute_keeps_remote_placement_convoy_on_the_admitting_store() {
+async fn dispatch_execute_routes_remote_placement_admission_to_the_actuator() {
     let (_tmp, daemon) = empty_daemon().await;
     let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
     let remote_host_id = "feta-host-id".to_string();
@@ -1639,7 +1672,7 @@ async fn dispatch_execute_keeps_remote_placement_convoy_on_the_admitting_store()
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
     let mut peer_manager_guard = peer_manager.lock().await;
-    peer_manager_guard.store_host_summary(remote_summary);
+    peer_manager_guard.store_host_summary(remote_summary.clone());
     peer_manager_guard.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
     drop(peer_manager_guard);
     let remote_command_router = make_remote_command_router(
@@ -1664,45 +1697,57 @@ async fn dispatch_execute_keeps_remote_placement_convoy_on_the_admitting_store()
         })
         .build();
 
-    let mut events = daemon.subscribe();
-    let command_id = remote_command_router.dispatch_execute(command).await.expect("admitting daemon should accept remote placement");
-    assert_eq!(wait_for_command_result(&mut events, command_id, StdDuration::from_secs(5)).await, CommandValue::ConvoyStarted {
-        name: "remote-work".to_string(),
-        attach_plan: None,
-        binding: None
-    });
-    assert!(pending_remote_commands.lock().await.is_empty(), "placement must not create a routed command");
-    assert!(sent.lock().expect("sent messages").is_empty(), "placement availability preflight must not route the admission command");
+    remote_command_router.dispatch_execute(command).await.expect("origin should route remote placement");
+    assert_eq!(pending_remote_commands.lock().await.len(), 1, "placement admission must wait on the routed command");
+    {
+        let sent = sent.lock().expect("sent messages");
+        assert_eq!(sent.len(), 1, "placement admission must be sent to the actuator");
+        let PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { target_node_id, command, .. }) = &sent[0] else {
+            panic!("expected routed admission, got {:?}", sent[0]);
+        };
+        assert_eq!(target_node_id, &node("feta"));
+        assert!(matches!(command.action, CommandAction::ConvoyStart { .. }));
+    }
+    let origin_convoys = daemon
+        .resource_backend()
+        .using::<Convoy>("flotilla")
+        .list_matching_labels(&BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "remote-work".to_string())]))
+        .await
+        .expect("list origin convoys");
+    assert!(origin_convoys.items.is_empty(), "the origin must not half-admit a routed convoy");
 
-    let admitting_backend = daemon.resource_backend();
-    let convoy =
-        admitting_backend.clone().using::<Convoy>("flotilla").get("remote-work").await.expect("admitting daemon should own the convoy");
-    assert_eq!(convoy.spec.workflow_ref, "remote-workflow");
-    assert_eq!(convoy.spec.placement_policy.as_deref(), Some(remote_policy_name.as_str()));
-    let workflow_snapshot_name =
-        convoy.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).expect("pinned workflow annotation");
-    let placement_snapshot_name =
-        convoy.metadata.annotations.get(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION).expect("pinned placement annotation");
-    let admitting_workflow = admitting_backend
-        .clone()
-        .using::<WorkflowTemplate>("flotilla")
-        .get(workflow_snapshot_name)
+    let disconnected_peers = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    disconnected_peers.lock().await.store_host_summary(remote_summary);
+    let disconnected_router = make_remote_command_router(
+        &daemon,
+        &disconnected_peers,
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(AtomicU64::new(1 << 62)),
+    );
+    let error = disconnected_router
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla/flotilla".to_string())
+                            .name("unreachable-work".to_string())
+                            .branch("feat/unreachable-work".to_string())
+                            .placement_policy(remote_policy_name)
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
         .await
-        .expect("admitting daemon should retain the pinned workflow");
-    assert_eq!(admitting_workflow.spec.vessels[0].stance, Stance::Trusted);
-    let admitting_placement = admitting_backend
-        .clone()
-        .using::<PlacementPolicy>("flotilla")
-        .get(placement_snapshot_name)
-        .await
-        .expect("admitting daemon should retain the pinned placement");
-    assert_eq!(admitting_placement.spec.host_direct.expect("host-direct snapshot").host_ref, remote_host_id);
+        .expect_err("an unreachable placement host must refuse admission");
+    assert_eq!(error, "peer host feta is not connected");
     assert!(
-        matches!(
-            remote_daemon.resource_backend().using::<Convoy>("flotilla").get("remote-work").await,
-            Err(ResourceError::NotFound { .. })
-        ),
-        "placement host must not become convoy authority"
+        matches!(daemon.resource_backend().using::<Convoy>("flotilla").get("unreachable-work").await, Err(ResourceError::NotFound { .. })),
+        "unreachable placement must not leave a half-admitted record"
     );
 }
 
@@ -3599,7 +3644,7 @@ async fn wire_generation_mismatched_client_can_request_shutdown() {
     let hello = Message::Hello {
         protocol_version: PROTOCOL_VERSION,
         node_id: NodeId::new("newer-client"),
-        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation"),
+        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation", "newer-client-fingerprint"),
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
@@ -3631,7 +3676,7 @@ async fn wire_generation_mismatched_client_cannot_request_rich_rpc() {
     let hello = Message::Hello {
         protocol_version: PROTOCOL_VERSION,
         node_id: NodeId::new("newer-client"),
-        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation"),
+        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation", "newer-client-fingerprint"),
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,

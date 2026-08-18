@@ -23,7 +23,8 @@ use sha2::{Digest, Sha256};
 /// while different channels can be consumed in any order.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ChannelLabel {
-    Noop,
+    /// Use the default label rather than an explicit one; the interaction is still recorded for replay.
+    Default,
     Command(String),
     GhApi(String),
     Http(String),
@@ -81,8 +82,8 @@ pub(crate) const FLOTILLA_HELPER_NAME: &str = "flotilla-helper";
 pub(crate) const FLOTILLA_HELPER_SCRIPT: &str = include_str!("scripts/flotilla_helper.sh");
 
 #[inline]
-pub(crate) fn noop_channel_label() -> ChannelLabel {
-    ChannelLabel::Noop
+pub(crate) fn default_channel_label() -> ChannelLabel {
+    ChannelLabel::Default
 }
 
 #[inline]
@@ -100,7 +101,7 @@ pub(crate) fn command_channel_label_with<const ENABLED: bool, L: ChannelLabeler 
         let request = ChannelRequest::Command { cmd, args };
         labeler.label_for(&request)
     } else {
-        noop_channel_label()
+        default_channel_label()
     }
 }
 
@@ -119,7 +120,7 @@ pub(crate) fn gh_api_channel_label_with<const ENABLED: bool, L: ChannelLabeler +
         let request = ChannelRequest::GhApi { method, endpoint };
         labeler.label_for(&request)
     } else {
-        noop_channel_label()
+        default_channel_label()
     }
 }
 
@@ -138,7 +139,7 @@ pub(crate) fn http_channel_label_with<const ENABLED: bool, L: ChannelLabeler + ?
         let request = ChannelRequest::Http { method, url };
         labeler.label_for(&request)
     } else {
-        noop_channel_label()
+        default_channel_label()
     }
 }
 
@@ -207,7 +208,7 @@ pub(crate) async fn install_managed_helper_script(
         helper_content.to_string(),
     ]);
     let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-    let helper_path = runner.run(command, &arg_refs, Path::new("/"), &ChannelLabel::Noop).await?;
+    let helper_path = runner.run(command, &arg_refs, Path::new("/"), &ChannelLabel::Default).await?;
     let helper_path = helper_path.trim();
     if helper_path.is_empty() {
         return Err(format!("managed helper installer returned empty path for {helper_name}"));
@@ -263,7 +264,7 @@ pub trait CommandRunner: Send + Sync {
     /// remote-host path semantics.
     async fn path_exists(&self, path: &Path) -> Result<bool, String> {
         let path = path.to_string_lossy();
-        self.run_output("test", &["-e", &path], Path::new("/"), &ChannelLabel::Noop).await.map(|output| output.success)
+        self.run_output("test", &["-e", &path], Path::new("/"), &ChannelLabel::Default).await.map(|output| output.success)
     }
 
     /// Choose a Flotilla-owned writable scratch base in this runner's
@@ -281,7 +282,7 @@ pub trait CommandRunner: Send + Sync {
                     "sh",
                     &["-c", "test -d \"$1\" && test -w \"$1\"", "flotilla-xdg-runtime-dir", &preferred_arg],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await;
             if output.is_ok_and(|output| output.success) {
@@ -710,7 +711,7 @@ pub(crate) mod testing {
                 "sh",
                 &["-c", "dd if=/dev/zero bs=131072 count=1 2>/dev/null; cat >/dev/null"],
                 Path::new("/"),
-                &ChannelLabel::Noop,
+                &ChannelLabel::Default,
                 &input,
             ),
         )
@@ -724,7 +725,7 @@ pub(crate) mod testing {
     #[tokio::test]
     async fn process_runner_long_lived_process_supports_lifecycle_contract() {
         let runner = super::ProcessCommandRunner;
-        let mut process = runner.spawn_long_lived("sleep", &["30"], Path::new("/"), &ChannelLabel::Noop).await.expect("spawn sleep");
+        let mut process = runner.spawn_long_lived("sleep", &["30"], Path::new("/"), &ChannelLabel::Default).await.expect("spawn sleep");
 
         assert!(process.try_wait().expect("poll running child").is_none());
         process.kill().await.expect("kill child");
@@ -740,7 +741,7 @@ pub(crate) mod testing {
         let pid_path_arg = pid_path.to_string_lossy();
         let runner = super::ProcessCommandRunner;
         let process = runner
-            .spawn_long_lived("sh", &["-c", "echo $$ > \"$1\"; exec sleep 30", "sh", &pid_path_arg], Path::new("/"), &ChannelLabel::Noop)
+            .spawn_long_lived("sh", &["-c", "echo $$ > \"$1\"; exec sleep 30", "sh", &pid_path_arg], Path::new("/"), &ChannelLabel::Default)
             .await
             .expect("spawn tracked sleep");
 
@@ -843,7 +844,7 @@ mod tests {
     #[test]
     fn command_label_disabled_skips_labeler() {
         let label = command_channel_label_with::<false, _>("git", &["status"], &PanicLabeler);
-        assert_eq!(label, ChannelLabel::Noop);
+        assert_eq!(label, ChannelLabel::Default);
     }
 
     #[test]
@@ -855,7 +856,7 @@ mod tests {
     #[test]
     fn gh_api_label_disabled_skips_labeler() {
         let label = gh_api_channel_label_with::<false, _>("GET", "repos/a/b/issues", &PanicLabeler);
-        assert_eq!(label, ChannelLabel::Noop);
+        assert_eq!(label, ChannelLabel::Default);
     }
 
     #[test]
@@ -867,6 +868,6 @@ mod tests {
     #[test]
     fn http_label_disabled_skips_labeler() {
         let label = http_channel_label_with::<false, _>("POST", "https://api.example.com/v1", &PanicLabeler);
-        assert_eq!(label, ChannelLabel::Noop);
+        assert_eq!(label, ChannelLabel::Default);
     }
 }

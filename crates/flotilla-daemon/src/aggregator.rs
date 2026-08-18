@@ -1779,7 +1779,7 @@ impl Aggregator {
     }
 
     fn summarize(&self, resource: &ResourceRef, convoy: &ResourceObject<Convoy>) -> ConvoyRow {
-        let name = &convoy.metadata.name;
+        let name = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
         let change_request = self.convoy_change_requests.get(resource).cloned();
         let status = convoy.status.as_ref();
         let phase = status.map(|status| status.phase).unwrap_or_default();
@@ -1809,6 +1809,7 @@ impl Aggregator {
         ConvoyRow::builder()
             .resource(resource.clone())
             .name(name)
+            .generation(convoy.spec.generation)
             .workflow_ref(&convoy.spec.workflow_ref)
             .dispatching_principal_ref(convoy.spec.dispatching_principal_ref.clone())
             .phase(convoy_phase(phase))
@@ -3005,6 +3006,25 @@ mod tests {
             rows: Vec::new(),
             result_sets: state.local_result_sets().await,
         }
+    }
+
+    #[tokio::test]
+    async fn convoy_projection_presents_role_identity_instead_of_record_name() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(1);
+        let aggregator = Aggregator::new(state, HostName::new("local"), event_tx);
+        let mut convoy = convoy_with_branch("convoy-0123456789abcdef").await;
+        convoy.spec.role = "governor".to_string();
+        convoy.spec.generation = 3;
+        convoy.spec.project_ref = Some("andamento".to_string());
+        let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-0123456789abcdef");
+
+        let row = aggregator.summarize(&reference, &convoy);
+
+        assert_eq!(row.name, "governor");
+        assert_eq!(row.generation, 3);
+        assert_eq!(row.project_ref.as_deref(), Some("andamento"));
+        assert_eq!(row.resource.name, "convoy-0123456789abcdef");
     }
 
     #[tokio::test]

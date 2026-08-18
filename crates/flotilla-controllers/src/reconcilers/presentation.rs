@@ -347,7 +347,7 @@ impl<R> PresentationReconciler<R> {
     }
 }
 
-pub enum PresentationDeps {
+pub enum PresentationPrepared {
     InSync,
     Applied(AppliedPresentation),
     TornDown { message: Option<String> },
@@ -360,9 +360,9 @@ where
     R: PresentationRuntime + 'static,
 {
     type Resource = Presentation;
-    type Dependencies = PresentationDeps;
+    type Prepared = PresentationPrepared;
 
-    async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         let listed = self.terminal_sessions.list_matching_labels(&obj.spec.process_selector).await?;
         let mut sessions: Vec<_> = listed
             .items
@@ -378,16 +378,16 @@ where
         if sessions.is_empty() {
             if let Some(previous) = previous {
                 self.runtime.tear_down(&previous.presentation_manager, &previous.workspace_ref).await.map_err(ResourceError::other)?;
-                return Ok(PresentationDeps::TornDown { message: None });
+                return Ok(PresentationPrepared::TornDown { message: None });
             }
             if has_any_observed_state(obj.status.as_ref()) {
-                return Ok(PresentationDeps::TornDown { message: obj.status.as_ref().and_then(|status| status.message.clone()) });
+                return Ok(PresentationPrepared::TornDown { message: obj.status.as_ref().and_then(|status| status.message.clone()) });
             }
-            return Ok(PresentationDeps::InSync);
+            return Ok(PresentationPrepared::InSync);
         }
 
         if self.policies.resolve(&obj.spec.presentation_policy_ref).is_none() {
-            return Ok(PresentationDeps::UnknownPolicy(obj.spec.presentation_policy_ref.clone()));
+            return Ok(PresentationPrepared::UnknownPolicy(obj.spec.presentation_policy_ref.clone()));
         }
 
         let mut processes = Vec::with_capacity(sessions.len());
@@ -396,7 +396,7 @@ where
         }
         let spec_hash = presentation_spec_hash(&obj.spec.presentation_policy_ref, &processes);
         if observed_in_sync(obj.status.as_ref(), &spec_hash) {
-            return Ok(PresentationDeps::InSync);
+            return Ok(PresentationPrepared::InSync);
         }
 
         let plan = PresentationPlan::builder()
@@ -413,30 +413,30 @@ where
         // authoritative observed workspace state we need to patch into PresentationStatus, and the
         // controller loop processes a given primary object serially through fetch/reconcile/patch.
         Ok(match self.runtime.apply(&plan).await {
-            Ok(applied) => PresentationDeps::Applied(applied),
-            Err(ApplyPresentationError::UnknownPolicy(name)) => PresentationDeps::UnknownPolicy(name),
-            Err(ApplyPresentationError::RetryFromCleanSlate(message)) => PresentationDeps::TornDown { message: Some(message) },
-            Err(ApplyPresentationError::Failed(message)) => PresentationDeps::Failed(message),
+            Ok(applied) => PresentationPrepared::Applied(applied),
+            Err(ApplyPresentationError::UnknownPolicy(name)) => PresentationPrepared::UnknownPolicy(name),
+            Err(ApplyPresentationError::RetryFromCleanSlate(message)) => PresentationPrepared::TornDown { message: Some(message) },
+            Err(ApplyPresentationError::Failed(message)) => PresentationPrepared::Failed(message),
         })
     }
 
     fn reconcile(
         &self,
         _obj: &ResourceObject<Self::Resource>,
-        deps: &Self::Dependencies,
+        prepared: &Self::Prepared,
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
-        let patch = match deps {
-            PresentationDeps::InSync => None,
-            PresentationDeps::Applied(applied) => Some(PresentationStatusPatch::MarkActive {
+        let patch = match prepared {
+            PresentationPrepared::InSync => None,
+            PresentationPrepared::Applied(applied) => Some(PresentationStatusPatch::MarkActive {
                 presentation_manager: applied.presentation_manager.clone(),
                 workspace_ref: applied.workspace_ref.clone(),
                 spec_hash: applied.spec_hash.clone(),
                 ready_at: now,
             }),
-            PresentationDeps::TornDown { message } => Some(PresentationStatusPatch::MarkTornDown { message: message.clone() }),
-            PresentationDeps::Failed(message) => Some(PresentationStatusPatch::MarkFailed { message: message.clone() }),
-            PresentationDeps::UnknownPolicy(name) => {
+            PresentationPrepared::TornDown { message } => Some(PresentationStatusPatch::MarkTornDown { message: message.clone() }),
+            PresentationPrepared::Failed(message) => Some(PresentationStatusPatch::MarkFailed { message: message.clone() }),
+            PresentationPrepared::UnknownPolicy(name) => {
                 Some(PresentationStatusPatch::MarkFailed { message: format!("unknown presentation policy '{name}'") })
             }
         };
