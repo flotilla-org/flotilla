@@ -17,8 +17,8 @@ fn host_replay_cursor_roundtrips() {
 }
 
 #[test]
-fn wire_generation_match_requires_equal_known_stamps() {
-    assert!(wire_generations_match("build-a", "build-a"));
-    assert!(!wire_generations_match("build-a", "build-b"));
-    assert!(!wire_generations_match("unknown", "unknown"));
+fn hello_build_info_roundtrips_build_and_protocol_fingerprint() {
+    let display_name = hello_display_name("client", "build-a", "fingerprint-a");
+    assert_eq!(hello_build_info(&display_name), Some(HelloBuildInfo { build_id: "build-a", protocol_fingerprint: "fingerprint-a" }));
+    assert_eq!(hello_build_info("client"), None);
 }

@@ -636,7 +636,11 @@ fn current_client_hello() -> Message {
     Message::Hello {
         protocol_version: PROTOCOL_VERSION,
         node_id: NodeId::new("client"),
-        display_name: flotilla_protocol::hello_display_name("client", env!("FLOTILLA_BUILD_ID")),
+        display_name: flotilla_protocol::hello_display_name(
+            "client",
+            "intentionally-different-client-build",
+            flotilla_protocol::PROTOCOL_FINGERPRINT,
+        ),
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
@@ -3640,7 +3644,7 @@ async fn wire_generation_mismatched_client_can_request_shutdown() {
     let hello = Message::Hello {
         protocol_version: PROTOCOL_VERSION,
         node_id: NodeId::new("newer-client"),
-        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation"),
+        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation", "newer-client-fingerprint"),
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
@@ -3672,7 +3676,7 @@ async fn wire_generation_mismatched_client_cannot_request_rich_rpc() {
     let hello = Message::Hello {
         protocol_version: PROTOCOL_VERSION,
         node_id: NodeId::new("newer-client"),
-        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation"),
+        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation", "newer-client-fingerprint"),
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,

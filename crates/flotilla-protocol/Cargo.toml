@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 license.workspace = true
 
+[build-dependencies]
+sha2 = "0.10"
+
 [features]
 default = []
 test-support = []
@@ -24,4 +27,6 @@ tokio = { version = "1", features = ["io-util"] }
 
 [dev-dependencies]
 serde_yml = "0.0.12"
+sha2 = "0.10"
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }
