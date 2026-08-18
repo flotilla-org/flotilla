@@ -635,16 +635,12 @@ mod tests {
     #[test]
     fn convoy_resume_withdraw_resolves_to_pending_brief_withdrawal() {
         let resolved = parse(&["convoy", "resume", "convoy-a", "--withdraw"]).resolve().expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyWithdrawPendingBrief { namespace: None, name: "convoy-a".into() },
-            },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyWithdrawPendingBrief { namespace: None, name: "convoy-a".into() },
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]
