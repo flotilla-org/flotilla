@@ -761,6 +761,15 @@ pub enum ConvoyStatusPatch {
 
 impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
     fn apply(&self, status: &mut ConvoyStatus) {
+        // Abandonment is an operator-authored terminal boundary. A controller
+        // may have computed any of the patches below from an older Active
+        // resource version; optimistic retry reapplies that patch to the
+        // current status, so accepting it here would resurrect the convoy and
+        // erase its terminal history. Once stamped, the historical record is
+        // immutable, including under duplicate abandon requests.
+        if status.phase == ConvoyPhase::Abandoned {
+            return;
+        }
         match self {
             Self::SetPlacementDecision { placement_decision } => {
                 status.placement_decision.get_or_insert_with(|| placement_decision.clone());
