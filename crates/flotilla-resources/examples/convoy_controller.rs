@@ -76,7 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &namespace,
                     {
                         let empty_registry = Arc::clone(&empty_registry);
-                        HopChainContext::new("local", HostName::local(), config_base, move |_env_ref| Ok(Arc::clone(&empty_registry)))
+                        HopChainContext::new(
+                            flotilla_protocol::CanonicalHostId::resolved("local"),
+                            HostName::local(),
+                            config_base,
+                            move |_env_ref| Ok(Arc::clone(&empty_registry)),
+                        )
                     },
                     policies,
                 ),

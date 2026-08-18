@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::SleepInhibitionHealth;
+use flotilla_protocol::{CanonicalHostId, SleepInhibitionHealth};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -20,6 +20,26 @@ pub const AMBIENT_CLAUDE_CREDENTIAL_SCOPE: &str = "ambient:claude";
 pub const TERMINAL_POOLS_CAPABILITY: &str = "terminal_pools";
 pub const HEARTBEAT_READY_TTL_SECS: i64 = 60;
 pub const SLEEP_INHIBITION_CONDITION_TYPE: &str = "SleepInhibition";
+
+/// Resolve a user-authored host resource name or display-name alias to the
+/// stable host resource identity used by comparison surfaces.
+pub fn canonical_host_id<'a>(
+    hosts: impl IntoIterator<Item = &'a crate::ResourceObject<Host>>,
+    host_ref: &str,
+) -> Result<Option<CanonicalHostId>, String> {
+    let hosts = hosts.into_iter().collect::<Vec<_>>();
+    if let Some(host) = hosts.iter().find(|host| host.metadata.name == host_ref) {
+        return Ok(Some(CanonicalHostId::resolved(host.metadata.name.clone())));
+    }
+    let mut matching = hosts.iter().filter(|host| host.spec.display_name == host_ref);
+    let Some(host) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.any(|candidate| candidate.metadata.name != host.metadata.name) {
+        return Err(format!("host reference `{host_ref}` is ambiguous"));
+    }
+    Ok(Some(CanonicalHostId::resolved(host.metadata.name.clone())))
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSpec {

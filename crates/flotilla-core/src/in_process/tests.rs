@@ -48,6 +48,51 @@ fn convoy_role_addresses_reject_malformed_values() {
 }
 
 #[test]
+fn qualified_role_address_is_a_typed_project_role_pair() {
+    assert_eq!(
+        RoleAddress::from_str("governor@andamento"),
+        Ok(RoleAddress { project: "andamento".to_string(), role: "governor".to_string() })
+    );
+    for value in ["governor", "@andamento", "governor@", "governor@andamento@extra"] {
+        assert!(RoleAddress::from_str(value).is_err(), "{value} must not produce a qualified address");
+    }
+}
+
+#[tokio::test]
+async fn attach_resolves_role_addresses_to_the_live_record_before_planning_the_hop() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    create_identity_convoy(&backend, "convoy-andamento", "governor", Some("andamento")).await;
+    create_identity_convoy(&backend, "convoy-flotilla", "governor", Some("flotilla")).await;
+    let local_host = daemon.local_host_id().expect("local host identity").to_string();
+    backend
+        .using::<ResourceHost>("flotilla")
+        .create(&test_meta(&local_host), &HostSpec { display_name: "standing-test".to_string() })
+        .await
+        .expect("local host resource");
+    let environment = create_test_environment(&daemon, "governor-env", &local_host).await;
+    create_running_session(&daemon, &environment, "governor-session", "convoy-andamento", "governor").await;
+
+    let contextual = daemon
+        .resolve_attach_with_context("governor", None, false, AttachMode::Default, Some("andamento"))
+        .await
+        .expect("bare role resolves inside project context");
+    assert_eq!(contextual.binding.as_ref().and_then(|binding| binding.convoy.as_deref()), Some("convoy-andamento"));
+    assert!(matches!(contextual.plan.0.as_slice(), [ResolvedAttachAction::Command(_)]));
+
+    let ambiguous = daemon
+        .resolve_attach_with_context("governor", None, false, AttachMode::Default, None)
+        .await
+        .expect_err("bare fleet context must refuse ambiguity");
+    assert_eq!(ambiguous, "governor is ambiguous: governor@andamento, governor@flotilla");
+
+    let qualified = daemon
+        .resolve_attach_with_context("governor@andamento", None, false, AttachMode::Default, None)
+        .await
+        .expect("qualified role resolves without project context");
+    assert_eq!(qualified.binding.as_ref().and_then(|binding| binding.convoy.as_deref()), Some("convoy-andamento"));
+}
+
+#[test]
 fn remote_fleet_attach_references_use_the_canonical_role_address() {
     let row = FleetListRow::builder()
         .convoy("reviewer @ flotilla")
@@ -476,7 +521,10 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
             "flotilla",
             Some(&PlacementDecision {
                 policy_name: "self-targeted".to_string(),
-                target_host: PlacementTargetHost { reference: host_id, display_name: "local-host".to_string() },
+                target_host: PlacementTargetHost {
+                    reference: flotilla_protocol::CanonicalHostId::resolved(host_id),
+                    display_name: "local-host".to_string(),
+                },
                 refused_candidates: Vec::new(),
                 viable_not_selected: Vec::new(),
             }),
@@ -486,7 +534,7 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
 }
 
 #[tokio::test]
-async fn resource_host_routing_falls_back_to_unregistered_canonical_ref() {
+async fn resource_host_routing_refuses_unresolved_host_ref() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-host\"\n").expect("daemon config");
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -498,12 +546,12 @@ async fn resource_host_routing_falls_back_to_unregistered_canonical_ref() {
     )
     .await;
 
-    let target = daemon
+    let error = daemon
         .target_host_for_resource_ref("flotilla", "unregistered-host-id")
         .await
-        .expect("unknown canonical ids remain routable for legacy environment records");
+        .expect_err("unknown host refs must not cross the canonical identity boundary");
 
-    assert_eq!(target, HostName::new("unregistered-host-id"));
+    assert_eq!(error, "references unknown host `unregistered-host-id`");
 }
 
 #[tokio::test]
@@ -547,7 +595,7 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
         .expect("self-targeted placement policy");
 
     let target = placement_target_host(&backend, "flotilla", &policy).await.expect("resolve display-name host reference");
-    assert_eq!(target.reference, host_id);
+    assert_eq!(target.reference.as_str(), host_id);
     assert_eq!(daemon.remote_placement_host("flotilla", Some("self-targeted")).await.expect("resolve host-direct routing"), None);
     daemon
         .check_remote_placement_free_space_floor(
@@ -770,7 +818,8 @@ async fn default_placement_prefers_local_host_referenced_by_display_name() {
         .expect("local host status");
     placement_policy(&backend, "host-direct-z-local", "local-host").await;
 
-    let resolution = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), Some("local-host-id"))
+    let local_host_id = flotilla_protocol::CanonicalHostId::resolved("local-host-id");
+    let resolution = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), Some(&local_host_id))
         .await
         .expect("default placement");
     assert_eq!(resolution.selected.expect("viable placement").metadata.name, "host-direct-z-local");
@@ -811,7 +860,7 @@ async fn create_test_environment(daemon: &InProcessDaemon, name: &str, host_ref:
     name.to_string()
 }
 
-async fn create_running_session(daemon: &InProcessDaemon, env_ref: &str, name: &str, convoy: &str) {
+async fn create_running_session(daemon: &InProcessDaemon, env_ref: &str, name: &str, convoy: &str, role: &str) {
     let terminals = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
     let created = terminals
         .create(
@@ -821,12 +870,12 @@ async fn create_running_session(daemon: &InProcessDaemon, env_ref: &str, name: &
                     (CONVOY_LABEL.to_string(), convoy.to_string()),
                     (VESSEL_LABEL.to_string(), "work".to_string()),
                     (VESSEL_REF_LABEL.to_string(), format!("{convoy}-work")),
-                    (ROLE_LABEL.to_string(), "watcher".to_string()),
+                    (ROLE_LABEL.to_string(), role.to_string()),
                 ]))
                 .build(),
             &ResourceTerminalSessionSpec {
                 env_ref: env_ref.to_string(),
-                role: "watcher".to_string(),
+                role: role.to_string(),
                 source: TerminalSessionSource::Tool { command: "bash".to_string() },
                 cwd: "/repo".to_string(),
                 pool: "passthrough".to_string(),
@@ -863,8 +912,8 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
     for host_id in ["shared-host-id-a", "shared-host-id-b"] {
         hosts.create(&test_meta(host_id), &HostSpec { display_name: "shared-host".to_string() }).await.expect("ambiguous host");
     }
-    create_running_session(&daemon, &ambiguous_env, "terminal-ambiguous", "convoy-ambiguous").await;
-    create_running_session(&daemon, &local_env, "terminal-local", "convoy-local").await;
+    create_running_session(&daemon, &ambiguous_env, "terminal-ambiguous", "convoy-ambiguous", "watcher").await;
+    create_running_session(&daemon, &local_env, "terminal-local", "convoy-local", "watcher").await;
 
     let rows = daemon.fleet_list_internal().await.expect("fleet list").rows;
     let hosts_by_convoy = rows.into_iter().map(|row| (row.convoy, row.host)).collect::<BTreeMap<_, _>>();

@@ -40,7 +40,7 @@ pub use leaf::{Leaf, LeafAddress, LeafFire, LeafKind, LeafOperator, WaitSubscrip
 pub use lifecycle::LifecycleAuthority;
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerWireMessage, RoutedPeerMessage};
-pub use placement::{PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate};
+pub use placement::{CanonicalHostId, PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate};
 pub use provisioning_target::ProvisioningTarget;
 pub use repository::{RepositoryKey, UNKNOWN_REPOSITORY_LABEL};
 pub use step::{CheckoutIntent, Step, StepAction, StepExecutionContext, StepOutcome};

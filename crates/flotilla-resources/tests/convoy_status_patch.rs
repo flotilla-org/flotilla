@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{TimeZone, Utc};
-use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
+use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     controller_patches, external_patches, provisioning_patches, ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec,
     CrewWorkPhase, CrewWorkState, PendingBrief, Selector, StatusPatch, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState,
@@ -179,13 +179,13 @@ fn terminal_convoy_phase_clears_pending_brief() {
 fn placement_decision_is_written_once_without_overwriting_concurrent_status() {
     let first = PlacementDecision {
         policy_name: "host-direct-kiwi".to_string(),
-        target_host: PlacementTargetHost { reference: "kiwi-id".to_string(), display_name: "kiwi".to_string() },
+        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("kiwi-id"), display_name: "kiwi".to_string() },
         refused_candidates: Vec::new(),
         viable_not_selected: Vec::new(),
     };
     let second = PlacementDecision {
         policy_name: "host-direct-feta".to_string(),
-        target_host: PlacementTargetHost { reference: "feta-id".to_string(), display_name: "feta".to_string() },
+        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("feta-id"), display_name: "feta".to_string() },
         refused_candidates: Vec::new(),
         viable_not_selected: Vec::new(),
     };

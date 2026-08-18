@@ -6,8 +6,10 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fmt,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Weak,
@@ -22,7 +24,7 @@ use flotilla_protocol::{
     commands::{AttachMode, RepositoryIdentityChange},
     qualified_path::{HostId, QualifiedPath},
     result_set::{CheckoutRow, ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
-    AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CredentialAttention,
+    AttachBinding, CanonicalHostId, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CredentialAttention,
     CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse,
     DispatchQueueRow, EnvironmentId, EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition,
     ExplainedCrewDelivery, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, FleetHealthResponse,
@@ -1202,25 +1204,18 @@ fn canonical_placement_host_ref_from_sources(
     hosts: &[ReadResourceObject<ResourceHost>],
     host_ref: &str,
 ) -> Result<Option<PlacementTargetHost>, String> {
-    let exact = authoritative_host_source(hosts.iter().filter(|host| host.object.metadata.name == host_ref));
-    let resolved = if let Some(host) = exact {
-        host
-    } else {
-        let mut matching = hosts.iter().filter(|host| host.object.spec.display_name == host_ref);
-        let Some(host) = matching.next() else {
-            return Ok(None);
-        };
-        if matching.any(|candidate| candidate.object.metadata.name != host.object.metadata.name) {
-            return Err(format!("host reference `{host_ref}` is ambiguous"));
-        }
-        host
+    let canonical = flotilla_resources::canonical_host_id(hosts.iter().map(|host| &host.object), host_ref)?;
+    let Some(canonical) = canonical else {
+        return Ok(None);
     };
+    let resolved = authoritative_host_source(hosts.iter().filter(|host| host.object.metadata.name == canonical.as_str()))
+        .expect("canonical host resolver selected an existing host");
     let display_name = if resolved.object.spec.display_name.is_empty() {
         resolved.object.metadata.name.clone()
     } else {
         resolved.object.spec.display_name.clone()
     };
-    Ok(Some(PlacementTargetHost { reference: resolved.object.metadata.name.clone(), display_name }))
+    Ok(Some(PlacementTargetHost { reference: canonical, display_name }))
 }
 
 /// Select the target daemon's self-report over a locally materialized peer-summary row.
@@ -1254,7 +1249,7 @@ async fn authoritative_placement_host(
         .list()
         .await
         .map_err(|error| format!("placement `{placement_name}` target host is not ready: {error}"))?;
-    authoritative_host_source(sources.items.iter().filter(|source| source.object.metadata.name == target_host.reference))
+    authoritative_host_source(sources.items.iter().filter(|source| source.object.metadata.name == target_host.reference.as_str()))
         .map(|source| source.object.clone())
         .ok_or_else(|| format!("placement `{placement_name}` target host is not ready: resource not found: {}", target_host.reference))
 }
@@ -1279,7 +1274,7 @@ async fn default_convoy_placement_policy(
     backend: &ResourceBackend,
     namespace: &str,
     workflow: &WorkflowTemplateSpec,
-    local_host_ref: Option<&str>,
+    local_host_ref: Option<&CanonicalHostId>,
 ) -> Result<PlacementResolution, String> {
     let contained = workflow.vessels.iter().any(|vessel| vessel.stance == flotilla_resources::Stance::Contained);
     let mut policies = match backend.clone().using::<PlacementPolicy>(namespace).list().await {
@@ -1302,9 +1297,10 @@ async fn default_convoy_placement_policy(
             validate_workflow_credentials(backend, namespace, workflow, Some(&policy)).await.err()
         };
         if let Some(reason) = refusal {
-            let target_host = placement_target_host(backend, namespace, &policy)
-                .await
-                .unwrap_or_else(|_| PlacementTargetHost { reference: String::new(), display_name: "no target host".to_string() });
+            let target_host = placement_target_host(backend, namespace, &policy).await.unwrap_or_else(|_| PlacementTargetHost {
+                reference: CanonicalHostId::resolved(String::new()),
+                display_name: "no target host".to_string(),
+            });
             refused_candidates.push(PlacementRefusal { policy_name: policy.metadata.name.clone(), target_host, reason });
         } else {
             viable.push(policy);
@@ -1320,7 +1316,10 @@ async fn default_convoy_placement_policy(
             }
             Err(reason) => refused_candidates.push(PlacementRefusal {
                 policy_name: policy.metadata.name.clone(),
-                target_host: PlacementTargetHost { reference: String::new(), display_name: "no target host".to_string() },
+                target_host: PlacementTargetHost {
+                    reference: CanonicalHostId::resolved(String::new()),
+                    display_name: "no target host".to_string(),
+                },
                 reason,
             }),
         }
@@ -1366,7 +1365,7 @@ fn placement_ordering_reason(
     selected_target: &PlacementTargetHost,
     candidate: &ResourceObject<PlacementPolicy>,
     candidate_target: &PlacementTargetHost,
-    local_host_ref: Option<&str>,
+    local_host_ref: Option<&CanonicalHostId>,
 ) -> String {
     if candidate.spec.priority != selected.spec.priority {
         return format!(
@@ -1375,8 +1374,8 @@ fn placement_ordering_reason(
         );
     }
 
-    let selected_is_local = local_host_ref.is_some_and(|local| selected_target.reference == local);
-    let candidate_is_local = local_host_ref.is_some_and(|local| candidate_target.reference == local);
+    let selected_is_local = local_host_ref.is_some_and(|local| &selected_target.reference == local);
+    let candidate_is_local = local_host_ref.is_some_and(|local| &candidate_target.reference == local);
     if selected_is_local && !candidate_is_local {
         return format!("fallback ordering preferred local policy `{}`", selected.metadata.name);
     }
@@ -1671,6 +1670,43 @@ fn convoy_address(role: &str, project: Option<&str>) -> String {
 
 fn convoy_disambiguation_address(role: &str, project: Option<&str>) -> String {
     format!("{role}@{}", project.unwrap_or_default())
+}
+
+/// The stable human-facing address of a convoy role, independent of any one
+/// generation's resource record name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RoleAddress {
+    pub project: String,
+    pub role: String,
+}
+
+impl FromStr for RoleAddress {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let Some((role, project)) = value.split_once('@') else {
+            return Err(format!("invalid role address `{value}`: expected role@project"));
+        };
+        if role.is_empty() || project.is_empty() || project.contains('@') {
+            return Err(format!("invalid role address `{value}`: expected role@project"));
+        }
+        Ok(Self { project: project.to_string(), role: role.to_string() })
+    }
+}
+
+impl fmt::Display for RoleAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}@{}", self.role, self.project)
+    }
+}
+
+/// A resolved, currently-live convoy generation. Callers route by owner and
+/// select sessions by `record_name`; neither operation accepts a raw role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveConvoyRecord {
+    pub address: RoleAddress,
+    pub record_name: String,
+    pub owner_host: HostName,
 }
 
 async fn allocate_convoy_generation(backend: &ResourceBackend, namespace: &str, project: Option<&str>, role: &str) -> Result<u64, String> {
@@ -2807,10 +2843,10 @@ impl InProcessDaemon {
             .await
             .map_err(|error| format!("placement policy {policy_name}: {error}"))?;
         let target_host = placement_target_host(&self.resource_backend, namespace, &policy).await?;
-        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == target_host.reference) {
+        if self.canonical_local_host_id().as_ref().is_some_and(|host_id| host_id == &target_host.reference) {
             return Ok(None);
         }
-        Ok(Some(flotilla_protocol::qualified_path::HostId::new(target_host.reference)))
+        Ok(Some(flotilla_protocol::qualified_path::HostId::new(target_host.reference.as_str())))
     }
 
     pub async fn convoy_start_placement_host(
@@ -2838,10 +2874,10 @@ impl InProcessDaemon {
             return Ok(None);
         };
         let target_host = placement_target_host(&self.resource_backend, &project_namespace, &policy).await?;
-        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == target_host.reference) {
+        if self.canonical_local_host_id().as_ref().is_some_and(|host_id| host_id == &target_host.reference) {
             return Ok(None);
         }
-        Ok(Some(flotilla_protocol::qualified_path::HostId::new(target_host.reference)))
+        Ok(Some(flotilla_protocol::qualified_path::HostId::new(target_host.reference.as_str())))
     }
 
     pub async fn resolve_existing_convoy_target(
@@ -4749,7 +4785,7 @@ impl InProcessDaemon {
         let sources =
             self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
         let matching_sources =
-            sources.items.into_iter().filter(|source| source.object.metadata.name == target_host.reference).collect::<Vec<_>>();
+            sources.items.into_iter().filter(|source| source.object.metadata.name == target_host.reference.as_str()).collect::<Vec<_>>();
         let has_replica = matching_sources.iter().any(|source| matches!(source.provenance, ResourceProvenance::Replica { .. }));
         let is_host_targeted_placement = self
             .resource_backend
@@ -4762,7 +4798,7 @@ impl InProcessDaemon {
             return Ok(());
         }
 
-        let owns_target_identity = self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == target_host.reference);
+        let owns_target_identity = self.canonical_local_host_id().as_ref().is_some_and(|host_id| host_id == &target_host.reference);
         let capacity = if owns_target_identity {
             matching_sources
                 .iter()
@@ -4869,14 +4905,9 @@ impl InProcessDaemon {
                 PlacementResolution { selected: Some(resolved), refused_candidates: Vec::new(), viable_not_selected: Vec::new() }
             }
             None => {
-                let local_host_id = self.local_host_id();
-                let placement = default_convoy_placement_policy(
-                    &self.resource_backend,
-                    namespace,
-                    workflow,
-                    local_host_id.as_ref().map(HostId::as_str),
-                )
-                .await?;
+                let local_host_id = self.canonical_local_host_id();
+                let placement =
+                    default_convoy_placement_policy(&self.resource_backend, namespace, workflow, local_host_id.as_ref()).await?;
                 if contained && placement.selected.is_none() {
                     return Err("contained workflow requires an available docker placement policy".to_string());
                 }
@@ -7575,12 +7606,16 @@ impl InProcessDaemon {
             let host = if let Some(host_ref) =
                 environment_map.get(&session.spec.env_ref).and_then(|environment| resource_environment_host_ref(environment))
             {
-                let canonical_ref = canonical_placement_host_ref_from_sources(&host_sources.items, host_ref)
-                    .ok()
-                    .flatten()
-                    .map(|target| target.reference)
-                    .unwrap_or_else(|| host_ref.to_string());
-                self.host_name_for_canonical_ref(&canonical_ref)
+                canonical_placement_host_ref_from_sources(&host_sources.items, host_ref).ok().flatten().map_or_else(
+                    || {
+                        if self.canonical_local_host_id().is_some_and(|local| local.as_str() == host_ref) {
+                            self.host_name.clone()
+                        } else {
+                            HostName::new(host_ref)
+                        }
+                    },
+                    |target| self.host_name_for_canonical_ref(&target.reference),
+                )
             } else {
                 self.host_name.clone()
             };
@@ -7617,6 +7652,109 @@ impl InProcessDaemon {
         self.resolve_attach_command_on_host_internal(reference, None).await
     }
 
+    async fn attach_project_context(&self, selector: Option<&flotilla_protocol::RepoSelector>) -> Result<Option<String>, String> {
+        let Some(selector) = selector else {
+            return Ok(None);
+        };
+        let path = self.resolve_repo_selector(selector).await?;
+        let Some(repository_key) = self.repository_keys_by_path.read().await.get(&path).cloned() else {
+            return Ok(None);
+        };
+        let namespace = self.provisioning_namespace().await;
+        let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let mut matches = projects
+            .into_iter()
+            .filter(|project| project.spec.repositories.iter().any(|repository| repository.repo == repository_key))
+            .collect::<Vec<_>>();
+        let repository_key = repository_key.to_string();
+        let mut declaration_matches = matches
+            .iter()
+            .filter(|project| project.metadata.annotations.get(BOOTSTRAP_REPOSITORY_ANNOTATION) == Some(&repository_key))
+            .map(|project| project.metadata.name.clone())
+            .collect::<Vec<_>>();
+        declaration_matches.sort();
+        declaration_matches.dedup();
+        if let [project] = declaration_matches.as_slice() {
+            return Ok(Some(project.clone()));
+        }
+        matches.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
+        matches.dedup_by(|left, right| left.metadata.name == right.metadata.name);
+        Ok(matches.as_slice().first().filter(|_| matches.len() == 1).map(|project| project.metadata.name.clone()))
+    }
+
+    async fn resolve_live_convoy_record(&self, reference: &str, project_context: Option<&str>) -> Result<Option<LiveConvoyRecord>, String> {
+        let explicit = reference.contains('@');
+        let requested = if explicit {
+            Some(RoleAddress::from_str(reference)?)
+        } else {
+            project_context.map(|project| RoleAddress { project: project.to_string(), role: reference.to_string() })
+        };
+        let namespace = self.provisioning_namespace().await;
+        let sources =
+            self.resource_backend.including_replicas::<ResourceConvoy>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let has_role = sources.items.iter().any(|source| source.object.spec.role == reference);
+        if !explicit && requested.is_none() && !has_role {
+            return Ok(None);
+        }
+
+        let role = requested.as_ref().map_or(reference, |address| address.role.as_str());
+        let mut candidates = sources
+            .items
+            .into_iter()
+            .filter(|source| {
+                source.object.spec.role == role
+                    && source.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
+                    && requested.as_ref().is_none_or(|address| source.object.spec.project_ref.as_deref() == Some(&address.project))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            (&left.object.spec.project_ref, &left.object.metadata.name).cmp(&(&right.object.spec.project_ref, &right.object.metadata.name))
+        });
+        match candidates.as_slice() {
+            [] if explicit || requested.is_some() => Err(format!("no live convoy matches `{reference}`")),
+            [] => Ok(None),
+            [source] => {
+                let project = source
+                    .object
+                    .spec
+                    .project_ref
+                    .clone()
+                    .ok_or_else(|| format!("live convoy {} has no project identity", source.object.metadata.name))?;
+                let owner_host = match &source.provenance {
+                    ResourceProvenance::Local => self.host_name.clone(),
+                    ResourceProvenance::Replica { origin_root, .. } => self
+                        .host_registry
+                        .live_routed_host_name(origin_root)
+                        .await
+                        .ok_or_else(|| format!("owner host for {role}@{project} is unreachable"))?,
+                };
+                Ok(Some(LiveConvoyRecord {
+                    address: RoleAddress { project, role: role.to_string() },
+                    record_name: source.object.metadata.name.clone(),
+                    owner_host,
+                }))
+            }
+            candidates => {
+                let addresses = candidates
+                    .iter()
+                    .filter_map(|source| {
+                        source
+                            .object
+                            .spec
+                            .project_ref
+                            .as_ref()
+                            .map(|project| RoleAddress { project: project.clone(), role: source.object.spec.role.clone() })
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .map(|address| address.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(format!("{role} is ambiguous: {addresses}"))
+            }
+        }
+    }
+
     pub async fn resolve_attach_command_on_host_internal(
         &self,
         reference: &str,
@@ -7632,9 +7770,34 @@ impl InProcessDaemon {
         transient: bool,
         mode: AttachMode,
     ) -> Result<ResolvedAttach, String> {
+        self.resolve_attach_with_context(reference, host, transient, mode, None).await
+    }
+
+    async fn resolve_attach_with_context(
+        &self,
+        reference: &str,
+        host: Option<&HostName>,
+        transient: bool,
+        mode: AttachMode,
+        project_context: Option<&str>,
+    ) -> Result<ResolvedAttach, String> {
         // Preserve validation precedence without paying to build the candidate index.
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
+        }
+        if let Some(record) = self.resolve_live_convoy_record(reference, project_context).await? {
+            if record.owner_host != self.host_name {
+                let plan = self.recursive_attach_plan_for_remote(&record.owner_host, &record.address.to_string(), mode).await?;
+                let binding = AttachBinding::builder()
+                    .host(record.owner_host)
+                    .namespace(self.provisioning_namespace().await)
+                    .convoy(record.record_name)
+                    .role(record.address.role)
+                    .build();
+                return Ok(ResolvedAttach { plan, binding: Some(binding) });
+            }
+            let index = self.attach_candidate_index().await?;
+            return index.resolve(self, &record.record_name, host, transient, mode).await;
         }
         let index = self.attach_candidate_index().await?;
         index.resolve(self, reference, host, transient, mode).await
@@ -8001,17 +8164,28 @@ impl InProcessDaemon {
     async fn target_host_for_resource_ref(&self, namespace: &str, host_ref: &str) -> Result<HostName, String> {
         let canonical_ref = match canonical_placement_host_ref(&self.resource_backend, namespace, host_ref).await {
             Ok(Some(target_host)) => target_host.reference,
-            Ok(None) => host_ref.to_string(),
+            Ok(None) => return Err(format!("references unknown host `{host_ref}`")),
             Err(error) => return Err(error),
         };
         Ok(self.host_name_for_canonical_ref(&canonical_ref))
     }
 
-    fn host_name_for_canonical_ref(&self, canonical_ref: &str) -> HostName {
-        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == canonical_ref) {
+    pub async fn canonical_host_id_internal(&self, namespace: &str, host_ref: &str) -> Result<CanonicalHostId, String> {
+        canonical_placement_host_ref(&self.resource_backend, namespace, host_ref)
+            .await?
+            .map(|target| target.reference)
+            .ok_or_else(|| format!("references unknown host `{host_ref}`"))
+    }
+
+    fn canonical_local_host_id(&self) -> Option<CanonicalHostId> {
+        self.local_host_id().map(|host_id| CanonicalHostId::resolved(host_id.as_str()))
+    }
+
+    fn host_name_for_canonical_ref(&self, canonical_ref: &CanonicalHostId) -> HostName {
+        if self.canonical_local_host_id().as_ref() == Some(canonical_ref) {
             self.host_name.clone()
         } else {
-            HostName::new(canonical_ref)
+            HostName::new(canonical_ref.as_str())
         }
     }
 
@@ -8024,10 +8198,10 @@ impl InProcessDaemon {
             let canonical_ref =
                 match canonical_placement_host_ref(&self.resource_backend, &environment.metadata.namespace, &host_direct.host_ref).await {
                     Ok(Some(target_host)) => target_host.reference,
-                    Ok(None) => host_direct.host_ref.clone(),
+                    Ok(None) => return Err(format!("references unknown host `{}`", host_direct.host_ref)),
                     Err(error) => return Err(error),
                 };
-            if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == canonical_ref) {
+            if self.canonical_local_host_id().as_ref() == Some(&canonical_ref) {
                 self.local_environment_id.clone()
             } else {
                 EnvironmentId::new(environment.metadata.name.clone())
@@ -9703,7 +9877,8 @@ impl DaemonHandle for InProcessDaemon {
                 ))))
             }
             CommandAction::Attach { reference, host, mode } => {
-                match self.resolve_attach_with_mode_internal(reference, host.as_ref(), false, *mode).await {
+                let project_context = self.attach_project_context(command.context_repo.as_ref()).await?;
+                match self.resolve_attach_with_context(reference, host.as_ref(), false, *mode, project_context.as_deref()).await {
                     Ok(resolved) => {
                         if let Some(binding) = &resolved.binding {
                             if let Err(error) = self.emit_attach_regard(binding, session_id).await {
@@ -9716,7 +9891,8 @@ impl DaemonHandle for InProcessDaemon {
                 }
             }
             CommandAction::AttachTransient { reference, host, mode } => {
-                match self.resolve_attach_with_mode_internal(reference, host.as_ref(), true, *mode).await {
+                let project_context = self.attach_project_context(command.context_repo.as_ref()).await?;
+                match self.resolve_attach_with_context(reference, host.as_ref(), true, *mode, project_context.as_deref()).await {
                     Ok(resolved) => {
                         Ok(flotilla_protocol::CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding })
                     }
