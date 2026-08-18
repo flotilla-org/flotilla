@@ -20,6 +20,7 @@ define_resource!(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoyEnsureSpec {
     pub project_ref: String,
+    pub role: String,
     pub workflow_ref: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_policy: Option<String>,

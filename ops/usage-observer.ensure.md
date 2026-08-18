@@ -1,6 +1,6 @@
 ---
 kind: ensure
-name: usage-observer
+role: usage-observer
 repos: [flotilla]
 ---
 workflow: usage-observer

@@ -14,8 +14,8 @@ use flotilla_core::{
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
     ops_entry::{
-        ENSURED_FROM_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
-        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
+        MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
+        SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
     },
     project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
     providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote},
@@ -24,7 +24,7 @@ use flotilla_core::{
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{commands::RepositoryIdentityChange, Command, CommandAction, CommandValue, DaemonEvent, HostName, RepoSelector};
 use flotilla_resources::{
-    Checkout, CheckoutSpec, Convoy, ConvoyEnsure, ConvoySpec, InMemoryBackend, InputMeta, IssueSource, ObservedCheckoutSpec, Project,
+    Checkout, CheckoutSpec, Convoy, ConvoyEnsure, InMemoryBackend, InputMeta, IssueSource, ObservedCheckoutSpec, Project,
     ProjectRepositoryRole, ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend, Stance,
     WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
 };
@@ -410,7 +410,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let ensure_path = tmp.path().join("quartermaster.entry");
     std::fs::write(
         &ensure_path,
-        "---\nkind: ensure\nname: quartermaster\nrepos: [app]\n---\nworkflow: all-code\nstance: trusted\npresents-as: fleet\n",
+        "---\nkind: ensure\nrole: quartermaster\nrepos: [app]\n---\nworkflow: all-code\nstance: trusted\npresents-as: fleet\n",
     )
     .expect("write standing convoy ensure");
 
@@ -439,13 +439,36 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     assert_eq!(app_repository.spec.verification_commands().get("test").map(String::as_str), Some("cargo test --workspace"));
     assert!(docs_repository.spec.verification_commands().is_empty());
     let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
-    let ensure = ensures.get("quartermaster").await.expect("materialized standing convoy ensure");
+    let ensure = ensures.list().await.expect("list ensures").into_iter().next().expect("materialized standing convoy ensure");
+    let ensure_name = ensure.metadata.name.clone();
     assert_eq!(ensure.spec.project_ref, "demo");
+    assert_eq!(ensure.spec.role, "quartermaster");
     assert_eq!(ensure.spec.workflow_ref, "all-code");
     assert_eq!(ensure.spec.repositories, vec![app.repo.clone()]);
     assert_eq!(ensure.spec.stance, Some(Stance::Trusted));
     assert_eq!(ensure.metadata.annotations.get(SOURCE_COMMIT_ANNOTATION).map(String::as_str), Some("ops-commit"));
     assert_eq!(ensure.metadata.annotations.get(PRESENTS_AS_ANNOTATION).map(String::as_str), Some("fleet"));
+
+    let repositories = backend.using::<flotilla_resources::Repository>("flotilla");
+    for source in repositories.list().await.expect("list repositories").items {
+        repositories
+            .update_status(&source.metadata.name, &source.metadata.resource_version, &flotilla_resources::RepositoryStatus {
+                default_branch: Some("main".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("resolve repository default branch");
+    }
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("start ensured standing convoy");
+    let ensured_convoy_ref = ensures
+        .get(&ensure_name)
+        .await
+        .expect("reconciled ensure")
+        .status
+        .and_then(|status| status.convoy_ref)
+        .expect("ensured convoy ref");
+    let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
+    convoys.get(&ensured_convoy_ref).await.expect("ensured standing convoy record");
 
     workflows
         .update(
@@ -466,17 +489,6 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     );
     assert_eq!(workflows.get("scoped").await.expect("converged workflow").spec, scoped.spec);
 
-    backend
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("quartermaster".to_string())
-                .annotations(BTreeMap::from([(ENSURED_FROM_ANNOTATION.to_string(), "quartermaster".to_string())]))
-                .build(),
-            &ConvoySpec::builder().workflow_ref("all-code".to_string()).build(),
-        )
-        .await
-        .expect("simulated ensured convoy");
     std::fs::remove_file(ensure_path).expect("remove ensure entry");
     assert_eq!(
         execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,
@@ -484,14 +496,14 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
             name: "demo".to_string(),
             members: 3,
             converged: true,
-            changes: vec!["deleted ConvoyEnsure/quartermaster".to_string()],
+            changes: vec![format!("deleted ConvoyEnsure/{ensure_name}")],
         }
     );
-    assert!(matches!(ensures.get("quartermaster").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
-    assert!(matches!(
-        backend.using::<Convoy>("flotilla").get("quartermaster").await,
-        Err(flotilla_resources::ResourceError::NotFound { .. })
-    ));
+    assert!(matches!(ensures.get(&ensure_name).await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+    assert!(
+        matches!(convoys.get(&ensured_convoy_ref).await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+        "removing the ops entry must tear down its live standing convoy"
+    );
 
     std::fs::remove_file(misleading_directory.join("this-is-a-workflow.md")).expect("remove workflow entry");
     assert_eq!(
@@ -610,7 +622,7 @@ async fn ops_entry_rejects_an_ensure_whose_workflow_has_an_exit() {
     .expect("write declaration");
     std::fs::write(
         tmp.path().join("invalid-ensure.entry"),
-        "---\nkind: ensure\nname: finite-work\nrepos: [app]\n---\nworkflow: single-agent-trusted\n",
+        "---\nkind: ensure\nrole: finite-work\nrepos: [app]\n---\nworkflow: single-agent-trusted\n",
     )
     .expect("write ensure entry");
 
@@ -872,7 +884,7 @@ async fn retracking_path_after_remote_appears_migrates_repository_identity() {
         })
         .await
         .expect("convoy create");
-    assert_eq!(await_command_result(&mut rx, convoy_id).await, CommandValue::ConvoyCreated { name: "identity-migrated".into() });
+    assert_eq!(await_command_result(&mut rx, convoy_id).await, CommandValue::ConvoyCreated { name: "identity-migrated@andamento".into() });
 }
 
 #[tokio::test]
@@ -1678,8 +1690,16 @@ async fn convoy_create_carries_project_ref() {
         })
         .await
         .expect("execute");
-    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "linked".into() });
-    let convoy = backend.using::<Convoy>("flotilla").get("linked").await.expect("convoy");
+    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "linked@my-project".into() });
+    let convoy = backend
+        .using::<Convoy>("flotilla")
+        .list_matching_labels(&BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "linked".to_string())]))
+        .await
+        .expect("list convoys")
+        .items
+        .into_iter()
+        .next()
+        .expect("convoy");
     assert_eq!(convoy.spec.project_ref.as_deref(), Some("my-project"));
     assert_eq!(convoy.spec.repositories.len(), 1);
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");

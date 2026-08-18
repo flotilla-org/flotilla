@@ -8,3 +8,7 @@ __pycache__/
 .worktrees/
 .superpowers/
 .local/
+
+# Generated ticket-DAG board artifacts (scripts/flotilla-tickets-dag.*)
+/flotilla-tickets-dag-*.html
+/scripts/flotilla-tickets-dag.generated.json

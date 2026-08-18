@@ -12,7 +12,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(about = "Manage convoys", subcommand_precedence_over_arg = true)]
 pub struct ConvoyNoun {
-    /// Convoy name
+    /// Convoy role or role@project address
     pub subject: Option<String>,
 
     #[command(subcommand)]
@@ -27,7 +27,7 @@ pub enum ConvoyVerb {
     Work(ConvoyWorkNoun),
     /// Delete a convoy and tear down its managed resources
     Delete {
-        /// Convoy resource name
+        /// Convoy role or role@project address
         name: String,
         /// Skip integration safety checks
         #[arg(long, default_value_t = false)]
@@ -35,7 +35,7 @@ pub enum ConvoyVerb {
     },
     /// Abandon a convoy, archive best-effort, and tear it down
     Abandon {
-        /// Convoy resource name
+        /// Convoy role or role@project address
         name: String,
         /// Human-readable reason for accepting loss of uncommitted work
         #[arg(long)]
@@ -43,7 +43,7 @@ pub enum ConvoyVerb {
     },
     /// Send a follow-up brief to convoy crew
     Resume {
-        /// Convoy resource name
+        /// Convoy role or role@project address
         name: String,
         /// Follow-up brief delivered to the existing crew session
         #[arg(long, required_unless_present = "withdraw", conflicts_with = "withdraw")]
@@ -79,7 +79,7 @@ pub enum ConvoyVerb {
         /// Portable issue scope identity; requires --issue and --issue-service
         #[arg(long)]
         issue_scope: Option<String>,
-        /// Complete convoy resource name
+        /// Human-facing convoy role within the project
         #[arg(long)]
         name: Option<String>,
         /// Complete git branch name
@@ -342,7 +342,7 @@ impl ConvoyNoun {
                 })
             }
             ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref, placement_policy, adopted_checkout } => {
-                let name = self.subject.ok_or_else(|| "convoy name is required before `create`".to_string())?;
+                let name = self.subject.ok_or_else(|| "convoy role is required before `create`".to_string())?;
                 if let Some(project_ref) = project_ref.as_ref().filter(|_| repository_url.is_none() && adopted_checkout.is_none()) {
                     return Ok(Resolved::NeedsContext {
                         command: Command {

@@ -1,7 +1,7 @@
 //! Integration tests for the `ConvoyCreate` + `WorkflowTemplateApply` daemon actions
 //! and the bundled WorkflowTemplates registered at startup.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use flotilla_core::{
     config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
@@ -10,8 +10,22 @@ use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, PrincipalRef};
 use flotilla_resources::{
     single_agent_contained_workflow_spec, Convoy, ConvoyPhase, CrewSource, InMemoryBackend, InputMeta, PlacementPolicy, ResourceBackend,
-    SqliteBackend, Stance, WorkflowTemplate, MANAGED_BY_LABEL,
+    SqliteBackend, Stance, WorkflowTemplate, MANAGED_BY_LABEL, ROLE_LABEL,
 };
+
+async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
+    backend
+        .using::<Convoy>("flotilla")
+        .list_matching_labels(&BTreeMap::from([(ROLE_LABEL.to_string(), role.to_string())]))
+        .await
+        .expect("list convoys by role")
+        .items
+        .into_iter()
+        .next()
+        .expect("convoy should exist")
+        .metadata
+        .name
+}
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&dir).expect("create config dir");
@@ -203,7 +217,7 @@ async fn convoy_create_command_creates_convoy_resource() {
     assert_eq!(result, CommandValue::ConvoyCreated { name: "my-scratch".into() });
 
     let convoys = backend.using::<Convoy>("flotilla");
-    let convoy = convoys.get("my-scratch").await.expect("convoy should exist");
+    let convoy = convoys.get(&convoy_record_name(&backend, "my-scratch").await).await.expect("convoy should exist");
     assert_eq!(convoy.spec.workflow_ref, "scratch");
     assert_eq!(convoy.spec.dispatching_principal_ref, PrincipalRef::implicit_for_namespace("flotilla"));
     assert_eq!(convoy.spec.inputs.len(), 1);
@@ -212,6 +226,28 @@ async fn convoy_create_command_creates_convoy_resource() {
         convoy.spec.placement_policy.as_deref().is_some_and(|policy| policy.starts_with("host-direct-")),
         "convoy create should default to the seeded host-direct placement policy: {convoy:?}"
     );
+
+    let invalid_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "bad@role".into(),
+                workflow_ref: "scratch".into(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("execute invalid role");
+    assert_eq!(await_command_result(&mut rx, invalid_id).await, CommandValue::Error {
+        message: "convoy name `bad@role` must be a lowercase DNS label of at most 63 characters".into()
+    });
 }
 
 #[tokio::test]
@@ -310,9 +346,10 @@ async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "sqlite-scratch".into() });
 
     let convoys = backend.using::<Convoy>("flotilla");
+    let record_name = convoy_record_name(&backend, "sqlite-scratch").await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let convoy = convoys.get("sqlite-scratch").await.expect("convoy should exist");
+        let convoy = convoys.get(&record_name).await.expect("convoy should exist");
         if matches!(
             convoy.status.as_ref(),
             Some(status) if status.phase == ConvoyPhase::Active && status.observed_workflow_ref.as_deref() == Some("scratch")

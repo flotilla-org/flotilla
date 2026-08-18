@@ -47,11 +47,12 @@ pub struct EnsureEntry {
 #[serde(deny_unknown_fields)]
 struct EntryFrontmatter {
     kind: EntryKind,
-    name: String,
+    name: Option<String>,
+    role: Option<String>,
     repos: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum EntryKind {
     WorkflowTemplate,
@@ -77,7 +78,18 @@ pub fn parse_operational_entry(contents: &str) -> Result<Option<OperationalEntry
         Err(_) if !frontmatter.lines().any(|line| line.trim_start().starts_with("kind:")) => return Ok(None),
         Err(error) => return Err(format!("invalid operational entry frontmatter: {error}")),
     };
-    let name = required(frontmatter.name, "name")?;
+    let name = match frontmatter.kind {
+        EntryKind::Ensure => match (frontmatter.name, frontmatter.role) {
+            (None, Some(role)) => required(role, "role")?,
+            (Some(_), _) => return Err("ensure entries declare `role`, not `name`".to_string()),
+            (None, None) => return Err("ensure entry role cannot be empty".to_string()),
+        },
+        EntryKind::WorkflowTemplate | EntryKind::VerificationCommand => match (frontmatter.name, frontmatter.role) {
+            (Some(name), None) => required(name, "name")?,
+            (_, Some(_)) => return Err("only ensure entries declare `role`".to_string()),
+            (None, None) => return Err("operational entry name cannot be empty".to_string()),
+        },
+    };
     let repos = frontmatter
         .repos
         .map(|repos| {
@@ -144,7 +156,7 @@ mod tests {
     #[test]
     fn parses_standing_convoy_ensure_preferences() {
         let entry = parse_operational_entry(
-            "---\nkind: ensure\nname: quartermaster\nrepos: [project-map]\n---\nworkflow: quartermaster\nplacement: feta\nstance: trusted\npresents-as: fleet\n",
+            "---\nkind: ensure\nrole: quartermaster\nrepos: [project-map]\n---\nworkflow: quartermaster\nplacement: feta\nstance: trusted\npresents-as: fleet\n",
         )
         .expect("parse")
         .expect("entry");

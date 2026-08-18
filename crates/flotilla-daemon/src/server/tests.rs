@@ -929,6 +929,8 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
     backend
         .using::<Convoy>("flotilla")
         .create(&InputMeta::builder().name("persisted".to_string()).build(), &ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "scratch".to_string(),
             dispatching_principal_ref: Default::default(),
             inputs: Default::default(),
@@ -1702,10 +1704,13 @@ async fn dispatch_execute_routes_remote_placement_admission_to_the_actuator() {
         assert_eq!(target_node_id, &node("feta"));
         assert!(matches!(command.action, CommandAction::ConvoyStart { .. }));
     }
-    assert!(
-        matches!(daemon.resource_backend().using::<Convoy>("flotilla").get("remote-work").await, Err(ResourceError::NotFound { .. })),
-        "the origin must not half-admit a routed convoy"
-    );
+    let origin_convoys = daemon
+        .resource_backend()
+        .using::<Convoy>("flotilla")
+        .list_matching_labels(&BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "remote-work".to_string())]))
+        .await
+        .expect("list origin convoys");
+    assert!(origin_convoys.items.is_empty(), "the origin must not half-admit a routed convoy");
 
     let disconnected_peers = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     disconnected_peers.lock().await.store_host_summary(remote_summary);

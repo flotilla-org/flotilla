@@ -10,7 +10,7 @@ use flotilla_resources::{
     TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
     TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, VirtualClock, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -18,6 +18,98 @@ use crate::providers::discovery::test_support::fake_discovery;
 
 fn test_meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
+}
+
+async fn create_identity_convoy(backend: &ResourceBackend, record: &str, role: &str, project: Option<&str>) {
+    let labels = BTreeMap::from([
+        (PROJECT_LABEL.to_string(), project.unwrap_or_default().to_string()),
+        (ROLE_LABEL.to_string(), role.to_string()),
+        (GENERATION_LABEL.to_string(), "1".to_string()),
+    ]);
+    let mut spec = ConvoySpec::builder().workflow_ref("review".to_string()).role(role.to_string()).generation(1).build();
+    spec.project_ref = project.map(str::to_string);
+    backend
+        .clone()
+        .using::<ResourceConvoy>("flotilla")
+        .create(&InputMeta::builder().name(record.to_string()).labels(labels).build(), &spec)
+        .await
+        .expect("convoy");
+}
+
+#[test]
+fn convoy_role_addresses_reject_malformed_values() {
+    assert_eq!(parse_role_address("reviewer"), Ok(("reviewer", None)));
+    assert_eq!(parse_role_address("reviewer@flotilla"), Ok(("reviewer", Some("flotilla"))));
+    assert_eq!(parse_role_address("reviewer@"), Ok(("reviewer", Some(""))));
+    for value in ["@project", "a@b@c"] {
+        assert_eq!(parse_role_address(value), Err(format!("invalid convoy address `{value}`: expected role@project")));
+    }
+    assert_eq!(parse_role_address(""), Err("convoy role cannot be empty".to_string()));
+}
+
+#[test]
+fn remote_fleet_attach_references_use_the_canonical_role_address() {
+    let row = FleetListRow::builder()
+        .convoy("reviewer @ flotilla")
+        .convoy_ref("convoy-opaque")
+        .vessel("convoy-opaque-implement")
+        .crew("implement/coder")
+        .crew_state("running")
+        .host(HostName::new("remote"))
+        .namespace("flotilla")
+        .session("session-opaque")
+        .staleness(FleetStaleness::Fresh { last_sync: Utc::now() })
+        .build();
+
+    let references = fleet_row_attach_reference_keys(&row);
+    assert!(references.contains(&"reviewer@flotilla".to_string()));
+    assert!(references.contains(&"reviewer@flotilla/implement/coder".to_string()));
+    assert!(references.contains(&"convoy-opaque".to_string()));
+    assert!(!references.contains(&"reviewer @ flotilla".to_string()));
+    assert_eq!(fleet_row_attach_reference_label(&row), "reviewer @ flotilla/implement/coder (remote)");
+}
+
+#[tokio::test]
+async fn convoy_role_resolution_can_disambiguate_a_projectless_convoy() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    create_identity_convoy(&backend, "convoy-one", "reviewer", None).await;
+    create_identity_convoy(&backend, "convoy-two", "reviewer", Some("beta")).await;
+
+    assert_eq!(
+        resolve_local_convoy_name(&backend, "flotilla", "reviewer").await,
+        Err("convoy role `reviewer` is ambiguous; use one of: reviewer@, reviewer@beta".to_string())
+    );
+    assert_eq!(resolve_local_convoy_name(&backend, "flotilla", "reviewer@").await, Ok("convoy-one".to_string()));
+    assert_eq!(resolve_local_convoy_name(&backend, "flotilla", "reviewer@beta").await, Ok("convoy-two".to_string()));
+}
+
+#[tokio::test]
+async fn convoy_explain_rejects_projectless_and_project_bound_role_ambiguity() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    create_identity_convoy(&backend, "convoy-one", "reviewer", None).await;
+    create_identity_convoy(&backend, "convoy-two", "reviewer", Some("beta")).await;
+
+    assert_eq!(
+        daemon.explain_convoy_internal(None, "reviewer").await.expect_err("bare role must be ambiguous"),
+        "convoy role `reviewer` is ambiguous; use one of: reviewer@, reviewer@beta"
+    );
+}
+
+#[tokio::test]
+async fn projectless_convoys_do_not_share_an_identity_bucket_with_a_project_named_standalone() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let record = convoy_record_name();
+    let generation = allocate_convoy_generation(&backend, "flotilla", None, "worker").await.expect("projectless identity");
+    let labels = BTreeMap::from([
+        (PROJECT_LABEL.to_string(), String::new()),
+        (ROLE_LABEL.to_string(), "worker".to_string()),
+        (GENERATION_LABEL.to_string(), generation.to_string()),
+    ]);
+    let spec = ConvoySpec::builder().workflow_ref("work".to_string()).role("worker".to_string()).generation(generation).build();
+    convoys.create(&InputMeta::builder().name(record).labels(labels).build(), &spec).await.expect("projectless convoy");
+
+    assert!(allocate_convoy_generation(&backend, "flotilla", Some("standalone"), "worker").await.is_ok());
 }
 
 async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<VirtualClock>, tempfile::TempDir) {
@@ -85,6 +177,7 @@ async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Ar
                 .build(),
             &ConvoyEnsureSpec {
                 project_ref: "standing-project".to_string(),
+                role: "quartermaster".to_string(),
                 workflow_ref: "quartermaster".to_string(),
                 placement_policy: None,
                 stance: Some(Stance::Trusted),
@@ -102,7 +195,16 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let first = convoys.get("quartermaster").await.expect("standing convoy");
+    let first_ref = backend
+        .using::<ConvoyEnsure>("flotilla")
+        .get("quartermaster")
+        .await
+        .expect("ensure")
+        .status
+        .expect("ensure status")
+        .convoy_ref
+        .expect("convoy ref");
+    let first = convoys.get(&first_ref).await.expect("standing convoy");
     let now = clock.now();
     convoys
         .update_status(&first.metadata.name, &first.metadata.resource_version, &ConvoyStatus {
@@ -120,7 +222,7 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
         .create(
             &InputMeta::builder()
                 .name("quartermaster-work".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "quartermaster".to_string())]))
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), first_ref.clone())]))
                 .build(),
             &ResourceEnvironmentSpec {
                 host_direct: None,
@@ -152,7 +254,7 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
     ]);
     clock.advance(ChronoDuration::hours(1));
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("continue holding").is_empty());
-    assert!(convoys.get("quartermaster").await.is_ok(), "failed convoy and its live container must survive");
+    assert!(convoys.get(&first_ref).await.is_ok(), "failed convoy and its live container must survive");
     let held = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("held ensure");
     assert_eq!(held.status.as_ref().expect("status").restart_count, 0);
     assert!(
@@ -174,7 +276,13 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
         .expect("verify backing dead");
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("record crash backoff");
     clock.advance(ChronoDuration::seconds(30));
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart dead backing"), vec!["started Convoy/quartermaster"]);
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart dead backing"), vec![
+        "started quartermaster@standing-project"
+    ]);
+    let generations = convoys.list().await.expect("standing generations").items;
+    assert_eq!(generations.len(), 2);
+    assert!(generations.iter().any(|convoy| convoy.metadata.name == first_ref && convoy.spec.generation == 1));
+    assert!(generations.iter().any(|convoy| convoy.spec.generation == 2));
     assert_eq!(backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 1);
 }
 
@@ -184,9 +292,10 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
     let ensures = backend.using::<ConvoyEnsure>("flotilla");
     let ensure = ensures.get("quartermaster").await.expect("ensure");
+    let first_ref = ensure.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("first convoy ref");
     ensures
         .update_status(&ensure.metadata.name, &ensure.metadata.resource_version, &ConvoyEnsureStatus {
-            convoy_ref: Some("quartermaster".to_string()),
+            convoy_ref: Some(first_ref.clone()),
             restart_count: 7,
             running_since: Some(clock.now()),
             retry_at: None,
@@ -195,13 +304,17 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
         .await
         .expect("seed crash budget");
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    convoys.delete("quartermaster").await.expect("operator reap");
+    convoys.delete(&first_ref).await.expect("operator reap");
 
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("prompt resurrection"), vec!["started Convoy/quartermaster"]);
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("prompt resurrection"), vec![
+        "started quartermaster@standing-project"
+    ]);
     assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 7);
 
     backend.using::<WorkflowTemplate>("flotilla").delete("quartermaster").await.expect("temporary resolution loss");
-    convoys.delete("quartermaster").await.expect("second operator reap");
+    let second_ref =
+        ensures.get("quartermaster").await.expect("ensure").status.and_then(|status| status.convoy_ref).expect("second convoy ref");
+    convoys.delete(&second_ref).await.expect("second operator reap");
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("unresolved workflow schedules retry");
     let retrying = ensures.get("quartermaster").await.expect("retrying ensure");
     assert_eq!(retrying.status.as_ref().expect("status").restart_count, 7);
@@ -235,7 +348,7 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
     assert!(restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("retry not due").is_empty());
     clock.set(retry_at);
     assert_eq!(restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("past-due retry"), vec![
-        "started Convoy/quartermaster"
+        "started quartermaster@standing-project"
     ]);
     assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 7);
 }

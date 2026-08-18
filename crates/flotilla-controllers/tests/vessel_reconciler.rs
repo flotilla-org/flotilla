@@ -95,6 +95,8 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
         .clone()
         .using::<Convoy>(NAMESPACE)
         .create(&meta("convoy-scratch"), &ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "scratch".to_string(),
             dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),
@@ -427,6 +429,8 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         .clone()
         .using::<Convoy>(NAMESPACE)
         .create(&meta("convoy-multi"), &ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "wf".to_string(),
             dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),
@@ -637,6 +641,8 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         .clone()
         .using::<Convoy>(NAMESPACE)
         .create(&meta("convoy-multi-docker"), &ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "wf".to_string(),
             dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),
@@ -813,6 +819,8 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
         .clone()
         .using::<Convoy>(NAMESPACE)
         .create(&meta("convoy-multi-fresh"), &ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "wf".to_string(),
             dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),
@@ -942,6 +950,8 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .clone()
         .using::<Convoy>(NAMESPACE)
         .create(&meta("convoy-scoped"), &ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "wf".to_string(),
             dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),
@@ -1884,6 +1894,8 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
         .clone()
         .using::<Convoy>(NAMESPACE)
         .create(&meta("convoy-issue-brief"), &ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "wf".to_string(),
             dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),
@@ -2304,6 +2316,8 @@ async fn create_convoy_with_labeled_processes(
     let convoys = backend.clone().using::<Convoy>(namespace);
     let convoy = convoys
         .create(&meta(name), &ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "wf".to_string(),
             dispatching_principal_ref: Default::default(),
             inputs: Default::default(),

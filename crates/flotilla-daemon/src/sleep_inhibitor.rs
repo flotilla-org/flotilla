@@ -630,6 +630,8 @@ mod tests {
 
     fn convoy_spec() -> ConvoySpec {
         ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "single-agent-contained".to_string(),
             dispatching_principal_ref: PrincipalRef::default(),
             inputs: BTreeMap::new(),
