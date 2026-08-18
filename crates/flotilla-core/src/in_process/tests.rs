@@ -91,6 +91,20 @@ async fn attach_resolves_role_addresses_to_the_live_record_before_planning_the_h
         .expect("qualified role resolves without project context");
     assert_eq!(qualified.binding.as_ref().and_then(|binding| binding.convoy.as_deref()), Some("convoy-andamento"));
 
+    let from_untracked_repo = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: Some(flotilla_protocol::RepoSelector::Path(PathBuf::from("/scratch/untracked"))),
+                action: CommandAction::Attach { reference: "governor@andamento".to_string(), host: None, mode: AttachMode::Default },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("untracked cwd context must not abort attach");
+    assert!(matches!(from_untracked_repo, CommandValue::AttachCommandResolved { .. }));
+
     let wrong_host = daemon
         .resolve_attach_with_context("governor@andamento", Some(&HostName::new("udder")), false, AttachMode::Default, None)
         .await

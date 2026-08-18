@@ -7656,7 +7656,9 @@ impl InProcessDaemon {
         let Some(selector) = selector else {
             return Ok(None);
         };
-        let path = self.resolve_repo_selector(selector).await?;
+        let Ok(path) = self.resolve_repo_selector(selector).await else {
+            return Ok(None);
+        };
         let Some(repository_key) = self.repository_keys_by_path.read().await.get(&path).cloned() else {
             return Ok(None);
         };
