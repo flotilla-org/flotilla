@@ -105,6 +105,12 @@ async fn attach_resolves_role_addresses_to_the_live_record_before_planning_the_h
         .expect("untracked cwd context must not abort attach");
     assert!(matches!(from_untracked_repo, CommandValue::AttachCommandResolved { .. }));
 
+    let session_in_project_context = daemon
+        .resolve_attach_with_context("governor-session", None, false, AttachMode::Default, Some("andamento"))
+        .await
+        .expect("non-role references must fall back to the attach index in project context");
+    assert_eq!(session_in_project_context.binding.as_ref().and_then(|binding| binding.session.as_deref()), Some("governor-session"));
+
     let wrong_host = daemon
         .resolve_attach_with_context("governor@andamento", Some(&HostName::new("udder")), false, AttachMode::Default, None)
         .await

@@ -7713,7 +7713,7 @@ impl InProcessDaemon {
             (&left.object.spec.project_ref, &left.object.metadata.name).cmp(&(&right.object.spec.project_ref, &right.object.metadata.name))
         });
         match candidates.as_slice() {
-            [] if explicit || requested.is_some() => Err(format!("no live convoy matches `{reference}`")),
+            [] if explicit => Err(format!("no live convoy matches `{reference}`")),
             [] => Ok(None),
             [source] => {
                 let project = source
