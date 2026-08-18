@@ -2463,11 +2463,8 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    let command = Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: None,
-        action: CommandAction::ConvoyStart {
+    let command = Command::builder()
+        .action(CommandAction::ConvoyStart {
             intent: Box::new(
                 ConvoyStartIntent::builder()
                     .project_ref("flotilla".to_string())
@@ -2476,8 +2473,8 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
                     .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                     .build(),
             ),
-        },
-    };
+        })
+        .build();
     let mut events = daemon.subscribe();
 
     let first_id = daemon.execute(command.clone()).await.expect("first admission");
@@ -2515,12 +2512,11 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
     assert!(generations.iter().any(|convoy| convoy.spec.generation == 2));
 
     let delete_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyDelete { namespace: None, name: "governor@flotilla".to_string(), force: true },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: None, name: "governor@flotilla".to_string(), force: true })
+                .build(),
+        )
         .await
         .expect("delete by role address");
     assert_eq!(recv_command_finished(&mut events, delete_id).await, CommandValue::Ok);

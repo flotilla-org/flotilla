@@ -226,21 +226,20 @@ async fn convoy_create_command_creates_convoy_resource() {
     );
 
     let invalid_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "bad@role".into(),
-                workflow_ref: "scratch".into(),
-                inputs: Vec::new(),
-                repository_url: None,
-                r#ref: None,
-                project_ref: None,
-                placement_policy: None,
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "bad@role".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: None,
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("execute invalid role");
     assert_eq!(await_command_result(&mut rx, invalid_id).await, CommandValue::Error {

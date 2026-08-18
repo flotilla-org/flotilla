@@ -8899,21 +8899,20 @@ mod tests {
         let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
         let checkout_count = checkouts.list().await.expect("list adopted checkouts").items.len();
         let duplicate_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyCreate {
-                    name: "convoy-adopted".to_string(),
-                    workflow_ref: "wf-a".to_string(),
-                    inputs: Vec::new(),
-                    repository_url: None,
-                    r#ref: None,
-                    project_ref: None,
-                    placement_policy: Some(format!("host-direct-{host_id}")),
-                    adopted_checkout: Some(Box::new(repo.clone())),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyCreate {
+                        name: "convoy-adopted".to_string(),
+                        workflow_ref: "wf-a".to_string(),
+                        inputs: Vec::new(),
+                        repository_url: None,
+                        r#ref: None,
+                        project_ref: None,
+                        placement_policy: Some(format!("host-direct-{host_id}")),
+                        adopted_checkout: Some(Box::new(repo.clone())),
+                    })
+                    .build(),
+            )
             .await
             .expect("duplicate convoy create command should start");
         assert_eq!(wait_for_command_result(&mut rx, duplicate_id).await, CommandValue::Error {
