@@ -811,7 +811,9 @@ async fn reconcile_provisioned_environments(state: &Arc<ControllerRuntimeState>,
         let Some(spec) = environment.spec.docker.as_ref() else {
             continue;
         };
-        let canonical = canonical_runtime_host_id(&state.daemon, namespace, &local_host_id, &spec.host_ref).await?;
+        let Ok(canonical) = canonical_runtime_host_id(&state.daemon, namespace, &local_host_id, &spec.host_ref).await else {
+            continue;
+        };
         if canonical == local_host_id && environment.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Ready) {
             environments.push(environment);
         }
@@ -6108,8 +6110,32 @@ mod tests {
         .await;
         let bad_id = EnvironmentId::new("env-bad");
         let good_id = EnvironmentId::new("env-good");
+        let orphaned_id = EnvironmentId::new("env-orphaned");
         create_ready_docker_environment(&daemon, bad_id.as_str(), "test-interior", BTreeSet::from(["missing-adapter".to_string()])).await;
         create_ready_docker_environment(&daemon, good_id.as_str(), "test-interior", BTreeSet::new()).await;
+        let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
+        environments
+            .create(&empty_meta(orphaned_id.as_str()), &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    host_ref: "deleted-host".to_string(),
+                    image: "contained-image".to_string(),
+                    declared_agent_adapters: BTreeSet::new(),
+                    required_agent_adapters: BTreeSet::new(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: BTreeMap::new(),
+                }),
+            })
+            .await
+            .expect("create orphaned environment");
+        flotilla_resources::apply_status_patch(&environments, orphaned_id.as_str(), &EnvironmentStatusPatch::MarkReady {
+            docker_container_id: Some("orphaned-container".to_string()),
+            image_ref: Some("contained-image".to_string()),
+            image_digest: Some("sha256:contained".to_string()),
+        })
+        .await
+        .expect("mark orphaned environment ready");
         let handle = |id: EnvironmentId| {
             Arc::new(TestInteriorEnvironment {
                 id,
@@ -6134,6 +6160,7 @@ mod tests {
         let bad = daemon.resource_backend().using::<Environment>(NAMESPACE).get(bad_id.as_str()).await.expect("bad environment");
         assert_eq!(bad.status.expect("bad environment status").phase, EnvironmentPhase::Failed);
         assert!(daemon.environment_registry_for_environment(&bad_id).is_none());
+        assert!(daemon.environment_registry_for_environment(&orphaned_id).is_none());
         assert!(daemon.environment_registry_for_environment(&good_id).is_some(), "live sibling should still be adopted");
     }
 

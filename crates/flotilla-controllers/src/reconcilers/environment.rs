@@ -73,9 +73,10 @@ impl<R> EnvironmentReconciler<R> {
             return Ok(true);
         };
         let hosts = self.hosts.list().await?;
-        let canonical = flotilla_resources::canonical_host_id(&hosts.items, host_ref)
-            .map_err(|message| ResourceError::Invalid { message })?
-            .ok_or_else(|| ResourceError::Invalid { message: format!("environment references unknown host `{host_ref}`") })?;
+        let canonical = match flotilla_resources::canonical_host_id(&hosts.items, host_ref) {
+            Ok(Some(canonical)) => canonical,
+            Ok(None) | Err(_) => return Ok(false),
+        };
         Ok(&canonical == local_host_ref)
     }
 }

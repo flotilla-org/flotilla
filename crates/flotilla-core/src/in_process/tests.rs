@@ -90,6 +90,12 @@ async fn attach_resolves_role_addresses_to_the_live_record_before_planning_the_h
         .await
         .expect("qualified role resolves without project context");
     assert_eq!(qualified.binding.as_ref().and_then(|binding| binding.convoy.as_deref()), Some("convoy-andamento"));
+
+    let wrong_host = daemon
+        .resolve_attach_with_context("governor@andamento", Some(&HostName::new("udder")), false, AttachMode::Default, None)
+        .await
+        .expect_err("an explicit host must constrain role-address resolution");
+    assert_eq!(wrong_host, "no attach target matching 'governor@andamento' on host 'udder'");
 }
 
 #[test]

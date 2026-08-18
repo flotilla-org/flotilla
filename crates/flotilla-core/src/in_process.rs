@@ -7786,6 +7786,11 @@ impl InProcessDaemon {
             return Err("attach reference is required".to_string());
         }
         if let Some(record) = self.resolve_live_convoy_record(reference, project_context).await? {
+            if let Some(requested) = host {
+                if requested != &record.owner_host {
+                    return Err(format!("no attach target matching '{reference}' on host '{requested}'"));
+                }
+            }
             if record.owner_host != self.host_name {
                 let plan = self.recursive_attach_plan_for_remote(&record.owner_host, &record.address.to_string(), mode).await?;
                 let binding = AttachBinding::builder()

@@ -137,3 +137,30 @@ async fn foreign_environment_is_not_actuated_or_finalized() {
         reconciler.run_finalizer(environment).await.expect("foreign finalization should be skipped");
     }
 }
+
+#[tokio::test]
+async fn orphaned_environment_can_finalize_after_its_host_disappears() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let environment = backend
+        .using::<Environment>("flotilla")
+        .create(&InputMeta::builder().name("env-orphaned".to_string()).build(), &EnvironmentSpec {
+            host_direct: None,
+            docker: Some(DockerEnvironmentSpec {
+                host_ref: "deleted-host".to_string(),
+                image: "crew:latest".to_string(),
+                declared_agent_adapters: BTreeSet::new(),
+                required_agent_adapters: BTreeSet::new(),
+                pull_policy: Default::default(),
+                mounts: Vec::new(),
+                env: Default::default(),
+            }),
+        })
+        .await
+        .expect("create orphaned environment");
+    let reconciler = EnvironmentReconciler::new(Arc::new(ForeignEnvironmentRuntime), backend, "flotilla")
+        .with_local_host_ref(flotilla_protocol::CanonicalHostId::resolved("kiwi"));
+
+    let prepared = reconciler.prepare(&environment).await.expect("orphaned environment should be treated as foreign");
+    assert!(reconciler.reconcile(&environment, &prepared, chrono::Utc::now()).patch.is_none());
+    reconciler.run_finalizer(&environment).await.expect("orphaned environment finalizer should converge");
+}
