@@ -86,10 +86,15 @@ A standing convoy is declared with an `ensure` entry. Its workflow must omit
 `exit`, which is the standing marker: the convoy remains live until the entry
 is removed and the project is refreshed.
 
+The entry declares a project-local `role`; the project is implied by the
+repository declaration being refreshed. The materialized ensure key and each
+Convoy generation name are machine-generated. Human surfaces address the live
+generation as `role@project` and render it as `role @ project`.
+
 ```yaml
 ---
 kind: ensure
-name: quartermaster
+role: quartermaster
 repos: [app]
 ---
 workflow: quartermaster

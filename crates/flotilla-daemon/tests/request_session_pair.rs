@@ -17,7 +17,7 @@ use flotilla_core::{
 };
 use flotilla_daemon::server::test_support::{
     apply_convoy_replica_feed, seed_trusted_remote_convoy_project, spawn_in_memory_request_topology,
-    spawn_in_memory_request_topology_stateful, spawn_in_memory_request_topology_stateful_with_surface,
+    spawn_in_memory_request_topology_stateful, spawn_in_memory_request_topology_stateful_with_surface, InMemoryRequestTopology,
 };
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
@@ -29,9 +29,24 @@ use flotilla_resources::{
     api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
     CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
     CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host, HostSpec, HostStatus, InputMeta, PlacementPolicy,
-    PlacementPolicySpec, Regard, Resource, ResourceError, ResourceProvenance, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
+    PlacementPolicySpec, Regard, Resource, ResourceBackend, ResourceError, ResourceProvenance, WorkPhase as ResourceWorkPhase, WorkState,
+    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL,
+    ROLE_LABEL,
 };
+
+async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
+    backend
+        .using::<Convoy>("flotilla")
+        .list_matching_labels(&BTreeMap::from([(ROLE_LABEL.to_string(), role.to_string())]))
+        .await
+        .expect("list convoys by role")
+        .items
+        .into_iter()
+        .next()
+        .expect("convoy should exist")
+        .metadata
+        .name
+}
 
 fn test_config_store(config_dir: std::path::PathBuf) -> Arc<ConfigStore> {
     test_config_store_with_floor(config_dir, None)
@@ -97,8 +112,36 @@ async fn await_host_capacity(daemon: &Arc<InProcessDaemon>, host_id: &str) {
     .expect("host capacity should replicate");
 }
 
-fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
-    ConvoySpec::builder().workflow_ref(workflow_ref.to_string()).build()
+async fn seed_target_placement_policy(topology: &InMemoryRequestTopology, namespace: &str, policy_name: &str) {
+    let policy =
+        topology.leader.resource_backend().using::<PlacementPolicy>(namespace).get(policy_name).await.expect("origin placement policy");
+    topology
+        .follower
+        .resource_backend()
+        .using::<PlacementPolicy>(namespace)
+        .create(&InputMeta::builder().name(policy_name.to_string()).build(), &policy.spec)
+        .await
+        .expect("placement host should register its local placement policy");
+}
+
+fn convoy_spec(workflow_ref: &str, role: &str) -> ConvoySpec {
+    ConvoySpec::builder()
+        .workflow_ref(workflow_ref.to_string())
+        .project_ref("flotilla".to_string())
+        .role(role.to_string())
+        .generation(1)
+        .build()
+}
+
+fn convoy_meta(record_name: &str, role: &str) -> InputMeta {
+    InputMeta::builder()
+        .name(record_name.to_string())
+        .labels(BTreeMap::from([
+            (PROJECT_LABEL.to_string(), "flotilla".to_string()),
+            (ROLE_LABEL.to_string(), role.to_string()),
+            (GENERATION_LABEL.to_string(), "1".to_string()),
+        ]))
+        .build()
 }
 
 async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
@@ -206,7 +249,9 @@ async fn convoy_creation_attributes_provenance_and_regard_to_the_surface_princip
         .expect("dispatch convoy creation");
     assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyCreated { name: "alice-dispatch".to_string() });
 
-    let convoy = leader.resource_backend().using::<Convoy>("flotilla").get("alice-dispatch").await.expect("created convoy");
+    let backend = leader.resource_backend();
+    let convoy =
+        backend.using::<Convoy>("flotilla").get(&convoy_record_name(&backend, "alice-dispatch").await).await.expect("created convoy");
     assert_eq!(convoy.spec.dispatching_principal_ref, principal_ref);
     let regards = leader.resource_backend().using::<Regard>("flotilla").list().await.expect("list regards");
     assert_eq!(regards.items.len(), 1);
@@ -347,7 +392,7 @@ async fn hostless_convoy_delete_routes_to_remote_home() {
 
     let follower_convoys = topology.follower.resource_backend().using::<Convoy>(namespace);
     follower_convoys
-        .create(&InputMeta::builder().name(convoy_name.to_string()).build(), &convoy_spec("scratch"))
+        .create(&convoy_meta(convoy_name, convoy_name), &convoy_spec("scratch", convoy_name))
         .await
         .expect("create remote-homed convoy");
 
@@ -386,7 +431,7 @@ async fn mistargeted_convoy_delete_routes_to_remote_home() {
 
     let follower_convoys = topology.follower.resource_backend().using::<Convoy>(namespace);
     follower_convoys
-        .create(&InputMeta::builder().name(convoy_name.to_string()).build(), &convoy_spec("scratch"))
+        .create(&convoy_meta(convoy_name, convoy_name), &convoy_spec("scratch", convoy_name))
         .await
         .expect("create remote-homed convoy");
     apply_convoy_replica_feed(&topology.leader, namespace, convoy_name, topology.follower_host.clone()).await;
@@ -420,7 +465,7 @@ async fn hostless_convoy_abandon_routes_to_remote_home() {
 
     let follower_convoys = topology.follower.resource_backend().using::<Convoy>(namespace);
     follower_convoys
-        .create(&InputMeta::builder().name(convoy_name.to_string()).build(), &convoy_spec("scratch"))
+        .create(&convoy_meta(convoy_name, convoy_name), &convoy_spec("scratch", convoy_name))
         .await
         .expect("create remote-homed convoy");
     apply_convoy_replica_feed(&topology.leader, namespace, convoy_name, topology.follower_host.clone()).await;
@@ -462,7 +507,7 @@ async fn hostless_convoy_work_complete_routes_to_remote_home() {
 
     let follower_convoys = topology.follower.resource_backend().using::<Convoy>(namespace);
     let created = follower_convoys
-        .create(&InputMeta::builder().name(convoy_name.to_string()).build(), &convoy_spec("scratch"))
+        .create(&convoy_meta(convoy_name, convoy_name), &convoy_spec("scratch", convoy_name))
         .await
         .expect("create remote-homed convoy");
     follower_convoys
@@ -545,7 +590,7 @@ async fn hostless_convoy_delete_uses_live_peer_route_when_connection_status_is_s
 
     let follower_convoys = topology.follower.resource_backend().using::<Convoy>(namespace);
     follower_convoys
-        .create(&InputMeta::builder().name(convoy_name.to_string()).build(), &convoy_spec("scratch"))
+        .create(&convoy_meta(convoy_name, convoy_name), &convoy_spec("scratch", convoy_name))
         .await
         .expect("create remote-homed convoy");
 
@@ -569,7 +614,7 @@ async fn hostless_convoy_delete_uses_live_peer_route_when_connection_status_is_s
 }
 
 #[tokio::test]
-async fn convoy_start_stays_on_admitting_store_when_placement_membership_is_stale() {
+async fn convoy_start_routes_to_placement_host_when_presentation_membership_is_stale() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named("follower").await;
     seed_host_capacity(&follower, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
@@ -590,8 +635,9 @@ async fn convoy_start_stays_on_admitting_store_when_placement_membership_is_stal
     .await
     .expect("peer host summary should materialize placement policy");
     await_host_capacity(&topology.leader, &remote_host_id).await;
+    seed_target_placement_policy(&topology, namespace, &placement_policy).await;
 
-    seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
+    seed_trusted_remote_convoy_project(&topology.follower, namespace).await;
 
     apply_convoy_replica_feed(&topology.leader, namespace, "fresh-feed", topology.follower_host.clone()).await;
     topology
@@ -635,27 +681,23 @@ async fn convoy_start_stays_on_admitting_store_when_placement_membership_is_stal
             },
         })
         .await
-        .expect("admitting store should accept remote placement despite stale presentation membership");
+        .expect("origin should route remote placement despite stale presentation membership");
 
     assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted {
-        name: "remote-work".to_string(),
+        name: "remote-work@flotilla".to_string(),
         attach_plan: None,
         binding: None
     });
-    topology
+    let origin_convoys = topology
         .leader
         .resource_backend()
         .using::<Convoy>(namespace)
-        .get("remote-work")
+        .list_matching_labels(&BTreeMap::from([(ROLE_LABEL.to_string(), "remote-work".to_string())]))
         .await
-        .expect("convoy should remain on the admitting store");
-    assert!(
-        matches!(
-            topology.follower.resource_backend().using::<Convoy>(namespace).get("remote-work").await,
-            Err(ResourceError::NotFound { .. })
-        ),
-        "placement host must not become the convoy authority"
-    );
+        .expect("list origin convoys");
+    assert!(origin_convoys.items.is_empty(), "the origin must not own an always-on convoy record");
+    let record_name = convoy_record_name(&topology.follower.resource_backend(), "remote-work").await;
+    topology.follower.resource_backend().using::<Convoy>(namespace).get(&record_name).await.expect("placement host should own the convoy");
 }
 
 #[tokio::test]
@@ -721,9 +763,10 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
     })
     .await
     .expect("kiwi should reproduce the stale local and fresh feta Host rows");
+    seed_target_placement_policy(&topology, namespace, &placement_policy).await;
 
-    seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
-    let workflows = topology.leader.resource_backend().using::<WorkflowTemplate>(namespace);
+    seed_trusted_remote_convoy_project(&topology.follower, namespace).await;
+    let workflows = topology.follower.resource_backend().using::<WorkflowTemplate>(namespace);
     let workflow = workflows.get("remote-workflow").await.expect("remote workflow");
     let mut workflow_spec = workflow.spec;
     let flotilla_resources::CrewSource::Agent { selector, .. } = &mut workflow_spec.vessels[0].crew[0].source else {
@@ -735,7 +778,7 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
         .await
         .expect("select claude-code for the remote workflow");
     topology
-        .leader
+        .follower
         .resource_backend()
         .definitions::<CredentialSpec>(namespace)
         .create(&InputMeta::builder().name("claude-max".to_string()).build(), &CredentialSpecSpec {
@@ -747,7 +790,7 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
         .await
         .expect("create Claude credential declaration");
     topology
-        .leader
+        .follower
         .resource_backend()
         .definitions::<CredentialGrant>(namespace)
         .create(
@@ -788,14 +831,14 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
         .expect("dispatch kiwi-to-feta convoy start");
 
     assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted {
-        name: "kiwi-to-feta".to_string(),
+        name: "kiwi-to-feta@flotilla".to_string(),
         attach_plan: None,
         binding: None
     });
 }
 
 #[tokio::test]
-async fn remote_convoy_start_enforces_target_capacity_without_moving_authority() {
+async fn routed_convoy_start_enforces_placement_host_capacity_before_persistence() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named_with_floor("follower", Some(1_000_000)).await;
     seed_host_capacity(&follower, 0, 1_000_000 * 1024 * 1024 * 1024).await;
@@ -816,7 +859,8 @@ async fn remote_convoy_start_enforces_target_capacity_without_moving_authority()
     .await
     .expect("peer host summary should materialize placement policy");
     await_host_capacity(&topology.leader, &remote_host_id).await;
-    seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
+    seed_target_placement_policy(&topology, namespace, &placement_policy).await;
+    seed_trusted_remote_convoy_project(&topology.follower, namespace).await;
 
     let mut events = topology.leader.subscribe();
     let command_id = topology

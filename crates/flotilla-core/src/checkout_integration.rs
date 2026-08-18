@@ -158,7 +158,7 @@ async fn inspect_checkout_integration_with_association(
 }
 
 async fn inspect_clean(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
-    match runner.run_output("git", &["status", "--porcelain"], checkout_path, &ChannelLabel::Noop).await {
+    match runner.run_output("git", &["status", "--porcelain"], checkout_path, &ChannelLabel::Default).await {
         Ok(output) if output.success => {
             let mut details = output
                 .stdout
@@ -205,7 +205,7 @@ async fn inspect_embedded_repositories(runner: &dyn CommandRunner, checkout_path
             "find",
             &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"],
             checkout_path,
-            &ChannelLabel::Noop,
+            &ChannelLabel::Default,
         )
         .await
         .map_err(|error| format!("embedded repository scan could not run: {error}"))?;
@@ -234,28 +234,31 @@ async fn inspect_embedded_repositories(runner: &dyn CommandRunner, checkout_path
 async fn inspect_embedded_repository(runner: &dyn CommandRunner, checkout_path: &Path, path: PathBuf) -> EmbeddedRepository {
     let path_arg = path.to_string_lossy();
     let branch = match runner
-        .run_output("git", &["-C", &path_arg, "symbolic-ref", "--short", "-q", "HEAD"], checkout_path, &ChannelLabel::Noop)
+        .run_output("git", &["-C", &path_arg, "symbolic-ref", "--short", "-q", "HEAD"], checkout_path, &ChannelLabel::Default)
         .await
     {
         Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-        _ => match runner.run_output("git", &["-C", &path_arg, "rev-parse", "--short", "HEAD"], checkout_path, &ChannelLabel::Noop).await {
-            Ok(output) if output.success && !output.stdout.trim().is_empty() => format!("detached at {}", output.stdout.trim()),
-            _ => "unknown".to_string(),
-        },
+        _ => {
+            match runner.run_output("git", &["-C", &path_arg, "rev-parse", "--short", "HEAD"], checkout_path, &ChannelLabel::Default).await
+            {
+                Ok(output) if output.success && !output.stdout.trim().is_empty() => format!("detached at {}", output.stdout.trim()),
+                _ => "unknown".to_string(),
+            }
+        }
     };
     let local_commits = runner
         .run_output(
             "git",
             &["-C", &path_arg, "rev-list", "--count", "HEAD", "--all", "--not", "--remotes"],
             checkout_path,
-            &ChannelLabel::Noop,
+            &ChannelLabel::Default,
         )
         .await
         .ok()
         .filter(|output| output.success)
         .and_then(|output| output.stdout.trim().parse().ok());
     let uncommitted_entries = runner
-        .run_output("git", &["-C", &path_arg, "status", "--porcelain"], checkout_path, &ChannelLabel::Noop)
+        .run_output("git", &["-C", &path_arg, "status", "--porcelain"], checkout_path, &ChannelLabel::Default)
         .await
         .ok()
         .filter(|output| output.success)
@@ -279,7 +282,7 @@ async fn inspect_pushed(
         .and_then(|status| status.head_sha.value.as_deref())
     {
         let ancestor =
-            runner.run_output("git", &["merge-base", "--is-ancestor", "HEAD", head_sha], checkout_path, &ChannelLabel::Noop).await;
+            runner.run_output("git", &["merge-base", "--is-ancestor", "HEAD", head_sha], checkout_path, &ChannelLabel::Default).await;
         if ancestor.is_ok_and(|output| output.success) {
             return IntegrationCondition::builder()
                 .value(ConditionValue::True)
@@ -289,28 +292,30 @@ async fn inspect_pushed(
         }
     }
 
-    let upstream = match runner.run_output("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], checkout_path, &ChannelLabel::Noop).await {
-        Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-        _ => match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Noop).await {
+    let upstream =
+        match runner.run_output("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], checkout_path, &ChannelLabel::Default).await {
             Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-            Ok(output) => {
-                return IntegrationCondition::builder()
-                    .value(ConditionValue::Unknown)
-                    .details(vec![non_empty_output_or("could not determine upstream for pushed check", &output.stderr)])
-                    .observed_at(observed_at.to_string())
-                    .build();
-            }
-            Err(error) => {
-                return IntegrationCondition::builder()
-                    .value(ConditionValue::Unknown)
-                    .details(vec![format!("could not determine upstream for pushed check: {error}")])
-                    .observed_at(observed_at.to_string())
-                    .build();
-            }
-        },
-    };
+            _ => match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Default).await
+            {
+                Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+                Ok(output) => {
+                    return IntegrationCondition::builder()
+                        .value(ConditionValue::Unknown)
+                        .details(vec![non_empty_output_or("could not determine upstream for pushed check", &output.stderr)])
+                        .observed_at(observed_at.to_string())
+                        .build();
+                }
+                Err(error) => {
+                    return IntegrationCondition::builder()
+                        .value(ConditionValue::Unknown)
+                        .details(vec![format!("could not determine upstream for pushed check: {error}")])
+                        .observed_at(observed_at.to_string())
+                        .build();
+                }
+            },
+        };
     let range = format!("{upstream}..HEAD");
-    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Noop).await {
+    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Default).await {
         Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
             Ok(0) => IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build(),
             Ok(count) => IntegrationCondition::builder()
@@ -357,7 +362,7 @@ async fn inspect_landed(
             vec!["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt,baseRefName,mergeable", "--limit", "1"]
         }
     };
-    match runner.run_output("gh", &args, checkout_path, &ChannelLabel::Noop).await {
+    match runner.run_output("gh", &args, checkout_path, &ChannelLabel::Default).await {
         Ok(output) if output.success => match serde_json::from_str::<serde_json::Value>(&output.stdout) {
             Ok(value) => {
                 let item = match value {
@@ -464,18 +469,20 @@ enum BaseComparison {
 async fn compare_branch_to_base(runner: &dyn CommandRunner, checkout_path: &Path, base_ref: Option<&str>) -> BaseComparison {
     let base_ref = match base_ref {
         Some(base_ref) => base_ref.to_string(),
-        None => match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Noop).await {
-            Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-            Ok(output) => {
-                return BaseComparison::Indeterminate {
-                    detail: non_empty_output_or("the base ref could not be determined", &output.stderr),
-                };
+        None => {
+            match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Default).await {
+                Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+                Ok(output) => {
+                    return BaseComparison::Indeterminate {
+                        detail: non_empty_output_or("the base ref could not be determined", &output.stderr),
+                    };
+                }
+                Err(error) => return BaseComparison::Indeterminate { detail: format!("the base ref could not be determined: {error}") },
             }
-            Err(error) => return BaseComparison::Indeterminate { detail: format!("the base ref could not be determined: {error}") },
-        },
+        }
     };
     let range = format!("{base_ref}..HEAD");
-    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Noop).await {
+    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Default).await {
         Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
             Ok(count) => BaseComparison::Counted { base_ref, count },
             Err(_) => BaseComparison::Indeterminate {

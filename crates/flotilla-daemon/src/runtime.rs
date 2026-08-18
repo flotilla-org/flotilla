@@ -654,7 +654,7 @@ impl ForgeDefaultBranchResolver for GhForgeDefaultBranchResolver {
             return Ok(None);
         }
         let endpoint = format!("repos/{}", forge.repository);
-        let output = self.runner.run("gh", &["api", &endpoint, "--jq", ".default_branch"], Path::new("/"), &ChannelLabel::Noop).await?;
+        let output = self.runner.run("gh", &["api", &endpoint, "--jq", ".default_branch"], Path::new("/"), &ChannelLabel::Default).await?;
         let branch = output.trim();
         Ok((!branch.is_empty()).then(|| branch.to_string()))
     }
@@ -1760,10 +1760,12 @@ fn spawn_controller_loops(
                     let namespace_string = namespace_string.clone();
                     let state = Arc::clone(&state);
                     async move {
+                        let local_host_ref = state.local_host_ref.clone();
                         ControllerLoop {
                             primary: backend.clone().using::<Environment>(&namespace_string),
                             secondaries: vec![],
-                            reconciler: EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state })),
+                            reconciler: EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }))
+                                .with_local_host_ref(local_host_ref),
                             resync_interval: controller_resync_interval,
                             backend,
                         }
@@ -1854,6 +1856,7 @@ fn spawn_controller_loops(
                     let namespace_string = namespace_string.clone();
                     let state = Arc::clone(&state);
                     async move {
+                        let local_host_ref = state.local_host_ref.clone();
                         ControllerLoop {
                             primary: backend.clone().using::<flotilla_resources::TerminalSession>(&namespace_string),
                             secondaries: vec![],
@@ -1862,6 +1865,7 @@ fn spawn_controller_loops(
                                 backend.clone(),
                                 &namespace_string,
                             )
+                            .with_local_host_ref(local_host_ref)
                             .with_federated_convoys(&backend, &namespace_string),
                             resync_interval: controller_resync_interval,
                             backend,
@@ -2289,7 +2293,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         }
         for delivery in &material_deliveries {
             let args = delivery.preflight.args.iter().map(String::as_str).collect::<Vec<_>>();
-            if let Err(error) = handle.runner().run(&delivery.preflight.command, &args, Path::new("/"), &ChannelLabel::Noop).await {
+            if let Err(error) = handle.runner().run(&delivery.preflight.command, &args, Path::new("/"), &ChannelLabel::Default).await {
                 return Err(DockerProvisioningError::Failed(
                     discard_failed_environment(
                         &handle,
@@ -2550,7 +2554,7 @@ async fn recover_existing_clone(
 
 async fn verify_clone_origin(runner: &dyn CommandRunner, repo_url: &str, target_path: &str, target_label: &str) -> Result<(), String> {
     let origin = runner
-        .run("git", &["-C", target_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop)
+        .run("git", &["-C", target_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Default)
         .await
         .map_err(|error| format!("{target_label} {target_path} already exists but is not a reusable clone: {error}"))?;
     let origin = origin.trim();
@@ -2627,27 +2631,27 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         let local_ref = format!("refs/heads/{branch}");
         let remote_ref = format!("refs/remotes/origin/{branch}");
         let local_exists = runner
-            .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_ref], Path::new("/"), &ChannelLabel::Noop)
+            .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_ref], Path::new("/"), &ChannelLabel::Default)
             .await
             .is_ok();
         if !local_exists
-            && runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop).await.is_ok()
+            && runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Default).await.is_ok()
         {
             let remote_head = format!("refs/heads/{branch}");
             let advertised = runner
-                .run("git", &["-C", clone_path, "ls-remote", "--heads", "origin", &remote_head], Path::new("/"), &ChannelLabel::Noop)
+                .run("git", &["-C", clone_path, "ls-remote", "--heads", "origin", &remote_head], Path::new("/"), &ChannelLabel::Default)
                 .await
                 .map_err(|error| format!("inspect remote convoy branch {branch}: {error}"))?;
             if !advertised.trim().is_empty() {
                 let refspec = format!("{remote_head}:refs/remotes/origin/{branch}");
                 runner
-                    .run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Noop)
+                    .run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|error| format!("fetch convoy branch {branch}: {error}"))?;
             }
         }
         let remote_exists = runner
-            .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
+            .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Default)
             .await
             .is_ok();
         let branch_provenance = if !local_exists && !remote_exists && base_ref.is_some() {
@@ -2660,7 +2664,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             // Multiple vessels can intentionally share the convoy branch. `--force`
             // overrides Git's protection against attaching it to another worktree.
             runner
-                .run("git", &["-C", clone_path, "worktree", "add", "--force", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
+                .run("git", &["-C", clone_path, "worktree", "add", "--force", target_path, branch], Path::new("/"), &ChannelLabel::Default)
                 .await?;
         } else if remote_exists {
             runner
@@ -2668,20 +2672,25 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     "git",
                     &["-C", clone_path, "worktree", "add", "-b", branch, "--track", target_path, &format!("origin/{branch}")],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await?;
         } else if let Some(base_ref) = base_ref {
             let local_base_ref = format!("refs/heads/{base_ref}");
             let remote_base_ref = format!("refs/remotes/origin/{base_ref}");
             let resolved_base_ref = if runner
-                .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_base_ref], Path::new("/"), &ChannelLabel::Noop)
+                .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_base_ref], Path::new("/"), &ChannelLabel::Default)
                 .await
                 .is_ok()
             {
                 base_ref.to_string()
             } else if runner
-                .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_base_ref], Path::new("/"), &ChannelLabel::Noop)
+                .run(
+                    "git",
+                    &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_base_ref],
+                    Path::new("/"),
+                    &ChannelLabel::Default,
+                )
                 .await
                 .is_ok()
             {
@@ -2694,12 +2703,12 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     "git",
                     &["-C", clone_path, "worktree", "add", "-b", branch, target_path, &resolved_base_ref],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await?;
         } else {
             runner
-                .run("git", &["-C", clone_path, "worktree", "add", "--detach", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
+                .run("git", &["-C", clone_path, "worktree", "add", "--detach", target_path, branch], Path::new("/"), &ChannelLabel::Default)
                 .await?;
         }
 
@@ -2709,7 +2718,12 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             // can share it and may finalize in either order.
             let commit = commit.as_deref().ok_or_else(|| format!("resolve bootstrap commit for {branch}"))?;
             runner
-                .run("git", &["-C", clone_path, "update-ref", &bootstrap_branch_ref(branch), commit], Path::new("/"), &ChannelLabel::Noop)
+                .run(
+                    "git",
+                    &["-C", clone_path, "update-ref", &bootstrap_branch_ref(branch), commit],
+                    Path::new("/"),
+                    &ChannelLabel::Default,
+                )
                 .await?;
         }
         Ok(PreparedCheckout { commit, branch_provenance })
@@ -2732,14 +2746,21 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         let clone_ref = base_ref.unwrap_or(branch);
         let prepare = async {
             if clone_ref == "HEAD" {
-                runner.run("git", &["clone", repo_url, &staging_path], Path::new("/"), &ChannelLabel::Noop).await?;
+                runner.run("git", &["clone", repo_url, &staging_path], Path::new("/"), &ChannelLabel::Default).await?;
             } else {
-                runner.run("git", &["clone", "--branch", clone_ref, repo_url, &staging_path], Path::new("/"), &ChannelLabel::Noop).await?;
+                runner
+                    .run("git", &["clone", "--branch", clone_ref, repo_url, &staging_path], Path::new("/"), &ChannelLabel::Default)
+                    .await?;
             }
             if clone_ref != branch {
                 let remote_ref = format!("refs/remotes/origin/{branch}");
                 let remote_exists = runner
-                    .run("git", &["-C", &staging_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
+                    .run(
+                        "git",
+                        &["-C", &staging_path, "show-ref", "--verify", "--quiet", &remote_ref],
+                        Path::new("/"),
+                        &ChannelLabel::Default,
+                    )
                     .await
                     .is_ok();
                 if remote_exists {
@@ -2748,11 +2769,11 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                             "git",
                             &["-C", &staging_path, "switch", "-c", branch, "--track", &format!("origin/{branch}")],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                         )
                         .await?;
                 } else {
-                    runner.run("git", &["-C", &staging_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Noop).await?;
+                    runner.run("git", &["-C", &staging_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Default).await?;
                 }
             }
             resolve_head_commit(&*runner, &staging_path).await
@@ -2822,27 +2843,27 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                         "git",
                         &["-C", clone_path, "worktree", "remove", "--force", target_path],
                         Path::new("/"),
-                        &ChannelLabel::Noop,
+                        &ChannelLabel::Default,
                     )
                     .await?;
                 if !remove.success && !remove.stderr.contains("is not a working tree") {
                     return Err(remove.stderr);
                 }
                 remove_checkout_path(&*runner, target_path).await?;
-                runner.run("git", &["-C", clone_path, "worktree", "prune"], Path::new("/"), &ChannelLabel::Noop).await?;
+                runner.run("git", &["-C", clone_path, "worktree", "prune"], Path::new("/"), &ChannelLabel::Default).await?;
                 remove_empty_checkout_parents(clone_path, target_path).await?;
 
                 let branch_ref = format!("refs/heads/{branch}");
                 let bootstrap_ref = bootstrap_branch_ref(branch);
                 let head = runner
-                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &branch_ref], Path::new("/"), &ChannelLabel::Noop)
+                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &branch_ref], Path::new("/"), &ChannelLabel::Default)
                     .await?;
                 if !head.success {
                     delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
                     return Ok(CheckoutRemovalOutcome::Removed);
                 }
                 let bootstrap = runner
-                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &bootstrap_ref], Path::new("/"), &ChannelLabel::Noop)
+                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &bootstrap_ref], Path::new("/"), &ChannelLabel::Default)
                     .await?;
                 if !bootstrap.success {
                     return Ok(CheckoutRemovalOutcome::PreservedBranch {
@@ -2858,8 +2879,9 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     });
                 }
 
-                let worktrees =
-                    runner.run("git", &["-C", clone_path, "worktree", "list", "--porcelain"], Path::new("/"), &ChannelLabel::Noop).await?;
+                let worktrees = runner
+                    .run("git", &["-C", clone_path, "worktree", "list", "--porcelain"], Path::new("/"), &ChannelLabel::Default)
+                    .await?;
                 if worktrees.lines().any(|line| line == format!("branch {branch_ref}")) {
                     return Ok(CheckoutRemovalOutcome::PreservedBranch {
                         branch: branch.clone(),
@@ -2868,7 +2890,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 }
 
                 runner
-                    .run("git", &["-C", clone_path, "branch", "--delete", "--force", branch], Path::new("/"), &ChannelLabel::Noop)
+                    .run("git", &["-C", clone_path, "branch", "--delete", "--force", branch], Path::new("/"), &ChannelLabel::Default)
                     .await?;
                 delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
@@ -2888,21 +2910,21 @@ async fn recover_existing_worktree(
     }
 
     let target_common_dir = runner
-        .run("git", &["-C", target_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Noop)
+        .run("git", &["-C", target_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Default)
         .await
         .map_err(|error| format!("checkout target {target_path} already exists but is not a reusable git worktree: {error}"))?;
     let clone_common_dir = runner
-        .run("git", &["-C", clone_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Noop)
+        .run("git", &["-C", clone_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Default)
         .await?;
     if target_common_dir.trim() != clone_common_dir.trim() {
         return Err(format!("checkout target {target_path} already exists but belongs to a different git repository"));
     }
 
     let current_branch =
-        runner.run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Noop).await;
+        runner.run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Default).await;
     if current_branch.as_deref().map(str::trim) != Ok(branch) {
         let target_commit = resolve_head_commit(runner, target_path).await?;
-        let expected_commit = runner.run("git", &["-C", clone_path, "rev-parse", branch], Path::new("/"), &ChannelLabel::Noop).await?;
+        let expected_commit = runner.run("git", &["-C", clone_path, "rev-parse", branch], Path::new("/"), &ChannelLabel::Default).await?;
         if target_commit.as_deref() != Some(expected_commit.trim()) {
             return Err(format!("checkout target {target_path} already exists at a different ref than {branch}"));
         }
@@ -2913,7 +2935,7 @@ async fn recover_existing_worktree(
             "git",
             &["-C", clone_path, "show-ref", "--verify", "--quiet", &bootstrap_branch_ref(branch)],
             Path::new("/"),
-            &ChannelLabel::Noop,
+            &ChannelLabel::Default,
         )
         .await
         .is_ok()
@@ -2939,7 +2961,7 @@ async fn recover_existing_fresh_clone(
 
     if branch != "HEAD" {
         let current_branch = runner
-            .run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Noop)
+            .run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Default)
             .await
             .map_err(|error| format!("checkout target {target_path} already exists but its branch cannot be resolved: {error}"))?;
         if current_branch.trim() != branch {
@@ -2958,14 +2980,14 @@ fn bootstrap_branch_ref(branch: &str) -> String {
 }
 
 async fn delete_ref(runner: &dyn CommandRunner, clone_path: &str, reference: &str) -> Result<(), String> {
-    runner.run("git", &["-C", clone_path, "update-ref", "-d", reference], Path::new("/"), &ChannelLabel::Noop).await?;
+    runner.run("git", &["-C", clone_path, "update-ref", "-d", reference], Path::new("/"), &ChannelLabel::Default).await?;
     Ok(())
 }
 
 async fn remove_checkout_path(runner: &dyn CommandRunner, target_path: &str) -> Result<(), String> {
-    runner.run("rm", &["-rf", target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+    runner.run("rm", &["-rf", target_path], Path::new("/"), &ChannelLabel::Default).await?;
     for predicate in ["-e", "-L"] {
-        let remaining = runner.run_output("test", &[predicate, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+        let remaining = runner.run_output("test", &[predicate, target_path], Path::new("/"), &ChannelLabel::Default).await?;
         if remaining.success {
             return Err(format!("checkout cleanup reported success but path remains: {target_path}"));
         }
@@ -3007,7 +3029,7 @@ async fn remove_empty_checkout_parents(clone_path: &str, target_path: &str) -> R
 }
 
 async fn resolve_head_commit(runner: &dyn CommandRunner, path: &str) -> Result<Option<String>, String> {
-    let commit = runner.run("git", &["-C", path, "rev-parse", "HEAD"], Path::new("/"), &ChannelLabel::Noop).await?;
+    let commit = runner.run("git", &["-C", path, "rev-parse", "HEAD"], Path::new("/"), &ChannelLabel::Default).await?;
     Ok(Some(commit.trim().to_string()))
 }
 
@@ -3570,7 +3592,7 @@ mod tests {
             .with_checkouts(backend.clone().using::<ResourceCheckout>(NAMESPACE))
             .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(Arc::clone(&daemon))));
         let convoy = convoys.get("raced").await.expect("get convoy");
-        let deps = reconciler.fetch_dependencies(&convoy).await.expect("fetch dependencies");
+        let deps = reconciler.prepare(&convoy).await.expect("fetch dependencies");
         let outcome = reconciler.reconcile(&convoy, &deps, Utc::now());
 
         assert!(
@@ -5797,6 +5819,8 @@ mod tests {
         let convoys = kiwi.resource_backend().using::<Convoy>(NAMESPACE);
         let convoy = convoys
             .create(&empty_meta("remote-placement"), &ConvoySpec {
+                role: String::new(),
+                generation: 1,
                 workflow_ref: workflow_name.to_string(),
                 dispatching_principal_ref: Default::default(),
                 inputs: BTreeMap::new(),
@@ -6830,7 +6854,7 @@ mod tests {
             NAMESPACE,
         )
         .with_federated_convoys(&checkout_host, NAMESPACE);
-        let dependencies = observer.fetch_dependencies(&checkout).await.expect("observe integration on checkout authority");
+        let dependencies = observer.prepare(&checkout).await.expect("observe integration on checkout authority");
         let observation = observer.reconcile(&checkout, &dependencies, chrono::Utc::now());
         let patch = observation.patch.expect("Landing observation should update checkout evidence");
         flotilla_resources::apply_status_patch(&checkouts, "checkout-b", &patch).await.expect("persist authority-local observation");
@@ -6866,7 +6890,7 @@ mod tests {
                 authority_daemon.change_request_stale_after(),
             )
             .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(authority_daemon)));
-        let dependencies = reconciler.fetch_dependencies(&current).await.expect("consume replicated checkout evidence");
+        let dependencies = reconciler.prepare(&current).await.expect("consume replicated checkout evidence");
         let outcome = reconciler.reconcile(&current, &dependencies, chrono::Utc::now());
         let patch = outcome.patch.expect("fresh replicated evidence should settle the convoy");
         flotilla_resources::apply_status_patch(&convoys, "cross-host", &patch).await.expect("persist Landed phase");
@@ -7295,26 +7319,38 @@ mod tests {
         backend
             .clone()
             .using::<Convoy>(NAMESPACE)
-            .create(&empty_meta("convoy-a"), &ConvoySpec {
-                workflow_ref: "wf-a".to_string(),
-                dispatching_principal_ref: Default::default(),
-                inputs: BTreeMap::new(),
-                placement_policy: Some(format!("host-direct-{host_id}")),
-                repositories: vec![ConvoyRepositorySpec {
-                    url: "https://github.com/flotilla-org/flotilla.git".to_string(),
-                    repo_ref: repository_key,
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: repository_spec.leaf_slug(),
-                    subpaths: Vec::new(),
-                }],
-                r#ref: Some("main".to_string()),
-                project_ref: None,
-                adopted_checkout_refs: BTreeMap::new(),
-                issues: Vec::new(),
-                change_request: None,
-                instruction: None,
-            })
+            .create(
+                &InputMeta::builder()
+                    .name("convoy-a".to_string())
+                    .labels(BTreeMap::from([
+                        (flotilla_resources::PROJECT_LABEL.to_string(), "test".to_string()),
+                        (flotilla_resources::ROLE_LABEL.to_string(), "convoy-a".to_string()),
+                        (flotilla_resources::GENERATION_LABEL.to_string(), "1".to_string()),
+                    ]))
+                    .build(),
+                &ConvoySpec {
+                    role: "convoy-a".to_string(),
+                    generation: 1,
+                    workflow_ref: "wf-a".to_string(),
+                    dispatching_principal_ref: Default::default(),
+                    inputs: BTreeMap::new(),
+                    placement_policy: Some(format!("host-direct-{host_id}")),
+                    repositories: vec![ConvoyRepositorySpec {
+                        url: "https://github.com/flotilla-org/flotilla.git".to_string(),
+                        repo_ref: repository_key,
+                        source_ref: "main".to_string(),
+                        target_ref: "main".to_string(),
+                        workspace_slug: repository_spec.leaf_slug(),
+                        subpaths: Vec::new(),
+                    }],
+                    r#ref: Some("main".to_string()),
+                    project_ref: Some("test".to_string()),
+                    adopted_checkout_refs: BTreeMap::new(),
+                    issues: Vec::new(),
+                    change_request: None,
+                    instruction: None,
+                },
+            )
             .await
             .expect("convoy create should succeed");
 
@@ -7395,7 +7431,7 @@ mod tests {
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::ConvoyWorkForceComplete {
-                    convoy: "convoy-a".to_string(),
+                    convoy: "convoy-a@test".to_string(),
                     work: "implement".to_string(),
                     message: Some(match completion_action {
                         CompletionAction::Delete => "https://github.com/flotilla-org/flotilla/pull/884".to_string(),
@@ -7460,6 +7496,21 @@ mod tests {
         Fut: std::future::Future<Output = bool>,
     {
         wait_until_with_timeout(Duration::from_secs(5), condition).await;
+    }
+
+    async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
+        backend
+            .clone()
+            .using::<Convoy>(NAMESPACE)
+            .list_matching_labels(&BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), role.to_string())]))
+            .await
+            .expect("list convoy by role")
+            .items
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("convoy role {role}"))
+            .metadata
+            .name
     }
 
     async fn wait_until_with_timeout<F, Fut>(timeout: Duration, mut condition: F)
@@ -8380,11 +8431,13 @@ mod tests {
         assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "crew-convoy".to_string() });
 
         let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        let crew_record = convoy_record_name(&backend, "crew-convoy").await;
         wait_until(|| {
             let convoys = convoys.clone();
+            let crew_record = crew_record.clone();
             async move {
                 matches!(
-                    convoys.get("crew-convoy").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                    convoys.get(&crew_record).await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Active
                             && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
@@ -8435,7 +8488,7 @@ mod tests {
             ("reviewer", "latent"),
             ("watcher", "active")
         ]);
-        let initial_status = convoys.get("crew-convoy").await.expect("crew convoy").status.expect("convoy status");
+        let initial_status = convoys.get(&crew_record).await.expect("crew convoy").status.expect("convoy status");
         assert_eq!(initial_status.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
         // The reviewer is latent above and has no terminal session yet, so the
         // convoy status has to agree rather than report a crew member that was
@@ -8526,14 +8579,15 @@ mod tests {
         drop(delivered);
         wait_until(|| {
             let convoys = convoys.clone();
+            let crew_record = crew_record.clone();
             async move {
-                convoys.get("crew-convoy").await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
+                convoys.get(&crew_record).await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
                     status.phase == ConvoyPhase::Active && status.work.get("implement").is_some_and(|work| work.phase == WorkPhase::Running)
                 })
             }
         })
         .await;
-        let reopened = convoys.get("crew-convoy").await.expect("reopened convoy").status.expect("reopened status");
+        let reopened = convoys.get(&crew_record).await.expect("reopened convoy").status.expect("reopened status");
         assert_eq!(reopened.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
         assert_eq!(reopened.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::HandedBack);
 
@@ -8594,8 +8648,9 @@ mod tests {
         .await;
         wait_until(|| {
             let convoys = convoys.clone();
+            let crew_record = crew_record.clone();
             async move {
-                convoys.get("crew-convoy").await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
+                convoys.get(&crew_record).await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
                     status.phase == ConvoyPhase::Active
                         && status.work["implement"].phase == WorkPhase::Running
                         && status.crew_work["implement"]["coder"].phase == flotilla_resources::CrewWorkPhase::Working
@@ -8635,7 +8690,7 @@ mod tests {
         let [flotilla_protocol::ResolvedAttachAction::Command(args)] = attach.plan.0.as_slice() else {
             panic!("expected one local attach command, got {:?}", attach.plan);
         };
-        assert!(flotilla_protocol::arg::flatten(args, 0).contains("attach terminal-crew-convoy-implement-coder"));
+        assert!(flotilla_protocol::arg::flatten(args, 0).contains(&format!("attach {}", revived_coder.metadata.name)));
 
         let mut rx = daemon.subscribe();
         let coder_recomplete_id = daemon
@@ -8671,7 +8726,14 @@ mod tests {
 
         let mut rx = daemon.subscribe();
         let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
-        let checkout = checkouts.get("adopted-checkout-crew-convoy").await.expect("adopted checkout");
+        let checkout = checkouts
+            .list()
+            .await
+            .expect("checkout list")
+            .items
+            .into_iter()
+            .find(|checkout| checkout.metadata.lifecycle_authority().ok().flatten() == Some(LifecycleAuthority::Adopted))
+            .expect("adopted checkout");
         let mut integration = checkout.status.expect("checkout status").integration;
         integration.landed = flotilla_resources::IntegrationCondition::builder()
             .value(flotilla_resources::ConditionValue::True)
@@ -8701,9 +8763,10 @@ mod tests {
         assert_eq!(wait_for_command_result(&mut rx, final_review_id).await, CommandValue::Ok);
         wait_until(|| {
             let convoys = convoys.clone();
+            let crew_record = crew_record.clone();
             async move {
                 convoys
-                    .get("crew-convoy")
+                    .get(&crew_record)
                     .await
                     .ok()
                     .and_then(|convoy| convoy.status)
@@ -8711,7 +8774,7 @@ mod tests {
             }
         })
         .await;
-        let completed = convoys.get("crew-convoy").await.expect("completed convoy").status.expect("completed status");
+        let completed = convoys.get(&crew_record).await.expect("completed convoy").status.expect("completed status");
         assert_eq!(completed.work["implement"].phase, WorkPhase::Complete);
         assert!(completed.crew_work["implement"].values().all(|state| state.phase == flotilla_resources::CrewWorkPhase::Done));
 
@@ -8848,12 +8911,43 @@ mod tests {
             .expect("convoy create command should start");
         assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
 
+        let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
+        let checkout_count = checkouts.list().await.expect("list adopted checkouts").items.len();
+        let duplicate_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyCreate {
+                    name: "convoy-adopted".to_string(),
+                    workflow_ref: "wf-a".to_string(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: Some(format!("host-direct-{host_id}")),
+                    adopted_checkout: Some(Box::new(repo.clone())),
+                },
+            })
+            .await
+            .expect("duplicate convoy create command should start");
+        assert_eq!(wait_for_command_result(&mut rx, duplicate_id).await, CommandValue::Error {
+            message: "live convoy convoy-adopted generation 1 already exists".to_string()
+        });
+        assert_eq!(
+            checkouts.list().await.expect("list adopted checkouts after duplicate").items.len(),
+            checkout_count,
+            "a rejected duplicate must not persist an orphan adopted checkout"
+        );
+
         let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        let adopted_record = convoy_record_name(&backend, "convoy-adopted").await;
         wait_until(|| {
             let convoys = convoys.clone();
+            let adopted_record = adopted_record.clone();
             async move {
                 matches!(
-                    convoys.get("convoy-adopted").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                    convoys.get(&adopted_record).await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Active
                             && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
@@ -8882,9 +8976,10 @@ mod tests {
 
         wait_until(|| {
             let convoys = convoys.clone();
+            let adopted_record = adopted_record.clone();
             async move {
                 matches!(
-                    convoys.get("convoy-adopted").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                    convoys.get(&adopted_record).await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Landed
                             && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
@@ -8896,11 +8991,15 @@ mod tests {
         let checkout = backend
             .clone()
             .using::<ResourceCheckout>(NAMESPACE)
-            .get("adopted-checkout-convoy-adopted")
+            .list()
             .await
+            .expect("list adopted checkouts")
+            .items
+            .into_iter()
+            .find(|checkout| checkout.metadata.lifecycle_authority().ok().flatten() == Some(LifecycleAuthority::Adopted))
             .expect("adopted checkout should remain after completion");
         assert_eq!(checkout.metadata.lifecycle_authority().expect("authority should parse"), Some(LifecycleAuthority::Adopted));
-        assert!(backend.clone().using::<ResourceCheckout>(NAMESPACE).get("checkout-convoy-adopted-implement").await.is_err());
+        assert_eq!(backend.clone().using::<ResourceCheckout>(NAMESPACE).list().await.expect("checkout list").items.len(), 1);
 
         for handle in controller_handles {
             handle.abort();

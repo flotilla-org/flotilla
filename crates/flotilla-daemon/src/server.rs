@@ -24,7 +24,9 @@ use std::{
 use flotilla_core::{
     agents::SharedAgentStateStore, config::ConfigStore, in_process::InProcessDaemon, providers::discovery::DiscoveryRuntime,
 };
-use flotilla_protocol::{ConfigLabel, ConnectionRole, EnvironmentId, GoodbyeReason, HostName, Message, NodeId, PROTOCOL_VERSION};
+use flotilla_protocol::{
+    ConfigLabel, ConnectionRole, EnvironmentId, GoodbyeReason, HostName, Message, NodeId, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION,
+};
 use flotilla_resources::{ResourceBackend, SqliteBackend};
 use flotilla_transport::message::{unix_message_session_with_prefix, MessageSession};
 use tokio::{
@@ -732,7 +734,7 @@ async fn handle_client_session(
                     .write(Message::Hello {
                         protocol_version: PROTOCOL_VERSION,
                         node_id: daemon.node_id().clone(),
-                        display_name: flotilla_protocol::hello_display_name(daemon.host_name().as_str(), BUILD_ID),
+                        display_name: flotilla_protocol::hello_display_name(daemon.host_name().as_str(), BUILD_ID, PROTOCOL_FINGERPRINT),
                         session_id: daemon.session_id(),
                         connection_role: Some(ConnectionRole::Client),
                         surface: None,
@@ -742,17 +744,21 @@ async fn handle_client_session(
                 {
                     return;
                 }
-                let client_generation = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
+                let client_info = flotilla_protocol::hello_build_info(&display_name);
+                let client_build = client_info.map_or("unknown", |info| info.build_id);
+                let client_fingerprint = client_info.map_or("unknown", |info| info.protocol_fingerprint);
                 if protocol_version != PROTOCOL_VERSION {
                     warn!(expected = PROTOCOL_VERSION, got = protocol_version, %node_id, "rejecting client with protocol version mismatch");
                     return;
                 }
-                if !flotilla_protocol::wire_generations_match(client_generation, BUILD_ID) {
+                if client_fingerprint != PROTOCOL_FINGERPRINT {
                     warn!(
-                        expected = BUILD_ID,
-                        got = client_generation,
+                        expected_fingerprint = PROTOCOL_FINGERPRINT,
+                        got_fingerprint = client_fingerprint,
+                        expected_build = BUILD_ID,
+                        got_build = client_build,
                         %node_id,
-                        "restricting client with wire generation mismatch to shutdown"
+                        "restricting client with protocol fingerprint mismatch to shutdown"
                     );
                     run_shutdown_only_session(&session, &shutdown_request_tx, &mut shutdown_rx).await;
                     return;
@@ -797,13 +803,16 @@ async fn run_shutdown_only_session(
             match message {
                 Ok(Some(Message::Request { id, request: flotilla_protocol::Request::Shutdown })) => {
                     if session.write(Message::ok_response(id, flotilla_protocol::Response::Shutdown)).await.is_ok() {
-                        info!("graceful shutdown requested by same-protocol client from a different build");
+                        info!("graceful shutdown requested by same-version client with a different protocol fingerprint");
                         let _ = shutdown_request_tx.send(());
                     }
                 }
                 Ok(Some(Message::Request { id, .. })) => {
                     let _ = session
-                        .write(Message::error_response(id, "wire generation mismatch: only daemon shutdown is available across builds"))
+                        .write(Message::error_response(
+                            id,
+                            "protocol fingerprint mismatch: only daemon shutdown is available",
+                        ))
                         .await;
                 }
                 Ok(Some(other)) => warn!(msg = ?other, "unexpected message from shutdown-only client"),

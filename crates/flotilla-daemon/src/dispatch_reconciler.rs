@@ -559,6 +559,8 @@ mod tests {
             .clone()
             .using::<Convoy>(NAMESPACE)
             .create(&InputMeta::builder().name("human-dispatch".to_string()).build(), &ConvoySpec {
+                role: String::new(),
+                generation: 1,
                 workflow_ref: "review-and-fix".to_string(),
                 dispatching_principal_ref: Default::default(),
                 inputs: BTreeMap::<String, InputValue>::new(),
@@ -620,6 +622,8 @@ mod tests {
             .clone()
             .using::<Convoy>(NAMESPACE)
             .create(&InputMeta::builder().name("missing-workflow-dispatch".to_string()).build(), &ConvoySpec {
+                role: String::new(),
+                generation: 1,
                 workflow_ref: "deleted-workflow".to_string(),
                 dispatching_principal_ref: Default::default(),
                 inputs: BTreeMap::<String, InputValue>::new(),

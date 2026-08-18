@@ -1,10 +1,16 @@
 use std::collections::HashMap;
 
 use flotilla_protocol::{
-    DaemonEvent, EnvironmentId, HostName, HostSnapshot, HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey,
+    CommandValue, DaemonEvent, EnvironmentId, HostName, HostSnapshot, HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey,
 };
 
-use super::{event_stream_seq, format_event_human};
+use super::{event_stream_seq, format_command_result, format_event_human};
+
+#[test]
+fn replaced_pending_brief_echoes_the_displaced_text() {
+    let output = format_command_result(&CommandValue::ConvoyBriefQueued { displaced: Some("older instruction".to_string()) });
+    assert_eq!(output, "pending brief replaced; displaced brief:\nolder instruction");
+}
 
 #[test]
 fn host_snapshot_formats_and_exposes_its_stream() {
