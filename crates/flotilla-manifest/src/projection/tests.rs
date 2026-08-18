@@ -93,7 +93,7 @@ fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
 
 #[test]
 fn long_entity_labels_publish_stable_semantic_tiers() {
-    let reference = convoy_ref("dev", "grouping-live-session");
+    let reference = convoy_ref("dev", "convoy-0123456789abcdef");
     let convoy = ConvoyRow::builder()
         .resource(reference.clone())
         .name("grouping-live-session")
@@ -103,8 +103,8 @@ fn long_entity_labels_publish_stable_semantic_tiers() {
         .vessels(vec![vessel().convoy(&reference).name("publish-release-notes").phase(WorkPhase::Running).call()])
         .build();
     let independent = IndependentRow::builder()
-        .resource(ResourceRef::new("flotilla/v1", "TerminalSession", "dev", "andamento-project-governor").on_host(HostName::new("feta")))
-        .name("andamento-project-governor")
+        .resource(ResourceRef::new("flotilla/v1", "TerminalSession", "dev", "governor").on_host(HostName::new("feta")))
+        .name("governor")
         .host(HostName::new("feta"))
         .phase(SessionPhase::Running)
         .build();
@@ -118,7 +118,7 @@ fn long_entity_labels_publish_stable_semantic_tiers() {
         (entity::project("dev", "platform-observability-tools", "kiwi"), "platform-observability-tools", "po-tools", "pot"),
         (entity::convoy("dev", "grouping-live-session", "kiwi"), "grouping-live-session", "gl-session", "gls"),
         (entity::vessel("dev", "grouping-live-session", "publish-release-notes", "feta"), "publish-release-notes", "pr-notes", "prn"),
-        (entity::session("feta/dev/andamento-project-governor"), "andamento-project-governor", "ap-governor", "apg"),
+        (entity::session("feta/dev/governor"), "governor", "governor", "g"),
     ];
     for (entity, full, medium, short) in cases {
         let patch = find_entity(&first, &entity);
