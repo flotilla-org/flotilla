@@ -8,8 +8,9 @@ use crate::{
     entity,
     keys::{
         KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY, KEY_CONVOY_NAME, KEY_COUNT_CHECKOUTS,
-        KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_DISPLAY_LABEL, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_PRIMARY_ACTION_RECIPE,
-        KEY_PRIMARY_ACTION_TARGET, KEY_SOURCE, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL, SEGMENT_PROJECT, SEGMENT_REPO,
+        KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID,
+        KEY_ENTITY_KIND, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET, KEY_SOURCE, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL,
+        SEGMENT_PROJECT, SEGMENT_REPO,
     },
     recipe::FlotillaRecipes,
 };
@@ -91,6 +92,43 @@ fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
 }
 
 #[test]
+fn long_entity_labels_publish_stable_semantic_tiers() {
+    let reference = convoy_ref("dev", "grouping-live-session");
+    let convoy = ConvoyRow::builder()
+        .resource(reference.clone())
+        .name("grouping-live-session")
+        .workflow_ref("implement")
+        .phase(ConvoyPhase::Active)
+        .project_ref("project/dev/platform-observability-tools")
+        .vessels(vec![vessel().convoy(&reference).name("publish-release-notes").phase(WorkPhase::Running).call()])
+        .build();
+    let independent = IndependentRow::builder()
+        .resource(ResourceRef::new("flotilla/v1", "TerminalSession", "dev", "andamento-project-governor").on_host(HostName::new("feta")))
+        .name("andamento-project-governor")
+        .host(HostName::new("feta"))
+        .phase(SessionPhase::Running)
+        .build();
+
+    let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[independent] }, &mint());
+    let first = catalog.reassert_patches();
+    let second = catalog.reassert_patches();
+    assert_eq!(first, second, "re-assertion must reuse the same label facts");
+
+    let cases = [
+        (entity::project("dev", "platform-observability-tools", "kiwi"), "platform-observability-tools", "po-tools", "pot"),
+        (entity::convoy("dev", "grouping-live-session", "kiwi"), "grouping-live-session", "gl-session", "gls"),
+        (entity::vessel("dev", "grouping-live-session", "publish-release-notes", "feta"), "publish-release-notes", "pr-notes", "prn"),
+        (entity::session("feta/dev/andamento-project-governor"), "andamento-project-governor", "ap-governor", "apg"),
+    ];
+    for (entity, full, medium, short) in cases {
+        let patch = find_entity(&first, &entity);
+        assert_eq!(text(patch, KEY_DISPLAY_LABEL), full);
+        assert_eq!(text(patch, KEY_DISPLAY_LABEL_MEDIUM), medium);
+        assert_eq!(text(patch, KEY_DISPLAY_LABEL_SHORT), short);
+    }
+}
+
+#[test]
 fn awareness_issues_are_recipe_less_entities_with_source_plus_id_identity() {
     let issue_ref = IssueRef {
         source: IssueSource { service: "https://github.com".to_owned(), scope: "flotilla-org/flotilla".to_owned() },
@@ -126,6 +164,8 @@ fn awareness_issues_are_recipe_less_entities_with_source_plus_id_identity() {
     );
     assert!(!issue_patch.set.contains_key(KEY_COUNT_ISSUES));
     assert!(!issue_patch.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
+    assert!(!issue_patch.set.contains_key(KEY_DISPLAY_LABEL_MEDIUM));
+    assert!(!issue_patch.set.contains_key(KEY_DISPLAY_LABEL_SHORT));
 }
 
 #[test]
@@ -166,6 +206,8 @@ fn awareness_composed_text_is_unchanged_alongside_granular_facts() {
     let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
     let convoy = find_entity(&patches, &entity::convoy("dev", "landing", "fleet"));
     assert_eq!(text(convoy, KEY_DISPLAY_LABEL), "landing · PR #1044");
+    assert_eq!(text(convoy, KEY_DISPLAY_LABEL_MEDIUM), "landing");
+    assert_eq!(text(convoy, KEY_DISPLAY_LABEL_SHORT), "l");
     assert_eq!(text(convoy, KEY_SUMMARY_TEXT), "landing · PR #1044");
     assert_eq!(text(convoy, KEY_CONVOY_NAME), "landing");
     assert_eq!(text(convoy, KEY_CHANGE_REQUEST_NUMBER), "1044");
