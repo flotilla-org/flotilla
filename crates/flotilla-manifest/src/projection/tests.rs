@@ -339,7 +339,10 @@ fn awareness_repository_group_does_not_masquerade_as_project() {
     let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
 
     find_entity(&patches, &entity::repo("flotilla-org/flotilla"));
-    find_entity(&patches, &entity::session("independent/dev/governor"));
+    let independent = find_entity(&patches, &entity::session("independent/dev/governor"));
+    assert_eq!(text(independent, KEY_DISPLAY_LABEL), "governor");
+    assert_eq!(text(independent, KEY_DISPLAY_LABEL_MEDIUM), "governor");
+    assert_eq!(text(independent, KEY_DISPLAY_LABEL_SHORT), "g");
     assert!(
         patches.iter().all(|patch| !matches!(&patch.target, MetadataTarget::Entity(entity) if entity.kind == "project")),
         "repository-only awareness must not mint a project entity"
