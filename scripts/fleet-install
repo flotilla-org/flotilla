@@ -732,7 +732,15 @@ prepare_linux_daemon_service() {
   command -v loginctl >/dev/null || die 'cannot install flotillad.service: loginctl is not available'
   command -v systemctl >/dev/null || die 'cannot install flotillad.service: systemctl is not available'
   write_systemd_user_unit
-  loginctl enable-linger "$(id -un)"
+  # Re-enabling linger can be denied by polkit outside a login session even
+  # when linger is already on; only attempt the transition that is needed.
+  local user
+  user="$(id -un)"
+  if [[ "$(loginctl show-user "$user" --property Linger --value 2>/dev/null)" != yes ]]; then
+    loginctl enable-linger "$user" || true
+    [[ "$(loginctl show-user "$user" --property Linger --value 2>/dev/null)" == yes ]] \
+      || die "cannot enable linger for $user; run: sudo loginctl enable-linger $user"
+  fi
   systemctl --user daemon-reload
   systemctl --user enable flotillad.service
 }

@@ -327,6 +327,12 @@ cat >"$fake_bin/loginctl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"$LOGINCTL_LOG"
+state="$LOGINCTL_LOG.linger"
+case "${1:-}" in
+  # A redundant re-enable is denied, as polkit does outside a login session.
+  enable-linger) if [[ -e "$state" ]]; then exit 1; else touch "$state"; fi ;;
+  show-user) if [[ -e "$state" ]]; then printf 'yes\n'; else printf 'no\n'; fi ;;
+esac
 SH
 chmod 0755 "$fake_bin/loginctl"
 
@@ -484,6 +490,8 @@ test "$(grep -Fxc -- '--user daemon-reload' "$test_root/systemctl.log")" = 1 \
   || fail 'unit refresh did not reload the systemd user manager exactly once'
 test "$(grep -Fxc -- '--user restart flotillad.service' "$test_root/systemctl.log")" = 1 \
   || fail 'unit refresh did not restart flotillad exactly once'
+test "$(grep -Ec '^enable-linger ' "$test_root/loginctl.log")" = 1 \
+  || fail 'reinstall with linger already enabled must not re-attempt enable-linger'
 
 ln -s "$$-active-test-owner" "$test_root/home/.local/opt/flotilla-fleet/.install.lock"
 if run_installer "$generation_one" >"$test_root/locked.out" 2>&1; then
