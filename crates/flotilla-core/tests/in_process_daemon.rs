@@ -762,16 +762,13 @@ async fn resource_list_and_get_queries_return_wire_json() {
 
     let listed = daemon
         .execute_query(
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryResourceList {
+            Command::builder()
+                .action(CommandAction::QueryResourceList {
                     namespace: "flotilla".to_string(),
                     kind: "convoys".to_string(),
                     include_replicas: false,
-                },
-            },
+                })
+                .build(),
             uuid::Uuid::new_v4(),
         )
         .await
@@ -786,16 +783,13 @@ async fn resource_list_and_get_queries_return_wire_json() {
 
     let fetched = daemon
         .execute_query(
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryResourceGet {
+            Command::builder()
+                .action(CommandAction::QueryResourceGet {
                     namespace: "flotilla".to_string(),
                     kind: "Convoy".to_string(),
                     name: "resource-demo".to_string(),
-                },
-            },
+                })
+                .build(),
             uuid::Uuid::new_v4(),
         )
         .await
@@ -824,16 +818,13 @@ async fn resource_list_and_get_queries_return_local_non_replicated_resources() {
 
     let listed = daemon
         .execute_query(
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryResourceList {
+            Command::builder()
+                .action(CommandAction::QueryResourceList {
                     namespace: "flotilla".to_string(),
                     kind: "workflowtemplates".to_string(),
                     include_replicas: true,
-                },
-            },
+                })
+                .build(),
             uuid::Uuid::new_v4(),
         )
         .await
@@ -846,16 +837,13 @@ async fn resource_list_and_get_queries_return_local_non_replicated_resources() {
 
     let fetched = daemon
         .execute_query(
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryResourceGet {
+            Command::builder()
+                .action(CommandAction::QueryResourceGet {
                     namespace: "flotilla".to_string(),
                     kind: "WorkflowTemplate".to_string(),
                     name: "local-workflow".to_string(),
-                },
-            },
+                })
+                .build(),
             uuid::Uuid::new_v4(),
         )
         .await
@@ -893,17 +881,16 @@ async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
     let mut events = daemon.subscribe();
     InProcessDaemon::publish_peer_connection_status(daemon.as_ref(), &authority_node, PeerConnectionState::Connected).await;
     let refused_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceDelete {
-                namespace: "flotilla".to_string(),
-                kind: "convoys".to_string(),
-                name: "orphaned-convoy".to_string(),
-                replica_origin: Some(origin.clone()),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: "orphaned-convoy".to_string(),
+                    replica_origin: Some(origin.clone()),
+                })
+                .build(),
+        )
         .await
         .expect("request collection while authority is connected");
     let refused = recv_command_finished(&mut events, refused_id).await;
@@ -914,17 +901,16 @@ async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
 
     InProcessDaemon::publish_peer_connection_status(daemon.as_ref(), &authority_node, PeerConnectionState::Disconnected).await;
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceDelete {
-                namespace: "flotilla".to_string(),
-                kind: "convoys".to_string(),
-                name: "orphaned-convoy".to_string(),
-                replica_origin: Some(origin),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: "orphaned-convoy".to_string(),
+                    replica_origin: Some(origin),
+                })
+                .build(),
+        )
         .await
         .expect("collect orphaned replica");
 
@@ -998,17 +984,16 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
         peer_one.resource_backend().including_replicas::<ResourceConvoy>("flotilla").watch().await.expect("watch first peer replicas");
     let mut authority_events = authority.subscribe();
     let delete_id = authority
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceDelete {
-                namespace: "flotilla".to_string(),
-                kind: "convoys".to_string(),
-                name: "lost-at-authority".to_string(),
-                replica_origin: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: "lost-at-authority".to_string(),
+                    replica_origin: None,
+                })
+                .build(),
+        )
         .await
         .expect("delete missing authority resource");
     let deleted = recv_command_finished(&mut authority_events, delete_id).await;
@@ -1071,17 +1056,16 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
     }
 
     let repeated_id = authority
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceDelete {
-                namespace: "flotilla".to_string(),
-                kind: "convoys".to_string(),
-                name: "lost-at-authority".to_string(),
-                replica_origin: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: "lost-at-authority".to_string(),
+                    replica_origin: None,
+                })
+                .build(),
+        )
         .await
         .expect("repeat delete missing authority resource");
     let repeated = recv_command_finished(&mut authority_events, repeated_id).await;
@@ -1096,19 +1080,18 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
     let mut events = daemon.subscribe();
     let name = flotilla_resources::usage_record_name("codex", "ada@example.com");
     let create_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceApply {
-                namespace: "flotilla".to_string(),
-                document: serde_json::json!({
-                    "kind": "Usage",
-                    "metadata": {"name": name},
-                    "spec": {"provider": "codex", "account": "Ada@Example.com"},
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceApply {
+                    namespace: "flotilla".to_string(),
+                    document: serde_json::json!({
+                        "kind": "Usage",
+                        "metadata": {"name": name},
+                        "spec": {"provider": "codex", "account": "Ada@Example.com"},
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("create usage command");
     let create_result = recv_command_finished(&mut events, create_id).await;
@@ -1121,17 +1104,16 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
         .build();
 
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceStatusPatch {
-                namespace: "flotilla".to_string(),
-                kind: "usages".to_string(),
-                name: name.clone(),
-                status: serde_json::to_value(&status).expect("encode usage status"),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceStatusPatch {
+                    namespace: "flotilla".to_string(),
+                    kind: "usages".to_string(),
+                    name: name.clone(),
+                    status: serde_json::to_value(&status).expect("encode usage status"),
+                })
+                .build(),
+        )
         .await
         .expect("patch usage status command");
 
@@ -1139,17 +1121,16 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
     assert!(matches!(result, CommandValue::ResourceObject(response) if response.kind == "Usage"));
 
     let malformed_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceStatusPatch {
-                namespace: "flotilla".to_string(),
-                kind: "usages".to_string(),
-                name: name.clone(),
-                status: serde_json::json!({"windows": []}),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceStatusPatch {
+                    namespace: "flotilla".to_string(),
+                    kind: "usages".to_string(),
+                    name: name.clone(),
+                    status: serde_json::json!({"windows": []}),
+                })
+                .build(),
+        )
         .await
         .expect("malformed status patch command");
     let malformed_result = recv_command_finished(&mut events, malformed_id).await;
@@ -1184,19 +1165,18 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
 
     let mut rx = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceWatch {
-                namespace: "flotilla".to_string(),
-                kind: "convoys".to_string(),
-                name: Some("watched-convoy".to_string()),
-                include_replicas: false,
-                replica_sources: false,
-                cursor: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceWatch {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: Some("watched-convoy".to_string()),
+                    include_replicas: false,
+                    replica_sources: false,
+                    cursor: None,
+                })
+                .build(),
+        )
         .await
         .expect("watch command");
 
@@ -1262,19 +1242,18 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
 
     let mut resumed_events = daemon.subscribe();
     let resumed_command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceWatch {
-                namespace: "flotilla".to_string(),
-                kind: "convoys".to_string(),
-                name: Some("watched-convoy".to_string()),
-                include_replicas: false,
-                replica_sources: false,
-                cursor: Some(resume_cursor),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceWatch {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: Some("watched-convoy".to_string()),
+                    include_replicas: false,
+                    replica_sources: false,
+                    cursor: Some(resume_cursor),
+                })
+                .build(),
+        )
         .await
         .expect("resume watch command");
     let deleted = loop {
@@ -1443,26 +1422,25 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .expect("project create");
 
     let mut events = daemon.subscribe();
-    let start = |name: &str, workflow_ref: &str| Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: None,
-        action: CommandAction::ConvoyStart {
-            intent: Box::new(ConvoyStartIntent {
-                namespace: None,
-                project_ref: "zellij".into(),
-                change_request: None,
-                issues: Vec::new(),
-                name: Some(name.to_string()),
-                branch: Some(format!("stack/{name}")),
-                workflow_ref: Some(workflow_ref.to_string()),
-                inputs: Vec::new(),
-                instruction: None,
-                placement_policy: Some("docker-test".into()),
-                agent_overrides: Vec::new(),
-                auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-            }),
-        },
+    let start = |name: &str, workflow_ref: &str| {
+        Command::builder()
+            .action(CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "zellij".into(),
+                    change_request: None,
+                    issues: Vec::new(),
+                    name: Some(name.to_string()),
+                    branch: Some(format!("stack/{name}")),
+                    workflow_ref: Some(workflow_ref.to_string()),
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: Some("docker-test".into()),
+                    agent_overrides: Vec::new(),
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                }),
+            })
+            .build()
     };
     let rejected_id = daemon.execute(start("reviewless", "single-agent-contained")).await.expect("dispatch command");
     assert_eq!(recv_command_finished(&mut events, rejected_id).await, CommandValue::Error {
@@ -1544,27 +1522,26 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
 
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".to_string(),
-                    change_request: Some("1071".to_string()),
-                    issues: Vec::new(),
-                    name: None,
-                    branch: None,
-                    workflow_ref: None,
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".to_string(),
+                        change_request: Some("1071".to_string()),
+                        issues: Vec::new(),
+                        name: None,
+                        branch: None,
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("PR adoption command accepted");
 
@@ -1618,12 +1595,12 @@ async fn fork_stance_refuses_change_request_merge_without_calling_provider() {
 
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: Some(RepoSelector::Path(repo)),
-            action: CommandAction::MergeChangeRequest { id: "42".to_string(), confirmed: true },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::MergeChangeRequest { id: "42".to_string(), confirmed: true })
+                .context_repo(RepoSelector::Path(repo))
+                .build(),
+        )
         .await
         .expect("dispatch merge command");
 
@@ -1722,27 +1699,26 @@ async fn bare_convoy_start_uses_priority_and_records_every_placement_candidate()
 
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("local-default".into()),
-                    branch: Some("fix/local-default".into()),
-                    workflow_ref: None,
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("local-default".into()),
+                        branch: Some("fix/local-default".into()),
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("start command accepted");
 
@@ -1811,27 +1787,26 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
 
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("missing-adapter".into()),
-                    branch: Some("fix/missing-adapter".into()),
-                    workflow_ref: None,
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: Some("docker-test".into()),
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("missing-adapter".into()),
+                        branch: Some("fix/missing-adapter".into()),
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: Some("docker-test".into()),
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("start command accepted");
     let result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1856,21 +1831,20 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
     ));
 
     let legacy_command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "missing-adapter-legacy".into(),
-                workflow_ref: "single-agent-contained".into(),
-                inputs: Vec::new(),
-                repository_url: None,
-                r#ref: Some("fix/missing-adapter-legacy".into()),
-                project_ref: Some("flotilla".into()),
-                placement_policy: Some("docker-test".into()),
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "missing-adapter-legacy".into(),
+                    workflow_ref: "single-agent-contained".into(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: Some("fix/missing-adapter-legacy".into()),
+                    project_ref: Some("flotilla".into()),
+                    placement_policy: Some("docker-test".into()),
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("legacy create command accepted");
     let legacy_result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1935,10 +1909,7 @@ async fn convoy_start_accepts_project_list_identifier() {
         .expect("project create");
 
     let list_result = daemon
-        .execute_query(
-            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },
-            uuid::Uuid::new_v4(),
-        )
+        .execute_query(Command::builder().action(CommandAction::QueryProjectList {}).build(), uuid::Uuid::new_v4())
         .await
         .expect("project list");
     let CommandValue::ProjectList(projects) = list_result else {
@@ -1951,27 +1922,26 @@ async fn convoy_start_accepts_project_list_identifier() {
     for (index, project_ref) in project_identifiers.into_iter().enumerate() {
         let name = format!("listed-project-{index}");
         let start_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyStart {
-                    intent: Box::new(ConvoyStartIntent {
-                        namespace: None,
-                        project_ref,
-                        change_request: None,
-                        issues: Vec::new(),
-                        name: Some(name.clone()),
-                        branch: Some(format!("fix/{name}")),
-                        workflow_ref: None,
-                        inputs: Vec::new(),
-                        instruction: None,
-                        placement_policy: None,
-                        agent_overrides: Vec::new(),
-                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                    }),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyStart {
+                        intent: Box::new(ConvoyStartIntent {
+                            namespace: None,
+                            project_ref,
+                            change_request: None,
+                            issues: Vec::new(),
+                            name: Some(name.clone()),
+                            branch: Some(format!("fix/{name}")),
+                            workflow_ref: None,
+                            inputs: Vec::new(),
+                            instruction: None,
+                            placement_policy: None,
+                            agent_overrides: Vec::new(),
+                            auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        }),
+                    })
+                    .build(),
+            )
             .await
             .expect("convoy start command accepted");
 
@@ -1993,27 +1963,26 @@ async fn convoy_start_unknown_project_reports_resolved_reference_tried() {
     let mut events = daemon.subscribe();
 
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "missing".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("unknown-project".into()),
-                    branch: Some("fix/unknown-project".into()),
-                    workflow_ref: None,
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "missing".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("unknown-project".into()),
+                        branch: Some("fix/unknown-project".into()),
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("convoy start command accepted");
 
@@ -2079,27 +2048,26 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
 
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: vec![IssueSelector::Reference(reference.clone())],
-                    name: Some("issue-732".into()),
-                    branch: Some("fix/issue-732".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: vec![("review".into(), "required".into())],
-                    instruction: Some("Keep the snapshot durable.".into()),
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: vec![IssueSelector::Reference(reference.clone())],
+                        name: Some("issue-732".into()),
+                        branch: Some("fix/issue-732".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: vec![("review".into(), "required".into())],
+                        instruction: Some("Keep the snapshot durable.".into()),
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("start command accepted");
     let result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2136,27 +2104,26 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(utility.calls.load(Ordering::SeqCst), 0, "fully specified admission must not call AI");
 
     let default_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("default-regard".into()),
-                    branch: Some("fix/default-regard".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("default-regard".into()),
+                        branch: Some("fix/default-regard".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("default start command accepted");
     assert_eq!(recv_command_finished(&mut events, default_id).await, CommandValue::ConvoyStarted {
@@ -2176,31 +2143,30 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(regard.spec.expiry, RegardExpiryPolicy::Decaying { expires_after_seconds: 300 });
 
     let batch_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: vec![
-                        IssueSelector::Reference(reference.clone()),
-                        IssueSelector::Reference(reference_two.clone()),
-                        IssueSelector::Reference(reference_two.clone()),
-                    ],
-                    name: Some("batch-732-733".into()),
-                    branch: Some("fix/batch-732-733".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: Vec::new(),
-                    instruction: Some("Fix both issues in one convoy.".into()),
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: vec![
+                            IssueSelector::Reference(reference.clone()),
+                            IssueSelector::Reference(reference_two.clone()),
+                            IssueSelector::Reference(reference_two.clone()),
+                        ],
+                        name: Some("batch-732-733".into()),
+                        branch: Some("fix/batch-732-733".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: Vec::new(),
+                        instruction: Some("Fix both issues in one convoy.".into()),
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("batch command accepted");
     let batch_result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2226,27 +2192,26 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
 
     utility.fail.store(true, Ordering::SeqCst);
     let fallback_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: vec![IssueSelector::Reference(reference)],
-                    name: None,
-                    branch: None,
-                    workflow_ref: None,
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: vec![IssueSelector::Reference(reference)],
+                        name: None,
+                        branch: None,
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("offline fallback command accepted");
     let fallback_result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2288,27 +2253,26 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .await
         .expect("project with unresolved default should persist");
     let explicit_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: Some("flotilla".into()),
-                    project_ref: "explicit-workflow".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("explicit-workflow".into()),
-                    branch: Some("fix/explicit-workflow".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: Some("flotilla".into()),
+                        project_ref: "explicit-workflow".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("explicit-workflow".into()),
+                        branch: Some("fix/explicit-workflow".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("explicit workflow command accepted");
     let explicit_result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2329,27 +2293,26 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     });
 
     let wrong_namespace_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: Some("other".into()),
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("wrong-namespace".into()),
-                    branch: Some("fix/wrong-namespace".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: Some("other".into()),
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("wrong-namespace".into()),
+                        branch: Some("fix/wrong-namespace".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("namespace rejection command accepted");
     let wrong_namespace_result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2370,27 +2333,26 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     ));
 
     let invalid_branch_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("invalid-branch".into()),
-                    branch: Some("bad branch".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("invalid-branch".into()),
+                        branch: Some("bad branch".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("invalid branch command accepted");
     let invalid_branch_result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2455,27 +2417,26 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
 
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: None,
-                    branch: None,
-                    workflow_ref: None,
-                    inputs: Vec::new(),
-                    instruction: Some("Implement the admission snapshot.".into()),
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: None,
+                        branch: None,
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: Some("Implement the admission snapshot.".into()),
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("start command accepted");
     let result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2502,11 +2463,8 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    let command = Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: None,
-        action: CommandAction::ConvoyStart {
+    let command = Command::builder()
+        .action(CommandAction::ConvoyStart {
             intent: Box::new(
                 ConvoyStartIntent::builder()
                     .project_ref("flotilla".to_string())
@@ -2515,8 +2473,8 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
                     .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                     .build(),
             ),
-        },
-    };
+        })
+        .build();
     let mut events = daemon.subscribe();
 
     let first_id = daemon.execute(command.clone()).await.expect("first admission");
@@ -2554,12 +2512,11 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
     assert!(generations.iter().any(|convoy| convoy.spec.generation == 2));
 
     let delete_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyDelete { namespace: None, name: "governor@flotilla".to_string(), force: true },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: None, name: "governor@flotilla".to_string(), force: true })
+                .build(),
+        )
         .await
         .expect("delete by role address");
     assert_eq!(recv_command_finished(&mut events, delete_id).await, CommandValue::Ok);
@@ -2579,27 +2536,26 @@ async fn convoy_start_acknowledges_while_admission_is_in_flight() {
         let daemon = Arc::clone(&daemon);
         async move {
             daemon
-                .execute(Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::ConvoyStart {
-                        intent: Box::new(ConvoyStartIntent {
-                            namespace: None,
-                            project_ref: "flotilla".into(),
-                            change_request: None,
-                            issues: Vec::new(),
-                            name: None,
-                            branch: None,
-                            workflow_ref: None,
-                            inputs: Vec::new(),
-                            instruction: None,
-                            placement_policy: None,
-                            agent_overrides: Vec::new(),
-                            auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                        }),
-                    },
-                })
+                .execute(
+                    Command::builder()
+                        .action(CommandAction::ConvoyStart {
+                            intent: Box::new(ConvoyStartIntent {
+                                namespace: None,
+                                project_ref: "flotilla".into(),
+                                change_request: None,
+                                issues: Vec::new(),
+                                name: None,
+                                branch: None,
+                                workflow_ref: None,
+                                inputs: Vec::new(),
+                                instruction: None,
+                                placement_policy: None,
+                                agent_overrides: Vec::new(),
+                                auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                            }),
+                        })
+                        .build(),
+                )
                 .await
         }
     });
@@ -2645,11 +2601,8 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, Some(reference.source.clone())).await;
-    let command = Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: None,
-        action: CommandAction::ConvoyStart {
+    let command = Command::builder()
+        .action(CommandAction::ConvoyStart {
             intent: Box::new(ConvoyStartIntent {
                 namespace: None,
                 project_ref: "flotilla".into(),
@@ -2664,8 +2617,8 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
                 agent_overrides: Vec::new(),
                 auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
             }),
-        },
-    };
+        })
+        .build();
     let mut events = daemon.subscribe();
 
     let first_id = daemon.execute(command.clone()).await.expect("first convoy start should be accepted");
@@ -2708,19 +2661,16 @@ async fn convoy_start_worker_panic_finishes_the_command_and_allows_retry() {
     discovery.factories.ai_utilities.push(Box::new(PanicOnceAiUtilityFactory { utility }));
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
     create_test_convoy_project(&daemon.resource_backend(), None).await;
-    let command = Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: None,
-        action: CommandAction::ConvoyStart {
+    let command = Command::builder()
+        .action(CommandAction::ConvoyStart {
             intent: Box::new(
                 ConvoyStartIntent::builder()
                     .project_ref("flotilla".to_string())
                     .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                     .build(),
             ),
-        },
-    };
+        })
+        .build();
     let mut events = daemon.subscribe();
 
     let first_id = daemon.execute(command.clone()).await.expect("first convoy start should be accepted");
@@ -2741,27 +2691,26 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
     create_test_convoy_project(&backend, None).await;
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("bootstrap-failure".into()),
-                    branch: Some("fix/bootstrap-failure".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Always,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("bootstrap-failure".into()),
+                        branch: Some("fix/bootstrap-failure".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Always,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("convoy start should be accepted");
     let convoys = backend.using::<ResourceConvoy>("flotilla");
@@ -4177,12 +4126,10 @@ async fn execute_broadcasts_lifecycle_events() {
     // ArchiveSession with a non-existent ID returns immediately with
     // "session not found" — no external API calls, deterministic.
     // We only care about the lifecycle events, not the command result.
-    let command = Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: Some(RepoSelector::Identity(identity.clone())),
-        action: CommandAction::ArchiveSession { session_id: "nonexistent-session".into() },
-    };
+    let command = Command::builder()
+        .action(CommandAction::ArchiveSession { session_id: "nonexistent-session".into() })
+        .context_repo(RepoSelector::Identity(identity.clone()))
+        .build();
     let command_id = daemon.execute(command).await.expect("execute should return a command id");
 
     // Collect CommandStarted and CommandFinished events, skipping any
@@ -4231,12 +4178,10 @@ async fn fetch_checkout_status_accepts_identity_context_repo() {
     let (_temp, _repo, daemon, identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();
 
-    let command = Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: Some(RepoSelector::Identity(identity.clone())),
-        action: CommandAction::FetchCheckoutStatus { branch: "main".into(), checkout_path: None, change_request_id: None },
-    };
+    let command = Command::builder()
+        .action(CommandAction::FetchCheckoutStatus { branch: "main".into(), checkout_path: None, change_request_id: None })
+        .context_repo(RepoSelector::Identity(identity.clone()))
+        .build();
 
     let command_id = daemon.execute(command).await.expect("status command should resolve via identity context repo");
 
@@ -4271,12 +4216,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     let mut rx = daemon.subscribe();
 
     let add_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: repo.clone() },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: repo.clone() }).build())
         .await
         .expect("add_repo command should return an id");
 
@@ -4314,12 +4254,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     assert_eq!(repos[0].repository_key, added.repository_key);
 
     let remove_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::UntrackRepo { repo: RepoSelector::Query("new-repo".into()) },
-        })
+        .execute(Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Query("new-repo".into()) }).build())
         .await
         .expect("remove_repo command should return an id");
     let (finished_remove, removed) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -4417,12 +4352,7 @@ async fn execute_on_untracked_repo_returns_error_without_started_event() {
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
 
     let err = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) },
-        })
+        .execute(Command::builder().action(CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) }).build())
         .await
         .expect_err("untracked repo should fail");
     assert!(err.contains("repo not tracked"));
@@ -4449,12 +4379,7 @@ async fn untrack_missing_repo_returns_error_without_started_event() {
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
 
     let err = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::UntrackRepo { repo: RepoSelector::Path(repo.clone()) },
-        })
+        .execute(Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Path(repo.clone()) }).build())
         .await
         .expect_err("untracked repo removal should fail");
     assert!(err.contains("repo not tracked"));
@@ -4485,7 +4410,7 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
     let mut rx = daemon.subscribe();
 
     let refresh_id = daemon
-        .execute(Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } })
+        .execute(Command::builder().action(CommandAction::Refresh { repo: None }).build())
         .await
         .expect("refresh all should return an id");
 
@@ -4508,12 +4433,9 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
 async fn remove_checkout_command_accepts_selector_queries() {
     let (_temp, repo, daemon) = daemon_for_cwd().await;
     let err = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("does-not-exist".into()) },
-        })
+        .execute(
+            Command::builder().action(CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("does-not-exist".into()) }).build(),
+        )
         .await
         .expect_err("missing checkout should fail cleanly");
 
@@ -4528,12 +4450,10 @@ async fn fetch_checkout_status_uses_context_repo_when_checkout_path_is_absent() 
     let (_temp, repo, daemon) = daemon_for_cwd().await;
     let mut rx = daemon.subscribe();
 
-    let command = Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: Some(RepoSelector::Path(repo.clone())),
-        action: CommandAction::FetchCheckoutStatus { branch: "main".into(), checkout_path: None, change_request_id: None },
-    };
+    let command = Command::builder()
+        .action(CommandAction::FetchCheckoutStatus { branch: "main".into(), checkout_path: None, change_request_id: None })
+        .context_repo(RepoSelector::Path(repo.clone()))
+        .build();
 
     let command_id = daemon.execute(command).await.expect("status command should resolve via context repo");
 
@@ -4558,30 +4478,28 @@ async fn checkout_target_branch_and_fresh_branch_are_distinct_errors() {
     let mut rx = daemon.subscribe();
 
     let branch_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Path(repo.clone()),
-                target: CheckoutTarget::Branch("definitely-missing-branch".into()),
-                issue_ids: vec![],
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Path(repo.clone()),
+                    target: CheckoutTarget::Branch("definitely-missing-branch".into()),
+                    issue_ids: vec![],
+                })
+                .build(),
+        )
         .await
         .expect("checking out a missing existing branch should return a command id");
 
     let fresh_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Path(repo),
-                target: CheckoutTarget::FreshBranch("main".into()),
-                issue_ids: vec![],
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Path(repo),
+                    target: CheckoutTarget::FreshBranch("main".into()),
+                    issue_ids: vec![],
+                })
+                .build(),
+        )
         .await
         .expect("creating a fresh branch that already exists should return a command id");
     let mut branch_err = None;

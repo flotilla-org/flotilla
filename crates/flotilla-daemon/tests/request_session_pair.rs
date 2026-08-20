@@ -230,21 +230,20 @@ async fn convoy_creation_attributes_provenance_and_regard_to_the_surface_princip
 
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "alice-dispatch".to_string(),
-                workflow_ref: "empty".to_string(),
-                inputs: Vec::new(),
-                repository_url: None,
-                r#ref: None,
-                project_ref: None,
-                placement_policy: None,
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "alice-dispatch".to_string(),
+                    workflow_ref: "empty".to_string(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: None,
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("dispatch convoy creation");
     assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyCreated { name: "alice-dispatch".to_string() });
@@ -300,12 +299,10 @@ async fn in_memory_request_client_routes_remote_command_result() {
     let result = topology
         .client
         .execute_query(
-            Command {
-                node_id: Some(follower_node_id.clone()),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryHostStatus { target_environment_id: follower_environment_id.clone() },
-            },
+            Command::builder()
+                .action(CommandAction::QueryHostStatus { target_environment_id: follower_environment_id.clone() })
+                .node_id(follower_node_id.clone())
+                .build(),
             uuid::Uuid::nil(),
         )
         .await
@@ -336,19 +333,19 @@ async fn resource_mutations_targeting_a_peer_modify_only_the_peer_store() {
     let mut events = topology.leader.subscribe();
     let apply_id = topology
         .client
-        .execute(Command {
-            node_id: Some(follower_node_id.clone()),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceApply {
-                namespace: namespace.to_string(),
-                document: serde_json::json!({
-                    "kind": "WorkflowTemplate",
-                    "metadata": {"name": name},
-                    "spec": {"vessels": []},
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceApply {
+                    namespace: namespace.to_string(),
+                    document: serde_json::json!({
+                        "kind": "WorkflowTemplate",
+                        "metadata": {"name": name},
+                        "spec": {"vessels": []},
+                    }),
+                })
+                .node_id(follower_node_id.clone())
+                .build(),
+        )
         .await
         .expect("dispatch peer resource apply");
 
@@ -361,17 +358,17 @@ async fn resource_mutations_targeting_a_peer_modify_only_the_peer_store() {
 
     let delete_id = topology
         .client
-        .execute(Command {
-            node_id: Some(follower_node_id),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceDelete {
-                namespace: namespace.to_string(),
-                kind: "workflowtemplates".to_string(),
-                name: name.to_string(),
-                replica_origin: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: namespace.to_string(),
+                    kind: "workflowtemplates".to_string(),
+                    name: name.to_string(),
+                    replica_origin: None,
+                })
+                .node_id(follower_node_id)
+                .build(),
+        )
         .await
         .expect("dispatch peer resource delete");
 
@@ -401,12 +398,11 @@ async fn hostless_convoy_delete_routes_to_remote_home() {
     let mut rx = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true })
+                .build(),
+        )
         .await
         .expect("dispatch hostless convoy delete");
 
@@ -439,12 +435,12 @@ async fn mistargeted_convoy_delete_routes_to_remote_home() {
     let mut rx = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: Some(topology.leader.node_id().clone()),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true })
+                .node_id(topology.leader.node_id().clone())
+                .build(),
+        )
         .await
         .expect("dispatch mistargeted convoy delete");
 
@@ -473,16 +469,15 @@ async fn hostless_convoy_abandon_routes_to_remote_home() {
     let mut rx = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyAbandon {
-                namespace: Some(namespace.to_string()),
-                name: convoy_name.to_string(),
-                reason: "accepted loss".to_string(),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyAbandon {
+                    namespace: Some(namespace.to_string()),
+                    name: convoy_name.to_string(),
+                    reason: "accepted loss".to_string(),
+                })
+                .build(),
+        )
         .await
         .expect("dispatch hostless convoy abandon");
 
@@ -523,16 +518,15 @@ async fn hostless_convoy_work_complete_routes_to_remote_home() {
     let mut rx = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyWorkForceComplete {
-                convoy: convoy_name.to_string(),
-                work: work_name.to_string(),
-                message: Some("done".to_string()),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyWorkForceComplete {
+                    convoy: convoy_name.to_string(),
+                    work: work_name.to_string(),
+                    message: Some("done".to_string()),
+                })
+                .build(),
+        )
         .await
         .expect("dispatch hostless work completion");
 
@@ -555,16 +549,15 @@ async fn hostless_convoy_command_explains_missing_home_route() {
 
     let message = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyAbandon {
-                namespace: Some(namespace.to_string()),
-                name: convoy_name.to_string(),
-                reason: "lost host".to_string(),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyAbandon {
+                    namespace: Some(namespace.to_string()),
+                    name: convoy_name.to_string(),
+                    reason: "lost host".to_string(),
+                })
+                .build(),
+        )
         .await
         .expect_err("unreachable convoy home should reject dispatch");
 
@@ -597,12 +590,11 @@ async fn hostless_convoy_delete_uses_live_peer_route_when_connection_status_is_s
     let mut rx = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true })
+                .build(),
+        )
         .await
         .expect("live peer route should take precedence over stale connection status");
 
@@ -664,22 +656,21 @@ async fn convoy_start_routes_to_placement_host_when_presentation_membership_is_s
     let mut events = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(
-                    ConvoyStartIntent::builder()
-                        .project_ref("flotilla".to_string())
-                        .name("remote-work".to_string())
-                        .branch("fix/remote-work".to_string())
-                        .placement_policy(placement_policy)
-                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                        .build(),
-                ),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".to_string())
+                            .name("remote-work".to_string())
+                            .branch("fix/remote-work".to_string())
+                            .placement_policy(placement_policy)
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
         .await
         .expect("origin should route remote placement despite stale presentation membership");
 
@@ -811,22 +802,21 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
     let mut events = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(
-                    ConvoyStartIntent::builder()
-                        .project_ref("flotilla".to_string())
-                        .name("kiwi-to-feta".to_string())
-                        .branch("fix/kiwi-to-feta".to_string())
-                        .placement_policy(placement_policy)
-                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                        .build(),
-                ),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".to_string())
+                            .name("kiwi-to-feta".to_string())
+                            .branch("fix/kiwi-to-feta".to_string())
+                            .placement_policy(placement_policy)
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
         .await
         .expect("dispatch kiwi-to-feta convoy start");
 
@@ -865,22 +855,21 @@ async fn routed_convoy_start_enforces_placement_host_capacity_before_persistence
     let mut events = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(
-                    ConvoyStartIntent::builder()
-                        .project_ref("flotilla".to_string())
-                        .name("remote-disk-hungry".to_string())
-                        .branch("fix/remote-disk-hungry".to_string())
-                        .placement_policy(placement_policy)
-                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                        .build(),
-                ),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".to_string())
+                            .name("remote-disk-hungry".to_string())
+                            .branch("fix/remote-disk-hungry".to_string())
+                            .placement_policy(placement_policy)
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
         .await
         .expect("admitting store should evaluate the convoy");
 
@@ -954,22 +943,21 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
 
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(
-                    ConvoyStartIntent::builder()
-                        .project_ref("flotilla".to_string())
-                        .name("remote-docker-work".to_string())
-                        .branch("fix/remote-docker-work".to_string())
-                        .placement_policy("remote-docker".to_string())
-                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                        .build(),
-                ),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".to_string())
+                            .name("remote-docker-work".to_string())
+                            .branch("fix/remote-docker-work".to_string())
+                            .placement_policy("remote-docker".to_string())
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
         .await
         .expect("dispatch remote Docker admission");
 
@@ -984,21 +972,20 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
     );
 
     let legacy_command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "legacy-remote-docker-work".to_string(),
-                workflow_ref: "remote-workflow".to_string(),
-                inputs: Vec::new(),
-                repository_url: None,
-                r#ref: None,
-                project_ref: None,
-                placement_policy: Some("remote-docker".to_string()),
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "legacy-remote-docker-work".to_string(),
+                    workflow_ref: "remote-workflow".to_string(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: Some("remote-docker".to_string()),
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("dispatch legacy remote Docker admission");
     let legacy_result = await_command_result(&mut events, legacy_command_id).await;
@@ -1038,17 +1025,15 @@ async fn remote_issue_query_returns_results() {
     let result = topology
         .client
         .execute_query(
-            Command {
-                node_id: Some(follower_node_id),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryIssues {
+            Command::builder()
+                .action(CommandAction::QueryIssues {
                     repo: RepoSelector::Path(follower_repo.clone()),
                     params: IssueQuery::default(),
                     page: 1,
                     count: 10,
-                },
-            },
+                })
+                .node_id(follower_node_id)
+                .build(),
             uuid::Uuid::nil(),
         )
         .await

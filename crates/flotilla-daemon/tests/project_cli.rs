@@ -206,17 +206,16 @@ async fn execute_project_add(
     display_name: Option<&str>,
 ) -> CommandValue {
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ProjectAdd {
-                target,
-                name: name.map(str::to_string),
-                display_name: display_name.map(str::to_string),
-                remote: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ProjectAdd {
+                    target,
+                    name: name.map(str::to_string),
+                    display_name: display_name.map(str::to_string),
+                    remote: None,
+                })
+                .build(),
+        )
         .await
         .expect("execute");
     await_command_result(rx, id).await
@@ -227,7 +226,7 @@ async fn execute_project_command(
     rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
     action: CommandAction,
 ) -> CommandValue {
-    let id = daemon.execute(Command { node_id: None, provisioning_target: None, context_repo: None, action }).await.expect("execute");
+    let id = daemon.execute(Command::builder().action(action).build()).await.expect("execute");
     await_command_result(rx, id).await
 }
 
@@ -797,12 +796,7 @@ async fn retracking_path_after_remote_appears_migrates_repository_identity() {
     daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
 
     let first_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
         .expect("initial repo add");
     assert!(matches!(await_command_result(&mut rx, first_id).await, CommandValue::RepoTracked { .. }));
@@ -830,12 +824,7 @@ async fn retracking_path_after_remote_appears_migrates_repository_identity() {
         .expect("stale disambiguated project twin");
     *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
     let second_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
         .expect("repo add after remote appears");
     assert_eq!(await_command_result(&mut rx, second_id).await, CommandValue::RepoTracked {
@@ -867,21 +856,20 @@ async fn retracking_path_after_remote_appears_migrates_repository_identity() {
         .await
         .expect("repository status update");
     let convoy_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "identity-migrated".into(),
-                workflow_ref: "scratch".into(),
-                inputs: Vec::new(),
-                repository_url: None,
-                r#ref: None,
-                project_ref: Some("andamento".into()),
-                placement_policy: None,
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "identity-migrated".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: Some("andamento".into()),
+                    placement_policy: None,
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("convoy create");
     assert_eq!(await_command_result(&mut rx, convoy_id).await, CommandValue::ConvoyCreated { name: "identity-migrated@andamento".into() });
@@ -913,12 +901,7 @@ async fn tracking_after_custom_project_identity_change_does_not_create_generated
     let remote_key = remote_spec.key();
     *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
     let track_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path }).build())
         .await
         .expect("track repo after remote appears");
     assert!(matches!(await_command_result(&mut rx, track_id).await, CommandValue::RepoTracked { .. }));
@@ -940,12 +923,7 @@ async fn identity_change_preserves_migrated_project_when_local_and_remote_names_
     let inspected_spec = Arc::new(RwLock::new(local_spec));
     daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
     let add_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
         .expect("initial repo add");
     assert!(matches!(await_command_result(&mut rx, add_id).await, CommandValue::RepoTracked { .. }));
@@ -974,12 +952,7 @@ async fn identity_change_preserves_migrated_project_when_local_and_remote_names_
 
     *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
     let second_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path }).build())
         .await
         .expect("repo add after remote appears");
     assert!(matches!(await_command_result(&mut rx, second_id).await, CommandValue::RepoTracked { .. }));
@@ -1002,12 +975,7 @@ async fn refresh_surfaces_and_reconciles_repository_identity_change() {
     ));
     daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
     let add_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
         .expect("initial repo add");
     assert!(matches!(await_command_result(&mut rx, add_id).await, CommandValue::RepoTracked { .. }));
@@ -1016,12 +984,7 @@ async fn refresh_surfaces_and_reconciles_repository_identity_change() {
     let remote_key = remote_spec.key();
     *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
     let refresh_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Refresh { repo: Some(RepoSelector::Path(checkout_path.clone())) },
-        })
+        .execute(Command::builder().action(CommandAction::Refresh { repo: Some(RepoSelector::Path(checkout_path.clone())) }).build())
         .await
         .expect("refresh command");
 
@@ -1047,12 +1010,7 @@ async fn identity_migration_marks_repository_retained_by_durable_checkout() {
     let inspected_spec = Arc::new(RwLock::new(local_spec));
     daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
     let add_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
         .expect("initial repo add");
     assert!(matches!(await_command_result(&mut rx, add_id).await, CommandValue::RepoTracked { .. }));
@@ -1076,12 +1034,7 @@ async fn identity_migration_marks_repository_retained_by_durable_checkout() {
     let remote_key = remote_spec.key();
     *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
     let second_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path }).build())
         .await
         .expect("repo add after remote appears");
     assert!(matches!(await_command_result(&mut rx, second_id).await, CommandValue::RepoTracked { .. }));
@@ -1200,17 +1153,14 @@ async fn daemon_restart_preserves_whole_repo_project_overlapped_by_applied_proje
     let second_key = RepositoryKey("second-repository".to_string());
     let mut rx = daemon.subscribe();
     let apply_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ProjectApply {
+        .execute(Command::builder()
+    .action(CommandAction::ProjectApply {
                 name: "presentation".into(),
                 spec_yaml: format!(
                     "display_name: Presentation\ndefault_workflow_ref: single-agent-contained\nrepositories:\n  - repo: {local_key}\n  - repo: {second_key}\n"
                 ),
-            },
-        })
+            })
+    .build())
         .await
         .expect("apply execute");
     assert_eq!(await_command_result(&mut rx, apply_id).await, CommandValue::ProjectApplied { name: "presentation".into() });
@@ -1498,16 +1448,15 @@ async fn concurrent_project_adds_of_one_identity_converge_on_one_verified_reposi
     std::fs::create_dir(&second).expect("second checkout");
     let mut first_rx = daemon.subscribe();
     let mut second_rx = daemon.subscribe();
-    let command = |target: &Path, name: &str| Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: None,
-        action: CommandAction::ProjectAdd {
-            target: target.to_string_lossy().into_owned(),
-            name: Some(name.to_string()),
-            display_name: None,
-            remote: None,
-        },
+    let command = |target: &Path, name: &str| {
+        Command::builder()
+            .action(CommandAction::ProjectAdd {
+                target: target.to_string_lossy().into_owned(),
+                name: Some(name.to_string()),
+                display_name: None,
+                remote: None,
+            })
+            .build()
     };
 
     let (first_id, second_id) = tokio::join!(daemon.execute(command(&first, "first")), daemon.execute(command(&second, "second")));
@@ -1575,12 +1524,7 @@ repositories:
 "#;
 
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ProjectApply { name: "cross".into(), spec_yaml: yaml.into() },
-        })
+        .execute(Command::builder().action(CommandAction::ProjectApply { name: "cross".into(), spec_yaml: yaml.into() }).build())
         .await
         .expect("execute");
 
@@ -1630,12 +1574,7 @@ repositories:
 "#;
 
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ProjectApply { name: "labelled".into(), spec_yaml: yaml.into() },
-        })
+        .execute(Command::builder().action(CommandAction::ProjectApply { name: "labelled".into(), spec_yaml: yaml.into() }).build())
         .await
         .expect("execute");
 
@@ -1673,21 +1612,20 @@ async fn convoy_create_carries_project_ref() {
         CommandValue::ProjectAdded { name: "my-project".into() }
     );
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "linked".into(),
-                workflow_ref: "scratch".into(),
-                inputs: vec![],
-                repository_url: None,
-                r#ref: None,
-                project_ref: Some("my-project".into()),
-                placement_policy: None,
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "linked".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: vec![],
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: Some("my-project".into()),
+                    placement_policy: None,
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("execute");
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "linked@my-project".into() });
@@ -1711,36 +1649,35 @@ async fn unresolved_replicated_project_refs_store_but_block_convoy_admission() {
     let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
     let apply_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ProjectApply {
-                name: "waiting".into(),
-                spec_yaml: "display_name: Waiting\ndefault_workflow_ref: single-agent-contained\nrepositories:\n  - repo: missing\n".into(),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ProjectApply {
+                    name: "waiting".into(),
+                    spec_yaml: "display_name: Waiting\ndefault_workflow_ref: single-agent-contained\nrepositories:\n  - repo: missing\n"
+                        .into(),
+                })
+                .build(),
+        )
         .await
         .expect("apply execute");
     assert_eq!(await_command_result(&mut rx, apply_id).await, CommandValue::ProjectApplied { name: "waiting".into() });
     assert!(backend.using::<Project>("flotilla").get("waiting").await.is_ok(), "definition should persist before its referent");
 
     let convoy_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "blocked".into(),
-                workflow_ref: "scratch".into(),
-                inputs: Vec::new(),
-                repository_url: None,
-                r#ref: None,
-                project_ref: Some("waiting".into()),
-                placement_policy: None,
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "blocked".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: Some("waiting".into()),
+                    placement_policy: None,
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("convoy execute");
     assert!(matches!(
@@ -1759,12 +1696,7 @@ async fn project_apply_rejects_invalid_or_incomplete_definitions() {
         "display_name: Empty repos\ndefault_workflow_ref: wf\nrepositories: []\n",
     ] {
         let id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ProjectApply { name: "broken".into(), spec_yaml: spec_yaml.into() },
-            })
+            .execute(Command::builder().action(CommandAction::ProjectApply { name: "broken".into(), spec_yaml: spec_yaml.into() }).build())
             .await
             .expect("execute");
         assert!(matches!(await_command_result(&mut rx, id).await, CommandValue::Error { .. }));

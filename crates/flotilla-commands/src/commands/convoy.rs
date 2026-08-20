@@ -562,36 +562,24 @@ mod tests {
         assert_eq!(error, "human work completion requires --force");
 
         let resolved = parse(&["convoy", "convoy-a", "work", "implement", "complete", "--force"]).resolve().expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyWorkForceComplete { convoy: "convoy-a".into(), work: "implement".into(), message: None },
-            },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyWorkForceComplete { convoy: "convoy-a".into(), work: "implement".into(), message: None },
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]
     fn convoy_work_complete_with_message_resolves() {
         let resolved =
             parse(&["convoy", "convoy-a", "work", "implement", "complete", "--force", "--message", "done"]).resolve().expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyWorkForceComplete {
-                    convoy: "convoy-a".into(),
-                    work: "implement".into(),
-                    message: Some("done".into()),
-                },
-            },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyWorkForceComplete { convoy: "convoy-a".into(), work: "implement".into(), message: Some("done".into()) },
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]
@@ -602,16 +590,12 @@ mod tests {
     #[test]
     fn convoy_delete_resolves() {
         let resolved = parse(&["convoy", "delete", "failed-convoy"]).resolve().expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyDelete { namespace: None, name: "failed-convoy".into(), force: false },
-            },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyDelete { namespace: None, name: "failed-convoy".into(), force: false },
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]
@@ -634,37 +618,29 @@ mod tests {
         ])
         .resolve()
         .expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyResume {
-                    namespace: None,
-                    name: "convoy-a".into(),
-                    prompt: "Rebase onto main and shepherd the PR".into(),
-                    vessel: Some("implement".into()),
-                    role: Some("coder".into()),
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyResume {
+                namespace: None,
+                name: "convoy-a".into(),
+                prompt: "Rebase onto main and shepherd the PR".into(),
+                vessel: Some("implement".into()),
+                role: Some("coder".into()),
             },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]
     fn convoy_resume_withdraw_resolves_to_pending_brief_withdrawal() {
         let resolved = parse(&["convoy", "resume", "convoy-a", "--withdraw"]).resolve().expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyWithdrawPendingBrief { namespace: None, name: "convoy-a".into() },
-            },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyWithdrawPendingBrief { namespace: None, name: "convoy-a".into() },
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]
@@ -737,34 +713,30 @@ mod tests {
         .resolve()
         .expect("resolve");
 
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyStart {
-                    intent: Box::new(ConvoyStartIntent {
-                        namespace: None,
-                        project_ref: "widgets".into(),
-                        change_request: None,
-                        issues: vec![IssueSelector::Reference(IssueRef {
-                            source: IssueSource { service: "https://linear.app".into(), scope: "WIDGET".into() },
-                            id: "WIDGET-732".into(),
-                        })],
-                        name: Some("repair-widget-admission".into()),
-                        branch: Some("fix/repair-widget-admission".into()),
-                        workflow_ref: Some("single-agent-contained".into()),
-                        inputs: vec![],
-                        instruction: Some("Preserve the public API.".into()),
-                        placement_policy: None,
-                        agent_overrides: Vec::new(),
-                        auto_attach: ConvoyAutoAttach::Never,
-                    }),
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "widgets".into(),
+                    change_request: None,
+                    issues: vec![IssueSelector::Reference(IssueRef {
+                        source: IssueSource { service: "https://linear.app".into(), scope: "WIDGET".into() },
+                        id: "WIDGET-732".into(),
+                    })],
+                    name: Some("repair-widget-admission".into()),
+                    branch: Some("fix/repair-widget-admission".into()),
+                    workflow_ref: Some("single-agent-contained".into()),
+                    inputs: vec![],
+                    instruction: Some("Preserve the public API.".into()),
+                    placement_policy: None,
+                    agent_overrides: Vec::new(),
+                    auto_attach: ConvoyAutoAttach::Never,
+                }),
             },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]
@@ -773,62 +745,54 @@ mod tests {
             .resolve()
             .expect("resolve");
 
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyStart {
-                    intent: Box::new(ConvoyStartIntent {
-                        namespace: None,
-                        project_ref: "flotilla".into(),
-                        change_request: None,
-                        issues: vec![IssueSelector::Id("834".into())],
-                        name: None,
-                        branch: None,
-                        workflow_ref: Some("interactive-single".into()),
-                        inputs: vec![],
-                        instruction: None,
-                        placement_policy: None,
-                        agent_overrides: Vec::new(),
-                        auto_attach: ConvoyAutoAttach::Default,
-                    }),
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "flotilla".into(),
+                    change_request: None,
+                    issues: vec![IssueSelector::Id("834".into())],
+                    name: None,
+                    branch: None,
+                    workflow_ref: Some("interactive-single".into()),
+                    inputs: vec![],
+                    instruction: None,
+                    placement_policy: None,
+                    agent_overrides: Vec::new(),
+                    auto_attach: ConvoyAutoAttach::Default,
+                }),
             },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]
     fn convoy_start_bare_issue_resolves_to_project_defaulted_selector() {
         let resolved = parse(&["convoy", "start", "--project", "flotilla", "--issue", "834"]).resolve().expect("resolve");
 
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyStart {
-                    intent: Box::new(ConvoyStartIntent {
-                        namespace: None,
-                        project_ref: "flotilla".into(),
-                        change_request: None,
-                        issues: vec![IssueSelector::Id("834".into())],
-                        name: None,
-                        branch: None,
-                        workflow_ref: None,
-                        inputs: vec![],
-                        instruction: None,
-                        placement_policy: None,
-                        agent_overrides: Vec::new(),
-                        auto_attach: ConvoyAutoAttach::Default,
-                    }),
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "flotilla".into(),
+                    change_request: None,
+                    issues: vec![IssueSelector::Id("834".into())],
+                    name: None,
+                    branch: None,
+                    workflow_ref: None,
+                    inputs: vec![],
+                    instruction: None,
+                    placement_policy: None,
+                    agent_overrides: Vec::new(),
+                    auto_attach: ConvoyAutoAttach::Default,
+                }),
             },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]
@@ -836,31 +800,27 @@ mod tests {
         let resolved =
             parse(&["convoy", "start", "--project", "flotilla", "--pr", "1071", "--no-attach"]).resolve().expect("resolve PR adoption");
 
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyStart {
-                    intent: Box::new(ConvoyStartIntent {
-                        namespace: None,
-                        project_ref: "flotilla".into(),
-                        change_request: Some("1071".into()),
-                        issues: Vec::new(),
-                        name: None,
-                        branch: None,
-                        workflow_ref: None,
-                        inputs: Vec::new(),
-                        instruction: None,
-                        placement_policy: None,
-                        agent_overrides: Vec::new(),
-                        auto_attach: ConvoyAutoAttach::Never,
-                    }),
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "flotilla".into(),
+                    change_request: Some("1071".into()),
+                    issues: Vec::new(),
+                    name: None,
+                    branch: None,
+                    workflow_ref: None,
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: None,
+                    agent_overrides: Vec::new(),
+                    auto_attach: ConvoyAutoAttach::Never,
+                }),
             },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+            RepoContext::None,
+            HostResolution::Local,
+        );
         assert!(
             ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--pr", "1071", "--branch", "feat/wrong",]).is_err(),
             "--pr must be the branch identity authority"
@@ -908,49 +868,41 @@ mod tests {
         ])
         .resolve()
         .expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyCreate {
-                    name: "my-convoy".into(),
-                    workflow_ref: "scratch".into(),
-                    inputs: vec![("topic".into(), "demo".into()), ("branch".into(), "foo".into())],
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
-                    r#ref: Some("main".into()),
-                    project_ref: None,
-                    placement_policy: None,
-                    adopted_checkout: None,
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyCreate {
+                name: "my-convoy".into(),
+                workflow_ref: "scratch".into(),
+                inputs: vec![("topic".into(), "demo".into()), ("branch".into(), "foo".into())],
+                repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
+                r#ref: Some("main".into()),
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: None,
             },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]
     fn convoy_create_minimal_resolves() {
         let resolved = parse(&["convoy", "scratch-1", "create", "--template", "scratch"]).resolve().expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyCreate {
-                    name: "scratch-1".into(),
-                    workflow_ref: "scratch".into(),
-                    inputs: vec![],
-                    repository_url: None,
-                    r#ref: None,
-                    project_ref: None,
-                    placement_policy: None,
-                    adopted_checkout: None,
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyCreate {
+                name: "scratch-1".into(),
+                workflow_ref: "scratch".into(),
+                inputs: vec![],
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: None,
             },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]
@@ -993,25 +945,21 @@ mod tests {
         let resolved = parse(&["convoy", "scratch-1", "create", "--template", "scratch", "--placement-policy", "host-direct-local"])
             .resolve()
             .expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyCreate {
-                    name: "scratch-1".into(),
-                    workflow_ref: "scratch".into(),
-                    inputs: vec![],
-                    repository_url: None,
-                    r#ref: None,
-                    project_ref: None,
-                    placement_policy: Some("host-direct-local".into()),
-                    adopted_checkout: None,
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyCreate {
+                name: "scratch-1".into(),
+                workflow_ref: "scratch".into(),
+                inputs: vec![],
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: Some("host-direct-local".into()),
+                adopted_checkout: None,
             },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]
@@ -1019,25 +967,21 @@ mod tests {
         let cwd = std::env::current_dir().expect("current dir");
         let resolved =
             parse(&["convoy", "scratch-1", "create", "--template", "scratch", "--adopt-checkout", "."]).resolve().expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyCreate {
-                    name: "scratch-1".into(),
-                    workflow_ref: "scratch".into(),
-                    inputs: vec![],
-                    repository_url: None,
-                    r#ref: None,
-                    project_ref: None,
-                    placement_policy: None,
-                    adopted_checkout: Some(Box::new(cwd)),
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ConvoyCreate {
+                name: "scratch-1".into(),
+                workflow_ref: "scratch".into(),
+                inputs: vec![],
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: Some(Box::new(cwd)),
             },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]

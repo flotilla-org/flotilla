@@ -7426,19 +7426,18 @@ mod tests {
         };
 
         daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyWorkForceComplete {
-                    convoy: "convoy-a@test".to_string(),
-                    work: "implement".to_string(),
-                    message: Some(match completion_action {
-                        CompletionAction::Delete => "https://github.com/flotilla-org/flotilla/pull/884".to_string(),
-                        CompletionAction::Retain => "done".to_string(),
-                    }),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyWorkForceComplete {
+                        convoy: "convoy-a@test".to_string(),
+                        work: "implement".to_string(),
+                        message: Some(match completion_action {
+                            CompletionAction::Delete => "https://github.com/flotilla-org/flotilla/pull/884".to_string(),
+                            CompletionAction::Retain => "done".to_string(),
+                        }),
+                    })
+                    .build(),
+            )
             .await
             .expect("convoy completion command should succeed");
         if matches!(completion_action, CompletionAction::Delete) {
@@ -8411,21 +8410,20 @@ mod tests {
 
         let mut rx = daemon.subscribe();
         let create_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyCreate {
-                    name: "crew-convoy".to_string(),
-                    workflow_ref: "crew-workflow".to_string(),
-                    inputs: Vec::new(),
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
-                    r#ref: Some("main".to_string()),
-                    project_ref: None,
-                    placement_policy: Some(profile.host_direct_policy_name()),
-                    adopted_checkout: Some(Box::new(repo.clone())),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyCreate {
+                        name: "crew-convoy".to_string(),
+                        workflow_ref: "crew-workflow".to_string(),
+                        inputs: Vec::new(),
+                        repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
+                        r#ref: Some("main".to_string()),
+                        project_ref: None,
+                        placement_policy: Some(profile.host_direct_policy_name()),
+                        adopted_checkout: Some(Box::new(repo.clone())),
+                    })
+                    .build(),
+            )
             .await
             .expect("create crew convoy");
         assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "crew-convoy".to_string() });
@@ -8472,12 +8470,7 @@ mod tests {
         let crew_context = CrewCommandContext { crew_id: Some(coder_id.clone()), ..Default::default() };
         let crew_list = daemon
             .execute_query(
-                Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::QueryCrewList { context: crew_context.clone() },
-                },
+                Command::builder().action(CommandAction::QueryCrewList { context: crew_context.clone() }).build(),
                 uuid::Uuid::new_v4(),
             )
             .await
@@ -8499,32 +8492,30 @@ mod tests {
 
         let mut rx = daemon.subscribe();
         let coder_complete_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewComplete {
-                    context: crew_context.clone(),
-                    message: Some("implementation ready".to_string()),
-                    disposition: None,
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewComplete {
+                        context: crew_context.clone(),
+                        message: Some("implementation ready".to_string()),
+                        disposition: None,
+                    })
+                    .build(),
+            )
             .await
             .expect("coder complete");
         assert_eq!(wait_for_command_result(&mut rx, coder_complete_id).await, CommandValue::Ok);
 
         let mut rx = daemon.subscribe();
         let handoff_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewHandoff {
-                    context: crew_context.clone(),
-                    target: "reviewer".to_string(),
-                    message: "Review commit abc123".to_string(),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewHandoff {
+                        context: crew_context.clone(),
+                        target: "reviewer".to_string(),
+                        message: "Review commit abc123".to_string(),
+                    })
+                    .build(),
+            )
             .await
             .expect("handoff reviewer");
         assert_eq!(wait_for_command_result(&mut rx, handoff_id).await, CommandValue::Ok);
@@ -8559,16 +8550,15 @@ mod tests {
 
         let mut rx = daemon.subscribe();
         let hand_back_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewHandoff {
-                    context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
-                    target: "coder".to_string(),
-                    message: "Address the review findings".to_string(),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewHandoff {
+                        context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
+                        target: "coder".to_string(),
+                        message: "Address the review findings".to_string(),
+                    })
+                    .build(),
+            )
             .await
             .expect("hand back to coder");
         assert_eq!(wait_for_command_result(&mut rx, hand_back_id).await, CommandValue::Ok);
@@ -8694,32 +8684,30 @@ mod tests {
 
         let mut rx = daemon.subscribe();
         let coder_recomplete_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some(revived_coder_id.clone()), ..Default::default() },
-                    message: Some("review findings addressed".to_string()),
-                    disposition: None,
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewComplete {
+                        context: CrewCommandContext { crew_id: Some(revived_coder_id.clone()), ..Default::default() },
+                        message: Some("review findings addressed".to_string()),
+                        disposition: None,
+                    })
+                    .build(),
+            )
             .await
             .expect("coder re-complete");
         assert_eq!(wait_for_command_result(&mut rx, coder_recomplete_id).await, CommandValue::Ok);
 
         let mut rx = daemon.subscribe();
         let return_to_reviewer_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewHandoff {
-                    context: CrewCommandContext { crew_id: Some(revived_coder_id), ..Default::default() },
-                    target: "reviewer".to_string(),
-                    message: "Please verify the fixes".to_string(),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewHandoff {
+                        context: CrewCommandContext { crew_id: Some(revived_coder_id), ..Default::default() },
+                        target: "reviewer".to_string(),
+                        message: "Please verify the fixes".to_string(),
+                    })
+                    .build(),
+            )
             .await
             .expect("return to reviewer");
         assert_eq!(wait_for_command_result(&mut rx, return_to_reviewer_id).await, CommandValue::Ok);
@@ -8748,16 +8736,15 @@ mod tests {
         .await
         .expect("record observed absence of a change request");
         let final_review_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some(reviewer_id), ..Default::default() },
-                    message: Some("changes accepted".to_string()),
-                    disposition: None,
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewComplete {
+                        context: CrewCommandContext { crew_id: Some(reviewer_id), ..Default::default() },
+                        message: Some("changes accepted".to_string()),
+                        disposition: None,
+                    })
+                    .build(),
+            )
             .await
             .expect("final reviewer completion");
         assert_eq!(wait_for_command_result(&mut rx, final_review_id).await, CommandValue::Ok);
@@ -8803,21 +8790,20 @@ mod tests {
             .expect("unknown capability workflow");
         let mut rx = daemon.subscribe();
         let create_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyCreate {
-                    name: "unknown-convoy".to_string(),
-                    workflow_ref: "unknown-capability".to_string(),
-                    inputs: Vec::new(),
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
-                    r#ref: Some("main".to_string()),
-                    project_ref: None,
-                    placement_policy: Some(profile.host_direct_policy_name()),
-                    adopted_checkout: Some(Box::new(repo)),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyCreate {
+                        name: "unknown-convoy".to_string(),
+                        workflow_ref: "unknown-capability".to_string(),
+                        inputs: Vec::new(),
+                        repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
+                        r#ref: Some("main".to_string()),
+                        project_ref: None,
+                        placement_policy: Some(profile.host_direct_policy_name()),
+                        adopted_checkout: Some(Box::new(repo)),
+                    })
+                    .build(),
+            )
             .await
             .expect("create unknown convoy");
         assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::Error {
@@ -8892,21 +8878,20 @@ mod tests {
 
         let mut rx = daemon.subscribe();
         let create_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyCreate {
-                    name: "convoy-adopted".to_string(),
-                    workflow_ref: "wf-a".to_string(),
-                    inputs: Vec::new(),
-                    repository_url: None,
-                    r#ref: None,
-                    project_ref: None,
-                    placement_policy: Some(format!("host-direct-{host_id}")),
-                    adopted_checkout: Some(Box::new(repo.clone())),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyCreate {
+                        name: "convoy-adopted".to_string(),
+                        workflow_ref: "wf-a".to_string(),
+                        inputs: Vec::new(),
+                        repository_url: None,
+                        r#ref: None,
+                        project_ref: None,
+                        placement_policy: Some(format!("host-direct-{host_id}")),
+                        adopted_checkout: Some(Box::new(repo.clone())),
+                    })
+                    .build(),
+            )
             .await
             .expect("convoy create command should start");
         assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
@@ -8914,21 +8899,20 @@ mod tests {
         let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
         let checkout_count = checkouts.list().await.expect("list adopted checkouts").items.len();
         let duplicate_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyCreate {
-                    name: "convoy-adopted".to_string(),
-                    workflow_ref: "wf-a".to_string(),
-                    inputs: Vec::new(),
-                    repository_url: None,
-                    r#ref: None,
-                    project_ref: None,
-                    placement_policy: Some(format!("host-direct-{host_id}")),
-                    adopted_checkout: Some(Box::new(repo.clone())),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyCreate {
+                        name: "convoy-adopted".to_string(),
+                        workflow_ref: "wf-a".to_string(),
+                        inputs: Vec::new(),
+                        repository_url: None,
+                        r#ref: None,
+                        project_ref: None,
+                        placement_policy: Some(format!("host-direct-{host_id}")),
+                        adopted_checkout: Some(Box::new(repo.clone())),
+                    })
+                    .build(),
+            )
             .await
             .expect("duplicate convoy create command should start");
         assert_eq!(wait_for_command_result(&mut rx, duplicate_id).await, CommandValue::Error {
@@ -8958,16 +8942,15 @@ mod tests {
 
         daemon.reconcile_adopted_checkouts(NAMESPACE).await.expect("adopted checkout integration observation should succeed");
         let complete_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyWorkForceComplete {
-                    convoy: "convoy-adopted".to_string(),
-                    work: "implement".to_string(),
-                    message: Some("done".to_string()),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyWorkForceComplete {
+                        convoy: "convoy-adopted".to_string(),
+                        work: "implement".to_string(),
+                        message: Some("done".to_string()),
+                    })
+                    .build(),
+            )
             .await
             .expect("convoy completion command should start");
         assert_eq!(wait_for_command_result(&mut rx, complete_id).await, CommandValue::Ok);
