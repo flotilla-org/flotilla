@@ -794,8 +794,7 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
         .with_vessels(vessels.clone())
         .with_teardown_runtime(Arc::new(AlwaysEligible));
     let completed_convoy = convoys.get("convoy-restart").await.expect("completed convoy should exist");
-    let initial_dependencies =
-        convoy_reconciler.fetch_dependencies(&completed_convoy).await.expect("initial cleanup dependencies should load");
+    let initial_dependencies = convoy_reconciler.prepare(&completed_convoy).await.expect("initial cleanup dependencies should load");
     let initial_cleanup = convoy_reconciler.reconcile(&completed_convoy, &initial_dependencies, Utc::now());
     assert!(initial_cleanup
         .actuations
@@ -819,8 +818,7 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
         .with_vessels(vessels.clone())
         .with_teardown_runtime(Arc::new(AlwaysEligible));
     let restarted_convoy = convoys.get("convoy-restart").await.expect("completed convoy should survive restart");
-    let restart_dependencies =
-        convoy_reconciler.fetch_dependencies(&restarted_convoy).await.expect("restart cleanup dependencies should load");
+    let restart_dependencies = convoy_reconciler.prepare(&restarted_convoy).await.expect("restart cleanup dependencies should load");
     let restart_cleanup = convoy_reconciler.reconcile(&restarted_convoy, &restart_dependencies, Utc::now());
     assert!(
         !restart_cleanup

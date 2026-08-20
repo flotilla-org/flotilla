@@ -77,6 +77,8 @@ pub async fn create_convoy_with_single_task(
     let convoys = backend.clone().using::<Convoy>(namespace);
     let convoy = convoys
         .create(&meta(name), &ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "wf".to_string(),
             dispatching_principal_ref: Default::default(),
             inputs: Default::default(),

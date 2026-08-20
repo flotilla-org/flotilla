@@ -1244,6 +1244,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "sha2",
+ "tempfile",
  "tokio",
  "tracing",
  "url",

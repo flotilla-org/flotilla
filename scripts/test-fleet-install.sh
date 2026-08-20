@@ -56,7 +56,7 @@ make_generation() {
   local bundle="$test_root/bundle-$generation/fleet-candidate-linux-x86_64-gnu2.36"
   mkdir -p "$directory" "$bundle/bin" "$bundle/lib"
   for name in flotilla flotillad cleat; do
-    printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\nprintf "%s from %s\\n"\n' "$name" "$generation" >"$bundle/bin/$name"
+    printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == host && "${3:-}" == list ]]; then\n  [[ -n "${FLEET_HOST_LIST_JSON:-}" ]] || exit 1\n  printf "%%s\\n" "$FLEET_HOST_LIST_JSON"\n  exit 0\nfi\nprintf "%s from %s\\n"\n' "$name" "$name" "$generation" >"$bundle/bin/$name"
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty\n' >"$bundle/lib/libghostty-vt.so.0"
@@ -353,6 +353,8 @@ HOME="$status_home" PATH="$status_home/.local/bin:$fake_bin:$PATH" FIXTURE_ROOT=
   FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
   "$installer" status >"$test_root/fresh-status.out"
 test ! -e "$status_home/.local/opt/flotilla-fleet" || fail 'status mutated the install root'
+grep -Fq 'fleet:   unavailable (daemon not running)' "$test_root/fresh-status.out" \
+  || fail 'status did not degrade gracefully without a daemon'
 
 run_installer "$generation_one" >"$test_root/install-one.out"
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'exact generation was not selected'
@@ -366,9 +368,28 @@ done
 status="$(run_installer status 2>"$test_root/status.err")"
 grep -Fq "current: $generation_one (peer protocol 20)" <<<"$status" || fail 'status omitted current manifest protocol'
 grep -Fq "latest:  $generation_two (peer protocol 21)" <<<"$status" || fail 'status selected the wrong promoted generation'
+grep -Fq 'fleet:   unavailable (daemon not running)' <<<"$status" || fail 'status did not report unavailable fleet spread'
 grep -Fq 'warning: peer protocol changes from 20 to 21' <<<"$status" || fail 'status omitted wire-bump warning'
 grep -Fq "skipping incomplete linux-x86_64-gnu2.36 generation $generation_incomplete" "$test_root/status.err" \
   || fail 'latest did not explain why it skipped an incomplete generation'
+
+fleet_health='{"kind":"fleet_health","hosts":[{"host":"feta","is_local":true,"daemon_generation":"111111111111"},{"host":"kiwi","is_local":false,"daemon_generation":"222222222222"},{"host":"mango","is_local":false,"daemon_generation":"111111111111"},{"host":"pear","is_local":false}],"dispatch_queue":{"entries":[]}}'
+fleet_status="$(DAEMON_RUNNING=1 FLEET_HOST_LIST_JSON="$fleet_health" run_installer status 2>"$test_root/fleet-status.err")"
+grep -Fq 'fleet wire generations:' <<<"$fleet_status" || fail 'status omitted reachable fleet spread'
+grep -Fq '  111111111111: feta (local), mango' <<<"$fleet_status" || fail 'status did not group hosts on the current wire generation'
+grep -Fq '  222222222222: kiwi' <<<"$fleet_status" || fail 'status omitted a pending wire generation'
+grep -Fq '  unknown: pear' <<<"$fleet_status" || fail 'status omitted a host with unknown generation'
+unreachable_status="$(DAEMON_RUNNING=1 run_installer status 2>"$test_root/unreachable-status.err")"
+grep -Fq 'fleet:   unavailable (daemon query failed)' <<<"$unreachable_status" \
+  || fail 'status did not degrade gracefully when the daemon query failed'
+
+for bad_payload in 'not json at all' '{"kind":"host_list","hosts":[]}' '{"kind":"fleet_health","hosts":"nope"}' '{"kind":"fleet_health","hosts":[{"is_local":true}]}'; do
+  invalid_status="$(DAEMON_RUNNING=1 FLEET_HOST_LIST_JSON="$bad_payload" run_installer status 2>"$test_root/invalid-status.err")"
+  grep -Fq 'fleet:   unavailable (invalid daemon response)' <<<"$invalid_status" \
+    || fail "status did not degrade gracefully on invalid daemon payload: $bad_payload"
+  grep -Fq "current: $generation_one" <<<"$invalid_status" \
+    || fail 'invalid daemon payload disturbed local status reporting'
+done
 
 if run_installer "$generation_incomplete" >"$test_root/incomplete-exact.out" 2>&1; then
   fail 'an explicitly requested incomplete generation was accepted'

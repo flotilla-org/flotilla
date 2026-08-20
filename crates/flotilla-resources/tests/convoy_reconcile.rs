@@ -93,7 +93,7 @@ async fn reconcile_once_with_resources(
         .with_vessels(vessels.clone())
         .with_presentations(presentations_resolver.clone())
         .with_teardown_runtime(Arc::new(AlwaysEligible));
-    let deps = reconciler.fetch_dependencies(&current).await.expect("dependency fetch should succeed");
+    let deps = reconciler.prepare(&current).await.expect("dependency fetch should succeed");
     reconciler.reconcile(&current, &deps, now)
 }
 
@@ -199,7 +199,7 @@ async fn reconcile_with_observed_change_request(
 
     let current = convoys.get("convoy-a").await.expect("convoy");
     let reconciler = ConvoyReconciler::new(templates).with_checkouts(checkouts).with_clock(Arc::new(FixedClock(timestamp(40))));
-    let deps = reconciler.fetch_dependencies(&current).await.expect("dependencies");
+    let deps = reconciler.prepare(&current).await.expect("dependencies");
     reconciler.reconcile(&current, &deps, timestamp(40))
 }
 
@@ -876,7 +876,7 @@ async fn terminal_bound_change_request_settles_checkout_without_own_landed_evide
         .with_checkouts(checkouts)
         .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), std::time::Duration::from_secs(180))
         .with_clock(Arc::new(FixedClock(timestamp(40))));
-    let deps = reconciler.fetch_dependencies(&current).await.expect("dependencies");
+    let deps = reconciler.prepare(&current).await.expect("dependencies");
     let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
 
     assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
@@ -958,7 +958,7 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
     let current = convoys.get("cross-host").await.expect("get authority convoy");
     let reconciler = ConvoyReconciler::new(authority.clone().using::<WorkflowTemplate>("flotilla"))
         .with_federated_checkouts(authority.including_replicas::<Checkout>("flotilla"));
-    let deps = reconciler.fetch_dependencies(&current).await.expect("resolve federated dependencies");
+    let deps = reconciler.prepare(&current).await.expect("resolve federated dependencies");
     let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
 
     assert_eq!(outcome.patch, None, "an open remote change request must hold Landing");
@@ -1679,14 +1679,14 @@ async fn refused_reclaim_requeues_at_the_evidence_staleness_horizon() {
     let refused = ConvoyReconciler::new(templates.clone())
         .with_teardown_runtime(Arc::new(NeverEligible))
         .with_landing_evidence_stale_after(Duration::from_secs(7));
-    let deps = refused.fetch_dependencies(&convoy).await.expect("dependencies");
+    let deps = refused.prepare(&convoy).await.expect("dependencies");
     let outcome = refused.reconcile(&convoy, &deps, timestamp(21));
     assert_eq!(outcome.requeue_after, Some(Duration::from_secs(7)), "a refused reclaim must requeue at the staleness horizon");
 
     let eligible = ConvoyReconciler::new(templates)
         .with_teardown_runtime(Arc::new(AlwaysEligible))
         .with_landing_evidence_stale_after(Duration::from_secs(7));
-    let deps = eligible.fetch_dependencies(&convoy).await.expect("dependencies");
+    let deps = eligible.prepare(&convoy).await.expect("dependencies");
     let outcome = eligible.reconcile(&convoy, &deps, timestamp(21));
     assert_eq!(outcome.requeue_after, None, "an eligible reclaim pass must not keep requeueing");
 }
@@ -1731,7 +1731,7 @@ async fn abandoned_convoy_reclaims_managed_checkout_but_retains_adopted_owner_re
 
     let convoy = convoys.get("convoy-a").await.expect("convoy get");
     let reconciler = ConvoyReconciler::new(templates).with_checkouts(checkouts).with_teardown_runtime(Arc::new(AlwaysEligible));
-    let deps = reconciler.fetch_dependencies(&convoy).await.expect("dependencies");
+    let deps = reconciler.prepare(&convoy).await.expect("dependencies");
     let outcome = reconciler.reconcile(&convoy, &deps, timestamp(21));
 
     assert!(outcome

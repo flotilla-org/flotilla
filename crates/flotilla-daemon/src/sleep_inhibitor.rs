@@ -31,6 +31,9 @@ const INHIBITOR_REASON: &str = "Flotilla vessel crew is active";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SleepCapability {
     Available,
+    // macOS hosts are always sleep-capable, so the lib target never
+    // constructs this variant there.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Unavailable,
 }
 
@@ -627,6 +630,8 @@ mod tests {
 
     fn convoy_spec() -> ConvoySpec {
         ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "single-agent-contained".to_string(),
             dispatching_principal_ref: PrincipalRef::default(),
             inputs: BTreeMap::new(),
