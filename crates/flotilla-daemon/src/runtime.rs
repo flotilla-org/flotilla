@@ -1272,7 +1272,8 @@ fn spawn_vessel_placement_projector(
     tokio::spawn(async move {
         // The projector and the Vessel reconciler need distinct health keys, while both remain tied to the resource they manage.
         supervise_controller(Vessel::API_PATHS.plural, supervision, runtime_health, move || {
-            let projector = VesselPlacementProjector::new(backend.clone(), namespace.clone(), CanonicalHostId::resolved(local_host_ref.clone()));
+            let projector =
+                VesselPlacementProjector::new(backend.clone(), namespace.clone(), CanonicalHostId::resolved(local_host_ref.clone()));
             async move { projector.run().await }
         })
         .await;
