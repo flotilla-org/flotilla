@@ -7,7 +7,7 @@ use super::{
     build_plan,
     checkout::{resolve_checkout_branch, CheckoutIntent, CheckoutResolutionScope, CheckoutService},
     session_actions::resolve_attach_command,
-    workspace_config, workspace_label_for_host, ExecutorStepResolver, RepoExecutionContext,
+    workspace_config, workspace_label_for_host, ExecutorStepResolver, PlannerRefusal, RepoExecutionContext,
 };
 use crate::{
     attachable::{AttachableStore, BindingObjectKind, ProviderBinding, SharedAttachableStore},
@@ -445,6 +445,11 @@ fn assert_error_eq(result: CommandValue, expected: &str) {
         CommandValue::Error { message } => assert_eq!(message, expected),
         other => panic!("expected Error, got {:?}", other),
     }
+}
+
+fn assert_refusal_contains(refusal: PlannerRefusal, expected_substring: &str) {
+    let message = refusal.message();
+    assert!(message.contains(expected_substring), "expected refusal containing {expected_substring:?}, got {message:?}");
 }
 
 fn assert_checkout_created_branch(result: CommandValue, expected_branch: &str) {
@@ -2064,7 +2069,7 @@ async fn daemon_level_commands_return_error() {
     for cmd in daemon_commands {
         let result = run_build_plan(cmd, empty_registry(), empty_data(), runner_ok()).await;
         match result {
-            Err(value) => assert_error_contains(value, "daemon-level command"),
+            Err(refusal) => assert_refusal_contains(refusal, "daemon-level command"),
             Ok(_) => panic!("expected Err for daemon-level command"),
         }
     }
@@ -2088,13 +2093,12 @@ fn workspace_config_builds_correct_struct() {
 // Helper to run build_plan with Arc-wrapped arguments
 // -----------------------------------------------------------------------
 
-#[allow(clippy::result_large_err)]
 async fn run_build_plan(
     action: CommandAction,
     registry: ProviderRegistry,
     providers_data: ProviderData,
     _runner: MockRunner,
-) -> Result<crate::step::StepPlan, CommandValue> {
+) -> Result<crate::step::StepPlan, PlannerRefusal> {
     let config_base = config_base();
     build_plan(
         local_command(action),
@@ -2158,7 +2162,7 @@ async fn run_build_plan_to_completion_with(
     .await;
 
     match plan {
-        Err(result) => result,
+        Err(refusal) => refusal.into_command_value(),
         Ok(step_plan) => {
             let (cancel, tx) = (CancellationToken::new(), broadcast::channel(64).0);
             let resolver = ExecutorStepResolver {

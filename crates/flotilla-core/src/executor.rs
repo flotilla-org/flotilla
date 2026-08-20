@@ -144,14 +144,32 @@ fn no_workspace_manager_error() -> CommandValue {
     CommandValue::Error { message: no_workspace_manager_error_message() }
 }
 
+#[derive(Debug)]
+pub struct PlannerRefusal {
+    message: String,
+}
+
+impl PlannerRefusal {
+    fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into() }
+    }
+
+    pub fn into_command_value(self) -> CommandValue {
+        CommandValue::Error { message: self.message }
+    }
+
+    #[cfg(test)]
+    fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 /// Build a step plan for a command.
 ///
-/// Returns `Ok(StepPlan)` for all per-repo commands, or `Err(CommandValue)`
+/// Returns `Ok(StepPlan)` for all per-repo commands, or `Err(PlannerRefusal)`
 /// for daemon-level commands that should never reach this function and for
 /// pre-resolution errors (e.g. teleport with an unknown checkout key).
-// The Err channel is deliberately the full protocol result enum: planning
-// short-circuits straight to a presentable CommandValue.
-#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
 pub async fn build_plan(
     cmd: Command,
     repo: RepoExecutionContext,
@@ -162,7 +180,7 @@ pub async fn build_plan(
     daemon_socket_path: Option<DaemonHostPath>,
     local_node_id: NodeId,
     local_host: HostName,
-) -> Result<StepPlan, CommandValue> {
+) -> Result<StepPlan, PlannerRefusal> {
     let Command { node_id, provisioning_target, action, .. } = cmd;
     let target_node_id = node_id.unwrap_or_else(|| local_node_id.clone());
     let checkout_host = StepExecutionContext::Host(target_node_id.clone());
@@ -177,7 +195,7 @@ pub async fn build_plan(
         | CommandAction::ResourceStatusPatch { .. }
         | CommandAction::ResourceDelete { .. }
         | CommandAction::ResourceWatch { .. } => {
-            Err(CommandValue::Error { message: "resource commands should be handled by the daemon resource dispatcher".to_string() })
+            Err(PlannerRefusal::new("resource commands should be handled by the daemon resource dispatcher"))
         }
         CommandAction::Checkout { target, issue_ids, .. } => {
             match provisioning_target {
@@ -262,7 +280,7 @@ pub async fn build_plan(
                 }
                 Err(message) => {
                     error!(%message, %target_node_id, %local_host, "checkout resolution failed");
-                    Err(CommandValue::Error { message })
+                    Err(PlannerRefusal::new(message))
                 }
             }
         }
@@ -333,7 +351,7 @@ pub async fn build_plan(
 
         CommandAction::MergeChangeRequest { id, confirmed } => {
             if !confirmed {
-                return Err(CommandValue::Error { message: format!("merging change request {id} requires explicit confirmation") });
+                return Err(PlannerRefusal::new(format!("merging change request {id} requires explicit confirmation")));
             }
             Ok(StepPlan::new(vec![Step {
                 description: format!("Merge change request {id}"),
@@ -388,9 +406,7 @@ pub async fn build_plan(
         | CommandAction::AttachTransient { .. }
         | CommandAction::QueryIssues { .. }
         | CommandAction::QueryIssueFetchByIds { .. }
-        | CommandAction::QueryIssueOpenInBrowser { .. } => {
-            Err(CommandValue::Error { message: "bug: daemon-level command reached per-repo executor".to_string() })
-        }
+        | CommandAction::QueryIssueOpenInBrowser { .. } => Err(PlannerRefusal::new("bug: daemon-level command reached per-repo executor")),
     }
 }
 
@@ -585,7 +601,7 @@ fn build_create_workspace_plan(
 /// 1. Resolve attach command from the session's cloud agent provider
 /// 2. Ensure checkout exists (skipped if checkout_key references a known checkout, or no branch)
 /// 3. Create workspace with the teleport (attach) command
-#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
 async fn build_teleport_session_plan(
     session_id: String,
     branch: Option<String>,
@@ -599,7 +615,7 @@ async fn build_teleport_session_plan(
     daemon_socket_path: Option<DaemonHostPath>,
     local_node_id: NodeId,
     local_host: flotilla_protocol::HostName,
-) -> Result<StepPlan, CommandValue> {
+) -> Result<StepPlan, PlannerRefusal> {
     let checkout_key_ee = checkout_key.map(ExecutionEnvironmentPath::new);
     let teleport_flow = TeleportFlow::new(
         &repo_root,
@@ -616,7 +632,7 @@ async fn build_teleport_session_plan(
     );
     let initial_path = match teleport_flow.initial_checkout_path().await {
         Ok(path) => path,
-        Err(message) => return Err(CommandValue::Error { message }),
+        Err(message) => return Err(PlannerRefusal::new(message)),
     };
 
     let steps = vec![
