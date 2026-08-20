@@ -87,7 +87,8 @@ async fn run_with_inhibitor<I: SleepInhibitor, P: SleepCapabilityProbe>(
     // then list, so events racing with the snapshot remain queued for us.
     let mut watch = convoys.watch().await?;
     let listed = convoys.list().await?;
-    let mut active_convoys = ActiveConvoys::from_objects(&listed, &host_id);
+    let canonical_host_id = flotilla_protocol::CanonicalHostId::resolved(&host_id);
+    let mut active_convoys = ActiveConvoys::from_objects(&listed, &canonical_host_id);
 
     let listed_vessels = vessels.list().await?;
     let mut active_vessels = ActiveVessels::from_objects(&listed_vessels.items);
@@ -109,7 +110,7 @@ async fn run_with_inhibitor<I: SleepInhibitor, P: SleepCapabilityProbe>(
             event = watch.next() => {
                 match event {
                     Some(Ok(event)) => {
-                        active_convoys.apply(event, &host_id);
+                        active_convoys.apply(event, &canonical_host_id);
                         maintain_and_publish(
                             &mut inhibitor,
                             effective_inhibition_required(active_convoys.required() || active_vessels.required(), sleep_capability),
@@ -291,12 +292,12 @@ struct ActiveConvoys {
 }
 
 impl ActiveConvoys {
-    fn from_objects(listed: &ReadResourceList<Convoy>, host_id: &str) -> Self {
+    fn from_objects(listed: &ReadResourceList<Convoy>, host_id: &flotilla_protocol::CanonicalHostId) -> Self {
         let keys = listed.items.iter().filter(|convoy| convoy_requires_inhibitor(&convoy.object, host_id)).map(convoy_key).collect();
         Self { keys }
     }
 
-    fn apply(&mut self, event: ReadWatchEvent<Convoy>, host_id: &str) {
+    fn apply(&mut self, event: ReadWatchEvent<Convoy>, host_id: &flotilla_protocol::CanonicalHostId) {
         match event {
             ReadWatchEvent::Added(convoy) | ReadWatchEvent::Modified(convoy) => {
                 let key = convoy_key(&convoy);
@@ -332,7 +333,7 @@ fn convoy_key(convoy: &ReadResourceObject<Convoy>) -> (Option<flotilla_protocol:
     (origin, convoy.object.metadata.name.clone())
 }
 
-fn convoy_requires_inhibitor(convoy: &ResourceObject<Convoy>, host_id: &str) -> bool {
+fn convoy_requires_inhibitor(convoy: &ResourceObject<Convoy>, host_id: &flotilla_protocol::CanonicalHostId) -> bool {
     let non_terminal = !matches!(
         convoy.status.as_ref().map(|status| status.phase),
         Some(ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned)
@@ -342,7 +343,7 @@ fn convoy_requires_inhibitor(convoy: &ResourceObject<Convoy>, host_id: &str) -> 
             .status
             .as_ref()
             .and_then(|status| status.placement_decision.as_ref())
-            .is_none_or(|decision| decision.target_host.reference == host_id)
+            .is_none_or(|decision| &decision.target_host.reference == host_id)
 }
 
 #[derive(Default)]
@@ -562,7 +563,7 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
 
     use chrono::Utc;
-    use flotilla_protocol::{NodeId, PlacementDecision, PlacementTargetHost, PrincipalRef};
+    use flotilla_protocol::{CanonicalHostId, NodeId, PlacementDecision, PlacementTargetHost, PrincipalRef};
     use flotilla_resources::{ConvoySpec, ConvoyStatus, HostSpec, InMemoryBackend, InputMeta, ResourceBackend, VesselSpec};
     use tokio::sync::mpsc;
 
@@ -658,7 +659,7 @@ mod tests {
                 phase,
                 placement_decision: target_host.map(|host| PlacementDecision {
                     policy_name: "test-policy".to_string(),
-                    target_host: PlacementTargetHost { reference: host.to_string(), display_name: host.to_string() },
+                    target_host: PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.to_string() },
                     refused_candidates: vec![],
                     viable_not_selected: vec![],
                 }),
@@ -823,7 +824,10 @@ mod tests {
                 phase: ConvoyPhase::Active,
                 placement_decision: Some(PlacementDecision {
                     policy_name: "test-policy".to_string(),
-                    target_host: PlacementTargetHost { reference: "other-host".to_string(), display_name: "other-host".to_string() },
+                    target_host: PlacementTargetHost {
+                        reference: CanonicalHostId::resolved("other-host"),
+                        display_name: "other-host".to_string(),
+                    },
                     refused_candidates: vec![],
                     viable_not_selected: vec![],
                 }),

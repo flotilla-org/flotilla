@@ -34,7 +34,7 @@ use flotilla_core::{
         ChannelLabel, CommandRunner,
     },
 };
-use flotilla_protocol::{EnvironmentId, HostSummary, ImageId, NodeId, Rows, TerminalStatus};
+use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, Rows, TerminalStatus};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, ChangeRequest, ChangeRequestStatus, Checkout,
     CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy, ConvoyReconciler, ConvoyTeardownRuntime,
@@ -707,6 +707,19 @@ struct ActiveProvisionedEnvironment {
     handle: EnvironmentHandle,
 }
 
+async fn canonical_runtime_host_id(
+    daemon: &InProcessDaemon,
+    namespace: &str,
+    local_host_id: &CanonicalHostId,
+    host_ref: &str,
+) -> Result<CanonicalHostId, String> {
+    if host_ref == local_host_id.as_str() {
+        Ok(local_host_id.clone())
+    } else {
+        daemon.canonical_host_id_internal(namespace, host_ref).await
+    }
+}
+
 #[async_trait]
 impl StandingConvoyBackingInspector for ControllerRuntimeState {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
@@ -727,15 +740,13 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
         if let Some(environment) = environments.iter().find(|environment| environment.spec.docker.is_none()) {
             return Err(format!("Environment/{} has no inspectable Docker backing", environment.metadata.name));
         }
-        if let Some(environment) = environments
-            .iter()
-            .find(|environment| environment.spec.docker.as_ref().is_some_and(|spec| spec.host_ref != self.local_host_ref))
-        {
-            return Err(format!(
-                "Environment/{} is backed by remote host {}",
-                environment.metadata.name,
-                environment.spec.docker.as_ref().expect("Docker environment checked above").host_ref
-            ));
+        let local_host_id = CanonicalHostId::resolved(&self.local_host_ref);
+        for environment in &environments {
+            let host_ref = &environment.spec.docker.as_ref().expect("Docker environment checked above").host_ref;
+            let canonical = canonical_runtime_host_id(&self.daemon, &convoy.metadata.namespace, &local_host_id, host_ref).await?;
+            if canonical != local_host_id {
+                return Err(format!("Environment/{} is backed by remote host {host_ref}", environment.metadata.name));
+            }
         }
         let (_, provider) = self
             .local_registry
@@ -786,20 +797,27 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
 }
 
 async fn reconcile_provisioned_environments(state: &Arc<ControllerRuntimeState>, namespace: &str) -> Result<(), String> {
-    let environments = state
+    let candidates = state
         .daemon
         .resource_backend()
         .using::<Environment>(namespace)
         .list()
         .await
         .map_err(|error| format!("list environments for adoption: {error}"))?
-        .items
-        .into_iter()
-        .filter(|environment| {
-            environment.spec.docker.as_ref().is_some_and(|spec| spec.host_ref == state.local_host_ref)
-                && environment.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Ready)
-        })
-        .collect::<Vec<_>>();
+        .items;
+    let local_host_id = CanonicalHostId::resolved(&state.local_host_ref);
+    let mut environments = Vec::new();
+    for environment in candidates {
+        let Some(spec) = environment.spec.docker.as_ref() else {
+            continue;
+        };
+        let Ok(canonical) = canonical_runtime_host_id(&state.daemon, namespace, &local_host_id, &spec.host_ref).await else {
+            continue;
+        };
+        if canonical == local_host_id && environment.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Ready) {
+            environments.push(environment);
+        }
+    }
     if environments.is_empty() {
         return Ok(());
     }
@@ -1254,7 +1272,8 @@ fn spawn_vessel_placement_projector(
     tokio::spawn(async move {
         // The projector and the Vessel reconciler need distinct health keys, while both remain tied to the resource they manage.
         supervise_controller(Vessel::API_PATHS.plural, supervision, runtime_health, move || {
-            let projector = VesselPlacementProjector::new(backend.clone(), namespace.clone(), local_host_ref.clone());
+            let projector =
+                VesselPlacementProjector::new(backend.clone(), namespace.clone(), CanonicalHostId::resolved(local_host_ref.clone()));
             async move { projector.run().await }
         })
         .await;
@@ -1782,10 +1801,14 @@ fn spawn_controller_loops(
         }),
         controller!(Environment, {
             let state = Arc::clone(&state);
-            move |_: ResourceBackend, _: String| {
+            move |backend: ResourceBackend, namespace_string: String| {
                 let local_host_ref = state.local_host_ref.clone();
                 let state = Arc::clone(&state);
-                (vec![], EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state })).with_local_host_ref(local_host_ref))
+                (
+                    vec![],
+                    EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, &namespace_string)
+                        .with_local_host_ref(CanonicalHostId::resolved(local_host_ref)),
+                )
             }
         }),
         controller!(Clone, {
@@ -1829,7 +1852,7 @@ fn spawn_controller_loops(
                 (
                     vec![],
                     TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
-                        .with_local_host_ref(local_host_ref)
+                        .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
                         .with_federated_convoys(&backend, &namespace_string),
                 )
             }
@@ -1843,7 +1866,7 @@ fn spawn_controller_loops(
                 (
                     VesselReconciler::secondary_watches(),
                     VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
-                        .with_federated_dependencies(&backend, local_host_ref),
+                        .with_federated_dependencies(&backend, CanonicalHostId::resolved(local_host_ref)),
                 )
             }
         }),
@@ -1854,7 +1877,7 @@ fn spawn_controller_loops(
                 let policies = Arc::new(PresentationPolicyRegistry::with_defaults());
                 let runtime = Arc::new(ProviderPresentationRuntime::new(Arc::clone(&state.local_registry), Arc::clone(&policies)));
                 let mut hop_chain = HopChainContext::new(
-                    state.local_host_ref.clone(),
+                    CanonicalHostId::resolved(state.local_host_ref.clone()),
                     state.daemon.host_name().clone(),
                     state.config.base_path().clone(),
                     {
@@ -5754,7 +5777,10 @@ mod tests {
             .update_status("remote-placement", &convoy.metadata.resource_version, &ConvoyStatus {
                 placement_decision: Some(PlacementDecision {
                     policy_name: policy_name.to_string(),
-                    target_host: PlacementTargetHost { reference: feta_host_ref.clone(), display_name: "feta".to_string() },
+                    target_host: PlacementTargetHost {
+                        reference: CanonicalHostId::resolved(feta_host_ref.clone()),
+                        display_name: "feta".to_string(),
+                    },
                     refused_candidates: Vec::new(),
                     viable_not_selected: Vec::new(),
                 }),
@@ -6085,8 +6111,32 @@ mod tests {
         .await;
         let bad_id = EnvironmentId::new("env-bad");
         let good_id = EnvironmentId::new("env-good");
+        let orphaned_id = EnvironmentId::new("env-orphaned");
         create_ready_docker_environment(&daemon, bad_id.as_str(), "test-interior", BTreeSet::from(["missing-adapter".to_string()])).await;
         create_ready_docker_environment(&daemon, good_id.as_str(), "test-interior", BTreeSet::new()).await;
+        let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
+        environments
+            .create(&empty_meta(orphaned_id.as_str()), &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    host_ref: "deleted-host".to_string(),
+                    image: "contained-image".to_string(),
+                    declared_agent_adapters: BTreeSet::new(),
+                    required_agent_adapters: BTreeSet::new(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: BTreeMap::new(),
+                }),
+            })
+            .await
+            .expect("create orphaned environment");
+        flotilla_resources::apply_status_patch(&environments, orphaned_id.as_str(), &EnvironmentStatusPatch::MarkReady {
+            docker_container_id: Some("orphaned-container".to_string()),
+            image_ref: Some("contained-image".to_string()),
+            image_digest: Some("sha256:contained".to_string()),
+        })
+        .await
+        .expect("mark orphaned environment ready");
         let handle = |id: EnvironmentId| {
             Arc::new(TestInteriorEnvironment {
                 id,
@@ -6111,6 +6161,7 @@ mod tests {
         let bad = daemon.resource_backend().using::<Environment>(NAMESPACE).get(bad_id.as_str()).await.expect("bad environment");
         assert_eq!(bad.status.expect("bad environment status").phase, EnvironmentPhase::Failed);
         assert!(daemon.environment_registry_for_environment(&bad_id).is_none());
+        assert!(daemon.environment_registry_for_environment(&orphaned_id).is_none());
         assert!(daemon.environment_registry_for_environment(&good_id).is_some(), "live sibling should still be adopted");
     }
 

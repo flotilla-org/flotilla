@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{
     controller::{Actuation, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
     Convoy, ConvoyPhase, Environment, EnvironmentPhase, ReplicaReadResolver, ResourceBackend, ResourceError, ResourceObject,
@@ -58,7 +59,7 @@ pub struct TerminalSessionReconciler<R> {
     convoys: TypedResolver<Convoy>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     environments: TypedResolver<Environment>,
-    local_host_ref: Option<String>,
+    local_host_ref: Option<CanonicalHostId>,
 }
 
 impl<R> TerminalSessionReconciler<R> {
@@ -72,8 +73,8 @@ impl<R> TerminalSessionReconciler<R> {
         }
     }
 
-    pub fn with_local_host_ref(mut self, local_host_ref: impl Into<String>) -> Self {
-        self.local_host_ref = Some(local_host_ref.into());
+    pub fn with_local_host_ref(mut self, local_host_ref: CanonicalHostId) -> Self {
+        self.local_host_ref = Some(local_host_ref);
         self
     }
 
@@ -85,7 +86,7 @@ impl<R> TerminalSessionReconciler<R> {
                 .metadata
                 .annotations
                 .get(ACTUATOR_HOST_REF_ANNOTATION)
-                .is_none_or(|actuator_host_ref| actuator_host_ref == local_host_ref)
+                .is_none_or(|actuator_host_ref| &CanonicalHostId::resolved(actuator_host_ref) == local_host_ref)
         })
     }
 

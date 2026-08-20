@@ -864,7 +864,7 @@ async fn presentation_controller_marks_presentation_active_for_live_convoy_sessi
                 backend.clone(),
                 NAMESPACE,
                 HopChainContext::new(
-                    "01HXYZ",
+                    flotilla_protocol::CanonicalHostId::resolved("01HXYZ"),
                     HostName::new("local"),
                     {
                         let path = std::env::temp_dir().join("flotilla-presentation-provisioning-in-memory");
@@ -1025,7 +1025,7 @@ fn environment_harness(backend: ResourceBackend) -> ControllerLoopHarness {
         ControllerLoop {
             primary: backend.clone().using::<Environment>(NAMESPACE),
             secondaries: vec![],
-            reconciler: EnvironmentReconciler::new(Arc::new(FakeDockerRuntime::default())),
+            reconciler: EnvironmentReconciler::new(Arc::new(FakeDockerRuntime::default()), backend.clone(), NAMESPACE),
             resync_interval: Duration::from_millis(50),
             backend,
         }

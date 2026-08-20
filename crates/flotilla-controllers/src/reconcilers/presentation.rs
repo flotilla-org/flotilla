@@ -20,7 +20,7 @@ use flotilla_core::{
     HostName,
 };
 use flotilla_manifest::{entity, stamp::WorkspaceStamp};
-use flotilla_protocol::{arg, EnvironmentId};
+use flotilla_protocol::{arg, CanonicalHostId, EnvironmentId};
 use flotilla_resources::{
     controller::{LabelJoinWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     Environment, Host, Presentation, PresentationStatus, PresentationStatusPatch, ResourceBackend, ResourceError, ResourceObject,
@@ -30,18 +30,6 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 type RegistryLookup = dyn Fn(&str) -> Result<Arc<ProviderRegistry>, String> + Send + Sync;
-
-fn canonical_host_ref(hosts: &[ResourceObject<Host>], host_ref: &str) -> Result<String, String> {
-    if hosts.iter().any(|host| host.metadata.name == host_ref) {
-        return Ok(host_ref.to_string());
-    }
-    let mut matching = hosts.iter().filter(|host| host.spec.display_name == host_ref);
-    let host = matching.next().ok_or_else(|| format!("host {host_ref} lookup failed: not found"))?;
-    if matching.any(|candidate| candidate.metadata.name != host.metadata.name) {
-        return Err(format!("host reference {host_ref} is ambiguous"));
-    }
-    Ok(host.metadata.name.clone())
-}
 
 #[async_trait]
 pub trait PresentationRuntime: Send + Sync {
@@ -157,7 +145,7 @@ impl PresentationPolicy for DefaultPolicy {
 
 #[derive(Clone)]
 pub struct HopChainContext {
-    local_host_ref: String,
+    local_host_ref: CanonicalHostId,
     local_host: HostName,
     config_base: DaemonHostPath,
     repo_root: Option<ExecutionEnvironmentPath>,
@@ -165,11 +153,11 @@ pub struct HopChainContext {
 }
 
 impl HopChainContext {
-    pub fn new<F>(local_host_ref: impl Into<String>, local_host: HostName, config_base: DaemonHostPath, registry_lookup: F) -> Self
+    pub fn new<F>(local_host_ref: CanonicalHostId, local_host: HostName, config_base: DaemonHostPath, registry_lookup: F) -> Self
     where
         F: Fn(&str) -> Result<Arc<ProviderRegistry>, String> + Send + Sync + 'static,
     {
-        Self { local_host_ref: local_host_ref.into(), local_host, config_base, repo_root: None, registry_lookup: Arc::new(registry_lookup) }
+        Self { local_host_ref, local_host, config_base, repo_root: None, registry_lookup: Arc::new(registry_lookup) }
     }
 
     pub fn with_repo_root(mut self, repo_root: ExecutionEnvironmentPath) -> Self {
@@ -204,11 +192,11 @@ impl HopChainContext {
         ExecutionEnvironmentPath::new(self.config_base.as_path())
     }
 
-    fn target_host(&self, host_ref: &str) -> HostName {
-        if host_ref == self.local_host_ref {
+    fn target_host(&self, host_ref: &CanonicalHostId) -> HostName {
+        if host_ref == &self.local_host_ref {
             self.local_host.clone()
         } else {
-            HostName::new(host_ref)
+            HostName::new(host_ref.as_str())
         }
     }
 }
@@ -244,9 +232,9 @@ impl<R> PresentationReconciler<R> {
         vec![Box::new(LabelJoinWatch::<TerminalSession, Presentation> { label_key: CONVOY_LABEL, _marker: PhantomData })]
     }
 
-    async fn canonical_host_ref(&self, host_ref: &str) -> Result<String, String> {
+    async fn canonical_host_ref(&self, host_ref: &str) -> Result<CanonicalHostId, String> {
         let hosts = self.hosts.list().await.map_err(|error| format!("host list failed: {error}"))?;
-        canonical_host_ref(&hosts.items, host_ref)
+        flotilla_resources::canonical_host_id(&hosts.items, host_ref)?.ok_or_else(|| format!("host {host_ref} lookup failed: not found"))
     }
 
     async fn resolve_process(&self, session: &ResourceObject<TerminalSession>) -> Result<ResolvedProcess, String> {
@@ -307,7 +295,7 @@ impl<R> PresentationReconciler<R> {
         &self,
         session: &ResourceObject<TerminalSession>,
         environment: &ResourceObject<Environment>,
-        host_ref: &str,
+        host_ref: &CanonicalHostId,
         attach_args: Vec<arg::Arg>,
     ) -> Result<String, String> {
         let ssh_resolver = ssh_resolver_from_config(self.hop_chain.config_base())?;
@@ -625,9 +613,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::Utc;
+    use flotilla_protocol::CanonicalHostId;
     use flotilla_resources::{HostSpec, ObjectMeta};
 
-    use super::{canonical_host_ref, yaml_string, HopChainContext, Host, HostName, ResourceObject};
+    use super::{yaml_string, HopChainContext, Host, HostName, ResourceObject};
 
     #[test]
     fn yaml_string_escapes_control_characters() {
@@ -652,9 +641,10 @@ mod tests {
             spec: HostSpec { display_name: "local-host".to_string() },
             status: None,
         }];
-        let canonical = canonical_host_ref(&hosts, "local-host").expect("resolve display-name alias");
+        let canonical =
+            flotilla_resources::canonical_host_id(&hosts, "local-host").expect("resolve display-name alias").expect("host alias exists");
         let context = HopChainContext::new(
-            "local-host-id",
+            CanonicalHostId::resolved("local-host-id"),
             HostName::new("local-host"),
             flotilla_core::path_context::DaemonHostPath::new("/tmp"),
             |_| Err("registry is not used by host routing".to_string()),

@@ -1,9 +1,11 @@
 use std::{fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{
     controller::{ReconcileOutcome, Reconciler},
-    DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentStatusPatch, EnvironmentWaitReason, ResourceError, ResourceObject,
+    DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentStatusPatch, EnvironmentWaitReason, Host, ResourceBackend,
+    ResourceError, ResourceObject, TypedResolver,
 };
 
 #[async_trait]
@@ -41,36 +43,46 @@ pub struct DockerProvisioning {
 
 pub struct EnvironmentReconciler<R> {
     docker: Arc<R>,
-    local_host_ref: Option<String>,
+    hosts: TypedResolver<Host>,
+    local_host_ref: Option<CanonicalHostId>,
 }
 
 impl<R> EnvironmentReconciler<R> {
-    pub fn new(docker: Arc<R>) -> Self {
-        Self { docker, local_host_ref: None }
+    pub fn new(docker: Arc<R>, backend: ResourceBackend, namespace: &str) -> Self {
+        Self { docker, hosts: backend.using::<Host>(namespace), local_host_ref: None }
     }
 
-    pub fn with_local_host_ref(mut self, local_host_ref: impl Into<String>) -> Self {
-        self.local_host_ref = Some(local_host_ref.into());
+    pub fn with_local_host_ref(mut self, local_host_ref: CanonicalHostId) -> Self {
+        self.local_host_ref = Some(local_host_ref);
         self
     }
 
-    fn actuates(&self, environment: &ResourceObject<Environment>) -> bool {
-        let Some(local_host_ref) = self.local_host_ref.as_deref() else {
-            return true;
+    async fn actuates(&self, environment: &ResourceObject<Environment>) -> Result<bool, ResourceError> {
+        let Some(local_host_ref) = self.local_host_ref.as_ref() else {
+            return Ok(true);
         };
         // Unscoped environments predate placement projection; their local
         // authoritative store remains their actuator.
-        environment
+        let Some(host_ref) = environment
             .spec
             .host_direct
             .as_ref()
             .map(|spec| spec.host_ref.as_str())
             .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
-            .is_none_or(|host_ref| host_ref == local_host_ref)
+        else {
+            return Ok(true);
+        };
+        let hosts = self.hosts.list().await?;
+        let canonical = match flotilla_resources::canonical_host_id(&hosts.items, host_ref) {
+            Ok(Some(canonical)) => canonical,
+            Ok(None) | Err(_) => return Ok(false),
+        };
+        Ok(&canonical == local_host_ref)
     }
 }
 
 pub enum EnvironmentPrepared {
+    Foreign,
     None,
     Ready(DockerProvisioning),
     Waiting { message: String, reason: EnvironmentWaitReason },
@@ -85,8 +97,8 @@ where
     type Prepared = EnvironmentPrepared;
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
-        if !self.actuates(obj) {
-            return Ok(EnvironmentPrepared::None);
+        if !self.actuates(obj).await? {
+            return Ok(EnvironmentPrepared::Foreign);
         }
         match obj.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending) {
             EnvironmentPhase::Pending => {
@@ -110,7 +122,7 @@ where
         prepared: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
-        if !self.actuates(obj) {
+        if matches!(prepared, EnvironmentPrepared::Foreign) {
             return ReconcileOutcome::new(None);
         }
         let patch = match obj.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending) {
@@ -127,7 +139,7 @@ where
                     Some(EnvironmentStatusPatch::MarkWaiting { message: message.clone(), reason: reason.clone() })
                 }
                 EnvironmentPrepared::Failed(message) => Some(EnvironmentStatusPatch::MarkFailed { message: message.clone() }),
-                EnvironmentPrepared::None => None,
+                EnvironmentPrepared::Foreign | EnvironmentPrepared::None => None,
             },
             _ => None,
         };
@@ -140,7 +152,7 @@ where
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
-        if !self.actuates(obj) {
+        if !self.actuates(obj).await? {
             return Ok(());
         }
         if let Some(container_id) = obj.status.as_ref().and_then(|status| status.docker_container_id.as_deref()) {

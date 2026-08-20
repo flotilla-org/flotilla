@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use chrono::Utc;
 use flotilla_controllers::reconcilers::VesselPlacementProjector;
-use flotilla_protocol::{NodeId, PlacementDecision, PlacementTargetHost};
+use flotilla_protocol::{CanonicalHostId, NodeId, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     Convoy, ConvoySpec, ConvoyStatus, InMemoryBackend, InputMeta, ResourceBackend, ResourceError, Vessel, VesselSpec,
     ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
@@ -29,7 +29,7 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
         .update_status("remote-placement", &convoy.metadata.resource_version, &ConvoyStatus {
             placement_decision: Some(PlacementDecision {
                 policy_name: "host-direct-feta".to_string(),
-                target_host: PlacementTargetHost { reference: "feta-host".to_string(), display_name: "feta".to_string() },
+                target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("feta-host"), display_name: "feta".to_string() },
                 refused_candidates: Vec::new(),
                 viable_not_selected: Vec::new(),
             }),
@@ -62,7 +62,7 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
         .await
         .expect("replicate Vessel");
 
-    let projector = VesselPlacementProjector::new(feta.clone(), NAMESPACE, "feta-host");
+    let projector = VesselPlacementProjector::new(feta.clone(), NAMESPACE, CanonicalHostId::resolved("feta-host"));
     let sync = projector.sync_once().await.expect("project placed Vessel");
     assert_eq!(sync.created, 1);
     assert_eq!(projector.sync_once().await.expect("repeat projection"), Default::default());

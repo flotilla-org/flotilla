@@ -1486,15 +1486,24 @@ mod tests {
     fn convoy_and_vessel_details_render_placement_decisions_with_refusals() {
         let decision = flotilla_protocol::PlacementDecision {
             policy_name: "host-direct-kiwi".into(),
-            target_host: flotilla_protocol::PlacementTargetHost { reference: "01HXYZ".into(), display_name: "kiwi".into() },
+            target_host: flotilla_protocol::PlacementTargetHost {
+                reference: flotilla_protocol::CanonicalHostId::resolved("01HXYZ"),
+                display_name: "kiwi".into(),
+            },
             refused_candidates: vec![flotilla_protocol::PlacementRefusal {
                 policy_name: "host-direct-feta".into(),
-                target_host: flotilla_protocol::PlacementTargetHost { reference: "02HXYZ".into(), display_name: "feta".into() },
+                target_host: flotilla_protocol::PlacementTargetHost {
+                    reference: flotilla_protocol::CanonicalHostId::resolved("02HXYZ"),
+                    display_name: "feta".into(),
+                },
                 reason: "disk below admission floor".into(),
             }],
             viable_not_selected: vec![flotilla_protocol::PlacementViableCandidate {
                 policy_name: "host-direct-gouda".into(),
-                target_host: flotilla_protocol::PlacementTargetHost { reference: "03HXYZ".into(), display_name: "gouda".into() },
+                target_host: flotilla_protocol::PlacementTargetHost {
+                    reference: flotilla_protocol::CanonicalHostId::resolved("03HXYZ"),
+                    display_name: "gouda".into(),
+                },
                 reason: "priority 0 is lower than selected policy `host-direct-kiwi` priority 100".into(),
             }],
         };

@@ -10,7 +10,7 @@ use flotilla_core::agent_adapter::{
     append_convoy_work_context, build_crew_brief_with_options, required_agent_adapters, CrewAssignment, CrewBriefMember,
     CrewBriefTemplateResolver,
 };
-use flotilla_protocol::PlacementDecision;
+use flotilla_protocol::{CanonicalHostId, PlacementDecision};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key,
     controller::{
@@ -47,7 +47,7 @@ pub struct VesselReconciler {
     terminal_sessions: TypedResolver<TerminalSession>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     federated_placement_policies: Option<ReplicaReadResolver<PlacementPolicy>>,
-    local_host_ref: Option<String>,
+    local_host_ref: Option<CanonicalHostId>,
     namespace: String,
     brief_templates: CrewBriefTemplateResolver,
 }
@@ -74,10 +74,10 @@ impl VesselReconciler {
         Self { brief_templates: CrewBriefTemplateResolver::with_config_dir(config_dir), ..Self::new(backend, namespace) }
     }
 
-    pub fn with_federated_dependencies(mut self, backend: &ResourceBackend, local_host_ref: impl Into<String>) -> Self {
+    pub fn with_federated_dependencies(mut self, backend: &ResourceBackend, local_host_ref: CanonicalHostId) -> Self {
         self.federated_convoys = Some(backend.including_replicas::<Convoy>(&self.namespace));
         self.federated_placement_policies = Some(backend.including_replicas::<PlacementPolicy>(&self.namespace));
-        self.local_host_ref = Some(local_host_ref.into());
+        self.local_host_ref = Some(local_host_ref);
         self
     }
 
@@ -118,7 +118,7 @@ impl VesselReconciler {
     }
 
     fn missing_host_local_environment(&self, environment_ref: &str, placement_host_ref: &str) -> String {
-        let reconciler_host_ref = self.local_host_ref.as_deref().unwrap_or("unknown");
+        let reconciler_host_ref = self.local_host_ref.as_ref().map_or("unknown", CanonicalHostId::as_str);
         let message = format!(
             "host-local Environment {environment_ref} for placement host {placement_host_ref} was not found in the resource store for reconciler host {reconciler_host_ref}"
         );
@@ -277,7 +277,7 @@ impl Reconciler for VesselReconciler {
             .local_host_ref
             .as_ref()
             .zip(placement_decision.as_ref())
-            .is_some_and(|(local_host_ref, decision)| decision.target_host.reference != *local_host_ref)
+            .is_some_and(|(local_host_ref, decision)| &decision.target_host.reference != local_host_ref)
         {
             return Ok(VesselPrepared::none());
         }
@@ -300,7 +300,7 @@ impl Reconciler for VesselReconciler {
             Err(message) => return Ok(VesselPrepared::failed(message)),
         };
         if let Some(decision) = placement_decision.as_ref() {
-            strategy.canonicalize_host_ref(&decision.target_host.reference);
+            strategy.canonicalize_host_ref(decision.target_host.reference.as_str());
         }
         let declared_agent_adapters =
             placement_policy.spec.docker_per_vessel.as_ref().map(|docker| docker.agent_adapters.clone()).unwrap_or_default();
@@ -572,13 +572,13 @@ impl Reconciler for VesselReconciler {
                     &convoy.metadata.name,
                     &convoy_repository.workspace_slug,
                     multi_repository,
-                    checkout_placement_scope(&convoy, self.local_host_ref.as_deref()).as_deref(),
+                    checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(CanonicalHostId::as_str)).as_deref(),
                 ),
                 PlacementStrategy::DockerFreshCloneInContainer { .. } => checkout_name(
                     &obj.metadata.name,
                     &convoy_repository.workspace_slug,
                     multi_repository,
-                    checkout_placement_scope(&convoy, self.local_host_ref.as_deref()).as_deref(),
+                    checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(CanonicalHostId::as_str)).as_deref(),
                 ),
             });
             let checkout_target_path = match &strategy {
@@ -1178,7 +1178,7 @@ fn host_direct_environment_name(host_ref: &str) -> String {
 
 fn legible_waiting_for(mut waiting_for: String, placement_decision: Option<&PlacementDecision>) -> String {
     if let Some(decision) = placement_decision {
-        let target_environment = host_direct_environment_name(&decision.target_host.reference);
+        let target_environment = host_direct_environment_name(decision.target_host.reference.as_str());
         let display_environment = host_direct_environment_name(&decision.target_host.display_name);
         waiting_for = waiting_for.replace(&target_environment, &display_environment);
     }
@@ -1428,7 +1428,10 @@ mod tests {
     fn waiting_message_replaces_the_structured_host_direct_environment_name() {
         let decision = PlacementDecision {
             policy_name: "host-direct-test".to_string(),
-            target_host: PlacementTargetHost { reference: "01HXYZ".to_string(), display_name: "kiwi".to_string() },
+            target_host: PlacementTargetHost {
+                reference: flotilla_protocol::CanonicalHostId::resolved("01HXYZ"),
+                display_name: "kiwi".to_string(),
+            },
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
         };
@@ -1455,13 +1458,16 @@ mod tests {
             .build();
         let decision = PlacementDecision {
             policy_name: "host-direct-udder".to_string(),
-            target_host: PlacementTargetHost { reference: "1c8df992".to_string(), display_name: "udder".to_string() },
+            target_host: PlacementTargetHost {
+                reference: flotilla_protocol::CanonicalHostId::resolved("1c8df992"),
+                display_name: "udder".to_string(),
+            },
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
         };
         let mut strategy = placement_strategy(&policy).expect("host-direct policy should produce a placement strategy");
 
-        strategy.canonicalize_host_ref(&decision.target_host.reference);
+        strategy.canonicalize_host_ref(decision.target_host.reference.as_str());
 
         assert!(
             matches!(strategy, PlacementStrategy::HostDirect { ref host_ref, .. } if host_ref == "1c8df992"),
@@ -1493,7 +1499,8 @@ mod tests {
     #[test]
     fn missing_host_local_environment_warns_with_store_and_host_context() {
         let backend = ResourceBackend::InMemory(Default::default());
-        let reconciler = VesselReconciler::new(backend.clone(), "flotilla").with_federated_dependencies(&backend, "feta-host");
+        let reconciler = VesselReconciler::new(backend.clone(), "flotilla")
+            .with_federated_dependencies(&backend, flotilla_protocol::CanonicalHostId::resolved("feta-host"));
         let log_output = Arc::new(Mutex::new(Vec::new()));
         let message;
         {

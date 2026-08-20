@@ -343,7 +343,8 @@ async fn foreign_actuator_runtime_failure_is_skipped_and_convoy_stays_active() {
         ControllerLoop {
             primary: sessions.clone(),
             secondaries: Vec::new(),
-            reconciler: TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla").with_local_host_ref("kiwi"),
+            reconciler: TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla")
+                .with_local_host_ref(flotilla_protocol::CanonicalHostId::resolved("kiwi")),
             resync_interval: Duration::from_secs(60),
             backend,
         }

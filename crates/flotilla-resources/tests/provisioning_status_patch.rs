@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Utc};
-use flotilla_protocol::{PlacementDecision, PlacementTargetHost, SleepInhibitionHealth};
+use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost, SleepInhibitionHealth};
 use flotilla_resources::{
     CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus,
     CloneStatusPatch, ConditionValue, EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch, HostStatus, HostStatusPatch,
@@ -246,7 +246,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     let ready_at = Utc.timestamp_opt(20, 0).single().expect("timestamp");
     let placement_decision = PlacementDecision {
         policy_name: "docker-on-01HXYZ".to_string(),
-        target_host: PlacementTargetHost { reference: "01HXYZ".to_string(), display_name: "kiwi".to_string() },
+        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("01HXYZ"), display_name: "kiwi".to_string() },
         refused_candidates: Vec::new(),
         viable_not_selected: Vec::new(),
     };
@@ -266,7 +266,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     VesselStatusPatch::MarkProvisioning {
         placement_decision: Some(PlacementDecision {
             policy_name: "replacement-must-not-win".to_string(),
-            target_host: PlacementTargetHost { reference: "other".to_string(), display_name: "feta".to_string() },
+            target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("other"), display_name: "feta".to_string() },
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
         }),

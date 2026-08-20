@@ -657,7 +657,12 @@ fn reconciler(runtime: Arc<FakePresentationRuntime>, backend: ResourceBackend) -
         runtime,
         backend,
         NAMESPACE,
-        HopChainContext::new(HOST_REF, HostName::new("local"), temp_config_base(), move |_env_ref| Ok(Arc::clone(&registry))),
+        HopChainContext::new(
+            flotilla_protocol::CanonicalHostId::resolved(HOST_REF),
+            HostName::new("local"),
+            temp_config_base(),
+            move |_env_ref| Ok(Arc::clone(&registry)),
+        ),
         Arc::new(PresentationPolicyRegistry::with_defaults()),
     )
 }
