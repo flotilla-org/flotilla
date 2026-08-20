@@ -669,10 +669,13 @@ PY
 write_systemd_user_unit() {
   [[ "$PLATFORM" == linux-* ]] || return 0
   local unit="$SYSTEMD_USER_DIR/flotillad.service"
-  local temporary
+  local temporary daemon_path fleet_bin_path cargo_bin_path
+  daemon_path="$(systemd_path "$FLEET_ROOT/current/bin/flotillad")"
+  fleet_bin_path="$(systemd_path "$FLEET_BIN_DIR")"
+  cargo_bin_path="$(systemd_path "$HOME/.cargo/bin")"
   mkdir -p "$SYSTEMD_USER_DIR"
   temporary="$(mktemp "$SYSTEMD_USER_DIR/.flotillad.service.fleet-install.XXXXXX")"
-  cat >"$temporary" <<'UNIT'
+  cat >"$temporary" <<UNIT
 # managed by fleet-install
 [Unit]
 Description=Flotilla daemon
@@ -681,8 +684,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/opt/flotilla-fleet/current/bin/flotillad
-Environment="PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart="$daemon_path"
+Environment="PATH=$fleet_bin_path:$cargo_bin_path:/usr/local/bin:/usr/bin:/bin"
 Restart=on-failure
 
 [Install]
@@ -692,8 +695,28 @@ UNIT
   mv -f "$temporary" "$unit"
 }
 
+systemd_path() {
+  python3 - "$1" "$HOME" <<'PY'
+import os
+import sys
+
+path, home = sys.argv[1:]
+if "\n" in path or "\r" in path:
+    raise SystemExit("systemd path contains a line break")
+if path == home:
+    print("%h")
+elif path.startswith(home + os.sep):
+    relative = path[len(home) + 1 :].replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    print(f"%h/{relative}")
+else:
+    print(path.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%"))
+PY
+}
+
 prepare_linux_daemon_service() {
   [[ "$PLATFORM" == linux-* ]] || return 0
+  command -v loginctl >/dev/null || die 'cannot install flotillad.service: loginctl is not available'
+  command -v systemctl >/dev/null || die 'cannot install flotillad.service: systemctl is not available'
   write_systemd_user_unit
   loginctl enable-linger "$(id -un)"
   systemctl --user daemon-reload
@@ -702,6 +725,7 @@ prepare_linux_daemon_service() {
 
 restart_linux_daemon_service() {
   [[ "$PLATFORM" == linux-* ]] || return 0
+  command -v systemctl >/dev/null || die 'cannot restart flotillad.service: systemctl is not available'
   systemctl --user restart flotillad.service
 }
 

@@ -335,6 +335,7 @@ run_installer() {
   : "${SYSTEMCTL_LOG:=$test_root/systemctl.log}"
   : "${LOGINCTL_LOG:=$test_root/loginctl.log}"
   HOME="$test_root/home" \
+    XDG_CONFIG_HOME="$test_root/home/.config" \
     PATH="$test_root/home/.local/bin:$fake_bin:$PATH" \
     FIXTURE_ROOT="$fixture_root" \
     SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
@@ -384,7 +385,7 @@ for name in flotilla flotillad cleat; do
 done
 unit="$test_root/home/.config/systemd/user/flotillad.service"
 test -f "$unit" || fail 'systemd user unit was not installed'
-grep -Fxq 'ExecStart=%h/.local/opt/flotilla-fleet/current/bin/flotillad' "$unit" \
+grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad"' "$unit" \
   || fail 'systemd user unit does not use the stable flotillad path'
 grep -Fxq 'Environment="PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"' "$unit" \
   || fail 'systemd user unit does not expose the fleet binary PATH'
@@ -441,7 +442,7 @@ printf '# managed by fleet-install\nstale unit\n' >"$unit"
 run_installer "$generation_one" >/dev/null
 after_manifest="$(file_sha256 "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json")"
 [[ "$before_manifest" == "$after_manifest" ]] || fail 'exact-generation reinstall mutated the release'
-grep -Fxq 'ExecStart=%h/.local/opt/flotilla-fleet/current/bin/flotillad' "$unit" \
+grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad"' "$unit" \
   || fail 'exact-generation reinstall did not refresh the systemd user unit'
 test "$(grep -Fxc -- '--user daemon-reload' "$test_root/systemctl.log")" = 1 \
   || fail 'unit refresh did not reload the systemd user manager exactly once'
@@ -480,6 +481,19 @@ test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" =
 run_installer rollback >"$test_root/rollback.out"
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'rollback did not restore previous generation'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" = "$generation_two" || fail 'rollback did not retain displaced generation'
+
+custom_root="$test_root/custom-root"
+custom_bin="$test_root/custom-bin"
+HOME="$test_root/home" XDG_CONFIG_HOME="$test_root/home/.config" PATH="$custom_bin:$fake_bin:$PATH" \
+  FIXTURE_ROOT="$fixture_root" SYSTEMCTL_LOG="$test_root/systemctl.log" LOGINCTL_LOG="$test_root/loginctl.log" \
+  FLEET_INSTALL_ROOT="$custom_root" FLEET_INSTALL_BIN_DIR="$custom_bin" \
+  FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
+  FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
+  "$installer" "$generation_one" >"$test_root/custom-paths.out"
+grep -Fxq "ExecStart=\"$custom_root/current/bin/flotillad\"" "$unit" \
+  || fail 'systemd user unit ignored the configured fleet root'
+grep -Fxq "Environment=\"PATH=$custom_bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"" "$unit" \
+  || fail 'systemd user unit ignored the configured fleet binary directory'
 
 darwin_home="$test_root/darwin-home"
 mkdir -p "$darwin_home/.config/flotilla"
