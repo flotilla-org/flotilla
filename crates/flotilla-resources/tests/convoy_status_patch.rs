@@ -236,6 +236,19 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
 }
 
 #[test]
+fn abandoned_status_is_immutable_against_stale_and_duplicate_patches() {
+    let mut status = ConvoyStatus { phase: ConvoyPhase::Active, ..ConvoyStatus::default() };
+    external_patches::mark_convoy_abandoned(ts(50), WorkCompletionAuthority::HumanOverride, "first reason".to_string()).apply(&mut status);
+    let abandoned = status.clone();
+
+    controller_patches::roll_up_phase(ConvoyPhase::Active, Some(ts(60)), None).apply(&mut status);
+    external_patches::mark_convoy_abandoned(ts(70), WorkCompletionAuthority::HumanOverride, "replacement reason".to_string())
+        .apply(&mut status);
+
+    assert_eq!(status, abandoned);
+}
+
+#[test]
 fn crew_completion_updates_only_the_calling_agent() {
     let mut status = ConvoyStatus {
         placement_decision: None,

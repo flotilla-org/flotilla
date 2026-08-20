@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::TimeZone;
 use flotilla_resources::{
-    ConvoyEnsureStatus, ConvoyStatus, CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
-    CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
-    CrewWorkPhase, Environment as ResourceEnvironment, EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec,
+    controller_patches, ConvoyEnsureStatus, ConvoyStatus, CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector,
+    CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
+    CrewSource, CrewSpec, CrewWorkPhase, Environment as ResourceEnvironment, EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec,
     EnvironmentStatus as ResourceEnvironmentStatus, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Selector, Stance, TerminalAttention,
     TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
@@ -284,6 +284,44 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
     assert!(generations.iter().any(|convoy| convoy.metadata.name == first_ref && convoy.spec.generation == 1));
     assert!(generations.iter().any(|convoy| convoy.spec.generation == 2));
     assert_eq!(backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 1);
+}
+
+#[tokio::test]
+async fn abandoned_ensure_generation_survives_a_stale_reconcile_write_and_is_superseded() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
+    let ensures = backend.using::<ConvoyEnsure>("flotilla");
+    let first_ref =
+        ensures.get("quartermaster").await.expect("ensure").status.and_then(|status| status.convoy_ref).expect("first convoy ref");
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let first = convoys.get(&first_ref).await.expect("first generation");
+    let workflow_snapshot_ref =
+        first.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).cloned().expect("workflow archive pointer");
+
+    daemon.abandon_convoy_internal("flotilla", &first_ref, "operator requested replacement").await.expect("abandon generation");
+
+    // This patch represents a reconcile that read the generation while it was
+    // still active and lost the optimistic write race to the abandon command.
+    // Retrying it against the newer status must not resurrect the generation.
+    apply_resource_status_patch(&convoys, &first_ref, &controller_patches::roll_up_phase(ConvoyPhase::Active, Some(clock.now()), None))
+        .await
+        .expect("stale reconcile write");
+
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("observe abandoned generation");
+    clock.advance(ChronoDuration::seconds(30));
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("supersede abandoned generation"), vec![
+        "started quartermaster@standing-project"
+    ]);
+
+    let generations = convoys.list().await.expect("standing generations").items;
+    assert_eq!(generations.len(), 2);
+    let abandoned = generations.iter().find(|convoy| convoy.metadata.name == first_ref).expect("abandoned history");
+    let abandoned_status = abandoned.status.as_ref().expect("abandoned status");
+    assert_eq!(abandoned.spec.generation, 1);
+    assert_eq!(abandoned_status.phase, ConvoyPhase::Abandoned);
+    assert_eq!(abandoned_status.message.as_deref(), Some("abandoned by HumanOverride: operator requested replacement"));
+    assert_eq!(abandoned.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION), Some(&workflow_snapshot_ref));
+    assert!(generations.iter().any(|convoy| convoy.spec.generation == 2 && convoy.metadata.name != first_ref));
 }
 
 #[tokio::test]
