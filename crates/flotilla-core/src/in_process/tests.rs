@@ -5,7 +5,7 @@ use flotilla_resources::{
     controller_patches, ConvoyEnsureStatus, ConvoyStatus, CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector,
     CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
     CrewSource, CrewSpec, CrewWorkPhase, Environment as ResourceEnvironment, EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec,
-    EnvironmentStatus as ResourceEnvironmentStatus, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    EnvironmentStatus as ResourceEnvironmentStatus, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Selector, Stance, TerminalAttention,
     TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
@@ -871,6 +871,49 @@ async fn default_placement_refuses_unknown_host_without_blocking_tool_workflow()
     let resolution = default_convoy_placement_policy(&backend, "flotilla", &workflow, None).await.expect("clean candidate");
     assert_eq!(resolution.selected.expect("clean placement").metadata.name, "z-clean");
     assert_eq!(resolution.refused_candidates[0].policy_name, "a-unknown-host");
+}
+
+#[tokio::test]
+async fn default_placement_error_lists_each_refusal_and_failed_host_condition_reason() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    for (policy_name, host_name, condition_reason, condition_message) in [
+        ("host-direct-feta", "feta", "StoredObjectDecodeFailed", "ConvoyEnsure/quarantined-record failed typed decode"),
+        ("host-direct-udder", "udder", "RestartBudgetExhausted", "resource controller stopped after repeated failures"),
+    ] {
+        create_host_direct_placement(&backend, policy_name, host_name, BTreeSet::from(["codex".to_string()])).await;
+        let hosts = backend.using::<ResourceHost>("flotilla");
+        let host = hosts.get(host_name).await.expect("host");
+        hosts
+            .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
+                capabilities: host.status.expect("host status").capabilities,
+                daemon_generation: Some(format!("{host_name}-generation")),
+                heartbeat_at: Some(Utc::now()),
+                ready: false,
+                conditions: vec![HostCondition::builder()
+                    .condition_type("test")
+                    .value(ConditionValue::False)
+                    .reason(condition_reason)
+                    .message(condition_message)
+                    .observed_at(Utc::now())
+                    .build()],
+                ..HostStatus::default()
+            })
+            .await
+            .expect("degraded host status");
+    }
+
+    let error = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), None)
+        .await
+        .expect_err("all placement candidates should be refused");
+
+    assert_eq!(
+        error,
+        "no placement policy satisfies adapter `codex`; candidates:\n\
+- `host-direct-feta`: placement `host-direct-feta` host `feta` generation `feta-generation` is not ready: \
+StoredObjectDecodeFailed: ConvoyEnsure/quarantined-record failed typed decode\n\
+- `host-direct-udder`: placement `host-direct-udder` host `udder` generation `udder-generation` is not ready: \
+RestartBudgetExhausted: resource controller stopped after repeated failures"
+    );
 }
 
 async fn create_test_environment(daemon: &InProcessDaemon, name: &str, host_ref: &str) -> String {

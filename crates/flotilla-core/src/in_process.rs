@@ -1258,6 +1258,18 @@ fn host_generation(status: Option<&ResourceHostStatus>) -> &str {
     status.and_then(|status| status.daemon_generation.as_deref()).unwrap_or("unknown")
 }
 
+fn placement_host_not_ready_reason(placement_name: &str, host_label: &str, generation: &str, status: &ResourceHostStatus) -> String {
+    let mut failing_conditions = status
+        .conditions
+        .iter()
+        .filter(|condition| condition.value == ConditionValue::False)
+        .map(|condition| format!("{}: {}", condition.reason, condition.message))
+        .collect::<Vec<_>>();
+    failing_conditions.sort();
+    let detail = if failing_conditions.is_empty() { String::new() } else { format!(": {}", failing_conditions.join("; ")) };
+    format!("placement `{placement_name}` host `{host_label}` generation `{generation}` is not ready{detail}")
+}
+
 fn check_placement_capacity(target_host: &PlacementTargetHost, capacity: Option<(u64, Option<u64>)>) -> Result<(), String> {
     let Some((floor_bytes, free_bytes)) = capacity else {
         return Err(format!("placement refused on host `{}`: admission free-space floor is unavailable", target_host.display_name));
@@ -1350,8 +1362,16 @@ async fn default_convoy_placement_policy(
         } else {
             format!("adapters {}", required_adapters.iter().map(|adapter| format!("`{adapter}`")).collect::<Vec<_>>().join(", "))
         };
-        let candidates = if candidate_names.is_empty() { "(none)".to_string() } else { candidate_names.join(", ") };
-        return Err(format!("no placement policy satisfies {requirement}; candidates: {candidates}"));
+        if refused_candidates.is_empty() {
+            return Err(format!("no placement policy satisfies {requirement}; candidates: (none)"));
+        }
+        refused_candidates.sort_by(|left, right| left.policy_name.cmp(&right.policy_name));
+        let candidates = refused_candidates
+            .iter()
+            .map(|candidate| format!("- `{}`: {}", candidate.policy_name, candidate.reason))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!("no placement policy satisfies {requirement}; candidates:\n{candidates}"));
     }
 
     if candidate_names.is_empty() {
@@ -3882,7 +3902,7 @@ async fn validate_workflow_credentials_with_capabilities(
     status.apply_heartbeat_readiness(Utc::now());
     if !required.is_empty() {
         if !status.ready {
-            return Err(format!("placement `{}` host `{host_label}` generation `{generation}` is not ready", placement.metadata.name));
+            return Err(placement_host_not_ready_reason(&placement.metadata.name, &host_label, &generation, &status));
         }
         let held = status.held_credentials().map_err(|error| {
             format!(
@@ -4040,7 +4060,7 @@ async fn placement_agent_adapters(
         })?;
         status.apply_heartbeat_readiness(Utc::now());
         if !status.ready {
-            return Err(format!("placement `{}` host `{host_label}` generation `{generation}` is not ready", placement.metadata.name));
+            return Err(placement_host_not_ready_reason(&placement.metadata.name, &host_label, &generation, &status));
         }
         let available_adapters = status.agent_adapters().map_err(|error| {
             format!(
