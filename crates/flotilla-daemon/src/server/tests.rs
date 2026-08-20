@@ -2254,7 +2254,7 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
                 branch: "feat-workspace-local".into(),
                 path: QualifiedPath::from_host_name(&HostName::new("feta"), "/srv/feta/repo/wt-feat-workspace-local"),
             }),
-            StepOutcome::Produced(CommandValue::PreparedWorkspace(PreparedWorkspace {
+            StepOutcome::Produced(CommandValue::PreparedWorkspace(Box::new(PreparedWorkspace {
                 label: "feat-workspace-local@feta".into(),
                 target_node_id: NodeId::new("feta"),
                 display_host: Some(HostName::new("feta")),
@@ -2265,7 +2265,7 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
                 container_name: None,
                 template_yaml: None,
                 prepared_commands: vec![],
-            })),
+            }))),
         ])
         .await;
 
