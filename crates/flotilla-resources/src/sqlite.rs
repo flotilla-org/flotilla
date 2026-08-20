@@ -1598,6 +1598,21 @@ impl SqliteBackend {
         .await
     }
 
+    pub(crate) async fn delete_decode_quarantine_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<bool, ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        let name = name.to_string();
+        self.call(move |connection| {
+            let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource quarantine delete"))?;
+            if Self::select_existing::<T>(&tx, &key, &name)?.is_some() {
+                return Err(ResourceError::conflict(&name, "cannot delete quarantine while a live resource exists"));
+            }
+            let deleted = Self::clear_decode_quarantine(&tx, &key, &name)?;
+            tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource quarantine delete"))?;
+            Ok(deleted)
+        })
+        .await
+    }
+
     pub(crate) async fn tombstone_typed<T: Resource>(
         &self,
         namespace: &str,
@@ -1853,5 +1868,59 @@ impl SqliteBackend {
         let quarantines =
             failures.into_iter().map(|(event_version, name, _, error)| EventDecodeWarning { event_version, name, error }).collect();
         Ok(ReplayedEvents { events, quarantines })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::{InputMeta, MaterialPool, MaterialPoolSpec};
+
+    #[tokio::test]
+    async fn quarantine_only_delete_refuses_a_concurrently_created_live_object() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("resources.sqlite");
+        let backend = SqliteBackend::open(&path).expect("sqlite backend should open");
+        backend
+            .create_typed::<MaterialPool>(
+                "flotilla",
+                &InputMeta::builder().name("contended".to_string()).build(),
+                &MaterialPoolSpec::default(),
+            )
+            .await
+            .expect("create live resource");
+
+        let connection = RusqliteConnection::open(&path).expect("open raw sqlite connection");
+        connection
+            .execute(
+                r#"
+                INSERT INTO resource_decode_quarantine
+                    (group_name, version, kind, namespace, name, body_json, error, quarantined_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, '{}', 'stale diagnosis', ?6)
+                "#,
+                params![
+                    MaterialPool::API_PATHS.group,
+                    MaterialPool::API_PATHS.version,
+                    MaterialPool::API_PATHS.kind,
+                    "flotilla",
+                    "contended",
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .expect("seed stale quarantine diagnosis beside live object");
+        drop(connection);
+
+        let error = backend
+            .delete_decode_quarantine_typed::<MaterialPool>("flotilla", "contended")
+            .await
+            .expect_err("quarantine-only deletion must not delete a live resource");
+        assert!(matches!(error, ResourceError::Conflict { .. }), "unexpected quarantine-delete error: {error}");
+        assert!(
+            backend.get_typed::<MaterialPool>("flotilla", "contended").await.is_ok(),
+            "the concurrent live resource must remain intact"
+        );
+        assert_eq!(backend.diagnostics().await.expect("read diagnostics").decode_quarantines.len(), 1);
     }
 }
