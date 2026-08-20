@@ -734,7 +734,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                         object_failures.remove(&name);
                     }
                     if let Some(failure) = object_failures.get(&name) {
-                        if Instant::now() < failure.retry_at || (failure.terminal && !degraded_needs_reconcile) {
+                        if !degraded_needs_reconcile && (failure.terminal || Instant::now() < failure.retry_at) {
                             return Ok(());
                         }
                     }
