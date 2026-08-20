@@ -39,14 +39,15 @@ async fn create_identity_convoy(backend: &ResourceBackend, record: &str, role: &
 async fn seed_convoy_routing_row(
     daemon: &InProcessDaemon,
     record: &str,
-    role: &str,
+    role: Option<&str>,
     project: Option<&str>,
     phase: flotilla_protocol::ConvoyPhase,
 ) {
     let resource = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", record).on_host(daemon.host_name.clone());
     let mut row = flotilla_protocol::ConvoyRow::builder()
         .resource(resource.clone())
-        .name(role.to_string())
+        .maybe_address_role(role.map(str::to_string))
+        .name(role.unwrap_or(record).to_string())
         .workflow_ref("review".to_string())
         .phase(phase)
         .build();
@@ -145,13 +146,13 @@ async fn convoy_resolution_refuses_multiple_terminal_generations() {
 #[tokio::test]
 async fn convoy_routing_falls_back_to_a_unique_terminal_generation_and_refuses_multiple() {
     let (daemon, _backend, _clock, _temp) = standing_ensure_fixture().await;
-    seed_convoy_routing_row(&daemon, "convoy-one", "reviewer", Some("flotilla"), flotilla_protocol::ConvoyPhase::Landed).await;
+    seed_convoy_routing_row(&daemon, "convoy-one", Some("reviewer"), Some("flotilla"), flotilla_protocol::ConvoyPhase::Landed).await;
     let action = flotilla_protocol::CommandAction::ConvoyDelete { namespace: None, name: "reviewer@flotilla".to_string(), force: false };
 
     let target = daemon.resolve_existing_convoy_target(&action).await.expect("route sole terminal generation").expect("routing target");
     assert_eq!(target.home, daemon.host_name);
 
-    seed_convoy_routing_row(&daemon, "convoy-two", "reviewer", Some("flotilla"), flotilla_protocol::ConvoyPhase::Failed).await;
+    seed_convoy_routing_row(&daemon, "convoy-two", Some("reviewer"), Some("flotilla"), flotilla_protocol::ConvoyPhase::Failed).await;
     assert_eq!(
         daemon.resolve_existing_convoy_target(&action).await,
         Err("convoy address `reviewer@flotilla` matches multiple terminal records; use an exact record name: convoy-one, convoy-two"
@@ -162,10 +163,21 @@ async fn convoy_routing_falls_back_to_a_unique_terminal_generation_and_refuses_m
 #[tokio::test]
 async fn convoy_routing_prefers_an_exact_terminal_pre_identity_record() {
     let (daemon, _backend, _clock, _temp) = standing_ensure_fixture().await;
-    seed_convoy_routing_row(&daemon, "pre-identity-record", "", None, flotilla_protocol::ConvoyPhase::Landed).await;
+    seed_convoy_routing_row(&daemon, "pre-identity-record", None, None, flotilla_protocol::ConvoyPhase::Landed).await;
     let action = flotilla_protocol::CommandAction::ConvoyDelete { namespace: None, name: "pre-identity-record".to_string(), force: false };
 
     let target = daemon.resolve_existing_convoy_target(&action).await.expect("route exact terminal record").expect("routing target");
+    assert_eq!(target.home, daemon.host_name);
+}
+
+#[tokio::test]
+async fn convoy_routing_does_not_treat_a_legacy_display_name_as_role_identity() {
+    let (daemon, _backend, _clock, _temp) = standing_ensure_fixture().await;
+    seed_convoy_routing_row(&daemon, "reviewer", None, Some("flotilla"), flotilla_protocol::ConvoyPhase::Landed).await;
+    seed_convoy_routing_row(&daemon, "convoy-one", Some("reviewer"), Some("flotilla"), flotilla_protocol::ConvoyPhase::Landed).await;
+    let action = flotilla_protocol::CommandAction::ConvoyDelete { namespace: None, name: "reviewer@flotilla".to_string(), force: false };
+
+    let target = daemon.resolve_existing_convoy_target(&action).await.expect("route explicit role identity").expect("routing target");
     assert_eq!(target.home, daemon.host_name);
 }
 

@@ -790,6 +790,9 @@ impl fmt::Display for WorkPhase {
 pub struct ConvoyRow {
     /// Row identity and merge key across hosts.
     pub resource: ResourceRef,
+    /// Stable role identity when this record participates in role addressing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_role: Option<String>,
     pub name: String,
     #[builder(default)]
     #[serde(default)]

@@ -24,7 +24,7 @@ use flotilla_resources::{
     Demand, DemandAddressee, DemandState, Environment, Presentation, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard,
     RegardExpiryPolicy, ReplicaReadResolver, Repository, Resource, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
     TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart,
-    WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
+    WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::sync::{broadcast, mpsc};
@@ -1808,6 +1808,7 @@ impl Aggregator {
         let needs_attention = reclaim_refusal.is_some() || vessels.iter().any(|vessel| vessel.needs_attention);
         ConvoyRow::builder()
             .resource(resource.clone())
+            .maybe_address_role(convoy.metadata.labels.get(ROLE_LABEL).cloned())
             .name(name)
             .generation(convoy.spec.generation)
             .workflow_ref(&convoy.spec.workflow_ref)

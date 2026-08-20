@@ -2914,7 +2914,7 @@ impl InProcessDaemon {
             .iter()
             .map(|row| ConvoyAddressIdentity {
                 record_name: &row.resource.name,
-                role: Some(&row.name),
+                role: row.address_role.as_deref(),
                 project: row.project_ref.as_deref(),
                 terminal: row.phase.is_terminal(),
             })
