@@ -36,6 +36,24 @@ async fn create_identity_convoy(backend: &ResourceBackend, record: &str, role: &
         .expect("convoy");
 }
 
+async fn seed_convoy_routing_row(
+    daemon: &InProcessDaemon,
+    record: &str,
+    role: &str,
+    project: Option<&str>,
+    phase: flotilla_protocol::ConvoyPhase,
+) {
+    let resource = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", record).on_host(daemon.host_name.clone());
+    let mut row = flotilla_protocol::ConvoyRow::builder()
+        .resource(resource.clone())
+        .name(role.to_string())
+        .workflow_ref("review".to_string())
+        .phase(phase)
+        .build();
+    row.project_ref = project.map(str::to_string);
+    daemon.aggregator_projection_state().await.write().await.local_rows.insert(resource, row);
+}
+
 #[test]
 fn convoy_role_addresses_reject_malformed_values() {
     assert_eq!(parse_role_address("reviewer"), Ok(("reviewer", None)));
@@ -125,6 +143,33 @@ async fn convoy_resolution_refuses_multiple_terminal_generations() {
 }
 
 #[tokio::test]
+async fn convoy_routing_falls_back_to_a_unique_terminal_generation_and_refuses_multiple() {
+    let (daemon, _backend, _clock, _temp) = standing_ensure_fixture().await;
+    seed_convoy_routing_row(&daemon, "convoy-one", "reviewer", Some("flotilla"), flotilla_protocol::ConvoyPhase::Landed).await;
+    let action = flotilla_protocol::CommandAction::ConvoyDelete { namespace: None, name: "reviewer@flotilla".to_string(), force: false };
+
+    let target = daemon.resolve_existing_convoy_target(&action).await.expect("route sole terminal generation").expect("routing target");
+    assert_eq!(target.home, daemon.host_name);
+
+    seed_convoy_routing_row(&daemon, "convoy-two", "reviewer", Some("flotilla"), flotilla_protocol::ConvoyPhase::Failed).await;
+    assert_eq!(
+        daemon.resolve_existing_convoy_target(&action).await,
+        Err("convoy address `reviewer@flotilla` matches multiple terminal records; use an exact record name: convoy-one, convoy-two"
+            .to_string())
+    );
+}
+
+#[tokio::test]
+async fn convoy_routing_prefers_an_exact_terminal_pre_identity_record() {
+    let (daemon, _backend, _clock, _temp) = standing_ensure_fixture().await;
+    seed_convoy_routing_row(&daemon, "pre-identity-record", "", None, flotilla_protocol::ConvoyPhase::Landed).await;
+    let action = flotilla_protocol::CommandAction::ConvoyDelete { namespace: None, name: "pre-identity-record".to_string(), force: false };
+
+    let target = daemon.resolve_existing_convoy_target(&action).await.expect("route exact terminal record").expect("routing target");
+    assert_eq!(target.home, daemon.host_name);
+}
+
+#[tokio::test]
 async fn convoy_resolution_prefers_an_exact_unlabelled_record_name() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -168,6 +213,30 @@ async fn convoy_explain_addresses_an_exact_terminal_pre_identity_record() {
     let explanation = daemon.explain_convoy_internal(None, "pre-identity-record").await.expect("explain terminal record");
     assert_eq!(explanation.convoy, "pre-identity-record");
     assert_eq!(explanation.phase, "Failed");
+}
+
+#[tokio::test]
+async fn convoy_explain_refuses_multiple_terminal_generations() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    create_identity_convoy(&backend, "convoy-one", "reviewer", Some("flotilla")).await;
+    create_identity_convoy(&backend, "convoy-two", "reviewer", Some("flotilla")).await;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    for name in ["convoy-one", "convoy-two"] {
+        let created = convoys.get(name).await.expect("terminal convoy");
+        convoys
+            .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Landed,
+                ..Default::default()
+            })
+            .await
+            .expect("mark convoy terminal");
+    }
+
+    assert_eq!(
+        daemon.explain_convoy_internal(None, "reviewer@flotilla").await,
+        Err("convoy address `reviewer@flotilla` matches multiple terminal records; use an exact record name: convoy-one, convoy-two"
+            .to_string())
+    );
 }
 
 #[tokio::test]

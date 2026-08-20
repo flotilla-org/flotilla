@@ -1702,50 +1702,77 @@ fn parse_role_address(value: &str) -> Result<(&str, Option<&str>), String> {
     }
 }
 
-async fn resolve_local_convoy_name(backend: &ResourceBackend, namespace: &str, address: &str) -> Result<String, String> {
-    let convoys = backend.clone().using::<ResourceConvoy>(namespace);
-    match convoys.get(address).await {
-        Ok(convoy) => return Ok(convoy.metadata.name),
-        Err(ResourceError::NotFound { .. }) => {}
-        Err(error) => return Err(error.to_string()),
+struct ConvoyAddressIdentity<'a> {
+    record_name: &'a str,
+    role: Option<&'a str>,
+    project: Option<&'a str>,
+    terminal: bool,
+}
+
+fn resolve_convoy_candidate_indices(identities: &[ConvoyAddressIdentity<'_>], address: &str) -> Result<Vec<usize>, String> {
+    let exact = identities
+        .iter()
+        .enumerate()
+        .filter_map(|(index, identity)| (identity.record_name == address).then_some(index))
+        .collect::<Vec<_>>();
+    if !exact.is_empty() {
+        return Ok(exact);
     }
 
     let (role, project) = parse_role_address(address)?;
-    let mut selector = BTreeMap::from([(ROLE_LABEL.to_string(), role.to_string())]);
-    if let Some(project) = project {
-        selector.insert(PROJECT_LABEL.to_string(), project.to_string());
+    let matching = identities
+        .iter()
+        .enumerate()
+        .filter_map(|(index, identity)| {
+            (identity.role == Some(role) && project.is_none_or(|project| identity.project.unwrap_or_default() == project)).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let (live, terminal): (Vec<_>, Vec<_>) = matching.into_iter().partition(|index| !identities[*index].terminal);
+    let candidates = if live.is_empty() { terminal } else { live };
+    let record_names = candidates.iter().map(|index| identities[*index].record_name).collect::<BTreeSet<_>>();
+    if record_names.len() <= 1 {
+        return Ok(candidates);
     }
-    let candidates = convoys.list_matching_labels(&selector).await.map_err(|error| error.to_string())?.items;
-    let (live, terminal): (Vec<_>, Vec<_>) =
-        candidates.into_iter().partition(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()));
-    let mut candidates = if live.is_empty() { terminal } else { live };
-    candidates.sort_by(|left, right| {
-        (&left.spec.project_ref, left.spec.generation, &left.metadata.name).cmp(&(
-            &right.spec.project_ref,
-            right.spec.generation,
-            &right.metadata.name,
-        ))
-    });
-    match candidates.as_slice() {
-        [convoy] => Ok(convoy.metadata.name.clone()),
+
+    let address_options = candidates
+        .iter()
+        .filter_map(|index| identities[*index].role.map(|role| convoy_disambiguation_address(role, identities[*index].project)))
+        .collect::<BTreeSet<_>>();
+    if candidates.iter().all(|index| identities[*index].terminal) && address_options.len() == 1 {
+        return Err(format!(
+            "convoy address `{address}` matches multiple terminal records; use an exact record name: {}",
+            record_names.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if address_options.len() > 1 {
+        return Err(format!(
+            "convoy role `{role}` is ambiguous; use one of: {}",
+            address_options.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    Err(format!(
+        "convoy address `{address}` matches multiple records; use an exact record name: {}",
+        record_names.into_iter().collect::<Vec<_>>().join(", ")
+    ))
+}
+
+async fn resolve_local_convoy_name(backend: &ResourceBackend, namespace: &str, address: &str) -> Result<String, String> {
+    let convoys = backend.clone().using::<ResourceConvoy>(namespace);
+    let candidates = convoys.list().await.map_err(|error| error.to_string())?.items;
+    let identities = candidates
+        .iter()
+        .map(|convoy| ConvoyAddressIdentity {
+            record_name: &convoy.metadata.name,
+            role: convoy.metadata.labels.get(ROLE_LABEL).map(String::as_str),
+            project: convoy.metadata.labels.get(PROJECT_LABEL).map(String::as_str),
+            terminal: convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()),
+        })
+        .collect::<Vec<_>>();
+    let selected = resolve_convoy_candidate_indices(&identities, address)?;
+    match selected.as_slice() {
+        [index] => Ok(candidates[*index].metadata.name.clone()),
         [] => Err(format!("no convoy matches `{address}`")),
-        candidates => {
-            let address_options = candidates
-                .iter()
-                .map(|convoy| convoy_disambiguation_address(&convoy.spec.role, convoy.spec.project_ref.as_deref()))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            if candidates.iter().all(|convoy| convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
-                && address_options.len() == 1
-            {
-                let records = candidates.iter().map(|convoy| convoy.metadata.name.as_str()).collect::<Vec<_>>().join(", ");
-                Err(format!("convoy address `{address}` matches multiple terminal records; use an exact record name: {records}"))
-            } else {
-                let addresses = address_options.join(", ");
-                Err(format!("convoy role `{role}` is ambiguous; use one of: {addresses}"))
-            }
-        }
+        _ => Err(format!("convoy record `{address}` is present from multiple sources")),
     }
 }
 
@@ -2882,35 +2909,18 @@ impl InProcessDaemon {
         let Rows::Convoys { rows, .. } = result_set.rows else {
             return Ok(None);
         };
-        let namespace_rows = rows.into_iter().filter(|row| row.resource.namespace == namespace).collect::<Vec<_>>();
-        let exact = namespace_rows.iter().filter(|row| row.resource.name == name).cloned().collect::<Vec<_>>();
-        let candidates = if exact.is_empty() {
-            let (role, project) = parse_role_address(name)?;
-            let matching = namespace_rows
-                .into_iter()
-                .filter(|row| row.name == role && project.is_none_or(|project| row.project_ref.as_deref().unwrap_or_default() == project))
-                .collect::<Vec<_>>();
-            let (live, terminal): (Vec<_>, Vec<_>) = matching.into_iter().partition(|row| !row.phase.is_terminal());
-            let candidates = if live.is_empty() { terminal } else { live };
-            if candidates.len() > 1 {
-                let address_options = candidates
-                    .iter()
-                    .map(|row| convoy_disambiguation_address(&row.name, row.project_ref.as_deref()))
-                    .collect::<BTreeSet<_>>();
-                if candidates.iter().all(|row| row.phase.is_terminal()) && address_options.len() == 1 {
-                    let records = candidates.iter().map(|row| row.resource.name.as_str()).collect::<Vec<_>>().join(", ");
-                    return Err(format!("convoy address `{name}` matches multiple terminal records; use an exact record name: {records}"));
-                }
-                return Err(format!(
-                    "convoy role `{role}` is ambiguous; use one of: {}",
-                    address_options.into_iter().collect::<Vec<_>>().join(", ")
-                ));
-            }
-            candidates
-        } else {
-            exact
-        };
-        let mut hosts = candidates.into_iter().filter_map(|row| row.resource.host).collect::<Vec<_>>();
+        let candidates = rows.into_iter().filter(|row| row.resource.namespace == namespace).collect::<Vec<_>>();
+        let identities = candidates
+            .iter()
+            .map(|row| ConvoyAddressIdentity {
+                record_name: &row.resource.name,
+                role: Some(&row.name),
+                project: row.project_ref.as_deref(),
+                terminal: row.phase.is_terminal(),
+            })
+            .collect::<Vec<_>>();
+        let selected = resolve_convoy_candidate_indices(&identities, name)?;
+        let mut hosts = selected.into_iter().filter_map(|index| candidates[index].resource.host.clone()).collect::<Vec<_>>();
         hosts.sort();
         hosts.dedup();
 
@@ -9384,51 +9394,23 @@ impl InProcessDaemon {
         let namespace = requested_namespace.map(ToOwned::to_owned).unwrap_or(self.provisioning_namespace().await);
         let convoy_sources =
             self.resource_backend.including_replicas::<ResourceConvoy>(&namespace).list().await.map_err(|error| error.to_string())?;
-        let exact = convoy_sources.items.iter().filter(|source| source.object.metadata.name == name).cloned().collect::<Vec<_>>();
-        let is_exact_record = !exact.is_empty();
-        let matching = if !is_exact_record {
-            let (role, project) = parse_role_address(name)?;
-            let candidates = convoy_sources
-                .items
-                .into_iter()
-                .filter(|source| {
-                    source.object.spec.role == role
-                        && project.is_none_or(|project| source.object.spec.project_ref.as_deref().unwrap_or_default() == project)
-                })
-                .collect::<Vec<_>>();
-            let (live, terminal): (Vec<_>, Vec<_>) =
-                candidates.into_iter().partition(|source| source.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal()));
-            if live.is_empty() {
-                terminal
-            } else {
-                live
-            }
-        } else {
-            exact
-        };
-        let addresses = matching
+        let identities = convoy_sources
+            .items
             .iter()
-            .map(|source| convoy_disambiguation_address(&source.object.spec.role, source.object.spec.project_ref.as_deref()))
-            .collect::<BTreeSet<_>>();
-        let record_names = matching.iter().map(|source| source.object.metadata.name.as_str()).collect::<BTreeSet<_>>();
-        if !is_exact_record && record_names.len() > 1 {
-            let (role, project) = parse_role_address(name)?;
-            if project.is_none() && addresses.len() > 1 {
-                return Err(format!(
-                    "convoy role `{role}` is ambiguous; use one of: {}",
-                    addresses.into_iter().collect::<Vec<_>>().join(", ")
-                ));
-            }
-            return Err(format!(
-                "convoy address `{name}` matches multiple records; use an exact record name: {}",
-                record_names.into_iter().collect::<Vec<_>>().join(", ")
-            ));
-        }
-        let convoy_source = matching
+            .map(|source| ConvoyAddressIdentity {
+                record_name: &source.object.metadata.name,
+                role: source.object.metadata.labels.get(ROLE_LABEL).map(String::as_str),
+                project: source.object.metadata.labels.get(PROJECT_LABEL).map(String::as_str),
+                terminal: source.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()),
+            })
+            .collect::<Vec<_>>();
+        let selected = resolve_convoy_candidate_indices(&identities, name)?;
+        let convoy_source = selected
             .into_iter()
+            .map(|index| &convoy_sources.items[index])
             .max_by_key(|source| matches!(source.provenance, ResourceProvenance::Local))
             .ok_or_else(|| format!("no convoy matches `{name}`"))?;
-        let convoy = convoy_source.object;
+        let convoy = convoy_source.object.clone();
         let now = self.clock.now();
         let change_request_stale_after = self.change_request_stale_after();
 
