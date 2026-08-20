@@ -132,6 +132,7 @@ PY
 add_darwin_derivative() {
   local generation="$1"
   local source_generation="$2"
+  local protocol="$3"
   local directory="$fixture_root/$generation"
   local bundle="$test_root/darwin-$generation/fleet-signed-darwin-aarch64"
   mkdir -p "$bundle/bin" "$bundle/lib"
@@ -143,7 +144,7 @@ add_darwin_derivative() {
   chmod 0755 "$bundle/lib/libghostty-vt.dylib"
   printf '#!/usr/bin/env bash\nexit 0\n' >"$bundle/install.sh"
   chmod 0755 "$bundle/install.sh"
-  TEST_BUNDLE="$bundle" TEST_GENERATION="$generation" TEST_SOURCE_GENERATION="$source_generation" python3 - <<'PY'
+  TEST_BUNDLE="$bundle" TEST_GENERATION="$generation" TEST_SOURCE_GENERATION="$source_generation" TEST_PROTOCOL="$protocol" python3 - <<'PY'
 import hashlib
 import json
 import os
@@ -176,7 +177,7 @@ signing = {
     "platform": "darwin-aarch64",
     "sources": sources,
     "build_profile": "release",
-    "peer_protocol_version": 21,
+    "peer_protocol_version": int(os.environ["TEST_PROTOCOL"]),
     "signed": True,
     "source_generation": os.environ["TEST_SOURCE_GENERATION"],
     "source_artifact_sha256": "c" * 64,
@@ -239,7 +240,9 @@ PY
 make_generation "$generation_one" 20
 make_generation "$generation_two" 21
 source_generation_two="20260815T215500Z-r2-f222222222222-cbbbbbbbbbbbb"
-add_darwin_derivative "$generation_two" "$source_generation_two"
+source_generation_one="20260815T205500Z-r1-f111111111111-caaaaaaaaaaaa"
+add_darwin_derivative "$generation_one" "$source_generation_one" 20
+add_darwin_derivative "$generation_two" "$source_generation_two" 21
 
 cat >"$fixture_root/packages-page-1.json" <<JSON
 [
@@ -336,6 +339,20 @@ esac
 SH
 chmod 0755 "$fake_bin/loginctl"
 
+cat >"$fake_bin/launchctl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+current='<none>'
+if [[ -L "$FLEET_INSTALL_ROOT/current" ]]; then
+  current="$(readlink "$FLEET_INSTALL_ROOT/current")"
+fi
+printf '%s|%s\n' "$*" "$current" >>"$LAUNCHCTL_LOG"
+if [[ "$1" == print-disabled ]]; then
+  printf 'disabled services = {\n    "work.flotilla.flotillad" => %s\n}\n' "${LAUNCHD_AGENT_DISABLED:-false}"
+fi
+SH
+chmod 0755 "$fake_bin/launchctl"
+
 cat >"$fake_bin/codesign" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -376,13 +393,17 @@ run_installer() {
 run_darwin_installer() {
   local home="$1"
   shift
+  : "${LAUNCHCTL_LOG:=$test_root/launchctl.log}"
   HOME="$home" \
     PATH="$home/.local/bin:$fake_bin:$PATH" \
     SHELL="$fake_bin/zsh" \
     LOGIN_SHELL_PATH="$home/.local/bin:$fake_bin:/usr/bin:/bin" \
     FIXTURE_ROOT="$fixture_root" \
     CODESIGN_LOG="$test_root/codesign.log" \
+    LAUNCHCTL_LOG="$LAUNCHCTL_LOG" \
+    LAUNCHD_AGENT_DISABLED="${LAUNCHD_AGENT_DISABLED:-false}" \
     FAIL_CODESIGN_FOR="${FAIL_CODESIGN_FOR:-}" \
+    FLEET_INSTALL_ROOT="$home/.local/opt/flotilla-fleet" \
     FLEET_INSTALL_TESTING=1 \
     FLEET_INSTALL_TEST_CODESIGN="$fake_bin/codesign" \
     FLEET_INSTALL_UNAME_S=Darwin \
@@ -543,7 +564,9 @@ grep -Fxq "Environment=\"PATH=$custom_bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:
 darwin_home="$test_root/darwin-home"
 mkdir -p "$darwin_home/.config/flotilla"
 cp "$test_root/home/.config/flotilla/fleet-reader-token" "$darwin_home/.config/flotilla/fleet-reader-token"
+run_darwin_installer "$darwin_home" "$generation_one" >"$test_root/darwin-install-one.out"
 : >"$test_root/codesign.log"
+: >"$test_root/launchctl.log"
 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-install.out"
 test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$generation_two" \
   || fail 'signed Darwin generation was not selected'
@@ -553,6 +576,53 @@ test "$(grep -c -- '--verify' "$test_root/codesign.log")" = 4 \
   || fail 'Darwin install did not strictly verify every Mach-O payload'
 test "$(grep -c -- '--entitlements' "$test_root/codesign.log")" = 4 \
   || fail 'Darwin install did not verify every Mach-O entitlement set'
+launch_agent="$darwin_home/Library/LaunchAgents/work.flotilla.flotillad.plist"
+python3 - "$launch_agent" "$darwin_home" <<'PY' || fail 'Darwin launchd agent content is incorrect'
+import plistlib
+import sys
+
+with open(sys.argv[1], "rb") as source:
+    agent = plistlib.load(source)
+home = sys.argv[2]
+assert agent["Label"] == "work.flotilla.flotillad"
+assert agent["ProgramArguments"] == [f"{home}/.local/opt/flotilla-fleet/current/bin/flotillad"]
+assert agent["EnvironmentVariables"]["PATH"].split(":")[0] == f"{home}/.local/bin"
+assert agent["RunAtLoad"] is True
+assert agent["KeepAlive"] == {"SuccessfulExit": False}
+PY
+grep -Eq "^bootout gui/[0-9]+/work\\.flotilla\\.flotillad\\|releases/$generation_one$" "$test_root/launchctl.log" \
+  || fail 'Darwin install did not unload the old agent before the generation flip'
+grep -Eq "^enable gui/[0-9]+/work\\.flotilla\\.flotillad\\|releases/$generation_two$" "$test_root/launchctl.log" \
+  || fail 'Darwin install did not enable the agent after selecting the generation'
+grep -Eq "^bootstrap gui/[0-9]+ $launch_agent\\|releases/$generation_two$" "$test_root/launchctl.log" \
+  || fail 'Darwin install did not bootstrap the selected generation'
+grep -Eq "^kickstart -k gui/[0-9]+/work\\.flotilla\\.flotillad\\|releases/$generation_two$" "$test_root/launchctl.log" \
+  || fail 'Darwin install did not restart through launchd after the generation flip'
+
+: >"$test_root/launchctl.log"
+run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-reinstall.out"
+test "$(grep -Ec '^bootout gui/[0-9]+/work\.flotilla\.flotillad\|' "$test_root/launchctl.log")" = 1 \
+  || fail 'Darwin exact-generation reinstall did not unload the agent exactly once'
+test "$(grep -Ec '^bootstrap gui/[0-9]+ ' "$test_root/launchctl.log")" = 1 \
+  || fail 'Darwin exact-generation reinstall did not bootstrap the refreshed agent exactly once'
+test "$(grep -Ec '^kickstart -k gui/[0-9]+/work\.flotilla\.flotillad\|' "$test_root/launchctl.log")" = 1 \
+  || fail 'Darwin exact-generation reinstall did not restart the agent exactly once'
+
+: >"$test_root/launchctl.log"
+LAUNCHD_AGENT_DISABLED=true run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-dev-mode-install.out"
+grep -Fq 'preserving flotillad dev mode' "$test_root/darwin-dev-mode-install.out" \
+  || fail 'Darwin install did not report preserved dev mode'
+if grep -Eq '^(enable|bootstrap|kickstart) ' "$test_root/launchctl.log"; then
+  fail 'Darwin install restarted the fleet agent while dev mode was active'
+fi
+
+darwin_previous_target="releases/$generation_one"
+: >"$test_root/launchctl.log"
+run_darwin_installer "$darwin_home" rollback >"$test_root/darwin-rollback.out"
+grep -Eq "^bootstrap gui/[0-9]+ $launch_agent\\|$darwin_previous_target$" "$test_root/launchctl.log" \
+  || fail 'Darwin rollback did not bootstrap after selecting the previous generation'
+grep -Eq "^kickstart -k gui/[0-9]+/work\\.flotilla\\.flotillad\\|$darwin_previous_target$" "$test_root/launchctl.log" \
+  || fail 'Darwin rollback did not restart the selected generation through launchd'
 
 darwin_fail_home="$test_root/darwin-fail-home"
 mkdir -p "$darwin_fail_home/.config/flotilla"
