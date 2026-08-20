@@ -1227,6 +1227,40 @@ where
     }
 }
 
+fn spawn_resource_controller<T, F, Fut>(
+    backend: ResourceBackend,
+    namespace: String,
+    supervision: ControllerSupervision,
+    runtime_health: RuntimeHealth,
+    mut make_run: F,
+) -> JoinHandle<()>
+where
+    T: Resource,
+    F: FnMut(ResourceBackend, String) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), ResourceError>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        supervise_controller(T::API_PATHS.kind, supervision, runtime_health, move || make_run(backend.clone(), namespace.clone())).await;
+    })
+}
+
+fn spawn_vessel_placement_projector(
+    backend: ResourceBackend,
+    namespace: String,
+    local_host_ref: String,
+    supervision: ControllerSupervision,
+    runtime_health: RuntimeHealth,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // The projector and the Vessel reconciler need distinct health keys, while both remain tied to the resource they manage.
+        supervise_controller(Vessel::API_PATHS.plural, supervision, runtime_health, move || {
+            let projector = VesselPlacementProjector::new(backend.clone(), namespace.clone(), local_host_ref.clone());
+            async move { projector.run().await }
+        })
+        .await;
+    })
+}
+
 fn spawn_sleep_inhibitor_task(
     backend: ResourceBackend,
     namespace: String,
@@ -1701,302 +1735,176 @@ fn spawn_controller_loops(
         .local_command_runner()
         .map(|runner| Arc::new(GhForgeDefaultBranchResolver { runner }) as Arc<dyn ForgeDefaultBranchResolver>);
     let namespace_string = namespace.to_string();
+
+    macro_rules! controller {
+        ($primary:ty, $make_parts:expr) => {{
+            let make_parts = $make_parts;
+            spawn_resource_controller::<$primary, _, _>(
+                backend.clone(),
+                namespace_string.clone(),
+                supervision.clone(),
+                runtime_health.clone(),
+                move |backend, namespace| {
+                    let (secondaries, reconciler) = make_parts(backend.clone(), namespace.clone());
+                    let controller = ControllerLoop {
+                        primary: backend.clone().using::<$primary>(&namespace),
+                        secondaries,
+                        reconciler,
+                        resync_interval: controller_resync_interval,
+                        backend,
+                    };
+                    async move { controller.run().await }
+                },
+            )
+        }};
+    }
+
     vec![
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
-            let local_host_ref = state.local_host_ref.clone();
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("vessel_placement", supervision, runtime_health, move || {
-                    let projector = VesselPlacementProjector::new(backend.clone(), namespace_string.clone(), local_host_ref.clone());
-                    async move { projector.run().await }
-                })
-                .await;
-            }
-        }),
-        tokio::spawn({
-            let backend = backend.clone();
+        spawn_vessel_placement_projector(
+            backend.clone(),
+            namespace_string.clone(),
+            state.local_host_ref.clone(),
+            supervision.clone(),
+            runtime_health.clone(),
+        ),
+        controller!(Repository, {
             let observed_backend = observed_backend.clone();
-            let namespace_string = namespace_string.clone();
             let forge_default_branch_resolver = forge_default_branch_resolver.clone();
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("repository", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let observed_backend = observed_backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let forge_default_branch_resolver = forge_default_branch_resolver.clone();
-                    async move {
-                        let mut reconciler = RepositoryReconciler::new(backend.clone(), observed_backend.clone(), &namespace_string);
-                        if let Some(resolver) = forge_default_branch_resolver {
-                            reconciler = reconciler.with_forge_default_branch_resolver(resolver);
-                        }
-                        ControllerLoop {
-                            primary: backend.clone().using::<Repository>(&namespace_string),
-                            secondaries: RepositoryReconciler::secondary_watches(observed_backend.clone(), &namespace_string),
-                            reconciler,
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |backend: ResourceBackend, namespace_string: String| {
+                let observed_backend = observed_backend.clone();
+                let forge_default_branch_resolver = forge_default_branch_resolver.clone();
+                let mut reconciler = RepositoryReconciler::new(backend, observed_backend.clone(), &namespace_string);
+                if let Some(resolver) = forge_default_branch_resolver {
+                    reconciler = reconciler.with_forge_default_branch_resolver(resolver);
+                }
+                (RepositoryReconciler::secondary_watches(observed_backend, &namespace_string), reconciler)
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(Environment, {
             let state = Arc::clone(&state);
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("environment", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let state = Arc::clone(&state);
-                    async move {
-                        let local_host_ref = state.local_host_ref.clone();
-                        ControllerLoop {
-                            primary: backend.clone().using::<Environment>(&namespace_string),
-                            secondaries: vec![],
-                            reconciler: EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }))
-                                .with_local_host_ref(local_host_ref),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |_: ResourceBackend, _: String| {
+                let local_host_ref = state.local_host_ref.clone();
+                let state = Arc::clone(&state);
+                (vec![], EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state })).with_local_host_ref(local_host_ref))
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(Clone, {
             let state = Arc::clone(&state);
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("clone", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let runner = state.daemon.local_command_runner().expect("local runner should exist");
-                    let flights = Arc::clone(&state.clone_flights);
-                    async move {
-                        ControllerLoop {
-                            primary: backend.clone().using::<Clone>(&namespace_string),
-                            secondaries: vec![],
-                            reconciler: CloneReconciler::new(
-                                Arc::new(CloneControllerRuntime { runner, flights }),
-                                backend.clone().using::<Repository>(&namespace_string),
-                            ),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |backend: ResourceBackend, namespace_string: String| {
+                let runner = state.daemon.local_command_runner().expect("local runner should exist");
+                let flights = Arc::clone(&state.clone_flights);
+                (
+                    vec![],
+                    CloneReconciler::new(
+                        Arc::new(CloneControllerRuntime { runner, flights }),
+                        backend.using::<Repository>(&namespace_string),
+                    ),
+                )
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(Checkout, {
             let state = Arc::clone(&state);
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("checkout", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let state = Arc::clone(&state);
-                    async move {
-                        let runner = state.daemon.local_command_runner().expect("local runner should exist");
-                        ControllerLoop {
-                            primary: backend.clone().using::<flotilla_resources::Checkout>(&namespace_string),
-                            secondaries: CheckoutReconciler::<CheckoutControllerRuntime>::federated_secondary_watches(
-                                &backend,
-                                &namespace_string,
-                            ),
-                            reconciler: CheckoutReconciler::new(
-                                Arc::new(CheckoutControllerRuntime {
-                                    runner,
-                                    change_requests: Some(backend.including_replicas::<ChangeRequest>(&namespace_string)),
-                                }),
-                                backend.clone(),
-                                &namespace_string,
-                            )
-                            .with_federated_convoys(&backend, &namespace_string),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |backend: ResourceBackend, namespace_string: String| {
+                let state = Arc::clone(&state);
+                let runner = state.daemon.local_command_runner().expect("local runner should exist");
+                (
+                    CheckoutReconciler::<CheckoutControllerRuntime>::federated_secondary_watches(&backend, &namespace_string),
+                    CheckoutReconciler::new(
+                        Arc::new(CheckoutControllerRuntime {
+                            runner,
+                            change_requests: Some(backend.including_replicas::<ChangeRequest>(&namespace_string)),
+                        }),
+                        backend.clone(),
+                        &namespace_string,
+                    )
+                    .with_federated_convoys(&backend, &namespace_string),
+                )
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(TerminalSession, {
             let state = Arc::clone(&state);
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("terminal_session", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let state = Arc::clone(&state);
-                    async move {
-                        let local_host_ref = state.local_host_ref.clone();
-                        ControllerLoop {
-                            primary: backend.clone().using::<flotilla_resources::TerminalSession>(&namespace_string),
-                            secondaries: vec![],
-                            reconciler: TerminalSessionReconciler::new(
-                                Arc::new(TerminalControllerRuntime { state }),
-                                backend.clone(),
-                                &namespace_string,
-                            )
-                            .with_local_host_ref(local_host_ref)
-                            .with_federated_convoys(&backend, &namespace_string),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |backend: ResourceBackend, namespace_string: String| {
+                let local_host_ref = state.local_host_ref.clone();
+                let state = Arc::clone(&state);
+                (
+                    vec![],
+                    TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
+                        .with_local_host_ref(local_host_ref)
+                        .with_federated_convoys(&backend, &namespace_string),
+                )
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(Vessel, {
             let config_dir = state.config.base_path().as_path().to_path_buf();
             let local_host_ref = state.local_host_ref.clone();
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("vessel", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let config_dir = config_dir.clone();
-                    let local_host_ref = local_host_ref.clone();
-                    async move {
-                        ControllerLoop {
-                            primary: backend.clone().using::<Vessel>(&namespace_string),
-                            secondaries: VesselReconciler::secondary_watches(),
-                            reconciler: VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
-                                .with_federated_dependencies(&backend, local_host_ref),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |backend: ResourceBackend, namespace_string: String| {
+                let config_dir = config_dir.clone();
+                let local_host_ref = local_host_ref.clone();
+                (
+                    VesselReconciler::secondary_watches(),
+                    VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
+                        .with_federated_dependencies(&backend, local_host_ref),
+                )
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(Presentation, {
             let state = Arc::clone(&state);
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("presentation", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let state = Arc::clone(&state);
-                    async move {
-                        let policies = Arc::new(PresentationPolicyRegistry::with_defaults());
-                        let runtime = Arc::new(ProviderPresentationRuntime::new(Arc::clone(&state.local_registry), Arc::clone(&policies)));
-                        let mut hop_chain = HopChainContext::new(
-                            state.local_host_ref.clone(),
-                            state.daemon.host_name().clone(),
-                            state.config.base_path().clone(),
-                            {
-                                let state = Arc::clone(&state);
-                                move |env_ref| {
-                                    if env_ref == state.host_direct_environment_name {
-                                        return Ok(Arc::clone(&state.local_registry));
-                                    }
-                                    state
-                                        .daemon
-                                        .environment_registry_for_environment(&EnvironmentId::new(env_ref.to_string()))
-                                        .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
-                                }
-                            },
-                        );
-                        if let Some(repo_root) = state.local_repo_root.clone() {
-                            hop_chain = hop_chain.with_repo_root(repo_root);
+            move |backend: ResourceBackend, namespace_string: String| {
+                let state = Arc::clone(&state);
+                let policies = Arc::new(PresentationPolicyRegistry::with_defaults());
+                let runtime = Arc::new(ProviderPresentationRuntime::new(Arc::clone(&state.local_registry), Arc::clone(&policies)));
+                let mut hop_chain = HopChainContext::new(
+                    state.local_host_ref.clone(),
+                    state.daemon.host_name().clone(),
+                    state.config.base_path().clone(),
+                    {
+                        let state = Arc::clone(&state);
+                        move |env_ref| {
+                            if env_ref == state.host_direct_environment_name {
+                                return Ok(Arc::clone(&state.local_registry));
+                            }
+                            state
+                                .daemon
+                                .environment_registry_for_environment(&EnvironmentId::new(env_ref.to_string()))
+                                .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
                         }
-
-                        ControllerLoop {
-                            primary: backend.clone().using::<Presentation>(&namespace_string),
-                            secondaries: PresentationReconciler::<ProviderPresentationRuntime>::secondary_watches(),
-                            reconciler: PresentationReconciler::new(runtime, backend.clone(), &namespace_string, hop_chain, policies),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+                    },
+                );
+                if let Some(repo_root) = state.local_repo_root.clone() {
+                    hop_chain = hop_chain.with_repo_root(repo_root);
+                }
+                (
+                    PresentationReconciler::<ProviderPresentationRuntime>::secondary_watches(),
+                    PresentationReconciler::new(runtime, backend, &namespace_string, hop_chain, policies),
+                )
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(Convoy, {
             let daemon = Arc::clone(&state.daemon);
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("convoy", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let daemon = Arc::clone(&daemon);
-                    async move {
-                        let mut secondaries = ConvoyReconciler::federated_secondary_watches(&backend, &namespace_string);
-                        secondaries.push(daemon.reconciler_wake_watch());
-                        ControllerLoop {
-                            primary: backend.clone().using::<Convoy>(&namespace_string),
-                            secondaries,
-                            reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
-                                .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
-                                .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))
-                                .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
-                                .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
-                                .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
-                                .with_federated_checkouts(backend.including_replicas::<Checkout>(&namespace_string))
-                                .with_change_requests(
-                                    backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
-                                    daemon.change_request_stale_after(),
-                                )
-                                .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
-                                .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
-                                .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
-                                    backend.clone(),
-                                    &namespace_string,
-                                )),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |backend: ResourceBackend, namespace_string: String| {
+                let daemon = Arc::clone(&daemon);
+                let mut secondaries = ConvoyReconciler::federated_secondary_watches(&backend, &namespace_string);
+                secondaries.push(daemon.reconciler_wake_watch());
+                (
+                    secondaries,
+                    ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
+                        .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
+                        .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))
+                        .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
+                        .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
+                        .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
+                        .with_federated_checkouts(backend.including_replicas::<Checkout>(&namespace_string))
+                        .with_change_requests(
+                            backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
+                            daemon.change_request_stale_after(),
+                        )
+                        .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
+                        .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
+                        .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
+                            backend.clone(),
+                            &namespace_string,
+                        )),
+                )
             }
         }),
     ]
@@ -6702,10 +6610,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_budget_exhaustion_is_recorded_in_runtime_health() {
+    async fn resource_controller_restart_budget_exhaustion_is_recorded_under_its_kind() {
         let runtime_health = RuntimeHealth::default();
-        supervise_controller(
-            "checkout",
+        spawn_resource_controller::<Checkout, _, _>(
+            ResourceBackend::InMemory(Default::default()),
+            NAMESPACE.to_string(),
             ControllerSupervision {
                 max_consecutive_failures: 1,
                 initial_backoff: Duration::ZERO,
@@ -6713,13 +6622,14 @@ mod tests {
                 success_reset_after: Duration::from_secs(60),
             },
             runtime_health.clone(),
-            || async { Err(ResourceError::other("root-owned debris")) },
+            |_, _| async { Err(ResourceError::other("root-owned debris")) },
         )
-        .await;
+        .await
+        .expect("controller supervisor task should finish");
 
         let conditions = runtime_health.conditions().await;
         assert_eq!(conditions.len(), 1);
-        assert_eq!(conditions[0].condition_type, "Controller/checkout");
+        assert_eq!(conditions[0].condition_type, format!("Controller/{}", Checkout::API_PATHS.kind));
         assert_eq!(conditions[0].reason, "RestartBudgetExhausted");
         assert!(conditions[0].message.contains("root-owned debris"));
     }
