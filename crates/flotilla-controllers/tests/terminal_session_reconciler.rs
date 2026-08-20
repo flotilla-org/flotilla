@@ -178,6 +178,7 @@ async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
 #[derive(Default)]
 struct UnavailableRunningRuntime {
     probes: AtomicUsize,
+    available: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -193,7 +194,11 @@ impl TerminalRuntime for UnavailableRunningRuntime {
 
     async fn session_is_running(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<bool, String> {
         self.probes.fetch_add(1, Ordering::SeqCst);
-        Err("provider registry unavailable for environment env-a".to_string())
+        if self.available.load(Ordering::SeqCst) {
+            Ok(true)
+        } else {
+            Err("provider registry unavailable for environment env-a".to_string())
+        }
     }
 
     async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
@@ -202,7 +207,7 @@ impl TerminalRuntime for UnavailableRunningRuntime {
 }
 
 #[tokio::test(start_paused = true)]
-async fn repeated_runtime_probe_failure_becomes_visible_and_stops_retrying() {
+async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
@@ -264,19 +269,36 @@ async fn repeated_runtime_probe_failure_becomes_visible_and_stops_retrying() {
         .status
         .expect("terminal should retain status");
     let degraded = status.degraded.expect("retry budget should produce a degraded condition");
-    assert_eq!(status.phase, TerminalSessionPhase::Failed);
-    assert_eq!(degraded.reason, "ReconcileErrorBudgetExhausted");
+    assert_eq!(status.phase, TerminalSessionPhase::Running);
+    assert_eq!(degraded.reason, "ReconcileBackoff");
     assert_eq!(degraded.consecutive_failures, 5);
     assert!(degraded.message.contains("provider registry unavailable"));
     assert_eq!(runtime.probes.load(Ordering::SeqCst), 5);
 
-    tokio::time::advance(Duration::from_secs(7200)).await;
-    for _ in 0..20 {
+    runtime.available.store(true, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(15 * 60)).await;
+    for _ in 0..40 {
         tokio::task::yield_now().await;
+        if sessions
+            .get("terminal-demo-work-coder")
+            .await
+            .ok()
+            .and_then(|session| session.status)
+            .is_some_and(|status| status.degraded.is_none())
+        {
+            break;
+        }
     }
-    assert_eq!(runtime.probes.load(Ordering::SeqCst), 5, "degraded terminal must stay parked across resyncs");
+    let recovered =
+        sessions.get("terminal-demo-work-coder").await.expect("terminal should recover").status.expect("terminal should retain status");
+    assert_eq!(recovered.phase, TerminalSessionPhase::Running);
+    assert_eq!(recovered.degraded, None);
+    assert!(runtime.probes.load(Ordering::SeqCst) > 5, "degraded terminal must keep probing with backoff");
 
-    let convoy = convoys.get("demo").await.expect("owning convoy should remain");
+    let active_convoy = convoys.get("demo").await.expect("owning convoy should remain");
+    assert_ne!(active_convoy.status.as_ref().map(|status| status.phase), Some(ConvoyPhase::Failed));
+
+    let convoy = active_convoy;
     let mut convoy_status = convoy.status.expect("owning convoy should have status");
     convoy_status.phase = ConvoyPhase::Abandoned;
     convoys.update_status("demo", &convoy.metadata.resource_version, &convoy_status).await.expect("owning convoy should be abandoned");

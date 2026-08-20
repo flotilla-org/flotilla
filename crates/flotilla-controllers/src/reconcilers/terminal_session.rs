@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
-    controller::{Actuation, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
+    controller::{Actuation, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
     Convoy, ConvoyPhase, Environment, EnvironmentPhase, ReplicaReadResolver, ResourceBackend, ResourceError, ResourceObject,
     ResourceProvenance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
@@ -216,6 +216,9 @@ where
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
+        if obj.status.as_ref().is_some_and(|status| status.degraded.is_some()) {
+            return ReconcileOutcome::new(Some(TerminalSessionStatusPatch::ClearReconcileDegraded));
+        }
         let patch = match phase {
             TerminalSessionPhase::Starting => match deps {
                 TerminalDeps::Running(state) => Some(TerminalSessionStatusPatch::MarkRunning {
@@ -302,6 +305,7 @@ where
             max_consecutive_failures: 5,
             initial_backoff: Duration::from_secs(60),
             max_backoff: Duration::from_secs(15 * 60),
+            exhaustion: ReconcileErrorExhaustion::Retry,
         })
     }
 

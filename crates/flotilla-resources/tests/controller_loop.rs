@@ -11,8 +11,8 @@ use std::{
 use common::{resource_meta, TestLoopHarness};
 use flotilla_resources::{
     controller::{
-        Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler,
-        ResolverLabelMappedWatch,
+        Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure,
+        ReconcileOutcome, Reconciler, ResolverLabelMappedWatch,
     },
     ApiPaths, Checkout, CheckoutSpec, CheckoutWorktreeSpec, InMemoryBackend, InputMeta, LifecycleAuthority, NoStatusPatch, Presentation,
     PresentationSpec, RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject, StatusPatch, TypedResolver, Vessel,
@@ -122,6 +122,7 @@ impl Reconciler for BudgetedFailureReconciler {
             max_consecutive_failures: 3,
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
+            exhaustion: ReconcileErrorExhaustion::Park,
         })
     }
 

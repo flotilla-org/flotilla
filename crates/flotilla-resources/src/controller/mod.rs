@@ -63,7 +63,7 @@ pub trait Reconciler: Send + Sync + 'static {
     }
 
     /// Persist a resource-specific degraded condition once the reconcile
-    /// error budget is exhausted.
+    /// error threshold is reached.
     fn reconcile_degraded_patch(
         &self,
         _obj: &ResourceObject<Self::Resource>,
@@ -72,13 +72,15 @@ pub trait Reconciler: Send + Sync + 'static {
         None
     }
 
-    /// A persisted degraded condition survives controller restarts and parks
-    /// the object until an explicit resource transition clears it.
+    /// Report whether a persisted degraded condition is present. A `Park`
+    /// policy uses this to survive controller restarts; a `Retry` policy keeps
+    /// reconciling the object with backoff.
     fn is_reconcile_degraded(&self, _obj: &ResourceObject<Self::Resource>) -> bool {
         false
     }
 
     /// Allow a lifecycle change to wake an otherwise parked degraded object.
+    /// This is consulted only for `Park` policies.
     async fn degraded_object_needs_reconcile(&self, _obj: &ResourceObject<Self::Resource>) -> Result<bool, ResourceError> {
         Ok(false)
     }
@@ -98,9 +100,21 @@ pub trait Reconciler: Send + Sync + 'static {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileErrorPolicy {
+    /// Number of identical consecutive failures before the degraded condition
+    /// is persisted and `exhaustion` takes effect.
     pub max_consecutive_failures: u32,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
+    pub exhaustion: ReconcileErrorExhaustion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileErrorExhaustion {
+    /// Persist the degraded condition and stop reconciling until a lifecycle
+    /// change explicitly wakes the resource.
+    Park,
+    /// Persist the degraded condition but keep retrying at the capped backoff.
+    Retry,
 }
 
 impl ReconcileErrorPolicy {
@@ -713,16 +727,17 @@ impl<R: Reconciler> ControllerLoop<R> {
                     if !lifecycle_owned {
                         return Ok(());
                     }
-                    let degraded_needs_reconcile =
-                        reconciler.is_reconcile_degraded(&object) && reconciler.degraded_object_needs_reconcile(&object).await?;
-                    if reconciler.is_reconcile_degraded(&object) && !degraded_needs_reconcile {
+                    let degraded_is_parked = reconciler.is_reconcile_degraded(&object)
+                        && reconciler.reconcile_error_policy().is_none_or(|policy| policy.exhaustion == ReconcileErrorExhaustion::Park);
+                    let degraded_needs_reconcile = degraded_is_parked && reconciler.degraded_object_needs_reconcile(&object).await?;
+                    if degraded_is_parked && !degraded_needs_reconcile {
                         return Ok(());
                     }
                     if object_failures.get(&name).is_some_and(|failure| failure.creation_timestamp != object.metadata.creation_timestamp) {
                         object_failures.remove(&name);
                     }
                     if let Some(failure) = object_failures.get(&name) {
-                        if !degraded_needs_reconcile && (failure.terminal || Instant::now() < failure.retry_at) {
+                        if Instant::now() < failure.retry_at || (failure.terminal && !degraded_needs_reconcile) {
                             return Ok(());
                         }
                     }
@@ -767,9 +782,10 @@ impl<R: Reconciler> ControllerLoop<R> {
                                     .filter(|previous| previous.failure.message == message)
                                     .map_or(1, |previous| previous.failure.consecutive_failures.saturating_add(1));
                                 let failure = ReconcileFailure { message, consecutive_failures };
-                                terminal = consecutive_failures >= policy.max_consecutive_failures;
+                                let exhausted = consecutive_failures >= policy.max_consecutive_failures;
+                                terminal = exhausted && policy.exhaustion == ReconcileErrorExhaustion::Park;
                                 let delay = policy.backoff(consecutive_failures);
-                                if terminal {
+                                if exhausted {
                                     if let Some(patch) = reconciler.reconcile_degraded_patch(&object, &failure) {
                                         match apply_status_patch(&primary, &name, &patch).await {
                                             Ok(_) => {}
@@ -779,7 +795,6 @@ impl<R: Reconciler> ControllerLoop<R> {
                                             }
                                             Err(patch_error) => {
                                                 terminal = false;
-                                                retry_after = Some(delay);
                                                 warn!(
                                                     resource_kind = R::Resource::API_PATHS.kind,
                                                     resource = %name,
@@ -790,9 +805,9 @@ impl<R: Reconciler> ControllerLoop<R> {
                                         }
                                     } else {
                                         terminal = false;
-                                        retry_after = Some(delay);
                                     }
-                                } else {
+                                }
+                                if !terminal {
                                     retry_after = Some(delay);
                                 }
                                 object_failures.insert(name.clone(), ObjectFailure {

@@ -178,7 +178,8 @@ pub struct TerminalSessionStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_pending: Option<CrewCompletionPending>,
     /// Set when the controller exhausts its budget for one repeated reconcile
-    /// error. The session remains parked until an explicit restart clears it.
+    /// error. The controller may either park or continue retrying with backoff,
+    /// according to its error policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded: Option<TerminalSessionDegradedCondition>,
 }
@@ -303,6 +304,7 @@ pub enum TerminalSessionStatusPatch {
         consecutive_failures: u32,
         observed_at: DateTime<Utc>,
     },
+    ClearReconcileDegraded,
     ObserveAttention {
         attention: TerminalAttention,
     },
@@ -356,10 +358,9 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 }
             }
             Self::MarkReconcileDegraded { message, consecutive_failures, observed_at } => {
-                status.phase = TerminalSessionPhase::Failed;
-                status.message = Some(format!("reconcile stopped after {consecutive_failures} consecutive failures: {message}"));
+                status.message = Some(format!("reconcile backing off after {consecutive_failures} consecutive failures: {message}"));
                 status.degraded = Some(TerminalSessionDegradedCondition {
-                    reason: "ReconcileErrorBudgetExhausted".to_string(),
+                    reason: "ReconcileBackoff".to_string(),
                     message: message.clone(),
                     consecutive_failures: *consecutive_failures,
                     observed_at: *observed_at,
@@ -368,6 +369,10 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     attention.state = TerminalAttentionState::Unobservable;
                     attention.as_of = *observed_at;
                 }
+            }
+            Self::ClearReconcileDegraded => {
+                status.message = None;
+                status.degraded = None;
             }
             Self::ObserveAttention { attention } => {
                 let replace = status.attention.as_ref().is_none_or(|previous| previous.should_replace_with(attention));
