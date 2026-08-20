@@ -579,6 +579,54 @@ except (OSError, ValueError):
 PY
 }
 
+show_fleet_spread() {
+  if ! pgrep -u "$(id -u)" -x flotillad >/dev/null 2>&1; then
+    printf 'fleet:   unavailable (daemon not running)\n'
+    return
+  fi
+  if [[ ! -x "$CURRENT_LINK/bin/flotilla" ]]; then
+    printf 'fleet:   unavailable (no current fleet CLI)\n'
+    return
+  fi
+
+  local response="$WORK_DIR/fleet-health.json"
+  if ! FLOTILLA_CONTAINED_HOST_DAEMON=1 "$CURRENT_LINK/bin/flotilla" --json host list >"$response" 2>/dev/null; then
+    printf 'fleet:   unavailable (daemon query failed)\n'
+    return
+  fi
+  if ! python3 - "$response" <<'PY'
+import json
+import sys
+
+try:
+    response = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    raise SystemExit(1)
+if not isinstance(response, dict) or response.get("kind") != "fleet_health":
+    raise SystemExit(1)
+hosts = response.get("hosts")
+if not isinstance(hosts, list):
+    raise SystemExit(1)
+
+spread = {}
+for host in hosts:
+    if not isinstance(host, dict) or not isinstance(host.get("host"), str):
+        raise SystemExit(1)
+    generation = host.get("daemon_generation")
+    if not isinstance(generation, str) or not generation:
+        generation = "unknown"
+    name = host["host"] + (" (local)" if host.get("is_local") is True else "")
+    spread.setdefault(generation, []).append(name)
+
+print("fleet wire generations:")
+for generation in sorted(spread, key=lambda value: (value == "unknown", value)):
+    print(f"  {generation}: {', '.join(sorted(spread[generation]))}")
+PY
+  then
+    printf 'fleet:   unavailable (invalid daemon response)\n'
+  fi
+}
+
 write_launcher() {
   local name="$1"
   local launcher="$FLEET_BIN_DIR/$name"
@@ -710,6 +758,7 @@ show_status() {
   target_version="$(manifest_value "$target_manifest" peer_protocol_version)"
   printf 'current: %s (peer protocol %s)\n' "${current:-<none>}" "${current_version:-unknown}"
   printf 'latest:  %s (peer protocol %s)\n' "$latest" "$target_version"
+  show_fleet_spread
   if [[ -n "$current_version" && "$current_version" != "$target_version" ]]; then
     printf 'warning: peer protocol changes from %s to %s; mixed generations may not peer\n' "$current_version" "$target_version"
   fi

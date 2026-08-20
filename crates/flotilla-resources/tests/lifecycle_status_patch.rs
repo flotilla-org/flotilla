@@ -5,8 +5,8 @@ use std::{
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
-    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InnerCommandStatus, PlacementStatus, PresentationPhase,
-    PresentationStatus, PresentationStatusPatch, Stance, StatusPatch, TerminalSessionPhase, TerminalSessionStatus,
+    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InnerCommandStatus, PendingBrief, PlacementStatus,
+    PresentationPhase, PresentationStatus, PresentationStatusPatch, Stance, StatusPatch, TerminalSessionPhase, TerminalSessionStatus,
     TerminalSessionStatusPatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung, VesselPhase, VesselStatus, VesselStatusPatch,
     WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
@@ -67,6 +67,9 @@ define_patch_kinds! {
     ConvoyMarkCrewFailed => DUPLICATE_RESETTLEMENT,
     ConvoyHandoffCrewWork => CONTINUATION,
     ConvoyResumeCrewWork => CONTINUATION,
+    ConvoySetPendingBrief => DUPLICATE,
+    ConvoyClearPendingBrief => DUPLICATE,
+    ConvoyDeliverPendingBrief => CONTINUATION,
     ConvoyRecordTurnDelivery => CONTINUATION,
     ConvoyRefuseTurnDelivery => NONE,
     ConvoyRollUpWork => DUPLICATE_CONTINUATION_RESETTLEMENT,
@@ -111,6 +114,9 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::MarkCrewFailed { .. } => PatchKind::ConvoyMarkCrewFailed,
         ConvoyStatusPatch::HandoffCrewWork { .. } => PatchKind::ConvoyHandoffCrewWork,
         ConvoyStatusPatch::ResumeCrewWork { .. } => PatchKind::ConvoyResumeCrewWork,
+        ConvoyStatusPatch::SetPendingBrief { .. } => PatchKind::ConvoySetPendingBrief,
+        ConvoyStatusPatch::ClearPendingBrief => PatchKind::ConvoyClearPendingBrief,
+        ConvoyStatusPatch::DeliverPendingBrief { .. } => PatchKind::ConvoyDeliverPendingBrief,
         ConvoyStatusPatch::RecordTurnDelivery { .. } => PatchKind::ConvoyRecordTurnDelivery,
         ConvoyStatusPatch::RefuseTurnDelivery { .. } => PatchKind::ConvoyRefuseTurnDelivery,
         ConvoyStatusPatch::RollUpWork { .. } => PatchKind::ConvoyRollUpWork,
@@ -197,6 +203,15 @@ fn work_state(phase: WorkPhase, started_at: Option<DateTime<Utc>>, finished_at: 
 
 fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> CrewWorkState {
     CrewWorkState { phase, started_at, finished_at, message: None, disposition: None }
+}
+
+fn pending_brief() -> PendingBrief {
+    PendingBrief::builder()
+        .vessel("implement".to_string())
+        .role("coder".to_string())
+        .content("address review".to_string())
+        .queued_at(ts(25))
+        .build()
 }
 
 fn active_convoy_status() -> ConvoyStatus {
@@ -660,6 +675,28 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             },
         },
         LifecycleCase {
+            name: "pending brief queued",
+            kind: PatchKind::ConvoySetPendingBrief,
+            exercise: || {
+                let mut status = active_convoy_status();
+                let before = convoy_timestamps(&status);
+                let patch = ConvoyStatusPatch::SetPendingBrief { pending_brief: pending_brief() };
+                apply_and_replay(&mut status, &patch);
+                (before, convoy_timestamps(&status))
+            },
+        },
+        LifecycleCase {
+            name: "pending brief cleared",
+            kind: PatchKind::ConvoyClearPendingBrief,
+            exercise: || {
+                let mut status = active_convoy_status();
+                ConvoyStatusPatch::SetPendingBrief { pending_brief: pending_brief() }.apply(&mut status);
+                let before = convoy_timestamps(&status);
+                apply_and_replay(&mut status, &ConvoyStatusPatch::ClearPendingBrief);
+                (before, convoy_timestamps(&status))
+            },
+        },
+        LifecycleCase {
             name: "presentation active",
             kind: PatchKind::PresentationMarkActive,
             exercise: || {
@@ -762,6 +799,25 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, crew_timestamps(&status))
+            },
+        },
+        LifecycleCase {
+            name: "pending brief delivery reopens convoy",
+            kind: PatchKind::ConvoyDeliverPendingBrief,
+            exercise: || {
+                let mut status = settled_convoy_status();
+                ConvoyStatusPatch::SetPendingBrief { pending_brief: pending_brief() }.apply(&mut status);
+                let before = convoy_timestamps(&status);
+                let patch = ConvoyStatusPatch::DeliverPendingBrief {
+                    vessel: "implement".to_string(),
+                    role: "coder".to_string(),
+                    delivered_at: ts(30),
+                    content: "address review".to_string(),
+                    completion_message: Some("first turn complete".to_string()),
+                    disposition: Some("satisfied".to_string()),
+                };
+                apply_and_replay(&mut status, &patch);
+                (before, convoy_timestamps(&status))
             },
         },
         LifecycleCase {

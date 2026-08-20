@@ -16,10 +16,10 @@ use common::{
     create_workspace, ControllerLoopHarness,
 };
 use flotilla_controllers::reconcilers::{
-    checkout::CheckoutDeps, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
-    DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler, HopChainContext, PreparedCheckout,
-    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TerminalRuntime, TerminalRuntimeState,
-    TerminalSessionReconciler, VesselReconciler,
+    checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler,
+    CloneRuntime, DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler, HopChainContext,
+    PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TerminalRuntime,
+    TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
     path_context::DaemonHostPath,
@@ -171,18 +171,13 @@ struct DropFirstCheckoutCompletion {
 
 impl Reconciler for DropFirstCheckoutCompletion {
     type Resource = Checkout;
-    type Dependencies = CheckoutDeps;
+    type Prepared = CheckoutPrepared;
 
-    async fn fetch_dependencies(&self, obj: &ResourceObject<Checkout>) -> Result<Self::Dependencies, ResourceError> {
-        self.inner.fetch_dependencies(obj).await
+    async fn prepare(&self, obj: &ResourceObject<Checkout>) -> Result<Self::Prepared, ResourceError> {
+        self.inner.prepare(obj).await
     }
 
-    fn reconcile(
-        &self,
-        obj: &ResourceObject<Checkout>,
-        deps: &Self::Dependencies,
-        now: chrono::DateTime<Utc>,
-    ) -> ReconcileOutcome<Checkout> {
+    fn reconcile(&self, obj: &ResourceObject<Checkout>, deps: &Self::Prepared, now: chrono::DateTime<Utc>) -> ReconcileOutcome<Checkout> {
         let mut outcome = self.inner.reconcile(obj, deps, now);
         if !self.dropped.swap(true, Ordering::SeqCst) {
             outcome.patch = None;
@@ -367,6 +362,8 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let convoy = convoys
         .create(&controller_meta().name("convoy-multi").call(), &ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "wf".to_string(),
             dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),

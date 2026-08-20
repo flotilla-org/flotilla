@@ -202,6 +202,8 @@ pub fn object_meta(name: &str, namespace: &str, resource_version: &str) -> Objec
 
 pub fn valid_convoy_spec() -> RealConvoySpec {
     RealConvoySpec {
+        role: String::new(),
+        generation: 1,
         workflow_ref: "review-and-fix".to_string(),
         dispatching_principal_ref: Default::default(),
         inputs: [

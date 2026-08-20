@@ -62,13 +62,12 @@ impl std::fmt::Display for WorkflowTemplateNoun {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use flotilla_protocol::{Command, CommandAction};
+    use flotilla_protocol::CommandAction;
 
     use super::WorkflowTemplateNoun;
     use crate::{
         resolved::{HostResolution, RepoContext},
         test_utils::assert_round_trip,
-        Resolved,
     };
 
     fn parse(args: &[&str]) -> WorkflowTemplateNoun {
@@ -82,16 +81,12 @@ mod tests {
         let path = tmp.path().to_string_lossy().to_string();
 
         let resolved = parse(&["workflow-template", "scratch", "apply", "--file", &path]).resolve().expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::WorkflowTemplateApply { name: "scratch".into(), spec_yaml: "vessels: []\n".into() },
-            },
-            repo: RepoContext::None,
-            host: HostResolution::Local,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::WorkflowTemplateApply { name: "scratch".into(), spec_yaml: "vessels: []\n".into() },
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]

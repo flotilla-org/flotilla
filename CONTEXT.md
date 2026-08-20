@@ -356,7 +356,30 @@ observed state and starts a new generation (repopulated by a full provider
 refresh). Watch-from-version is valid only within a generation; a consumer or
 federated replica that sees the generation change must re-list. The durable
 **Managed** log has no generations — its version is continuous across restarts.
+Distinct sense: see **Convoy generation**.
 _Avoid_: Epoch, session, restart-id.
+
+**Convoy generation**:
+One incarnation of a standing **Convoy**: a single Convoy record holding that
+life's crew turns, archive pointers, and terminal reason (ADR 0032). Records
+are never reused across restarts — an ensure rebuilds by admitting the next
+generation; terminal generations are retained as history. At most one live
+generation exists per **Role address**. Distinct from the store-lifespan
+sense of **Generation**, and from the fleet-release generations of the
+deployment pipeline.
+_Avoid_: Incarnation (in code), husk (except informally for a terminal
+generation blocking nothing).
+
+**Role address**:
+The stable identity of a standing **Convoy**: `{project, role}`, written
+`role@project` (e.g. `governor@andamento`). What operators attach to, what
+ensures maintain, what surfaces display. Resolves via selector to the live
+**Convoy generation** — in project context a bare role suffices; in bare
+context resolution requires fleet-wide uniqueness or the qualified form.
+Convoy record names are generated machine identifiers and are never a human
+surface (ADR 0032).
+_Avoid_: Convoy name (for the human-facing identity), triple-barrelled
+generated names.
 
 **Provisioning**:
 Bringing an execution context into being — a checkout, an **Environment**

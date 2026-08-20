@@ -136,88 +136,68 @@ mod tests {
     #[test]
     fn checkout_create_branch() {
         let resolved = parse(&["checkout", "create", "--branch", "feat-x"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Checkout {
-                    repo: RepoSelector::Query("".into()),
-                    target: CheckoutTarget::Branch("feat-x".into()),
-                    issue_ids: vec![],
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::Checkout {
+                repo: RepoSelector::Query("".into()),
+                target: CheckoutTarget::Branch("feat-x".into()),
+                issue_ids: vec![],
             },
-            repo: RepoContext::Required,
-            host: HostResolution::ProvisioningTarget,
-        });
+            RepoContext::Required,
+            HostResolution::ProvisioningTarget,
+        );
     }
 
     #[test]
     fn checkout_create_fresh_branch() {
         let resolved = parse(&["checkout", "create", "--branch", "feat-x", "--fresh"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Checkout {
-                    repo: RepoSelector::Query("".into()),
-                    target: CheckoutTarget::FreshBranch("feat-x".into()),
-                    issue_ids: vec![],
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::Checkout {
+                repo: RepoSelector::Query("".into()),
+                target: CheckoutTarget::FreshBranch("feat-x".into()),
+                issue_ids: vec![],
             },
-            repo: RepoContext::Required,
-            host: HostResolution::ProvisioningTarget,
-        });
+            RepoContext::Required,
+            HostResolution::ProvisioningTarget,
+        );
     }
 
     #[test]
     fn checkout_remove() {
         let resolved = parse(&["checkout", "my-feature", "remove"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("my-feature".into()) },
-            },
-            repo: RepoContext::Inferred,
-            host: HostResolution::SubjectHost,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("my-feature".into()) },
+            RepoContext::Inferred,
+            HostResolution::SubjectHost,
+        );
     }
 
     #[test]
     fn checkout_status_subject_only() {
         let resolved = parse(&["checkout", "my-feature", "status"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::FetchCheckoutStatus { branch: "my-feature".into(), checkout_path: None, change_request_id: None },
-            },
-            repo: RepoContext::Inferred,
-            host: HostResolution::SubjectHost,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::FetchCheckoutStatus { branch: "my-feature".into(), checkout_path: None, change_request_id: None },
+            RepoContext::Inferred,
+            HostResolution::SubjectHost,
+        );
     }
 
     #[test]
     fn checkout_status_with_all_flags() {
         let resolved = parse(&["checkout", "my-feature", "status", "--checkout-path", "/tmp/wt", "--cr-id", "42"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::FetchCheckoutStatus {
-                    branch: "my-feature".into(),
-                    checkout_path: Some(PathBuf::from("/tmp/wt")),
-                    change_request_id: Some("42".into()),
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::FetchCheckoutStatus {
+                branch: "my-feature".into(),
+                checkout_path: Some(PathBuf::from("/tmp/wt")),
+                change_request_id: Some("42".into()),
             },
-            repo: RepoContext::Inferred,
-            host: HostResolution::SubjectHost,
-        });
+            RepoContext::Inferred,
+            HostResolution::SubjectHost,
+        );
     }
 
     #[test]

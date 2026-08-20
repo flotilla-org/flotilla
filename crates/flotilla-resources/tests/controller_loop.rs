@@ -93,9 +93,9 @@ struct BudgetedFailureReconciler {
 
 impl Reconciler for BudgetedFailureReconciler {
     type Resource = FailureResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         self.attempts.fetch_add(1, Ordering::SeqCst);
         Err(ResourceError::other("provider registry unavailable"))
     }
@@ -103,7 +103,7 @@ impl Reconciler for BudgetedFailureReconciler {
     fn reconcile(
         &self,
         _obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         unreachable!("dependency failure should prevent reconcile")
@@ -153,16 +153,16 @@ impl RecordingReconciler {
 
 impl Reconciler for RecordingReconciler {
     type Resource = PrimaryResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
@@ -187,16 +187,16 @@ struct FailingObjectReconciler {
 
 impl Reconciler for FailingObjectReconciler {
     type Resource = PrimaryResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
@@ -222,16 +222,16 @@ struct FinalizingReconciler {
 
 impl Reconciler for FinalizingReconciler {
     type Resource = PrimaryResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         _obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         ReconcileOutcome::new(None)
@@ -255,16 +255,16 @@ struct RacingFinalizerRemovalReconciler {
 
 impl Reconciler for RacingFinalizerRemovalReconciler {
     type Resource = PrimaryResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         _obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         ReconcileOutcome::new(None)
@@ -303,16 +303,16 @@ struct RacingAttachReconciler {
 
 impl Reconciler for RacingAttachReconciler {
     type Resource = PrimaryResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         _obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         ReconcileOutcome::new(None)
@@ -372,16 +372,16 @@ struct RacingStatusPatchReconciler {
 
 impl Reconciler for RacingStatusPatchReconciler {
     type Resource = StatusfulResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
@@ -485,16 +485,16 @@ struct ActuatingReconciler {
 
 impl Reconciler for ActuatingReconciler {
     type Resource = PrimaryResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         if let Some(reconciled) = &self.reconciled {

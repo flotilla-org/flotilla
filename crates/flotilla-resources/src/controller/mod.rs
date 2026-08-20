@@ -36,18 +36,15 @@ pub type Event = String;
 #[allow(async_fn_in_trait)]
 pub trait Reconciler: Send + Sync + 'static {
     type Resource: Resource;
-    type Dependencies;
+    type Prepared;
 
-    /// Gather or prepare the dependency state needed for `reconcile()`.
-    ///
-    /// Reconcilers may use this hook for idempotent preparation work when the
-    /// dependency result depends on performing that step first.
-    async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError>;
+    /// Prepare the state needed for `reconcile()`; this method may perform effects and must be idempotent, while `reconcile()` must be pure.
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError>;
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        deps: &Self::Dependencies,
+        prepared: &Self::Prepared,
         now: DateTime<Utc>,
     ) -> ReconcileOutcome<Self::Resource>;
 
@@ -742,8 +739,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                         }
                     }
                     attempted_reconcile = true;
-                    let deps = reconciler.fetch_dependencies(&object).await?;
-                    let outcome = reconciler.reconcile(&object, &deps, Utc::now());
+                    let prepared = reconciler.prepare(&object).await?;
+                    let outcome = reconciler.reconcile(&object, &prepared, Utc::now());
                     for actuation in outcome.actuations {
                         Self::apply_actuation(&primary.backend, &primary.namespace, actuation).await?;
                     }

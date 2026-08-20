@@ -19,7 +19,8 @@ use flotilla_resources::{
     Convoy, ConvoyPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta,
     LifecycleAuthority, ResourceBackend, ResourceError, ResourceObject, StatusPatch, TerminalAttention, TerminalAttentionSource,
     TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
-    VirtualClock, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
+    VirtualClock, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
+    VESSEL_REF_LABEL,
 };
 
 mod common;
@@ -74,7 +75,7 @@ async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
         .await
         .expect("session create should succeed");
     let reconciler = TerminalSessionReconciler::new(Arc::new(FailingTerminalRuntime), backend, "flotilla");
-    let deps = reconciler.fetch_dependencies(&session).await.expect("deps should load");
+    let deps = reconciler.prepare(&session).await.expect("deps should load");
     let now = Utc::now();
     let outcome = reconciler.reconcile(&session, &deps, now);
 
@@ -120,7 +121,7 @@ async fn terminal_session_is_reclaimed_when_its_environment_is_gone() {
         .expect("create orphaned terminal session");
     let reconciler = TerminalSessionReconciler::new(Arc::new(RecordingTerminalRuntime::default()), backend, "flotilla");
 
-    let deps = reconciler.fetch_dependencies(&session).await.expect("missing environment should be lifecycle state");
+    let deps = reconciler.prepare(&session).await.expect("missing environment should be lifecycle state");
     let outcome = reconciler.reconcile(&session, &deps, Utc::now());
 
     assert!(matches!(
@@ -166,7 +167,7 @@ async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
         .expect("terminal should exist");
     let reconciler = TerminalSessionReconciler::new(Arc::new(RecordingTerminalRuntime::default()), backend, "flotilla");
 
-    let deps = reconciler.fetch_dependencies(&session).await.expect("abandoned owner should be handled as lifecycle state");
+    let deps = reconciler.prepare(&session).await.expect("abandoned owner should be handled as lifecycle state");
     let outcome = reconciler.reconcile(&session, &deps, Utc::now());
 
     assert!(matches!(
@@ -318,6 +319,75 @@ async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
     let _ = loop_task.await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn foreign_actuator_runtime_failure_is_skipped_and_convoy_stays_active() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let convoy = convoys.get("demo").await.expect("convoy");
+    let mut convoy_status = convoy.status.expect("convoy status");
+    convoy_status.phase = ConvoyPhase::Active;
+    convoys.update_status("demo", &convoy.metadata.resource_version, &convoy_status).await.expect("mark convoy active");
+
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(
+            &InputMeta::builder()
+                .name("terminal-demo-work-coder".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "demo".to_string())]))
+                .annotations(BTreeMap::from([(ACTUATOR_HOST_REF_ANNOTATION.to_string(), "udder".to_string())]))
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("terminal should be created");
+    let mut running = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "cleat-demo-work-coder".to_string(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "cargo test".to_string(),
+        delivered_message_id: None,
+    }
+    .apply(&mut running);
+    sessions.update_status(&created.metadata.name, &created.metadata.resource_version, &running).await.expect("terminal should be running");
+
+    let runtime = Arc::new(UnavailableRunningRuntime::default());
+    let loop_task = tokio::spawn(
+        ControllerLoop {
+            primary: sessions.clone(),
+            secondaries: Vec::new(),
+            reconciler: TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla").with_local_host_ref("kiwi"),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    for _ in 0..6 {
+        tokio::time::advance(Duration::from_secs(60)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let terminal_status = sessions.get("terminal-demo-work-coder").await.expect("terminal remains").status.expect("terminal status");
+    assert_eq!(terminal_status.phase, TerminalSessionPhase::Running);
+    assert!(terminal_status.degraded.is_none());
+    assert_eq!(runtime.probes.load(Ordering::SeqCst), 0, "a non-actuator must never consult its local provider registry");
+    assert_eq!(convoys.get("demo").await.expect("convoy remains").status.expect("convoy status").phase, ConvoyPhase::Active);
+
+    loop_task.abort();
+}
+
 const GHOST_SESSION_NAME: &str = "terminal-deleted-convoy-work-coder";
 
 struct GhostRecoveryWorld {
@@ -433,7 +503,7 @@ impl ReconcileStep<GhostRecoveryWorld> for GhostRecoveryStep {
     type Actuation = Actuation;
 
     async fn reconcile_step(&self, world: &mut GhostRecoveryWorld) -> Result<LivenessStep<Self::Patch, Self::Actuation>, String> {
-        let deps = world.reconciler.fetch_dependencies(&world.stale_session).await.map_err(|error| error.to_string())?;
+        let deps = world.reconciler.prepare(&world.stale_session).await.map_err(|error| error.to_string())?;
         let outcome = world.reconciler.reconcile(&world.stale_session, &deps, Utc::now());
         world.ownerless_recovery_rejected = outcome.patch.is_none()
             && matches!(
@@ -613,7 +683,7 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
     let runtime = Arc::new(TagRecordingRuntime::default());
     let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
 
-    reconciler.fetch_dependencies(&session).await.expect("provisioning dependencies");
+    reconciler.prepare(&session).await.expect("provisioning dependencies");
 
     assert_eq!(runtime.tags.lock().expect("tags mutex").as_slice(), &[
         flotilla_resources::TerminalSessionTag::new("convoy", "demo"),
@@ -696,7 +766,7 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
     let reconciler = TerminalSessionReconciler::new(Arc::new(MissingTerminalRuntime), backend, "flotilla");
 
-    let deps = reconciler.fetch_dependencies(&session).await.expect("observe session");
+    let deps = reconciler.prepare(&session).await.expect("observe session");
     let now = Utc::now();
     let outcome = reconciler.reconcile(&session, &deps, now);
 
@@ -780,7 +850,7 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     let runtime = Arc::new(DeliveringTerminalRuntime::default());
     let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
 
-    let deps = reconciler.fetch_dependencies(&session).await.expect("observe pending message");
+    let deps = reconciler.prepare(&session).await.expect("observe pending message");
     assert_eq!(runtime.delivered.lock().expect("delivered mutex").as_slice(), &[(
         "cleat-session".to_string(),
         "Review the amended commit".to_string()
@@ -796,8 +866,8 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     let acknowledged =
         sessions.update_status("term-a", &session.metadata.resource_version, &acknowledged_status).await.expect("acknowledge message");
 
-    let deps = reconciler.fetch_dependencies(&acknowledged).await.expect("observe acknowledged message");
-    assert!(matches!(deps, flotilla_controllers::reconcilers::terminal_session::TerminalDeps::Attention(_)));
+    let deps = reconciler.prepare(&acknowledged).await.expect("observe acknowledged message");
+    assert!(matches!(deps, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
     assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), 1);
 }
 
@@ -941,7 +1011,7 @@ async fn stale_hook_attention_decays_to_unobservable_without_changing_phase() {
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
     let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
 
-    let deps = reconciler.fetch_dependencies(&session).await.expect("observe stale attention");
+    let deps = reconciler.prepare(&session).await.expect("observe stale attention");
     let now = Utc::now();
     let patch = reconciler.reconcile(&session, &deps, now).patch.expect("decay patch");
     patch.apply(&mut status);

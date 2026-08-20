@@ -319,6 +319,10 @@ pub struct FleetListResponse {
 #[builder(on(String, into))]
 pub struct FleetListRow {
     pub convoy: String,
+    /// Opaque record key used for internal joins. Human surfaces render
+    /// `convoy`, which is the role address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convoy_ref: Option<String>,
     pub vessel: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authority: Option<String>,

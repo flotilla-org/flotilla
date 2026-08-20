@@ -654,7 +654,7 @@ impl ForgeDefaultBranchResolver for GhForgeDefaultBranchResolver {
             return Ok(None);
         }
         let endpoint = format!("repos/{}", forge.repository);
-        let output = self.runner.run("gh", &["api", &endpoint, "--jq", ".default_branch"], Path::new("/"), &ChannelLabel::Noop).await?;
+        let output = self.runner.run("gh", &["api", &endpoint, "--jq", ".default_branch"], Path::new("/"), &ChannelLabel::Default).await?;
         let branch = output.trim();
         Ok((!branch.is_empty()).then(|| branch.to_string()))
     }
@@ -1227,6 +1227,40 @@ where
     }
 }
 
+fn spawn_resource_controller<T, F, Fut>(
+    backend: ResourceBackend,
+    namespace: String,
+    supervision: ControllerSupervision,
+    runtime_health: RuntimeHealth,
+    mut make_run: F,
+) -> JoinHandle<()>
+where
+    T: Resource,
+    F: FnMut(ResourceBackend, String) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), ResourceError>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        supervise_controller(T::API_PATHS.kind, supervision, runtime_health, move || make_run(backend.clone(), namespace.clone())).await;
+    })
+}
+
+fn spawn_vessel_placement_projector(
+    backend: ResourceBackend,
+    namespace: String,
+    local_host_ref: String,
+    supervision: ControllerSupervision,
+    runtime_health: RuntimeHealth,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // The projector and the Vessel reconciler need distinct health keys, while both remain tied to the resource they manage.
+        supervise_controller(Vessel::API_PATHS.plural, supervision, runtime_health, move || {
+            let projector = VesselPlacementProjector::new(backend.clone(), namespace.clone(), local_host_ref.clone());
+            async move { projector.run().await }
+        })
+        .await;
+    })
+}
+
 fn spawn_sleep_inhibitor_task(
     backend: ResourceBackend,
     namespace: String,
@@ -1701,298 +1735,176 @@ fn spawn_controller_loops(
         .local_command_runner()
         .map(|runner| Arc::new(GhForgeDefaultBranchResolver { runner }) as Arc<dyn ForgeDefaultBranchResolver>);
     let namespace_string = namespace.to_string();
+
+    macro_rules! controller {
+        ($primary:ty, $make_parts:expr) => {{
+            let make_parts = $make_parts;
+            spawn_resource_controller::<$primary, _, _>(
+                backend.clone(),
+                namespace_string.clone(),
+                supervision.clone(),
+                runtime_health.clone(),
+                move |backend, namespace| {
+                    let (secondaries, reconciler) = make_parts(backend.clone(), namespace.clone());
+                    let controller = ControllerLoop {
+                        primary: backend.clone().using::<$primary>(&namespace),
+                        secondaries,
+                        reconciler,
+                        resync_interval: controller_resync_interval,
+                        backend,
+                    };
+                    async move { controller.run().await }
+                },
+            )
+        }};
+    }
+
     vec![
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
-            let local_host_ref = state.local_host_ref.clone();
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("vessel_placement", supervision, runtime_health, move || {
-                    let projector = VesselPlacementProjector::new(backend.clone(), namespace_string.clone(), local_host_ref.clone());
-                    async move { projector.run().await }
-                })
-                .await;
-            }
-        }),
-        tokio::spawn({
-            let backend = backend.clone();
+        spawn_vessel_placement_projector(
+            backend.clone(),
+            namespace_string.clone(),
+            state.local_host_ref.clone(),
+            supervision.clone(),
+            runtime_health.clone(),
+        ),
+        controller!(Repository, {
             let observed_backend = observed_backend.clone();
-            let namespace_string = namespace_string.clone();
             let forge_default_branch_resolver = forge_default_branch_resolver.clone();
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("repository", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let observed_backend = observed_backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let forge_default_branch_resolver = forge_default_branch_resolver.clone();
-                    async move {
-                        let mut reconciler = RepositoryReconciler::new(backend.clone(), observed_backend.clone(), &namespace_string);
-                        if let Some(resolver) = forge_default_branch_resolver {
-                            reconciler = reconciler.with_forge_default_branch_resolver(resolver);
-                        }
-                        ControllerLoop {
-                            primary: backend.clone().using::<Repository>(&namespace_string),
-                            secondaries: RepositoryReconciler::secondary_watches(observed_backend.clone(), &namespace_string),
-                            reconciler,
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |backend: ResourceBackend, namespace_string: String| {
+                let observed_backend = observed_backend.clone();
+                let forge_default_branch_resolver = forge_default_branch_resolver.clone();
+                let mut reconciler = RepositoryReconciler::new(backend, observed_backend.clone(), &namespace_string);
+                if let Some(resolver) = forge_default_branch_resolver {
+                    reconciler = reconciler.with_forge_default_branch_resolver(resolver);
+                }
+                (RepositoryReconciler::secondary_watches(observed_backend, &namespace_string), reconciler)
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(Environment, {
             let state = Arc::clone(&state);
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("environment", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let state = Arc::clone(&state);
-                    async move {
-                        ControllerLoop {
-                            primary: backend.clone().using::<Environment>(&namespace_string),
-                            secondaries: vec![],
-                            reconciler: EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state })),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |_: ResourceBackend, _: String| {
+                let local_host_ref = state.local_host_ref.clone();
+                let state = Arc::clone(&state);
+                (vec![], EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state })).with_local_host_ref(local_host_ref))
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(Clone, {
             let state = Arc::clone(&state);
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("clone", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let runner = state.daemon.local_command_runner().expect("local runner should exist");
-                    let flights = Arc::clone(&state.clone_flights);
-                    async move {
-                        ControllerLoop {
-                            primary: backend.clone().using::<Clone>(&namespace_string),
-                            secondaries: vec![],
-                            reconciler: CloneReconciler::new(
-                                Arc::new(CloneControllerRuntime { runner, flights }),
-                                backend.clone().using::<Repository>(&namespace_string),
-                            ),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |backend: ResourceBackend, namespace_string: String| {
+                let runner = state.daemon.local_command_runner().expect("local runner should exist");
+                let flights = Arc::clone(&state.clone_flights);
+                (
+                    vec![],
+                    CloneReconciler::new(
+                        Arc::new(CloneControllerRuntime { runner, flights }),
+                        backend.using::<Repository>(&namespace_string),
+                    ),
+                )
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(Checkout, {
             let state = Arc::clone(&state);
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("checkout", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let state = Arc::clone(&state);
-                    async move {
-                        let runner = state.daemon.local_command_runner().expect("local runner should exist");
-                        ControllerLoop {
-                            primary: backend.clone().using::<flotilla_resources::Checkout>(&namespace_string),
-                            secondaries: CheckoutReconciler::<CheckoutControllerRuntime>::federated_secondary_watches(
-                                &backend,
-                                &namespace_string,
-                            ),
-                            reconciler: CheckoutReconciler::new(
-                                Arc::new(CheckoutControllerRuntime {
-                                    runner,
-                                    change_requests: Some(backend.including_replicas::<ChangeRequest>(&namespace_string)),
-                                }),
-                                backend.clone(),
-                                &namespace_string,
-                            )
-                            .with_federated_convoys(&backend, &namespace_string),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |backend: ResourceBackend, namespace_string: String| {
+                let state = Arc::clone(&state);
+                let runner = state.daemon.local_command_runner().expect("local runner should exist");
+                (
+                    CheckoutReconciler::<CheckoutControllerRuntime>::federated_secondary_watches(&backend, &namespace_string),
+                    CheckoutReconciler::new(
+                        Arc::new(CheckoutControllerRuntime {
+                            runner,
+                            change_requests: Some(backend.including_replicas::<ChangeRequest>(&namespace_string)),
+                        }),
+                        backend.clone(),
+                        &namespace_string,
+                    )
+                    .with_federated_convoys(&backend, &namespace_string),
+                )
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(TerminalSession, {
             let state = Arc::clone(&state);
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("terminal_session", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let state = Arc::clone(&state);
-                    async move {
-                        ControllerLoop {
-                            primary: backend.clone().using::<flotilla_resources::TerminalSession>(&namespace_string),
-                            secondaries: vec![],
-                            reconciler: TerminalSessionReconciler::new(
-                                Arc::new(TerminalControllerRuntime { state }),
-                                backend.clone(),
-                                &namespace_string,
-                            )
-                            .with_federated_convoys(&backend, &namespace_string),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |backend: ResourceBackend, namespace_string: String| {
+                let local_host_ref = state.local_host_ref.clone();
+                let state = Arc::clone(&state);
+                (
+                    vec![],
+                    TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
+                        .with_local_host_ref(local_host_ref)
+                        .with_federated_convoys(&backend, &namespace_string),
+                )
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(Vessel, {
             let config_dir = state.config.base_path().as_path().to_path_buf();
             let local_host_ref = state.local_host_ref.clone();
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("vessel", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let config_dir = config_dir.clone();
-                    let local_host_ref = local_host_ref.clone();
-                    async move {
-                        ControllerLoop {
-                            primary: backend.clone().using::<Vessel>(&namespace_string),
-                            secondaries: VesselReconciler::secondary_watches(),
-                            reconciler: VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
-                                .with_federated_dependencies(&backend, local_host_ref),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |backend: ResourceBackend, namespace_string: String| {
+                let config_dir = config_dir.clone();
+                let local_host_ref = local_host_ref.clone();
+                (
+                    VesselReconciler::secondary_watches(),
+                    VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
+                        .with_federated_dependencies(&backend, local_host_ref),
+                )
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(Presentation, {
             let state = Arc::clone(&state);
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("presentation", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let state = Arc::clone(&state);
-                    async move {
-                        let policies = Arc::new(PresentationPolicyRegistry::with_defaults());
-                        let runtime = Arc::new(ProviderPresentationRuntime::new(Arc::clone(&state.local_registry), Arc::clone(&policies)));
-                        let mut hop_chain = HopChainContext::new(
-                            state.local_host_ref.clone(),
-                            state.daemon.host_name().clone(),
-                            state.config.base_path().clone(),
-                            {
-                                let state = Arc::clone(&state);
-                                move |env_ref| {
-                                    if env_ref == state.host_direct_environment_name {
-                                        return Ok(Arc::clone(&state.local_registry));
-                                    }
-                                    state
-                                        .daemon
-                                        .environment_registry_for_environment(&EnvironmentId::new(env_ref.to_string()))
-                                        .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
-                                }
-                            },
-                        );
-                        if let Some(repo_root) = state.local_repo_root.clone() {
-                            hop_chain = hop_chain.with_repo_root(repo_root);
+            move |backend: ResourceBackend, namespace_string: String| {
+                let state = Arc::clone(&state);
+                let policies = Arc::new(PresentationPolicyRegistry::with_defaults());
+                let runtime = Arc::new(ProviderPresentationRuntime::new(Arc::clone(&state.local_registry), Arc::clone(&policies)));
+                let mut hop_chain = HopChainContext::new(
+                    state.local_host_ref.clone(),
+                    state.daemon.host_name().clone(),
+                    state.config.base_path().clone(),
+                    {
+                        let state = Arc::clone(&state);
+                        move |env_ref| {
+                            if env_ref == state.host_direct_environment_name {
+                                return Ok(Arc::clone(&state.local_registry));
+                            }
+                            state
+                                .daemon
+                                .environment_registry_for_environment(&EnvironmentId::new(env_ref.to_string()))
+                                .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
                         }
-
-                        ControllerLoop {
-                            primary: backend.clone().using::<Presentation>(&namespace_string),
-                            secondaries: PresentationReconciler::<ProviderPresentationRuntime>::secondary_watches(),
-                            reconciler: PresentationReconciler::new(runtime, backend.clone(), &namespace_string, hop_chain, policies),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+                    },
+                );
+                if let Some(repo_root) = state.local_repo_root.clone() {
+                    hop_chain = hop_chain.with_repo_root(repo_root);
+                }
+                (
+                    PresentationReconciler::<ProviderPresentationRuntime>::secondary_watches(),
+                    PresentationReconciler::new(runtime, backend, &namespace_string, hop_chain, policies),
+                )
             }
         }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
+        controller!(Convoy, {
             let daemon = Arc::clone(&state.daemon);
-            let supervision = supervision.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                supervise_controller("convoy", supervision, runtime_health, move || {
-                    let backend = backend.clone();
-                    let namespace_string = namespace_string.clone();
-                    let daemon = Arc::clone(&daemon);
-                    async move {
-                        let mut secondaries = ConvoyReconciler::federated_secondary_watches(&backend, &namespace_string);
-                        secondaries.push(daemon.reconciler_wake_watch());
-                        ControllerLoop {
-                            primary: backend.clone().using::<Convoy>(&namespace_string),
-                            secondaries,
-                            reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
-                                .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
-                                .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))
-                                .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
-                                .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
-                                .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
-                                .with_federated_checkouts(backend.including_replicas::<Checkout>(&namespace_string))
-                                .with_change_requests(
-                                    backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
-                                    daemon.change_request_stale_after(),
-                                )
-                                .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
-                                .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
-                                .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
-                                    backend.clone(),
-                                    &namespace_string,
-                                )),
-                            resync_interval: controller_resync_interval,
-                            backend,
-                        }
-                        .run()
-                        .await
-                    }
-                })
-                .await;
+            move |backend: ResourceBackend, namespace_string: String| {
+                let daemon = Arc::clone(&daemon);
+                let mut secondaries = ConvoyReconciler::federated_secondary_watches(&backend, &namespace_string);
+                secondaries.push(daemon.reconciler_wake_watch());
+                (
+                    secondaries,
+                    ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
+                        .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
+                        .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))
+                        .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
+                        .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
+                        .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
+                        .with_federated_checkouts(backend.including_replicas::<Checkout>(&namespace_string))
+                        .with_change_requests(
+                            backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
+                            daemon.change_request_stale_after(),
+                        )
+                        .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
+                        .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
+                        .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
+                            backend.clone(),
+                            &namespace_string,
+                        )),
+                )
             }
         }),
     ]
@@ -2289,7 +2201,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         }
         for delivery in &material_deliveries {
             let args = delivery.preflight.args.iter().map(String::as_str).collect::<Vec<_>>();
-            if let Err(error) = handle.runner().run(&delivery.preflight.command, &args, Path::new("/"), &ChannelLabel::Noop).await {
+            if let Err(error) = handle.runner().run(&delivery.preflight.command, &args, Path::new("/"), &ChannelLabel::Default).await {
                 return Err(DockerProvisioningError::Failed(
                     discard_failed_environment(
                         &handle,
@@ -2550,7 +2462,7 @@ async fn recover_existing_clone(
 
 async fn verify_clone_origin(runner: &dyn CommandRunner, repo_url: &str, target_path: &str, target_label: &str) -> Result<(), String> {
     let origin = runner
-        .run("git", &["-C", target_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop)
+        .run("git", &["-C", target_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Default)
         .await
         .map_err(|error| format!("{target_label} {target_path} already exists but is not a reusable clone: {error}"))?;
     let origin = origin.trim();
@@ -2627,27 +2539,27 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         let local_ref = format!("refs/heads/{branch}");
         let remote_ref = format!("refs/remotes/origin/{branch}");
         let local_exists = runner
-            .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_ref], Path::new("/"), &ChannelLabel::Noop)
+            .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_ref], Path::new("/"), &ChannelLabel::Default)
             .await
             .is_ok();
         if !local_exists
-            && runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop).await.is_ok()
+            && runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Default).await.is_ok()
         {
             let remote_head = format!("refs/heads/{branch}");
             let advertised = runner
-                .run("git", &["-C", clone_path, "ls-remote", "--heads", "origin", &remote_head], Path::new("/"), &ChannelLabel::Noop)
+                .run("git", &["-C", clone_path, "ls-remote", "--heads", "origin", &remote_head], Path::new("/"), &ChannelLabel::Default)
                 .await
                 .map_err(|error| format!("inspect remote convoy branch {branch}: {error}"))?;
             if !advertised.trim().is_empty() {
                 let refspec = format!("{remote_head}:refs/remotes/origin/{branch}");
                 runner
-                    .run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Noop)
+                    .run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|error| format!("fetch convoy branch {branch}: {error}"))?;
             }
         }
         let remote_exists = runner
-            .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
+            .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Default)
             .await
             .is_ok();
         let branch_provenance = if !local_exists && !remote_exists && base_ref.is_some() {
@@ -2660,7 +2572,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             // Multiple vessels can intentionally share the convoy branch. `--force`
             // overrides Git's protection against attaching it to another worktree.
             runner
-                .run("git", &["-C", clone_path, "worktree", "add", "--force", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
+                .run("git", &["-C", clone_path, "worktree", "add", "--force", target_path, branch], Path::new("/"), &ChannelLabel::Default)
                 .await?;
         } else if remote_exists {
             runner
@@ -2668,20 +2580,25 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     "git",
                     &["-C", clone_path, "worktree", "add", "-b", branch, "--track", target_path, &format!("origin/{branch}")],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await?;
         } else if let Some(base_ref) = base_ref {
             let local_base_ref = format!("refs/heads/{base_ref}");
             let remote_base_ref = format!("refs/remotes/origin/{base_ref}");
             let resolved_base_ref = if runner
-                .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_base_ref], Path::new("/"), &ChannelLabel::Noop)
+                .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_base_ref], Path::new("/"), &ChannelLabel::Default)
                 .await
                 .is_ok()
             {
                 base_ref.to_string()
             } else if runner
-                .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_base_ref], Path::new("/"), &ChannelLabel::Noop)
+                .run(
+                    "git",
+                    &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_base_ref],
+                    Path::new("/"),
+                    &ChannelLabel::Default,
+                )
                 .await
                 .is_ok()
             {
@@ -2694,12 +2611,12 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     "git",
                     &["-C", clone_path, "worktree", "add", "-b", branch, target_path, &resolved_base_ref],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await?;
         } else {
             runner
-                .run("git", &["-C", clone_path, "worktree", "add", "--detach", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
+                .run("git", &["-C", clone_path, "worktree", "add", "--detach", target_path, branch], Path::new("/"), &ChannelLabel::Default)
                 .await?;
         }
 
@@ -2709,7 +2626,12 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             // can share it and may finalize in either order.
             let commit = commit.as_deref().ok_or_else(|| format!("resolve bootstrap commit for {branch}"))?;
             runner
-                .run("git", &["-C", clone_path, "update-ref", &bootstrap_branch_ref(branch), commit], Path::new("/"), &ChannelLabel::Noop)
+                .run(
+                    "git",
+                    &["-C", clone_path, "update-ref", &bootstrap_branch_ref(branch), commit],
+                    Path::new("/"),
+                    &ChannelLabel::Default,
+                )
                 .await?;
         }
         Ok(PreparedCheckout { commit, branch_provenance })
@@ -2732,14 +2654,21 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         let clone_ref = base_ref.unwrap_or(branch);
         let prepare = async {
             if clone_ref == "HEAD" {
-                runner.run("git", &["clone", repo_url, &staging_path], Path::new("/"), &ChannelLabel::Noop).await?;
+                runner.run("git", &["clone", repo_url, &staging_path], Path::new("/"), &ChannelLabel::Default).await?;
             } else {
-                runner.run("git", &["clone", "--branch", clone_ref, repo_url, &staging_path], Path::new("/"), &ChannelLabel::Noop).await?;
+                runner
+                    .run("git", &["clone", "--branch", clone_ref, repo_url, &staging_path], Path::new("/"), &ChannelLabel::Default)
+                    .await?;
             }
             if clone_ref != branch {
                 let remote_ref = format!("refs/remotes/origin/{branch}");
                 let remote_exists = runner
-                    .run("git", &["-C", &staging_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
+                    .run(
+                        "git",
+                        &["-C", &staging_path, "show-ref", "--verify", "--quiet", &remote_ref],
+                        Path::new("/"),
+                        &ChannelLabel::Default,
+                    )
                     .await
                     .is_ok();
                 if remote_exists {
@@ -2748,11 +2677,11 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                             "git",
                             &["-C", &staging_path, "switch", "-c", branch, "--track", &format!("origin/{branch}")],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                         )
                         .await?;
                 } else {
-                    runner.run("git", &["-C", &staging_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Noop).await?;
+                    runner.run("git", &["-C", &staging_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Default).await?;
                 }
             }
             resolve_head_commit(&*runner, &staging_path).await
@@ -2822,27 +2751,27 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                         "git",
                         &["-C", clone_path, "worktree", "remove", "--force", target_path],
                         Path::new("/"),
-                        &ChannelLabel::Noop,
+                        &ChannelLabel::Default,
                     )
                     .await?;
                 if !remove.success && !remove.stderr.contains("is not a working tree") {
                     return Err(remove.stderr);
                 }
                 remove_checkout_path(&*runner, target_path).await?;
-                runner.run("git", &["-C", clone_path, "worktree", "prune"], Path::new("/"), &ChannelLabel::Noop).await?;
+                runner.run("git", &["-C", clone_path, "worktree", "prune"], Path::new("/"), &ChannelLabel::Default).await?;
                 remove_empty_checkout_parents(clone_path, target_path).await?;
 
                 let branch_ref = format!("refs/heads/{branch}");
                 let bootstrap_ref = bootstrap_branch_ref(branch);
                 let head = runner
-                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &branch_ref], Path::new("/"), &ChannelLabel::Noop)
+                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &branch_ref], Path::new("/"), &ChannelLabel::Default)
                     .await?;
                 if !head.success {
                     delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
                     return Ok(CheckoutRemovalOutcome::Removed);
                 }
                 let bootstrap = runner
-                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &bootstrap_ref], Path::new("/"), &ChannelLabel::Noop)
+                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &bootstrap_ref], Path::new("/"), &ChannelLabel::Default)
                     .await?;
                 if !bootstrap.success {
                     return Ok(CheckoutRemovalOutcome::PreservedBranch {
@@ -2858,8 +2787,9 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     });
                 }
 
-                let worktrees =
-                    runner.run("git", &["-C", clone_path, "worktree", "list", "--porcelain"], Path::new("/"), &ChannelLabel::Noop).await?;
+                let worktrees = runner
+                    .run("git", &["-C", clone_path, "worktree", "list", "--porcelain"], Path::new("/"), &ChannelLabel::Default)
+                    .await?;
                 if worktrees.lines().any(|line| line == format!("branch {branch_ref}")) {
                     return Ok(CheckoutRemovalOutcome::PreservedBranch {
                         branch: branch.clone(),
@@ -2868,7 +2798,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 }
 
                 runner
-                    .run("git", &["-C", clone_path, "branch", "--delete", "--force", branch], Path::new("/"), &ChannelLabel::Noop)
+                    .run("git", &["-C", clone_path, "branch", "--delete", "--force", branch], Path::new("/"), &ChannelLabel::Default)
                     .await?;
                 delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
@@ -2888,21 +2818,21 @@ async fn recover_existing_worktree(
     }
 
     let target_common_dir = runner
-        .run("git", &["-C", target_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Noop)
+        .run("git", &["-C", target_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Default)
         .await
         .map_err(|error| format!("checkout target {target_path} already exists but is not a reusable git worktree: {error}"))?;
     let clone_common_dir = runner
-        .run("git", &["-C", clone_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Noop)
+        .run("git", &["-C", clone_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Default)
         .await?;
     if target_common_dir.trim() != clone_common_dir.trim() {
         return Err(format!("checkout target {target_path} already exists but belongs to a different git repository"));
     }
 
     let current_branch =
-        runner.run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Noop).await;
+        runner.run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Default).await;
     if current_branch.as_deref().map(str::trim) != Ok(branch) {
         let target_commit = resolve_head_commit(runner, target_path).await?;
-        let expected_commit = runner.run("git", &["-C", clone_path, "rev-parse", branch], Path::new("/"), &ChannelLabel::Noop).await?;
+        let expected_commit = runner.run("git", &["-C", clone_path, "rev-parse", branch], Path::new("/"), &ChannelLabel::Default).await?;
         if target_commit.as_deref() != Some(expected_commit.trim()) {
             return Err(format!("checkout target {target_path} already exists at a different ref than {branch}"));
         }
@@ -2913,7 +2843,7 @@ async fn recover_existing_worktree(
             "git",
             &["-C", clone_path, "show-ref", "--verify", "--quiet", &bootstrap_branch_ref(branch)],
             Path::new("/"),
-            &ChannelLabel::Noop,
+            &ChannelLabel::Default,
         )
         .await
         .is_ok()
@@ -2939,7 +2869,7 @@ async fn recover_existing_fresh_clone(
 
     if branch != "HEAD" {
         let current_branch = runner
-            .run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Noop)
+            .run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Default)
             .await
             .map_err(|error| format!("checkout target {target_path} already exists but its branch cannot be resolved: {error}"))?;
         if current_branch.trim() != branch {
@@ -2958,14 +2888,14 @@ fn bootstrap_branch_ref(branch: &str) -> String {
 }
 
 async fn delete_ref(runner: &dyn CommandRunner, clone_path: &str, reference: &str) -> Result<(), String> {
-    runner.run("git", &["-C", clone_path, "update-ref", "-d", reference], Path::new("/"), &ChannelLabel::Noop).await?;
+    runner.run("git", &["-C", clone_path, "update-ref", "-d", reference], Path::new("/"), &ChannelLabel::Default).await?;
     Ok(())
 }
 
 async fn remove_checkout_path(runner: &dyn CommandRunner, target_path: &str) -> Result<(), String> {
-    runner.run("rm", &["-rf", target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+    runner.run("rm", &["-rf", target_path], Path::new("/"), &ChannelLabel::Default).await?;
     for predicate in ["-e", "-L"] {
-        let remaining = runner.run_output("test", &[predicate, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+        let remaining = runner.run_output("test", &[predicate, target_path], Path::new("/"), &ChannelLabel::Default).await?;
         if remaining.success {
             return Err(format!("checkout cleanup reported success but path remains: {target_path}"));
         }
@@ -3007,7 +2937,7 @@ async fn remove_empty_checkout_parents(clone_path: &str, target_path: &str) -> R
 }
 
 async fn resolve_head_commit(runner: &dyn CommandRunner, path: &str) -> Result<Option<String>, String> {
-    let commit = runner.run("git", &["-C", path, "rev-parse", "HEAD"], Path::new("/"), &ChannelLabel::Noop).await?;
+    let commit = runner.run("git", &["-C", path, "rev-parse", "HEAD"], Path::new("/"), &ChannelLabel::Default).await?;
     Ok(Some(commit.trim().to_string()))
 }
 
@@ -3571,7 +3501,7 @@ mod tests {
             .with_checkouts(backend.clone().using::<ResourceCheckout>(NAMESPACE))
             .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(Arc::clone(&daemon))));
         let convoy = convoys.get("raced").await.expect("get convoy");
-        let deps = reconciler.fetch_dependencies(&convoy).await.expect("fetch dependencies");
+        let deps = reconciler.prepare(&convoy).await.expect("fetch dependencies");
         let outcome = reconciler.reconcile(&convoy, &deps, Utc::now());
 
         assert!(
@@ -5798,6 +5728,8 @@ mod tests {
         let convoys = kiwi.resource_backend().using::<Convoy>(NAMESPACE);
         let convoy = convoys
             .create(&empty_meta("remote-placement"), &ConvoySpec {
+                role: String::new(),
+                generation: 1,
                 workflow_ref: workflow_name.to_string(),
                 dispatching_principal_ref: Default::default(),
                 inputs: BTreeMap::new(),
@@ -6679,10 +6611,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_budget_exhaustion_is_recorded_in_runtime_health() {
+    async fn resource_controller_restart_budget_exhaustion_is_recorded_under_its_kind() {
         let runtime_health = RuntimeHealth::default();
-        supervise_controller(
-            "checkout",
+        spawn_resource_controller::<Checkout, _, _>(
+            ResourceBackend::InMemory(Default::default()),
+            NAMESPACE.to_string(),
             ControllerSupervision {
                 max_consecutive_failures: 1,
                 initial_backoff: Duration::ZERO,
@@ -6690,13 +6623,14 @@ mod tests {
                 success_reset_after: Duration::from_secs(60),
             },
             runtime_health.clone(),
-            || async { Err(ResourceError::other("root-owned debris")) },
+            |_, _| async { Err(ResourceError::other("root-owned debris")) },
         )
-        .await;
+        .await
+        .expect("controller supervisor task should finish");
 
         let conditions = runtime_health.conditions().await;
         assert_eq!(conditions.len(), 1);
-        assert_eq!(conditions[0].condition_type, "Controller/checkout");
+        assert_eq!(conditions[0].condition_type, format!("Controller/{}", Checkout::API_PATHS.kind));
         assert_eq!(conditions[0].reason, "RestartBudgetExhausted");
         assert!(conditions[0].message.contains("root-owned debris"));
     }
@@ -6831,7 +6765,7 @@ mod tests {
             NAMESPACE,
         )
         .with_federated_convoys(&checkout_host, NAMESPACE);
-        let dependencies = observer.fetch_dependencies(&checkout).await.expect("observe integration on checkout authority");
+        let dependencies = observer.prepare(&checkout).await.expect("observe integration on checkout authority");
         let observation = observer.reconcile(&checkout, &dependencies, chrono::Utc::now());
         let patch = observation.patch.expect("Landing observation should update checkout evidence");
         flotilla_resources::apply_status_patch(&checkouts, "checkout-b", &patch).await.expect("persist authority-local observation");
@@ -6867,7 +6801,7 @@ mod tests {
                 authority_daemon.change_request_stale_after(),
             )
             .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(authority_daemon)));
-        let dependencies = reconciler.fetch_dependencies(&current).await.expect("consume replicated checkout evidence");
+        let dependencies = reconciler.prepare(&current).await.expect("consume replicated checkout evidence");
         let outcome = reconciler.reconcile(&current, &dependencies, chrono::Utc::now());
         let patch = outcome.patch.expect("fresh replicated evidence should settle the convoy");
         flotilla_resources::apply_status_patch(&convoys, "cross-host", &patch).await.expect("persist Landed phase");
@@ -7503,26 +7437,38 @@ mod tests {
         backend
             .clone()
             .using::<Convoy>(NAMESPACE)
-            .create(&empty_meta("convoy-a"), &ConvoySpec {
-                workflow_ref: "wf-a".to_string(),
-                dispatching_principal_ref: Default::default(),
-                inputs: BTreeMap::new(),
-                placement_policy: Some(format!("host-direct-{host_id}")),
-                repositories: vec![ConvoyRepositorySpec {
-                    url: "https://github.com/flotilla-org/flotilla.git".to_string(),
-                    repo_ref: repository_key,
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: repository_spec.leaf_slug(),
-                    subpaths: Vec::new(),
-                }],
-                r#ref: Some("main".to_string()),
-                project_ref: None,
-                adopted_checkout_refs: BTreeMap::new(),
-                issues: Vec::new(),
-                change_request: None,
-                instruction: None,
-            })
+            .create(
+                &InputMeta::builder()
+                    .name("convoy-a".to_string())
+                    .labels(BTreeMap::from([
+                        (flotilla_resources::PROJECT_LABEL.to_string(), "test".to_string()),
+                        (flotilla_resources::ROLE_LABEL.to_string(), "convoy-a".to_string()),
+                        (flotilla_resources::GENERATION_LABEL.to_string(), "1".to_string()),
+                    ]))
+                    .build(),
+                &ConvoySpec {
+                    role: "convoy-a".to_string(),
+                    generation: 1,
+                    workflow_ref: "wf-a".to_string(),
+                    dispatching_principal_ref: Default::default(),
+                    inputs: BTreeMap::new(),
+                    placement_policy: Some(format!("host-direct-{host_id}")),
+                    repositories: vec![ConvoyRepositorySpec {
+                        url: "https://github.com/flotilla-org/flotilla.git".to_string(),
+                        repo_ref: repository_key,
+                        source_ref: "main".to_string(),
+                        target_ref: "main".to_string(),
+                        workspace_slug: repository_spec.leaf_slug(),
+                        subpaths: Vec::new(),
+                    }],
+                    r#ref: Some("main".to_string()),
+                    project_ref: Some("test".to_string()),
+                    adopted_checkout_refs: BTreeMap::new(),
+                    issues: Vec::new(),
+                    change_request: None,
+                    instruction: None,
+                },
+            )
             .await
             .expect("convoy create should succeed");
 
@@ -7598,19 +7544,18 @@ mod tests {
         };
 
         daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyWorkForceComplete {
-                    convoy: "convoy-a".to_string(),
-                    work: "implement".to_string(),
-                    message: Some(match completion_action {
-                        CompletionAction::Delete => "https://github.com/flotilla-org/flotilla/pull/884".to_string(),
-                        CompletionAction::Retain => "done".to_string(),
-                    }),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyWorkForceComplete {
+                        convoy: "convoy-a@test".to_string(),
+                        work: "implement".to_string(),
+                        message: Some(match completion_action {
+                            CompletionAction::Delete => "https://github.com/flotilla-org/flotilla/pull/884".to_string(),
+                            CompletionAction::Retain => "done".to_string(),
+                        }),
+                    })
+                    .build(),
+            )
             .await
             .expect("convoy completion command should succeed");
         if matches!(completion_action, CompletionAction::Delete) {
@@ -7668,6 +7613,21 @@ mod tests {
         Fut: std::future::Future<Output = bool>,
     {
         wait_until_with_timeout(Duration::from_secs(5), condition).await;
+    }
+
+    async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
+        backend
+            .clone()
+            .using::<Convoy>(NAMESPACE)
+            .list_matching_labels(&BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), role.to_string())]))
+            .await
+            .expect("list convoy by role")
+            .items
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("convoy role {role}"))
+            .metadata
+            .name
     }
 
     async fn wait_until_with_timeout<F, Fut>(timeout: Duration, mut condition: F)
@@ -8568,31 +8528,32 @@ mod tests {
 
         let mut rx = daemon.subscribe();
         let create_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyCreate {
-                    name: "crew-convoy".to_string(),
-                    workflow_ref: "crew-workflow".to_string(),
-                    inputs: Vec::new(),
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
-                    r#ref: Some("main".to_string()),
-                    project_ref: None,
-                    placement_policy: Some(profile.host_direct_policy_name()),
-                    adopted_checkout: Some(Box::new(repo.clone())),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyCreate {
+                        name: "crew-convoy".to_string(),
+                        workflow_ref: "crew-workflow".to_string(),
+                        inputs: Vec::new(),
+                        repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
+                        r#ref: Some("main".to_string()),
+                        project_ref: None,
+                        placement_policy: Some(profile.host_direct_policy_name()),
+                        adopted_checkout: Some(Box::new(repo.clone())),
+                    })
+                    .build(),
+            )
             .await
             .expect("create crew convoy");
         assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "crew-convoy".to_string() });
 
         let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        let crew_record = convoy_record_name(&backend, "crew-convoy").await;
         wait_until(|| {
             let convoys = convoys.clone();
+            let crew_record = crew_record.clone();
             async move {
                 matches!(
-                    convoys.get("crew-convoy").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                    convoys.get(&crew_record).await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Active
                             && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
@@ -8627,12 +8588,7 @@ mod tests {
         let crew_context = CrewCommandContext { crew_id: Some(coder_id.clone()), ..Default::default() };
         let crew_list = daemon
             .execute_query(
-                Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::QueryCrewList { context: crew_context.clone() },
-                },
+                Command::builder().action(CommandAction::QueryCrewList { context: crew_context.clone() }).build(),
                 uuid::Uuid::new_v4(),
             )
             .await
@@ -8643,7 +8599,7 @@ mod tests {
             ("reviewer", "latent"),
             ("watcher", "active")
         ]);
-        let initial_status = convoys.get("crew-convoy").await.expect("crew convoy").status.expect("convoy status");
+        let initial_status = convoys.get(&crew_record).await.expect("crew convoy").status.expect("convoy status");
         assert_eq!(initial_status.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
         // The reviewer is latent above and has no terminal session yet, so the
         // convoy status has to agree rather than report a crew member that was
@@ -8654,32 +8610,30 @@ mod tests {
 
         let mut rx = daemon.subscribe();
         let coder_complete_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewComplete {
-                    context: crew_context.clone(),
-                    message: Some("implementation ready".to_string()),
-                    disposition: None,
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewComplete {
+                        context: crew_context.clone(),
+                        message: Some("implementation ready".to_string()),
+                        disposition: None,
+                    })
+                    .build(),
+            )
             .await
             .expect("coder complete");
         assert_eq!(wait_for_command_result(&mut rx, coder_complete_id).await, CommandValue::Ok);
 
         let mut rx = daemon.subscribe();
         let handoff_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewHandoff {
-                    context: crew_context.clone(),
-                    target: "reviewer".to_string(),
-                    message: "Review commit abc123".to_string(),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewHandoff {
+                        context: crew_context.clone(),
+                        target: "reviewer".to_string(),
+                        message: "Review commit abc123".to_string(),
+                    })
+                    .build(),
+            )
             .await
             .expect("handoff reviewer");
         assert_eq!(wait_for_command_result(&mut rx, handoff_id).await, CommandValue::Ok);
@@ -8714,16 +8668,15 @@ mod tests {
 
         let mut rx = daemon.subscribe();
         let hand_back_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewHandoff {
-                    context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
-                    target: "coder".to_string(),
-                    message: "Address the review findings".to_string(),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewHandoff {
+                        context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
+                        target: "coder".to_string(),
+                        message: "Address the review findings".to_string(),
+                    })
+                    .build(),
+            )
             .await
             .expect("hand back to coder");
         assert_eq!(wait_for_command_result(&mut rx, hand_back_id).await, CommandValue::Ok);
@@ -8734,14 +8687,15 @@ mod tests {
         drop(delivered);
         wait_until(|| {
             let convoys = convoys.clone();
+            let crew_record = crew_record.clone();
             async move {
-                convoys.get("crew-convoy").await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
+                convoys.get(&crew_record).await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
                     status.phase == ConvoyPhase::Active && status.work.get("implement").is_some_and(|work| work.phase == WorkPhase::Running)
                 })
             }
         })
         .await;
-        let reopened = convoys.get("crew-convoy").await.expect("reopened convoy").status.expect("reopened status");
+        let reopened = convoys.get(&crew_record).await.expect("reopened convoy").status.expect("reopened status");
         assert_eq!(reopened.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
         assert_eq!(reopened.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::HandedBack);
 
@@ -8802,8 +8756,9 @@ mod tests {
         .await;
         wait_until(|| {
             let convoys = convoys.clone();
+            let crew_record = crew_record.clone();
             async move {
-                convoys.get("crew-convoy").await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
+                convoys.get(&crew_record).await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
                     status.phase == ConvoyPhase::Active
                         && status.work["implement"].phase == WorkPhase::Running
                         && status.crew_work["implement"]["coder"].phase == flotilla_resources::CrewWorkPhase::Working
@@ -8843,43 +8798,48 @@ mod tests {
         let [flotilla_protocol::ResolvedAttachAction::Command(args)] = attach.plan.0.as_slice() else {
             panic!("expected one local attach command, got {:?}", attach.plan);
         };
-        assert!(flotilla_protocol::arg::flatten(args, 0).contains("attach terminal-crew-convoy-implement-coder"));
+        assert!(flotilla_protocol::arg::flatten(args, 0).contains(&format!("attach {}", revived_coder.metadata.name)));
 
         let mut rx = daemon.subscribe();
         let coder_recomplete_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some(revived_coder_id.clone()), ..Default::default() },
-                    message: Some("review findings addressed".to_string()),
-                    disposition: None,
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewComplete {
+                        context: CrewCommandContext { crew_id: Some(revived_coder_id.clone()), ..Default::default() },
+                        message: Some("review findings addressed".to_string()),
+                        disposition: None,
+                    })
+                    .build(),
+            )
             .await
             .expect("coder re-complete");
         assert_eq!(wait_for_command_result(&mut rx, coder_recomplete_id).await, CommandValue::Ok);
 
         let mut rx = daemon.subscribe();
         let return_to_reviewer_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewHandoff {
-                    context: CrewCommandContext { crew_id: Some(revived_coder_id), ..Default::default() },
-                    target: "reviewer".to_string(),
-                    message: "Please verify the fixes".to_string(),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewHandoff {
+                        context: CrewCommandContext { crew_id: Some(revived_coder_id), ..Default::default() },
+                        target: "reviewer".to_string(),
+                        message: "Please verify the fixes".to_string(),
+                    })
+                    .build(),
+            )
             .await
             .expect("return to reviewer");
         assert_eq!(wait_for_command_result(&mut rx, return_to_reviewer_id).await, CommandValue::Ok);
 
         let mut rx = daemon.subscribe();
         let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
-        let checkout = checkouts.get("adopted-checkout-crew-convoy").await.expect("adopted checkout");
+        let checkout = checkouts
+            .list()
+            .await
+            .expect("checkout list")
+            .items
+            .into_iter()
+            .find(|checkout| checkout.metadata.lifecycle_authority().ok().flatten() == Some(LifecycleAuthority::Adopted))
+            .expect("adopted checkout");
         let mut integration = checkout.status.expect("checkout status").integration;
         integration.landed = flotilla_resources::IntegrationCondition::builder()
             .value(flotilla_resources::ConditionValue::True)
@@ -8894,24 +8854,24 @@ mod tests {
         .await
         .expect("record observed absence of a change request");
         let final_review_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some(reviewer_id), ..Default::default() },
-                    message: Some("changes accepted".to_string()),
-                    disposition: None,
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewComplete {
+                        context: CrewCommandContext { crew_id: Some(reviewer_id), ..Default::default() },
+                        message: Some("changes accepted".to_string()),
+                        disposition: None,
+                    })
+                    .build(),
+            )
             .await
             .expect("final reviewer completion");
         assert_eq!(wait_for_command_result(&mut rx, final_review_id).await, CommandValue::Ok);
         wait_until(|| {
             let convoys = convoys.clone();
+            let crew_record = crew_record.clone();
             async move {
                 convoys
-                    .get("crew-convoy")
+                    .get(&crew_record)
                     .await
                     .ok()
                     .and_then(|convoy| convoy.status)
@@ -8919,7 +8879,7 @@ mod tests {
             }
         })
         .await;
-        let completed = convoys.get("crew-convoy").await.expect("completed convoy").status.expect("completed status");
+        let completed = convoys.get(&crew_record).await.expect("completed convoy").status.expect("completed status");
         assert_eq!(completed.work["implement"].phase, WorkPhase::Complete);
         assert!(completed.crew_work["implement"].values().all(|state| state.phase == flotilla_resources::CrewWorkPhase::Done));
 
@@ -8948,21 +8908,20 @@ mod tests {
             .expect("unknown capability workflow");
         let mut rx = daemon.subscribe();
         let create_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyCreate {
-                    name: "unknown-convoy".to_string(),
-                    workflow_ref: "unknown-capability".to_string(),
-                    inputs: Vec::new(),
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
-                    r#ref: Some("main".to_string()),
-                    project_ref: None,
-                    placement_policy: Some(profile.host_direct_policy_name()),
-                    adopted_checkout: Some(Box::new(repo)),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyCreate {
+                        name: "unknown-convoy".to_string(),
+                        workflow_ref: "unknown-capability".to_string(),
+                        inputs: Vec::new(),
+                        repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
+                        r#ref: Some("main".to_string()),
+                        project_ref: None,
+                        placement_policy: Some(profile.host_direct_policy_name()),
+                        adopted_checkout: Some(Box::new(repo)),
+                    })
+                    .build(),
+            )
             .await
             .expect("create unknown convoy");
         assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::Error {
@@ -9037,31 +8996,60 @@ mod tests {
 
         let mut rx = daemon.subscribe();
         let create_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyCreate {
-                    name: "convoy-adopted".to_string(),
-                    workflow_ref: "wf-a".to_string(),
-                    inputs: Vec::new(),
-                    repository_url: None,
-                    r#ref: None,
-                    project_ref: None,
-                    placement_policy: Some(format!("host-direct-{host_id}")),
-                    adopted_checkout: Some(Box::new(repo.clone())),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyCreate {
+                        name: "convoy-adopted".to_string(),
+                        workflow_ref: "wf-a".to_string(),
+                        inputs: Vec::new(),
+                        repository_url: None,
+                        r#ref: None,
+                        project_ref: None,
+                        placement_policy: Some(format!("host-direct-{host_id}")),
+                        adopted_checkout: Some(Box::new(repo.clone())),
+                    })
+                    .build(),
+            )
             .await
             .expect("convoy create command should start");
         assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
 
+        let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
+        let checkout_count = checkouts.list().await.expect("list adopted checkouts").items.len();
+        let duplicate_id = daemon
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyCreate {
+                        name: "convoy-adopted".to_string(),
+                        workflow_ref: "wf-a".to_string(),
+                        inputs: Vec::new(),
+                        repository_url: None,
+                        r#ref: None,
+                        project_ref: None,
+                        placement_policy: Some(format!("host-direct-{host_id}")),
+                        adopted_checkout: Some(Box::new(repo.clone())),
+                    })
+                    .build(),
+            )
+            .await
+            .expect("duplicate convoy create command should start");
+        assert_eq!(wait_for_command_result(&mut rx, duplicate_id).await, CommandValue::Error {
+            message: "live convoy convoy-adopted generation 1 already exists".to_string()
+        });
+        assert_eq!(
+            checkouts.list().await.expect("list adopted checkouts after duplicate").items.len(),
+            checkout_count,
+            "a rejected duplicate must not persist an orphan adopted checkout"
+        );
+
         let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        let adopted_record = convoy_record_name(&backend, "convoy-adopted").await;
         wait_until(|| {
             let convoys = convoys.clone();
+            let adopted_record = adopted_record.clone();
             async move {
                 matches!(
-                    convoys.get("convoy-adopted").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                    convoys.get(&adopted_record).await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Active
                             && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
@@ -9072,16 +9060,15 @@ mod tests {
 
         daemon.reconcile_adopted_checkouts(NAMESPACE).await.expect("adopted checkout integration observation should succeed");
         let complete_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyWorkForceComplete {
-                    convoy: "convoy-adopted".to_string(),
-                    work: "implement".to_string(),
-                    message: Some("done".to_string()),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyWorkForceComplete {
+                        convoy: "convoy-adopted".to_string(),
+                        work: "implement".to_string(),
+                        message: Some("done".to_string()),
+                    })
+                    .build(),
+            )
             .await
             .expect("convoy completion command should start");
         assert_eq!(wait_for_command_result(&mut rx, complete_id).await, CommandValue::Ok);
@@ -9090,9 +9077,10 @@ mod tests {
 
         wait_until(|| {
             let convoys = convoys.clone();
+            let adopted_record = adopted_record.clone();
             async move {
                 matches!(
-                    convoys.get("convoy-adopted").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                    convoys.get(&adopted_record).await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Landed
                             && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
@@ -9104,11 +9092,15 @@ mod tests {
         let checkout = backend
             .clone()
             .using::<ResourceCheckout>(NAMESPACE)
-            .get("adopted-checkout-convoy-adopted")
+            .list()
             .await
+            .expect("list adopted checkouts")
+            .items
+            .into_iter()
+            .find(|checkout| checkout.metadata.lifecycle_authority().ok().flatten() == Some(LifecycleAuthority::Adopted))
             .expect("adopted checkout should remain after completion");
         assert_eq!(checkout.metadata.lifecycle_authority().expect("authority should parse"), Some(LifecycleAuthority::Adopted));
-        assert!(backend.clone().using::<ResourceCheckout>(NAMESPACE).get("checkout-convoy-adopted-implement").await.is_err());
+        assert_eq!(backend.clone().using::<ResourceCheckout>(NAMESPACE).list().await.expect("checkout list").items.len(), 1);
 
         for handle in controller_handles {
             handle.abort();
