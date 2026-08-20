@@ -309,6 +309,11 @@ cat >"$fake_bin/loginctl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"$LOGINCTL_LOG"
+state="$LOGINCTL_LOG.linger"
+case "${1:-}" in
+  enable-linger) touch "$state" ;;
+  show-user) if [[ -e "$state" ]]; then printf 'yes\n'; else printf 'no\n'; fi ;;
+esac
 SH
 chmod 0755 "$fake_bin/loginctl"
 
