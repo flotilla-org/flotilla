@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{
-    controller::{Actuation, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
+    controller::{Actuation, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
     Convoy, ConvoyPhase, Environment, EnvironmentPhase, ReplicaReadResolver, ResourceBackend, ResourceError, ResourceObject,
     ResourceProvenance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, ACTUATOR_HOST_REF_ANNOTATION,
@@ -297,7 +297,13 @@ where
                 _ => None,
             },
             TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed => None,
-        };
+        }
+        .or_else(|| {
+            obj.status
+                .as_ref()
+                .is_some_and(|status| status.degraded.is_some())
+                .then_some(TerminalSessionStatusPatch::ClearReconcileDegraded)
+        });
 
         ReconcileOutcome::new(patch)
     }
@@ -331,6 +337,7 @@ where
             max_consecutive_failures: 5,
             initial_backoff: Duration::from_secs(60),
             max_backoff: Duration::from_secs(15 * 60),
+            exhaustion: ReconcileErrorExhaustion::Retry,
         })
     }
 

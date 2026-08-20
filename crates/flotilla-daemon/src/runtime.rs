@@ -3264,6 +3264,7 @@ mod tests {
                 EnvironmentAssertion, EnvironmentBag, ProviderCategory, ProviderDescriptor,
             },
             environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
+            terminal::{TerminalEnvVars, TerminalPool, TerminalSession as ProviderTerminalSession, TerminalSessionTag},
             ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
         },
     };
@@ -3283,9 +3284,9 @@ mod tests {
         CredentialConsumer, CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
         CredentialSpecSpec, CrewSource, CrewSpec, LifecycleAuthority, MaterialPoolSpec, MaterialPoolUnitSpec,
         ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementStatus, RepositoryKey, RepositorySpec, Resource,
-        Selector, SqliteBackend, TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, VesselSpec,
-        VesselStatus, VirtualClock, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION,
-        CONVOY_LABEL,
+        Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSpec,
+        TerminalSessionStatus, TerminalSessionStatusPatch, VesselRequirement, VesselSpec, VesselStatus, VirtualClock, WorkPhase, WorkState,
+        WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
@@ -7177,6 +7178,79 @@ mod tests {
         crew_daemon_with_backend(config, ResourceBackend::InMemory(Default::default())).await
     }
 
+    struct TransientTerminalPool {
+        inner: FakeTerminalPool,
+        available: AtomicBool,
+    }
+
+    impl TransientTerminalPool {
+        fn new() -> Self {
+            Self { inner: FakeTerminalPool::new(), available: AtomicBool::new(true) }
+        }
+
+        fn set_available(&self, available: bool) {
+            self.available.store(available, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl TerminalPool for TransientTerminalPool {
+        fn tracks_session_liveness(&self) -> bool {
+            true
+        }
+
+        async fn list_sessions(&self) -> Result<Vec<ProviderTerminalSession>, String> {
+            if !self.available.load(Ordering::SeqCst) {
+                return Err("terminal pool temporarily unavailable".to_string());
+            }
+            self.inner.list_sessions().await
+        }
+
+        async fn ensure_session(
+            &self,
+            session_name: &str,
+            command: &str,
+            cwd: &ExecutionEnvironmentPath,
+            env_vars: &TerminalEnvVars,
+            tags: &[TerminalSessionTag],
+        ) -> Result<(), String> {
+            self.inner.ensure_session(session_name, command, cwd, env_vars, tags).await
+        }
+
+        fn attach_args(
+            &self,
+            session_name: &str,
+            command: &str,
+            cwd: &ExecutionEnvironmentPath,
+            env_vars: &TerminalEnvVars,
+        ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+            self.inner.attach_args(session_name, command, cwd, env_vars)
+        }
+
+        async fn kill_session(&self, session_name: &str) -> Result<(), String> {
+            self.inner.kill_session(session_name).await
+        }
+    }
+
+    async fn daemon_with_transient_terminal_pool(
+        config: Arc<ConfigStore>,
+        backend: ResourceBackend,
+        pool: Arc<TransientTerminalPool>,
+    ) -> Arc<InProcessDaemon> {
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(pool as Arc<dyn TerminalPool>));
+        let daemon =
+            InProcessDaemon::new_with_resource_backend(Vec::new(), config, discovery, flotilla_protocol::HostName::new("dinghy"), backend)
+                .await;
+        daemon
+            .replace_local_environment_bag_for_test(
+                EnvironmentBag::new()
+                    .with(EnvironmentAssertion::env_var("HOME", "/Users/tester"))
+                    .with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
+            )
+            .expect("transient pool environment bag");
+        daemon
+    }
+
     async fn crew_daemon_with_backend(config: Arc<ConfigStore>, backend: ResourceBackend) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
         let pool = Arc::new(FakeTerminalPool::new());
         let discovery = fake_discovery_with_provider_set(
@@ -7218,6 +7292,140 @@ mod tests {
             )
             .expect("crew environment bag");
         (daemon, pool)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn convoy_holds_and_recovers_when_terminal_pool_is_transiently_unavailable_after_daemon_restart() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config");
+        std::fs::create_dir_all(&config_path).expect("config dir");
+        std::fs::write(config_path.join("daemon.toml"), "machine_id = \"transient-pool-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_path));
+        let backend = ResourceBackend::InMemory(Default::default());
+        let pool = Arc::new(TransientTerminalPool::new());
+
+        let initial = daemon_with_transient_terminal_pool(Arc::clone(&config), backend.clone(), Arc::clone(&pool)).await;
+        let registry = probe_local_provider_registry(&initial, &config).await.expect("initial provider registry");
+        let profile = build_local_profile(&initial, &registry).expect("initial profile");
+        register_startup_resources(&initial, NAMESPACE, &profile).await.expect("initial startup resources");
+
+        let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        let convoy = convoys
+            .create(
+                &empty_meta("transient-pool-convoy"),
+                &ConvoySpec::builder().workflow_ref("transient-pool-workflow".to_string()).build(),
+            )
+            .await
+            .expect("create convoy");
+        convoys
+            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                ..Default::default()
+            })
+            .await
+            .expect("mark convoy active");
+
+        let session_name = "terminal-transient-pool-convoy-implement-coder";
+        pool.inner
+            .add_sessions(vec![ProviderTerminalSession::builder()
+                .session_name(session_name.to_string())
+                .status(TerminalStatus::Running)
+                .command("cargo test".to_string())
+                .working_directory(ExecutionEnvironmentPath::new("/workspace"))
+                .build()])
+            .await;
+        let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
+        let session = sessions
+            .create(
+                &InputMeta::builder()
+                    .name(session_name.to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "transient-pool-convoy".to_string())]))
+                    .build(),
+                &TerminalSessionSpec {
+                    env_ref: profile.host_direct_environment_name(),
+                    role: "coder".to_string(),
+                    source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                    cwd: "/workspace".to_string(),
+                    pool: profile.host_direct_pool.clone(),
+                },
+            )
+            .await
+            .expect("create running terminal resource");
+        let mut running = TerminalSessionStatus::default();
+        TerminalSessionStatusPatch::MarkRunning {
+            session_id: session_name.to_string(),
+            pid: None,
+            started_at: Utc::now(),
+            crew: None,
+            launch_command: "cargo test".to_string(),
+            delivered_message_id: None,
+        }
+        .apply(&mut running);
+        sessions.update_status(session_name, &session.metadata.resource_version, &running).await.expect("mark terminal running");
+        drop(initial);
+
+        pool.set_available(false);
+        let restarted = daemon_with_transient_terminal_pool(Arc::clone(&config), backend.clone(), Arc::clone(&pool)).await;
+        let restarted_registry = probe_local_provider_registry(&restarted, &config).await.expect("restarted provider registry");
+        let state = Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&restarted),
+            config,
+            restarted_registry,
+            None,
+            profile.host_id.clone(),
+            None,
+            profile.host_direct_environment_name(),
+        ));
+        let loop_task = tokio::spawn(
+            ControllerLoop {
+                primary: sessions.clone(),
+                secondaries: Vec::new(),
+                reconciler: TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), NAMESPACE),
+                resync_interval: Duration::from_secs(3600),
+                backend,
+            }
+            .run(),
+        );
+
+        for delay in [0, 60, 120, 240, 480] {
+            if delay > 0 {
+                tokio::time::advance(Duration::from_secs(delay)).await;
+            }
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let held = sessions.get(session_name).await.expect("held terminal").status.expect("held terminal status");
+        assert_eq!(held.phase, TerminalSessionPhase::Running);
+        assert!(held
+            .degraded
+            .as_ref()
+            .is_some_and(|condition| { condition.consecutive_failures == 5 && condition.message.contains("temporarily unavailable") }));
+        assert_eq!(
+            convoys.get("transient-pool-convoy").await.expect("held convoy").status.expect("held convoy status").phase,
+            ConvoyPhase::Active
+        );
+
+        pool.set_available(true);
+        tokio::time::advance(Duration::from_secs(15 * 60)).await;
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+            if sessions.get(session_name).await.ok().and_then(|session| session.status).is_some_and(|status| status.degraded.is_none()) {
+                break;
+            }
+        }
+
+        let recovered = sessions.get(session_name).await.expect("recovered terminal").status.expect("recovered terminal status");
+        assert_eq!(recovered.phase, TerminalSessionPhase::Running);
+        assert_eq!(recovered.degraded, None);
+        assert_eq!(
+            convoys.get("transient-pool-convoy").await.expect("recovered convoy").status.expect("recovered convoy status").phase,
+            ConvoyPhase::Active
+        );
+
+        loop_task.abort();
+        let _ = loop_task.await;
     }
 
     async fn run_stage4a_flow_reaches_running_and_completes_convoy(

@@ -178,7 +178,8 @@ pub struct TerminalSessionStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_pending: Option<CrewCompletionPending>,
     /// Set when the controller exhausts its budget for one repeated reconcile
-    /// error. The session remains parked until an explicit restart clears it.
+    /// error. The controller may either park or continue retrying with backoff,
+    /// according to its error policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded: Option<TerminalSessionDegradedCondition>,
 }
@@ -303,6 +304,7 @@ pub enum TerminalSessionStatusPatch {
         consecutive_failures: u32,
         observed_at: DateTime<Utc>,
     },
+    ClearReconcileDegraded,
     ObserveAttention {
         attention: TerminalAttention,
     },
@@ -329,14 +331,20 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.crew = crew.clone();
                 status.launch_command = Some(launch_command.clone());
                 status.delivered_message_id = delivered_message_id.clone();
+                status.degraded = None;
             }
-            Self::MarkMessageDelivered { message_id } => status.delivered_message_id = Some(message_id.clone()),
+            Self::MarkMessageDelivered { message_id } => {
+                status.delivered_message_id = Some(message_id.clone());
+                status.message = None;
+                status.degraded = None;
+            }
             Self::MarkStopped { stopped_at, inner_command_status, inner_exit_code, message } => {
                 status.phase = TerminalSessionPhase::Stopped;
                 status.stopped_at.get_or_insert(*stopped_at);
                 status.inner_command_status = *inner_command_status;
                 status.inner_exit_code = *inner_exit_code;
                 status.message = message.clone();
+                status.degraded = None;
                 if let Some(attention) = &mut status.attention {
                     attention.state = TerminalAttentionState::Unobservable;
                     attention.as_of = *stopped_at;
@@ -348,6 +356,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     status.stopped_at.get_or_insert(*stopped_at);
                 }
                 status.message = Some(message.clone());
+                status.degraded = None;
                 if let Some(attention) = &mut status.attention {
                     attention.state = TerminalAttentionState::Unobservable;
                     if let Some(stopped_at) = stopped_at {
@@ -356,10 +365,9 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 }
             }
             Self::MarkReconcileDegraded { message, consecutive_failures, observed_at } => {
-                status.phase = TerminalSessionPhase::Failed;
-                status.message = Some(format!("reconcile stopped after {consecutive_failures} consecutive failures: {message}"));
+                status.message = Some(format!("reconcile backing off after {consecutive_failures} consecutive failures: {message}"));
                 status.degraded = Some(TerminalSessionDegradedCondition {
-                    reason: "ReconcileErrorBudgetExhausted".to_string(),
+                    reason: "ReconcileBackoff".to_string(),
                     message: message.clone(),
                     consecutive_failures: *consecutive_failures,
                     observed_at: *observed_at,
@@ -369,11 +377,17 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     attention.as_of = *observed_at;
                 }
             }
+            Self::ClearReconcileDegraded => {
+                status.message = None;
+                status.degraded = None;
+            }
             Self::ObserveAttention { attention } => {
                 let replace = status.attention.as_ref().is_none_or(|previous| previous.should_replace_with(attention));
                 if replace {
                     status.attention = Some(attention.clone());
                 }
+                status.message = None;
+                status.degraded = None;
             }
             Self::MarkCompletionPending { pending } => status.completion_pending = Some(pending.clone()),
             Self::ClearCompletionPending => status.completion_pending = None,
