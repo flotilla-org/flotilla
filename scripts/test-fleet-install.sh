@@ -301,7 +301,8 @@ chmod 0755 "$fake_bin/pgrep"
 cat >"$fake_bin/zsh" <<'SH'
 #!/bin/sh
 set -eu
-[ "$#" -eq 3 ] && [ "$1" = -l ] && [ "$2" = -c ]
+[ "$#" -eq 3 ] || exit 98
+[ "$1" = -l ] && [ "$2" = -c ] || exit 98
 case "$3" in
   'command -v flotilla'|'command -v flotillad'|'command -v cleat') ;;
   *) exit 98 ;;
