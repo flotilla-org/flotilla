@@ -625,10 +625,27 @@ async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, n
             }
             (object_value(&object)?, false)
         }
-        Err(ResourceError::NotFound { .. }) if T::REPLICATION_CLASS != crate::ReplicationClass::None => {
-            let write = retain_authoritative_name_tombstone::<T>(backend, namespace, name).await?;
-            (tombstone_value::<T>(&write.tombstone), !write.created)
-        }
+        Err(ResourceError::NotFound { .. }) => match resolver.delete(name).await {
+            Ok(()) => {
+                if T::REPLICATION_CLASS != crate::ReplicationClass::None {
+                    let write = retain_authoritative_name_tombstone::<T>(backend, namespace, name).await?;
+                    (tombstone_value::<T>(&write.tombstone), false)
+                } else {
+                    let tombstone = crate::ResourceTombstone {
+                        name: name.to_string(),
+                        namespace: namespace.to_string(),
+                        resource_version: String::new(),
+                        annotations: BTreeMap::new(),
+                    };
+                    (tombstone_value::<T>(&tombstone), false)
+                }
+            }
+            Err(ResourceError::NotFound { .. }) if T::REPLICATION_CLASS != crate::ReplicationClass::None => {
+                let write = retain_authoritative_name_tombstone::<T>(backend, namespace, name).await?;
+                (tombstone_value::<T>(&write.tombstone), !write.created)
+            }
+            Err(error) => return Err(error),
+        },
         Err(error) => return Err(error),
     };
     Ok(DynamicResourceDelete {

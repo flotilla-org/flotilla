@@ -31,9 +31,10 @@ use common::{
 use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
-    ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, ConvoyTeardownRuntime, EventRetention, InMemoryBackend, InputMeta, NoStatusPatch,
-    Project, ProjectSpec, Resource, ResourceBackend, ResourceError, SqliteBackend, TerminalSession, TerminalSessionSource,
-    TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate, CONVOY_LABEL, VESSEL_REF_LABEL,
+    delete_resource_kind, ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, ConvoyTeardownRuntime, EventRetention, InMemoryBackend,
+    InputMeta, NoStatusPatch, Project, ProjectSpec, Resource, ResourceBackend, ResourceError, SqliteBackend, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate, CONVOY_LABEL,
+    VESSEL_REF_LABEL,
 };
 use futures::StreamExt;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
@@ -584,6 +585,43 @@ async fn recreating_a_quarantined_object_clears_its_decode_diagnosis() {
     assert!(
         backend.diagnostics().await.expect("read repaired diagnostics").expect("sqlite diagnostics").decode_quarantines.is_empty(),
         "a valid same-identity recreation should resolve the active quarantine diagnosis"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_quarantined_object_clears_its_decode_diagnosis() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("resources.sqlite");
+
+    {
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should open"));
+        backend
+            .using::<Convoy>("flotilla")
+            .create(&convoy_meta("poisoned"), &convoy_spec("template-a"))
+            .await
+            .expect("create object to corrupt");
+    }
+    let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
+    let changed = connection
+        .execute("UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = ?2", rusqlite::params![
+            Convoy::API_PATHS.kind,
+            "poisoned"
+        ])
+        .expect("corrupt stored object");
+    assert_eq!(changed, 1);
+    drop(connection);
+
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should reopen"));
+    assert!(backend.using::<Convoy>("flotilla").list().await.expect("quarantine corrupt object").items.is_empty());
+    assert_eq!(backend.diagnostics().await.expect("read quarantine diagnostics").expect("sqlite diagnostics").decode_quarantines.len(), 1);
+
+    delete_resource_kind(&backend, "flotilla", Convoy::API_PATHS.kind, "poisoned")
+        .await
+        .expect("delete quarantined object through the operator resource API");
+
+    assert!(
+        backend.diagnostics().await.expect("read repaired diagnostics").expect("sqlite diagnostics").decode_quarantines.is_empty(),
+        "deleting a quarantined identity should resolve the active quarantine diagnosis"
     );
 }
 

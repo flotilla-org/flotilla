@@ -1555,7 +1555,13 @@ impl SqliteBackend {
         self.call(move |connection| {
             let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource delete"))?;
             let existing = Self::select_existing::<T>(&tx, &key, &name)?;
-            let mut object = existing.ok_or_else(|| ResourceError::not_found(&name))?;
+            let Some(mut object) = existing else {
+                if Self::clear_decode_quarantine(&tx, &key, &name)? {
+                    tx.commit().map_err(|err| Self::map_sqlite(err, "commit quarantined sqlite resource delete"))?;
+                    return Ok(());
+                }
+                return Err(ResourceError::not_found(&name));
+            };
             if object.metadata.is_pending_finalization() {
                 return Ok(());
             }
@@ -1627,9 +1633,11 @@ impl SqliteBackend {
                 .optional()
                 .map_err(|err| Self::map_sqlite(err, "read sqlite resource tombstone"))?;
             if let Some(body) = existing {
+                Self::clear_decode_quarantine(&tx, &key, &name)?;
                 let value = serde_json::from_str(&body)
                     .map_err(|err| ResourceError::decode(format!("decode stored resource tombstone JSON: {err}")))?;
                 let tombstone = Self::decode_tombstone(value)?;
+                tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource quarantine cleanup"))?;
                 return Ok(crate::watch::TombstoneWrite { tombstone, created: false });
             }
             let version = Self::allocate_version_after(&tx, &key, minimum_resource_version)?;
@@ -1650,6 +1658,7 @@ impl SqliteBackend {
                 params![key.0, key.1, key.2, key.3, name, body_json],
             )
             .map_err(|err| Self::map_sqlite(err, "write sqlite resource tombstone"))?;
+            Self::clear_decode_quarantine(&tx, &key, &name)?;
             Self::insert_event(&tx, &key, version, StoredEventKind::Deleted, &body_json, event_retention, T::REPLICATION_CLASS)?;
             tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource tombstone"))?;
             Self::notify_watchers(&watchers, &key, StoredEvent { kind: StoredEventKind::Deleted, object: encoded });
@@ -1744,16 +1753,17 @@ impl SqliteBackend {
         Ok(())
     }
 
-    fn clear_decode_quarantine(tx: &rusqlite::Transaction<'_>, key: &StoreKey, name: &str) -> Result<(), ResourceError> {
-        tx.execute(
-            r#"
+    fn clear_decode_quarantine(tx: &rusqlite::Transaction<'_>, key: &StoreKey, name: &str) -> Result<bool, ResourceError> {
+        let deleted = tx
+            .execute(
+                r#"
             DELETE FROM resource_decode_quarantine
             WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
             "#,
-            params![key.0, key.1, key.2, key.3, name],
-        )
-        .map_err(|err| Self::map_sqlite(err, "clear sqlite resource decode quarantine"))?;
-        Ok(())
+                params![key.0, key.1, key.2, key.3, name],
+            )
+            .map_err(|err| Self::map_sqlite(err, "clear sqlite resource decode quarantine"))?;
+        Ok(deleted != 0)
     }
 
     fn replay_events<T: Resource>(
