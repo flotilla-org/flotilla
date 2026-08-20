@@ -22,6 +22,7 @@ READ_ONLY=0
 INSTALL_LOCK_PATH=""
 INSTALL_LOCK_OWNER=""
 INSTALL_LOCK_HELD=0
+DARWIN_AGENT_DISABLED=0
 readonly GENERATION_INCOMPLETE_EXIT=20
 
 die() {
@@ -762,6 +763,12 @@ prepare_darwin_daemon_service() {
   [[ "$PLATFORM" == darwin-* ]] || return 0
   command -v launchctl >/dev/null || die "cannot install $LAUNCH_AGENT_LABEL: launchctl is not available"
   local domain="gui/$(id -u)"
+  local disabled_services
+  disabled_services="$(launchctl print-disabled "$domain")" \
+    || die "cannot determine whether $LAUNCH_AGENT_LABEL is disabled"
+  if grep -Fq "\"$LAUNCH_AGENT_LABEL\" => true" <<<"$disabled_services"; then
+    DARWIN_AGENT_DISABLED=1
+  fi
   # Unload before publishing the refreshed plist. Enabled clients then defer
   # to launchd, whose kickstart cannot race the generation flip while the job
   # is absent from the domain.
@@ -771,6 +778,10 @@ prepare_darwin_daemon_service() {
 
 restart_darwin_daemon_service() {
   [[ "$PLATFORM" == darwin-* ]] || return 0
+  if ((DARWIN_AGENT_DISABLED)); then
+    printf 'fleet-install: preserving flotillad dev mode; launchd agent remains disabled\n'
+    return 0
+  fi
   command -v launchctl >/dev/null || die "cannot restart $LAUNCH_AGENT_LABEL: launchctl is not available"
   local domain="gui/$(id -u)"
   local target="$domain/$LAUNCH_AGENT_LABEL"

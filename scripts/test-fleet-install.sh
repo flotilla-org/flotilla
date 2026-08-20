@@ -323,6 +323,9 @@ if [[ -L "$FLEET_INSTALL_ROOT/current" ]]; then
   current="$(readlink "$FLEET_INSTALL_ROOT/current")"
 fi
 printf '%s|%s\n' "$*" "$current" >>"$LAUNCHCTL_LOG"
+if [[ "$1" == print-disabled ]]; then
+  printf 'disabled services = {\n    "work.flotilla.flotillad" => %s\n}\n' "${LAUNCHD_AGENT_DISABLED:-false}"
+fi
 SH
 chmod 0755 "$fake_bin/launchctl"
 
@@ -370,6 +373,7 @@ run_darwin_installer() {
     FIXTURE_ROOT="$fixture_root" \
     CODESIGN_LOG="$test_root/codesign.log" \
     LAUNCHCTL_LOG="$LAUNCHCTL_LOG" \
+    LAUNCHD_AGENT_DISABLED="${LAUNCHD_AGENT_DISABLED:-false}" \
     FAIL_CODESIGN_FOR="${FAIL_CODESIGN_FOR:-}" \
     FLEET_INSTALL_ROOT="$home/.local/opt/flotilla-fleet" \
     FLEET_INSTALL_TESTING=1 \
@@ -558,6 +562,14 @@ test "$(grep -Ec '^bootstrap gui/[0-9]+ ' "$test_root/launchctl.log")" = 1 \
   || fail 'Darwin exact-generation reinstall did not bootstrap the refreshed agent exactly once'
 test "$(grep -Ec '^kickstart -k gui/[0-9]+/work\.flotilla\.flotillad\|' "$test_root/launchctl.log")" = 1 \
   || fail 'Darwin exact-generation reinstall did not restart the agent exactly once'
+
+: >"$test_root/launchctl.log"
+LAUNCHD_AGENT_DISABLED=true run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-dev-mode-install.out"
+grep -Fq 'preserving flotillad dev mode' "$test_root/darwin-dev-mode-install.out" \
+  || fail 'Darwin install did not report preserved dev mode'
+if grep -Eq '^(enable|bootstrap|kickstart) ' "$test_root/launchctl.log"; then
+  fail 'Darwin install restarted the fleet agent while dev mode was active'
+fi
 
 darwin_previous_target="releases/$generation_one"
 : >"$test_root/launchctl.log"

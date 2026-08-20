@@ -152,11 +152,13 @@ flotilla daemon dev-mode disable  # re-enable/kickstart the fleet agent
 
 While the agent is enabled, clients defer daemon startup to launchd instead of
 executing `flotillad` themselves. The disabled launchd state is the durable
-dev-mode marker. After changing the installer or client ownership logic, smoke
-this on Kiwi: kill the fleet daemon, verify exactly one replacement process is
-started by launchd, verify `cleat` appears in provider discovery, then exercise
-both dev-mode transitions and confirm the socket remains free after a daemon
-exit while dev mode is enabled.
+dev-mode marker, and fleet installs preserve it rather than interrupting an
+active development stack. After changing the installer or client ownership
+logic, smoke this on Kiwi: capture `launchctl print-disabled gui/$UID` in both
+modes, kill the fleet daemon, verify exactly one replacement process is started
+by launchd, verify `cleat` appears in provider discovery, then exercise both
+dev-mode transitions and confirm the socket remains free after a daemon exit
+while dev mode is enabled.
 
 The consumer verifies the outer size and digest, safely extracts the archive,
 and verifies every inner file against its manifest before atomically selecting
