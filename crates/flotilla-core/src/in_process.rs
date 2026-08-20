@@ -9407,20 +9407,19 @@ impl InProcessDaemon {
 
             let plan = match repository_action_policy_error {
                 Some(message) => Err(CommandValue::Error { message }),
-                None => {
-                    executor::build_plan(
-                        command,
-                        executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path },
-                        registry,
-                        providers_data,
-                        config_base,
-                        attachable_store,
-                        daemon_socket_dhp.clone(),
-                        local_node_id.clone(),
-                        local_host,
-                    )
-                    .await
-                }
+                None => executor::build_plan(
+                    command,
+                    executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path },
+                    registry,
+                    providers_data,
+                    config_base,
+                    attachable_store,
+                    daemon_socket_dhp.clone(),
+                    local_node_id.clone(),
+                    local_host,
+                )
+                .await
+                .map_err(executor::PlannerRefusal::into_command_value),
             };
 
             match plan {
