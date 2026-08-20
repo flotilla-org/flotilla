@@ -301,7 +301,11 @@ chmod 0755 "$fake_bin/pgrep"
 cat >"$fake_bin/zsh" <<'SH'
 #!/bin/sh
 set -eu
-[ "$#" -eq 3 ] && [ "$1" = -l ] && [ "$2" = -c ] && [ "$3" = 'command -v flotilla' ]
+[ "$#" -eq 3 ] && [ "$1" = -l ] && [ "$2" = -c ]
+case "$3" in
+  'command -v flotilla'|'command -v flotillad'|'command -v cleat') ;;
+  *) exit 98 ;;
+esac
 case ":${PATH:-}:" in
   *":$HOME/.local/bin:"*) exit 97 ;;
 esac
@@ -608,10 +612,8 @@ shadow_home="$test_root/shadow-home"
 shadow_bin="$test_root/shadow-bin"
 mkdir -p "$shadow_home/.config/flotilla" "$shadow_bin"
 cp "$test_root/home/.config/flotilla/fleet-reader-token" "$shadow_home/.config/flotilla/fleet-reader-token"
-for name in flotilla flotillad cleat; do
-  printf '#!/bin/sh\nexit 0\n' >"$shadow_bin/$name"
-  chmod 0755 "$shadow_bin/$name"
-done
+printf '#!/bin/sh\nexit 0\n' >"$shadow_bin/cleat"
+chmod 0755 "$shadow_bin/cleat"
 if HOME="$shadow_home" PATH="$shadow_bin:$shadow_home/.local/bin:$fake_bin:$PATH" FIXTURE_ROOT="$fixture_root" \
   SHELL="$fake_bin/zsh" LOGIN_SHELL_PATH="$shadow_bin:$shadow_home/.local/bin:$fake_bin:/usr/bin:/bin" \
   FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
@@ -619,7 +621,7 @@ if HOME="$shadow_home" PATH="$shadow_bin:$shadow_home/.local/bin:$fake_bin:$PATH
   "$installer" "$generation_one" >"$test_root/shadow.out" 2>&1; then
   fail 'PATH shadow was accepted'
 fi
-grep -Fq 'PATH shadows the fleet launcher' "$test_root/shadow.out" || fail 'PATH shadow error was unclear'
+grep -Fq 'PATH shadows the fleet launcher for cleat' "$test_root/shadow.out" || fail 'cleat PATH shadow error was unclear'
 test ! -L "$shadow_home/.local/opt/flotilla-fleet/current" || fail 'PATH shadow switched current'
 
 echo 'fleet-install contract passed'
