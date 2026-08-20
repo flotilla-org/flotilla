@@ -2090,6 +2090,7 @@ fn workspace_config_builds_correct_struct() {
 // Helper to run build_plan with Arc-wrapped arguments
 // -----------------------------------------------------------------------
 
+#[allow(clippy::result_large_err)]
 async fn run_build_plan(
     action: CommandAction,
     registry: ProviderRegistry,
