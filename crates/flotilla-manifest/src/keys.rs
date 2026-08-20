@@ -69,6 +69,10 @@ pub const KEY_ENTITY_KIND: &str = "entity.kind";
 pub const KEY_ENTITY_ID: &str = "entity.id";
 /// Concise human label used by grouping levels and fallback rendering.
 pub const KEY_DISPLAY_LABEL: &str = "display.label";
+/// Optional medium-width, display-only companion to [`KEY_DISPLAY_LABEL`].
+pub const KEY_DISPLAY_LABEL_MEDIUM: &str = "display.label.medium";
+/// Optional shortest, acronym-like display companion to [`KEY_DISPLAY_LABEL`].
+pub const KEY_DISPLAY_LABEL_SHORT: &str = "display.label.short";
 /// Producer provenance suitable for a surface badge.
 pub const KEY_SOURCE: &str = "source";
 /// Badge state: `idle | waiting | active | done | failed`.
