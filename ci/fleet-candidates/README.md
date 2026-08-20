@@ -135,6 +135,29 @@ The unit runs the stable
 `~/.local/bin` and `~/.cargo/bin` in `PATH`, including `cleat` installed by the
 fleet installer.
 
+On Darwin, every install and rollback refreshes
+`~/Library/LaunchAgents/work.flotilla.flotillad.plist`, selects the generation,
+then bootstraps and kickstarts that agent. The plist runs the same stable
+`current/bin/flotillad` path and declares a `PATH` containing `~/.local/bin`, so
+the daemon discovers the fleet-installed `cleat`. The installed binaries remain
+the centrally signed Comte artifacts; installation does not re-sign them.
+
+Kiwi's protocol-development workflow has an explicit supervision toggle:
+
+```sh
+flotilla daemon dev-mode enable   # disable/unload the fleet agent
+# run the target/debug stack; client-side daemon spawning is active
+flotilla daemon dev-mode disable  # re-enable/kickstart the fleet agent
+```
+
+While the agent is enabled, clients defer daemon startup to launchd instead of
+executing `flotillad` themselves. The disabled launchd state is the durable
+dev-mode marker. After changing the installer or client ownership logic, smoke
+this on Kiwi: kill the fleet daemon, verify exactly one replacement process is
+started by launchd, verify `cleat` appears in provider discovery, then exercise
+both dev-mode transitions and confirm the socket remains free after a daemon
+exit while dev mode is enabled.
+
 The consumer verifies the outer size and digest, safely extracts the archive,
 and verifies every inner file against its manifest before atomically selecting
 the read-only generation. Linux requires the exact unsigned candidate selected

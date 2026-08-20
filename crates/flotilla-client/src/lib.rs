@@ -18,6 +18,7 @@ use flotilla_transport::message::{connect_unix_message_session, MessageSession};
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{debug, error, warn};
 
+pub mod launchd;
 pub mod reconnect;
 pub mod resource;
 pub const BUILD_ID: &str = env!("FLOTILLA_BUILD_ID");
@@ -496,6 +497,11 @@ async fn connect_or_spawn_with_optional_surface_using(
         return Ok(daemon);
     }
 
+    if launchd::agent_manages_daemon(socket_path, config_dir, state_dir)? {
+        launchd::kickstart_agent()?;
+        return wait_for_daemon(socket_path, surface.as_ref(), "launchd agent").await;
+    }
+
     // Config identity constrains daemon creation, not client connectivity. A
     // client may deliberately inspect or drive an existing daemon through a
     // socket owned by another root, but it must never create that daemon with
@@ -603,26 +609,28 @@ async fn connect_or_spawn_with_optional_surface_using(
         spawner(socket_path, config_dir, state_dir)?;
     }
 
-    // Poll for connection with a 10s deadline (soft: the deadline is checked
-    // between probes, and a probe can block up to HELLO_HANDSHAKE_TIMEOUT, so
-    // the true worst-case is deadline + handshake timeout). Handshake errors here are
-    // retried rather than propagated: the daemon on this socket was spawned by
-    // us moments ago, so an error is far more likely a startup race (accepted
-    // before the serve loop is up) than a genuine incompatibility. The last
-    // error is surfaced if the deadline expires without a successful handshake.
+    wait_for_daemon(socket_path, surface.as_ref(), "spawned daemon").await
+}
+
+/// Poll for a daemon started through the selected owner with a 10s deadline
+/// (soft: the deadline is checked between probes, and a probe can block up to
+/// HELLO_HANDSHAKE_TIMEOUT). Handshake errors are retried because the daemon is
+/// expected to be in its startup window. The last error is surfaced if the
+/// deadline expires without a successful handshake.
+async fn wait_for_daemon(socket_path: &Path, surface: Option<&SurfaceDeclaration>, owner: &str) -> Result<Arc<SocketDaemon>, String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut last_handshake_error: Option<String> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        match connect_existing_stateful(socket_path, surface.as_ref()).await {
+        match connect_existing_stateful(socket_path, surface).await {
             Ok(Some(daemon)) => return Ok(daemon),
             Ok(None) => {}
             Err(e) => last_handshake_error = Some(e),
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(match last_handshake_error {
-                Some(e) => format!("daemon spawned but handshake kept failing until the 10s deadline; last error: {e}"),
-                None => "timed out waiting for daemon to start (10s)".into(),
+                Some(e) => format!("{owner} started the daemon, but its handshake kept failing until the 10s deadline; last error: {e}"),
+                None => format!("timed out waiting for {owner} to start the daemon (10s)"),
             });
         }
     }
