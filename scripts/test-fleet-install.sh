@@ -298,6 +298,19 @@ cat >"$fake_bin/pgrep" <<'SH'
 SH
 chmod 0755 "$fake_bin/pgrep"
 
+cat >"$fake_bin/zsh" <<'SH'
+#!/bin/sh
+set -eu
+[ "$#" -eq 3 ] && [ "$1" = -l ] && [ "$2" = -c ] && [ "$3" = 'command -v flotilla' ]
+case ":${PATH:-}:" in
+  *":$HOME/.local/bin:"*) exit 97 ;;
+esac
+PATH="$LOGIN_SHELL_PATH"
+export PATH
+exec /bin/sh -c "$3"
+SH
+chmod 0755 "$fake_bin/zsh"
+
 cat >"$fake_bin/codesign" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -320,6 +333,8 @@ chmod 0755 "$fake_bin/codesign"
 run_installer() {
   HOME="$test_root/home" \
     PATH="$test_root/home/.local/bin:$fake_bin:$PATH" \
+    SHELL="$fake_bin/zsh" \
+    LOGIN_SHELL_PATH="$test_root/home/.local/bin:$fake_bin:/usr/bin:/bin" \
     FIXTURE_ROOT="$fixture_root" \
     FLEET_INSTALL_UNAME_S=Linux \
     FLEET_INSTALL_UNAME_M=x86_64 \
@@ -333,6 +348,8 @@ run_darwin_installer() {
   shift
   HOME="$home" \
     PATH="$home/.local/bin:$fake_bin:$PATH" \
+    SHELL="$fake_bin/zsh" \
+    LOGIN_SHELL_PATH="$home/.local/bin:$fake_bin:/usr/bin:/bin" \
     FIXTURE_ROOT="$fixture_root" \
     CODESIGN_LOG="$test_root/codesign.log" \
     FAIL_CODESIGN_FOR="${FAIL_CODESIGN_FOR:-}" \
@@ -353,6 +370,20 @@ HOME="$status_home" PATH="$status_home/.local/bin:$fake_bin:$PATH" FIXTURE_ROOT=
   FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
   "$installer" status >"$test_root/fresh-status.out"
 test ! -e "$status_home/.local/opt/flotilla-fleet" || fail 'status mutated the install root'
+
+login_path_home="$test_root/login-path-home"
+mkdir -p "$login_path_home/.config/flotilla"
+cp "$test_root/home/.config/flotilla/fleet-reader-token" "$login_path_home/.config/flotilla/fleet-reader-token"
+if HOME="$login_path_home" PATH="$login_path_home/.local/bin:$fake_bin:$PATH" SHELL="$fake_bin/zsh" \
+  LOGIN_SHELL_PATH="$fake_bin:/usr/bin:/bin" FIXTURE_ROOT="$fixture_root" \
+  FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
+  FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
+  "$installer" "$generation_one" >"$test_root/login-path.out" 2>&1; then
+  fail 'inline PATH masked a missing login-shell PATH entry'
+fi
+grep -Fq 'not reachable through the login shell' "$test_root/login-path.out" \
+  || fail 'login-shell PATH failure was unclear'
+grep -Fq '~/.zshenv' "$test_root/login-path.out" || fail 'zsh PATH failure omitted ~/.zshenv'
 
 run_installer "$generation_one" >"$test_root/install-one.out"
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'exact generation was not selected'
@@ -509,6 +540,7 @@ for name in flotilla flotillad cleat; do
   chmod 0755 "$shadow_bin/$name"
 done
 if HOME="$shadow_home" PATH="$shadow_bin:$shadow_home/.local/bin:$fake_bin:$PATH" FIXTURE_ROOT="$fixture_root" \
+  SHELL="$fake_bin/zsh" LOGIN_SHELL_PATH="$shadow_bin:$shadow_home/.local/bin:$fake_bin:/usr/bin:/bin" \
   FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
   FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
   "$installer" "$generation_one" >"$test_root/shadow.out" 2>&1; then

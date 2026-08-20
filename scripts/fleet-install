@@ -594,27 +594,40 @@ write_launcher() {
 }
 
 ensure_launchers_and_path() {
-  local name resolved expected
+  local name
   for name in flotilla flotillad cleat; do
     write_launcher "$name"
-    expected="$(python3 - "$FLEET_BIN_DIR/$name" <<'PY'
-import os
-import sys
-
-print(os.path.realpath(sys.argv[1]))
-PY
-)"
-    resolved="$(command -v "$name" || true)"
-    [[ -n "$resolved" ]] || die "$name is not reachable through PATH; add $FLEET_BIN_DIR before installing"
-    resolved="$(python3 - "$resolved" <<'PY'
-import os
-import sys
-
-print(os.path.realpath(sys.argv[1]))
-PY
-)"
-    [[ "$resolved" == "$expected" ]] || die "PATH shadows the fleet launcher for $name: $resolved; put $FLEET_BIN_DIR first"
   done
+
+  local login_shell="${SHELL:-/bin/sh}"
+  local init_file
+  case "${login_shell##*/}" in
+    zsh) init_file='~/.zshenv' ;;
+    *) init_file='~/.profile' ;;
+  esac
+
+  local resolved
+  resolved="$( (unset PATH; "$login_shell" -l -c 'command -v flotilla') 2>/dev/null || true)"
+  [[ -n "$resolved" ]] \
+    || die "flotilla is not reachable through the login shell; add $FLEET_BIN_DIR to PATH in $init_file before installing"
+
+  local expected
+  expected="$(python3 - "$FLEET_BIN_DIR/flotilla" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+)"
+  resolved="$(python3 - "$resolved" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+)"
+  [[ "$resolved" == "$expected" ]] \
+    || die "the login shell PATH shadows the fleet launcher for flotilla: $resolved; put $FLEET_BIN_DIR first in $init_file"
 }
 
 daemon_preflight() {
