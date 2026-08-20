@@ -56,7 +56,7 @@ make_generation() {
   local bundle="$test_root/bundle-$generation/fleet-candidate-linux-x86_64-gnu2.36"
   mkdir -p "$directory" "$bundle/bin" "$bundle/lib"
   for name in flotilla flotillad cleat; do
-    printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\nprintf "%s from %s\\n"\n' "$name" "$generation" >"$bundle/bin/$name"
+    printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == host && "${3:-}" == list ]]; then\n  [[ -n "${FLEET_HOST_LIST_JSON:-}" ]] || exit 1\n  printf "%%s\\n" "$FLEET_HOST_LIST_JSON"\n  exit 0\nfi\nprintf "%s from %s\\n"\n' "$name" "$name" "$generation" >"$bundle/bin/$name"
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty\n' >"$bundle/lib/libghostty-vt.so.0"
@@ -311,6 +311,20 @@ exec /bin/sh -c "$3"
 SH
 chmod 0755 "$fake_bin/zsh"
 
+cat >"$fake_bin/systemctl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+SH
+chmod 0755 "$fake_bin/systemctl"
+
+cat >"$fake_bin/loginctl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$LOGINCTL_LOG"
+SH
+chmod 0755 "$fake_bin/loginctl"
+
 cat >"$fake_bin/codesign" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -331,11 +345,16 @@ SH
 chmod 0755 "$fake_bin/codesign"
 
 run_installer() {
+  : "${SYSTEMCTL_LOG:=$test_root/systemctl.log}"
+  : "${LOGINCTL_LOG:=$test_root/loginctl.log}"
   HOME="$test_root/home" \
+    XDG_CONFIG_HOME="$test_root/home/.config" \
     PATH="$test_root/home/.local/bin:$fake_bin:$PATH" \
     SHELL="$fake_bin/zsh" \
     LOGIN_SHELL_PATH="$test_root/home/.local/bin:$fake_bin:/usr/bin:/bin" \
     FIXTURE_ROOT="$fixture_root" \
+    SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+    LOGINCTL_LOG="$LOGINCTL_LOG" \
     FLEET_INSTALL_UNAME_S=Linux \
     FLEET_INSTALL_UNAME_M=x86_64 \
     FLEET_INSTALL_API_URL="https://test.invalid/api/v1" \
@@ -370,6 +389,8 @@ HOME="$status_home" PATH="$status_home/.local/bin:$fake_bin:$PATH" FIXTURE_ROOT=
   FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
   "$installer" status >"$test_root/fresh-status.out"
 test ! -e "$status_home/.local/opt/flotilla-fleet" || fail 'status mutated the install root'
+grep -Fq 'fleet:   unavailable (daemon not running)' "$test_root/fresh-status.out" \
+  || fail 'status did not degrade gracefully without a daemon'
 
 login_path_home="$test_root/login-path-home"
 mkdir -p "$login_path_home/.config/flotilla"
@@ -393,13 +414,43 @@ test "$(file_mode "$test_root/home/.local/bin")" = 755 || fail 'credential umask
 for name in flotilla flotillad cleat; do
   grep -Fq '# managed by fleet-install' "$test_root/home/.local/bin/$name" || fail "missing stable $name launcher"
 done
+unit="$test_root/home/.config/systemd/user/flotillad.service"
+test -f "$unit" || fail 'systemd user unit was not installed'
+grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad"' "$unit" \
+  || fail 'systemd user unit does not use the stable flotillad path'
+grep -Fxq 'Environment="PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"' "$unit" \
+  || fail 'systemd user unit does not expose the fleet binary PATH'
+grep -Fxq 'Restart=on-failure' "$unit" || fail 'systemd user unit does not restart after failures'
+grep -Fxq -- '--user daemon-reload' "$test_root/systemctl.log" || fail 'systemd user manager was not reloaded'
+grep -Fxq -- '--user enable flotillad.service' "$test_root/systemctl.log" || fail 'systemd user unit was not enabled'
+grep -Fxq -- '--user restart flotillad.service' "$test_root/systemctl.log" || fail 'systemd user unit was not started'
+grep -Eq '^enable-linger .+$' "$test_root/loginctl.log" || fail 'systemd lingering was not enabled'
 
 status="$(run_installer status 2>"$test_root/status.err")"
 grep -Fq "current: $generation_one (peer protocol 20)" <<<"$status" || fail 'status omitted current manifest protocol'
 grep -Fq "latest:  $generation_two (peer protocol 21)" <<<"$status" || fail 'status selected the wrong promoted generation'
+grep -Fq 'fleet:   unavailable (daemon not running)' <<<"$status" || fail 'status did not report unavailable fleet spread'
 grep -Fq 'warning: peer protocol changes from 20 to 21' <<<"$status" || fail 'status omitted wire-bump warning'
 grep -Fq "skipping incomplete linux-x86_64-gnu2.36 generation $generation_incomplete" "$test_root/status.err" \
   || fail 'latest did not explain why it skipped an incomplete generation'
+
+fleet_health='{"kind":"fleet_health","hosts":[{"host":"feta","is_local":true,"daemon_generation":"111111111111"},{"host":"kiwi","is_local":false,"daemon_generation":"222222222222"},{"host":"mango","is_local":false,"daemon_generation":"111111111111"},{"host":"pear","is_local":false}],"dispatch_queue":{"entries":[]}}'
+fleet_status="$(DAEMON_RUNNING=1 FLEET_HOST_LIST_JSON="$fleet_health" run_installer status 2>"$test_root/fleet-status.err")"
+grep -Fq 'fleet wire generations:' <<<"$fleet_status" || fail 'status omitted reachable fleet spread'
+grep -Fq '  111111111111: feta (local), mango' <<<"$fleet_status" || fail 'status did not group hosts on the current wire generation'
+grep -Fq '  222222222222: kiwi' <<<"$fleet_status" || fail 'status omitted a pending wire generation'
+grep -Fq '  unknown: pear' <<<"$fleet_status" || fail 'status omitted a host with unknown generation'
+unreachable_status="$(DAEMON_RUNNING=1 run_installer status 2>"$test_root/unreachable-status.err")"
+grep -Fq 'fleet:   unavailable (daemon query failed)' <<<"$unreachable_status" \
+  || fail 'status did not degrade gracefully when the daemon query failed'
+
+for bad_payload in 'not json at all' '{"kind":"host_list","hosts":[]}' '{"kind":"fleet_health","hosts":"nope"}' '{"kind":"fleet_health","hosts":[{"is_local":true}]}'; do
+  invalid_status="$(DAEMON_RUNNING=1 FLEET_HOST_LIST_JSON="$bad_payload" run_installer status 2>"$test_root/invalid-status.err")"
+  grep -Fq 'fleet:   unavailable (invalid daemon response)' <<<"$invalid_status" \
+    || fail "status did not degrade gracefully on invalid daemon payload: $bad_payload"
+  grep -Fq "current: $generation_one" <<<"$invalid_status" \
+    || fail 'invalid daemon payload disturbed local status reporting'
+done
 
 if run_installer "$generation_incomplete" >"$test_root/incomplete-exact.out" 2>&1; then
   fail 'an explicitly requested incomplete generation was accepted'
@@ -417,9 +468,17 @@ if grep -Fq "could not verify advertised generation $generation_two" "$test_root
 fi
 
 before_manifest="$(file_sha256 "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json")"
+printf '# managed by fleet-install\nstale unit\n' >"$unit"
+: >"$test_root/systemctl.log"
 run_installer "$generation_one" >/dev/null
 after_manifest="$(file_sha256 "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json")"
 [[ "$before_manifest" == "$after_manifest" ]] || fail 'exact-generation reinstall mutated the release'
+grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad"' "$unit" \
+  || fail 'exact-generation reinstall did not refresh the systemd user unit'
+test "$(grep -Fxc -- '--user daemon-reload' "$test_root/systemctl.log")" = 1 \
+  || fail 'unit refresh did not reload the systemd user manager exactly once'
+test "$(grep -Fxc -- '--user restart flotillad.service' "$test_root/systemctl.log")" = 1 \
+  || fail 'unit refresh did not restart flotillad exactly once'
 
 ln -s "$$-active-test-owner" "$test_root/home/.local/opt/flotilla-fleet/.install.lock"
 if run_installer "$generation_one" >"$test_root/locked.out" 2>&1; then
@@ -453,6 +512,20 @@ test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" =
 run_installer rollback >"$test_root/rollback.out"
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'rollback did not restore previous generation'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" = "$generation_two" || fail 'rollback did not retain displaced generation'
+
+custom_root="$test_root/custom-root"
+custom_bin="$test_root/custom-bin"
+HOME="$test_root/home" XDG_CONFIG_HOME="$test_root/home/.config" PATH="$custom_bin:$fake_bin:$PATH" \
+  SHELL="$fake_bin/zsh" LOGIN_SHELL_PATH="$custom_bin:$fake_bin:/usr/bin:/bin" \
+  FIXTURE_ROOT="$fixture_root" SYSTEMCTL_LOG="$test_root/systemctl.log" LOGINCTL_LOG="$test_root/loginctl.log" \
+  FLEET_INSTALL_ROOT="$custom_root" FLEET_INSTALL_BIN_DIR="$custom_bin" \
+  FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
+  FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
+  "$installer" "$generation_one" >"$test_root/custom-paths.out"
+grep -Fxq "ExecStart=\"$custom_root/current/bin/flotillad\"" "$unit" \
+  || fail 'systemd user unit ignored the configured fleet root'
+grep -Fxq "Environment=\"PATH=$custom_bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"" "$unit" \
+  || fail 'systemd user unit ignored the configured fleet binary directory'
 
 darwin_home="$test_root/darwin-home"
 mkdir -p "$darwin_home/.config/flotilla"

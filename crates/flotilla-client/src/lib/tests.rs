@@ -1,8 +1,13 @@
 use super::*;
 
-async fn hello_result(protocol_version: u32, daemon_build: &str, policy: WireGenerationPolicy) -> Result<Option<String>, String> {
+async fn hello_result(
+    protocol_version: u32,
+    daemon_build: &str,
+    daemon_fingerprint: &str,
+    policy: WireGenerationPolicy,
+) -> Result<Option<String>, String> {
     let (client, server) = flotilla_transport::message::message_session_pair();
-    let display_name = flotilla_protocol::hello_display_name("daemon", daemon_build);
+    let display_name = flotilla_protocol::hello_display_name("daemon", daemon_build, daemon_fingerprint);
     let server_task = tokio::spawn(async move {
         assert!(matches!(server.read().await.expect("read client hello"), Some(Message::Hello { .. })));
         server
@@ -23,23 +28,54 @@ async fn hello_result(protocol_version: u32, daemon_build: &str, policy: WireGen
 }
 
 #[tokio::test]
-async fn shutdown_hello_allows_only_same_protocol_build_mismatch() {
-    let different_build = "different-build";
+async fn normal_hello_gates_all_protocol_version_and_fingerprint_combinations() {
     assert_eq!(
-        hello_result(PROTOCOL_VERSION, different_build, WireGenerationPolicy::AllowMismatchForShutdown)
+        hello_result(PROTOCOL_VERSION, "different-build", PROTOCOL_FINGERPRINT, WireGenerationPolicy::RequireMatch)
             .await
-            .expect("same-protocol shutdown hello"),
-        Some(different_build.to_string())
+            .expect("matching version and fingerprint"),
+        Some("different-build".to_string()),
+        "build identity must not gate compatibility"
     );
 
-    let strict_error = hello_result(PROTOCOL_VERSION, different_build, WireGenerationPolicy::RequireMatch)
+    let fingerprint_error = hello_result(PROTOCOL_VERSION, "daemon-build", "different-fingerprint", WireGenerationPolicy::RequireMatch)
         .await
-        .expect_err("normal session must reject a build mismatch");
-    assert!(strict_error.contains("wire generation mismatch"), "unexpected error: {strict_error}");
+        .expect_err("matching version with mismatched fingerprint must fail");
+    assert!(fingerprint_error.contains("wire generation mismatch"), "unexpected error: {fingerprint_error}");
+    assert!(fingerprint_error.contains(PROTOCOL_FINGERPRINT), "missing client fingerprint: {fingerprint_error}");
+    assert!(fingerprint_error.contains("different-fingerprint"), "missing daemon fingerprint: {fingerprint_error}");
+    assert!(fingerprint_error.contains(BUILD_ID), "missing client build: {fingerprint_error}");
+    assert!(fingerprint_error.contains("daemon-build"), "missing daemon build: {fingerprint_error}");
 
-    let version_error = hello_result(PROTOCOL_VERSION + 1, different_build, WireGenerationPolicy::AllowMismatchForShutdown)
+    let version_error = hello_result(PROTOCOL_VERSION + 1, "daemon-build", PROTOCOL_FINGERPRINT, WireGenerationPolicy::RequireMatch)
         .await
-        .expect_err("shutdown must reject a protocol mismatch");
+        .expect_err("mismatched version with matching fingerprint must fail");
+    assert!(version_error.contains("protocol version mismatch"), "unexpected error: {version_error}");
+
+    let both_error = hello_result(PROTOCOL_VERSION + 1, "daemon-build", "different-fingerprint", WireGenerationPolicy::RequireMatch)
+        .await
+        .expect_err("mismatched version and fingerprint must fail");
+    assert!(both_error.contains("protocol version mismatch"), "unexpected error: {both_error}");
+    assert!(both_error.contains(PROTOCOL_FINGERPRINT), "missing client fingerprint: {both_error}");
+    assert!(both_error.contains("different-fingerprint"), "missing daemon fingerprint: {both_error}");
+    assert!(both_error.contains(BUILD_ID), "missing client build: {both_error}");
+    assert!(both_error.contains("daemon-build"), "missing daemon build: {both_error}");
+    assert!(both_error.contains(&PROTOCOL_VERSION.to_string()), "missing client protocol version: {both_error}");
+    assert!(both_error.contains(&(PROTOCOL_VERSION + 1).to_string()), "missing daemon protocol version: {both_error}");
+}
+
+#[tokio::test]
+async fn shutdown_hello_allows_only_same_protocol_version() {
+    assert_eq!(
+        hello_result(PROTOCOL_VERSION, "different-build", "different-fingerprint", WireGenerationPolicy::AllowMismatchForShutdown)
+            .await
+            .expect("same-version shutdown hello"),
+        Some("different-build".to_string())
+    );
+
+    let version_error =
+        hello_result(PROTOCOL_VERSION + 1, "different-build", "different-fingerprint", WireGenerationPolicy::AllowMismatchForShutdown)
+            .await
+            .expect_err("shutdown must reject a protocol-version mismatch");
     assert!(version_error.contains("protocol version mismatch"), "unexpected error: {version_error}");
 }
 

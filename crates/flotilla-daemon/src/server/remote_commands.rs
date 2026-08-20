@@ -175,23 +175,24 @@ impl RemoteCommandRouter {
         if let Some(target) = existing_convoy_target.as_ref() {
             command.node_id = Some(target.node_id.clone());
         }
-        let remote_host_direct = match &command.action {
+        let remote_placement_host = match &command.action {
             CommandAction::ConvoyStart { intent } => {
                 let namespace = intent.namespace.clone().unwrap_or(self.daemon.provisioning_namespace().await);
-                self.daemon.remote_host_direct_placement_host(&namespace, intent.placement_policy.as_deref()).await?
+                self.daemon.convoy_start_placement_host(&namespace, intent).await?
             }
             CommandAction::ConvoyCreate { placement_policy, .. } => {
                 let namespace = self.daemon.provisioning_namespace().await;
-                self.daemon.remote_host_direct_placement_host(&namespace, placement_policy.as_deref()).await?
+                self.daemon.remote_placement_host(&namespace, placement_policy.as_deref()).await?
             }
             _ => None,
         };
-        if let Some(host_id) = remote_host_direct {
+        if let Some(host_id) = remote_placement_host {
             let peer_manager = self.peer_manager.lock().await;
             let environment_id = EnvironmentId::host(host_id.clone());
             let (node_id, host_name) =
                 peer_manager.node_for_host_environment(&environment_id).map_err(|_| format!("peer host {host_id} is not connected"))?;
             peer_manager.resolve_sender(&node_id).map_err(|_| format!("peer host {host_name} is not connected"))?;
+            command.node_id = Some(node_id);
         }
         let target_node_id = command.node_id.clone().unwrap_or_else(|| self.daemon.node_id().clone());
         let local = self.daemon.node_id();
@@ -201,9 +202,12 @@ impl RemoteCommandRouter {
             if command.action.is_query()
                 || matches!(
                     command.action,
-                    CommandAction::ConvoyDelete { .. }
+                    CommandAction::ConvoyStart { .. }
+                        | CommandAction::ConvoyCreate { .. }
+                        | CommandAction::ConvoyDelete { .. }
                         | CommandAction::ConvoyAbandon { .. }
                         | CommandAction::ConvoyResume { .. }
+                        | CommandAction::ConvoyWithdrawPendingBrief { .. }
                         | CommandAction::ConvoyWorkForceComplete { .. }
                         | CommandAction::CrewComplete { .. }
                         | CommandAction::CrewFail { .. }

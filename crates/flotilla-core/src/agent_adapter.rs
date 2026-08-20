@@ -599,7 +599,7 @@ impl AgentAdapter for CliAgentAdapter {
                 }
                 let invocation_state = if let Some(config_dir) = self.claude_invocation_config_dir(environment) {
                     let config_dir_string = config_dir.display().to_string();
-                    self.runner.run("mkdir", &["-p", &config_dir_string], Path::new("/"), &ChannelLabel::Noop).await?;
+                    self.runner.run("mkdir", &["-p", &config_dir_string], Path::new("/"), &ChannelLabel::Default).await?;
                     Some(ClaudeStateConfig { path: config_dir.join(".claude.json"), lock: Arc::clone(state_lock) })
                 } else {
                     None
@@ -684,7 +684,7 @@ fn codex_screen_needs_input(screen: &str) -> bool {
 async fn seed_codex_workspace_trust(runner: &dyn CommandRunner, cwd: &Path, config: &CodexTrustConfig) -> Result<(), String> {
     let _guard = config.lock.lock().await;
     let output = runner
-        .run_output("pwd", &["-P"], cwd, &ChannelLabel::Noop)
+        .run_output("pwd", &["-P"], cwd, &ChannelLabel::Default)
         .await
         .map_err(|error| format!("resolve canonical Codex workspace {}: {error}", cwd.display()))?;
     if !output.success {
@@ -717,7 +717,7 @@ async fn seed_codex_workspace_trust(runner: &dyn CommandRunner, cwd: &Path, conf
 async fn seed_claude_headless_state(runner: &dyn CommandRunner, cwd: &Path, config: &ClaudeStateConfig) -> Result<(), String> {
     let _guard = config.lock.lock().await;
     let output = runner
-        .run_output("pwd", &["-P"], cwd, &ChannelLabel::Noop)
+        .run_output("pwd", &["-P"], cwd, &ChannelLabel::Default)
         .await
         .map_err(|error| format!("resolve canonical Claude workspace {}: {error}", cwd.display()))?;
     if !output.success {
@@ -749,7 +749,7 @@ async fn seed_claude_headless_state(runner: &dyn CommandRunner, cwd: &Path, conf
 }
 
 async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, cwd: &Path) -> Result<(), String> {
-    let Ok(output) = runner.run_output("git", &["rev-parse", "--git-path", "info/exclude"], cwd, &ChannelLabel::Noop).await else {
+    let Ok(output) = runner.run_output("git", &["rev-parse", "--git-path", "info/exclude"], cwd, &ChannelLabel::Default).await else {
         return Ok(());
     };
     if !output.success {
@@ -764,7 +764,7 @@ async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, cwd: &Path) -> 
         "set -eu; exclude={}; mkdir -p \"$(dirname \"$exclude\")\"; touch \"$exclude\"; grep -qxF '.flotilla/' \"$exclude\" || printf '%s\\n' '.flotilla/' >> \"$exclude\"",
         flotilla_protocol::arg::shell_quote(exclude_path),
     );
-    let _ = runner.run("sh", &["-lc", &script], cwd, &ChannelLabel::Noop).await;
+    let _ = runner.run("sh", &["-lc", &script], cwd, &ChannelLabel::Default).await;
     Ok(())
 }
 
@@ -777,7 +777,7 @@ async fn remove_agent_files(runner: &dyn CommandRunner, cwd: &Path, brief: &Term
 
     for path in &paths {
         let path_str = path.to_str().ok_or_else(|| format!("agent file path is not valid UTF-8: {}", path.display()))?;
-        runner.run("rm", &["-f", path_str], Path::new("/"), &ChannelLabel::Noop).await?;
+        runner.run("rm", &["-f", path_str], Path::new("/"), &ChannelLabel::Default).await?;
     }
 
     let mut directories = paths
@@ -792,7 +792,7 @@ async fn remove_agent_files(runner: &dyn CommandRunner, cwd: &Path, brief: &Term
         let Some(directory) = directory.to_str() else {
             continue;
         };
-        let _ = runner.run("rmdir", &[directory], Path::new("/"), &ChannelLabel::Noop).await;
+        let _ = runner.run("rmdir", &[directory], Path::new("/"), &ChannelLabel::Default).await;
     }
     Ok(())
 }
@@ -1196,6 +1196,8 @@ mod tests {
             },
             spec: ConvoySpec {
                 workflow_ref: "workflow".to_string(),
+                role: "work".to_string(),
+                generation: 1,
                 dispatching_principal_ref: Default::default(),
                 inputs: BTreeMap::new(),
                 placement_policy: None,

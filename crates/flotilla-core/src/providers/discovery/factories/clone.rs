@@ -53,7 +53,7 @@ impl Factory for CloneCheckoutManagerFactory {
                 "git",
                 &["--git-dir", "/ref/repo", "rev-parse", "--git-dir"],
                 std::path::Path::new("/"),
-                &crate::providers::ChannelLabel::Noop,
+                &crate::providers::ChannelLabel::Default,
             )
             .await
             .is_err()

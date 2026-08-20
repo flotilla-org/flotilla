@@ -721,6 +721,10 @@ pub enum ConvoyPhase {
 }
 
 impl ConvoyPhase {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Landed | Self::Failed | Self::Cancelled | Self::Abandoned)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -787,6 +791,9 @@ pub struct ConvoyRow {
     /// Row identity and merge key across hosts.
     pub resource: ResourceRef,
     pub name: String,
+    #[builder(default)]
+    #[serde(default)]
+    pub generation: u64,
     pub workflow_ref: String,
     /// Human principal that dispatched the convoy.
     #[builder(default)]

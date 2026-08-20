@@ -121,6 +121,20 @@ fleet-install <generation>
 fleet-install rollback
 ```
 
+On Linux, every install and rollback refreshes and enables the
+`~/.config/systemd/user/flotillad.service` user unit, enables lingering, and
+starts the selected generation. Restart the daemon through that canonical unit
+so its provider-discovery environment stays consistent:
+
+```sh
+systemctl --user restart flotillad
+```
+
+The unit runs the stable
+`~/.local/opt/flotilla-fleet/current/bin/flotillad` path and explicitly includes
+`~/.local/bin` and `~/.cargo/bin` in `PATH`, including `cleat` installed by the
+fleet installer.
+
 The consumer verifies the outer size and digest, safely extracts the archive,
 and verifies every inner file against its manifest before atomically selecting
 the read-only generation. Linux requires the exact unsigned candidate selected

@@ -1110,12 +1110,16 @@ async fn run_attach(
 ) -> Result<()> {
     reset_sigpipe();
     let daemon = connect_daemon(cli).await?;
+    let context_repo = match resolve_repo_from_env(cli) {
+        Some(repo) => Some(repo),
+        None => startup_repo_roots(&[]).await.into_iter().next().map(RepoSelector::Path),
+    };
     let result = daemon
         .execute_query(
             Command {
                 node_id: None,
                 provisioning_target: None,
-                context_repo: None,
+                context_repo,
                 action: if transient {
                     CommandAction::AttachTransient {
                         reference: reference.to_string(),

@@ -85,7 +85,7 @@ pub struct ConvoyReconciler {
 }
 
 #[derive(Debug, Clone)]
-pub struct ConvoyDependencies {
+pub struct ConvoyPrepared {
     template: Option<ResourceObject<WorkflowTemplate>>,
     vessels: BTreeMap<String, ResourceObject<Vessel>>,
     presentations: BTreeMap<String, ResourceObject<Presentation>>,
@@ -427,9 +427,9 @@ fn evaluate_landing_settlement_with_disposition(
 
 impl Reconciler for ConvoyReconciler {
     type Resource = Convoy;
-    type Dependencies = ConvoyDependencies;
+    type Prepared = ConvoyPrepared;
 
-    async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         let template = if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() {
             None
         } else {
@@ -506,22 +506,22 @@ impl Reconciler for ConvoyReconciler {
         } else {
             false
         };
-        Ok(ConvoyDependencies { template, vessels, presentations, checkouts, exit_disposition, reclaim_eligible })
+        Ok(ConvoyPrepared { template, vessels, presentations, checkouts, exit_disposition, reclaim_eligible })
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        deps: &Self::Dependencies,
+        prepared: &Self::Prepared,
         now: DateTime<Utc>,
     ) -> ControllerReconcileOutcome<Self::Resource> {
         let outcome = reconcile_internal(
             obj,
-            deps.template.as_ref(),
-            &deps.vessels,
-            &deps.presentations,
-            &deps.checkouts,
-            LifecycleConditions { exit_disposition: deps.exit_disposition.clone(), reclaim_eligible: deps.reclaim_eligible },
+            prepared.template.as_ref(),
+            &prepared.vessels,
+            &prepared.presentations,
+            &prepared.checkouts,
+            LifecycleConditions { exit_disposition: prepared.exit_disposition.clone(), reclaim_eligible: prepared.reclaim_eligible },
             now,
         );
         // A refused reclaim must retry on its own schedule: the refusal is
@@ -531,7 +531,7 @@ impl Reconciler for ConvoyReconciler {
         // the freshness the gate is waiting on.
         let reclaim_refused = self.teardown_runtime.is_some()
             && obj.status.as_ref().is_some_and(|status| status.phase.is_terminal())
-            && !deps.reclaim_eligible;
+            && !prepared.reclaim_eligible;
         ControllerReconcileOutcome {
             patch: outcome.patch,
             actuations: outcome.actuations,

@@ -6,8 +6,10 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fmt,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Weak,
@@ -22,7 +24,7 @@ use flotilla_protocol::{
     commands::{AttachMode, RepositoryIdentityChange},
     qualified_path::{HostId, QualifiedPath},
     result_set::{CheckoutRow, ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
-    AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CredentialAttention,
+    AttachBinding, CanonicalHostId, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CredentialAttention,
     CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse,
     DispatchQueueRow, EnvironmentId, EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition,
     ExplainedCrewDelivery, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, FleetHealthResponse,
@@ -49,14 +51,15 @@ use flotilla_resources::{
     CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandKind, DemandSpec, Environment as ResourceEnvironment, EnvironmentPhase,
     HoldAct, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
     InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ReadResourceObject,
     Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
     SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
     WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -442,7 +445,7 @@ impl crate::providers::discovery::EnvVars for StaticEnvVars {
 }
 
 async fn load_env_vars(runner: &dyn CommandRunner, cwd: &Path) -> HashMap<String, String> {
-    let Ok(output) = runner.run("env", &[], cwd, &ChannelLabel::Noop).await else {
+    let Ok(output) = runner.run("env", &[], cwd, &ChannelLabel::Default).await else {
         return HashMap::new();
     };
 
@@ -465,7 +468,7 @@ async fn register_static_ssh_direct_environment(
 ) -> Result<(), String> {
     let fallback_env_id = static_ssh_environment_id(config_key);
     let runner = Arc::new(SshCommandRunner::new(environment.hostname.clone(), true, Arc::clone(&discovery.runner)));
-    tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, runner.run("true", &[], Path::new("/"), &ChannelLabel::Noop))
+    tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, runner.run("true", &[], Path::new("/"), &ChannelLabel::Default))
         .await
         .map_err(|_| format!("ssh preflight timed out for {}", environment.hostname))?
         .map_err(|err| format!("ssh preflight failed for {}: {err}", environment.hostname))?;
@@ -525,7 +528,7 @@ pub struct ResolvedAttach {
     pub binding: Option<AttachBinding>,
 }
 
-fn attach_reference_keys(session_name: &str, labels: &BTreeMap<String, String>) -> Vec<String> {
+fn attach_reference_keys(session_name: &str, labels: &BTreeMap<String, String>, convoy_address: Option<&str>) -> Vec<String> {
     let mut refs = vec![session_name.to_string()];
 
     let convoy = labels.get(CONVOY_LABEL);
@@ -535,6 +538,15 @@ fn attach_reference_keys(session_name: &str, labels: &BTreeMap<String, String>) 
 
     if let Some(convoy) = convoy {
         refs.push(convoy.clone());
+    }
+    if let Some(address) = convoy_address {
+        refs.push(address.to_string());
+        if let Some(task) = task {
+            refs.push(format!("{address}/{task}"));
+        }
+        if let (Some(task), Some(role)) = (task, role) {
+            refs.push(format!("{address}/{task}/{role}"));
+        }
     }
     if let Some(vessel) = vessel {
         refs.push(vessel.clone());
@@ -557,7 +569,10 @@ fn attach_reference_keys(session_name: &str, labels: &BTreeMap<String, String>) 
     refs
 }
 
-fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>) -> String {
+fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>, convoy_address: Option<&str>) -> String {
+    if let Some(address) = convoy_address {
+        return format!("{} ({session_name})", address.replace('@', " @ "));
+    }
     match (labels.get(CONVOY_LABEL), labels.get(VESSEL_LABEL), labels.get(ROLE_LABEL)) {
         (Some(convoy), Some(task), Some(role)) => format!("{convoy}/{task}/{role} ({session_name})"),
         (Some(convoy), Some(task), None) => format!("{convoy}/{task} ({session_name})"),
@@ -568,12 +583,19 @@ fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>)
 }
 
 fn fleet_row_attach_reference_keys(row: &FleetListRow) -> Vec<String> {
-    let mut refs = vec![row.convoy.clone(), row.vessel.clone(), row.crew.clone()];
+    let address = row.convoy.replace(" @ ", "@");
+    let mut refs = vec![address.clone(), row.vessel.clone(), row.crew.clone()];
+    if let Some(convoy_ref) = &row.convoy_ref {
+        refs.push(convoy_ref.clone());
+    }
     if let Some(session) = &row.session {
         refs.push(session.clone());
     }
     if row.crew != "-" {
-        refs.push(format!("{}/{}", row.convoy, row.crew));
+        refs.push(format!("{address}/{}", row.crew));
+        if let Some(convoy_ref) = &row.convoy_ref {
+            refs.push(format!("{convoy_ref}/{}", row.crew));
+        }
         if let Some((_task, role)) = row.crew.rsplit_once('/') {
             refs.push(role.to_string());
         }
@@ -632,7 +654,7 @@ impl AttachTarget {
                     .host(row.host.clone())
                     .namespace(row.namespace.clone())
                     .maybe_session(row.session.clone())
-                    .maybe_convoy(Some(row.convoy.clone()).filter(|convoy| convoy != "-"))
+                    .maybe_convoy(row.convoy_ref.clone().or_else(|| Some(row.convoy.clone()).filter(|convoy| convoy != "-")))
                     .maybe_vessel(vessel)
                     .maybe_role(role)
                     .build();
@@ -757,19 +779,21 @@ fn append_crewless_convoy_rows(
     host: &HostName,
     staleness: FleetStaleness,
 ) {
-    let mut convoys_with_crew: HashSet<String> = rows.iter().map(|row| row.convoy.clone()).collect();
+    let mut convoys_with_crew: HashSet<String> = rows.iter().filter_map(|row| row.convoy_ref.clone()).collect();
     for result_set in result_sets {
         let Rows::Convoys { rows: convoys, .. } = &result_set.rows else { continue };
         for row in convoys {
             if row.resource.namespace != target_namespace {
                 continue;
             }
-            if !convoys_with_crew.insert(row.name.clone()) {
+            if !convoys_with_crew.insert(row.resource.name.clone()) {
                 continue;
             }
+            let display = row.project_ref.as_ref().map_or_else(|| row.name.clone(), |project| format!("{} @ {project}", row.name));
             rows.push(
                 FleetListRow::builder()
-                    .convoy(row.name.clone())
+                    .convoy(display)
+                    .convoy_ref(row.resource.name.clone())
                     .vessel("-")
                     .crew("-")
                     .crew_state(convoy_state_label(row))
@@ -1180,25 +1204,18 @@ fn canonical_placement_host_ref_from_sources(
     hosts: &[ReadResourceObject<ResourceHost>],
     host_ref: &str,
 ) -> Result<Option<PlacementTargetHost>, String> {
-    let exact = authoritative_host_source(hosts.iter().filter(|host| host.object.metadata.name == host_ref));
-    let resolved = if let Some(host) = exact {
-        host
-    } else {
-        let mut matching = hosts.iter().filter(|host| host.object.spec.display_name == host_ref);
-        let Some(host) = matching.next() else {
-            return Ok(None);
-        };
-        if matching.any(|candidate| candidate.object.metadata.name != host.object.metadata.name) {
-            return Err(format!("host reference `{host_ref}` is ambiguous"));
-        }
-        host
+    let canonical = flotilla_resources::canonical_host_id(hosts.iter().map(|host| &host.object), host_ref)?;
+    let Some(canonical) = canonical else {
+        return Ok(None);
     };
+    let resolved = authoritative_host_source(hosts.iter().filter(|host| host.object.metadata.name == canonical.as_str()))
+        .expect("canonical host resolver selected an existing host");
     let display_name = if resolved.object.spec.display_name.is_empty() {
         resolved.object.metadata.name.clone()
     } else {
         resolved.object.spec.display_name.clone()
     };
-    Ok(Some(PlacementTargetHost { reference: resolved.object.metadata.name.clone(), display_name }))
+    Ok(Some(PlacementTargetHost { reference: canonical, display_name }))
 }
 
 /// Select the target daemon's self-report over a locally materialized peer-summary row.
@@ -1232,13 +1249,25 @@ async fn authoritative_placement_host(
         .list()
         .await
         .map_err(|error| format!("placement `{placement_name}` target host is not ready: {error}"))?;
-    authoritative_host_source(sources.items.iter().filter(|source| source.object.metadata.name == target_host.reference))
+    authoritative_host_source(sources.items.iter().filter(|source| source.object.metadata.name == target_host.reference.as_str()))
         .map(|source| source.object.clone())
         .ok_or_else(|| format!("placement `{placement_name}` target host is not ready: resource not found: {}", target_host.reference))
 }
 
 fn host_generation(status: Option<&ResourceHostStatus>) -> &str {
     status.and_then(|status| status.daemon_generation.as_deref()).unwrap_or("unknown")
+}
+
+fn placement_host_not_ready_reason(placement_name: &str, host_label: &str, generation: &str, status: &ResourceHostStatus) -> String {
+    let mut failing_conditions = status
+        .conditions
+        .iter()
+        .filter(|condition| condition.value == ConditionValue::False)
+        .map(|condition| format!("{}: {}", condition.reason, condition.message))
+        .collect::<Vec<_>>();
+    failing_conditions.sort();
+    let detail = if failing_conditions.is_empty() { String::new() } else { format!(": {}", failing_conditions.join("; ")) };
+    format!("placement `{placement_name}` host `{host_label}` generation `{generation}` is not ready{detail}")
 }
 
 fn check_placement_capacity(target_host: &PlacementTargetHost, capacity: Option<(u64, Option<u64>)>) -> Result<(), String> {
@@ -1257,7 +1286,7 @@ async fn default_convoy_placement_policy(
     backend: &ResourceBackend,
     namespace: &str,
     workflow: &WorkflowTemplateSpec,
-    local_host_ref: Option<&str>,
+    local_host_ref: Option<&CanonicalHostId>,
 ) -> Result<PlacementResolution, String> {
     let contained = workflow.vessels.iter().any(|vessel| vessel.stance == flotilla_resources::Stance::Contained);
     let mut policies = match backend.clone().using::<PlacementPolicy>(namespace).list().await {
@@ -1280,9 +1309,10 @@ async fn default_convoy_placement_policy(
             validate_workflow_credentials(backend, namespace, workflow, Some(&policy)).await.err()
         };
         if let Some(reason) = refusal {
-            let target_host = placement_target_host(backend, namespace, &policy)
-                .await
-                .unwrap_or_else(|_| PlacementTargetHost { reference: String::new(), display_name: "no target host".to_string() });
+            let target_host = placement_target_host(backend, namespace, &policy).await.unwrap_or_else(|_| PlacementTargetHost {
+                reference: CanonicalHostId::resolved(String::new()),
+                display_name: "no target host".to_string(),
+            });
             refused_candidates.push(PlacementRefusal { policy_name: policy.metadata.name.clone(), target_host, reason });
         } else {
             viable.push(policy);
@@ -1298,7 +1328,10 @@ async fn default_convoy_placement_policy(
             }
             Err(reason) => refused_candidates.push(PlacementRefusal {
                 policy_name: policy.metadata.name.clone(),
-                target_host: PlacementTargetHost { reference: String::new(), display_name: "no target host".to_string() },
+                target_host: PlacementTargetHost {
+                    reference: CanonicalHostId::resolved(String::new()),
+                    display_name: "no target host".to_string(),
+                },
                 reason,
             }),
         }
@@ -1329,8 +1362,16 @@ async fn default_convoy_placement_policy(
         } else {
             format!("adapters {}", required_adapters.iter().map(|adapter| format!("`{adapter}`")).collect::<Vec<_>>().join(", "))
         };
-        let candidates = if candidate_names.is_empty() { "(none)".to_string() } else { candidate_names.join(", ") };
-        return Err(format!("no placement policy satisfies {requirement}; candidates: {candidates}"));
+        if refused_candidates.is_empty() {
+            return Err(format!("no placement policy satisfies {requirement}; candidates: (none)"));
+        }
+        refused_candidates.sort_by(|left, right| left.policy_name.cmp(&right.policy_name));
+        let candidates = refused_candidates
+            .iter()
+            .map(|candidate| format!("- `{}`: {}", candidate.policy_name, candidate.reason))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!("no placement policy satisfies {requirement}; candidates:\n{candidates}"));
     }
 
     if candidate_names.is_empty() {
@@ -1344,7 +1385,7 @@ fn placement_ordering_reason(
     selected_target: &PlacementTargetHost,
     candidate: &ResourceObject<PlacementPolicy>,
     candidate_target: &PlacementTargetHost,
-    local_host_ref: Option<&str>,
+    local_host_ref: Option<&CanonicalHostId>,
 ) -> String {
     if candidate.spec.priority != selected.spec.priority {
         return format!(
@@ -1353,8 +1394,8 @@ fn placement_ordering_reason(
         );
     }
 
-    let selected_is_local = local_host_ref.is_some_and(|local| selected_target.reference == local);
-    let candidate_is_local = local_host_ref.is_some_and(|local| candidate_target.reference == local);
+    let selected_is_local = local_host_ref.is_some_and(|local| &selected_target.reference == local);
+    let candidate_is_local = local_host_ref.is_some_and(|local| &candidate_target.reference == local);
     if selected_is_local && !candidate_is_local {
         return format!("fallback ordering preferred local policy `{}`", selected.metadata.name);
     }
@@ -1564,6 +1605,32 @@ fn pending_crew_message(text: &str) -> TerminalCrewMessage {
     TerminalCrewMessage { id: uuid::Uuid::new_v4().to_string(), text: text.to_string() }
 }
 
+fn ensure_crew_work_is_defined(
+    convoy: &flotilla_resources::ResourceObject<ResourceConvoy>,
+    context: &ResolvedCrewContext,
+) -> Result<(), String> {
+    let known_agent = convoy
+        .status
+        .as_ref()
+        .and_then(|status| status.crew_work.get(&context.vessel))
+        .is_some_and(|crew| crew.contains_key(&context.caller_role));
+    if known_agent {
+        Ok(())
+    } else {
+        Err(format!("crew work for role `{}` is not defined on vessel `{}`", context.caller_role, context.vessel))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConvoyResumeOutcome {
+    Delivered,
+    Queued { displaced: Option<String> },
+}
+
+type ConvoyMessageKey = (String, String);
+type ConvoyMessageLock = Arc<Mutex<()>>;
+type WeakConvoyMessageLock = Weak<Mutex<()>>;
+
 fn crew_handoff_address_error(target: &str, vessel: &str) -> String {
     format!(
         "no such crew member in your vessel; crew messaging is intra-vessel and requires a different crew member (target `{target}`, vessel `{vessel}`)"
@@ -1606,6 +1673,128 @@ struct ConvoyAdmission {
     workflow: WorkflowTemplateSpec,
     placement_policy: Option<PlacementPolicySpec>,
     placement_decision: Option<PlacementDecision>,
+}
+
+fn convoy_record_name() -> String {
+    format!("convoy-{}", uuid::Uuid::new_v4().simple())
+}
+
+fn convoy_ensure_name(project: &str, role: &str) -> String {
+    let digest = Sha256::digest(format!("{project}\0{role}").as_bytes());
+    format!("ensure-{digest:x}")
+}
+
+fn convoy_address(role: &str, project: Option<&str>) -> String {
+    project.map_or_else(|| role.to_string(), |project| format!("{role}@{project}"))
+}
+
+fn convoy_disambiguation_address(role: &str, project: Option<&str>) -> String {
+    format!("{role}@{}", project.unwrap_or_default())
+}
+
+/// The stable human-facing address of a convoy role, independent of any one
+/// generation's resource record name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RoleAddress {
+    pub project: String,
+    pub role: String,
+}
+
+impl FromStr for RoleAddress {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let Some((role, project)) = value.split_once('@') else {
+            return Err(format!("invalid role address `{value}`: expected role@project"));
+        };
+        if role.is_empty() || project.is_empty() || project.contains('@') {
+            return Err(format!("invalid role address `{value}`: expected role@project"));
+        }
+        Ok(Self { project: project.to_string(), role: role.to_string() })
+    }
+}
+
+impl fmt::Display for RoleAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}@{}", self.role, self.project)
+    }
+}
+
+/// A resolved, currently-live convoy generation. Callers route by owner and
+/// select sessions by `record_name`; neither operation accepts a raw role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveConvoyRecord {
+    pub address: RoleAddress,
+    pub record_name: String,
+    pub owner_host: HostName,
+}
+
+async fn allocate_convoy_generation(backend: &ResourceBackend, namespace: &str, project: Option<&str>, role: &str) -> Result<u64, String> {
+    let mut selector = BTreeMap::from([(ROLE_LABEL.to_string(), role.to_string())]);
+    selector.insert(PROJECT_LABEL.to_string(), project.unwrap_or_default().to_string());
+    let generations =
+        backend.clone().using::<ResourceConvoy>(namespace).list_matching_labels(&selector).await.map_err(|error| error.to_string())?;
+    let mut maximum = 0;
+    for convoy in generations.items {
+        let generation =
+            convoy.metadata.labels.get(GENERATION_LABEL).and_then(|value| value.parse::<u64>().ok()).unwrap_or(convoy.spec.generation);
+        maximum = maximum.max(generation);
+        let live = convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal());
+        if live {
+            return Err(format!("live convoy {} generation {generation} already exists", convoy_address(role, project)));
+        }
+    }
+    let generation =
+        maximum.checked_add(1).ok_or_else(|| format!("convoy {} exhausted its generation counter", convoy_address(role, project)))?;
+    Ok(generation)
+}
+
+fn parse_role_address(value: &str) -> Result<(&str, Option<&str>), String> {
+    match value.split_once('@') {
+        Some((role, project)) if !role.is_empty() && !project.contains('@') => Ok((role, Some(project))),
+        Some(_) => Err(format!("invalid convoy address `{value}`: expected role@project")),
+        None if value.is_empty() => Err("convoy role cannot be empty".to_string()),
+        None => Ok((value, None)),
+    }
+}
+
+async fn resolve_local_convoy_name(backend: &ResourceBackend, namespace: &str, address: &str) -> Result<String, String> {
+    let (role, project) = parse_role_address(address)?;
+    let mut selector = BTreeMap::from([(ROLE_LABEL.to_string(), role.to_string())]);
+    if let Some(project) = project {
+        selector.insert(PROJECT_LABEL.to_string(), project.to_string());
+    }
+    let mut candidates = backend
+        .clone()
+        .using::<ResourceConvoy>(namespace)
+        .list_matching_labels(&selector)
+        .await
+        .map_err(|error| error.to_string())?
+        .items
+        .into_iter()
+        .filter(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        (&left.spec.project_ref, left.spec.generation, &left.metadata.name).cmp(&(
+            &right.spec.project_ref,
+            right.spec.generation,
+            &right.metadata.name,
+        ))
+    });
+    match candidates.as_slice() {
+        [convoy] => Ok(convoy.metadata.name.clone()),
+        [] => Err(format!("no live convoy matches `{address}`")),
+        candidates => {
+            let addresses = candidates
+                .iter()
+                .map(|convoy| convoy_disambiguation_address(&convoy.spec.role, convoy.spec.project_ref.as_deref()))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!("convoy role `{role}` is ambiguous; use one of: {addresses}"))
+        }
+    }
 }
 
 #[derive(bon::Builder)]
@@ -1676,17 +1865,19 @@ struct ResolvedConvoyChangeRequestAdmission {
 }
 
 fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<String> {
+    let role = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
+    let identity = convoy.spec.project_ref.as_ref().map_or_else(|| role.clone(), |project| format!("{role}@{project}"));
     let status = convoy.status.as_ref()?;
     if let Some((work, state)) = status.work.iter().find(|(_, state)| state.phase == ResourceWorkPhase::Failed) {
         let detail = state.message.as_deref().filter(|message| !message.trim().is_empty()).unwrap_or("work failed without a message");
-        return Some(format!("convoy {} failed while starting work {work}: {detail}", convoy.metadata.name));
+        return Some(format!("convoy {identity} failed while starting work {work}: {detail}"));
     }
     match status.phase {
         flotilla_resources::ConvoyPhase::Failed => Some(match status.message.as_deref().filter(|message| !message.trim().is_empty()) {
-            Some(message) => format!("convoy {} failed while starting: {message}", convoy.metadata.name),
-            None => format!("convoy {} failed while starting", convoy.metadata.name),
+            Some(message) => format!("convoy {identity} failed while starting: {message}"),
+            None => format!("convoy {identity} failed while starting"),
         }),
-        flotilla_resources::ConvoyPhase::Cancelled => Some(format!("convoy {} was cancelled while starting", convoy.metadata.name)),
+        flotilla_resources::ConvoyPhase::Cancelled => Some(format!("convoy {identity} was cancelled while starting")),
         flotilla_resources::ConvoyPhase::Pending
         | flotilla_resources::ConvoyPhase::Active
         | flotilla_resources::ConvoyPhase::Interrupted
@@ -1779,6 +1970,12 @@ pub struct InProcessDaemon {
     active_commands: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     self_weak: Weak<InProcessDaemon>,
     pending_convoy_starts: Mutex<HashSet<ConvoyStartKey>>,
+    /// Serializes pending-brief state with its terminal-session delivery side effect.
+    convoy_message_locks: Mutex<HashMap<ConvoyMessageKey, WeakConvoyMessageLock>>,
+    /// Serializes the identity selector check with Convoy creation. The owner
+    /// host is the admission authority, so this is the local transaction that
+    /// enforces one live generation per `{project, role}`.
+    convoy_admission: Mutex<()>,
     /// Unique identity for this daemon instance, generated at startup.
     /// Used in peer Hello handshake to detect remote daemon restarts.
     session_id: uuid::Uuid,
@@ -1835,12 +2032,6 @@ fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
 #[async_trait]
 pub trait StandingConvoyBackingInspector: Send + Sync {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String>;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StandingTeardownEvidence {
-    None,
-    BackingVerifiedDead,
 }
 
 #[async_trait]
@@ -2010,6 +2201,8 @@ impl InProcessDaemon {
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             self_weak: self_weak.clone(),
             pending_convoy_starts: Mutex::new(HashSet::new()),
+            convoy_message_locks: Mutex::new(HashMap::new()),
+            convoy_admission: Mutex::new(()),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
@@ -2654,7 +2847,7 @@ impl InProcessDaemon {
         reconcile_registered_policy(&self.resource_backend, &namespace, &policy_name, &desired).await
     }
 
-    pub async fn remote_host_direct_placement_host(
+    pub async fn remote_placement_host(
         &self,
         namespace: &str,
         policy_name: Option<&str>,
@@ -2669,14 +2862,42 @@ impl InProcessDaemon {
             .get(policy_name)
             .await
             .map_err(|error| format!("placement policy {policy_name}: {error}"))?;
-        if policy.spec.host_direct.is_none() {
-            return Ok(None);
-        }
         let target_host = placement_target_host(&self.resource_backend, namespace, &policy).await?;
-        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == target_host.reference) {
+        if self.canonical_local_host_id().as_ref().is_some_and(|host_id| host_id == &target_host.reference) {
             return Ok(None);
         }
-        Ok(Some(flotilla_protocol::qualified_path::HostId::new(target_host.reference)))
+        Ok(Some(flotilla_protocol::qualified_path::HostId::new(target_host.reference.as_str())))
+    }
+
+    pub async fn convoy_start_placement_host(
+        &self,
+        namespace: &str,
+        intent: &flotilla_protocol::ConvoyStartIntent,
+    ) -> Result<Option<flotilla_protocol::qualified_path::HostId>, String> {
+        if intent.placement_policy.is_some() {
+            return self.remote_placement_host(namespace, intent.placement_policy.as_deref()).await;
+        }
+
+        let (project_namespace, project_ref) = resolve_project_ref(namespace, &intent.project_ref)?;
+        let project = self
+            .resource_backend
+            .clone()
+            .definitions::<Project>(&project_namespace)
+            .get(&project_ref)
+            .await
+            .map_err(|error| project_not_ready_error(&project_namespace, &project_ref, error))?;
+        let repositories = self.snapshot_project_repositories(&project_namespace, &project_ref).await?;
+        let (_, workflow) =
+            self.resolve_convoy_admission_workflow(&project_namespace, &project_ref, &project.spec, &repositories, intent, None).await?;
+        let placement = self.resolve_and_validate_convoy_placement(&project_namespace, &workflow, None).await?;
+        let Some(policy) = placement.selected else {
+            return Ok(None);
+        };
+        let target_host = placement_target_host(&self.resource_backend, &project_namespace, &policy).await?;
+        if self.canonical_local_host_id().as_ref().is_some_and(|host_id| host_id == &target_host.reference) {
+            return Ok(None);
+        }
+        Ok(Some(flotilla_protocol::qualified_path::HostId::new(target_host.reference.as_str())))
     }
 
     pub async fn resolve_existing_convoy_target(
@@ -2687,6 +2908,7 @@ impl InProcessDaemon {
             flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyResume { namespace, name, .. }
+            | flotilla_protocol::CommandAction::ConvoyWithdrawPendingBrief { namespace, name }
             | flotilla_protocol::CommandAction::QueryExplainConvoy { namespace, name } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), name.as_str())
             }
@@ -2708,9 +2930,15 @@ impl InProcessDaemon {
         let Rows::Convoys { rows, .. } = result_set.rows else {
             return Ok(None);
         };
+        let (role, project) = parse_role_address(name)?;
         let mut hosts = rows
             .into_iter()
-            .filter(|row| row.resource.namespace == namespace && row.resource.name == name)
+            .filter(|row| {
+                row.resource.namespace == namespace
+                    && row.name == role
+                    && project.is_none_or(|project| row.project_ref.as_deref().unwrap_or_default() == project)
+                    && !row.phase.is_terminal()
+            })
             .filter_map(|row| row.resource.host)
             .collect::<Vec<_>>();
         hosts.sort();
@@ -3674,7 +3902,7 @@ async fn validate_workflow_credentials_with_capabilities(
     status.apply_heartbeat_readiness(Utc::now());
     if !required.is_empty() {
         if !status.ready {
-            return Err(format!("placement `{}` host `{host_label}` generation `{generation}` is not ready", placement.metadata.name));
+            return Err(placement_host_not_ready_reason(&placement.metadata.name, &host_label, &generation, &status));
         }
         let held = status.held_credentials().map_err(|error| {
             format!(
@@ -3832,7 +4060,7 @@ async fn placement_agent_adapters(
         })?;
         status.apply_heartbeat_readiness(Utc::now());
         if !status.ready {
-            return Err(format!("placement `{}` host `{host_label}` generation `{generation}` is not ready", placement.metadata.name));
+            return Err(placement_host_not_ready_reason(&placement.metadata.name, &host_label, &generation, &status));
         }
         let available_adapters = status.agent_adapters().map_err(|error| {
             format!(
@@ -4005,6 +4233,38 @@ impl InProcessDaemon {
         self.prepare_convoy_admission_with_preferences(namespace, intent, dispatching_principal_ref, None, None).await
     }
 
+    async fn resolve_convoy_admission_workflow(
+        &self,
+        namespace: &str,
+        project_ref: &str,
+        project: &ProjectSpec,
+        repositories: &[ConvoyRepositorySpec],
+        intent: &flotilla_protocol::ConvoyStartIntent,
+        stance: Option<flotilla_resources::Stance>,
+    ) -> Result<(String, WorkflowTemplateSpec), String> {
+        let workflow_ref = match intent.workflow_ref.as_deref() {
+            Some(workflow_ref) => required_admission_value(workflow_ref, "workflow")?.to_string(),
+            None if intent.change_request.is_some() => "single-agent-shepherd".to_string(),
+            None => project.default_workflow_ref.clone(),
+        };
+        let mut workflow = self
+            .resource_backend
+            .clone()
+            .using::<WorkflowTemplate>(namespace)
+            .get(&workflow_ref)
+            .await
+            .map_err(|error| format!("workflow template {workflow_ref}: {error}"))?;
+        if let Some(stance) = stance {
+            for vessel in &mut workflow.spec.vessels {
+                vessel.stance = stance;
+            }
+        }
+        apply_agent_overrides(&mut workflow.spec, &intent.agent_overrides)?;
+        validate_fork_workflow_admission(&self.resource_backend, namespace, repositories, &workflow_ref, &workflow.spec).await?;
+        resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), repositories, &mut workflow.spec).await?;
+        Ok((workflow_ref, workflow.spec))
+    }
+
     async fn prepare_convoy_admission_with_preferences(
         &self,
         namespace: &str,
@@ -4064,27 +4324,8 @@ impl InProcessDaemon {
                 issues.push(self.resolve_convoy_issue(namespace, &project, selector).await?);
             }
         }
-        let workflow_ref = match intent.workflow_ref.as_deref() {
-            Some(workflow_ref) => required_admission_value(workflow_ref, "workflow")?.to_string(),
-            None if change_request.is_some() => "single-agent-shepherd".to_string(),
-            None => project.spec.default_workflow_ref.clone(),
-        };
-        let mut workflow = self
-            .resource_backend
-            .clone()
-            .using::<WorkflowTemplate>(namespace)
-            .get(&workflow_ref)
-            .await
-            .map_err(|error| format!("workflow template {workflow_ref}: {error}"))?;
-        if let Some(stance) = stance {
-            for vessel in &mut workflow.spec.vessels {
-                vessel.stance = stance;
-            }
-        }
-        apply_agent_overrides(&mut workflow.spec, &intent.agent_overrides)?;
-        validate_fork_workflow_admission(&self.resource_backend, namespace, &repositories_snapshot, &workflow_ref, &workflow.spec).await?;
-        resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), &repositories_snapshot, &mut workflow.spec)
-            .await?;
+        let (workflow_ref, workflow) =
+            self.resolve_convoy_admission_workflow(namespace, project_ref, &project.spec, &repositories_snapshot, intent, stance).await?;
 
         let fallback_slug = change_request
             .as_ref()
@@ -4109,13 +4350,13 @@ impl InProcessDaemon {
             None
         };
         let generated = generated.unwrap_or_else(|| ConvoyNames { name: fallback_slug.clone(), branch: fallback_slug.clone() });
-        let name = intent
+        let role = intent
             .name
             .as_deref()
             .map(|name| required_admission_value(name, "name").map(str::to_string))
             .transpose()?
             .unwrap_or_else(|| convoy_fallback_slug(&generated.name, "").trim_end_matches('-').to_string());
-        validate_convoy_name(&name)?;
+        validate_convoy_name(&role)?;
         let branch = match (change_request.as_ref(), intent.branch.as_deref()) {
             (Some(change_request), None) => change_request.branch.clone(),
             (Some(_), Some(_)) => unreachable!("change request plus branch was rejected"),
@@ -4123,13 +4364,7 @@ impl InProcessDaemon {
             (None, None) => required_admission_value(&generated.branch, "generated branch")?.to_string(),
         };
         validate_convoy_branch(&branch)?;
-        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        match convoys.get(&name).await {
-            Ok(_) => return Err(format!("convoy {name} already exists")),
-            Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-        let placement = self.resolve_and_validate_convoy_placement(namespace, &workflow.spec, intent.placement_policy.as_deref()).await?;
+        let placement = self.resolve_and_validate_convoy_placement(namespace, &workflow, intent.placement_policy.as_deref()).await?;
         let placement_policy = placement.selected.as_ref().map(|placement| placement.metadata.name.clone());
         let placement_decision = match placement.selected.as_ref() {
             Some(selected) => Some(PlacementDecision {
@@ -4142,6 +4377,8 @@ impl InProcessDaemon {
         };
         let spec = ConvoySpec {
             workflow_ref,
+            role,
+            generation: 0,
             dispatching_principal_ref: dispatching_principal_ref.clone(),
             inputs: intent.inputs.iter().map(|(key, value)| (key.clone(), InputValue::String(value.clone()))).collect(),
             placement_policy,
@@ -4154,9 +4391,9 @@ impl InProcessDaemon {
             instruction: intent.instruction.clone(),
         };
         Ok(ConvoyAdmission::builder()
-            .name(name)
+            .name(String::new())
             .spec(spec)
-            .workflow(workflow.spec)
+            .workflow(workflow)
             .maybe_placement_policy(placement.selected.map(|placement| placement.spec))
             .maybe_placement_decision(placement_decision)
             .build())
@@ -4167,10 +4404,15 @@ impl InProcessDaemon {
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
         dispatching_principal_ref: &PrincipalRef,
-    ) -> Result<String, String> {
+    ) -> Result<(String, String), String> {
         self.check_local_free_space_floor().await?;
-        let admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
+        let mut admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
         self.check_remote_placement_free_space_floor(namespace, admission.placement_decision.as_ref()).await?;
+        let _admission_guard = self.convoy_admission.lock().await;
+        admission.name = convoy_record_name();
+        admission.spec.generation =
+            allocate_convoy_generation(&self.resource_backend, namespace, admission.spec.project_ref.as_deref(), &admission.spec.role)
+                .await?;
         self.create_convoy_with_workflow_snapshot(
             namespace,
             &admission.name,
@@ -4183,7 +4425,8 @@ impl InProcessDaemon {
             intent.auto_attach.into(),
         )
         .await?;
-        Ok(admission.name)
+        let address = convoy_address(&admission.spec.role, admission.spec.project_ref.as_deref());
+        Ok((admission.name, address))
     }
 
     /// Drive one deterministic pass of the standing-convoy ensure loop.
@@ -4226,23 +4469,40 @@ impl InProcessDaemon {
     ) -> Result<Option<String>, String> {
         let now = self.clock.now();
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let convoy = match convoys.get(&ensure.metadata.name).await {
-            Ok(convoy) if convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name) => Some(convoy),
-            Ok(_) => return Err(format!("convoy {} already exists without this ensure's provenance", ensure.metadata.name)),
-            Err(ResourceError::NotFound { .. }) => None,
-            Err(error) => return Err(error.to_string()),
-        };
         let status = ensure.status.clone().unwrap_or_default();
+        let convoy = match status.convoy_ref.as_deref() {
+            Some(convoy_ref) => match convoys.get(convoy_ref).await {
+                Ok(convoy) if convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name) => Some(convoy),
+                Ok(_) => return Err(format!("convoy {convoy_ref} exists without this ensure's provenance")),
+                Err(ResourceError::NotFound { .. }) => None,
+                Err(error) => return Err(error.to_string()),
+            },
+            None => {
+                let selector = BTreeMap::from([
+                    (PROJECT_LABEL.to_string(), ensure.spec.project_ref.clone()),
+                    (ROLE_LABEL.to_string(), ensure.spec.role.clone()),
+                ]);
+                convoys
+                    .list_matching_labels(&selector)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .items
+                    .into_iter()
+                    .filter(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
+                    .max_by_key(|convoy| convoy.spec.generation)
+            }
+        };
         let terminal = convoy
             .as_ref()
             .and_then(|convoy| convoy.status.as_ref())
             .is_some_and(|status| matches!(status.phase, ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned));
 
-        if convoy.is_some() && !terminal {
+        if let Some(convoy) = convoy.as_ref().filter(|_| !terminal) {
             self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
-            if status.convoy_ref.as_deref() != Some(&ensure.metadata.name) || status.retry_at.is_some() || status.last_failure.is_some() {
+            let convoy_ref = convoy.metadata.name.clone();
+            if status.convoy_ref.as_deref() != Some(&convoy_ref) || status.retry_at.is_some() || status.last_failure.is_some() {
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
-                    convoy_ref: ensure.metadata.name.clone(),
+                    convoy_ref,
                     observed_at: now,
                 })
                 .await?;
@@ -4272,7 +4532,7 @@ impl InProcessDaemon {
                 self.raise_ensure_attention(&convoy, &failure).await?;
                 if status.retry_at.is_some() || status.last_failure.as_deref() != Some(&failure) {
                     self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Holding {
-                        convoy_ref: ensure.metadata.name.clone(),
+                        convoy_ref: convoy.metadata.name.clone(),
                         failure,
                     })
                     .await?;
@@ -4298,21 +4558,19 @@ impl InProcessDaemon {
         }
 
         let restart = async {
-            // Standing convoys have no landing table, so verified-dead backing
-            // is their automatic reclaim evidence. This still runs the
-            // teardown gate and never uses the operator force bypass.
-            self.reap_ensured_convoy(namespace, &ensure.metadata.name, false, StandingTeardownEvidence::BackingVerifiedDead).await?;
+            // The terminal generation remains as history. A successful
+            // restart admits the next generation under a fresh record name.
             self.start_ensured_convoy(namespace, ensure).await
         }
         .await;
         match restart {
-            Ok(()) => {
+            Ok(convoy_ref) => {
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
-                    convoy_ref: ensure.metadata.name.clone(),
+                    convoy_ref: convoy_ref.clone(),
                     observed_at: now,
                 })
                 .await?;
-                Ok(Some(format!("started Convoy/{}", ensure.metadata.name)))
+                Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
             }
             Err(error) => {
                 let retry_at = now + ensure_retry_delay(status.restart_count);
@@ -4335,13 +4593,13 @@ impl InProcessDaemon {
     ) -> Result<Option<String>, String> {
         self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
         match self.start_ensured_convoy(namespace, ensure).await {
-            Ok(()) => {
+            Ok(convoy_ref) => {
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
-                    convoy_ref: ensure.metadata.name.clone(),
+                    convoy_ref,
                     observed_at: now,
                 })
                 .await?;
-                Ok(Some(format!("started Convoy/{}", ensure.metadata.name)))
+                Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
             }
             Err(error) => {
                 let retry_at = now + ensure_retry_delay(status.restart_count);
@@ -4423,17 +4681,17 @@ impl InProcessDaemon {
             .map_err(|error| error.to_string())
     }
 
-    async fn start_ensured_convoy(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<(), String> {
+    async fn start_ensured_convoy(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<String, String> {
         let intent = flotilla_protocol::ConvoyStartIntent::builder()
             .namespace(namespace.to_string())
             .project_ref(ensure.spec.project_ref.clone())
-            .name(ensure.metadata.name.clone())
-            .branch(ensure.metadata.name.clone())
+            .name(ensure.spec.role.clone())
+            .branch(ensure.spec.role.clone())
             .workflow_ref(ensure.spec.workflow_ref.clone())
             .maybe_placement_policy(ensure.spec.placement_policy.clone())
             .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
             .build();
-        let admission = self
+        let mut admission = self
             .prepare_convoy_admission_with_preferences(
                 namespace,
                 &intent,
@@ -4469,6 +4727,11 @@ impl InProcessDaemon {
         if let Some(presents_as) = &ensure.spec.presents_as {
             annotations.insert(PRESENTS_AS_ANNOTATION.to_string(), presents_as.clone());
         }
+        let _admission_guard = self.convoy_admission.lock().await;
+        admission.name = convoy_record_name();
+        admission.spec.generation =
+            allocate_convoy_generation(&self.resource_backend, namespace, admission.spec.project_ref.as_deref(), &admission.spec.role)
+                .await?;
         let workflow_value = serde_json::to_value(&admission.workflow).map_err(|error| error.to_string())?;
         let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
         ensure_prepared_workflow_snapshot(&self.resource_backend, namespace, &workflow_name, &admission.workflow).await?;
@@ -4487,42 +4750,25 @@ impl InProcessDaemon {
             ConvoyDispatchRegard::Suppress,
             annotations,
         )
-        .await
+        .await?;
+        Ok(admission.name)
     }
 
-    async fn reap_ensured_convoy(
-        &self,
-        namespace: &str,
-        name: &str,
-        force: bool,
-        standing_evidence: StandingTeardownEvidence,
-    ) -> Result<(), String> {
+    async fn reap_ensured_convoy(&self, namespace: &str, ensure_name: &str, convoy_name: &str, force: bool) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let convoy = match convoys.get(name).await {
+        let convoy = match convoys.get(convoy_name).await {
             Ok(convoy) => convoy,
             Err(ResourceError::NotFound { .. }) => return Ok(()),
             Err(error) => return Err(error.to_string()),
         };
-        if convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).map(String::as_str) != Some(name) {
-            return Err(format!("refusing to reap Convoy/{name}: it is not owned by ConvoyEnsure/{name}"));
+        if convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).map(String::as_str) != Some(ensure_name) {
+            return Err(format!("refusing to reap standing convoy: it is not owned by ConvoyEnsure/{ensure_name}"));
         }
-        self.reap_convoy_internal_with_standing_evidence(namespace, name, force, standing_evidence).await
+        self.reap_convoy_internal(namespace, convoy_name, force).await
     }
 
     async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
-        self.reap_convoy_internal_with_standing_evidence(namespace, name, force, StandingTeardownEvidence::None).await
-    }
-
-    async fn reap_convoy_internal_with_standing_evidence(
-        &self,
-        namespace: &str,
-        name: &str,
-        force: bool,
-        standing_evidence: StandingTeardownEvidence,
-    ) -> Result<(), String> {
-        if standing_evidence == StandingTeardownEvidence::None {
-            self.verify_convoy_teardown_gate(namespace, name, force).await?;
-        }
+        self.verify_convoy_teardown_gate(namespace, name, force).await?;
         self.cascade_convoy_children(namespace, name).await?;
         self.resource_backend.clone().using::<ResourceConvoy>(namespace).delete(name).await.map_err(|error| error.to_string())
     }
@@ -4559,7 +4805,7 @@ impl InProcessDaemon {
         let sources =
             self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
         let matching_sources =
-            sources.items.into_iter().filter(|source| source.object.metadata.name == target_host.reference).collect::<Vec<_>>();
+            sources.items.into_iter().filter(|source| source.object.metadata.name == target_host.reference.as_str()).collect::<Vec<_>>();
         let has_replica = matching_sources.iter().any(|source| matches!(source.provenance, ResourceProvenance::Replica { .. }));
         let is_host_targeted_placement = self
             .resource_backend
@@ -4572,7 +4818,7 @@ impl InProcessDaemon {
             return Ok(());
         }
 
-        let owns_target_identity = self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == target_host.reference);
+        let owns_target_identity = self.canonical_local_host_id().as_ref().is_some_and(|host_id| host_id == &target_host.reference);
         let capacity = if owns_target_identity {
             matching_sources
                 .iter()
@@ -4619,8 +4865,13 @@ impl InProcessDaemon {
         annotations: BTreeMap<String, String>,
     ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let labels = BTreeMap::from([
+            (PROJECT_LABEL.to_string(), spec.project_ref.clone().unwrap_or_default()),
+            (ROLE_LABEL.to_string(), spec.role.clone()),
+            (GENERATION_LABEL.to_string(), spec.generation.to_string()),
+        ]);
         convoys
-            .create(&InputMeta::builder().name(name.to_string()).annotations(annotations).build(), spec)
+            .create(&InputMeta::builder().name(name.to_string()).labels(labels).annotations(annotations).build(), spec)
             .await
             .map_err(|error| error.to_string())?;
         if let Some(placement_decision) = placement_decision {
@@ -4674,14 +4925,9 @@ impl InProcessDaemon {
                 PlacementResolution { selected: Some(resolved), refused_candidates: Vec::new(), viable_not_selected: Vec::new() }
             }
             None => {
-                let local_host_id = self.local_host_id();
-                let placement = default_convoy_placement_policy(
-                    &self.resource_backend,
-                    namespace,
-                    workflow,
-                    local_host_id.as_ref().map(HostId::as_str),
-                )
-                .await?;
+                let local_host_id = self.canonical_local_host_id();
+                let placement =
+                    default_convoy_placement_policy(&self.resource_backend, namespace, workflow, local_host_id.as_ref()).await?;
                 if contained && placement.selected.is_none() {
                     return Err("contained workflow requires an available docker placement policy".to_string());
                 }
@@ -4707,13 +4953,17 @@ impl InProcessDaemon {
         }
         let auto_attach = self.should_auto_attach(intent.auto_attach);
         match self.admit_convoy_start(&namespace, &intent, &dispatching_principal_ref).await {
-            Ok(name) if auto_attach => match self.wait_for_convoy_attach(&namespace, &name).await {
-                Ok(resolved) => {
-                    flotilla_protocol::CommandValue::ConvoyStarted { name, attach_plan: Some(resolved.plan), binding: resolved.binding }
-                }
+            Ok((record_name, address)) if auto_attach => match self.wait_for_convoy_attach(&namespace, &record_name, &address).await {
+                Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
+                    name: address,
+                    attach_plan: Some(resolved.plan),
+                    binding: resolved.binding,
+                },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             },
-            Ok(name) => flotilla_protocol::CommandValue::ConvoyStarted { name, attach_plan: None, binding: None },
+            Ok((_record_name, address)) => {
+                flotilla_protocol::CommandValue::ConvoyStarted { name: address, attach_plan: None, binding: None }
+            }
             Err(message) => flotilla_protocol::CommandValue::Error { message },
         }
     }
@@ -4731,16 +4981,16 @@ impl InProcessDaemon {
         self.finish_context_free_command(command_id, empty_repo_identity(), result);
     }
 
-    async fn wait_for_convoy_attach(&self, namespace: &str, name: &str) -> Result<ResolvedAttach, String> {
+    async fn wait_for_convoy_attach(&self, namespace: &str, name: &str, address: &str) -> Result<ResolvedAttach, String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let listed = convoys.list().await.map_err(|error| format!("watch convoy {name} while waiting to attach: {error}"))?;
+        let listed = convoys.list().await.map_err(|error| format!("watch convoy {address} while waiting to attach: {error}"))?;
         if let Some(message) = listed.items.iter().find(|convoy| convoy.metadata.name == name).and_then(convoy_start_failure) {
             return Err(message);
         }
         let mut watch = convoys
             .watch(WatchStart::resuming_from(&listed))
             .await
-            .map_err(|error| format!("watch convoy {name} while waiting to attach: {error}"))?;
+            .map_err(|error| format!("watch convoy {address} while waiting to attach: {error}"))?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         let mut retry = tokio::time::interval(Duration::from_millis(100));
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -4762,15 +5012,15 @@ impl InProcessDaemon {
                             }
                         }
                         Some(Ok(WatchEvent::Deleted(convoy))) if convoy.metadata.name == name => {
-                            return Err(format!("convoy {name} was deleted while waiting for a crew session"));
+                            return Err(format!("convoy {address} was deleted while waiting for a crew session"));
                         }
                         Some(Ok(_)) => {}
-                        Some(Err(error)) => return Err(format!("watch convoy {name} while waiting to attach: {error}")),
-                        None => return Err(format!("convoy {name} status watch ended while waiting to attach")),
+                        Some(Err(error)) => return Err(format!("watch convoy {address} while waiting to attach: {error}")),
+                        None => return Err(format!("convoy {address} status watch ended while waiting to attach")),
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    return Err(format!("convoy {name} was created but no crew session became attachable: {last_attach_error}"));
+                    return Err(format!("convoy {address} was created but no crew session became attachable: {last_attach_error}"));
                 }
             }
         }
@@ -5196,7 +5446,9 @@ impl InProcessDaemon {
             ensure.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
                 && !ensures.contains_key(&ensure.metadata.name)
         }) {
-            self.reap_ensured_convoy(&namespace, &stale.metadata.name, false, StandingTeardownEvidence::None).await?;
+            if let Some(convoy_ref) = stale.status.as_ref().and_then(|status| status.convoy_ref.as_deref()) {
+                self.reap_ensured_convoy(&namespace, &stale.metadata.name, convoy_ref, false).await?;
+            }
             convoy_ensures.delete(&stale.metadata.name).await.map_err(|error| error.to_string())?;
             changes.push(format!("deleted ConvoyEnsure/{}", stale.metadata.name));
         }
@@ -5339,8 +5591,10 @@ impl InProcessDaemon {
                     }
                 }
                 OperationalEntryDefinition::Ensure(ensure) => {
+                    let role = entry.name;
+                    let ensure_name = convoy_ensure_name(project_name, &role);
                     let mut meta = InputMeta::builder()
-                        .name(entry.name.clone())
+                        .name(ensure_name.clone())
                         .annotations(BTreeMap::from([
                             (MATERIALIZED_PROJECT_ANNOTATION.to_string(), project_name.to_string()),
                             (SOURCE_REPOSITORY_ANNOTATION.to_string(), source_repository.to_string()),
@@ -5353,14 +5607,15 @@ impl InProcessDaemon {
                     }
                     let spec = ConvoyEnsureSpec {
                         project_ref: project_name.to_string(),
+                        role: role.clone(),
                         workflow_ref: ensure.workflow,
                         placement_policy: ensure.placement,
                         stance: ensure.stance,
                         repositories: targets,
                         presents_as: ensure.presents_as,
                     };
-                    if ensures.insert(entry.name.clone(), (meta, spec)).is_some() {
-                        return Err(format!("duplicate materialized ConvoyEnsure `{}`", entry.name));
+                    if ensures.insert(ensure_name, (meta, spec)).is_some() {
+                        return Err(format!("duplicate standing convoy role `{role}` in project `{project_name}`"));
                     }
                 }
             }
@@ -6422,13 +6677,16 @@ impl InProcessDaemon {
 
     async fn resolve_crew_context(&self, requested: &CrewCommandContext) -> Result<ResolvedCrewContext, String> {
         let routing = self.resolve_crew_routing_context(requested).await?;
-        let CrewCommandContext { namespace, convoy, vessel_ref, role, .. } = routing.command_context;
-        let namespace = namespace.expect("routing context always has namespace");
-        let convoy = convoy.expect("routing context always has convoy");
-        let vessel_ref = vessel_ref.expect("routing context always has vessel ref");
-        let role = role.expect("routing context always has role");
-        let caller = match routing.session_name {
-            Some(name) => self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).get(&name).await.ok(),
+        self.resolve_crew_context_from_routing(&routing).await
+    }
+
+    async fn resolve_crew_context_from_routing(&self, routing: &CrewRoutingContext) -> Result<ResolvedCrewContext, String> {
+        let namespace = routing.command_context.namespace.as_ref().expect("routing context always has namespace").clone();
+        let convoy = routing.command_context.convoy.as_ref().expect("routing context always has convoy").clone();
+        let vessel_ref = routing.command_context.vessel_ref.as_ref().expect("routing context always has vessel ref").clone();
+        let role = routing.command_context.role.as_ref().expect("routing context always has role").clone();
+        let caller = match routing.session_name.as_ref() {
+            Some(name) => self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).get(name).await.ok(),
             None => None,
         };
         self.resolved_crew_context(namespace, convoy, vessel_ref, role, caller).await
@@ -6573,18 +6831,51 @@ impl InProcessDaemon {
         disposition: Option<String>,
     ) -> Result<(), String> {
         let routing = self.resolve_crew_routing_context(requested).await?;
-        self.apply_crew_work_patch(requested, |context| {
-            convoy_external_patches::mark_crew_completed(
-                context.vessel.clone(),
-                context.caller_role.clone(),
-                chrono::Utc::now(),
-                message,
-                disposition,
+        let namespace = routing.command_context.namespace.as_deref().expect("resolved crew routing context has a namespace");
+        let convoy_name = routing.command_context.convoy.as_deref().expect("resolved crew routing context has a convoy");
+        let message_lock = self.convoy_message_lock(namespace, convoy_name).await;
+        let _message_guard = message_lock.lock().await;
+        let context = self.resolve_crew_context_from_routing(&routing).await?;
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
+        ensure_crew_work_is_defined(&convoy, &context)?;
+        if let Some(pending) = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.pending_brief())
+            .filter(|pending| pending.vessel == context.vessel && pending.role == context.caller_role)
+        {
+            let session_name = routing.session_name.as_deref().ok_or_else(|| {
+                format!("pending brief target `{}/{}` has no intact terminal session", context.vessel, context.caller_role)
+            })?;
+            let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
+            let session = sessions.get(session_name).await.map_err(|err| err.to_string())?;
+            queue_pending_crew_message(&sessions, &session, &pending.content).await?;
+            apply_resource_status_patch(
+                &convoys,
+                convoy_name,
+                &convoy_external_patches::deliver_pending_brief(
+                    context.vessel,
+                    context.caller_role,
+                    chrono::Utc::now(),
+                    pending.content.clone(),
+                    message,
+                    disposition,
+                ),
             )
-        })
-        .await?;
+            .await
+            .map_err(|err| err.to_string())?;
+            self.clear_crew_completion_pending(namespace, session_name).await?;
+            return Ok(());
+        }
+        apply_resource_status_patch(
+            &convoys,
+            convoy_name,
+            &convoy_external_patches::mark_crew_completed(context.vessel, context.caller_role, chrono::Utc::now(), message, disposition),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
         if let Some(session_name) = routing.session_name {
-            let namespace = routing.command_context.namespace.as_deref().expect("resolved crew routing context has a namespace");
             self.clear_crew_completion_pending(namespace, &session_name).await?;
         }
         Ok(())
@@ -6748,7 +7039,7 @@ impl InProcessDaemon {
             let Ok(runner) = self.runner_for_resource_checkout(&checkout).await else {
                 continue;
             };
-            let output = runner.run_output("git", &["push", "-u", "origin", "HEAD"], Path::new(path), &ChannelLabel::Noop).await;
+            let output = runner.run_output("git", &["push", "-u", "origin", "HEAD"], Path::new(path), &ChannelLabel::Default).await;
             if let Ok(output) = output {
                 if !output.success {
                     warn!(checkout = %checkout.metadata.name, stderr = %output.stderr.trim(), "best-effort abandon archive push failed");
@@ -6785,14 +7076,7 @@ impl InProcessDaemon {
         let context = self.resolve_crew_context(requested).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
         let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
-        let known_agent = convoy
-            .status
-            .as_ref()
-            .and_then(|status| status.crew_work.get(&context.vessel))
-            .is_some_and(|crew| crew.contains_key(&context.caller_role));
-        if !known_agent {
-            return Err(format!("crew work for role `{}` is not defined on vessel `{}`", context.caller_role, context.vessel));
-        }
+        ensure_crew_work_is_defined(&convoy, &context)?;
         apply_resource_status_patch(&convoys, &context.convoy, &patch(&context)).await.map(|_| ()).map_err(|err| err.to_string())
     }
 
@@ -6936,19 +7220,24 @@ impl InProcessDaemon {
         prompt: &str,
         requested_vessel: Option<&str>,
         requested_role: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<ConvoyResumeOutcome, String> {
         if prompt.trim().is_empty() {
             return Err("convoy resume requires a non-empty prompt".to_string());
         }
+        let message_lock = self.convoy_message_lock(namespace, name).await;
+        let _message_guard = message_lock.lock().await;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{name}` has no status"))?;
+        if status.phase.is_terminal() {
+            return Err(format!("convoy `{name}` is in terminal phase `{:?}` and cannot accept a brief", status.phase));
+        }
         let candidates = status
             .crew_work
             .iter()
             .flat_map(|(vessel, crew)| crew.iter().map(move |(role, state)| (vessel, role, state)))
             .filter(|(vessel, role, state)| {
-                state.phase == flotilla_resources::CrewWorkPhase::Done
+                matches!(state.phase, flotilla_resources::CrewWorkPhase::Working | flotilla_resources::CrewWorkPhase::Done)
                     && requested_vessel.is_none_or(|requested| requested == vessel.as_str())
                     && requested_role.is_none_or(|requested| requested == role.as_str())
             })
@@ -6962,16 +7251,36 @@ impl InProcessDaemon {
                     (None, Some(role)) => format!(" for role `{role}`"),
                     (None, None) => String::new(),
                 };
-                return Err(format!("convoy `{name}` has no completed crew work{scope}"));
+                return Err(format!("convoy `{name}` has no active or completed crew work{scope}"));
             }
             [candidate] => candidate.clone(),
             _ => {
                 let matches = candidates.iter().map(|(vessel, role)| format!("{vessel}/{role}")).collect::<Vec<_>>().join(", ");
                 return Err(format!(
-                    "convoy `{name}` has multiple completed crew members ({matches}); select one with --vessel and --role"
+                    "convoy `{name}` has multiple active or completed crew members ({matches}); select one with --vessel and --role"
                 ));
             }
         };
+
+        let crew_phase = status
+            .crew_work
+            .get(&vessel)
+            .and_then(|crew| crew.get(&role))
+            .map(|state| state.phase)
+            .expect("selected candidate has crew work");
+        if crew_phase == flotilla_resources::CrewWorkPhase::Working {
+            let displaced = status.pending_brief().map(|brief| brief.content.clone());
+            apply_resource_status_patch(
+                &convoys,
+                name,
+                &convoy_external_patches::set_pending_brief(
+                    PendingBrief::builder().vessel(vessel).role(role).content(prompt.to_string()).queued_at(chrono::Utc::now()).build(),
+                ),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+            return Ok(ConvoyResumeOutcome::Queued { displaced });
+        }
 
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
         let session = sessions
@@ -7005,8 +7314,40 @@ impl InProcessDaemon {
             &convoy_external_patches::resume_crew_work(vessel, role, chrono::Utc::now(), prompt.to_string()),
         )
         .await
-        .map(|_| ())
+        .map(|_| ConvoyResumeOutcome::Delivered)
         .map_err(|err| err.to_string())
+    }
+
+    pub async fn convoy_withdraw_pending_brief_internal(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {
+        let message_lock = self.convoy_message_lock(namespace, name).await;
+        let _message_guard = message_lock.lock().await;
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
+        let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{name}` has no status"))?;
+        if status.phase.is_terminal() {
+            return Err(format!("convoy `{name}` is in terminal phase `{:?}` and cannot accept message changes", status.phase));
+        }
+        let withdrawn = status.pending_brief().map(|brief| brief.content.clone());
+        if withdrawn.is_some() {
+            apply_resource_status_patch(&convoys, name, &convoy_external_patches::clear_pending_brief())
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(withdrawn)
+    }
+
+    async fn convoy_message_lock(&self, namespace: &str, name: &str) -> ConvoyMessageLock {
+        let key = (namespace.to_string(), name.to_string());
+        let mut locks = self.convoy_message_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&key).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        }
     }
 
     async fn deliver_standing_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
@@ -7080,7 +7421,7 @@ impl InProcessDaemon {
         let comment = format!("{}\n\n{}", body.trim(), reason);
         let runner = self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
         runner
-            .run("gh", &["pr", "comment", &bound.id, "-R", repository_name, "--body", &comment], Path::new("/"), &ChannelLabel::Noop)
+            .run("gh", &["pr", "comment", &bound.id, "-R", repository_name, "--body", &comment], Path::new("/"), &ChannelLabel::Default)
             .await
             .map(|_| ())
     }
@@ -7180,11 +7521,13 @@ impl InProcessDaemon {
     ) -> Result<ParsedFleetReplicaSnapshot, String> {
         let args = fleet_replica_ssh_args(remote, multiplex);
         let arg_refs: Vec<_> = args.iter().map(String::as_str).collect();
-        let output =
-            tokio::time::timeout(FLEET_REPLICA_REFRESH_TIMEOUT, runner.run_output("ssh", &arg_refs, Path::new("/"), &ChannelLabel::Noop))
-                .await
-                .map_err(|_| format!("replica snapshot timed out after {}s", FLEET_REPLICA_REFRESH_TIMEOUT.as_secs()))?
-                .map_err(|err| format!("replica snapshot ssh failed: {err}"))?;
+        let output = tokio::time::timeout(
+            FLEET_REPLICA_REFRESH_TIMEOUT,
+            runner.run_output("ssh", &arg_refs, Path::new("/"), &ChannelLabel::Default),
+        )
+        .await
+        .map_err(|_| format!("replica snapshot timed out after {}s", FLEET_REPLICA_REFRESH_TIMEOUT.as_secs()))?
+        .map_err(|err| format!("replica snapshot ssh failed: {err}"))?;
         if !output.success {
             let message = if output.stderr.trim().is_empty() { output.stdout.trim() } else { output.stderr.trim() };
             return Err(format!("replica snapshot command failed: {message}"));
@@ -7209,7 +7552,10 @@ impl InProcessDaemon {
             .filter_map(|result_set| result_set.rows.as_convoys())
             .flatten()
             .filter_map(|convoy| {
-                convoy.placement_decision.clone().map(|decision| ((convoy.resource.namespace.clone(), convoy.name.clone()), decision))
+                convoy
+                    .placement_decision
+                    .clone()
+                    .map(|decision| ((convoy.resource.namespace.clone(), convoy.resource.name.clone()), decision))
             })
             .collect::<HashMap<_, _>>();
         let environment_map: HashMap<_, _> = environments
@@ -7220,11 +7566,19 @@ impl InProcessDaemon {
             .into_iter()
             .map(|environment| (environment.metadata.name.clone(), environment))
             .collect();
-        let work_unsettled = convoys
-            .list()
-            .await
-            .map_err(|err| err.to_string())?
-            .items
+        let convoy_items = convoys.list().await.map_err(|err| err.to_string())?.items;
+        let convoy_addresses = convoy_items
+            .iter()
+            .map(|convoy| {
+                let address = convoy
+                    .spec
+                    .project_ref
+                    .as_ref()
+                    .map_or_else(|| convoy.spec.role.clone(), |project| format!("{} @ {project}", convoy.spec.role));
+                (convoy.metadata.name.clone(), address)
+            })
+            .collect::<HashMap<_, _>>();
+        let work_unsettled = convoy_items
             .into_iter()
             .flat_map(|convoy| {
                 let convoy_name = convoy.metadata.name;
@@ -7272,18 +7626,23 @@ impl InProcessDaemon {
             let host = if let Some(host_ref) =
                 environment_map.get(&session.spec.env_ref).and_then(|environment| resource_environment_host_ref(environment))
             {
-                let canonical_ref = canonical_placement_host_ref_from_sources(&host_sources.items, host_ref)
-                    .ok()
-                    .flatten()
-                    .map(|target| target.reference)
-                    .unwrap_or_else(|| host_ref.to_string());
-                self.host_name_for_canonical_ref(&canonical_ref)
+                canonical_placement_host_ref_from_sources(&host_sources.items, host_ref).ok().flatten().map_or_else(
+                    || {
+                        if self.canonical_local_host_id().is_some_and(|local| local.as_str() == host_ref) {
+                            self.host_name.clone()
+                        } else {
+                            HostName::new(host_ref)
+                        }
+                    },
+                    |target| self.host_name_for_canonical_ref(&target.reference),
+                )
             } else {
                 self.host_name.clone()
             };
             rows.push(
                 FleetListRow::builder()
-                    .convoy(convoy.clone())
+                    .convoy(convoy_addresses.get(&convoy).cloned().unwrap_or_else(|| convoy.clone()))
+                    .maybe_convoy_ref((convoy != "-").then_some(convoy.clone()))
                     .vessel(session.spec.env_ref.clone())
                     .maybe_authority(authority_by_convoy.get(&convoy).cloned().flatten())
                     .crew(crew)
@@ -7313,6 +7672,111 @@ impl InProcessDaemon {
         self.resolve_attach_command_on_host_internal(reference, None).await
     }
 
+    async fn attach_project_context(&self, selector: Option<&flotilla_protocol::RepoSelector>) -> Result<Option<String>, String> {
+        let Some(selector) = selector else {
+            return Ok(None);
+        };
+        let Ok(path) = self.resolve_repo_selector(selector).await else {
+            return Ok(None);
+        };
+        let Some(repository_key) = self.repository_keys_by_path.read().await.get(&path).cloned() else {
+            return Ok(None);
+        };
+        let namespace = self.provisioning_namespace().await;
+        let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let mut matches = projects
+            .into_iter()
+            .filter(|project| project.spec.repositories.iter().any(|repository| repository.repo == repository_key))
+            .collect::<Vec<_>>();
+        let repository_key = repository_key.to_string();
+        let mut declaration_matches = matches
+            .iter()
+            .filter(|project| project.metadata.annotations.get(BOOTSTRAP_REPOSITORY_ANNOTATION) == Some(&repository_key))
+            .map(|project| project.metadata.name.clone())
+            .collect::<Vec<_>>();
+        declaration_matches.sort();
+        declaration_matches.dedup();
+        if let [project] = declaration_matches.as_slice() {
+            return Ok(Some(project.clone()));
+        }
+        matches.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
+        matches.dedup_by(|left, right| left.metadata.name == right.metadata.name);
+        Ok(matches.as_slice().first().filter(|_| matches.len() == 1).map(|project| project.metadata.name.clone()))
+    }
+
+    async fn resolve_live_convoy_record(&self, reference: &str, project_context: Option<&str>) -> Result<Option<LiveConvoyRecord>, String> {
+        let explicit = reference.contains('@');
+        let requested = if explicit {
+            Some(RoleAddress::from_str(reference)?)
+        } else {
+            project_context.map(|project| RoleAddress { project: project.to_string(), role: reference.to_string() })
+        };
+        let namespace = self.provisioning_namespace().await;
+        let sources =
+            self.resource_backend.including_replicas::<ResourceConvoy>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let has_role = sources.items.iter().any(|source| source.object.spec.role == reference);
+        if !explicit && requested.is_none() && !has_role {
+            return Ok(None);
+        }
+
+        let role = requested.as_ref().map_or(reference, |address| address.role.as_str());
+        let mut candidates = sources
+            .items
+            .into_iter()
+            .filter(|source| {
+                source.object.spec.role == role
+                    && source.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
+                    && requested.as_ref().is_none_or(|address| source.object.spec.project_ref.as_deref() == Some(&address.project))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            (&left.object.spec.project_ref, &left.object.metadata.name).cmp(&(&right.object.spec.project_ref, &right.object.metadata.name))
+        });
+        match candidates.as_slice() {
+            [] if explicit => Err(format!("no live convoy matches `{reference}`")),
+            [] => Ok(None),
+            [source] => {
+                let project = source
+                    .object
+                    .spec
+                    .project_ref
+                    .clone()
+                    .ok_or_else(|| format!("live convoy {} has no project identity", source.object.metadata.name))?;
+                let owner_host = match &source.provenance {
+                    ResourceProvenance::Local => self.host_name.clone(),
+                    ResourceProvenance::Replica { origin_root, .. } => self
+                        .host_registry
+                        .live_routed_host_name(origin_root)
+                        .await
+                        .ok_or_else(|| format!("owner host for {role}@{project} is unreachable"))?,
+                };
+                Ok(Some(LiveConvoyRecord {
+                    address: RoleAddress { project, role: role.to_string() },
+                    record_name: source.object.metadata.name.clone(),
+                    owner_host,
+                }))
+            }
+            candidates => {
+                let addresses = candidates
+                    .iter()
+                    .filter_map(|source| {
+                        source
+                            .object
+                            .spec
+                            .project_ref
+                            .as_ref()
+                            .map(|project| RoleAddress { project: project.clone(), role: source.object.spec.role.clone() })
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .map(|address| address.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(format!("{role} is ambiguous: {addresses}"))
+            }
+        }
+    }
+
     pub async fn resolve_attach_command_on_host_internal(
         &self,
         reference: &str,
@@ -7328,9 +7792,39 @@ impl InProcessDaemon {
         transient: bool,
         mode: AttachMode,
     ) -> Result<ResolvedAttach, String> {
+        self.resolve_attach_with_context(reference, host, transient, mode, None).await
+    }
+
+    async fn resolve_attach_with_context(
+        &self,
+        reference: &str,
+        host: Option<&HostName>,
+        transient: bool,
+        mode: AttachMode,
+        project_context: Option<&str>,
+    ) -> Result<ResolvedAttach, String> {
         // Preserve validation precedence without paying to build the candidate index.
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
+        }
+        if let Some(record) = self.resolve_live_convoy_record(reference, project_context).await? {
+            if let Some(requested) = host {
+                if requested != &record.owner_host {
+                    return Err(format!("no attach target matching '{reference}' on host '{requested}'"));
+                }
+            }
+            if record.owner_host != self.host_name {
+                let plan = self.recursive_attach_plan_for_remote(&record.owner_host, &record.address.to_string(), mode).await?;
+                let binding = AttachBinding::builder()
+                    .host(record.owner_host)
+                    .namespace(self.provisioning_namespace().await)
+                    .convoy(record.record_name)
+                    .role(record.address.role)
+                    .build();
+                return Ok(ResolvedAttach { plan, binding: Some(binding) });
+            }
+            let index = self.attach_candidate_index().await?;
+            return index.resolve(self, &record.record_name, host, transient, mode).await;
         }
         let index = self.attach_candidate_index().await?;
         index.resolve(self, reference, host, transient, mode).await
@@ -7382,6 +7876,20 @@ impl InProcessDaemon {
 
     async fn attach_candidate_index(&self) -> Result<AttachCandidateIndex, String> {
         let namespace = self.provisioning_namespace().await;
+        let convoy_addresses = self
+            .resource_backend
+            .including_replicas::<ResourceConvoy>(&namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .filter(|source| source.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
+            .map(|source| {
+                let address = convoy_address(&source.object.spec.role, source.object.spec.project_ref.as_deref());
+                (source.object.metadata.name, address)
+            })
+            .collect::<HashMap<_, _>>();
         let durable_sessions = self
             .resource_backend
             .including_replicas::<ResourceTerminalSession>(&namespace)
@@ -7415,9 +7923,10 @@ impl InProcessDaemon {
             if session.status.as_ref().map(|status| status.phase) != Some(ResourceTerminalSessionPhase::Running) {
                 continue;
             }
+            let convoy_address = session.metadata.labels.get(CONVOY_LABEL).and_then(|name| convoy_addresses.get(name));
             candidates.push(AttachCandidate {
-                label: attach_reference_label(&session.metadata.name, &session.metadata.labels),
-                references: attach_reference_keys(&session.metadata.name, &session.metadata.labels),
+                label: attach_reference_label(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
+                references: attach_reference_keys(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
                 host: self.host_name.clone(),
                 target: AttachTarget::Local(Box::new(session)),
             });
@@ -7435,6 +7944,7 @@ impl InProcessDaemon {
                 continue;
             };
             indexed_remote_sessions.insert((host.clone(), session.metadata.name.clone()));
+            let convoy_address = session.metadata.labels.get(CONVOY_LABEL).and_then(|name| convoy_addresses.get(name));
             let convoy = session.metadata.labels.get(CONVOY_LABEL).cloned().unwrap_or_else(|| "-".to_string());
             let role = session.metadata.labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
             let crew = session.metadata.labels.get(VESSEL_LABEL).map_or_else(|| role.clone(), |vessel| format!("{vessel}/{role}"));
@@ -7449,8 +7959,8 @@ impl InProcessDaemon {
                 .staleness(FleetStaleness::Local)
                 .build();
             candidates.push(AttachCandidate {
-                label: attach_reference_label(&session.metadata.name, &session.metadata.labels),
-                references: attach_reference_keys(&session.metadata.name, &session.metadata.labels),
+                label: attach_reference_label(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
+                references: attach_reference_keys(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
                 host,
                 target: AttachTarget::Replica { row: Box::new(row) },
             });
@@ -7681,17 +8191,28 @@ impl InProcessDaemon {
     async fn target_host_for_resource_ref(&self, namespace: &str, host_ref: &str) -> Result<HostName, String> {
         let canonical_ref = match canonical_placement_host_ref(&self.resource_backend, namespace, host_ref).await {
             Ok(Some(target_host)) => target_host.reference,
-            Ok(None) => host_ref.to_string(),
+            Ok(None) => return Err(format!("references unknown host `{host_ref}`")),
             Err(error) => return Err(error),
         };
         Ok(self.host_name_for_canonical_ref(&canonical_ref))
     }
 
-    fn host_name_for_canonical_ref(&self, canonical_ref: &str) -> HostName {
-        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == canonical_ref) {
+    pub async fn canonical_host_id_internal(&self, namespace: &str, host_ref: &str) -> Result<CanonicalHostId, String> {
+        canonical_placement_host_ref(&self.resource_backend, namespace, host_ref)
+            .await?
+            .map(|target| target.reference)
+            .ok_or_else(|| format!("references unknown host `{host_ref}`"))
+    }
+
+    fn canonical_local_host_id(&self) -> Option<CanonicalHostId> {
+        self.local_host_id().map(|host_id| CanonicalHostId::resolved(host_id.as_str()))
+    }
+
+    fn host_name_for_canonical_ref(&self, canonical_ref: &CanonicalHostId) -> HostName {
+        if self.canonical_local_host_id().as_ref() == Some(canonical_ref) {
             self.host_name.clone()
         } else {
-            HostName::new(canonical_ref)
+            HostName::new(canonical_ref.as_str())
         }
     }
 
@@ -7704,10 +8225,10 @@ impl InProcessDaemon {
             let canonical_ref =
                 match canonical_placement_host_ref(&self.resource_backend, &environment.metadata.namespace, &host_direct.host_ref).await {
                     Ok(Some(target_host)) => target_host.reference,
-                    Ok(None) => host_direct.host_ref.clone(),
+                    Ok(None) => return Err(format!("references unknown host `{}`", host_direct.host_ref)),
                     Err(error) => return Err(error),
                 };
-            if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == canonical_ref) {
+            if self.canonical_local_host_id().as_ref() == Some(&canonical_ref) {
                 self.local_environment_id.clone()
             } else {
                 EnvironmentId::new(environment.metadata.name.clone())
@@ -8078,8 +8599,28 @@ impl InProcessDaemon {
         if let flotilla_protocol::CommandAction::ConvoyResume { namespace, name, prompt, vessel, role } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
-            let result = match self.convoy_resume_internal(&namespace, name, prompt, vessel.as_deref(), role.as_deref()).await {
-                Ok(()) => flotilla_protocol::CommandValue::Ok,
+            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
+                Ok(record_name) => {
+                    match self.convoy_resume_internal(&namespace, &record_name, prompt, vessel.as_deref(), role.as_deref()).await {
+                        Ok(ConvoyResumeOutcome::Delivered) => flotilla_protocol::CommandValue::Ok,
+                        Ok(ConvoyResumeOutcome::Queued { displaced }) => flotilla_protocol::CommandValue::ConvoyBriefQueued { displaced },
+                        Err(message) => flotilla_protocol::CommandValue::Error { message },
+                    }
+                }
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ConvoyWithdrawPendingBrief { namespace, name } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
+            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
+                Ok(record_name) => match self.convoy_withdraw_pending_brief_internal(&namespace, &record_name).await {
+                    Ok(withdrawn) => flotilla_protocol::CommandValue::ConvoyBriefWithdrawn { withdrawn },
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             self.finish_context_free_command(id, empty_identity, result);
@@ -8112,8 +8653,11 @@ impl InProcessDaemon {
                 Some(namespace) => namespace.clone(),
                 None => self.provisioning_namespace().await,
             };
-            let result = match self.reap_convoy_internal(&namespace, name, *force).await {
-                Ok(()) => flotilla_protocol::CommandValue::Ok,
+            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
+                Ok(record_name) => match self.reap_convoy_internal(&namespace, &record_name, *force).await {
+                    Ok(()) => flotilla_protocol::CommandValue::Ok,
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             self.finish_context_free_command(id, empty_identity, result);
@@ -8126,8 +8670,11 @@ impl InProcessDaemon {
                 Some(namespace) => namespace.clone(),
                 None => self.provisioning_namespace().await,
             };
-            let result = match self.abandon_convoy_internal(&namespace, name, reason).await {
-                Ok(()) => flotilla_protocol::CommandValue::Ok,
+            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
+                Ok(record_name) => match self.abandon_convoy_internal(&namespace, &record_name, reason).await {
+                    Ok(()) => flotilla_protocol::CommandValue::Ok,
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             self.finish_context_free_command(id, empty_identity, result);
@@ -8138,6 +8685,13 @@ impl InProcessDaemon {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = self.provisioning_namespace().await;
             let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
+            let record_name = match resolve_local_convoy_name(&self.resource_backend, &namespace, convoy).await {
+                Ok(record_name) => record_name,
+                Err(message) => {
+                    self.finish_context_free_command(id, empty_identity, flotilla_protocol::CommandValue::Error { message });
+                    return Ok(id);
+                }
+            };
             let check_work_is_completable = |current: &ResourceObject<ResourceConvoy>| match current.status.as_ref() {
                 None => Err(ResourceError::other(format!("convoy {convoy} has no status"))),
                 Some(status) => match status.work.get(work) {
@@ -8157,7 +8711,7 @@ impl InProcessDaemon {
             };
             let result = match apply_resource_status_patch_checked(
                 &convoys,
-                convoy,
+                &record_name,
                 &convoy_external_patches::force_work_completed(work.clone(), chrono::Utc::now(), message.clone()),
                 check_work_is_completable,
             )
@@ -8228,32 +8782,32 @@ impl InProcessDaemon {
                 description: command.description().to_string(),
             });
             let namespace = self.provisioning_namespace().await;
-            let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
-            match convoys.get(name).await {
-                Ok(_) => {
-                    let result = flotilla_protocol::CommandValue::Error { message: format!("convoy {name} already exists") };
-                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                        command_id: id,
-                        node_id: self.node_id.clone(),
-                        repo_identity: empty_identity,
-                        repo: None,
-                        result,
-                    });
-                    return Ok(id);
-                }
-                Err(ResourceError::NotFound { .. }) => {}
-                Err(err) => {
-                    let result = flotilla_protocol::CommandValue::Error { message: err.to_string() };
-                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                        command_id: id,
-                        node_id: self.node_id.clone(),
-                        repo_identity: empty_identity,
-                        repo: None,
-                        result,
-                    });
-                    return Ok(id);
-                }
+            let role = name.clone();
+            let project_identity = project_ref.as_deref();
+            if let Err(message) = validate_convoy_name(&role) {
+                let result = flotilla_protocol::CommandValue::Error { message };
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    node_id: self.node_id.clone(),
+                    repo_identity: empty_identity,
+                    repo: None,
+                    result,
+                });
+                return Ok(id);
             }
+            if let Err(message) = allocate_convoy_generation(&self.resource_backend, &namespace, project_identity, &role).await {
+                let result = flotilla_protocol::CommandValue::Error { message };
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    node_id: self.node_id.clone(),
+                    repo_identity: empty_identity,
+                    repo: None,
+                    result,
+                });
+                return Ok(id);
+            }
+            let record_name = convoy_record_name();
+            let name = &record_name;
             if let Err(message) = self.check_local_free_space_floor().await {
                 let result = flotilla_protocol::CommandValue::Error { message };
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
@@ -8421,6 +8975,7 @@ impl InProcessDaemon {
             } else {
                 Vec::new()
             };
+            let adopted_checkout_ref_to_cleanup = adopted_checkout.as_ref().map(|(_, checkout_ref)| checkout_ref.clone());
             let mut adopted_checkout_refs = BTreeMap::new();
             if let Some((repo_ref, checkout_ref)) = adopted_checkout {
                 if !repositories.iter().any(|repository| repository.repo_ref == repo_ref) {
@@ -8496,8 +9051,31 @@ impl InProcessDaemon {
                 return Ok(id);
             }
             let placement_policy = placement.selected.as_ref().map(|placement| placement.metadata.name.clone());
+            let _admission_guard = self.convoy_admission.lock().await;
+            let generation = match allocate_convoy_generation(&self.resource_backend, &namespace, project_identity, &role).await {
+                Ok(generation) => generation,
+                Err(message) => {
+                    if let Some(checkout_ref) = adopted_checkout_ref_to_cleanup {
+                        if let Err(error) = self.resource_backend.clone().using::<ResourceCheckout>(&namespace).delete(&checkout_ref).await
+                        {
+                            warn!(%error, %checkout_ref, "failed to clean up adopted checkout after convoy identity conflict");
+                        }
+                    }
+                    let result = flotilla_protocol::CommandValue::Error { message };
+                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                        command_id: id,
+                        node_id: self.node_id.clone(),
+                        repo_identity: empty_identity,
+                        repo: None,
+                        result,
+                    });
+                    return Ok(id);
+                }
+            };
             let spec = ConvoySpec {
                 workflow_ref: workflow_ref.clone(),
+                role: role.clone(),
+                generation,
                 dispatching_principal_ref: dispatching_principal_ref
                     .clone()
                     .unwrap_or_else(|| PrincipalRef::implicit_for_namespace(&namespace)),
@@ -8525,7 +9103,7 @@ impl InProcessDaemon {
                 )
                 .await
             {
-                Ok(()) => flotilla_protocol::CommandValue::ConvoyCreated { name: name.clone() },
+                Ok(()) => flotilla_protocol::CommandValue::ConvoyCreated { name: convoy_address(&role, project_identity) },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
@@ -8979,14 +9557,29 @@ async fn execute_local_remote_step_batch(
 impl InProcessDaemon {
     async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String> {
         let namespace = requested_namespace.map(ToOwned::to_owned).unwrap_or(self.provisioning_namespace().await);
+        let (role, project) = parse_role_address(name)?;
         let convoy_sources =
             self.resource_backend.including_replicas::<ResourceConvoy>(&namespace).list().await.map_err(|error| error.to_string())?;
-        let convoy_source = convoy_sources
+        let matching = convoy_sources
             .items
             .into_iter()
-            .filter(|source| source.object.metadata.name == name)
+            .filter(|source| {
+                source.object.spec.role == role
+                    && project.is_none_or(|project| source.object.spec.project_ref.as_deref().unwrap_or_default() == project)
+                    && source.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
+            })
+            .collect::<Vec<_>>();
+        let addresses = matching
+            .iter()
+            .map(|source| convoy_disambiguation_address(&source.object.spec.role, source.object.spec.project_ref.as_deref()))
+            .collect::<BTreeSet<_>>();
+        if project.is_none() && addresses.len() > 1 {
+            return Err(format!("convoy role `{role}` is ambiguous; use one of: {}", addresses.into_iter().collect::<Vec<_>>().join(", ")));
+        }
+        let convoy_source = matching
+            .into_iter()
             .max_by_key(|source| matches!(source.provenance, ResourceProvenance::Local))
-            .ok_or_else(|| format!("convoy {namespace}/{name} not found in local or replicated resources"))?;
+            .ok_or_else(|| format!("no live convoy matches `{name}`"))?;
         let convoy = convoy_source.object;
         let now = self.clock.now();
         let change_request_stale_after = self.change_request_stale_after();
@@ -9311,7 +9904,8 @@ impl DaemonHandle for InProcessDaemon {
                 ))))
             }
             CommandAction::Attach { reference, host, mode } => {
-                match self.resolve_attach_with_mode_internal(reference, host.as_ref(), false, *mode).await {
+                let project_context = self.attach_project_context(command.context_repo.as_ref()).await?;
+                match self.resolve_attach_with_context(reference, host.as_ref(), false, *mode, project_context.as_deref()).await {
                     Ok(resolved) => {
                         if let Some(binding) = &resolved.binding {
                             if let Err(error) = self.emit_attach_regard(binding, session_id).await {
@@ -9324,7 +9918,8 @@ impl DaemonHandle for InProcessDaemon {
                 }
             }
             CommandAction::AttachTransient { reference, host, mode } => {
-                match self.resolve_attach_with_mode_internal(reference, host.as_ref(), true, *mode).await {
+                let project_context = self.attach_project_context(command.context_repo.as_ref()).await?;
+                match self.resolve_attach_with_context(reference, host.as_ref(), true, *mode, project_context.as_deref()).await {
                     Ok(resolved) => {
                         Ok(flotilla_protocol::CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding })
                     }

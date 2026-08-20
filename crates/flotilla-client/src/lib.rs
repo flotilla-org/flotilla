@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
     Command, ConnectionRole, DaemonEvent, LeafFire, Message, NodeId, QueryCursor, QueryId, ReplayCursor, RepoInfo, Request, Response,
-    ResponseResult, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, PROTOCOL_VERSION,
+    ResponseResult, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION,
 };
 use flotilla_transport::message::{connect_unix_message_session, MessageSession};
 use tokio::sync::{broadcast, oneshot, Mutex};
@@ -76,7 +76,7 @@ async fn do_client_hello_with_surface(
         .write(Message::Hello {
             protocol_version: PROTOCOL_VERSION,
             node_id: NodeId::new("client"),
-            display_name: flotilla_protocol::hello_display_name("client", BUILD_ID),
+            display_name: flotilla_protocol::hello_display_name("client", BUILD_ID, PROTOCOL_FINGERPRINT),
             session_id,
             connection_role: Some(ConnectionRole::Client),
             surface,
@@ -86,25 +86,25 @@ async fn do_client_hello_with_surface(
 
     match session.read().await.map_err(|e| format!("failed to read Hello reply: {e}"))? {
         Some(Message::Hello { protocol_version, display_name, .. }) if protocol_version != PROTOCOL_VERSION => {
-            let daemon_build = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
+            let daemon_info = flotilla_protocol::hello_build_info(&display_name);
+            let daemon_build = daemon_info.map_or("unknown", |info| info.build_id);
+            let daemon_fingerprint = daemon_info.map_or("unknown", |info| info.protocol_fingerprint);
             Err(format!(
-                "daemon protocol version mismatch: client built {} speaks proto {PROTOCOL_VERSION}; daemon built {daemon_build} speaks \
-                 proto {protocol_version} — rebuild/reinstall the CLI",
-                BUILD_ID,
+                "daemon protocol version mismatch: client fingerprint {PROTOCOL_FINGERPRINT} speaks proto {PROTOCOL_VERSION} (build \
+                 {BUILD_ID}); daemon fingerprint {daemon_fingerprint} speaks proto {protocol_version} (build {daemon_build})"
             ))
         }
         Some(Message::Hello { display_name, .. }) => {
-            let daemon_generation = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
-            if !flotilla_protocol::wire_generations_match(daemon_generation, BUILD_ID)
-                && matches!(wire_generation_policy, WireGenerationPolicy::RequireMatch)
-            {
+            let daemon_info = flotilla_protocol::hello_build_info(&display_name);
+            let daemon_build = daemon_info.map_or("unknown", |info| info.build_id);
+            let daemon_fingerprint = daemon_info.map_or("unknown", |info| info.protocol_fingerprint);
+            if daemon_fingerprint != PROTOCOL_FINGERPRINT && matches!(wire_generation_policy, WireGenerationPolicy::RequireMatch) {
                 return Err(format!(
-                    "wire generation mismatch: client built {} speaks proto {PROTOCOL_VERSION}; daemon built {daemon_generation} speaks \
-                     proto {PROTOCOL_VERSION} — rebuild/reinstall the CLI",
-                    BUILD_ID,
+                    "wire generation mismatch: client fingerprint {PROTOCOL_FINGERPRINT} speaks proto {PROTOCOL_VERSION} (build \
+                     {BUILD_ID}); daemon fingerprint {daemon_fingerprint} speaks proto {PROTOCOL_VERSION} (build {daemon_build})"
                 ));
             }
-            Ok(Some(daemon_generation.to_owned()))
+            Ok(Some(daemon_build.to_owned()))
         }
         Some(other) => Err(format!("expected Hello reply, got: {other:?}")),
         None => Err("connection closed before Hello reply".into()),
@@ -113,10 +113,10 @@ async fn do_client_hello_with_surface(
 
 /// Stop an existing daemon through the same-protocol deployment seam.
 ///
-/// Normal client sessions still require an identical wire generation. This
-/// path permits a build mismatch only long enough to send the typed shutdown
-/// request and receive its typed acknowledgement. Protocol mismatches remain
-/// rejected by the Hello handshake.
+/// Normal client sessions require an identical protocol fingerprint. This path
+/// permits a fingerprint mismatch only long enough to send the typed shutdown
+/// request and receive its typed acknowledgement. Protocol-version mismatches
+/// remain rejected by the Hello handshake.
 pub async fn shutdown_existing(socket_path: &Path) -> Result<(), String> {
     let session = connect_unix_message_session(socket_path).await?;
     tokio::time::timeout(
