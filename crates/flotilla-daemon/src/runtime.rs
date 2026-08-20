@@ -3275,14 +3275,15 @@ mod tests {
     use flotilla_resources::{
         api_version,
         controller::{Actuation, Reconciler},
+        delete_resource_kind,
         test_support::{
             run_transition_sequence, FixpointPredicate, LivenessEnrollment, LivenessScenario, LivenessStep, ReconcileStep, Transition,
             TransitionDriver, TransitionSequence, WorldBuilder,
         },
         Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec, CheckoutSpec as ResourceCheckoutSpec,
-        CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
-        CredentialConsumer, CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-        CredentialSpecSpec, CrewSource, CrewSpec, LifecycleAuthority, MaterialPoolSpec, MaterialPoolUnitSpec,
+        CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, ConvoyEnsure, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec,
+        ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
+        CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, LifecycleAuthority, MaterialPoolSpec, MaterialPoolUnitSpec,
         ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementStatus, RepositoryKey, RepositorySpec, Resource,
         Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSpec,
         TerminalSessionStatus, TerminalSessionStatusPatch, VesselRequirement, VesselSpec, VesselStatus, VirtualClock, WorkPhase, WorkState,
@@ -7129,6 +7130,66 @@ mod tests {
             assert!(logs.contains(field), "quarantine warning should include {field}: {logs}");
         }
         assert!(logs.contains("quarantin"), "quarantine warning should be explicit: {logs}");
+
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn deleting_the_last_quarantined_object_recovers_host_readiness_without_restart() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"quarantine-recovery-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let sqlite_path = config.state_dir().join("resources.sqlite");
+        drop(SqliteBackend::open(&sqlite_path).expect("initialize sqlite store"));
+        let connection = rusqlite::Connection::open(&sqlite_path).expect("open raw sqlite store");
+        insert_undecodable_resource::<ConvoyEnsure>(&connection, "governor");
+        drop(connection);
+
+        let daemon = sqlite_daemon(Vec::new(), Arc::clone(&config)).await;
+        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
+            heartbeat_interval: Duration::from_millis(10),
+            controller_resync_interval: Duration::from_secs(300),
+            start_controllers: false,
+            ..RuntimeOptions::default()
+        })
+        .await
+        .expect("daemon should boot with an undecodable stored resource");
+
+        let health = daemon.fleet_health_internal().await.expect("daemon should serve fleet health");
+        let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
+        assert!(
+            local.degraded_conditions.iter().any(|condition| condition.contains("ConvoyEnsure/governor")),
+            "fleet diagnosis should identify the quarantined resource: {:?}",
+            local.degraded_conditions
+        );
+        let hosts = daemon.resource_backend().using::<Host>(NAMESPACE).list().await.expect("local host resource should exist");
+        let [host] = hosts.items.as_slice() else { panic!("expected exactly one local host resource, got {:?}", hosts.items) };
+        let host_id = host.metadata.name.clone();
+        assert!(
+            !host.status.as_ref().expect("startup heartbeat should publish host status").ready,
+            "decode quarantine should degrade readiness"
+        );
+
+        delete_resource_kind(&daemon.resource_backend(), NAMESPACE, ConvoyEnsure::API_PATHS.kind, "governor")
+            .await
+            .expect("operator delete should resolve the quarantined identity");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let host = daemon
+                    .resource_backend()
+                    .using::<Host>(NAMESPACE)
+                    .get(&host_id)
+                    .await
+                    .expect("local host resource should remain available");
+                if host.status.is_some_and(|status| status.ready) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("host readiness should recover after the final quarantine is deleted");
 
         runtime.shutdown();
     }
