@@ -149,7 +149,7 @@ fn no_workspace_manager_error() -> CommandValue {
 /// Returns `Ok(StepPlan)` for all per-repo commands, or `Err(CommandValue)`
 /// for daemon-level commands that should never reach this function and for
 /// pre-resolution errors (e.g. teleport with an unknown checkout key).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub async fn build_plan(
     cmd: Command,
     repo: RepoExecutionContext,
@@ -582,7 +582,7 @@ fn build_create_workspace_plan(
 /// 1. Resolve attach command from the session's cloud agent provider
 /// 2. Ensure checkout exists (skipped if checkout_key references a known checkout, or no branch)
 /// 3. Create workspace with the teleport (attach) command
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 async fn build_teleport_session_plan(
     session_id: String,
     branch: Option<String>,

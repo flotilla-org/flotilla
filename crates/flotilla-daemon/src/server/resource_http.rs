@@ -36,7 +36,7 @@ pub(super) async fn serve_resource_http(mut stream: UnixStream, first_byte: u8, 
         return write_error(&mut stream, 405, "resource API is read-only").await;
     }
 
-    let (path, raw_query) = target.split_once('?').map_or((target, ""), |parts| parts);
+    let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
     let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
     let (namespace, kind, name) = match segments.as_slice() {
         ["apis", "flotilla.work", "v1", "namespaces", namespace, kind] => (*namespace, *kind, None),
