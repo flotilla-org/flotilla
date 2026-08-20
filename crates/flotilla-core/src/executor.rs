@@ -149,7 +149,9 @@ fn no_workspace_manager_error() -> CommandValue {
 /// Returns `Ok(StepPlan)` for all per-repo commands, or `Err(CommandValue)`
 /// for daemon-level commands that should never reach this function and for
 /// pre-resolution errors (e.g. teleport with an unknown checkout key).
-#[allow(clippy::too_many_arguments)]
+// The Err channel is deliberately the full protocol result enum: planning
+// short-circuits straight to a presentable CommandValue.
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 pub async fn build_plan(
     cmd: Command,
     repo: RepoExecutionContext,
@@ -583,7 +585,7 @@ fn build_create_workspace_plan(
 /// 1. Resolve attach command from the session's cloud agent provider
 /// 2. Ensure checkout exists (skipped if checkout_key references a known checkout, or no branch)
 /// 3. Create workspace with the teleport (attach) command
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn build_teleport_session_plan(
     session_id: String,
     branch: Option<String>,
@@ -902,7 +904,7 @@ impl StepResolver for ExecutorStepResolver {
                 let container_name =
                     context_environment_id.as_ref().and_then(|env_id| self.environment_manager.environment_container_name(env_id));
 
-                Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(PreparedWorkspace {
+                Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(Box::new(PreparedWorkspace {
                     label,
                     target_node_id: self.local_node_id.clone(),
                     display_host,
@@ -913,7 +915,7 @@ impl StepResolver for ExecutorStepResolver {
                     container_name,
                     template_yaml,
                     prepared_commands,
-                })))
+                }))))
             }
             StepAction::AttachWorkspace => {
                 let prepared = prior
@@ -1091,7 +1093,7 @@ impl StepResolver for ExecutorStepResolver {
                     effective_runner.as_ref(),
                 )
                 .await;
-                Ok(StepOutcome::CompletedWith(CommandValue::CheckoutStatus(info)))
+                Ok(StepOutcome::CompletedWith(CommandValue::CheckoutStatus(Box::new(info))))
             }
             StepAction::OpenChangeRequest { id } => {
                 debug!(%id, "opening change request in browser");

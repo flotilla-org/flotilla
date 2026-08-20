@@ -871,12 +871,12 @@ pub enum CommandValue {
         attachable_set_id: Option<AttachableSetId>,
         commands: Vec<ResolvedPaneCommand>,
     },
-    PreparedWorkspace(PreparedWorkspace),
+    PreparedWorkspace(Box<PreparedWorkspace>),
     BranchNameGenerated {
         name: String,
         issue_ids: Vec<(String, String)>,
     },
-    CheckoutStatus(CheckoutStatus),
+    CheckoutStatus(Box<CheckoutStatus>),
     Error {
         message: String,
     },
@@ -1284,7 +1284,7 @@ mod tests {
                 attachable_set_id: Some(AttachableSetId::new("set-1")),
                 commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
             },
-            CommandValue::PreparedWorkspace(PreparedWorkspace {
+            CommandValue::PreparedWorkspace(Box::new(PreparedWorkspace {
                 label: "feat-x".into(),
                 target_node_id: NodeId::new("desktop"),
                 display_host: Some(crate::HostName::new("desktop")),
@@ -1295,9 +1295,9 @@ mod tests {
                 container_name: None,
                 template_yaml: Some("layout: []\ncontent: []\n".into()),
                 prepared_commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
-            }),
+            })),
             CommandValue::BranchNameGenerated { name: "feat/cool-thing".into(), issue_ids: vec![("gh".into(), "1".into())] },
-            CommandValue::CheckoutStatus(CheckoutStatus {
+            CommandValue::CheckoutStatus(Box::new(CheckoutStatus {
                 branch: "old".into(),
                 change_request_status: Some("merged".into()),
                 merge_commit_sha: Some("abc123".into()),
@@ -1305,7 +1305,7 @@ mod tests {
                 has_uncommitted: true,
                 uncommitted_files: vec!["M  src/main.rs".into(), "?? TODO.txt".into()],
                 base_detection_warning: Some("warning text".into()),
-            }),
+            })),
             CommandValue::Error { message: "something failed".into() },
             CommandValue::Cancelled,
             CommandValue::AttachCommandResolved { plan: crate::ResolvedAttachPlan::shell_command("bash --login"), binding: None },
