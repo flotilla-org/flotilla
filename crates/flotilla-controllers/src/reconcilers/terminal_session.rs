@@ -216,9 +216,6 @@ where
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
-        if obj.status.as_ref().is_some_and(|status| status.degraded.is_some()) {
-            return ReconcileOutcome::new(Some(TerminalSessionStatusPatch::ClearReconcileDegraded));
-        }
         let patch = match phase {
             TerminalSessionPhase::Starting => match deps {
                 TerminalDeps::Running(state) => Some(TerminalSessionStatusPatch::MarkRunning {
@@ -274,7 +271,13 @@ where
                 _ => None,
             },
             TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed => None,
-        };
+        }
+        .or_else(|| {
+            obj.status
+                .as_ref()
+                .is_some_and(|status| status.degraded.is_some())
+                .then_some(TerminalSessionStatusPatch::ClearReconcileDegraded)
+        });
 
         ReconcileOutcome::new(patch)
     }

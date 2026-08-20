@@ -331,14 +331,20 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.crew = crew.clone();
                 status.launch_command = Some(launch_command.clone());
                 status.delivered_message_id = delivered_message_id.clone();
+                status.degraded = None;
             }
-            Self::MarkMessageDelivered { message_id } => status.delivered_message_id = Some(message_id.clone()),
+            Self::MarkMessageDelivered { message_id } => {
+                status.delivered_message_id = Some(message_id.clone());
+                status.message = None;
+                status.degraded = None;
+            }
             Self::MarkStopped { stopped_at, inner_command_status, inner_exit_code, message } => {
                 status.phase = TerminalSessionPhase::Stopped;
                 status.stopped_at.get_or_insert(*stopped_at);
                 status.inner_command_status = *inner_command_status;
                 status.inner_exit_code = *inner_exit_code;
                 status.message = message.clone();
+                status.degraded = None;
                 if let Some(attention) = &mut status.attention {
                     attention.state = TerminalAttentionState::Unobservable;
                     attention.as_of = *stopped_at;
@@ -350,6 +356,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     status.stopped_at.get_or_insert(*stopped_at);
                 }
                 status.message = Some(message.clone());
+                status.degraded = None;
                 if let Some(attention) = &mut status.attention {
                     attention.state = TerminalAttentionState::Unobservable;
                     if let Some(stopped_at) = stopped_at {
@@ -379,6 +386,8 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 if replace {
                     status.attention = Some(attention.clone());
                 }
+                status.message = None;
+                status.degraded = None;
             }
             Self::MarkCompletionPending { pending } => status.completion_pending = Some(pending.clone()),
             Self::ClearCompletionPending => status.completion_pending = None,

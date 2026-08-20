@@ -770,6 +770,12 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
         delivered_message_id: Some("message-old".into()),
     }
     .apply(&mut status);
+    flotilla_resources::TerminalSessionStatusPatch::MarkReconcileDegraded {
+        message: "terminal pool temporarily unavailable".into(),
+        consecutive_failures: 5,
+        observed_at: Utc::now(),
+    }
+    .apply(&mut status);
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
     let runtime = Arc::new(DeliveringTerminalRuntime::default());
     let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
@@ -786,6 +792,7 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     ));
     let mut acknowledged_status = session.status.clone().expect("status");
     outcome.patch.expect("acknowledgement patch").apply(&mut acknowledged_status);
+    assert_eq!(acknowledged_status.degraded, None, "message acknowledgement should clear the recovered provider condition");
     let acknowledged =
         sessions.update_status("term-a", &session.metadata.resource_version, &acknowledged_status).await.expect("acknowledge message");
 
