@@ -2521,6 +2521,71 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
         .expect("delete by role address");
     assert_eq!(recv_command_finished(&mut events, delete_id).await, CommandValue::Ok);
     assert_eq!(convoys.list().await.expect("list after addressed delete").items.len(), 1);
+
+    let terminal_delete_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: None, name: "governor@flotilla".to_string(), force: true })
+                .build(),
+        )
+        .await
+        .expect("delete sole terminal generation by role address");
+    assert_eq!(recv_command_finished(&mut events, terminal_delete_id).await, CommandValue::Ok);
+    assert!(convoys.list().await.expect("list after terminal generation delete").items.is_empty());
+    drop(temp);
+}
+
+#[tokio::test]
+async fn convoy_delete_reaps_a_landed_pre_identity_record_and_its_terminal_sessions() {
+    let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &InputMeta::builder().name("command-builder".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("legacy-workflow".to_string()).build(),
+        )
+        .await
+        .expect("create pre-identity convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+            phase: ConvoyPhase::Landed,
+            ..Default::default()
+        })
+        .await
+        .expect("mark pre-identity convoy landed");
+
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    sessions
+        .create(
+            &InputMeta::builder()
+                .name("legacy-session".to_string())
+                .labels(BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), "command-builder".to_string())]))
+                .build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("legacy-environment".to_string())
+                .role("coder".to_string())
+                .source(TerminalSessionSource::Tool { command: "legacy-agent".to_string() })
+                .cwd("/workspace".to_string())
+                .pool("cleat".to_string())
+                .build(),
+        )
+        .await
+        .expect("create legacy terminal session");
+
+    let mut events = daemon.subscribe();
+    let delete_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: None, name: "command-builder".to_string(), force: false })
+                .build(),
+        )
+        .await
+        .expect("delete command accepted");
+
+    assert_eq!(recv_command_finished(&mut events, delete_id).await, CommandValue::Ok);
+    assert!(matches!(convoys.get("command-builder").await, Err(ResourceError::NotFound { .. })));
+    assert!(matches!(sessions.get("legacy-session").await, Err(ResourceError::NotFound { .. })));
     drop(temp);
 }
 
