@@ -298,6 +298,24 @@ cat >"$fake_bin/pgrep" <<'SH'
 SH
 chmod 0755 "$fake_bin/pgrep"
 
+cat >"$fake_bin/zsh" <<'SH'
+#!/bin/sh
+set -eu
+[ "$#" -eq 3 ] || exit 98
+[ "$1" = -l ] && [ "$2" = -c ] || exit 98
+case "$3" in
+  'command -v flotilla'|'command -v flotillad'|'command -v cleat') ;;
+  *) exit 98 ;;
+esac
+case ":${PATH:-}:" in
+  *":$HOME/.local/bin:"*) exit 97 ;;
+esac
+PATH="$LOGIN_SHELL_PATH"
+export PATH
+exec /bin/sh -c "$3"
+SH
+chmod 0755 "$fake_bin/zsh"
+
 cat >"$fake_bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -337,6 +355,8 @@ run_installer() {
   HOME="$test_root/home" \
     XDG_CONFIG_HOME="$test_root/home/.config" \
     PATH="$test_root/home/.local/bin:$fake_bin:$PATH" \
+    SHELL="$fake_bin/zsh" \
+    LOGIN_SHELL_PATH="$test_root/home/.local/bin:$fake_bin:/usr/bin:/bin" \
     FIXTURE_ROOT="$fixture_root" \
     SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
     LOGINCTL_LOG="$LOGINCTL_LOG" \
@@ -352,6 +372,8 @@ run_darwin_installer() {
   shift
   HOME="$home" \
     PATH="$home/.local/bin:$fake_bin:$PATH" \
+    SHELL="$fake_bin/zsh" \
+    LOGIN_SHELL_PATH="$home/.local/bin:$fake_bin:/usr/bin:/bin" \
     FIXTURE_ROOT="$fixture_root" \
     CODESIGN_LOG="$test_root/codesign.log" \
     FAIL_CODESIGN_FOR="${FAIL_CODESIGN_FOR:-}" \
@@ -374,6 +396,20 @@ HOME="$status_home" PATH="$status_home/.local/bin:$fake_bin:$PATH" FIXTURE_ROOT=
 test ! -e "$status_home/.local/opt/flotilla-fleet" || fail 'status mutated the install root'
 grep -Fq 'fleet:   unavailable (daemon not running)' "$test_root/fresh-status.out" \
   || fail 'status did not degrade gracefully without a daemon'
+
+login_path_home="$test_root/login-path-home"
+mkdir -p "$login_path_home/.config/flotilla"
+cp "$test_root/home/.config/flotilla/fleet-reader-token" "$login_path_home/.config/flotilla/fleet-reader-token"
+if HOME="$login_path_home" PATH="$login_path_home/.local/bin:$fake_bin:$PATH" SHELL="$fake_bin/zsh" \
+  LOGIN_SHELL_PATH="$fake_bin:/usr/bin:/bin" FIXTURE_ROOT="$fixture_root" \
+  FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
+  FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
+  "$installer" "$generation_one" >"$test_root/login-path.out" 2>&1; then
+  fail 'inline PATH masked a missing login-shell PATH entry'
+fi
+grep -Fq 'not reachable through the login shell' "$test_root/login-path.out" \
+  || fail 'login-shell PATH failure was unclear'
+grep -Fq '~/.zshenv' "$test_root/login-path.out" || fail 'zsh PATH failure omitted ~/.zshenv'
 
 run_installer "$generation_one" >"$test_root/install-one.out"
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'exact generation was not selected'
@@ -485,6 +521,7 @@ test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" =
 custom_root="$test_root/custom-root"
 custom_bin="$test_root/custom-bin"
 HOME="$test_root/home" XDG_CONFIG_HOME="$test_root/home/.config" PATH="$custom_bin:$fake_bin:$PATH" \
+  SHELL="$fake_bin/zsh" LOGIN_SHELL_PATH="$custom_bin:$fake_bin:/usr/bin:/bin" \
   FIXTURE_ROOT="$fixture_root" SYSTEMCTL_LOG="$test_root/systemctl.log" LOGINCTL_LOG="$test_root/loginctl.log" \
   FLEET_INSTALL_ROOT="$custom_root" FLEET_INSTALL_BIN_DIR="$custom_bin" \
   FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
@@ -576,17 +613,16 @@ shadow_home="$test_root/shadow-home"
 shadow_bin="$test_root/shadow-bin"
 mkdir -p "$shadow_home/.config/flotilla" "$shadow_bin"
 cp "$test_root/home/.config/flotilla/fleet-reader-token" "$shadow_home/.config/flotilla/fleet-reader-token"
-for name in flotilla flotillad cleat; do
-  printf '#!/bin/sh\nexit 0\n' >"$shadow_bin/$name"
-  chmod 0755 "$shadow_bin/$name"
-done
+printf '#!/bin/sh\nexit 0\n' >"$shadow_bin/cleat"
+chmod 0755 "$shadow_bin/cleat"
 if HOME="$shadow_home" PATH="$shadow_bin:$shadow_home/.local/bin:$fake_bin:$PATH" FIXTURE_ROOT="$fixture_root" \
+  SHELL="$fake_bin/zsh" LOGIN_SHELL_PATH="$shadow_bin:$shadow_home/.local/bin:$fake_bin:/usr/bin:/bin" \
   FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
   FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
   "$installer" "$generation_one" >"$test_root/shadow.out" 2>&1; then
   fail 'PATH shadow was accepted'
 fi
-grep -Fq 'PATH shadows the fleet launcher' "$test_root/shadow.out" || fail 'PATH shadow error was unclear'
+grep -Fq 'PATH shadows the fleet launcher for cleat' "$test_root/shadow.out" || fail 'cleat PATH shadow error was unclear'
 test ! -L "$shadow_home/.local/opt/flotilla-fleet/current" || fail 'PATH shadow switched current'
 
 echo 'fleet-install contract passed'
