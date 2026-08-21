@@ -4,7 +4,8 @@
 **Date:** 2026-08-21
 **Relates to:** ADR 0017 (settlement claims / conditions / attention — this
 ADR adds a claims-plane artifact and two admission rules), ADR 0018
-(Demands and Regards — this ADR completes the Demand's shape), ADR 0028
+(Demands and Regards — this ADR completes the Demand's shape), ADR 0027
+(the episode escalation ladder the never-claimed ruling leans on), ADR 0028
 (the durability fence the ledger rides), ADR 0010 (briefs — which gain the
 ledger obligation). Sources: the 2026-08-21 research sweep
 (`docs/research/2026-08-21-*.md`, PR #1612), especially the decision-ledger
@@ -79,7 +80,7 @@ never transitions a phase. The never-claimed convoy is already visible as
 `Idle ∧ work unsettled`, which is the needs-attention formula; what the
 timeout becomes in Flotilla's shape is a **deadline on the escalation**,
 not a settlement transition: past the deadline the demand escalates
-loudly (ADR 0028's episode-ladder stance), and the convoy stays where
+loudly (ADR 0027's episode-escalation-ladder stance), and the convoy stays where
 truth left it. Force-settle exists in the field because those systems
 have no attention plane; Flotilla has one — use it.
 
