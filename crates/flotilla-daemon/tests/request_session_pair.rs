@@ -28,10 +28,10 @@ use flotilla_protocol::{
 use flotilla_resources::{
     api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
     CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host, HostSpec, HostStatus, InputMeta, PlacementPolicy,
-    PlacementPolicySpec, Regard, Resource, ResourceBackend, ResourceError, ResourceProvenance, WorkPhase as ResourceWorkPhase, WorkState,
-    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL,
-    ROLE_LABEL,
+    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host, HostSpec, HostStatus, InMemoryBackend, InputMeta,
+    PlacementPolicy, PlacementPolicySpec, Regard, Resource, ResourceBackend, ResourceError, ResourceProvenance,
+    WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL,
+    HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
 };
 
 async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
@@ -156,6 +156,91 @@ async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEv
     })
     .await
     .expect("timed out waiting for command result")
+}
+
+#[tokio::test]
+async fn convoy_delete_routes_to_the_home_and_its_tombstone_does_not_resurrect() {
+    let kiwi = empty_daemon_named("kiwi").await;
+    let feta = empty_daemon_named("feta").await;
+    let namespace = "flotilla";
+    let name = "feta-homed";
+    feta.resource_backend()
+        .using::<Convoy>(namespace)
+        .create(
+            &convoy_meta(name, name),
+            &ConvoySpec::builder().workflow_ref("scratch".to_string()).project_ref("flotilla".to_string()).role(name.to_string()).build(),
+        )
+        .await
+        .expect("create feta-homed convoy");
+
+    let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect kiwi and feta");
+    let action = CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: name.to_string(), force: true };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if kiwi.resource_backend().including_replicas::<Convoy>(namespace).get(name).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("feta-homed convoy should replicate to kiwi");
+    apply_convoy_replica_feed(&kiwi, namespace, name, HostName::new("feta")).await;
+    assert_eq!(
+        kiwi.resolve_existing_convoy_target(&action).await.expect("resolve replica home").expect("remote target").home,
+        HostName::new("feta")
+    );
+
+    let mut events = topology.leader.subscribe();
+    let command_id = topology.client.execute(Command::builder().action(action).build()).await.expect("dispatch convoy delete from kiwi");
+    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::Ok);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let absent_at_home =
+                matches!(feta.resource_backend().using::<Convoy>(namespace).get(name).await, Err(ResourceError::NotFound { .. }));
+            let absent_from_peer = matches!(
+                kiwi.resource_backend().including_replicas::<Convoy>(namespace).get(name).await,
+                Err(ResourceError::NotFound { .. })
+            );
+            if absent_at_home && absent_from_peer {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("home deletion should propagate to kiwi");
+
+    drop(topology);
+    let reconnected = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("reconnect kiwi and feta");
+    feta.resource_backend()
+        .using::<Convoy>(namespace)
+        .create(
+            &convoy_meta("after-reconnect", "after-reconnect"),
+            &ConvoySpec::builder()
+                .workflow_ref("scratch".to_string())
+                .project_ref("flotilla".to_string())
+                .role("after-reconnect".to_string())
+                .build(),
+        )
+        .await
+        .expect("create convergence marker");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if kiwi.resource_backend().including_replicas::<Convoy>(namespace).get("after-reconnect").await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reconnected replication should converge");
+    assert!(
+        matches!(kiwi.resource_backend().including_replicas::<Convoy>(namespace).get(name).await, Err(ResourceError::NotFound { .. })),
+        "the deleted convoy must not resurrect after federation reconnects"
+    );
+    drop(reconnected);
 }
 
 #[tokio::test]
@@ -546,6 +631,26 @@ async fn hostless_convoy_command_explains_missing_home_route() {
     let convoy_name = "stranded";
 
     apply_convoy_replica_feed(&topology.leader, namespace, convoy_name, HostName::new("feta")).await;
+    let replica_fixture = ResourceBackend::InMemory(InMemoryBackend::default());
+    replica_fixture
+        .using::<Convoy>(namespace)
+        .create(
+            &convoy_meta(convoy_name, convoy_name),
+            &ConvoySpec::builder().workflow_ref("scratch".to_string()).role(convoy_name.to_string()).build(),
+        )
+        .await
+        .expect("create stranded replica fixture");
+    let replica_snapshot = replica_fixture.using::<Convoy>(namespace).list().await.expect("list stranded replica fixture");
+    topology
+        .leader
+        .resource_backend()
+        .replica_writer::<Convoy>(flotilla_protocol::NodeId::new("feta-root"), namespace)
+        .replace(
+            &replica_snapshot,
+            chrono::DateTime::parse_from_rfc3339("2026-08-21T11:22:33Z").expect("fixed last-seen time").with_timezone(&Utc),
+        )
+        .await
+        .expect("seed stranded replica provenance");
 
     let message = topology
         .client
@@ -561,7 +666,11 @@ async fn hostless_convoy_command_explains_missing_home_route() {
         .await
         .expect_err("unreachable convoy home should reject dispatch");
 
-    assert_eq!(message, "connect to feta for convoy stranded: no routed node address found for host");
+    assert_eq!(
+        message,
+        "convoy flotilla/stranded is homed at feta, last seen 2026-08-21T11:22:33+00:00; home is unreachable: \
+         no routed node address found for host. Break glass: flotilla resource delete convoys stranded --namespace flotilla --host feta"
+    );
 }
 
 #[tokio::test]
