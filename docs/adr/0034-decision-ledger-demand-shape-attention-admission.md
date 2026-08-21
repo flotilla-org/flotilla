@@ -114,12 +114,17 @@ pane commands), so no classification vocabulary is imported:
   crew attention stays exactly 0017's formula. A build an agent runs
   inside its own session is the agent's business, not the attention
   system's.
-- **Bare panes contribute exactly one event: exit — read through a
-  template hint.** A workspace-template pane may declare itself
-  expected-to-persist (a dev server). Its exit is a failure-flavored
-  attention event; an unmarked (bounded) pane's exit is
-  completion-flavored. Both surface on exit; neither surfaces while
-  running. One optional field on template panes; no glossary coinage.
+- **Bare panes contribute exactly one event: exit.** *(Amended
+  2026-08-21, same day: the original ruling added an expected-to-persist
+  template hint with failure- versus completion-flavored exits. Struck —
+  template panes are only ever standing things (dev servers, test
+  runners, agents aside); nobody declares a one-shot command in a
+  workspace template, so the hint was a flag with one value.)* A template
+  pane exiting is the attention event; nothing surfaces while it runs.
+  No template schema change. When a crew agent wants a *bounded* run to
+  be observable, the path is adoption, not templates: run it in a cleat
+  session and it becomes adopted crew, visible through the existing
+  session machinery — observability arriving with the need.
 - **Occupancy suppression.** A session the principal is currently
   attached to raises no Demands — the principal is looking at it. This
   is strictly better than a static "interactive tool" class: the same
@@ -136,7 +141,7 @@ pane commands), so no classification vocabulary is imported:
 - `Demand` grows verdict, response-options, and expiry fields; demand
   admission gains the occupancy check; the escalation path gains
   deadline-driven raising.
-- Workspace-template panes gain the optional expected-to-persist hint;
-  pane exit events map to the two attention flavors.
+- Workspace-template panes are unchanged (the persist hint was struck by
+  the same-day amendment); a pane exit is the single attention event.
 - The independent completeness-auditor remains future work with its two
   rules (non-blocking, cannot change code) binding from now.
