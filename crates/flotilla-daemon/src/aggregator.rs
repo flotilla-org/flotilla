@@ -22,9 +22,10 @@ use flotilla_protocol::{
 use flotilla_resources::{
     api_version, repository_display_labels, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
     Demand, DemandAddressee, DemandState, Environment, Presentation, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard,
-    RegardExpiryPolicy, ReplicaReadResolver, Repository, Resource, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
-    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart,
-    WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    RegardExpiryPolicy, ReplicaReadResolver, Repository, RepositoryIdentity as ResourceRepositoryIdentity, Resource, ResourceError,
+    ResourceList, ResourceObject, ResourceProvenance, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel,
+    VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL,
+    REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::sync::{broadcast, mpsc};
@@ -1114,6 +1115,12 @@ impl Aggregator {
     }
 
     fn replace_managed_terminals(&mut self, snapshot: &RepoSnapshot) -> bool {
+        // Managed-terminal removals are explicit RepoDelta entries. Treat an
+        // empty/default snapshot field as absent so a future partial snapshot
+        // cannot silently wipe pane attention owned by this independent path.
+        if snapshot.providers.managed_terminals.is_empty() {
+            return false;
+        }
         let terminals = snapshot.providers.managed_terminals.iter().map(|(id, terminal)| (id.clone(), terminal.clone())).collect();
         if self.managed_terminals_by_repo.get(&snapshot.repo_identity) == Some(&terminals) {
             return false;
@@ -1692,6 +1699,9 @@ impl Aggregator {
                     .observed_checkouts
                     .values()
                     .filter_map(|checkout| {
+                        if !self.checkout_matches_repo_identity(checkout, repo) {
+                            return None;
+                        }
                         let CheckoutSpec::Observed(spec) = &checkout.spec else { return None };
                         terminal.working_directory.starts_with(&spec.path).then_some((checkout, spec.path.len()))
                     })
@@ -1704,6 +1714,16 @@ impl Aggregator {
             (&left.target.namespace, &left.target.name, left.as_of).cmp(&(&right.target.namespace, &right.target.name, right.as_of))
         });
         SalienceFacts { demands, regards, attention, pane_exits }
+    }
+
+    fn checkout_matches_repo_identity(&self, checkout: &ResourceObject<Checkout>, repo: &RepoIdentity) -> bool {
+        let CheckoutSpec::Observed(spec) = &checkout.spec else { return false };
+        if repo.authority == "local" {
+            return spec.path == repo.path;
+        }
+        let Some(repository) = self.repositories.get(&spec.repo_ref) else { return false };
+        let ResourceRepositoryIdentity::Remote { canonical_remote } = repository.spec.identity() else { return false };
+        RepoIdentity::from_remote_url(canonical_remote).as_ref() == Some(repo)
     }
 
     fn next_regard_expiry_delay(&self) -> Option<std::time::Duration> {
@@ -2659,8 +2679,14 @@ mod tests {
             .apply_checkout_event(WatchEvent::Added(checkout_object("flotilla", "/work/flotilla", repository.spec.key()).await))
             .await
             .expect("checkout projection");
+        let nested_repository = repository_object("https://github.com/flotilla-org/nested").await;
+        aggregator.apply_repository_event(WatchEvent::Added(nested_repository.clone())).await;
+        aggregator
+            .apply_checkout_event(WatchEvent::Added(checkout_object("nested", "/work/flotilla/app", nested_repository.spec.key()).await))
+            .await
+            .expect("nested checkout projection");
 
-        let checkout_salience = async |state: &AggregatorProjectionState| {
+        let checkout_salience = async |state: &AggregatorProjectionState, name: &str| {
             let result = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
             result
                 .rows
@@ -2668,7 +2694,9 @@ mod tests {
                 .expect("awareness rows")
                 .iter()
                 .flat_map(|node| &node.entries)
-                .find(|entry| entry.kind == flotilla_protocol::AwarenessKind::Checkout)
+                .find(|entry| {
+                    entry.kind == flotilla_protocol::AwarenessKind::Checkout && entry.refs.iter().any(|reference| reference.name == name)
+                })
                 .expect("checkout entry")
                 .salience
         };
@@ -2681,14 +2709,27 @@ mod tests {
         assert!(!aggregator.repo_delta_changed_change_requests(&running));
         assert_eq!(aggregator.repo_change_requests.get(&repo_identity), Some(&fingerprint));
         assert!(!aggregator.rebuild_salience_projection().await);
-        assert_eq!(checkout_salience(&state).await, flotilla_protocol::Salience::None);
+        assert_eq!(checkout_salience(&state, "flotilla").await, flotilla_protocol::Salience::None);
 
-        let exited = managed_terminal_delta(repo_identity, "pane-1", Some(PaneExitAttention { exit_code: 7 }), true);
+        let exited = managed_terminal_delta(repo_identity.clone(), "pane-1", Some(PaneExitAttention { exit_code: 7 }), true);
         assert!(aggregator.apply_managed_terminal_delta(&exited));
         assert!(aggregator.rebuild_salience_projection().await);
-        assert_eq!(checkout_salience(&state).await, flotilla_protocol::Salience::Attention);
+        assert_eq!(checkout_salience(&state, "flotilla").await, flotilla_protocol::Salience::Attention);
+        assert_eq!(checkout_salience(&state, "nested").await, flotilla_protocol::Salience::None);
         assert!(aggregator.apply_managed_terminal_delta(&exited));
         assert!(!aggregator.rebuild_salience_projection().await, "the same exit is not admitted twice");
+
+        let partial_snapshot = RepoSnapshot {
+            seq: 2,
+            repo_identity,
+            repo: Some("/work/flotilla".into()),
+            node_id: flotilla_protocol::NodeId::new("local-node"),
+            providers: ProviderData::default(),
+            provider_health: HashMap::new(),
+            errors: Vec::new(),
+        };
+        assert!(!aggregator.replace_managed_terminals(&partial_snapshot));
+        assert_eq!(checkout_salience(&state, "flotilla").await, flotilla_protocol::Salience::Attention);
     }
 
     fn attention_meta(name: &str, creation_timestamp: chrono::DateTime<Utc>) -> ObjectMeta {
