@@ -45,9 +45,15 @@ union for facts, field-merge for definitions. Nothing here narrows them.
 ## Creation: authorship cascades from the parent
 
 The gap 0016 left open: who authors a *new* record when several roots
-could? (All three roots ran the materializer over the andamento project
-and each authored `ConvoyEnsure/governor` — which is why one schema
-change later, all three daemons quarantined at once.)
+could? The observed fact (#1593): after one schema change, every root
+held an undecodable stored copy of `ConvoyEnsure/governor` in its own
+store — clearing them took per-root store surgery, and the sets differed
+(udder also held `ConvoyEnsure/andamento-governor`). Independent per-root
+authorship is the inferred mechanism rather than a narrated one: the
+materializer carries no home gate at all, so every root that observes a
+project is architecturally positioned to author its entries. Whichever
+path put three copies in three stores, no invariant forbade it — that is
+the gap.
 
 **A controller authors a child record only at the home of its parent.**
 The root homing `Project/andamento` — and only that root — materializes
