@@ -629,6 +629,18 @@ async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
     let logs = String::from_utf8(log_output.lock().expect("log capture lock should be healthy").clone()).expect("logs should be utf-8");
     assert!(logs.contains("skipping project materialization away from its home"), "captured logs: {logs:?}");
     assert!(logs.contains("replicated"), "skip log should identify the Project: {logs:?}");
+
+    let register =
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: tmp.path().to_string_lossy().into_owned() })
+            .await;
+    assert!(
+        matches!(&register, CommandValue::Error { message } if message.contains("homed by another root") && message.contains("at its home")),
+        "replica-only registration should identify the Project's remote home: {register:?}"
+    );
+    assert!(
+        matches!(backend.using::<Project>("flotilla").get("replicated").await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+        "registration at a replica root must not establish local Project authorship"
+    );
 }
 
 #[tokio::test]

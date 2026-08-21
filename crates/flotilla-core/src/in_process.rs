@@ -5190,8 +5190,10 @@ impl InProcessDaemon {
         let declaration = parse_project_declaration(&inspection.yaml)?;
         let name = declaration.name.clone();
         self.materialize_project_declaration(declaration, inspection).await?;
-        let project =
-            self.resource_backend.clone().definitions::<Project>(&namespace).get(&name).await.map_err(|error| error.to_string())?;
+        let project = self.resource_backend.clone().using::<Project>(&namespace).get(&name).await.map_err(|error| match error {
+            ResourceError::NotFound { .. } => format!("project {name} is homed by another root; register it at its home"),
+            error => error.to_string(),
+        })?;
         Ok((name, project.spec.repositories.len()))
     }
 
