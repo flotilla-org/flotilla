@@ -598,6 +598,8 @@ test "$(grep -Fxc -- '--user restart flotillad.service' "$test_root/systemctl.lo
 DAEMON_RUNNING=1 STOP_FAIL=0 run_installer latest >"$test_root/latest.out"
 grep -Fq "generation $generation_two confirmed healthy" "$test_root/latest.out" \
   || fail 'healthy Linux upgrade was not confirmed'
+compgen -G "$test_root/home/.local/opt/flotilla-fleet/.confirmation.*.log" >/dev/null \
+  && fail 'completed health watchdog left a confirmation log behind'
 grep -Fq "$generation_one -> $generation_two" "$test_root/latest.out" || fail 'latest did not print the exact transition'
 grep -Fq 'daemon stop requested' "$test_root/latest.out" || fail 'running daemon was not stopped before switching'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_two" || fail 'latest did not select newest promoted generation'

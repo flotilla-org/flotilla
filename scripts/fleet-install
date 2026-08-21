@@ -40,6 +40,7 @@ die() {
 
 cleanup() {
   [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
+  [[ -z "$CONFIRMATION_LOG" ]] || rm -f -- "$CONFIRMATION_LOG"
   if ((INSTALL_LOCK_HELD)); then
     python3 - "$INSTALL_LOCK_PATH" "$INSTALL_LOCK_OWNER" <<'PY'
 import os
@@ -979,9 +980,11 @@ await_confirmation_watchdog() {
   else
     result=$?
   fi
-  [[ ! -f "$CONFIRMATION_LOG" ]] || cat "$CONFIRMATION_LOG"
   case "$result" in
-    0) return 0 ;;
+    0)
+      printf 'fleet-install: generation %s confirmed healthy\n' "$generation"
+      return 0
+      ;;
     10) die "generation $generation failed health confirmation; rolled back to $rollback_generation" ;;
     *) die "generation $generation failed health confirmation and no healthy previous generation could be restored" ;;
   esac
@@ -1167,6 +1170,7 @@ main() {
   if [[ "${1:-}" == __confirm ]]; then
     [[ $# -eq 4 ]] || usage
     PLATFORM="$(host_platform)"
+    CONFIRMATION_LOG="$FLEET_ROOT/.confirmation.$4.log"
     confirmation_watchdog "$2" "$3" "$4"
     return
   fi
