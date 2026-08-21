@@ -1010,6 +1010,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at = None;
                     state.message = Some(prompt.clone());
                 }
+                clear_pending_brief_for(status, vessel, role);
             }
             Self::SetPendingBrief { pending_brief } => {
                 status.turn_deliveries.entry(PENDING_BRIEF_DELIVERY_SOURCE.to_string()).or_default().pending_brief =
