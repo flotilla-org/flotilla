@@ -30,6 +30,7 @@ pub(crate) const ENVIRONMENT_CLEAT_LIBRARY_DIR: &str = "/usr/local/lib/flotilla"
 pub(crate) const ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH: &str = "/usr/local/lib/flotilla/libghostty-vt.so.0";
 pub(crate) const ENVIRONMENT_CLEAT_RUNTIME_DIR: &str = "/var/lib/flotilla/cleat";
 const CLEAT_GHOSTTY_LIBRARY: &str = "libghostty-vt.so.0";
+const FLEET_INSTALL_MARKER: &str = "# managed by fleet-install";
 
 #[async_trait]
 pub(crate) trait EnvironmentToolFactory: Send + Sync {
@@ -230,11 +231,7 @@ impl EnvironmentToolFactory for CleatTool {
         let binary_path = self.binary_path.as_ref().map_err(|error| format!("cleat unavailable for environment provisioning: {error}"))?;
         let ghostty_library_path = self
             .ghostty_library_path
-            .get_or_try_init(|| async {
-                let runner =
-                    self.runner.as_ref().ok_or_else(|| "local command runner unavailable for cleat asset discovery".to_string())?;
-                resolve_cleat_ghostty_library(&**runner, binary_path).await
-            })
+            .get_or_try_init(|| resolve_cleat_ghostty_library(self.runner.as_deref(), binary_path))
             .await
             .map_err(|error| format!("cleat unavailable for environment provisioning: {error}"))?;
         let state_path = self.state_root.join(environment_name);
@@ -299,7 +296,58 @@ fn resolve_host_binary_from(path: &Path, current_dir: &Path, search_path: Option
     if !canonical.is_file() {
         return Err(format!("resolved host binary is not a file: {}", canonical.display()));
     }
+    let canonical = resolve_fleet_cleat_launcher(&canonical)?.unwrap_or(canonical);
     Ok(DaemonHostPath::new(canonical))
+}
+
+fn resolve_fleet_cleat_launcher(path: &Path) -> Result<Option<PathBuf>, String> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let mut lines = contents.lines();
+    if lines.next() != Some("#!/usr/bin/env bash") || lines.next() != Some(FLEET_INSTALL_MARKER) {
+        return Ok(None);
+    }
+    let command = lines.next().ok_or_else(|| format!("fleet cleat launcher has no exec command: {}", path.display()))?;
+    if lines.next().is_some() {
+        return Err(format!("fleet cleat launcher has unexpected trailing content: {}", path.display()));
+    }
+    let encoded_target = command
+        .strip_prefix("exec ")
+        .and_then(|command| command.strip_suffix(" \"$@\""))
+        .ok_or_else(|| format!("fleet cleat launcher has an unexpected exec command: {}", path.display()))?;
+    let target = decode_bash_printf_q_word(encoded_target)
+        .ok_or_else(|| format!("fleet cleat launcher target is not a supported shell word: {}", path.display()))?;
+    let target = PathBuf::from(target);
+    if !target.is_absolute() {
+        return Err(format!("fleet cleat launcher target is not absolute: {}", target.display()));
+    }
+    let canonical = std::fs::canonicalize(&target)
+        .map_err(|error| format!("resolve fleet cleat binary {} from launcher {}: {error}", target.display(), path.display()))?;
+    if !canonical.is_file() {
+        return Err(format!("resolved fleet cleat binary is not a file: {}", canonical.display()));
+    }
+    Ok(Some(canonical))
+}
+
+/// Decodes the ordinary one-word form emitted by Bash's `printf %q`.
+///
+/// Fleet install roots must be filesystem paths, so control-character paths
+/// (which Bash renders using `$'...'`) are deliberately unsupported.
+fn decode_bash_printf_q_word(encoded: &str) -> Option<String> {
+    if encoded.is_empty() {
+        return None;
+    }
+    let mut decoded = String::with_capacity(encoded.len());
+    let mut characters = encoded.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => decoded.push(characters.next()?),
+            character if character.is_whitespace() || "'\"$`;|&()<>".contains(character) => return None,
+            character => decoded.push(character),
+        }
+    }
+    Some(decoded)
 }
 
 fn resolve_host_binary(path: &Path) -> Result<DaemonHostPath, String> {
@@ -342,7 +390,19 @@ fn running_daemon_flotilla_binary() -> Result<DaemonHostPath, String> {
     }
 }
 
-async fn resolve_cleat_ghostty_library(runner: &dyn CommandRunner, cleat_binary_path: &DaemonHostPath) -> Result<DaemonHostPath, String> {
+async fn resolve_cleat_ghostty_library(
+    runner: Option<&dyn CommandRunner>,
+    cleat_binary_path: &DaemonHostPath,
+) -> Result<DaemonHostPath, String> {
+    if let Some(generation_root) = cleat_binary_path.as_path().parent().and_then(Path::parent) {
+        let bundled_library = generation_root.join("lib").join(CLEAT_GHOSTTY_LIBRARY);
+        if bundled_library.is_file() {
+            let canonical = std::fs::canonicalize(&bundled_library)
+                .map_err(|error| format!("resolve bundled cleat runtime library {}: {error}", bundled_library.display()))?;
+            return Ok(DaemonHostPath::new(canonical));
+        }
+    }
+    let runner = runner.ok_or_else(|| "local command runner unavailable for cleat asset discovery".to_string())?;
     let binary = cleat_binary_path.as_path().to_string_lossy().into_owned();
     let output = runner.run_output("ldd", &[&binary], Path::new("/"), &ChannelLabel::Default).await?;
     if !output.success {
@@ -383,6 +443,44 @@ mod tests {
             resolve_host_binary_from(Path::new("cleat"), Path::new("/not-used"), Some(&search_path)).expect("resolve detected binary");
 
         assert_eq!(resolved.as_path(), binary.canonicalize().expect("canonical binary"));
+    }
+
+    #[tokio::test]
+    async fn prepares_cleat_from_a_fleet_launcher() {
+        let temp = TempDir::new().expect("tempdir");
+        let fleet_root = temp.path().join("fleet root");
+        let generation = fleet_root.join("releases/generation-1");
+        let binary = generation.join("bin/cleat");
+        let library = generation.join("lib/libghostty-vt.so.0");
+        fs::create_dir_all(binary.parent().expect("binary parent")).expect("generation binary directory");
+        fs::create_dir_all(library.parent().expect("library parent")).expect("generation library directory");
+        fs::write(&binary, b"cleat binary").expect("generation binary");
+        fs::write(&library, b"ghostty library").expect("generation library");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&generation, fleet_root.join("current")).expect("current generation link");
+
+        let launcher_directory = temp.path().join("bin");
+        fs::create_dir_all(&launcher_directory).expect("launcher directory");
+        let launcher = launcher_directory.join("cleat");
+        let encoded_root = fleet_root.to_string_lossy().replace(' ', "\\ ");
+        fs::write(&launcher, format!("#!/usr/bin/env bash\n{FLEET_INSTALL_MARKER}\nexec {encoded_root}/current/bin/cleat \"$@\"\n"))
+            .expect("fleet launcher");
+        let search_path = env::join_paths([launcher_directory]).expect("search path");
+
+        let resolved = resolve_host_binary_from(Path::new("cleat"), Path::new("/not-used"), Some(&search_path))
+            .expect("resolve generation binary from launcher");
+        let tool = CleatTool {
+            binary_path: Ok(resolved),
+            ghostty_library_path: OnceCell::new(),
+            state_root: temp.path().join("state"),
+            runner: None,
+        }
+        .prepare("contained-work")
+        .await
+        .expect("prepare cleat from fleet launcher");
+
+        assert_eq!(tool.assets[0].host_path.as_path(), binary.canonicalize().expect("canonical generation binary"));
+        assert_eq!(tool.assets[1].host_path.as_path(), library.canonicalize().expect("canonical generation library"));
     }
 
     #[test]
@@ -461,9 +559,24 @@ mod tests {
             )
             .build();
 
-        let library =
-            resolve_cleat_ghostty_library(&runner, &DaemonHostPath::new("/opt/flotilla/bin/cleat")).await.expect("resolve ghostty library");
+        let library = resolve_cleat_ghostty_library(Some(&runner), &DaemonHostPath::new("/opt/flotilla/bin/cleat"))
+            .await
+            .expect("resolve ghostty library");
 
         assert_eq!(library, DaemonHostPath::new("/opt/flotilla/lib/libghostty-vt.so.0"));
+    }
+
+    #[tokio::test]
+    async fn resolves_the_cleat_vt_library_from_the_generation_bundle() {
+        let temp = TempDir::new().expect("tempdir");
+        let binary = temp.path().join("generation/bin/cleat");
+        let library = temp.path().join("generation/lib/libghostty-vt.so.0");
+        fs::create_dir_all(binary.parent().expect("binary parent")).expect("binary directory");
+        fs::create_dir_all(library.parent().expect("library parent")).expect("library directory");
+        fs::write(&binary, b"cleat binary").expect("cleat binary");
+        fs::write(&library, b"ghostty library").expect("ghostty library");
+        let resolved = resolve_cleat_ghostty_library(None, &DaemonHostPath::new(binary)).await.expect("resolve bundled ghostty library");
+
+        assert_eq!(resolved.as_path(), library.canonicalize().expect("canonical bundled library"));
     }
 }
