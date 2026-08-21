@@ -222,7 +222,13 @@ impl ResourceClient {
                         }
                     };
                 }
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    return Err(format!(
+                        "delete {}/{} from root {} lost {skipped} daemon events while waiting for completion; rerun the sweep",
+                        source.kind, source.name, source.root.host_id
+                    ));
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     return Err(format!("daemon closed while deleting {}/{}", source.kind, source.name));
                 }
