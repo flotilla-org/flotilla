@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use flotilla_protocol::{
-    arg, commands::AttachMode, qualified_path::QualifiedPath, AttachableId, AttachableSet, AttachableSetId, HostName, TerminalStatus,
+    arg, commands::AttachMode, qualified_path::QualifiedPath, AttachableId, AttachableSet, AttachableSetId, HostName, PaneExitAttention,
+    TerminalStatus,
 };
 use tracing::warn;
 
@@ -44,6 +45,25 @@ pub struct TerminalInfo {
     pub command: String,
     pub working_directory: ExecutionEnvironmentPath,
     pub status: TerminalStatus,
+    pub expected_to_persist: bool,
+    pub attention: Option<PaneExitAttention>,
+}
+
+pub struct TerminalLaunchSpec {
+    pub command: String,
+    pub working_directory: ExecutionEnvironmentPath,
+    pub expected_to_persist: bool,
+}
+
+impl TerminalLaunchSpec {
+    pub fn new(command: impl Into<String>, working_directory: ExecutionEnvironmentPath) -> Self {
+        Self { command: command.into(), working_directory, expected_to_persist: false }
+    }
+
+    pub fn with_persistence_expectation(mut self, expected_to_persist: bool) -> Self {
+        self.expected_to_persist = expected_to_persist;
+        self
+    }
 }
 
 /// Manages terminal session lifecycle using a `TerminalPool` for CLI operations
@@ -89,20 +109,29 @@ impl TerminalManager {
         role: &str,
         index: u32,
         checkout: &str,
-        command: &str,
-        working_directory: ExecutionEnvironmentPath,
+        launch: TerminalLaunchSpec,
     ) -> Result<AttachableId, String> {
         let mut store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
         let target_purpose = TerminalPurpose { checkout: checkout.to_string(), role: role.to_string(), index };
         // Return existing terminal if one matches the purpose within this set.
-        for (id, attachable) in store.registry().attachables.iter() {
-            if attachable.set_id != set_id {
-                continue;
+        let existing = store
+            .registry()
+            .attachables
+            .iter()
+            .find(|(_, attachable)| {
+                attachable.set_id == set_id
+                    && match &attachable.content {
+                        AttachableContent::Terminal(terminal) => terminal.purpose == target_purpose,
+                    }
+            })
+            .map(|(id, attachable)| (id.clone(), attachable.clone()));
+        if let Some((id, mut attachable)) = existing {
+            let AttachableContent::Terminal(terminal) = &mut attachable.content;
+            if terminal.expected_to_persist != launch.expected_to_persist {
+                terminal.expected_to_persist = launch.expected_to_persist;
+                store.insert_attachable(attachable);
             }
-            let AttachableContent::Terminal(t) = &attachable.content;
-            if t.purpose == target_purpose {
-                return Ok(id.clone());
-            }
+            return Ok(id);
         }
         let id = store.allocate_attachable_id();
         let metadata = ManagedSessionMetadata::builder()
@@ -111,16 +140,17 @@ impl TerminalManager {
             .checkout(target_purpose.checkout.clone())
             .role(target_purpose.role.clone())
             .index(target_purpose.index)
-            .working_directory(working_directory.clone())
+            .working_directory(launch.working_directory.clone())
             .build();
         store.insert_attachable(Attachable {
             id: id.clone(),
             set_id: set_id.clone(),
             content: AttachableContent::Terminal(TerminalAttachable {
                 purpose: target_purpose,
-                command: command.to_string(),
-                working_directory,
+                command: launch.command,
+                working_directory: launch.working_directory,
                 status: TerminalStatus::Disconnected,
+                expected_to_persist: launch.expected_to_persist,
             }),
         });
         // Add the member link to the set.
@@ -264,6 +294,10 @@ impl TerminalManager {
                     AttachableContent::Terminal(terminal) => terminal.command.clone(),
                 })
             });
+            let expected_to_persist =
+                store.registry().attachables.get(&metadata.attachable_id).is_some_and(|attachable| match &attachable.content {
+                    AttachableContent::Terminal(terminal) => terminal.expected_to_persist,
+                });
             let discovered = Attachable {
                 id: metadata.attachable_id.clone(),
                 set_id: metadata.set_id.clone(),
@@ -272,6 +306,7 @@ impl TerminalManager {
                     command: command.unwrap_or_default(),
                     working_directory: metadata.working_directory,
                     status: session.status.clone(),
+                    expected_to_persist,
                 }),
             };
             if store.registry().attachables.get(&metadata.attachable_id) != Some(&discovered) {
@@ -342,6 +377,8 @@ impl TerminalManager {
                             command: t.command.clone(),
                             working_directory: t.working_directory.clone(),
                             status: new_status,
+                            expected_to_persist: t.expected_to_persist,
+                            attention: t.exit_attention(),
                         });
                     }
                 }

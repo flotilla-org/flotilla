@@ -114,7 +114,9 @@ async fn allocate_terminal_creates_attachable() {
     let mgr = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone(), test_host());
 
     let set_id = mgr.allocate_set(test_host(), test_checkout().into()).expect("allocate_set");
-    let att_id = mgr.allocate_terminal(set_id.clone(), "shell", 0, "feat", "$SHELL", ee("/repo/wt-feat")).expect("allocate_terminal");
+    let att_id = mgr
+        .allocate_terminal(set_id.clone(), "shell", 0, "feat", TerminalLaunchSpec::new("$SHELL", ee("/repo/wt-feat")))
+        .expect("allocate_terminal");
 
     let store = store.lock().expect("lock store");
     let attachable = store.registry().attachables.get(&att_id).expect("attachable should exist");
@@ -132,13 +134,39 @@ async fn allocate_terminal_creates_attachable() {
 }
 
 #[tokio::test]
+async fn allocate_terminal_updates_persistence_expectation_on_existing_pane() {
+    let store = shared_in_memory_attachable_store();
+    let mgr = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone(), test_host());
+    let set_id = mgr.allocate_set(test_host(), test_checkout().into()).expect("allocate_set");
+    let first = mgr
+        .allocate_terminal(set_id.clone(), "server", 0, "feat", TerminalLaunchSpec::new("npm run dev", ee("/repo/wt-feat")))
+        .expect("allocate terminal");
+    let second = mgr
+        .allocate_terminal(
+            set_id,
+            "server",
+            0,
+            "feat",
+            TerminalLaunchSpec::new("npm run dev", ee("/repo/wt-feat")).with_persistence_expectation(true),
+        )
+        .expect("update terminal");
+
+    assert_eq!(first, second);
+    let store = store.lock().expect("lock store");
+    let attachable = store.registry().attachables.get(&first).expect("attachable");
+    let AttachableContent::Terminal(terminal) = &attachable.content;
+    assert!(terminal.expected_to_persist);
+}
+
+#[tokio::test]
 async fn ensure_running_delegates_to_pool() {
     let store = shared_in_memory_attachable_store();
     let pool = MockTerminalPool::new();
     let mgr = TerminalManager::new(Arc::new(pool), store.clone(), test_host());
 
     let set_id = mgr.allocate_set(test_host(), test_checkout().into()).expect("allocate_set");
-    let att_id = mgr.allocate_terminal(set_id, "shell", 0, "feat", "bash", ee("/repo/wt-feat")).expect("allocate_terminal");
+    let att_id =
+        mgr.allocate_terminal(set_id, "shell", 0, "feat", TerminalLaunchSpec::new("bash", ee("/repo/wt-feat"))).expect("allocate_terminal");
 
     mgr.ensure_running(&att_id, None).await.expect("ensure_running");
 
@@ -212,7 +240,8 @@ async fn ensure_running_uses_provider_discovery_session_name() {
     let _ = mock; // silence unused warning
 
     let set_id = mgr.allocate_set(test_host(), test_checkout().into()).expect("allocate_set");
-    let att_id = mgr.allocate_terminal(set_id, "shell", 0, "feat", "bash", ee("/repo/wt-feat")).expect("allocate_terminal");
+    let att_id =
+        mgr.allocate_terminal(set_id, "shell", 0, "feat", TerminalLaunchSpec::new("bash", ee("/repo/wt-feat"))).expect("allocate_terminal");
 
     mgr.ensure_running(&att_id, Some("/tmp/flotilla.sock")).await.expect("ensure_running");
 
@@ -280,7 +309,9 @@ async fn attach_command_includes_env_vars() {
     let mgr = TerminalManager::new(Arc::new(SharedMock { calls: calls_clone }), store.clone(), test_host());
 
     let set_id = mgr.allocate_set(test_host(), test_checkout().into()).expect("allocate_set");
-    let att_id = mgr.allocate_terminal(set_id, "agent", 1, "feat", "claude", ee("/repo/wt-feat")).expect("allocate_terminal");
+    let att_id = mgr
+        .allocate_terminal(set_id, "agent", 1, "feat", TerminalLaunchSpec::new("claude", ee("/repo/wt-feat")))
+        .expect("allocate_terminal");
 
     let result = mgr.attach_command(&att_id, Some("/tmp/flotilla.sock")).await.expect("attach_command");
     assert!(result.contains("attach"));
@@ -328,6 +359,7 @@ async fn attach_command_rejects_remote_attachable() {
                 command: "bash".to_string(),
                 working_directory: ee("/remote/wt-feat"),
                 status: flotilla_protocol::TerminalStatus::Disconnected,
+                expected_to_persist: false,
             }),
         });
     }
@@ -385,7 +417,8 @@ async fn kill_terminal_delegates_to_pool() {
     let mgr = TerminalManager::new(Arc::new(SharedMock { calls: calls_clone }), store.clone(), test_host());
 
     let set_id = mgr.allocate_set(test_host(), test_checkout().into()).expect("allocate_set");
-    let att_id = mgr.allocate_terminal(set_id, "shell", 0, "feat", "bash", ee("/repo/wt-feat")).expect("allocate_terminal");
+    let att_id =
+        mgr.allocate_terminal(set_id, "shell", 0, "feat", TerminalLaunchSpec::new("bash", ee("/repo/wt-feat"))).expect("allocate_terminal");
 
     mgr.kill_terminal(&att_id).await.expect("kill_terminal");
 
@@ -405,7 +438,9 @@ async fn refresh_updates_statuses() {
     let mgr_for_setup = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone(), test_host());
 
     let set_id = mgr_for_setup.allocate_set(test_host(), test_checkout().into()).expect("allocate_set");
-    let att_id = mgr_for_setup.allocate_terminal(set_id, "shell", 0, "feat", "bash", ee("/repo/wt-feat")).expect("allocate_terminal");
+    let att_id = mgr_for_setup
+        .allocate_terminal(set_id, "shell", 0, "feat", TerminalLaunchSpec::new("bash", ee("/repo/wt-feat")))
+        .expect("allocate_terminal");
 
     // Create a new manager with a pool that reports the session as running.
     let pool = MockTerminalPool::with_sessions(vec![TerminalSession {
@@ -421,8 +456,41 @@ async fn refresh_updates_statuses() {
     assert_eq!(infos.len(), 1);
     assert_eq!(infos[0].attachable_id, att_id);
     assert_eq!(infos[0].status, TerminalStatus::Running);
+    assert_eq!(infos[0].attention, None);
     assert_eq!(infos[0].role, "shell");
     assert_eq!(infos[0].checkout, "feat");
+}
+
+#[tokio::test]
+async fn refresh_flavors_only_exited_pane_attention_from_persistence_expectation() {
+    use flotilla_protocol::PaneExitAttentionFlavor;
+
+    for (expected_to_persist, expected_flavor) in [(false, PaneExitAttentionFlavor::Completion), (true, PaneExitAttentionFlavor::Failure)] {
+        let store = shared_in_memory_attachable_store();
+        let setup = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone(), test_host());
+        let set_id = setup.allocate_set(test_host(), test_checkout().into()).expect("allocate_set");
+        let attachable_id = setup
+            .allocate_terminal(
+                set_id,
+                "server",
+                0,
+                "feat",
+                TerminalLaunchSpec::new("npm run dev", ee("/repo/wt-feat")).with_persistence_expectation(expected_to_persist),
+            )
+            .expect("allocate_terminal");
+        let pool = MockTerminalPool::with_sessions(vec![TerminalSession {
+            session_name: attachable_id.to_string(),
+            status: TerminalStatus::Exited(7),
+            command: Some("npm run dev".to_string()),
+            working_directory: Some(ee("/repo/wt-feat")),
+            screen_activity: None,
+        }]);
+
+        let infos = TerminalManager::new(Arc::new(pool), store, test_host()).refresh().await.expect("refresh");
+        let attention = infos[0].attention.as_ref().expect("exited pane attention");
+        assert_eq!(attention.flavor, expected_flavor);
+        assert_eq!(attention.exit_code, 7);
+    }
 }
 
 #[tokio::test]
@@ -431,7 +499,9 @@ async fn refresh_reports_disconnected_for_missing_sessions() {
     let mgr_for_setup = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone(), test_host());
 
     let set_id = mgr_for_setup.allocate_set(test_host(), test_checkout().into()).expect("allocate_set");
-    let att_id = mgr_for_setup.allocate_terminal(set_id, "shell", 0, "feat", "bash", ee("/repo/wt-feat")).expect("allocate_terminal");
+    let att_id = mgr_for_setup
+        .allocate_terminal(set_id, "shell", 0, "feat", TerminalLaunchSpec::new("bash", ee("/repo/wt-feat")))
+        .expect("allocate_terminal");
 
     // Pool returns empty — no live sessions.
     let pool = MockTerminalPool::new();
@@ -486,8 +556,12 @@ async fn cascade_delete_removes_sets_and_kills_sessions() {
     let mgr = TerminalManager::new(Arc::new(SharedMock { calls: calls_clone }), store.clone(), test_host());
 
     let set_id = mgr.allocate_set(test_host(), test_checkout().into()).expect("allocate_set");
-    let att_id_1 = mgr.allocate_terminal(set_id.clone(), "shell", 0, "feat", "bash", ee("/repo/wt-feat")).expect("allocate_terminal");
-    let att_id_2 = mgr.allocate_terminal(set_id, "agent", 0, "feat", "claude", ee("/repo/wt-feat")).expect("allocate_terminal");
+    let att_id_1 = mgr
+        .allocate_terminal(set_id.clone(), "shell", 0, "feat", TerminalLaunchSpec::new("bash", ee("/repo/wt-feat")))
+        .expect("allocate_terminal");
+    let att_id_2 = mgr
+        .allocate_terminal(set_id, "agent", 0, "feat", TerminalLaunchSpec::new("claude", ee("/repo/wt-feat")))
+        .expect("allocate_terminal");
 
     mgr.cascade_delete(&[test_checkout().into()]).await.expect("cascade_delete");
 

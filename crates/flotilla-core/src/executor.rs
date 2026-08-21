@@ -913,7 +913,11 @@ impl StepResolver for ExecutorStepResolver {
                     let workspace_config = workspace_config.clone();
                     terminals::render_fallback_commands(move || workspace_config.clone())
                         .into_iter()
-                        .map(|cmd| ResolvedPaneCommand { role: cmd.role, args: vec![Arg::Literal(cmd.command)] })
+                        .map(|cmd| ResolvedPaneCommand {
+                            role: cmd.role,
+                            args: vec![Arg::Literal(cmd.command)],
+                            expected_to_persist: cmd.expected_to_persist,
+                        })
                         .collect()
                 };
 
@@ -1074,7 +1078,11 @@ impl StepResolver for ExecutorStepResolver {
                     } else if !requested_commands.is_empty() {
                         requested_commands
                             .iter()
-                            .map(|cmd| ResolvedPaneCommand { role: cmd.role.clone(), args: vec![Arg::Literal(cmd.command.clone())] })
+                            .map(|cmd| ResolvedPaneCommand {
+                                role: cmd.role.clone(),
+                                args: vec![Arg::Literal(cmd.command.clone())],
+                                expected_to_persist: cmd.expected_to_persist,
+                            })
                             .collect()
                     } else {
                         terminals::render_fallback_commands(|| {
@@ -1087,7 +1095,11 @@ impl StepResolver for ExecutorStepResolver {
                             )
                         })
                         .into_iter()
-                        .map(|cmd| ResolvedPaneCommand { role: cmd.role, args: vec![Arg::Literal(cmd.command)] })
+                        .map(|cmd| ResolvedPaneCommand {
+                            role: cmd.role,
+                            args: vec![Arg::Literal(cmd.command)],
+                            expected_to_persist: cmd.expected_to_persist,
+                        })
                         .collect()
                     };
                     Ok(StepOutcome::CompletedWith(CommandValue::TerminalPrepared {

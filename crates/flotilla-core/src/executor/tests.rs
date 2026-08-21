@@ -645,7 +645,11 @@ async fn prepare_terminal_for_checkout_returns_terminal_commands() {
             assert_eq!(branch, "feat");
             assert_eq!(checkout_path, path);
             assert!(attachable_set_id.is_some(), "prepare should allocate an attachable set");
-            assert_eq!(commands, vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("claude".into())] }]);
+            assert_eq!(commands, vec![ResolvedPaneCommand {
+                role: "main".into(),
+                args: vec![Arg::Literal("claude".into())],
+                expected_to_persist: false,
+            }]);
         }
         other => panic!("expected TerminalPrepared, got {other:?}"),
     }
@@ -782,7 +786,11 @@ async fn create_workspace_from_prepared_terminal_wraps_remote_commands_in_ssh() 
             branch: "feat".into(),
             checkout_path: PathBuf::from("/remote/feat"),
             attachable_set_id: Some(attachable_set_id),
-            commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash -l".into())] }],
+            commands: vec![ResolvedPaneCommand {
+                role: "main".into(),
+                args: vec![Arg::Literal("bash -l".into())],
+                expected_to_persist: false,
+            }],
         },
         registry,
         empty_data(),
@@ -830,7 +838,11 @@ async fn create_workspace_from_prepared_terminal_prefixes_name_with_host() {
             branch: "feat".into(),
             checkout_path: PathBuf::from("/remote/feat"),
             attachable_set_id: Some(attachable_set_id),
-            commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
+            commands: vec![ResolvedPaneCommand {
+                role: "main".into(),
+                args: vec![Arg::Literal("bash".into())],
+                expected_to_persist: false,
+            }],
         },
         registry,
         empty_data(),
@@ -873,7 +885,11 @@ async fn create_workspace_from_prepared_terminal_persists_remote_attachable_set_
             branch: "feat".into(),
             checkout_path: PathBuf::from("/remote/feat"),
             attachable_set_id: Some(set_id.clone()),
-            commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
+            commands: vec![ResolvedPaneCommand {
+                role: "main".into(),
+                args: vec![Arg::Literal("bash".into())],
+                expected_to_persist: false,
+            }],
         },
         registry,
         empty_data(),
@@ -994,7 +1010,11 @@ async fn create_workspace_from_prepared_terminal_uses_local_fallback_for_remote_
             branch: "feat".into(),
             checkout_path: PathBuf::from("/remote/feat"),
             attachable_set_id: Some(attachable_set_id),
-            commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash -l".into())] }],
+            commands: vec![ResolvedPaneCommand {
+                role: "main".into(),
+                args: vec![Arg::Literal("bash -l".into())],
+                expected_to_persist: false,
+            }],
         },
         registry,
         empty_data(),
@@ -3281,10 +3301,10 @@ async fn prepare_terminal_commands_wraps_requested_commands_via_terminal_manager
     let set_id = tm.allocate_set(HostName::local(), HostPath::new(HostName::local(), "/repo/wt").into()).expect("allocate terminal set");
 
     let service = super::terminals::TerminalPreparationService::new(&tm, None);
-    let requested = vec![PreparedTerminalCommand { role: "main".into(), command: "claude".into() }, PreparedTerminalCommand {
-        role: "main".into(),
-        command: "bash".into(),
-    }];
+    let requested = vec![
+        PreparedTerminalCommand { role: "main".into(), command: "claude".into(), expected_to_persist: true },
+        PreparedTerminalCommand { role: "main".into(), command: "bash".into(), expected_to_persist: false },
+    ];
 
     let result = service
         .prepare_terminal_commands(&set_id, "feat", Path::new("/repo/wt"), &requested, || panic!("workspace config should not be built"))
@@ -3295,6 +3315,8 @@ async fn prepare_terminal_commands_wraps_requested_commands_via_terminal_manager
     assert_eq!(result.len(), 2);
     assert_eq!(result[0].role, "main");
     assert_eq!(result[1].role, "main");
+    assert!(result[0].expected_to_persist);
+    assert!(!result[1].expected_to_persist);
     // Args should contain structured Arg from attach_args(), not Literal-wrapped strings
     let flat = flotilla_protocol::arg::flatten(&result[0].args, 0);
     assert!(flat.starts_with("attach:"), "expected attach: prefix, got: {flat}");

@@ -7,7 +7,7 @@ use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::types::WorkspaceConfig,
     template::{self, WorkspaceTemplate},
-    terminal_manager::TerminalManager,
+    terminal_manager::{TerminalLaunchSpec, TerminalManager},
 };
 
 pub(super) struct TerminalPreparationService<'a> {
@@ -41,8 +41,8 @@ impl<'a> TerminalPreparationService<'a> {
                     &entry.role,
                     i,
                     &config.name,
-                    &entry.command,
-                    config.working_directory.clone(),
+                    TerminalLaunchSpec::new(&entry.command, config.working_directory.clone())
+                        .with_persistence_expectation(entry.expected_to_persist),
                 ) {
                     Ok(id) => id,
                     Err(err) => {
@@ -57,7 +57,7 @@ impl<'a> TerminalPreparationService<'a> {
                 match self.terminal_manager.attach_command(&attachable_id, socket_str.as_deref()).await {
                     Ok(cmd) => {
                         debug!(attachable_id = %attachable_id, command = ?entry.command, resolved = ?cmd, "terminal resolved");
-                        resolved.push((entry.role.clone(), cmd));
+                        resolved.push((entry.role.clone(), cmd, entry.expected_to_persist));
                     }
                     Err(err) => warn!(attachable_id = %attachable_id, err = %err, "failed to get attach command"),
                 }
@@ -94,14 +94,18 @@ impl<'a> TerminalPreparationService<'a> {
                     &cmd.role,
                     idx,
                     branch,
-                    &cmd.command,
-                    ExecutionEnvironmentPath::new(checkout_path),
+                    TerminalLaunchSpec::new(&cmd.command, ExecutionEnvironmentPath::new(checkout_path))
+                        .with_persistence_expectation(cmd.expected_to_persist),
                 ) {
                     Ok(id) => id,
                     Err(err) => {
                         warn!(role = %cmd.role, err = %err, "failed to allocate terminal");
                         // Fallback: wrap original command as Arg::Literal
-                        resolved.push(ResolvedPaneCommand { role: cmd.role.clone(), args: vec![Arg::Literal(cmd.command.clone())] });
+                        resolved.push(ResolvedPaneCommand {
+                            role: cmd.role.clone(),
+                            args: vec![Arg::Literal(cmd.command.clone())],
+                            expected_to_persist: cmd.expected_to_persist,
+                        });
                         continue;
                     }
                 };
@@ -111,12 +115,16 @@ impl<'a> TerminalPreparationService<'a> {
                 match self.terminal_manager.attach_args(&attachable_id, socket_str.as_deref()) {
                     Ok(args) => {
                         debug!(attachable_id = %attachable_id, command = ?cmd.command, ?args, "terminal resolved");
-                        resolved.push(ResolvedPaneCommand { role: cmd.role.clone(), args });
+                        resolved.push(ResolvedPaneCommand { role: cmd.role.clone(), args, expected_to_persist: cmd.expected_to_persist });
                     }
                     Err(err) => {
                         warn!(attachable_id = %attachable_id, err = %err, "failed to get attach args, using original");
                         // Fallback: wrap original command as Arg::Literal
-                        resolved.push(ResolvedPaneCommand { role: cmd.role.clone(), args: vec![Arg::Literal(cmd.command.clone())] });
+                        resolved.push(ResolvedPaneCommand {
+                            role: cmd.role.clone(),
+                            args: vec![Arg::Literal(cmd.command.clone())],
+                            expected_to_persist: cmd.expected_to_persist,
+                        });
                     }
                 }
             }
@@ -128,7 +136,14 @@ impl<'a> TerminalPreparationService<'a> {
 
         let commands = if let Some(resolved) = config.resolved_commands { resolved } else { render_template_commands(&config) };
 
-        Ok(commands.into_iter().map(|(role, command)| ResolvedPaneCommand { role, args: vec![Arg::Literal(command)] }).collect())
+        Ok(commands
+            .into_iter()
+            .map(|(role, command, expected_to_persist)| ResolvedPaneCommand {
+                role,
+                args: vec![Arg::Literal(command)],
+                expected_to_persist,
+            })
+            .collect())
     }
 }
 
@@ -136,10 +151,13 @@ impl<'a> TerminalPreparationService<'a> {
 /// Used when no terminal pool is available.
 pub(super) fn render_fallback_commands(workspace_config: impl FnOnce() -> WorkspaceConfig) -> Vec<PreparedTerminalCommand> {
     let config = workspace_config();
-    render_template_commands(&config).into_iter().map(|(role, command)| PreparedTerminalCommand { role, command }).collect()
+    render_template_commands(&config)
+        .into_iter()
+        .map(|(role, command, expected_to_persist)| PreparedTerminalCommand { role, command, expected_to_persist })
+        .collect()
 }
 
-fn render_template_commands(config: &WorkspaceConfig) -> Vec<(String, String)> {
+fn render_template_commands(config: &WorkspaceConfig) -> Vec<(String, String, bool)> {
     let rendered = parse_workspace_template(config).render(&config.template_vars);
     let mut commands = Vec::new();
     for entry in &rendered.content {
@@ -148,7 +166,7 @@ fn render_template_commands(config: &WorkspaceConfig) -> Vec<(String, String)> {
         }
         let count = entry.count.unwrap_or(1);
         for _ in 0..count {
-            commands.push((entry.role.clone(), entry.command.clone()));
+            commands.push((entry.role.clone(), entry.command.clone(), entry.expected_to_persist));
         }
     }
     commands

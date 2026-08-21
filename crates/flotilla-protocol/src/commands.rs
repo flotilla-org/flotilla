@@ -43,6 +43,8 @@ pub enum CheckoutTarget {
 pub struct PreparedTerminalCommand {
     pub role: String,
     pub command: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expected_to_persist: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -276,6 +278,8 @@ pub struct DaemonLogQuery {
 pub struct ResolvedPaneCommand {
     pub role: String,
     pub args: Vec<Arg>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expected_to_persist: bool,
 }
 
 /// Execution-side workspace preparation artifact.
@@ -1013,7 +1017,11 @@ mod tests {
                     branch: "feat-x".into(),
                     checkout_path: PathBuf::from("/remote/repo/feat-x"),
                     attachable_set_id: Some(AttachableSetId::new("set-1")),
-                    commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
+                    commands: vec![ResolvedPaneCommand {
+                        role: "main".into(),
+                        args: vec![Arg::Literal("bash".into())],
+                        expected_to_persist: false,
+                    }],
                 })
                 .context_repo(RepoSelector::Path(PathBuf::from("/repo")))
                 .build(),
@@ -1282,7 +1290,11 @@ mod tests {
                 branch: "feat-x".into(),
                 checkout_path: PathBuf::from("/remote/repo/feat-x"),
                 attachable_set_id: Some(AttachableSetId::new("set-1")),
-                commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
+                commands: vec![ResolvedPaneCommand {
+                    role: "main".into(),
+                    args: vec![Arg::Literal("bash".into())],
+                    expected_to_persist: false,
+                }],
             },
             CommandValue::PreparedWorkspace(Box::new(PreparedWorkspace {
                 label: "feat-x".into(),
@@ -1294,7 +1306,11 @@ mod tests {
                 environment_id: None,
                 container_name: None,
                 template_yaml: Some("layout: []\ncontent: []\n".into()),
-                prepared_commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
+                prepared_commands: vec![ResolvedPaneCommand {
+                    role: "main".into(),
+                    args: vec![Arg::Literal("bash".into())],
+                    expected_to_persist: false,
+                }],
             })),
             CommandValue::BranchNameGenerated { name: "feat/cool-thing".into(), issue_ids: vec![("gh".into(), "1".into())] },
             CommandValue::CheckoutStatus(Box::new(CheckoutStatus {
@@ -1508,7 +1524,11 @@ mod tests {
             environment_id: None,
             container_name: None,
             template_yaml: Some("layout: []\ncontent: []\n".into()),
-            prepared_commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
+            prepared_commands: vec![ResolvedPaneCommand {
+                role: "main".into(),
+                args: vec![Arg::Literal("bash".into())],
+                expected_to_persist: false,
+            }],
         };
 
         assert_json_roundtrip(&prepared);
@@ -1610,7 +1630,11 @@ mod tests {
                     branch: "feat-x".into(),
                     checkout_path: PathBuf::from("/remote/repo/feat-x"),
                     attachable_set_id: None,
-                    commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
+                    commands: vec![ResolvedPaneCommand {
+                        role: "main".into(),
+                        args: vec![Arg::Literal("bash".into())],
+                        expected_to_persist: false,
+                    }],
                 })
                 .context_repo(RepoSelector::Identity(repo_identity()))
                 .build(),

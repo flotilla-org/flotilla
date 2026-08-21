@@ -42,6 +42,7 @@ fn contract_ensure_terminal_attachable_reuses_existing_binding(store: &mut impl 
             command: "codex".into(),
             working_directory: ExecutionEnvironmentPath::new("/repo/wt-feat"),
             status: TerminalStatus::Disconnected,
+            expected_to_persist: false,
         })
     );
 }
@@ -296,6 +297,7 @@ fn registry_roundtrip_rebuilds_binding_index() {
             command: "claude".into(),
             working_directory: ExecutionEnvironmentPath::new("/repo/wt-feat"),
             status: TerminalStatus::Running,
+            expected_to_persist: false,
         }),
     });
     store.replace_binding(ProviderBinding {
@@ -573,6 +575,7 @@ fn contract_lookup_workspace_ref_for_set(store: &mut impl AttachableStoreApi) {
             command: "bash".into(),
             working_directory: ExecutionEnvironmentPath::new("/repo"),
             status: TerminalStatus::Running,
+            expected_to_persist: false,
         }),
     });
     store.replace_binding(ProviderBinding {

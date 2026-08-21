@@ -15,6 +15,9 @@ content:
     command: "{main_command}"
   - role: ai
     command: codex
+    # Set true for long-running processes such as development servers.
+    # Their exit is failure-flavored attention; other exits are completion-flavored.
+    expected_to_persist: false
   - role: shell
     command: ""
 

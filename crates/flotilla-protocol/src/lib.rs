@@ -123,8 +123,8 @@ pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
     Agent, AgentContext, AgentEventType, AgentHarness, AgentHookEvent, AgentHookTerminalRef, AgentStatus, AheadBehind, AttachableId,
     AttachableSet, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, Issue, IssueChangeset,
-    IssueRef, IssueSource, IssueState, ManagedTerminal, ProviderData, RemoteAccessPoint, RemoteAccessType, SessionStatus, TerminalStatus,
-    WorkingTreeStatus, Workspace,
+    IssueRef, IssueSource, IssueState, ManagedTerminal, PaneExitAttention, PaneExitAttentionFlavor, ProviderData, RemoteAccessPoint,
+    RemoteAccessType, SessionStatus, TerminalStatus, WorkingTreeStatus, Workspace,
 };
 pub use query::{
     CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DiscoveryEntry,
