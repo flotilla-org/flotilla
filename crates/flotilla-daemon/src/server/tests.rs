@@ -1404,6 +1404,23 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
     let (_tmp, daemon) = empty_daemon().await;
     let home = HostName::new("feta");
     apply_convoy_replica_feed(&daemon, "flotilla", "stranded", home.clone()).await;
+    let replica_fixture = ResourceBackend::InMemory(InMemoryBackend::default());
+    replica_fixture
+        .using::<Convoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("stranded".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+        )
+        .await
+        .expect("create replica fixture");
+    let replica_snapshot = replica_fixture.using::<Convoy>("flotilla").list().await.expect("list replica fixture");
+    let last_seen_at = chrono::DateTime::parse_from_rfc3339("2026-08-21T12:34:56Z").expect("fixed timestamp").with_timezone(&chrono::Utc);
+    daemon
+        .resource_backend()
+        .replica_writer::<Convoy>(node("feta"), "flotilla")
+        .replace(&replica_snapshot, last_seen_at)
+        .await
+        .expect("seed last-seen replica");
     daemon
         .publish_peer_summary(
             HostSummary::builder()
@@ -1433,7 +1450,12 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
         .await
         .expect_err("failed peer send should reject dispatch");
 
-    assert_eq!(message, "connect to feta at ssh://feta.example: outbound channel closed");
+    assert_eq!(
+        message,
+        "convoy flotilla/stranded is homed at feta, last seen 2026-08-21T12:34:56+00:00; home is unreachable: \
+         connect to feta at ssh://feta.example: outbound channel closed. Break glass: flotilla resource delete convoys stranded \
+         --namespace flotilla --host feta"
+    );
 }
 
 #[tokio::test]

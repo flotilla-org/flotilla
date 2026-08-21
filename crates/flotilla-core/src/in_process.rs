@@ -1996,6 +1996,29 @@ fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, int
 pub struct ExistingConvoyTarget {
     pub home: HostName,
     pub node_id: NodeId,
+    pub namespace: String,
+    pub record_name: String,
+    pub last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl ExistingConvoyTarget {
+    pub fn unreachable_message(&self, cause: &str) -> String {
+        convoy_home_unreachable_message(&self.namespace, &self.record_name, &self.home, self.last_seen_at, cause)
+    }
+}
+
+fn convoy_home_unreachable_message(
+    namespace: &str,
+    record_name: &str,
+    home: &HostName,
+    last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+    cause: &str,
+) -> String {
+    let last_seen = last_seen_at.map_or_else(|| "unknown".to_string(), |timestamp| timestamp.to_rfc3339());
+    format!(
+        "convoy {namespace}/{record_name} is homed at {home}, last seen {last_seen}; home is unreachable: {cause}. \
+         Break glass: flotilla resource delete convoys {record_name} --namespace {namespace} --host {home}"
+    )
 }
 
 pub struct InProcessDaemon {
@@ -2997,6 +3020,7 @@ impl InProcessDaemon {
             })
             .collect::<Vec<_>>();
         let selected = resolve_convoy_candidate_indices(&identities, name)?;
+        let record_name = selected.first().map(|index| candidates[*index].resource.name.clone()).unwrap_or_else(|| name.to_string());
         let mut hosts = selected.into_iter().filter_map(|index| candidates[index].resource.host.clone()).collect::<Vec<_>>();
         hosts.sort();
         hosts.dedup();
@@ -3004,7 +3028,13 @@ impl InProcessDaemon {
         let home = match hosts.as_slice() {
             [] => return Ok(None),
             [host] if host == &self.host_name => {
-                return Ok(Some(ExistingConvoyTarget { home: host.clone(), node_id: self.node_id.clone() }));
+                return Ok(Some(ExistingConvoyTarget {
+                    home: host.clone(),
+                    node_id: self.node_id.clone(),
+                    namespace,
+                    record_name,
+                    last_seen_at: None,
+                }));
             }
             [host] => host.clone(),
             _ => {
@@ -3013,12 +3043,18 @@ impl InProcessDaemon {
             }
         };
 
-        let node_id = self
-            .host_registry
-            .node_id_for_host_name(&home)
-            .await?
-            .ok_or_else(|| format!("connect to {home} for convoy {name}: no routed node address found for host"))?;
-        Ok(Some(ExistingConvoyTarget { home, node_id }))
+        let last_seen_at =
+            self.resource_backend.including_replicas::<ResourceConvoy>(&namespace).get(&record_name).await.ok().and_then(|source| {
+                match source.provenance {
+                    flotilla_resources::ResourceProvenance::Replica { last_synced_at, .. } => Some(last_synced_at),
+                    flotilla_resources::ResourceProvenance::Local => None,
+                }
+            });
+
+        let node_id = self.host_registry.node_id_for_host_name(&home).await?.ok_or_else(|| {
+            convoy_home_unreachable_message(&namespace, &record_name, &home, last_seen_at, "no routed node address found for host")
+        })?;
+        Ok(Some(ExistingConvoyTarget { home, node_id, namespace, record_name, last_seen_at }))
     }
 
     pub async fn has_authoritative_convoy(&self, namespace: &str, name: &str) -> Result<bool, String> {

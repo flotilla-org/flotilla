@@ -259,13 +259,15 @@ impl RemoteCommandRouter {
                     Ok(()) => Ok(command_id),
                     Err(err) => {
                         self.pending_remote_commands.lock().await.remove(&request_id);
-                        if let (Some(completion), Some(target)) = (crew_completion, existing_convoy_target) {
-                            let message = self.authority_unreachable_message(&completion.convoy, &target.home, &err);
-                            self.persist_crew_completion(&completion, &target.home, &message).await;
-                            self.spawn_crew_completion_retry(completion);
-                            Err(format!("completion pending: {message}"))
-                        } else {
-                            Err(err)
+                        match (crew_completion, existing_convoy_target) {
+                            (Some(completion), Some(target)) => {
+                                let message = self.authority_unreachable_message(&completion.convoy, &target.home, &err);
+                                self.persist_crew_completion(&completion, &target.home, &message).await;
+                                self.spawn_crew_completion_retry(completion);
+                                Err(format!("completion pending: {message}"))
+                            }
+                            (_, Some(target)) => Err(target.unreachable_message(&err)),
+                            _ => Err(err),
                         }
                     }
                 }
