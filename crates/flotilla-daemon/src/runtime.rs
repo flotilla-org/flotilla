@@ -309,6 +309,7 @@ impl RuntimeHealth {
                             frequency.window.as_secs() / 60
                         ))
                         .observed_at(Utc::now())
+                        .blocks_readiness(false)
                         .build(),
                 ),
                 Ok(_) => None,
@@ -1571,7 +1572,7 @@ async fn apply_host_heartbeat_with_credentials(
         capabilities: host_capabilities(&summary, profile, &held_credentials, &credential_expiry),
         agent_adapter_baseline: Some(adapter_assessment.baseline),
         heartbeat_at: Some(Utc::now()),
-        ready: conditions.is_empty(),
+        ready: !conditions.iter().any(HostCondition::blocks_readiness),
         resource_store,
         daemon_generation: health.generation.clone(),
         daemon_version: Some(health.version.clone()),
@@ -1611,6 +1612,7 @@ async fn resource_authorship_collision_condition(daemon: &Arc<InProcessDaemon>, 
                 if collisions.len() == 1 { "" } else { "s" },
             ))
             .observed_at(Utc::now())
+            .blocks_readiness(false)
             .build(),
     ))
 }
@@ -3685,7 +3687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn home_bound_authorship_collision_degrades_the_host_and_clears_after_removal() {
+    async fn home_bound_authorship_collision_is_advisory_and_clears_after_removal() {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("local");
         fs::create_dir_all(&config_base).expect("config directory");
@@ -3727,7 +3729,9 @@ mod tests {
         ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "local").await.expect("register local Host");
         apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("publish degraded heartbeat");
         let degraded = daemon.resource_backend().using::<Host>(NAMESPACE).get(&host_id).await.expect("read degraded Host");
-        assert!(degraded.status.expect("degraded Host status").conditions.iter().any(|condition| {
+        let status = degraded.status.expect("degraded Host status");
+        assert!(status.ready, "an authorship collision must not make the host unavailable for placement");
+        assert!(status.conditions.iter().any(|condition| {
             condition.condition_type == "ResourceReplication/AuthorshipCollision"
                 && condition.message.contains("Convoy/flotilla/command-builder")
         }));
@@ -7346,6 +7350,9 @@ mod tests {
             "fleet diagnosis should surface the restart window: {:?}",
             local.degraded_conditions
         );
+        let host_id = daemon.local_host_id().expect("local Host identity");
+        let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id.as_str()).await.expect("local Host");
+        assert!(host.status.expect("local Host status").ready, "historical abnormal exits must not block placement after recovery");
 
         runtime.shutdown();
     }

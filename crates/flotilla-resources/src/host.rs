@@ -100,7 +100,7 @@ impl HostStatus {
 
     pub fn apply_heartbeat_readiness(&mut self, now: DateTime<Utc>) {
         self.ready = self.ready
-            && !self.is_degraded()
+            && !self.readiness_blocked()
             && self
                 .heartbeat_at
                 .is_some_and(|heartbeat_at| now.signed_duration_since(heartbeat_at) <= chrono::Duration::seconds(HEARTBEAT_READY_TTL_SECS));
@@ -109,12 +109,17 @@ impl HostStatus {
     pub fn is_degraded(&self) -> bool {
         self.conditions.iter().any(|condition| condition.value == ConditionValue::False)
     }
+
+    pub fn readiness_blocked(&self) -> bool {
+        self.conditions.iter().any(HostCondition::blocks_readiness)
+    }
 }
 
 /// A daemon-owned liveness invariant published on its [`Host`] resource.
 ///
-/// `True` means the named subsystem is healthy; `False` makes the host
-/// degraded and unavailable for placement until a later observation clears it.
+/// `True` means the named subsystem is healthy. `False` surfaces a diagnostic;
+/// by default it also makes the host unavailable for placement until a later
+/// observation clears it, unless `blocks_readiness` marks it advisory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct HostCondition {
@@ -124,6 +129,27 @@ pub struct HostCondition {
     pub reason: String,
     pub message: String,
     pub observed_at: DateTime<Utc>,
+    /// Whether this condition makes the host unavailable for placement.
+    ///
+    /// Conditions may also report diagnostic warnings about specific records
+    /// or historical events without indicating current host unhealth.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    #[builder(default = true)]
+    pub blocks_readiness: bool,
+}
+
+impl HostCondition {
+    pub fn blocks_readiness(&self) -> bool {
+        self.blocks_readiness && self.value == ConditionValue::False
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 /// Expiry metadata observed for one piece of held credential material.
@@ -253,6 +279,30 @@ mod tests {
         assert!(!status.ready);
         let encoded = serde_json::to_value(&status).expect("serialize host status");
         assert_eq!(encoded["conditions"][0]["type"], "Controller/checkout");
+    }
+
+    #[test]
+    fn advisory_host_condition_keeps_fresh_heartbeat_ready() {
+        let now = Utc::now();
+        let mut status = HostStatus {
+            heartbeat_at: Some(now),
+            ready: true,
+            conditions: vec![HostCondition::builder()
+                .condition_type("ResourceReplication/AuthorshipCollision")
+                .value(ConditionValue::False)
+                .reason("HomeBoundRecordAuthoredAtMultipleRoots")
+                .message("record is authored at multiple roots")
+                .observed_at(now)
+                .blocks_readiness(false)
+                .build()],
+            ..HostStatus::default()
+        };
+
+        status.apply_heartbeat_readiness(now);
+
+        assert!(status.ready);
+        assert!(status.is_degraded(), "advisory condition should remain visible as a diagnostic");
+        assert!(!status.readiness_blocked());
     }
 
     #[test]

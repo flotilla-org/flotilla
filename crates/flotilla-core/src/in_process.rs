@@ -1260,7 +1260,7 @@ fn placement_host_not_ready_reason(placement_name: &str, host_label: &str, gener
     let mut failing_conditions = status
         .conditions
         .iter()
-        .filter(|condition| condition.value == ConditionValue::False)
+        .filter(|condition| condition.blocks_readiness())
         .map(|condition| format!("{}: {}", condition.reason, condition.message))
         .collect::<Vec<_>>();
     failing_conditions.sort();
