@@ -557,6 +557,32 @@ test "$(grep -Fxc -- '--user restart flotillad.service' "$test_root/systemctl.lo
 grep -Fq "generation $generation_two failed health confirmation; rolled back to $generation_one" \
   "$test_root/health-rollback.out" || fail 'Linux automatic rollback was not reported loudly'
 
+: >"$test_root/systemctl.log"
+FLEET_HEALTH_FAIL_FOR="$generation_two" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=2 \
+  run_installer "$generation_two" >"$test_root/interrupted-confirmation.out" 2>&1 &
+interrupted_installer_pid=$!
+for _ in {1..50}; do
+  if [[ "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" == "$generation_two" ]] \
+    && grep -Fxq -- '--user restart flotillad.service' "$test_root/systemctl.log"; then
+    break
+  fi
+  sleep 0.1
+done
+test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_two" \
+  || fail 'interrupted-confirmation test never selected the candidate'
+grep -Fxq -- '--user restart flotillad.service' "$test_root/systemctl.log" \
+  || fail 'interrupted-confirmation test did not start the candidate daemon'
+kill "$interrupted_installer_pid"
+wait "$interrupted_installer_pid" 2>/dev/null || true
+for _ in {1..50}; do
+  [[ "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" == "$generation_one" ]] && break
+  sleep 0.1
+done
+test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
+  || fail 'detached health watchdog did not roll back after the installer exited'
+test "$(grep -Fxc -- '--user restart flotillad.service' "$test_root/systemctl.log")" = 2 \
+  || fail 'detached Linux watchdog did not restart the candidate and restored daemon'
+
 DAEMON_RUNNING=1 STOP_FAIL=0 run_installer latest >"$test_root/latest.out"
 grep -Fq "generation $generation_two confirmed healthy" "$test_root/latest.out" \
   || fail 'healthy Linux upgrade was not confirmed'
