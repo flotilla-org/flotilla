@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use chrono::Utc;
 use flotilla_protocol::NodeId;
@@ -72,6 +72,15 @@ pub struct DynamicResourceObject {
 pub struct DynamicResourceDelete {
     pub object: DynamicResourceObject,
     pub already_deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+pub struct HomeBoundAuthorshipCollision {
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub local_root: NodeId,
+    pub replica_root: NodeId,
 }
 
 #[derive(bon::Builder)]
@@ -303,6 +312,69 @@ pub async fn replica_cursor_for_resource_kind(
     origin_root: &NodeId,
 ) -> Result<Option<ReplicaCursor>, ResourceError> {
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, replica_cursor_typed(backend, namespace, origin_root).await)
+}
+
+/// Find same-name records authored both locally and by another root for every
+/// single-home resource kind.
+///
+/// The collision is diagnostic only: callers must surface it rather than
+/// choosing either record as authoritative.
+pub async fn home_bound_authorship_collisions(
+    backend: &ResourceBackend,
+    namespace: &str,
+) -> Result<Vec<HomeBoundAuthorshipCollision>, ResourceError> {
+    let local_root = backend.local_root()?;
+    let mut collisions = Vec::new();
+    for registered in REGISTERED_RESOURCE_KINDS {
+        if registered.replication_class != ReplicationClass::HomeBoundRuntime {
+            continue;
+        }
+        collisions.extend(dispatch_resource_kind!(
+            registered.resource,
+            home_bound_authorship_collisions_typed(backend, namespace, &local_root).await
+        )?);
+    }
+    collisions.sort_by(|left, right| {
+        (&left.kind, &left.namespace, &left.name, &left.replica_root).cmp(&(
+            &right.kind,
+            &right.namespace,
+            &right.name,
+            &right.replica_root,
+        ))
+    });
+    Ok(collisions)
+}
+
+async fn home_bound_authorship_collisions_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    local_root: &NodeId,
+) -> Result<Vec<HomeBoundAuthorshipCollision>, ResourceError> {
+    let sources = backend.including_replicas::<T>(namespace).list_sources().await?;
+    let local_names = sources
+        .items
+        .iter()
+        .filter(|item| matches!(item.provenance, ResourceProvenance::Local))
+        .map(|item| item.object.metadata.name.as_str())
+        .collect::<HashSet<_>>();
+    Ok(sources
+        .items
+        .iter()
+        .filter_map(|item| {
+            let ResourceProvenance::Replica { origin_root, .. } = &item.provenance else {
+                return None;
+            };
+            (origin_root != local_root && local_names.contains(item.object.metadata.name.as_str())).then(|| {
+                HomeBoundAuthorshipCollision::builder()
+                    .kind(T::API_PATHS.kind.to_string())
+                    .namespace(namespace.to_string())
+                    .name(item.object.metadata.name.clone())
+                    .local_root(local_root.clone())
+                    .replica_root(origin_root.clone())
+                    .build()
+            })
+        })
+        .collect())
 }
 
 async fn replica_cursor_typed<T: Resource>(

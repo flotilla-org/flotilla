@@ -36,16 +36,16 @@ use flotilla_core::{
 };
 use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, Rows, TerminalStatus};
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, ChangeRequest, ChangeRequestStatus, Checkout,
-    CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy, ConvoyReconciler, ConvoyTeardownRuntime,
-    CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec,
-    Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, EnvironmentWaitReason, ForgeIdentity, Host, HostCondition,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
-    InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, Resource,
-    ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement,
-    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV,
-    CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
-    REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
+    canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions, ChangeRequest,
+    ChangeRequestStatus, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy,
+    ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec,
+    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch,
+    EnvironmentWaitReason, ForgeIdentity, Host, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard,
+    ReplicaReadResolver, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession,
+    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG,
+    HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -1554,6 +1554,9 @@ async fn apply_host_heartbeat_with_credentials(
     if let Some(condition) = resource_field_ownership_condition(resource_store.as_ref()) {
         conditions.push(condition);
     }
+    if let Some(condition) = resource_authorship_collision_condition(daemon, namespace).await? {
+        conditions.push(condition);
+    }
     if let Some(condition) = resource_replication_content_condition(daemon, namespace).await? {
         conditions.push(condition);
     }
@@ -1581,6 +1584,36 @@ async fn apply_host_heartbeat_with_credentials(
     hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|err| err.to_string())?;
     daemon.refresh_connected_peer_host_heartbeats().await;
     Ok(())
+}
+
+async fn resource_authorship_collision_condition(daemon: &Arc<InProcessDaemon>, namespace: &str) -> Result<Option<HostCondition>, String> {
+    let collisions = home_bound_authorship_collisions(&daemon.resource_backend(), namespace).await.map_err(|error| error.to_string())?;
+    if collisions.is_empty() {
+        return Ok(None);
+    }
+    let identities = collisions
+        .iter()
+        .map(|collision| {
+            format!(
+                "{}/{}/{} is authored locally at {} and replicated from {}",
+                collision.kind, collision.namespace, collision.name, collision.local_root, collision.replica_root
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Ok(Some(
+        HostCondition::builder()
+            .condition_type("ResourceReplication/AuthorshipCollision")
+            .value(ConditionValue::False)
+            .reason("HomeBoundRecordAuthoredAtMultipleRoots")
+            .message(format!(
+                "{} home-bound resource authorship collision{} detected: {identities}. Choose the record's natural home and delete the other authored copy at its root; the replicator will not choose a winner",
+                collisions.len(),
+                if collisions.len() == 1 { "" } else { "s" },
+            ))
+            .observed_at(Utc::now())
+            .build(),
+    ))
 }
 
 async fn resource_replication_content_condition(daemon: &Arc<InProcessDaemon>, namespace: &str) -> Result<Option<HostCondition>, String> {
@@ -3285,9 +3318,9 @@ mod tests {
         ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
         CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, LifecycleAuthority, MaterialPoolSpec, MaterialPoolUnitSpec,
         ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementStatus, RepositoryKey, RepositorySpec, Resource,
-        Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSpec,
-        TerminalSessionStatus, TerminalSessionStatusPatch, VesselRequirement, VesselSpec, VesselStatus, VirtualClock, WorkPhase, WorkState,
-        WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
+        ResourceList, Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
+        TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, VesselRequirement, VesselSpec, VesselStatus, VirtualClock,
+        WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
@@ -3650,6 +3683,89 @@ mod tests {
             "fleet diagnosis must clear after bootstrap: {:?}",
             feta_row.degraded_conditions
         );
+    }
+
+    #[tokio::test]
+    async fn home_bound_authorship_collision_degrades_the_host_and_clears_after_removal() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("local");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"collision-local-root\"\n").expect("daemon config");
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(config_base))).await;
+        let local_root = daemon.node_id().clone();
+        let remote_root = NodeId::new("collision-remote-root");
+        let local_convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
+        local_convoys
+            .create(&empty_meta("command-builder"), &ConvoySpec::builder().workflow_ref("scratch".to_string()).build())
+            .await
+            .expect("create local authored convoy");
+        let remote_backend = ResourceBackend::InMemory(Default::default()).with_local_root(remote_root.clone());
+        let remote_convoys = remote_backend.using::<Convoy>(NAMESPACE);
+        remote_convoys
+            .create(&empty_meta("command-builder"), &ConvoySpec::builder().workflow_ref("scratch".to_string()).build())
+            .await
+            .expect("create remote authored convoy");
+        let writer = daemon.resource_backend().replica_writer::<Convoy>(remote_root.clone(), NAMESPACE);
+        writer.replace(&remote_convoys.list().await.expect("list remote convoys"), Utc::now()).await.expect("inject colliding replica");
+
+        let collision = resource_authorship_collision_condition(&daemon, NAMESPACE)
+            .await
+            .expect("inspect collision")
+            .expect("collision must degrade the host");
+        assert_eq!(collision.condition_type, "ResourceReplication/AuthorshipCollision");
+        assert_eq!(collision.reason, "HomeBoundRecordAuthoredAtMultipleRoots");
+        assert!(collision.message.contains("Convoy/flotilla/command-builder"), "unexpected diagnosis: {}", collision.message);
+        assert!(collision.message.contains(local_root.as_str()), "local root missing from diagnosis: {}", collision.message);
+        assert!(collision.message.contains(remote_root.as_str()), "remote root missing from diagnosis: {}", collision.message);
+        assert!(
+            collision.message.contains("natural home") && collision.message.contains("delete the other authored copy"),
+            "remediation direction missing from diagnosis: {}",
+            collision.message
+        );
+
+        let host_id = daemon.local_host_id().expect("local Host identity").to_string();
+        let profile = manual_profile(&host_id, false);
+        ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "local").await.expect("register local Host");
+        apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("publish degraded heartbeat");
+        let degraded = daemon.resource_backend().using::<Host>(NAMESPACE).get(&host_id).await.expect("read degraded Host");
+        assert!(degraded.status.expect("degraded Host status").conditions.iter().any(|condition| {
+            condition.condition_type == "ResourceReplication/AuthorshipCollision"
+                && condition.message.contains("Convoy/flotilla/command-builder")
+        }));
+
+        writer
+            .replace(&ResourceList { items: Vec::new(), resource_version: "2".to_string(), generation: None }, Utc::now())
+            .await
+            .expect("remove colliding replica");
+        assert!(
+            resource_authorship_collision_condition(&daemon, NAMESPACE).await.expect("inspect cleared collision").is_none(),
+            "removing the replica must clear the diagnosis without restart"
+        );
+        apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("publish recovered heartbeat");
+        let recovered = daemon.resource_backend().using::<Host>(NAMESPACE).get(&host_id).await.expect("read recovered Host");
+        assert!(recovered
+            .status
+            .expect("recovered Host status")
+            .conditions
+            .iter()
+            .all(|condition| { condition.condition_type != "ResourceReplication/AuthorshipCollision" }));
+    }
+
+    #[tokio::test]
+    async fn builtin_workflow_templates_seeded_at_multiple_roots_do_not_raise_authorship_collisions() {
+        assert_eq!(
+            WorkflowTemplate::REPLICATION_CLASS,
+            ReplicationClass::None,
+            "code-seeded builtins must remain outside single-home replication and collision enforcement"
+        );
+        for root in ["builtin-root-a", "builtin-root-b", "builtin-root-c"] {
+            let backend = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new(root));
+            reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("seed builtin workflow templates");
+            assert!(
+                home_bound_authorship_collisions(&backend, NAMESPACE).await.expect("inspect authored resources").is_empty(),
+                "code-seeded builtins at {root} must be exempt from single-home collision enforcement"
+            );
+        }
     }
 
     #[tokio::test]
