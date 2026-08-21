@@ -1550,6 +1550,7 @@ impl Aggregator {
                     .and_then(|status| match state {
                         DemandState::Raised => status.raised.as_ref(),
                         DemandState::Satisfied => status.satisfied.as_ref(),
+                        DemandState::Escalated => status.escalated.as_ref(),
                         DemandState::Acknowledged => status.acknowledged.as_ref(),
                     })
                     .map_or(demand.metadata.creation_timestamp, |transition| transition.as_of);
@@ -1798,7 +1799,7 @@ impl Aggregator {
         let reclaim_refusal = self.demands.values().find(|demand| {
             let state = demand.status.as_ref().map_or(DemandState::Raised, |status| status.state);
             let target = &demand.spec.originating_work_ref;
-            state == DemandState::Raised
+            matches!(state, DemandState::Raised | DemandState::Escalated)
                 && target.api_version == resource.api_version
                 && target.kind == resource.kind
                 && target.namespace == resource.namespace

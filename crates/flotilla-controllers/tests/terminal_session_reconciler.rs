@@ -9,7 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_controllers::reconcilers::{TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
+use flotilla_controllers::reconcilers::{TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
     test_support::{
@@ -18,9 +18,9 @@ use flotilla_resources::{
     },
     Convoy, ConvoyPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta,
     LifecycleAuthority, ResourceBackend, ResourceError, ResourceObject, StatusPatch, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
-    VirtualClock, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
-    VESSEL_REF_LABEL,
+    TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus,
+    TerminalSessionStatusPatch, VirtualClock, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION,
+    CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
 };
 
 mod common;
@@ -126,7 +126,8 @@ async fn terminal_session_is_reclaimed_when_its_environment_is_gone() {
 
     assert!(matches!(
         outcome.actuations.as_slice(),
-        [Actuation::DeleteTerminalSession { name }] if name == "terminal-orphan"
+        [Actuation::DeleteTerminalSession { name }, Actuation::DeleteDemand { name: demand_name }]
+            if name == "terminal-orphan" && demand_name == "terminal-attention-terminal-orphan"
     ));
 }
 
@@ -172,7 +173,9 @@ async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
 
     assert!(matches!(
         outcome.actuations.as_slice(),
-        [Actuation::DeleteTerminalSession { name }] if name == "terminal-abandoned-convoy-work-coder"
+        [Actuation::DeleteTerminalSession { name }, Actuation::DeleteDemand { name: demand_name }]
+            if name == "terminal-abandoned-convoy-work-coder"
+                && demand_name == "terminal-attention-terminal-abandoned-convoy-work-coder"
     ));
 }
 
@@ -509,7 +512,8 @@ impl ReconcileStep<GhostRecoveryWorld> for GhostRecoveryStep {
         world.ownerless_recovery_rejected = outcome.patch.is_none()
             && matches!(
                 outcome.actuations.as_slice(),
-                [Actuation::DeleteTerminalSession { name }] if name == GHOST_SESSION_NAME
+                [Actuation::DeleteTerminalSession { name }, Actuation::DeleteDemand { name: demand_name }]
+                    if name == GHOST_SESSION_NAME && demand_name == "terminal-attention-terminal-deleted-convoy-work-coder"
             );
         Ok(LivenessStep::new(outcome.patch, outcome.actuations))
     }
@@ -525,6 +529,12 @@ impl ReconcileStep<GhostRecoveryWorld> for GhostRecoveryStep {
         match actuation {
             Actuation::DeleteTerminalSession { name } => {
                 match world.backend.clone().using::<TerminalSession>("flotilla").delete(&name).await {
+                    Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            Actuation::DeleteDemand { name } => {
+                match world.backend.clone().using::<flotilla_resources::Demand>("flotilla").delete(&name).await {
                     Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
                     Err(error) => Err(error.to_string()),
                 }
@@ -617,12 +627,25 @@ async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
         .update_status(&created.metadata.name, &created.metadata.resource_version, &status)
         .await
         .expect("session should be running");
+    let demands = backend.clone().using::<flotilla_resources::Demand>("flotilla");
+    demands
+        .create(
+            &meta("terminal-attention-terminal-convoy-work-coder").with_lifecycle_authority(LifecycleAuthority::Managed),
+            &flotilla_resources::DemandSpec::for_dispatching_principal(
+                flotilla_protocol::ResourceRef::new("flotilla.work/v1", "TerminalSession", "flotilla", "terminal-convoy-work-coder"),
+                flotilla_resources::DemandKind::HumanGate,
+                flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
+            ),
+        )
+        .await
+        .expect("attention demand");
     let runtime = Arc::new(RecordingTerminalRuntime::default());
     let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
 
     reconciler.run_finalizer(&session).await.expect("terminal finalizer should kill the session");
 
     assert_eq!(runtime.killed.lock().expect("killed mutex").as_slice(), &[("terminal-convoy-work-coder".to_string(), spec)]);
+    assert!(matches!(demands.get("terminal-attention-terminal-convoy-work-coder").await, Err(ResourceError::NotFound { .. })));
 }
 
 #[derive(Default)]
@@ -775,6 +798,10 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
         outcome.patch,
         Some(flotilla_resources::TerminalSessionStatusPatch::MarkStopped { stopped_at, .. }) if stopped_at == now
     ));
+    assert!(matches!(
+        outcome.actuations.as_slice(),
+        [Actuation::DeleteDemand { name }] if name == "terminal-attention-term-a"
+    ));
 }
 
 struct MissingTerminalRuntime;
@@ -870,6 +897,56 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     let deps = reconciler.prepare(&acknowledged).await.expect("observe acknowledged message");
     assert!(matches!(deps, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
     assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), 1);
+}
+
+#[tokio::test]
+async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_still_true() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(&meta("term-a"), &TerminalSessionSpec {
+            env_ref: "env-a".to_string(),
+            role: "coder".to_string(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+            cwd: "/workspace".to_string(),
+            pool: "cleat".to_string(),
+        })
+        .await
+        .expect("session");
+    let mut status = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "cleat-session".into(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "cargo test".into(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
+    let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
+    let attention =
+        TerminalAttention { state: TerminalAttentionState::NeedsInput, as_of: Utc::now(), source: TerminalAttentionSource::Hook };
+
+    let attached = reconciler.reconcile(
+        &session,
+        &flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+            attention: Some(attention.clone()),
+            occupancy: TerminalOccupancy::Occupied,
+        }),
+        Utc::now(),
+    );
+    assert!(!attached.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateDemand { .. })));
+
+    let detached = reconciler.reconcile(
+        &session,
+        &flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+            attention: Some(attention),
+            occupancy: TerminalOccupancy::Vacant,
+        }),
+        Utc::now(),
+    );
+    assert!(matches!(detached.actuations.as_slice(), [Actuation::CreateDemand { spec, .. }] if spec.originating_work_ref.name == "term-a"));
 }
 
 #[tokio::test]
@@ -970,8 +1047,15 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
         Ok(())
     }
 
-    async fn observe_attention(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<TerminalAttention>, String> {
-        Ok(Some(TerminalAttention { state: TerminalAttentionState::Working, as_of: Utc::now(), source: TerminalAttentionSource::Screen }))
+    async fn observe_attention(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {
+        Ok(Some(TerminalObservation {
+            attention: Some(TerminalAttention {
+                state: TerminalAttentionState::Working,
+                as_of: Utc::now(),
+                source: TerminalAttentionSource::Screen,
+            }),
+            occupancy: TerminalOccupancy::Vacant,
+        }))
     }
 
     async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {

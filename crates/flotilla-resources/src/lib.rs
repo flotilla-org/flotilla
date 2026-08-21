@@ -107,7 +107,8 @@ pub use prepared_snapshot::{
 };
 pub use presentation::{Presentation, PresentationPhase, PresentationSpec, PresentationStatus, PresentationStatusPatch};
 pub use principal_attention::{
-    Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, DemandState, DemandStatus, DemandStatusPatch, DemandTransition, Regard,
+    resolve_demand, Demand, DemandAddressee, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandPoolRef, DemandResponseOption,
+    DemandSpec, DemandState, DemandStatus, DemandStatusPatch, DemandTransition, DemandVerdict, DemandVerdictDisposition, Regard,
     RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
 };
 pub use project::{
@@ -141,9 +142,9 @@ pub use sqlite::SqliteBackend;
 pub use status_patch::{apply_status_patch, apply_status_patch_checked, NoStatusPatch, StatusPatch};
 pub use terminal_session::{
     terminal_session_attach_target, CrewCompletionPending, CrewSessionStatus, InnerCommandStatus, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession,
-    TerminalSessionAttachTarget, TerminalSessionDegradedCondition, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTag,
+    TerminalAttentionSource, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalOccupancy,
+    TerminalSession, TerminalSessionAttachTarget, TerminalSessionDegradedCondition, TerminalSessionIdentity, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTag,
 };
 pub use usage::{usage_record_name, Usage, UsagePace, UsageProviderCost, UsageSpec, UsageStatus, UsageStatusPatch, UsageWindow};
 pub use vessel::{

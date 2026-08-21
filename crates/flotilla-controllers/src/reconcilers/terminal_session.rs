@@ -2,14 +2,16 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_protocol::CanonicalHostId;
+use flotilla_protocol::{CanonicalHostId, PrincipalRef, ResourceRef};
 use flotilla_resources::{
+    api_version,
     controller::{Actuation, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
-    Convoy, ConvoyPhase, Environment, EnvironmentPhase, ReplicaReadResolver, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, ACTUATOR_HOST_REF_ANNOTATION,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION,
-    CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
+    Convoy, ConvoyPhase, Demand, DemandAddressee, DemandKind, DemandSpec, Environment, EnvironmentPhase, InputMeta, LifecycleAuthority,
+    OwnerReference, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TerminalAttention,
+    TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
+    VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -20,6 +22,12 @@ pub struct TerminalRuntimeState {
     pub crew: Option<flotilla_resources::CrewSessionStatus>,
     pub launch_command: String,
     pub delivered_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalObservation {
+    pub attention: Option<TerminalAttention>,
+    pub occupancy: TerminalOccupancy,
 }
 
 #[async_trait]
@@ -37,7 +45,7 @@ pub trait TerminalRuntime: Send + Sync {
         &self,
         _session_id: &str,
         _spec: &flotilla_resources::TerminalSessionSpec,
-    ) -> Result<Option<TerminalAttention>, String> {
+    ) -> Result<Option<TerminalObservation>, String> {
         Ok(None)
     }
     async fn deliver_message(
@@ -59,6 +67,7 @@ pub struct TerminalSessionReconciler<R> {
     convoys: TypedResolver<Convoy>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     environments: TypedResolver<Environment>,
+    demands: TypedResolver<Demand>,
     local_host_ref: Option<CanonicalHostId>,
 }
 
@@ -68,7 +77,8 @@ impl<R> TerminalSessionReconciler<R> {
             runtime,
             convoys: backend.clone().using::<Convoy>(namespace),
             federated_convoys: None,
-            environments: backend.using::<Environment>(namespace),
+            environments: backend.clone().using::<Environment>(namespace),
+            demands: backend.using::<Demand>(namespace),
             local_host_ref: None,
         }
     }
@@ -145,7 +155,7 @@ pub enum TerminalPrepared {
     Running(TerminalRuntimeState),
     MessageDelivered(String),
     Stopped,
-    Attention(TerminalAttention),
+    Attention(TerminalObservation),
     AttentionStale,
     OwnerMissing,
     Failed(String),
@@ -192,8 +202,8 @@ where
                     return Ok(TerminalPrepared::MessageDelivered(message.id.clone()));
                 }
             }
-            if let Some(attention) = self.runtime.observe_attention(session_id, &obj.spec).await.map_err(ResourceError::other)? {
-                return Ok(TerminalPrepared::Attention(attention));
+            if let Some(observation) = self.runtime.observe_attention(session_id, &obj.spec).await.map_err(ResourceError::other)? {
+                return Ok(TerminalPrepared::Attention(observation));
             }
             if obj.status.as_ref().and_then(|status| status.attention.as_ref()).is_some_and(|attention| attention.is_stale_at(Utc::now())) {
                 return Ok(TerminalPrepared::AttentionStale);
@@ -236,7 +246,10 @@ where
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         if matches!(prepared, TerminalPrepared::OwnerMissing) {
-            return ReconcileOutcome::with_actuations(None, vec![Actuation::DeleteTerminalSession { name: obj.metadata.name.clone() }]);
+            return ReconcileOutcome::with_actuations(None, vec![
+                Actuation::DeleteTerminalSession { name: obj.metadata.name.clone() },
+                Actuation::DeleteDemand { name: attention_demand_name(obj) },
+            ]);
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
@@ -273,14 +286,23 @@ where
                 TerminalPrepared::MessageDelivered(message_id) => {
                     Some(TerminalSessionStatusPatch::MarkMessageDelivered { message_id: message_id.clone() })
                 }
-                TerminalPrepared::Attention(attention)
-                    if obj
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.attention.as_ref())
-                        .is_none_or(|current| current.should_replace_with(attention)) =>
-                {
-                    Some(TerminalSessionStatusPatch::ObserveAttention { attention: attention.clone() })
+                TerminalPrepared::Attention(observation) => {
+                    let current = obj.status.as_ref();
+                    let attention = observation.attention.clone().or_else(|| {
+                        current.and_then(|status| status.attention.as_ref()).filter(|attention| attention.is_stale_at(now)).map(
+                            |attention| TerminalAttention {
+                                state: TerminalAttentionState::Unobservable,
+                                as_of: now,
+                                source: attention.source,
+                            },
+                        )
+                    });
+                    let occupancy_changed = current.is_none_or(|status| status.occupancy != observation.occupancy);
+                    let attention_changed = attention.as_ref().is_some_and(|attention| {
+                        current.and_then(|status| status.attention.as_ref()).is_none_or(|previous| previous.should_replace_with(attention))
+                    });
+                    (occupancy_changed || attention_changed)
+                        .then_some(TerminalSessionStatusPatch::Observe { attention, occupancy: observation.occupancy })
                 }
                 TerminalPrepared::AttentionStale => Some(TerminalSessionStatusPatch::ObserveAttention {
                     attention: TerminalAttention {
@@ -305,7 +327,16 @@ where
                 .then_some(TerminalSessionStatusPatch::ClearReconcileDegraded)
         });
 
-        ReconcileOutcome::new(patch)
+        let actuations = match prepared {
+            TerminalPrepared::Attention(observation) => vec![attention_demand_actuation(obj, observation)],
+            TerminalPrepared::Stopped => vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }],
+            TerminalPrepared::AttentionStale => vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }],
+            _ if matches!(phase, TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed) => {
+                vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
+            }
+            _ => Vec::new(),
+        };
+        ReconcileOutcome::with_actuations(patch, actuations)
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
@@ -320,6 +351,15 @@ where
         }
         if let Err(error) = self.runtime.cleanup_session_artifacts(&obj.spec).await {
             errors.push(error);
+        }
+        match self.demands.get(&attention_demand_name(obj)).await {
+            Ok(demand) if demand.metadata.lifecycle_authority()? == Some(LifecycleAuthority::Managed) => {
+                if let Err(error) = self.demands.delete(&demand.metadata.name).await {
+                    errors.push(error.to_string());
+                }
+            }
+            Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => errors.push(error.to_string()),
         }
         if errors.is_empty() {
             Ok(())
@@ -360,4 +400,39 @@ where
     async fn degraded_object_needs_reconcile(&self, obj: &ResourceObject<Self::Resource>) -> Result<bool, ResourceError> {
         self.session_owner_missing(obj).await
     }
+}
+
+fn attention_demand_actuation(session: &ResourceObject<TerminalSession>, observation: &TerminalObservation) -> Actuation {
+    let name = attention_demand_name(session);
+    let demands_attention = observation.occupancy == TerminalOccupancy::Vacant
+        && observation.attention.as_ref().is_some_and(|attention| attention.state == TerminalAttentionState::NeedsInput);
+    if !demands_attention {
+        return Actuation::DeleteDemand { name };
+    }
+
+    let target = ResourceRef::new(
+        api_version(TerminalSession::API_PATHS),
+        TerminalSession::API_PATHS.kind,
+        &session.metadata.namespace,
+        &session.metadata.name,
+    );
+    let meta = InputMeta::builder()
+        .name(name)
+        .owner_references(vec![OwnerReference {
+            api_version: api_version(TerminalSession::API_PATHS),
+            kind: TerminalSession::API_PATHS.kind.to_string(),
+            name: session.metadata.name.clone(),
+            controller: true,
+        }])
+        .build();
+    let spec = DemandSpec::builder()
+        .originating_work_ref(target)
+        .kind(DemandKind::HumanGate)
+        .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace(&session.metadata.namespace) })
+        .build();
+    Actuation::CreateDemand { meta, spec }
+}
+
+fn attention_demand_name(session: &ResourceObject<TerminalSession>) -> String {
+    format!("terminal-attention-{}", session.metadata.name)
 }
