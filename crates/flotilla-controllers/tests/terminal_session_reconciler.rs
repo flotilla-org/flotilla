@@ -126,7 +126,8 @@ async fn terminal_session_is_reclaimed_when_its_environment_is_gone() {
 
     assert!(matches!(
         outcome.actuations.as_slice(),
-        [Actuation::DeleteTerminalSession { name }] if name == "terminal-orphan"
+        [Actuation::DeleteTerminalSession { name }, Actuation::DeleteDemand { name: demand_name }]
+            if name == "terminal-orphan" && demand_name == "terminal-attention-terminal-orphan"
     ));
 }
 
@@ -172,7 +173,9 @@ async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
 
     assert!(matches!(
         outcome.actuations.as_slice(),
-        [Actuation::DeleteTerminalSession { name }] if name == "terminal-abandoned-convoy-work-coder"
+        [Actuation::DeleteTerminalSession { name }, Actuation::DeleteDemand { name: demand_name }]
+            if name == "terminal-abandoned-convoy-work-coder"
+                && demand_name == "terminal-attention-terminal-abandoned-convoy-work-coder"
     ));
 }
 
@@ -509,7 +512,8 @@ impl ReconcileStep<GhostRecoveryWorld> for GhostRecoveryStep {
         world.ownerless_recovery_rejected = outcome.patch.is_none()
             && matches!(
                 outcome.actuations.as_slice(),
-                [Actuation::DeleteTerminalSession { name }] if name == GHOST_SESSION_NAME
+                [Actuation::DeleteTerminalSession { name }, Actuation::DeleteDemand { name: demand_name }]
+                    if name == GHOST_SESSION_NAME && demand_name == "terminal-attention-terminal-deleted-convoy-work-coder"
             );
         Ok(LivenessStep::new(outcome.patch, outcome.actuations))
     }
@@ -525,6 +529,12 @@ impl ReconcileStep<GhostRecoveryWorld> for GhostRecoveryStep {
         match actuation {
             Actuation::DeleteTerminalSession { name } => {
                 match world.backend.clone().using::<TerminalSession>("flotilla").delete(&name).await {
+                    Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            Actuation::DeleteDemand { name } => {
+                match world.backend.clone().using::<flotilla_resources::Demand>("flotilla").delete(&name).await {
                     Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
                     Err(error) => Err(error.to_string()),
                 }
@@ -617,12 +627,25 @@ async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
         .update_status(&created.metadata.name, &created.metadata.resource_version, &status)
         .await
         .expect("session should be running");
+    let demands = backend.clone().using::<flotilla_resources::Demand>("flotilla");
+    demands
+        .create(
+            &meta("terminal-attention-terminal-convoy-work-coder").with_lifecycle_authority(LifecycleAuthority::Managed),
+            &flotilla_resources::DemandSpec::for_dispatching_principal(
+                flotilla_protocol::ResourceRef::new("flotilla.work/v1", "TerminalSession", "flotilla", "terminal-convoy-work-coder"),
+                flotilla_resources::DemandKind::HumanGate,
+                flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
+            ),
+        )
+        .await
+        .expect("attention demand");
     let runtime = Arc::new(RecordingTerminalRuntime::default());
     let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
 
     reconciler.run_finalizer(&session).await.expect("terminal finalizer should kill the session");
 
     assert_eq!(runtime.killed.lock().expect("killed mutex").as_slice(), &[("terminal-convoy-work-coder".to_string(), spec)]);
+    assert!(matches!(demands.get("terminal-attention-terminal-convoy-work-coder").await, Err(ResourceError::NotFound { .. })));
 }
 
 #[derive(Default)]
@@ -774,6 +797,10 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
     assert!(matches!(
         outcome.patch,
         Some(flotilla_resources::TerminalSessionStatusPatch::MarkStopped { stopped_at, .. }) if stopped_at == now
+    ));
+    assert!(matches!(
+        outcome.actuations.as_slice(),
+        [Actuation::DeleteDemand { name }] if name == "terminal-attention-term-a"
     ));
 }
 

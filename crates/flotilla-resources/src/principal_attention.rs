@@ -245,6 +245,9 @@ pub async fn resolve_demand(
     let patch = ResolveDemandStatusPatch { as_of, authority, verdict: verdict.clone() };
     apply_status_patch_checked(resolver, name, &patch, move |demand| {
         demand.spec.validate_verdict(&verdict)?;
+        if demand.status.as_ref().is_some_and(|status| status.state == DemandState::Acknowledged) {
+            return Err(ResourceError::invalid("acknowledged demand cannot be resolved"));
+        }
         if demand.status.as_ref().and_then(|status| status.verdict.as_ref()).is_none_or(|current| current == &verdict) {
             Ok(())
         } else {

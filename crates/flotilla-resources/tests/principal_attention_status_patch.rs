@@ -140,3 +140,37 @@ async fn demand_resolution_rejects_an_unoffered_verdict_but_accepts_explicit_oth
         .expect("explicit other is valid");
     assert_eq!(resolved.status.expect("status").verdict, Some(other));
 }
+
+#[tokio::test]
+async fn acknowledged_demand_cannot_report_a_successful_resolution_without_a_verdict() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let demands = backend.using::<flotilla_resources::Demand>("flotilla");
+    demands
+        .create(
+            &flotilla_resources::InputMeta::builder().name("dismissed".to_string()).build(),
+            &DemandSpec::for_dispatching_principal(
+                ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-review"),
+                DemandKind::Review,
+                PrincipalRef::implicit_for_namespace("flotilla"),
+            ),
+        )
+        .await
+        .expect("create demand");
+    flotilla_resources::apply_status_patch(&demands, "dismissed", &DemandStatusPatch::Acknowledge {
+        as_of: timestamp(20),
+        authority: "principal/default".to_string(),
+    })
+    .await
+    .expect("acknowledge demand");
+    let verdict = DemandVerdict::builder()
+        .responding_principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
+        .disposition(DemandVerdictDisposition::Other)
+        .build();
+
+    let error = resolve_demand(&demands, "dismissed", verdict, timestamp(30), "principal/default".to_string())
+        .await
+        .expect_err("acknowledged demand cannot resolve");
+
+    assert!(error.to_string().contains("acknowledged demand cannot be resolved"));
+    assert!(demands.get("dismissed").await.expect("demand").status.expect("status").verdict.is_none());
+}

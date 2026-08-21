@@ -6,8 +6,8 @@ use flotilla_protocol::{CanonicalHostId, PrincipalRef, ResourceRef};
 use flotilla_resources::{
     api_version,
     controller::{Actuation, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
-    Convoy, ConvoyPhase, DemandAddressee, DemandKind, DemandSpec, Environment, EnvironmentPhase, InputMeta, OwnerReference,
-    ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TerminalAttention,
+    Convoy, ConvoyPhase, Demand, DemandAddressee, DemandKind, DemandSpec, Environment, EnvironmentPhase, InputMeta, LifecycleAuthority,
+    OwnerReference, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TerminalAttention,
     TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
     TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
     CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
@@ -67,6 +67,7 @@ pub struct TerminalSessionReconciler<R> {
     convoys: TypedResolver<Convoy>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     environments: TypedResolver<Environment>,
+    demands: TypedResolver<Demand>,
     local_host_ref: Option<CanonicalHostId>,
 }
 
@@ -76,7 +77,8 @@ impl<R> TerminalSessionReconciler<R> {
             runtime,
             convoys: backend.clone().using::<Convoy>(namespace),
             federated_convoys: None,
-            environments: backend.using::<Environment>(namespace),
+            environments: backend.clone().using::<Environment>(namespace),
+            demands: backend.using::<Demand>(namespace),
             local_host_ref: None,
         }
     }
@@ -244,7 +246,10 @@ where
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         if matches!(prepared, TerminalPrepared::OwnerMissing) {
-            return ReconcileOutcome::with_actuations(None, vec![Actuation::DeleteTerminalSession { name: obj.metadata.name.clone() }]);
+            return ReconcileOutcome::with_actuations(None, vec![
+                Actuation::DeleteTerminalSession { name: obj.metadata.name.clone() },
+                Actuation::DeleteDemand { name: attention_demand_name(obj) },
+            ]);
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
@@ -324,6 +329,11 @@ where
 
         let actuations = match prepared {
             TerminalPrepared::Attention(observation) => vec![attention_demand_actuation(obj, observation)],
+            TerminalPrepared::Stopped => vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }],
+            TerminalPrepared::AttentionStale => vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }],
+            _ if matches!(phase, TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed) => {
+                vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
+            }
             _ => Vec::new(),
         };
         ReconcileOutcome::with_actuations(patch, actuations)
@@ -341,6 +351,15 @@ where
         }
         if let Err(error) = self.runtime.cleanup_session_artifacts(&obj.spec).await {
             errors.push(error);
+        }
+        match self.demands.get(&attention_demand_name(obj)).await {
+            Ok(demand) if demand.metadata.lifecycle_authority()? == Some(LifecycleAuthority::Managed) => {
+                if let Err(error) = self.demands.delete(&demand.metadata.name).await {
+                    errors.push(error.to_string());
+                }
+            }
+            Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => errors.push(error.to_string()),
         }
         if errors.is_empty() {
             Ok(())
@@ -384,7 +403,7 @@ where
 }
 
 fn attention_demand_actuation(session: &ResourceObject<TerminalSession>, observation: &TerminalObservation) -> Actuation {
-    let name = format!("terminal-attention-{}", session.metadata.name);
+    let name = attention_demand_name(session);
     let demands_attention = observation.occupancy == TerminalOccupancy::Vacant
         && observation.attention.as_ref().is_some_and(|attention| attention.state == TerminalAttentionState::NeedsInput);
     if !demands_attention {
@@ -412,4 +431,8 @@ fn attention_demand_actuation(session: &ResourceObject<TerminalSession>, observa
         .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace(&session.metadata.namespace) })
         .build();
     Actuation::CreateDemand { meta, spec }
+}
+
+fn attention_demand_name(session: &ResourceObject<TerminalSession>) -> String {
+    format!("terminal-attention-{}", session.metadata.name)
 }
