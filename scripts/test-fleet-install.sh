@@ -581,7 +581,10 @@ test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = 
   || fail 'interrupted-confirmation test never selected the candidate'
 grep -Fxq -- '--user restart flotillad.service' "$test_root/systemctl.log" \
   || fail 'interrupted-confirmation test did not start the candidate daemon'
-kill "$interrupted_installer_pid"
+confirmation_token="$(awk -F= '$1 == "token" { print $2 }' "$test_root/home/.local/opt/flotilla-fleet/.pending-confirmation")"
+confirmation_installer_pid="${confirmation_token%%-*}"
+[[ "$confirmation_installer_pid" =~ ^[0-9]+$ ]] || fail 'interrupted-confirmation test could not identify the installer process'
+kill "$confirmation_installer_pid"
 wait "$interrupted_installer_pid" 2>/dev/null || true
 for _ in {1..50}; do
   if [[ "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" == "$generation_one" ]] \
