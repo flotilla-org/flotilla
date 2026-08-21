@@ -52,6 +52,29 @@ fn test_meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
 }
 
+#[test]
+fn latent_handoff_terminal_inherits_resolved_vessel_credentials() {
+    let repository = RepositoryKey("github.com-flotilla-org-flotilla".to_string());
+    let requirement = VesselRequirement::builder()
+        .name("work".to_string())
+        .stance(Stance::Contained)
+        .credential_refs(BTreeSet::from(["claude-max".to_string(), "github-crew-pr".to_string()]))
+        .credential_scopes(BTreeMap::from([
+            ("claude-max".to_string(), BTreeSet::from([repository.clone()])),
+            ("github-crew-pr".to_string(), BTreeSet::from([repository])),
+        ]))
+        .crew(Vec::new())
+        .build();
+
+    let meta = terminal_meta_with_vessel_credentials(test_meta("terminal-demo-work-reviewer"), &requirement);
+
+    assert_eq!(meta.annotations.get(CREDENTIAL_REFS_ANNOTATION), Some(&r#"["claude-max","github-crew-pr"]"#.to_string()));
+    assert_eq!(
+        meta.annotations.get(CREDENTIAL_SCOPES_ANNOTATION),
+        Some(&r#"{"claude-max":["github.com-flotilla-org-flotilla"],"github-crew-pr":["github.com-flotilla-org-flotilla"]}"#.to_string())
+    );
+}
+
 async fn create_identity_convoy(backend: &ResourceBackend, record: &str, role: &str, project: Option<&str>) {
     let labels = BTreeMap::from([
         (PROJECT_LABEL.to_string(), project.unwrap_or_default().to_string()),
