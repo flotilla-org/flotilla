@@ -5242,6 +5242,15 @@ impl InProcessDaemon {
             Err(ResourceError::NotFound { .. }) => None,
             Err(error) => return Err(error.to_string()),
         };
+        let locally_homed = match self.resource_backend.clone().using::<Project>(&namespace).get(&declaration.name).await {
+            Ok(_) => true,
+            Err(ResourceError::NotFound { .. }) => false,
+            Err(error) => return Err(error.to_string()),
+        };
+        if existing_project.is_some() && !locally_homed {
+            debug!(project = %declaration.name, "skipping project materialization away from its home");
+            return Ok(Vec::new());
+        }
         let aliases = existing_project
             .as_ref()
             .into_iter()
