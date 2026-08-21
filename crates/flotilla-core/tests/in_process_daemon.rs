@@ -5132,21 +5132,38 @@ async fn convoy_resume_delivers_immediately_when_working_crew_is_already_idle() 
             phase: TerminalSessionPhase::Running,
             session_id: Some("idle-coder".to_string()),
             attention: Some(TerminalAttention {
-                state: TerminalAttentionState::Idle,
-                as_of: chrono::Utc::now() - chrono::Duration::minutes(1),
+                state: TerminalAttentionState::Working,
+                as_of: chrono::Utc::now() - chrono::Duration::minutes(2),
                 source: TerminalAttentionSource::Screen,
             }),
             ..Default::default()
         })
         .await
-        .expect("observe idle crew session");
+        .expect("observe working crew session");
+
+    let queued = daemon
+        .convoy_resume_internal("flotilla", "idle-convoy", "Finish the current turn", Some("work"), Some("coder"))
+        .await
+        .expect("queue brief while crew is working");
+    assert_eq!(queued, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: None });
+    apply_status_patch(&sessions, "idle-coder-session", &TerminalSessionStatusPatch::ObserveAttention {
+        attention: TerminalAttention {
+            state: TerminalAttentionState::Idle,
+            as_of: chrono::Utc::now() - chrono::Duration::minutes(1),
+            source: TerminalAttentionSource::Screen,
+        },
+    })
+    .await
+    .expect("observe idle crew session");
 
     let outcome = daemon
         .convoy_resume_internal("flotilla", "idle-convoy", "Start the next turn", Some("work"), Some("coder"))
         .await
         .expect("deliver brief to idle crew");
 
-    assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Delivered);
+    assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Delivered {
+        displaced: Some("Finish the current turn".to_string())
+    });
     assert_eq!(*terminal_pool.delivered.lock().await, vec![("idle-coder".to_string(), "Start the next turn".to_string(), true)]);
     let status = convoys.get("idle-convoy").await.expect("read resumed convoy").status.expect("convoy status");
     assert!(status.pending_brief().is_none());

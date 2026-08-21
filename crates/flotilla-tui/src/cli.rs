@@ -644,7 +644,10 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
     use flotilla_protocol::commands::CommandValue;
     match result {
         CommandValue::Ok => "ok".to_string(),
-        CommandValue::ConvoyBriefDelivered => "brief delivered now".to_string(),
+        CommandValue::ConvoyBriefDelivered { displaced: Some(displaced) } => {
+            format!("brief delivered now; displaced pending brief:\n{displaced}")
+        }
+        CommandValue::ConvoyBriefDelivered { displaced: None } => "brief delivered now".to_string(),
         CommandValue::ConvoyBriefQueued { displaced: Some(displaced) } => {
             format!("brief queued for turn end; displaced brief:\n{displaced}")
         }

@@ -14,8 +14,14 @@ fn replaced_pending_brief_echoes_the_displaced_text() {
 
 #[test]
 fn convoy_resume_reports_immediate_and_deferred_delivery_distinctly() {
-    assert_eq!(format_command_result(&CommandValue::ConvoyBriefDelivered), "brief delivered now");
+    assert_eq!(format_command_result(&CommandValue::ConvoyBriefDelivered { displaced: None }), "brief delivered now");
     assert_eq!(format_command_result(&CommandValue::ConvoyBriefQueued { displaced: None }), "brief queued for turn end");
+}
+
+#[test]
+fn immediately_delivered_brief_echoes_displaced_pending_text() {
+    let output = format_command_result(&CommandValue::ConvoyBriefDelivered { displaced: Some("older instruction".to_string()) });
+    assert_eq!(output, "brief delivered now; displaced pending brief:\nolder instruction");
 }
 
 #[test]

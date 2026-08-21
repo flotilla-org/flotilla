@@ -1621,7 +1621,7 @@ fn ensure_crew_work_is_defined(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyResumeOutcome {
-    Delivered,
+    Delivered { displaced: Option<String> },
     Queued { displaced: Option<String> },
 }
 
@@ -7285,11 +7285,9 @@ impl InProcessDaemon {
                 (ROLE_LABEL.to_string(), role.clone()),
             ]))
             .await
-            .map_err(|err| err.to_string())?
-            .items
-            .into_iter()
-            .next();
-        let at_turn_boundary = session.as_ref().is_some_and(|session| {
+            .map_err(|err| err.to_string())
+            .map(|list| list.items.into_iter().next());
+        let at_turn_boundary = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
             session.status.as_ref().is_some_and(|status| {
                 status.phase == ResourceTerminalSessionPhase::Running
                     && status.attention.as_ref().is_some_and(|attention| attention.state == TerminalAttentionState::Idle)
@@ -7309,7 +7307,8 @@ impl InProcessDaemon {
             return Ok(ConvoyResumeOutcome::Queued { displaced });
         }
 
-        let session = session.ok_or_else(|| format!("crew member `{role}` on vessel `{vessel}` has no intact terminal session"))?;
+        let displaced = status.pending_brief().map(|brief| brief.content.clone());
+        let session = session?.ok_or_else(|| format!("crew member `{role}` on vessel `{vessel}` has no intact terminal session"))?;
         match session.status.as_ref().map(|status| status.phase) {
             Some(ResourceTerminalSessionPhase::Running) => self.deliver_to_crew_session(&session, prompt).await?,
             Some(ResourceTerminalSessionPhase::Stopped) => {
@@ -7329,7 +7328,7 @@ impl InProcessDaemon {
             &convoy_external_patches::resume_crew_work(vessel, role, chrono::Utc::now(), prompt.to_string()),
         )
         .await
-        .map(|_| ConvoyResumeOutcome::Delivered)
+        .map(|_| ConvoyResumeOutcome::Delivered { displaced })
         .map_err(|err| err.to_string())
     }
 
@@ -8617,7 +8616,9 @@ impl InProcessDaemon {
             let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
                 Ok(record_name) => {
                     match self.convoy_resume_internal(&namespace, &record_name, prompt, vessel.as_deref(), role.as_deref()).await {
-                        Ok(ConvoyResumeOutcome::Delivered) => flotilla_protocol::CommandValue::ConvoyBriefDelivered,
+                        Ok(ConvoyResumeOutcome::Delivered { displaced }) => {
+                            flotilla_protocol::CommandValue::ConvoyBriefDelivered { displaced }
+                        }
                         Ok(ConvoyResumeOutcome::Queued { displaced }) => flotilla_protocol::CommandValue::ConvoyBriefQueued { displaced },
                         Err(message) => flotilla_protocol::CommandValue::Error { message },
                     }
