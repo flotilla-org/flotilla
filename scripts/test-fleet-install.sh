@@ -395,6 +395,8 @@ run_darwin_installer() {
   shift
   : "${LAUNCHCTL_LOG:=$test_root/launchctl.log}"
   HOME="$home" \
+    XDG_CONFIG_HOME="$home/.config" \
+    XDG_STATE_HOME="$home/.local/state" \
     PATH="$home/.local/bin:$fake_bin:$PATH" \
     SHELL="$fake_bin/zsh" \
     LOGIN_SHELL_PATH="$home/.local/bin:$fake_bin:/usr/bin:/bin" \
@@ -585,11 +587,25 @@ with open(sys.argv[1], "rb") as source:
     agent = plistlib.load(source)
 home = sys.argv[2]
 assert agent["Label"] == "work.flotilla.flotillad"
-assert agent["ProgramArguments"] == [f"{home}/.local/opt/flotilla-fleet/current/bin/flotillad"]
+assert agent["ProgramArguments"] == [
+    f"{home}/.local/opt/flotilla-fleet/current/bin/flotillad",
+    "--config-dir",
+    f"{home}/.config/flotilla",
+    "--state-dir",
+    f"{home}/.local/state/flotilla",
+    "--socket",
+    f"{home}/.config/flotilla/run/flotilla.sock",
+]
 assert agent["EnvironmentVariables"]["PATH"].split(":")[0] == f"{home}/.local/bin"
+assert "/usr/sbin" in agent["EnvironmentVariables"]["PATH"].split(":")
+assert "/sbin" in agent["EnvironmentVariables"]["PATH"].split(":")
+assert agent["StandardErrorPath"] == f"{home}/Library/Logs/flotilla/flotillad.stderr.log"
+assert agent["StandardOutPath"] == f"{home}/Library/Logs/flotilla/flotillad.stdout.log"
 assert agent["RunAtLoad"] is True
 assert agent["KeepAlive"] == {"SuccessfulExit": False}
 PY
+test -d "$darwin_home/Library/Logs/flotilla" \
+  || fail 'Darwin install did not create the launchd log directory'
 grep -Eq "^bootout gui/[0-9]+/work\\.flotilla\\.flotillad\\|releases/$generation_one$" "$test_root/launchctl.log" \
   || fail 'Darwin install did not unload the old agent before the generation flip'
 grep -Eq "^enable gui/[0-9]+/work\\.flotilla\\.flotillad\\|releases/$generation_two$" "$test_root/launchctl.log" \
