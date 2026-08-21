@@ -1695,6 +1695,7 @@ impl Aggregator {
             .iter()
             .filter_map(|((repo, id), (_exit, as_of))| {
                 let terminal = self.managed_terminals_by_repo.get(repo)?.get(id)?;
+                let working_directory = canonical_or_original(&terminal.working_directory);
                 let checkout = self
                     .observed_checkouts
                     .values()
@@ -1703,7 +1704,8 @@ impl Aggregator {
                             return None;
                         }
                         let CheckoutSpec::Observed(spec) = &checkout.spec else { return None };
-                        terminal.working_directory.starts_with(&spec.path).then_some((checkout, spec.path.len()))
+                        let checkout_path = canonical_or_original(std::path::Path::new(&spec.path));
+                        working_directory.starts_with(&checkout_path).then_some((checkout, checkout_path.components().count()))
                     })
                     .max_by_key(|(_, path_len)| *path_len)?
                     .0;
@@ -1719,7 +1721,7 @@ impl Aggregator {
     fn checkout_matches_repo_identity(&self, checkout: &ResourceObject<Checkout>, repo: &RepoIdentity) -> bool {
         let CheckoutSpec::Observed(spec) = &checkout.spec else { return false };
         if repo.authority == "local" {
-            return spec.path == repo.path;
+            return canonical_or_original(std::path::Path::new(&spec.path)) == canonical_or_original(std::path::Path::new(&repo.path));
         }
         let Some(repository) = self.repositories.get(&spec.repo_ref) else { return false };
         let ResourceRepositoryIdentity::Remote { canonical_remote } = repository.spec.identity() else { return false };
@@ -2100,6 +2102,10 @@ fn session_key(session: &ReadResourceObject<TerminalSession>) -> SessionKey {
         ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
     };
     (session.object.metadata.namespace.clone(), session.object.metadata.name.clone(), origin)
+}
+
+fn canonical_or_original(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn regard_as_of(regard: &ResourceObject<Regard>) -> chrono::DateTime<chrono::Utc> {
@@ -2704,14 +2710,15 @@ mod tests {
         let fingerprint = HashMap::from([("change-1".to_string(), ("feature".to_string(), "open".to_string()))]);
         aggregator.repo_change_requests.insert(repo_identity.clone(), fingerprint.clone());
 
-        let running = managed_terminal_delta(repo_identity.clone(), "pane-1", None, false);
+        let running = managed_terminal_delta(repo_identity.clone(), "pane-1", "/work/flotilla/app", None, false);
         assert!(aggregator.apply_managed_terminal_delta(&running));
         assert!(!aggregator.repo_delta_changed_change_requests(&running));
         assert_eq!(aggregator.repo_change_requests.get(&repo_identity), Some(&fingerprint));
         assert!(!aggregator.rebuild_salience_projection().await);
         assert_eq!(checkout_salience(&state, "flotilla").await, flotilla_protocol::Salience::None);
 
-        let exited = managed_terminal_delta(repo_identity.clone(), "pane-1", Some(PaneExitAttention { exit_code: 7 }), true);
+        let exited =
+            managed_terminal_delta(repo_identity.clone(), "pane-1", "/work/flotilla/app", Some(PaneExitAttention { exit_code: 7 }), true);
         assert!(aggregator.apply_managed_terminal_delta(&exited));
         assert!(aggregator.rebuild_salience_projection().await);
         assert_eq!(checkout_salience(&state, "flotilla").await, flotilla_protocol::Salience::Attention);
@@ -2730,6 +2737,59 @@ mod tests {
         };
         assert!(!aggregator.replace_managed_terminals(&partial_snapshot));
         assert_eq!(checkout_salience(&state, "flotilla").await, flotilla_protocol::Salience::Attention);
+    }
+
+    #[tokio::test]
+    async fn local_pane_exit_matches_cosmetically_different_checkout_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_checkout = temp.path().join("private").join("repo");
+        let alias_checkout = temp.path().join("repo-alias");
+        std::fs::create_dir_all(real_checkout.join("app")).expect("real checkout");
+        std::os::unix::fs::symlink(&real_checkout, &alias_checkout).expect("checkout alias");
+
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let repository_spec =
+            RepositorySpec::local("local", real_checkout.join(".git").to_string_lossy()).expect("local repository specification");
+        let repository = backend
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name("local-repo".to_string()).build(), &repository_spec)
+            .await
+            .expect("local repository");
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(16);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        aggregator.apply_repository_event(WatchEvent::Added(repository.clone())).await;
+        aggregator
+            .apply_checkout_event(WatchEvent::Added(
+                checkout_object("local-checkout", &alias_checkout.to_string_lossy(), repository.spec.key()).await,
+            ))
+            .await
+            .expect("local checkout projection");
+
+        let repo_identity = RepoIdentity { authority: "local".to_string(), path: real_checkout.to_string_lossy().into_owned() };
+        let exited = managed_terminal_delta(
+            repo_identity,
+            "local-pane",
+            &real_checkout.join("app").to_string_lossy(),
+            Some(PaneExitAttention { exit_code: 1 }),
+            false,
+        );
+        assert!(aggregator.apply_managed_terminal_delta(&exited));
+        assert!(aggregator.rebuild_salience_projection().await);
+
+        let result = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
+        let checkout = result
+            .rows
+            .as_awareness()
+            .expect("awareness rows")
+            .iter()
+            .flat_map(|node| &node.entries)
+            .find(|entry| {
+                entry.kind == flotilla_protocol::AwarenessKind::Checkout
+                    && entry.refs.iter().any(|reference| reference.name == "local-checkout")
+            })
+            .expect("local checkout entry");
+        assert_eq!(checkout.salience, flotilla_protocol::Salience::Attention);
     }
 
     fn attention_meta(name: &str, creation_timestamp: chrono::DateTime<Utc>) -> ObjectMeta {
@@ -3174,6 +3234,7 @@ mod tests {
     fn managed_terminal_delta(
         repo_identity: RepoIdentity,
         terminal_id: &str,
+        working_directory: &str,
         attention: Option<PaneExitAttention>,
         updated: bool,
     ) -> RepoDelta {
@@ -3181,7 +3242,7 @@ mod tests {
             set_id: flotilla_protocol::AttachableSetId::new("set-1"),
             role: "server".to_string(),
             command: "npm start".to_string(),
-            working_directory: "/work/flotilla/app".into(),
+            working_directory: working_directory.into(),
             status: attention.as_ref().map_or(flotilla_protocol::TerminalStatus::Running, |attention| {
                 flotilla_protocol::TerminalStatus::Exited(attention.exit_code)
             }),
