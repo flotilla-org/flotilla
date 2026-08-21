@@ -594,6 +594,15 @@ test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = 
   || fail 'detached health watchdog did not roll back after the installer exited'
 test "$(grep -Fxc -- '--user restart flotillad.service' "$test_root/systemctl.log")" = 2 \
   || fail 'detached Linux watchdog did not restart the candidate and restored daemon'
+orphan_confirmation_log=""
+for candidate_log in "$test_root/home/.local/opt/flotilla-fleet"/.confirmation.*.log; do
+  [[ -f "$candidate_log" ]] || continue
+  orphan_confirmation_log="$candidate_log"
+  break
+done
+[[ -n "$orphan_confirmation_log" ]] || fail 'detached watchdog did not retain its confirmation log'
+grep -Fq "generation $generation_two failed health confirmation; rolled back to $generation_one" "$orphan_confirmation_log" \
+  || fail 'detached watchdog log did not explain its rollback'
 
 DAEMON_RUNNING=1 STOP_FAIL=0 run_installer latest >"$test_root/latest.out"
 grep -Fq "generation $generation_two confirmed healthy" "$test_root/latest.out" \
