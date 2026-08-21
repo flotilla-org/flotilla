@@ -8,6 +8,7 @@ use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, HostListEntry, NodeId, PeerConnectionState, ResourceCursor, ResourceReadEnvelope,
     StepStatus,
 };
+use flotilla_resources::{is_prepared_snapshot, PLACEMENT_SNAPSHOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND};
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, bon::Builder)]
@@ -47,8 +48,6 @@ pub struct ResourceClient {
 }
 
 const SINGLE_HOME_SWEEP_KINDS: &[&str] = &["hosts", "placementpolicies"];
-const PLACEMENT_SNAPSHOT_PREFIX: &str = "placement-snapshot-";
-const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapshot";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DedupSweepDeletion {
@@ -354,7 +353,15 @@ fn natural_home(kind: &str, object: &serde_json::Value, placement_snapshot_homes
         "hosts" => object.pointer("/metadata/name").and_then(serde_json::Value::as_str).map(ToOwned::to_owned),
         "placementpolicies" => {
             let name = object.pointer("/metadata/name").and_then(serde_json::Value::as_str)?;
-            if name.starts_with(PLACEMENT_SNAPSHOT_PREFIX) {
+            let labels = object
+                .pointer("/metadata/labels")
+                .cloned()
+                .map(serde_json::from_value::<BTreeMap<String, String>>)
+                .transpose()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if is_prepared_snapshot(name, &labels, PLACEMENT_SNAPSHOT_KIND) {
                 let homes = placement_snapshot_homes.get(name)?;
                 return (homes.len() == 1).then(|| homes.first().expect("one placement snapshot home").clone());
             }
@@ -548,6 +555,26 @@ mod tests {
             kind: "placementpolicies".to_string(),
             name: name.to_string(),
             natural_home: Some(home.to_string()),
+        }
+    }
+
+    #[test]
+    fn every_prepared_placement_snapshot_form_uses_its_convoy_home() {
+        let homes = BTreeMap::from([
+            ("placement-snapshot-012345abcdef".to_string(), BTreeSet::from(["host-a".to_string()])),
+            ("convoy-remote-placement-012345abcdef".to_string(), BTreeSet::from(["host-a".to_string()])),
+            ("labelled-policy".to_string(), BTreeSet::from(["host-a".to_string()])),
+        ]);
+        for (name, labels) in [
+            ("placement-snapshot-012345abcdef", serde_json::json!({})),
+            ("convoy-remote-placement-012345abcdef", serde_json::json!({})),
+            ("labelled-policy", serde_json::json!({"flotilla.work/prepared-snapshot": "placement"})),
+        ] {
+            let object = serde_json::json!({
+                "metadata": {"name": name, "labels": labels},
+                "spec": {"docker_per_vessel": {"host_ref": "host-b"}}
+            });
+            assert_eq!(natural_home("placementpolicies", &object, &homes).as_deref(), Some("host-a"));
         }
     }
 
