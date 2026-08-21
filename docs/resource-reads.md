@@ -90,17 +90,21 @@ the read starts.
 
 ## One-time single-home duplicate sweep
 
-Fleets that ran before ADR 0033 may contain Host and PlacementPolicy records
-authored on several roots. With every fleet host online and connected, run:
+[ADR 0033](adr/0033-homing-in-practice-creation-cascade-mutation-routing-enforcement.md)
+enforces single-home authorship for new records, but fleets upgrading from the
+transitional multi-author behavior may still contain Host and PlacementPolicy
+records authored on several roots. With every fleet host upgraded, online, and
+connected, run:
 
 ```bash
 flotilla resource dedup-sweep
 flotilla resource dedup-sweep --json
 ```
 
-Run the sweep immediately when deploying the single-home resource behavior,
-before relying on placement decisions. Until the standing duplicates are
-removed, ordinary replica lookup may select an older authored copy.
+Run the sweep as the migration step immediately after deploying the ADR 0033
+behavior, before relying on placement decisions. Until the standing duplicates
+are removed, ordinary replica lookup may select an older authored copy and the
+collision condition will remain active.
 
 The command inventories each root's local authored rows, keeps the copy on the
 host named by the Host or placement policy, and uses the raw resource-delete
