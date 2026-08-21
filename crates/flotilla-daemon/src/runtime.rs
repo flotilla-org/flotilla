@@ -3753,6 +3753,11 @@ mod tests {
 
     #[tokio::test]
     async fn builtin_workflow_templates_seeded_at_multiple_roots_do_not_raise_authorship_collisions() {
+        assert_eq!(
+            WorkflowTemplate::REPLICATION_CLASS,
+            ReplicationClass::None,
+            "code-seeded builtins must remain outside single-home replication and collision enforcement"
+        );
         for root in ["builtin-root-a", "builtin-root-b", "builtin-root-c"] {
             let backend = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new(root));
             reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("seed builtin workflow templates");
