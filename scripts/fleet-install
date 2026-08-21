@@ -19,7 +19,6 @@ readonly RELEASES_DIR="$FLEET_ROOT/releases"
 readonly CURRENT_LINK="$FLEET_ROOT/current"
 readonly PREVIOUS_LINK="$FLEET_ROOT/previous"
 readonly PENDING_CONFIRMATION="$FLEET_ROOT/.pending-confirmation"
-readonly CONFIRMATION_LOG="$FLEET_ROOT/.confirmation.log"
 readonly TRUSTED_APPLE_TEAM_ID="973L4GV58R"
 readonly CONFIRM_TIMEOUT_SECONDS="${FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS:-30}"
 PLATFORM=""
@@ -31,6 +30,7 @@ INSTALL_LOCK_OWNER=""
 INSTALL_LOCK_HELD=0
 DARWIN_AGENT_DISABLED=0
 CONFIRMATION_PID=""
+CONFIRMATION_LOG=""
 readonly GENERATION_INCOMPLETE_EXIT=20
 
 die() {
@@ -942,6 +942,14 @@ confirmation_watchdog() {
     return 0
   fi
   confirmation_is_armed "$token" || return 0
+  local parent_pid="${token%%-*}"
+  if ! kill -0 "$parent_pid" 2>/dev/null; then
+    # The foreground installer normally holds this lock for the watchdog's
+    # lifetime. If it died, reclaim that protection before mutating links so
+    # a replacement install cannot race the orphaned rollback.
+    acquire_install_lock
+    confirmation_is_armed "$token" || return 0
+  fi
   if automatic_rollback "$generation" "$rollback_generation"; then
     disarm_health_confirmation "$token"
     printf 'fleet-install: generation %s failed health confirmation; rolled back to %s\n' "$generation" "$rollback_generation" >&2
@@ -957,6 +965,7 @@ start_confirmation_watchdog() {
   local token="$3"
   local installer
   installer="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  CONFIRMATION_LOG="$FLEET_ROOT/.confirmation.$token.log"
   nohup "$installer" __confirm "$generation" "$rollback_generation" "$token" >"$CONFIRMATION_LOG" 2>&1 </dev/null &
   CONFIRMATION_PID=$!
 }

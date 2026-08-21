@@ -446,6 +446,15 @@ run_installer "$generation_one" >"$test_root/install-one.out"
 grep -Fq "generation $generation_one confirmed healthy" "$test_root/install-one.out" \
   || fail 'healthy Linux install was not confirmed'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'exact generation was not selected'
+if FLEET_HEALTH_FAIL_FOR="$generation_one" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=0 \
+  run_installer "$generation_one" >"$test_root/no-previous.out" 2>&1; then
+  fail 'unhealthy reinstall without a previous generation was accepted'
+fi
+grep -Fq "generation $generation_one failed health confirmation and no healthy previous generation could be restored" \
+  "$test_root/no-previous.out" || fail 'unhealthy reinstall without a rollback target was not reported clearly'
+test ! -L "$test_root/home/.local/opt/flotilla-fleet/previous" \
+  || fail 'unhealthy reinstall created a self-referential previous generation'
+run_installer "$generation_one" >/dev/null
 test -x "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/bin/flotilla" || fail 'candidate binaries were not staged'
 test ! -w "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json" || fail 'selected generation is writable'
 test "$(file_mode "$test_root/home/.local/bin")" = 755 || fail 'credential umask leaked into the launcher directory'
