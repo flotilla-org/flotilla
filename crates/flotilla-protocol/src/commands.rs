@@ -846,6 +846,10 @@ impl AttachBinding {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandValue {
     Ok,
+    ConvoyBriefDelivered {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        displaced: Option<String>,
+    },
     ConvoyBriefQueued {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         displaced: Option<String>,
@@ -1274,6 +1278,7 @@ mod tests {
     fn command_value_roundtrip_covers_all_variants() {
         let cases = vec![
             CommandValue::Ok,
+            CommandValue::ConvoyBriefDelivered { displaced: Some("older instruction".into()) },
             CommandValue::ConvoyBriefQueued { displaced: Some("older instruction".into()) },
             CommandValue::ConvoyBriefWithdrawn { withdrawn: Some("latest instruction".into()) },
             CommandValue::RepoTracked {
