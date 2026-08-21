@@ -584,7 +584,10 @@ grep -Fxq -- '--user restart flotillad.service' "$test_root/systemctl.log" \
 kill "$interrupted_installer_pid"
 wait "$interrupted_installer_pid" 2>/dev/null || true
 for _ in {1..50}; do
-  [[ "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" == "$generation_one" ]] && break
+  if [[ "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" == "$generation_one" ]] \
+    && [[ "$(grep -Fxc -- '--user restart flotillad.service' "$test_root/systemctl.log" || true)" == 2 ]]; then
+    break
+  fi
   sleep 0.1
 done
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
