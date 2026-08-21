@@ -1170,6 +1170,26 @@ struct PlacementResolution {
     viable_not_selected: Vec<PlacementViableCandidate>,
 }
 
+fn home_copy_wins_by_name<T: Resource>(sources: impl IntoIterator<Item = ReadResourceObject<T>>) -> Vec<ResourceObject<T>> {
+    let mut resolved = BTreeMap::<String, ReadResourceObject<T>>::new();
+    for source in sources {
+        let name = source.object.metadata.name.clone();
+        match resolved.entry(name) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(source);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry)
+                if matches!(source.provenance, ResourceProvenance::Local)
+                    && matches!(entry.get().provenance, ResourceProvenance::Replica { .. }) =>
+            {
+                entry.insert(source);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    resolved.into_values().map(|source| source.object).collect()
+}
+
 fn placement_host_ref(policy: &ResourceObject<PlacementPolicy>) -> Option<&str> {
     policy
         .spec
@@ -1289,8 +1309,8 @@ async fn default_convoy_placement_policy(
     local_host_ref: Option<&CanonicalHostId>,
 ) -> Result<PlacementResolution, String> {
     let contained = workflow.vessels.iter().any(|vessel| vessel.stance == flotilla_resources::Stance::Contained);
-    let mut policies = match backend.clone().using::<PlacementPolicy>(namespace).list().await {
-        Ok(list) => list.items,
+    let mut policies = match backend.including_replicas::<PlacementPolicy>(namespace).list().await {
+        Ok(list) => home_copy_wins_by_name(list.items),
         Err(err) => {
             warn!(%namespace, error = %err, "failed to list placement policies; convoy will remain Pending until one is registered");
             return Ok(PlacementResolution { selected: None, refused_candidates: Vec::new(), viable_not_selected: Vec::new() });
@@ -2893,9 +2913,10 @@ impl InProcessDaemon {
         let policy = self
             .resource_backend
             .clone()
-            .using::<PlacementPolicy>(namespace)
+            .including_replicas::<PlacementPolicy>(namespace)
             .get(policy_name)
             .await
+            .map(|source| source.object)
             .map_err(|error| format!("placement policy {policy_name}: {error}"))?;
         let target_host = placement_target_host(&self.resource_backend, namespace, &policy).await?;
         if self.canonical_local_host_id().as_ref().is_some_and(|host_id| host_id == &target_host.reference) {
@@ -3808,19 +3829,19 @@ async fn resolve_workflow_credentials(
     workflow: &mut WorkflowTemplateSpec,
 ) -> Result<(), String> {
     let grants = backend
-        .clone()
-        .definitions::<CredentialGrant>(namespace)
+        .including_replicas::<CredentialGrant>(namespace)
         .list()
         .await
-        .map_err(|error| format!("list credential grants: {error}"))?;
+        .map_err(|error| format!("list credential grants: {error}"))?
+        .items;
     let specs = backend
-        .clone()
-        .definitions::<CredentialSpec>(namespace)
+        .including_replicas::<CredentialSpec>(namespace)
         .list()
         .await
         .map_err(|error| format!("list credential specs: {error}"))?
+        .items
         .into_iter()
-        .map(|spec| spec.metadata.name)
+        .map(|source| source.object.metadata.name)
         .collect::<BTreeSet<_>>();
     let all_repositories = repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<BTreeSet<_>>();
 
@@ -3830,20 +3851,22 @@ async fn resolve_workflow_credentials(
             .as_ref()
             .map(|repositories| repositories.iter().cloned().collect())
             .unwrap_or_else(|| all_repositories.clone());
-        let matching_grants =
-            grants.iter().filter(|grant| grant.spec.selector.matches(vessel.stance, project_ref, &vessel_repositories)).collect::<Vec<_>>();
-        let granted = matching_grants.iter().flat_map(|grant| grant.spec.credentials.iter().cloned()).collect::<BTreeSet<_>>();
+        let matching_grants = grants
+            .iter()
+            .filter(|source| source.object.spec.selector.matches(vessel.stance, project_ref, &vessel_repositories))
+            .collect::<Vec<_>>();
+        let granted = matching_grants.iter().flat_map(|grant| grant.object.spec.credentials.iter().cloned()).collect::<BTreeSet<_>>();
         if let Some(missing) = granted.iter().find(|name| !specs.contains(*name)) {
             return Err(format!("credential grant references missing credential `{missing}`"));
         }
         let mut credential_scopes = BTreeMap::<String, BTreeSet<_>>::new();
         for grant in matching_grants {
-            let covered_repositories = if grant.spec.selector.repositories.is_empty() {
+            let covered_repositories = if grant.object.spec.selector.repositories.is_empty() {
                 vessel_repositories.clone()
             } else {
-                grant.spec.selector.repositories.intersection(&vessel_repositories).cloned().collect()
+                grant.object.spec.selector.repositories.intersection(&vessel_repositories).cloned().collect()
             };
-            for credential in &grant.spec.credentials {
+            for credential in &grant.object.spec.credentials {
                 credential_scopes.entry(credential.clone()).or_default().extend(covered_repositories.iter().cloned());
             }
         }
@@ -3870,13 +3893,13 @@ async fn validate_workflow_credentials_with_capabilities(
     capabilities: &CapabilityTable,
 ) -> Result<(), String> {
     let specs = backend
-        .clone()
-        .definitions::<CredentialSpec>(namespace)
+        .including_replicas::<CredentialSpec>(namespace)
         .list()
         .await
         .map_err(|error| format!("list credential specs: {error}"))?
+        .items
         .into_iter()
-        .map(|spec| (spec.metadata.name, spec.spec.consumer))
+        .map(|source| (source.object.metadata.name, source.object.spec.consumer))
         .collect::<BTreeMap<_, _>>();
     for vessel in &workflow.vessels {
         for crew in &vessel.crew {
@@ -4286,9 +4309,10 @@ impl InProcessDaemon {
         let mut workflow = self
             .resource_backend
             .clone()
-            .using::<WorkflowTemplate>(namespace)
+            .including_replicas::<WorkflowTemplate>(namespace)
             .get(&workflow_ref)
             .await
+            .map(|source| source.object)
             .map_err(|error| format!("workflow template {workflow_ref}: {error}"))?;
         if let Some(stance) = stance {
             for vessel in &mut workflow.spec.vessels {
@@ -4846,10 +4870,10 @@ impl InProcessDaemon {
         let is_host_targeted_placement = self
             .resource_backend
             .clone()
-            .using::<PlacementPolicy>(namespace)
+            .including_replicas::<PlacementPolicy>(namespace)
             .get(&placement.policy_name)
             .await
-            .is_ok_and(|policy| placement_host_ref(&policy).is_some());
+            .is_ok_and(|source| placement_host_ref(&source.object).is_some());
         if !has_replica && !is_host_targeted_placement {
             return Ok(());
         }
@@ -4951,9 +4975,10 @@ impl InProcessDaemon {
                 let resolved = self
                     .resource_backend
                     .clone()
-                    .using::<PlacementPolicy>(namespace)
+                    .including_replicas::<PlacementPolicy>(namespace)
                     .get(policy)
                     .await
+                    .map(|source| source.object)
                     .map_err(|error| format!("placement policy {policy}: {error}"))?;
                 if contained && resolved.spec.docker_per_vessel.is_none() {
                     return Err(format!("contained workflow requires a docker placement policy, but {policy} is not contained"));
@@ -8858,9 +8883,10 @@ impl InProcessDaemon {
             let mut workflow = match self
                 .resource_backend
                 .clone()
-                .using::<WorkflowTemplate>(&namespace)
+                .including_replicas::<WorkflowTemplate>(&namespace)
                 .get(workflow_ref)
                 .await
+                .map(|source| source.object)
                 .map_err(|error| format!("workflow template {workflow_ref}: {error}"))
             {
                 Ok(workflow) => workflow,

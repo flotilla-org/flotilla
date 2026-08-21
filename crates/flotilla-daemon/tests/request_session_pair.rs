@@ -209,6 +209,7 @@ async fn default_focal_surface_uses_the_daemons_provisioning_principal() {
 #[tokio::test]
 async fn convoy_creation_attributes_provenance_and_regard_to_the_surface_principal() {
     let leader = empty_daemon_named("leader").await;
+    seed_host_capacity(&leader, 2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024).await;
     leader
         .resource_backend()
         .using::<WorkflowTemplate>("flotilla")

@@ -886,7 +886,8 @@ async fn default_remote_placement_routes_before_admission() {
         })
         .await
         .expect("remote host capabilities");
-    backend
+    let placement_source = ResourceBackend::InMemory(InMemoryBackend::default());
+    placement_source
         .using::<PlacementPolicy>("flotilla")
         .create(
             &test_meta("docker-udder-id"),
@@ -905,6 +906,11 @@ async fn default_remote_placement_routes_before_admission() {
         )
         .await
         .expect("remote placement");
+    backend
+        .replica_writer::<PlacementPolicy>(NodeId::new("udder-root"), "flotilla")
+        .replace(&placement_source.using::<PlacementPolicy>("flotilla").list().await.expect("list remote placement policies"), Utc::now())
+        .await
+        .expect("replicate remote placement policy");
 
     let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("andamento".to_string()).build();
     let (_, resolved_workflow) = daemon
@@ -919,7 +925,8 @@ async fn default_remote_placement_routes_before_admission() {
         .await
         .expect("resolve admission workflow");
     assert_eq!(resolved_workflow.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
-    let placement = backend.using::<PlacementPolicy>("flotilla").get("docker-udder-id").await.expect("placement");
+    let placement =
+        backend.including_replicas::<PlacementPolicy>("flotilla").get("docker-udder-id").await.expect("placement replica").object;
     validate_workflow_agent_adapters(&backend, "flotilla", &resolved_workflow, Some(&placement))
         .await
         .expect("placement should provide agent adapter");
@@ -935,6 +942,61 @@ async fn default_remote_placement_routes_before_admission() {
 
     assert_eq!(target.as_str(), "udder-id");
     assert!(matches!(backend.using::<ResourceConvoy>("flotilla").list().await, Ok(list) if list.items.is_empty()));
+}
+
+#[tokio::test]
+async fn placement_decision_prefers_local_home_copy_over_same_name_replica() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    for host in ["local-host", "replica-host"] {
+        hosts.create(&test_meta(host), &HostSpec { display_name: host.to_string() }).await.expect("placement host");
+    }
+
+    backend
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &test_meta("shared-policy"),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .priority(0)
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: "local-host".to_string(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("local home policy");
+    let replica_source = ResourceBackend::InMemory(InMemoryBackend::default());
+    replica_source
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &test_meta("shared-policy"),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .priority(100)
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: "replica-host".to_string(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("replica policy source");
+    backend
+        .replica_writer::<PlacementPolicy>(NodeId::new("remote-root"), "flotilla")
+        .replace(&replica_source.using::<PlacementPolicy>("flotilla").list().await.expect("list replica policy"), Utc::now())
+        .await
+        .expect("replicate colliding policy");
+
+    let resolution =
+        default_convoy_placement_policy(&backend, "flotilla", &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(), None)
+            .await
+            .expect("resolve placement");
+    let selected = resolution.selected.expect("select local home policy");
+
+    assert_eq!(placement_host_ref(&selected), Some("local-host"));
+    assert!(resolution.viable_not_selected.is_empty(), "same-name replica must not remain as a second candidate");
 }
 
 async fn placement_policy(backend: &ResourceBackend, name: &str, host_ref: &str) -> ResourceObject<PlacementPolicy> {
