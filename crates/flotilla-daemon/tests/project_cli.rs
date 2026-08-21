@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::Utc;
 use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
@@ -22,7 +23,9 @@ use flotilla_core::{
     repository_inspection::{LocalCheckoutInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
-use flotilla_protocol::{commands::RepositoryIdentityChange, Command, CommandAction, CommandValue, DaemonEvent, HostName, RepoSelector};
+use flotilla_protocol::{
+    commands::RepositoryIdentityChange, Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId, RepoSelector,
+};
 use flotilla_resources::{
     Checkout, CheckoutSpec, Convoy, ConvoyEnsure, InMemoryBackend, InputMeta, IssueSource, ObservedCheckoutSpec, Project,
     ProjectRepositoryRole, ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend, Stance,
@@ -531,6 +534,113 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let released = backend.using::<Repository>("flotilla").get(&app.repo.to_string()).await.expect("released repository");
     assert!(released.spec.verification_commands().is_empty());
     assert!(!released.metadata.annotations.contains_key(VERIFICATION_PROJECT_ANNOTATION));
+}
+
+#[tokio::test]
+async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
+    daemon
+        .set_repository_inspector(Arc::new(DeclarationInspector {
+            bootstrap: ops_spec.clone(),
+            commit: Arc::new(RwLock::new("replica-commit".to_string())),
+        }))
+        .await;
+    std::fs::write(
+        tmp.path().join("project.yaml"),
+        "name: replicated\nmembers:\n  - alias: app\n    url: https://github.com/example/app\n    roles: [code]\n  - alias: operations\n    url: https://github.com/example/project-ops\n    roles: [ops]\n",
+    )
+    .expect("write declaration");
+    std::fs::write(
+        tmp.path().join("replicated.entry"),
+        "---\nkind: workflow_template\nname: replica-authored\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo test\n",
+    )
+    .expect("write operational entry");
+
+    let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("project-home"));
+    let mut annotations = BTreeMap::new();
+    annotations.insert(BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), ops_spec.key().to_string());
+    annotations.insert(BOOTSTRAP_COMMIT_ANNOTATION.to_string(), "replica-commit".to_string());
+    annotations.insert(BOOTSTRAP_PATH_ANNOTATION.to_string(), tmp.path().to_string_lossy().into_owned());
+    let app = RepositorySpec::remote("https://github.com/example/app").expect("app spec");
+    authority
+        .definitions::<Project>("flotilla")
+        .apply(
+            &InputMeta::builder().name("replicated".to_string()).annotations(annotations).build(),
+            &ProjectSpec::builder()
+                .display_name("replicated".to_string())
+                .default_workflow_ref("single-agent-trusted".to_string())
+                .repositories(vec![
+                    flotilla_resources::ProjectRepositorySpec {
+                        repo: app.key(),
+                        alias: Some("app".to_string()),
+                        roles: [ProjectRepositoryRole::Code].into_iter().collect(),
+                        subpath: None,
+                        default_branch: None,
+                    },
+                    flotilla_resources::ProjectRepositorySpec {
+                        repo: ops_spec.key(),
+                        alias: Some("operations".to_string()),
+                        roles: [ProjectRepositoryRole::Ops].into_iter().collect(),
+                        subpath: None,
+                        default_branch: None,
+                    },
+                ])
+                .build(),
+        )
+        .await
+        .expect("author Project at its home");
+    let snapshot = authority.using::<Project>("flotilla").list().await.expect("list home Project");
+    backend
+        .replica_writer::<Project>(NodeId::new("project-home"), "flotilla")
+        .replace(&snapshot, Utc::now())
+        .await
+        .expect("replicate Project");
+
+    let log_output = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogCaptureWriter(Arc::clone(&log_output));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let mut rx = daemon.subscribe();
+    let result = execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "replicated".to_string() })
+        .with_subscriber(subscriber)
+        .await;
+
+    assert_eq!(result, CommandValue::ProjectRefreshed {
+        name: "replicated".to_string(),
+        members: 2,
+        converged: false,
+        changes: Vec::new()
+    });
+    assert!(
+        matches!(backend.using::<Project>("flotilla").get("replicated").await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+        "refreshing a replica must not establish local Project authorship"
+    );
+    assert!(matches!(
+        backend.using::<WorkflowTemplate>("flotilla").get("replica-authored").await,
+        Err(flotilla_resources::ResourceError::NotFound { .. })
+    ));
+    assert!(backend.using::<ConvoyEnsure>("flotilla").list().await.expect("list ensures").items.is_empty());
+    let logs = String::from_utf8(log_output.lock().expect("log capture lock should be healthy").clone()).expect("logs should be utf-8");
+    assert!(logs.contains("skipping project materialization away from its home"), "captured logs: {logs:?}");
+    assert!(logs.contains("replicated"), "skip log should identify the Project: {logs:?}");
+
+    let register =
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: tmp.path().to_string_lossy().into_owned() })
+            .await;
+    assert!(
+        matches!(&register, CommandValue::Error { message } if message.contains("homed by another root") && message.contains("at its home")),
+        "replica-only registration should identify the Project's remote home: {register:?}"
+    );
+    assert!(
+        matches!(backend.using::<Project>("flotilla").get("replicated").await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+        "registration at a replica root must not establish local Project authorship"
+    );
 }
 
 #[tokio::test]
