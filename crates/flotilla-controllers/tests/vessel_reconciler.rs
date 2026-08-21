@@ -2430,6 +2430,7 @@ async fn create_running_terminal(
             launch_command: Some(command.to_string()),
             delivered_message_id: None,
             attention: None,
+            occupancy: Default::default(),
             completion_pending: None,
             degraded: None,
         })

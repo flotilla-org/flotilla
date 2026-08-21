@@ -12,7 +12,8 @@ use flotilla_controllers::reconcilers::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
     DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler, ForgeDefaultBranchResolver,
     HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
-    RepositoryReconciler, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
+    RepositoryReconciler, TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselPlacementProjector,
+    VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
@@ -22,6 +23,7 @@ use flotilla_core::{
         inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
     },
     config::ConfigStore,
+    demand_lifecycle::DemandLifecycle,
     in_process::{InProcessDaemon, StandingConvoyBackingInspector},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
@@ -42,10 +44,11 @@ use flotilla_resources::{
     DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch,
     EnvironmentWaitReason, ForgeIdentity, Host, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard,
-    ReplicaReadResolver, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession,
-    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
-    CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG,
-    HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
+    ReplicaReadResolver, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock,
+    TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
+    CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS,
+    SLEEP_INHIBITION_CONDITION_TYPE,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -471,6 +474,7 @@ impl DaemonRuntime {
                 options.heartbeat_interval,
             ),
             spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
+            spawn_demand_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
             spawn_adopted_checkout_reconciliation_task(Arc::clone(&daemon), options.namespace.clone(), options.controller_resync_interval),
             spawn_projection_parity_task(
                 daemon.resource_backend(),
@@ -1358,6 +1362,19 @@ fn spawn_replica_refresh_task(daemon: Arc<InProcessDaemon>, interval: Duration) 
         async move {
             if let Err(err) = daemon.refresh_fleet_replicas_once().await {
                 warn!(%err, "failed to refresh fleet replicas");
+            }
+        }
+    })
+}
+
+fn spawn_demand_expiry_task(backend: ResourceBackend, namespace: String, interval: Duration) -> JoinHandle<()> {
+    let lifecycle = Arc::new(DemandLifecycle::new(backend, Arc::new(SystemClock)));
+    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
+        let lifecycle = Arc::clone(&lifecycle);
+        let namespace = namespace.clone();
+        async move {
+            if let Err(error) = lifecycle.expire_due(&namespace).await {
+                warn!(%error, %namespace, "failed to expire demands");
             }
         }
     })
@@ -3116,12 +3133,18 @@ impl TerminalRuntime for TerminalControllerRuntime {
         &self,
         session_id: &str,
         spec: &flotilla_resources::TerminalSessionSpec,
-    ) -> Result<Option<flotilla_resources::TerminalAttention>, String> {
+    ) -> Result<Option<TerminalObservation>, String> {
         let pool = self.pool_for_spec(spec)?;
         let Some(session) = pool.list_sessions().await?.into_iter().find(|session| session.session_name == session_id) else {
             return Ok(None);
         };
-        let Some(activity) = session.screen_activity else { return Ok(None) };
+        let occupancy = match session.status {
+            TerminalStatus::Running => TerminalOccupancy::Occupied,
+            TerminalStatus::Disconnected | TerminalStatus::Exited(_) => TerminalOccupancy::Vacant,
+        };
+        let Some(activity) = session.screen_activity else {
+            return Ok(Some(TerminalObservation { attention: None, occupancy }));
+        };
         if activity == ScreenActivity::Stable {
             if let TerminalSessionSource::Agent { selector, .. } = &spec.source {
                 let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
@@ -3134,10 +3157,13 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     Ok(Some(screen))
                         if adapter.classify_screen_attention(&screen) == Some(flotilla_resources::TerminalAttentionState::NeedsInput) =>
                     {
-                        return Ok(Some(flotilla_resources::TerminalAttention {
-                            state: flotilla_resources::TerminalAttentionState::NeedsInput,
-                            as_of: Utc::now(),
-                            source: flotilla_resources::TerminalAttentionSource::Screen,
+                        return Ok(Some(TerminalObservation {
+                            attention: Some(flotilla_resources::TerminalAttention {
+                                state: flotilla_resources::TerminalAttentionState::NeedsInput,
+                                as_of: Utc::now(),
+                                source: flotilla_resources::TerminalAttentionSource::Screen,
+                            }),
+                            occupancy,
                         }));
                     }
                     Ok(_) => {}
@@ -3149,10 +3175,13 @@ impl TerminalRuntime for TerminalControllerRuntime {
             ScreenActivity::Active => flotilla_resources::TerminalAttentionState::Working,
             ScreenActivity::Stable => flotilla_resources::TerminalAttentionState::Idle,
         };
-        Ok(Some(flotilla_resources::TerminalAttention {
-            state,
-            as_of: Utc::now(),
-            source: flotilla_resources::TerminalAttentionSource::Screen,
+        Ok(Some(TerminalObservation {
+            attention: Some(flotilla_resources::TerminalAttention {
+                state,
+                as_of: Utc::now(),
+                source: flotilla_resources::TerminalAttentionSource::Screen,
+            }),
+            occupancy,
         }))
     }
 
@@ -8629,13 +8658,13 @@ mod tests {
             pool: "fake-terminals".to_string(),
         };
 
-        let attention = runtime.observe_attention(session_name, &spec).await.expect("observe prompt").expect("attention observation");
-        assert_eq!(attention.state, TerminalAttentionState::NeedsInput);
+        let observation = runtime.observe_attention(session_name, &spec).await.expect("observe prompt").expect("attention observation");
+        assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::NeedsInput);
 
         pool.set_captured_screen(session_name, "› Ask Codex to do something\n\ngpt-5.6-sol high · /workspace").await;
-        let attention =
+        let observation =
             runtime.observe_attention(session_name, &spec).await.expect("observe normal composer").expect("attention observation");
-        assert_eq!(attention.state, TerminalAttentionState::Idle);
+        assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Idle);
     }
 
     #[tokio::test]

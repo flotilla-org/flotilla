@@ -172,6 +172,10 @@ pub struct TerminalSessionStatus {
     /// This deliberately does not participate in the session lifecycle phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<TerminalAttention>,
+    /// Whether the principal currently occupies the terminal's controller
+    /// seat. Cleat's attachment state is authoritative for this observation.
+    #[serde(default)]
+    pub occupancy: TerminalOccupancy,
     /// A crew completion accepted by this host but not yet acknowledged by
     /// the convoy authority. The local terminal session owns this durable
     /// intent so a daemon restart or mesh partition cannot lose the final act.
@@ -216,6 +220,15 @@ pub enum TerminalAttentionState {
 pub enum TerminalAttentionSource {
     Hook,
     Screen,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalOccupancy {
+    Occupied,
+    Vacant,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +321,10 @@ pub enum TerminalSessionStatusPatch {
     ObserveAttention {
         attention: TerminalAttention,
     },
+    Observe {
+        attention: Option<TerminalAttention>,
+        occupancy: TerminalOccupancy,
+    },
     MarkCompletionPending {
         pending: CrewCompletionPending,
     },
@@ -385,6 +402,17 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 let replace = status.attention.as_ref().is_none_or(|previous| previous.should_replace_with(attention));
                 if replace {
                     status.attention = Some(attention.clone());
+                }
+                status.message = None;
+                status.degraded = None;
+            }
+            Self::Observe { attention, occupancy } => {
+                status.occupancy = *occupancy;
+                if let Some(attention) = attention {
+                    let replace = status.attention.as_ref().is_none_or(|previous| previous.should_replace_with(attention));
+                    if replace {
+                        status.attention = Some(attention.clone());
+                    }
                 }
                 status.message = None;
                 status.degraded = None;

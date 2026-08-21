@@ -161,6 +161,8 @@ pub enum Actuation {
     RetryClone { name: String, failed_at: DateTime<Utc> },
     CreateCheckout { meta: InputMeta, spec: CheckoutSpec },
     CreateTerminalSession { meta: InputMeta, spec: TerminalSessionSpec },
+    CreateDemand { meta: InputMeta, spec: crate::DemandSpec },
+    DeleteDemand { name: String },
     RestartTerminalSession { name: String },
     DeleteTerminalSession { name: String },
     CreateVessel { meta: InputMeta, spec: VesselSpec },
@@ -496,6 +498,14 @@ impl<R: Reconciler> ControllerLoop<R> {
             Actuation::CreateTerminalSession { meta, spec } => {
                 let resolver = backend.using::<crate::TerminalSession>(namespace);
                 Self::create_if_missing(&resolver, meta, spec).await
+            }
+            Actuation::CreateDemand { meta, spec } => {
+                let resolver = backend.using::<crate::Demand>(namespace);
+                Self::create_if_missing(&resolver, meta, spec).await
+            }
+            Actuation::DeleteDemand { name } => {
+                let resolver = backend.using::<crate::Demand>(namespace);
+                Self::delete_if_lifecycle_owned(&resolver, &name).await
             }
             Actuation::RestartTerminalSession { name } => {
                 let resolver = backend.using::<crate::TerminalSession>(namespace);

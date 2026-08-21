@@ -364,6 +364,7 @@ pub async fn create_stopped_terminal(
             launch_command: Some(fixture.command),
             delivered_message_id: None,
             attention: None,
+            occupancy: Default::default(),
             completion_pending: None,
             degraded: None,
         })
