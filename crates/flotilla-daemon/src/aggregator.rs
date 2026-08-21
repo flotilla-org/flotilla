@@ -2671,16 +2671,22 @@ mod tests {
                 .salience
         };
 
-        let running = managed_terminal_snapshot(repo_identity.clone(), "pane-1", None);
-        assert!(aggregator.replace_managed_terminals(&running));
+        let fingerprint = HashMap::from([("change-1".to_string(), ("feature".to_string(), "open".to_string()))]);
+        aggregator.repo_change_requests.insert(repo_identity.clone(), fingerprint.clone());
+
+        let running = managed_terminal_delta(repo_identity.clone(), "pane-1", None, false);
+        assert!(aggregator.apply_managed_terminal_delta(&running));
+        assert!(!aggregator.repo_delta_changed_change_requests(&running));
+        assert_eq!(aggregator.repo_change_requests.get(&repo_identity), Some(&fingerprint));
         assert!(!aggregator.rebuild_salience_projection().await);
         assert_eq!(checkout_salience(&state).await, flotilla_protocol::Salience::None);
 
-        let exited = managed_terminal_snapshot(repo_identity, "pane-1", Some(PaneExitAttention { exit_code: 7 }));
-        assert!(aggregator.replace_managed_terminals(&exited));
+        let exited = managed_terminal_delta(repo_identity, "pane-1", Some(PaneExitAttention { exit_code: 7 }), true);
+        assert!(aggregator.apply_managed_terminal_delta(&exited));
         assert!(aggregator.rebuild_salience_projection().await);
         assert_eq!(checkout_salience(&state).await, flotilla_protocol::Salience::Attention);
-        assert!(!aggregator.replace_managed_terminals(&exited), "the same exit is not admitted twice");
+        assert!(aggregator.apply_managed_terminal_delta(&exited));
+        assert!(!aggregator.rebuild_salience_projection().await, "the same exit is not admitted twice");
     }
 
     fn attention_meta(name: &str, creation_timestamp: chrono::DateTime<Utc>) -> ObjectMeta {
@@ -3122,9 +3128,13 @@ mod tests {
             .expect("create scripted checkout")
     }
 
-    fn managed_terminal_snapshot(repo_identity: RepoIdentity, terminal_id: &str, attention: Option<PaneExitAttention>) -> RepoSnapshot {
-        let mut providers = ProviderData::default();
-        providers.managed_terminals.insert(AttachableId::new(terminal_id), ManagedTerminal {
+    fn managed_terminal_delta(
+        repo_identity: RepoIdentity,
+        terminal_id: &str,
+        attention: Option<PaneExitAttention>,
+        updated: bool,
+    ) -> RepoDelta {
+        let terminal = ManagedTerminal {
             set_id: flotilla_protocol::AttachableSetId::new("set-1"),
             role: "server".to_string(),
             command: "npm start".to_string(),
@@ -3133,15 +3143,14 @@ mod tests {
                 flotilla_protocol::TerminalStatus::Exited(attention.exit_code)
             }),
             attention,
-        });
-        RepoSnapshot {
+        };
+        let op = if updated { EntryOp::Updated(terminal) } else { EntryOp::Added(terminal) };
+        RepoDelta {
             seq: 1,
+            prev_seq: 0,
             repo_identity,
             repo: Some("/work/flotilla".into()),
-            node_id: flotilla_protocol::NodeId::new("local-node"),
-            providers,
-            provider_health: HashMap::new(),
-            errors: Vec::new(),
+            changes: vec![Change::ManagedTerminal { key: AttachableId::new(terminal_id), op }],
         }
     }
 

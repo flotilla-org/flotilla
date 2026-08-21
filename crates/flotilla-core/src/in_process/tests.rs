@@ -77,6 +77,38 @@ fn qualified_role_address_is_a_typed_project_role_pair() {
     }
 }
 
+#[test]
+fn managed_terminal_changes_are_field_scoped_and_deduplicated() {
+    let id = flotilla_protocol::AttachableId::new("pane-1");
+    let running = ManagedTerminal {
+        set_id: flotilla_protocol::AttachableSetId::new("set-1"),
+        role: "server".to_string(),
+        command: "npm start".to_string(),
+        working_directory: "/work/flotilla".into(),
+        status: flotilla_protocol::TerminalStatus::Running,
+        attention: None,
+    };
+    let current = HashMap::from([(id.clone(), running.clone())]);
+    assert!(matches!(
+        managed_terminal_changes(None, &current).as_slice(),
+        [Change::ManagedTerminal { key, op: EntryOp::Added(terminal) }] if key == &id && terminal == &running
+    ));
+    assert!(managed_terminal_changes(Some(&current), &current).is_empty());
+
+    let mut exited = running;
+    exited.status = flotilla_protocol::TerminalStatus::Exited(7);
+    exited.attention = Some(flotilla_protocol::PaneExitAttention { exit_code: 7 });
+    let updated = HashMap::from([(id.clone(), exited.clone())]);
+    assert!(matches!(
+        managed_terminal_changes(Some(&current), &updated).as_slice(),
+        [Change::ManagedTerminal { key, op: EntryOp::Updated(terminal) }] if key == &id && terminal == &exited
+    ));
+    assert!(matches!(
+        managed_terminal_changes(Some(&updated), &HashMap::new()).as_slice(),
+        [Change::ManagedTerminal { key, op: EntryOp::Removed }] if key == &id
+    ));
+}
+
 #[tokio::test]
 async fn attach_resolves_role_addresses_to_the_live_record_before_planning_the_hop() {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
