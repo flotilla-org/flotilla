@@ -9,6 +9,7 @@ pub struct SalienceFacts {
     pub demands: Vec<DemandFact>,
     pub regards: Vec<RegardFact>,
     pub attention: Vec<AttentionFact>,
+    pub pane_exits: Vec<PaneExitFact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +32,12 @@ pub struct AttentionFact {
     pub target: ResourceRef,
     pub state: TerminalAttentionState,
     pub work_unsettled: bool,
+    pub as_of: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneExitFact {
+    pub target: ResourceRef,
     pub as_of: DateTime<Utc>,
 }
 
@@ -87,6 +94,8 @@ pub fn evaluate_entry(
         .iter()
         .filter(|observation| targets.iter().any(|target| references_match(&observation.target, target)))
         .collect::<Vec<_>>();
+    let pane_exits =
+        facts.pane_exits.iter().filter(|exit| targets.iter().any(|target| references_match(&exit.target, target))).collect::<Vec<_>>();
 
     let mut result = SalienceEvaluation { salience: Salience::None, as_of: base_as_of };
     evaluate_combination(None, None, coverage_targets, facts, &mut result);
@@ -98,6 +107,10 @@ pub fn evaluate_entry(
         for &observation in &attention {
             evaluate_combination(Some(demand), Some(observation), coverage_targets, facts, &mut result);
         }
+    }
+    for exit in pane_exits {
+        result.salience = result.salience.max(Salience::Attention);
+        result.as_of = result.as_of.max(exit.as_of);
     }
     result
 }

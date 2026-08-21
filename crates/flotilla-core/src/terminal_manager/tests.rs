@@ -426,6 +426,29 @@ async fn refresh_updates_statuses() {
 }
 
 #[tokio::test]
+async fn refresh_surfaces_only_exited_panes_as_attention() {
+    for (status, expected_exit_code) in
+        [(TerminalStatus::Running, None), (TerminalStatus::Disconnected, None), (TerminalStatus::Exited(7), Some(7))]
+    {
+        let store = shared_in_memory_attachable_store();
+        let setup = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone(), test_host());
+        let set_id = setup.allocate_set(test_host(), test_checkout().into()).expect("allocate set");
+        let terminal_id =
+            setup.allocate_terminal(set_id, "server", 0, "feat", "npm start", ee("/repo/wt-feat")).expect("allocate terminal");
+        let pool = MockTerminalPool::with_sessions(vec![TerminalSession {
+            session_name: terminal_id.to_string(),
+            status,
+            command: Some("npm start".to_string()),
+            working_directory: Some(ee("/repo/wt-feat")),
+            screen_activity: None,
+        }]);
+
+        let infos = TerminalManager::new(Arc::new(pool), store, test_host()).refresh().await.expect("refresh");
+        assert_eq!(infos[0].attention.as_ref().map(|attention| attention.exit_code), expected_exit_code);
+    }
+}
+
+#[tokio::test]
 async fn refresh_reports_disconnected_for_missing_sessions() {
     let store = shared_in_memory_attachable_store();
     let mgr_for_setup = TerminalManager::new(Arc::new(MockTerminalPool::new()), store.clone(), test_host());

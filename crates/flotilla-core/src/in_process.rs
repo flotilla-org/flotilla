@@ -24,18 +24,18 @@ use flotilla_protocol::{
     commands::{AttachMode, RepositoryIdentityChange},
     qualified_path::{HostId, QualifiedPath},
     result_set::{CheckoutRow, ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
-    AttachBinding, CanonicalHostId, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CredentialAttention,
-    CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse,
-    DispatchQueueRow, EnvironmentId, EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition,
-    ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription,
+    AttachBinding, CanonicalHostId, Change, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation,
+    CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent,
+    DispatchQueueResponse, DispatchQueueRow, EntryOp, EnvironmentId, EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout,
+    ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription,
     ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow,
     FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProviderStatus,
-    HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal,
-    PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse,
-    ProviderData, ProviderInfo, QueryCursor, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachAction,
-    ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance,
-    ResourceRecordType, ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute,
-    ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    HostProvidersResponse, HostStatusResponse, HostSummary, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
+    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
+    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary,
+    ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
+    ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse,
+    TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -95,7 +95,7 @@ use crate::{
         MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
         SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
     },
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
+    path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath},
     project_declaration::{
         parse_project_declaration, ProjectDeclaration, BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION,
         BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE, DECLARATION_FILE_ANNOTATION,
@@ -2000,6 +2000,27 @@ fn convoy_home_unreachable_message(
     )
 }
 
+fn managed_terminal_changes(
+    previous: Option<&HashMap<flotilla_protocol::AttachableId, ManagedTerminal>>,
+    current: &HashMap<flotilla_protocol::AttachableId, ManagedTerminal>,
+) -> Vec<Change> {
+    let mut changes = Vec::new();
+    for (key, terminal) in current {
+        let op = match previous.and_then(|terminals| terminals.get(key)) {
+            Some(previous) if previous == terminal => continue,
+            Some(_) => EntryOp::Updated(terminal.clone()),
+            None => EntryOp::Added(terminal.clone()),
+        };
+        changes.push(Change::ManagedTerminal { key: key.clone(), op });
+    }
+    if let Some(previous) = previous {
+        for key in previous.keys().filter(|key| !current.contains_key(*key)) {
+            changes.push(Change::ManagedTerminal { key: key.clone(), op: EntryOp::Removed });
+        }
+    }
+    changes
+}
+
 pub struct InProcessDaemon {
     repos: RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -2057,6 +2078,9 @@ pub struct InProcessDaemon {
     resource_replication_failures: RwLock<HashMap<NodeId, BTreeMap<String, String>>>,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
     local_placement_provider_statuses: RwLock<Vec<HostProviderStatus>>,
+    /// Last terminal state published per repository, used to emit field-scoped
+    /// deltas without disturbing unrelated provider snapshot state.
+    managed_terminals_by_repo: RwLock<HashMap<RepoIdentity, HashMap<flotilla_protocol::AttachableId, ManagedTerminal>>>,
     /// Filesystem path whose capacity governs convoy admission on this host.
     ///
     /// The daemon runtime sets this to the host-direct checkout root. Keeping
@@ -2275,6 +2299,7 @@ impl InProcessDaemon {
             resource_replication_failures: RwLock::new(HashMap::new()),
             repository_inspector: RwLock::new(None),
             local_placement_provider_statuses: RwLock::new(Vec::new()),
+            managed_terminals_by_repo: RwLock::new(HashMap::new()),
             admission_free_space_path: std::sync::RwLock::new(admission_free_space_path),
             leaf_subscriptions: leaf_subscriptions.clone(),
         });
@@ -6018,6 +6043,88 @@ impl InProcessDaemon {
             }
         };
         Ok(identity_change)
+    }
+
+    /// Refresh host-local bare pane state and publish field-scoped deltas.
+    /// Pools are scanned once even when several tracked repositories share the
+    /// same host-scoped provider.
+    pub async fn refresh_managed_terminal_attention(&self) {
+        struct RepoTerminals {
+            identity: RepoIdentity,
+            roots: Vec<PathBuf>,
+            pool_key: usize,
+        }
+
+        let (repos, pools) = {
+            let tracked = self.repos.read().await;
+            let mut repos = Vec::new();
+            let mut pools = HashMap::new();
+            for state in tracked.values() {
+                let registry = state.registry();
+                let Some(pool) = registry.terminal_pools.preferred().cloned() else { continue };
+                let pool_key = Arc::as_ptr(&pool) as *const () as usize;
+                pools.entry(pool_key).or_insert(pool);
+                let roots = state.local_paths().into_iter().map(|root| canonical_or_original(&root)).collect();
+                repos.push(RepoTerminals { identity: state.identity().clone(), roots, pool_key });
+            }
+            (repos, pools)
+        };
+
+        let store = self.discovery.shared_attachable_store(&self.config);
+        for (pool_key, pool) in pools {
+            let manager = crate::terminal_manager::TerminalManager::new(pool, store.clone(), self.host_name.clone());
+            let terminals = match manager.refresh().await {
+                Ok(terminals) => terminals,
+                Err(error) => {
+                    warn!(%error, "failed to refresh managed terminal attention");
+                    continue;
+                }
+            };
+            let pool_repos = repos.iter().filter(|repo| repo.pool_key == pool_key).collect::<Vec<_>>();
+            let mut current = pool_repos.iter().map(|repo| (repo.identity.clone(), HashMap::new())).collect::<HashMap<_, HashMap<_, _>>>();
+            for terminal in &terminals {
+                let working_directory = canonical_or_original(terminal.working_directory.as_path());
+                // A nested checkout can share a path prefix with another
+                // tracked repository. Attribute the pane to the most-specific
+                // root only so one exit cannot surface on multiple checkouts.
+                let owner = pool_repos
+                    .iter()
+                    .flat_map(|repo| repo.roots.iter().map(move |root| (*repo, root)))
+                    .filter(|(_, root)| working_directory.starts_with(root))
+                    .max_by_key(|(_, root)| root.components().count())
+                    .map(|(repo, _)| repo);
+                if let Some(repo) = owner {
+                    current.get_mut(&repo.identity).expect("pool repository is initialized").insert(
+                        terminal.attachable_id.clone(),
+                        ManagedTerminal {
+                            set_id: terminal.attachable_set_id.clone(),
+                            role: terminal.role.clone(),
+                            command: terminal.command.clone(),
+                            working_directory: terminal.working_directory.as_path().to_path_buf(),
+                            status: terminal.status.clone(),
+                            attention: terminal.attention.clone(),
+                        },
+                    );
+                }
+            }
+
+            let mut previous = self.managed_terminals_by_repo.write().await;
+            for repo in pool_repos {
+                let next = current.remove(&repo.identity).expect("pool repository is initialized");
+                let changes = managed_terminal_changes(previous.get(&repo.identity), &next);
+                previous.insert(repo.identity.clone(), next);
+                if changes.is_empty() {
+                    continue;
+                }
+                let _ = self.event_tx.send(DaemonEvent::RepoDelta(Box::new(RepoDelta {
+                    seq: 0,
+                    prev_seq: 0,
+                    repo_identity: repo.identity.clone(),
+                    repo: repo.roots.first().cloned(),
+                    changes,
+                })));
+            }
+        }
     }
 
     /// Resolve a path that might be a git worktree to the main repo root.

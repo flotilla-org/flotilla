@@ -14,7 +14,10 @@ use flotilla_resources::{
 };
 
 use super::*;
-use crate::providers::discovery::test_support::fake_discovery;
+use crate::providers::{
+    discovery::test_support::{fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders, FakeTerminalPool},
+    terminal::{managed_session_name, ManagedSessionMetadata, TerminalSession},
+};
 
 #[test]
 fn completed_claims_without_a_decision_ledger_are_flagged_not_hidden() {
@@ -104,6 +107,95 @@ fn qualified_role_address_is_a_typed_project_role_pair() {
     for value in ["governor", "@andamento", "governor@", "governor@andamento@extra"] {
         assert!(RoleAddress::from_str(value).is_err(), "{value} must not produce a qualified address");
     }
+}
+
+#[test]
+fn managed_terminal_changes_are_field_scoped_and_deduplicated() {
+    let id = flotilla_protocol::AttachableId::new("pane-1");
+    let running = ManagedTerminal {
+        set_id: flotilla_protocol::AttachableSetId::new("set-1"),
+        role: "server".to_string(),
+        command: "npm start".to_string(),
+        working_directory: "/work/flotilla".into(),
+        status: flotilla_protocol::TerminalStatus::Running,
+        attention: None,
+    };
+    let current = HashMap::from([(id.clone(), running.clone())]);
+    assert!(matches!(
+        managed_terminal_changes(None, &current).as_slice(),
+        [Change::ManagedTerminal { key, op: EntryOp::Added(terminal) }] if key == &id && terminal == &running
+    ));
+    assert!(managed_terminal_changes(Some(&current), &current).is_empty());
+
+    let mut exited = running;
+    exited.status = flotilla_protocol::TerminalStatus::Exited(7);
+    exited.attention = Some(flotilla_protocol::PaneExitAttention { exit_code: 7 });
+    let updated = HashMap::from([(id.clone(), exited.clone())]);
+    assert!(matches!(
+        managed_terminal_changes(Some(&current), &updated).as_slice(),
+        [Change::ManagedTerminal { key, op: EntryOp::Updated(terminal) }] if key == &id && terminal == &exited
+    ));
+    assert!(matches!(
+        managed_terminal_changes(Some(&updated), &HashMap::new()).as_slice(),
+        [Change::ManagedTerminal { key, op: EntryOp::Removed }] if key == &id
+    ));
+}
+
+#[tokio::test]
+async fn managed_terminal_refresh_assigns_nested_cwd_to_most_specific_repo() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"pane-owner-test\"\n").expect("daemon config");
+    let canonical_outer = temp.path().join("private").join("outer");
+    let canonical_inner = canonical_outer.join("nested");
+    let configured_outer = temp.path().join("outer-alias");
+    let configured_inner = configured_outer.join("nested");
+    std::fs::create_dir_all(&canonical_inner).expect("nested repository roots");
+    std::os::unix::fs::symlink(&canonical_outer, &configured_outer).expect("configured repository alias");
+
+    let pool = Arc::new(FakeTerminalPool::new());
+    let terminal_id = flotilla_protocol::AttachableId::new("pane-1");
+    let working_directory = ExecutionEnvironmentPath::new(canonical_inner.join("app"));
+    let metadata = ManagedSessionMetadata::builder()
+        .set_id(flotilla_protocol::AttachableSetId::new("set-1"))
+        .attachable_id(terminal_id.clone())
+        .checkout("nested".to_string())
+        .role("server".to_string())
+        .index(0)
+        .working_directory(working_directory.clone())
+        .build();
+    pool.add_sessions(vec![TerminalSession {
+        session_name: managed_session_name(&metadata),
+        status: flotilla_protocol::TerminalStatus::Exited(7),
+        command: Some("npm start".to_string()),
+        working_directory: Some(working_directory),
+        screen_activity: None,
+    }])
+    .await;
+    let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(pool.clone()));
+    let daemon = InProcessDaemon::new(
+        vec![configured_outer, configured_inner.clone()],
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::new("local-host"),
+    )
+    .await;
+    let mut events = daemon.subscribe();
+
+    daemon.refresh_managed_terminal_attention().await;
+
+    let deltas = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|event| match event {
+            DaemonEvent::RepoDelta(delta) => Some(delta),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(deltas.len(), 1, "one pane must be attributed to one repository");
+    assert_eq!(deltas[0].repo_identity, fallback_repo_identity(&configured_inner));
+    assert!(matches!(
+        deltas[0].changes.as_slice(),
+        [Change::ManagedTerminal { key, op: EntryOp::Added(terminal) }]
+            if key == &terminal_id && terminal.attention == Some(flotilla_protocol::PaneExitAttention { exit_code: 7 })
+    ));
 }
 
 #[tokio::test]

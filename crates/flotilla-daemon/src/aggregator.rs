@@ -9,22 +9,24 @@ use async_trait::async_trait;
 use flotilla_core::{
     aggregator_projection::AggregatorProjectionState,
     in_process::InProcessDaemon,
-    salience::{AttentionFact, DemandFact, RegardFact, SalienceFacts},
+    path_context::canonical_or_original,
+    salience::{AttentionFact, DemandFact, PaneExitFact, RegardFact, SalienceFacts},
 };
 use flotilla_protocol::{
     result_set::{
         CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryChanges, QueryId, QueryScope,
         ResultDelta, Rows, SessionPhase, VesselRow, WorkPhase,
     },
-    Change, DaemonEvent, EntryOp, FleetReplicaSnapshot, HostName, LifecycleAuthority, ProviderData, RepoDelta, RepoIdentity, RepoSnapshot,
-    RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
+    AttachableId, Change, DaemonEvent, EntryOp, FleetReplicaSnapshot, HostName, LifecycleAuthority, ManagedTerminal, PaneExitAttention,
+    ProviderData, RepoDelta, RepoIdentity, RepoSnapshot, RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{
     api_version, repository_display_labels, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
     Demand, DemandAddressee, DemandState, Environment, Presentation, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard,
-    RegardExpiryPolicy, ReplicaReadResolver, Repository, Resource, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
-    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart,
-    WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    RegardExpiryPolicy, ReplicaReadResolver, Repository, RepositoryIdentity as ResourceRepositoryIdentity, Resource, ResourceError,
+    ResourceList, ResourceObject, ResourceProvenance, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel,
+    VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL,
+    REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::sync::{broadcast, mpsc};
@@ -196,6 +198,10 @@ pub struct Aggregator {
     #[builder(skip)]
     repo_change_requests: HashMap<RepoIdentity, ChangeRequestFingerprint>,
     #[builder(skip)]
+    managed_terminals_by_repo: HashMap<RepoIdentity, HashMap<AttachableId, ManagedTerminal>>,
+    #[builder(skip)]
+    pane_exit_as_of: HashMap<(RepoIdentity, AttachableId), (PaneExitAttention, chrono::DateTime<chrono::Utc>)>,
+    #[builder(skip)]
     issue_materializer: Option<IssueMaterializer>,
     event_tx: broadcast::Sender<DaemonEvent>,
 }
@@ -247,6 +253,8 @@ impl Aggregator {
             change_request_refresh_tasks: HashMap::new(),
             change_request_refresh_queue: ChangeRequestRefreshQueue::default(),
             repo_change_requests: HashMap::new(),
+            managed_terminals_by_repo: HashMap::new(),
+            pane_exit_as_of: HashMap::new(),
             issue_materializer: None,
             event_tx,
         }
@@ -412,13 +420,21 @@ impl Aggregator {
                         self.refresh_repository_change_requests(&repo_identity).await;
                     }
                     Ok(DaemonEvent::RepoSnapshot(snapshot)) => {
+                        let pane_attention_changed = self.replace_managed_terminals(&snapshot);
                         if self.repo_snapshot_changed_change_requests(&snapshot) {
                             self.refresh_repository_change_requests(&snapshot.repo_identity).await;
                         }
+                        if pane_attention_changed && self.rebuild_salience_projection().await {
+                            self.emit_awareness_result_sets().await;
+                        }
                     }
                     Ok(DaemonEvent::RepoDelta(delta)) => {
+                        let pane_attention_changed = self.apply_managed_terminal_delta(&delta);
                         if self.repo_delta_changed_change_requests(&delta) {
                             self.refresh_repository_change_requests(&delta.repo_identity).await;
+                        }
+                        if pane_attention_changed && self.rebuild_salience_projection().await {
+                            self.emit_awareness_result_sets().await;
                         }
                     }
                     Ok(
@@ -1099,6 +1115,68 @@ impl Aggregator {
         changed
     }
 
+    fn replace_managed_terminals(&mut self, snapshot: &RepoSnapshot) -> bool {
+        // Managed-terminal removals are explicit RepoDelta entries. Treat an
+        // empty/default snapshot field as absent so a future partial snapshot
+        // cannot silently wipe pane attention owned by this independent path.
+        if snapshot.providers.managed_terminals.is_empty() {
+            return false;
+        }
+        let terminals = snapshot.providers.managed_terminals.iter().map(|(id, terminal)| (id.clone(), terminal.clone())).collect();
+        if self.managed_terminals_by_repo.get(&snapshot.repo_identity) == Some(&terminals) {
+            return false;
+        }
+        self.managed_terminals_by_repo.insert(snapshot.repo_identity.clone(), terminals);
+        self.reconcile_pane_exit_timestamps();
+        true
+    }
+
+    fn apply_managed_terminal_delta(&mut self, delta: &RepoDelta) -> bool {
+        let terminals = self.managed_terminals_by_repo.entry(delta.repo_identity.clone()).or_default();
+        let mut changed = false;
+        for change in &delta.changes {
+            let Change::ManagedTerminal { key, op } = change else { continue };
+            changed = true;
+            match op {
+                EntryOp::Added(terminal) | EntryOp::Updated(terminal) => {
+                    terminals.insert(key.clone(), terminal.clone());
+                }
+                EntryOp::Removed => {
+                    terminals.remove(key);
+                }
+            }
+        }
+        if changed {
+            self.reconcile_pane_exit_timestamps();
+        }
+        changed
+    }
+
+    fn reconcile_pane_exit_timestamps(&mut self) {
+        let active = self
+            .managed_terminals_by_repo
+            .iter()
+            .flat_map(|(repo, terminals)| {
+                terminals
+                    .iter()
+                    .filter_map(|(id, terminal)| terminal.attention.clone().map(|attention| ((repo.clone(), id.clone()), attention)))
+            })
+            .collect::<HashMap<_, _>>();
+        self.pane_exit_as_of.retain(|key, _| active.contains_key(key));
+        let now = chrono::Utc::now();
+        for (key, attention) in active {
+            match self.pane_exit_as_of.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) if entry.get().0 != attention => {
+                    entry.insert((attention, now));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((attention, now));
+                }
+            }
+        }
+    }
+
     fn effective_convoys(&self) -> HashMap<ResourceRef, ResourceObject<Convoy>> {
         self.effective_convoy_reads().into_iter().map(|(reference, convoy)| (reference, convoy.object)).collect()
     }
@@ -1332,7 +1410,11 @@ impl Aggregator {
                 self.observed_checkouts.remove(&reference);
             }
         }
-        self.rebuild_checkout_rows().await
+        self.rebuild_checkout_rows().await?;
+        if self.rebuild_salience_projection().await {
+            self.emit_awareness_result_sets().await;
+        }
+        Ok(())
     }
 
     fn repository_labels(&self) -> HashMap<RepositoryKey, String> {
@@ -1609,7 +1691,42 @@ impl Aggregator {
                     .collect()
             })
             .collect();
-        SalienceFacts { demands, regards, attention }
+        let mut pane_exits = self
+            .pane_exit_as_of
+            .iter()
+            .filter_map(|((repo, id), (_exit, as_of))| {
+                let terminal = self.managed_terminals_by_repo.get(repo)?.get(id)?;
+                let working_directory = canonical_or_original(&terminal.working_directory);
+                let checkout = self
+                    .observed_checkouts
+                    .values()
+                    .filter_map(|checkout| {
+                        if !self.checkout_matches_repo_identity(checkout, repo) {
+                            return None;
+                        }
+                        let CheckoutSpec::Observed(spec) = &checkout.spec else { return None };
+                        let checkout_path = canonical_or_original(std::path::Path::new(&spec.path));
+                        working_directory.starts_with(&checkout_path).then_some((checkout, checkout_path.components().count()))
+                    })
+                    .max_by_key(|(_, path_len)| *path_len)?
+                    .0;
+                Some(PaneExitFact { target: self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name), as_of: *as_of })
+            })
+            .collect::<Vec<_>>();
+        pane_exits.sort_by(|left, right| {
+            (&left.target.namespace, &left.target.name, left.as_of).cmp(&(&right.target.namespace, &right.target.name, right.as_of))
+        });
+        SalienceFacts { demands, regards, attention, pane_exits }
+    }
+
+    fn checkout_matches_repo_identity(&self, checkout: &ResourceObject<Checkout>, repo: &RepoIdentity) -> bool {
+        let CheckoutSpec::Observed(spec) = &checkout.spec else { return false };
+        if repo.authority == "local" {
+            return canonical_or_original(std::path::Path::new(&spec.path)) == canonical_or_original(std::path::Path::new(&repo.path));
+        }
+        let Some(repository) = self.repositories.get(&spec.repo_ref) else { return false };
+        let ResourceRepositoryIdentity::Remote { canonical_remote } = repository.spec.identity() else { return false };
+        RepoIdentity::from_remote_url(canonical_remote).as_ref() == Some(repo)
     }
 
     fn next_regard_expiry_delay(&self) -> Option<std::time::Duration> {
@@ -2553,6 +2670,125 @@ mod tests {
         assert_eq!(as_of, working_at);
     }
 
+    #[tokio::test]
+    async fn managed_pane_exits_surface_once_as_checkout_attention() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(16);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let repository = repository_object("https://github.com/flotilla-org/flotilla").await;
+        let repo_identity = RepoIdentity { authority: "github.com".to_string(), path: "flotilla-org/flotilla".to_string() };
+        aggregator.apply_repository_event(WatchEvent::Added(repository.clone())).await;
+        aggregator
+            .apply_checkout_event(WatchEvent::Added(checkout_object("flotilla", "/work/flotilla", repository.spec.key()).await))
+            .await
+            .expect("checkout projection");
+        let nested_repository = repository_object("https://github.com/flotilla-org/nested").await;
+        aggregator.apply_repository_event(WatchEvent::Added(nested_repository.clone())).await;
+        aggregator
+            .apply_checkout_event(WatchEvent::Added(checkout_object("nested", "/work/flotilla/app", nested_repository.spec.key()).await))
+            .await
+            .expect("nested checkout projection");
+
+        let checkout_salience = async |state: &AggregatorProjectionState, name: &str| {
+            let result = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
+            result
+                .rows
+                .as_awareness()
+                .expect("awareness rows")
+                .iter()
+                .flat_map(|node| &node.entries)
+                .find(|entry| {
+                    entry.kind == flotilla_protocol::AwarenessKind::Checkout && entry.refs.iter().any(|reference| reference.name == name)
+                })
+                .expect("checkout entry")
+                .salience
+        };
+
+        let fingerprint = HashMap::from([("change-1".to_string(), ("feature".to_string(), "open".to_string()))]);
+        aggregator.repo_change_requests.insert(repo_identity.clone(), fingerprint.clone());
+
+        let running = managed_terminal_delta(repo_identity.clone(), "pane-1", "/work/flotilla/app", None, false);
+        assert!(aggregator.apply_managed_terminal_delta(&running));
+        assert!(!aggregator.repo_delta_changed_change_requests(&running));
+        assert_eq!(aggregator.repo_change_requests.get(&repo_identity), Some(&fingerprint));
+        assert!(!aggregator.rebuild_salience_projection().await);
+        assert_eq!(checkout_salience(&state, "flotilla").await, flotilla_protocol::Salience::None);
+
+        let exited =
+            managed_terminal_delta(repo_identity.clone(), "pane-1", "/work/flotilla/app", Some(PaneExitAttention { exit_code: 7 }), true);
+        assert!(aggregator.apply_managed_terminal_delta(&exited));
+        assert!(aggregator.rebuild_salience_projection().await);
+        assert_eq!(checkout_salience(&state, "flotilla").await, flotilla_protocol::Salience::Attention);
+        assert_eq!(checkout_salience(&state, "nested").await, flotilla_protocol::Salience::None);
+        assert!(aggregator.apply_managed_terminal_delta(&exited));
+        assert!(!aggregator.rebuild_salience_projection().await, "the same exit is not admitted twice");
+
+        let partial_snapshot = RepoSnapshot {
+            seq: 2,
+            repo_identity,
+            repo: Some("/work/flotilla".into()),
+            node_id: flotilla_protocol::NodeId::new("local-node"),
+            providers: ProviderData::default(),
+            provider_health: HashMap::new(),
+            errors: Vec::new(),
+        };
+        assert!(!aggregator.replace_managed_terminals(&partial_snapshot));
+        assert_eq!(checkout_salience(&state, "flotilla").await, flotilla_protocol::Salience::Attention);
+    }
+
+    #[tokio::test]
+    async fn local_pane_exit_matches_cosmetically_different_checkout_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_checkout = temp.path().join("private").join("repo");
+        let alias_checkout = temp.path().join("repo-alias");
+        std::fs::create_dir_all(real_checkout.join("app")).expect("real checkout");
+        std::os::unix::fs::symlink(&real_checkout, &alias_checkout).expect("checkout alias");
+
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let repository_spec =
+            RepositorySpec::local("local", real_checkout.join(".git").to_string_lossy()).expect("local repository specification");
+        let repository = backend
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name("local-repo".to_string()).build(), &repository_spec)
+            .await
+            .expect("local repository");
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(16);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        aggregator.apply_repository_event(WatchEvent::Added(repository.clone())).await;
+        aggregator
+            .apply_checkout_event(WatchEvent::Added(
+                checkout_object("local-checkout", &alias_checkout.to_string_lossy(), repository.spec.key()).await,
+            ))
+            .await
+            .expect("local checkout projection");
+
+        let repo_identity = RepoIdentity { authority: "local".to_string(), path: real_checkout.to_string_lossy().into_owned() };
+        let exited = managed_terminal_delta(
+            repo_identity,
+            "local-pane",
+            &real_checkout.join("app").to_string_lossy(),
+            Some(PaneExitAttention { exit_code: 1 }),
+            false,
+        );
+        assert!(aggregator.apply_managed_terminal_delta(&exited));
+        assert!(aggregator.rebuild_salience_projection().await);
+
+        let result = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
+        let checkout = result
+            .rows
+            .as_awareness()
+            .expect("awareness rows")
+            .iter()
+            .flat_map(|node| &node.entries)
+            .find(|entry| {
+                entry.kind == flotilla_protocol::AwarenessKind::Checkout
+                    && entry.refs.iter().any(|reference| reference.name == "local-checkout")
+            })
+            .expect("local checkout entry");
+        assert_eq!(checkout.salience, flotilla_protocol::Salience::Attention);
+    }
+
     fn attention_meta(name: &str, creation_timestamp: chrono::DateTime<Utc>) -> ObjectMeta {
         ObjectMeta {
             name: name.to_string(),
@@ -2990,6 +3226,33 @@ mod tests {
             )
             .await
             .expect("create scripted checkout")
+    }
+
+    fn managed_terminal_delta(
+        repo_identity: RepoIdentity,
+        terminal_id: &str,
+        working_directory: &str,
+        attention: Option<PaneExitAttention>,
+        updated: bool,
+    ) -> RepoDelta {
+        let terminal = ManagedTerminal {
+            set_id: flotilla_protocol::AttachableSetId::new("set-1"),
+            role: "server".to_string(),
+            command: "npm start".to_string(),
+            working_directory: working_directory.into(),
+            status: attention.as_ref().map_or(flotilla_protocol::TerminalStatus::Running, |attention| {
+                flotilla_protocol::TerminalStatus::Exited(attention.exit_code)
+            }),
+            attention,
+        };
+        let op = if updated { EntryOp::Updated(terminal) } else { EntryOp::Added(terminal) };
+        RepoDelta {
+            seq: 1,
+            prev_seq: 0,
+            repo_identity,
+            repo: Some("/work/flotilla".into()),
+            changes: vec![Change::ManagedTerminal { key: AttachableId::new(terminal_id), op }],
+        }
     }
 
     async fn repository_replica_snapshot(host: &str, url: &str) -> FleetReplicaSnapshot {
