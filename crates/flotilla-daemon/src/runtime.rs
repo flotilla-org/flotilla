@@ -3105,12 +3105,11 @@ impl TerminalRuntime for TerminalControllerRuntime {
         };
         env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
 
-        if matches!(spec.source, TerminalSessionSource::Agent { .. })
-            && pool.list_sessions().await?.iter().any(|session| session.session_name == name)
-        {
+        let is_agent_session = matches!(spec.source, TerminalSessionSource::Agent { .. });
+        if is_agent_session && pool.list_sessions().await?.iter().any(|session| session.session_name == name) {
             pool.kill_session(name).await?;
         }
-        let initial_size = matches!(spec.source, TerminalSessionSource::Agent { .. }).then_some(CREW_SESSION_SIZE);
+        let initial_size = is_agent_session.then_some(CREW_SESSION_SIZE);
         pool.ensure_session_with_size(name, &command, &cwd, &env, &pool_tags, initial_size).await?;
         let delivered_message_id = initial_message.as_ref().map(|message| message.id.clone());
         if let Some(message) = initial_message {
