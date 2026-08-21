@@ -24,9 +24,9 @@ ADR 0016 ruled the cross-root model: convergent facts union, definitions
 merge, home-bound runtime is reconciled only at home. One week of running
 the fleet through daemon restarts, a schema change, and a generation roll
 produced the incidents above — none falsified 0016. Every one was the
-implementation failing to hold an invariant 0016 assumed by construction. This ADR closes the gap: who
-authors a new record, how mutations reach a record's home, what reads are
-required to see, and what enforces all of it.
+implementation failing to hold an invariant 0016 assumed by construction.
+This ADR closes the gap: who authors a new record, how mutations reach a
+record's home, what reads are required to see, and what enforces all of it.
 
 ## Records are authored at one home; practice now enforces it
 
