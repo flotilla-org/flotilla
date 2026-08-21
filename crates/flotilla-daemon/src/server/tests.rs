@@ -30,10 +30,10 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus, Host,
-    HostSpec, HostStatus, HttpBackend, InMemoryBackend, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ResourceBackend,
-    ResourceError, ResourceList, ResourceProvenance, Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalBrief,
-    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
-    WatchEvent, WatchStart,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HttpBackend, InMemoryBackend, InputMeta,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, ResourceBackend, ResourceError,
+    ResourceList, ResourceProvenance, Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
+    TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, WatchEvent, WatchStart,
 };
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
@@ -1670,6 +1670,26 @@ async fn dispatch_execute_routes_remote_placement_admission_to_the_actuator() {
         .await
         .expect("replicate remote host capacity");
     let remote_policy_name = format!("host-direct-{remote_host_id}");
+    let remote_policies = remote_daemon.resource_backend().using::<PlacementPolicy>("flotilla");
+    remote_policies
+        .create(
+            &InputMeta::builder().name(remote_policy_name.clone()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("cleat".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: remote_host_id.clone(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("create remote placement policy at its home");
+    daemon
+        .resource_backend()
+        .replica_writer::<PlacementPolicy>(node("feta"), "flotilla")
+        .replace(&remote_policies.list().await.expect("list remote placement policies"), chrono::Utc::now())
+        .await
+        .expect("replicate remote placement policy");
     let remote_summary = HostSummary::builder()
         .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(&remote_host_id)))
         .host_name(HostName::new("feta"))

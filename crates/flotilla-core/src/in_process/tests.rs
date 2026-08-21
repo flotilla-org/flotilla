@@ -1326,21 +1326,9 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
 }
 
 #[tokio::test]
-async fn remote_placement_uses_fresh_host_capabilities_over_a_stale_local_row() {
+async fn remote_placement_uses_replicated_host_capabilities() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("kiwi-root"));
     let now = Utc::now();
-    let hosts = backend.using::<ResourceHost>("flotilla");
-    let stale =
-        hosts.create(&test_meta("feta-host"), &HostSpec { display_name: "feta".to_string() }).await.expect("create stale local host row");
-    hosts
-        .update_status(&stale.metadata.name, &stale.metadata.resource_version, &HostStatus {
-            heartbeat_at: Some(now),
-            ready: true,
-            ..HostStatus::default()
-        })
-        .await
-        .expect("write stale null-capability host status");
-
     let feta = ResourceBackend::InMemory(InMemoryBackend::default());
     let feta_hosts = feta.using::<ResourceHost>("flotilla");
     let fresh = feta_hosts
@@ -1370,7 +1358,7 @@ async fn remote_placement_uses_fresh_host_capabilities_over_a_stale_local_row() 
         .expect("replicate fresh feta self-report to kiwi");
 
     let sources = backend.including_replicas::<ResourceHost>("flotilla").list().await.expect("list host sources");
-    assert_eq!(sources.items.len(), 2, "reproduction requires the stale and fresh rows to coexist");
+    assert_eq!(sources.items.len(), 1, "a Host should have only its home-authored source");
 
     let placement = backend
         .using::<PlacementPolicy>("flotilla")

@@ -87,3 +87,20 @@ last successfully processed cursor and resume after an error.
 `--host <name>` routes all three reads to that peer. The same wire-generation
 handshake used by every CLI connection rejects an incompatible daemon before
 the read starts.
+
+## One-time single-home duplicate sweep
+
+Fleets that ran before ADR 0033 may contain Host and PlacementPolicy records
+authored on several roots. With every fleet host online and connected, run:
+
+```bash
+flotilla resource dedup-sweep
+flotilla resource dedup-sweep --json
+```
+
+The command inventories each root's local authored rows, keeps the copy on the
+host named by the Host or placement policy, and uses the raw resource-delete
+path for every non-home copy. It refuses before deleting a record if the copies
+disagree about their home or the home has no authored copy. The report names
+each deletion. A successful second run reports zero duplicates and zero
+deletions.

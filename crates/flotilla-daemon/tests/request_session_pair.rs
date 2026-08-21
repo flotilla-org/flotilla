@@ -28,10 +28,10 @@ use flotilla_protocol::{
 use flotilla_resources::{
     api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
     CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host, HostSpec, HostStatus, InMemoryBackend, InputMeta,
-    PlacementPolicy, PlacementPolicySpec, Regard, Resource, ResourceBackend, ResourceError, ResourceProvenance,
-    WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL,
-    HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
+    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, Regard, Resource,
+    ResourceBackend, ResourceError, ResourceProvenance, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
+    AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
 };
 
 async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
@@ -78,7 +78,11 @@ async fn seed_host_capacity(daemon: &Arc<InProcessDaemon>, free_bytes: u64, floo
         .expect("create host capacity resource");
     hosts
         .update_status(&host_id, &host.metadata.resource_version, &HostStatus {
+            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
+            heartbeat_at: Some(Utc::now()),
             ready: true,
+            daemon_generation: Some("test-generation".to_string()),
+            daemon_started_at: Some(Utc::now()),
             disk_free_bytes: Some(free_bytes),
             admission_free_space_floor_bytes: Some(floor_bytes),
             ..HostStatus::default()
@@ -113,15 +117,28 @@ async fn await_host_capacity(daemon: &Arc<InProcessDaemon>, host_id: &str) {
 }
 
 async fn seed_target_placement_policy(topology: &InMemoryRequestTopology, namespace: &str, policy_name: &str) {
-    let policy =
-        topology.leader.resource_backend().using::<PlacementPolicy>(namespace).get(policy_name).await.expect("origin placement policy");
-    topology
-        .follower
-        .resource_backend()
-        .using::<PlacementPolicy>(namespace)
-        .create(&InputMeta::builder().name(policy_name.to_string()).build(), &policy.spec)
+    let host_ref = topology.follower.local_host_id().expect("placement host identity").to_string();
+    let policies = topology.follower.resource_backend().using::<PlacementPolicy>(namespace);
+    policies
+        .create(
+            &InputMeta::builder().name(policy_name.to_string()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("cleat".to_string())
+                .host_direct(HostDirectPlacementPolicySpec { host_ref, checkout: HostDirectPlacementPolicyCheckout::Worktree })
+                .build(),
+        )
         .await
         .expect("placement host should register its local placement policy");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if topology.leader.resource_backend().including_replicas::<PlacementPolicy>(namespace).get(policy_name).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("home-authored placement policy should replicate to origin");
 }
 
 fn convoy_spec(workflow_ref: &str, role: &str) -> ConvoySpec {
@@ -726,18 +743,8 @@ async fn convoy_start_routes_to_placement_host_when_presentation_membership_is_s
     let remote_host_id = topology.follower.local_host_id().expect("follower host identity").to_string();
     let placement_policy = format!("host-direct-{remote_host_id}");
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if topology.leader.resource_backend().using::<PlacementPolicy>(namespace).get(&placement_policy).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("peer host summary should materialize placement policy");
-    await_host_capacity(&topology.leader, &remote_host_id).await;
     seed_target_placement_policy(&topology, namespace, &placement_policy).await;
+    await_host_capacity(&topology.leader, &remote_host_id).await;
 
     seed_trusted_remote_convoy_project(&topology.follower, namespace).await;
 
@@ -826,6 +833,7 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
     let namespace = "flotilla";
     let placement_policy = format!("host-direct-{remote_host_id}");
+    seed_target_placement_policy(&topology, namespace, &placement_policy).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let sources = topology
@@ -839,13 +847,6 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
                 .into_iter()
                 .filter(|source| source.object.metadata.name == remote_host_id)
                 .collect::<Vec<_>>();
-            let stale_local =
-                sources.iter().any(|source| {
-                    matches!(source.provenance, ResourceProvenance::Local)
-                        && source.object.status.as_ref().is_some_and(|status| {
-                            status.held_credentials().expect("decode local held credentials").is_empty() && status.ready
-                        })
-                });
             let fresh_replica = sources.iter().any(|source| {
                 matches!(source.provenance, ResourceProvenance::Replica { .. })
                     && source.object.status.as_ref().is_some_and(|status| {
@@ -853,18 +854,14 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
                             && status.held_credentials().expect("decode replica held credentials").contains("claude-max")
                     })
             });
-            if stale_local
-                && fresh_replica
-                && topology.leader.resource_backend().using::<PlacementPolicy>(namespace).get(&placement_policy).await.is_ok()
-            {
+            if sources.len() == 1 && fresh_replica {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("kiwi should reproduce the stale local and fresh feta Host rows");
-    seed_target_placement_policy(&topology, namespace, &placement_policy).await;
+    .expect("kiwi should read feta's single home-authored Host replica");
 
     seed_trusted_remote_convoy_project(&topology.follower, namespace).await;
     let workflows = topology.follower.resource_backend().using::<WorkflowTemplate>(namespace);
@@ -948,18 +945,8 @@ async fn routed_convoy_start_enforces_placement_host_capacity_before_persistence
     let remote_host_id = topology.follower.local_host_id().expect("follower host identity").to_string();
     let placement_policy = format!("host-direct-{remote_host_id}");
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if topology.leader.resource_backend().using::<PlacementPolicy>(namespace).get(&placement_policy).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("peer host summary should materialize placement policy");
-    await_host_capacity(&topology.leader, &remote_host_id).await;
     seed_target_placement_policy(&topology, namespace, &placement_policy).await;
+    await_host_capacity(&topology.leader, &remote_host_id).await;
     seed_trusted_remote_convoy_project(&topology.follower, namespace).await;
 
     let mut events = topology.leader.subscribe();
