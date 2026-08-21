@@ -225,6 +225,17 @@ pub struct ExplainedCrewDelivery {
     pub delivered_message_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ExplainedDecisionLedger {
+    pub vessel: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_url: Option<String>,
+    pub missing: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainedUnmetExpectation {
     pub reason: String,
@@ -253,6 +264,7 @@ pub struct ConvoyExplanation {
     pub change_requests: Vec<ExplainedChangeRequest>,
     pub subscriptions: Vec<ExplainedSubscription>,
     pub crew_deliveries: Vec<ExplainedCrewDelivery>,
+    pub decision_ledgers: Vec<ExplainedDecisionLedger>,
     pub settlement: ExplainedSettlement,
 }
 
@@ -550,6 +562,8 @@ pub enum CommandAction {
         message: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         disposition: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision_ledger_ref: Option<String>,
     },
     CrewFail {
         context: CrewCommandContext,
@@ -1119,6 +1133,7 @@ mod tests {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     message: Some("ready for review".into()),
                     disposition: Some("changes-pushed".into()),
+                    decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1#issuecomment-2".into()),
                 })
                 .build(),
             Command::builder()

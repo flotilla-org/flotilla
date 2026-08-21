@@ -388,17 +388,18 @@ impl LeafSubscriptionTable {
         if status.turn_deliveries.get(source).is_some_and(|delivery| delivery.episodes.iter().any(|episode| episode.head_sha == head_sha)) {
             return Ok(());
         }
-        let claim_at = status
+        let claim = status
             .crew_work
             .get(&rule.to.vessel)
             .and_then(|crew| crew.get(&rule.to.role))
-            .and_then(|work| work.finished_at)
             .ok_or_else(|| format!("turn-delivery target {}/{} has no settlement claim", rule.to.vessel, rule.to.role))?;
+        let claim_at =
+            claim.finished_at.ok_or_else(|| format!("turn-delivery target {}/{} has no settlement claim", rule.to.vessel, rule.to.role))?;
         if evidence_at <= claim_at || cr.head_sha.observed_at <= claim_at {
             return Ok(());
         }
 
-        let brief = compose_turn_brief(&convoy, source, rule, leaf, cr, claim_at);
+        let brief = compose_turn_brief(&convoy, source, rule, leaf, cr, claim_at, claim.decision_ledger_ref.as_deref());
         let request = TurnDeliveryRequest::builder()
             .namespace(namespace.clone())
             .convoy(convoy_name.to_string())
@@ -458,6 +459,7 @@ fn compose_turn_brief(
     leaf: &Leaf,
     cr: &flotilla_resources::ChangeRequestStatus,
     claim_at: DateTime<Utc>,
+    decision_ledger_ref: Option<&str>,
 ) -> String {
     let repositories = convoy
         .spec
@@ -467,13 +469,14 @@ fn compose_turn_brief(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "{}\n\n## Turn firing context\n\n- Condition source: `{source}`\n- Fired leaf: `{leaf:?}`\n- Head SHA: `{}`\n- Review actionable at head: {:?}\n- Checks: {:?}\n- Mergeability: {:?}\n- Claim durability fence: `{}`\n- Durable convoy record: `{}/{}`\n- Target crew: `{}/{}`\n\n## Change request and branches\n\n{}\n",
+        "{}\n\n## Turn firing context\n\n- Condition source: `{source}`\n- Fired leaf: `{leaf:?}`\n- Head SHA: `{}`\n- Review actionable at head: {:?}\n- Checks: {:?}\n- Mergeability: {:?}\n- Claim durability fence: `{}`\n- Decision ledger: {}\n- Durable convoy record: `{}/{}`\n- Target crew: `{}/{}`\n\n## Change request and branches\n\n{}\n",
         rule.brief.trim(),
         cr.head_sha.value.as_deref().unwrap_or("unknown"),
         cr.review.actionable_at_head.value,
         cr.checks.value,
         cr.mergeable.value,
         claim_at.to_rfc3339(),
+        decision_ledger_ref.unwrap_or("MISSING (flagged, claim remains accepted)"),
         convoy.metadata.namespace,
         convoy.metadata.name,
         rule.to.vessel,
@@ -1214,7 +1217,14 @@ mod tests {
                 work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
                 crew_work: BTreeMap::from([(
                     "work".to_string(),
-                    BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Done).finished_at(base).build())]),
+                    BTreeMap::from([(
+                        "coder".to_string(),
+                        CrewWorkState::builder()
+                            .phase(CrewWorkPhase::Done)
+                            .finished_at(base)
+                            .decision_ledger_ref("https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1".to_string())
+                            .build(),
+                    )]),
                 )]),
                 ..Default::default()
             })
@@ -1314,6 +1324,7 @@ mod tests {
         assert!(first_brief.contains("Head SHA: `aaa`"));
         assert!(first_brief.contains("feature/wake"));
         assert!(first_brief.contains("Durable convoy record: `flotilla/wake-turn`"));
+        assert!(first_brief.contains("Decision ledger: https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1"));
     }
 
     #[tokio::test]

@@ -27,15 +27,15 @@ use flotilla_protocol::{
     AttachBinding, CanonicalHostId, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CredentialAttention,
     CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse,
     DispatchQueueRow, EnvironmentId, EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition,
-    ExplainedCrewDelivery, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, FleetHealthResponse,
-    FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus,
-    FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
-    NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef,
-    ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoIdentity, RepoInfo,
-    RepoProvidersResponse, RepoSummary, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse,
-    ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus,
-    StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY,
-    TERMINAL_POOL_PROVIDER_CATEGORY,
+    ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription,
+    ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow,
+    FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProviderStatus,
+    HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal,
+    PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse,
+    ProviderData, ProviderInfo, QueryCursor, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachAction,
+    ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance,
+    ResourceRecordType, ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute,
+    ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -47,18 +47,19 @@ use flotilla_resources::{
     watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
     ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending,
-    CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandKind, DemandSpec, Environment as ResourceEnvironment, EnvironmentPhase,
-    HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
-    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
-    PendingBrief, PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation, Project, ProjectRepositoryRole,
-    ProjectRepositorySpec, ProjectSpec, ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend,
-    ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief,
-    TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch,
-    TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
-    WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS,
-    MANAGED_BY_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec,
+    CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandKind, DemandSpec, Environment as ResourceEnvironment,
+    EnvironmentPhase, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue,
+    IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
+    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ReadResourceObject,
+    Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
+    SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
+    WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -6830,7 +6831,7 @@ impl InProcessDaemon {
     }
 
     pub async fn crew_complete_internal(&self, requested: &CrewCommandContext, message: Option<String>) -> Result<(), String> {
-        self.crew_complete_with_disposition_internal(requested, message, None).await
+        self.crew_complete_with_disposition_internal(requested, message, None, None).await
     }
 
     pub async fn crew_complete_with_disposition_internal(
@@ -6838,7 +6839,12 @@ impl InProcessDaemon {
         requested: &CrewCommandContext,
         message: Option<String>,
         disposition: Option<String>,
+        decision_ledger_ref: Option<String>,
     ) -> Result<(), String> {
+        if decision_ledger_ref.as_deref().is_some_and(|reference| !(reference.starts_with("https://") || reference.starts_with("http://")))
+        {
+            return Err("decision ledger reference must use an HTTP(S) URL".to_string());
+        }
         let routing = self.resolve_crew_routing_context(requested).await?;
         let namespace = routing.command_context.namespace.as_deref().expect("resolved crew routing context has a namespace");
         let convoy_name = routing.command_context.convoy.as_deref().expect("resolved crew routing context has a convoy");
@@ -6870,6 +6876,7 @@ impl InProcessDaemon {
                     pending.content.clone(),
                     message,
                     disposition,
+                    decision_ledger_ref,
                 ),
             )
             .await
@@ -6880,7 +6887,14 @@ impl InProcessDaemon {
         apply_resource_status_patch(
             &convoys,
             convoy_name,
-            &convoy_external_patches::mark_crew_completed(context.vessel, context.caller_role, chrono::Utc::now(), message, disposition),
+            &convoy_external_patches::mark_crew_completed(
+                context.vessel,
+                context.caller_role,
+                chrono::Utc::now(),
+                message,
+                disposition,
+                decision_ledger_ref,
+            ),
         )
         .await
         .map_err(|err| err.to_string())?;
@@ -8636,9 +8650,12 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::CrewComplete { context, message, disposition } = &command.action {
+        if let flotilla_protocol::CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result = match self.crew_complete_with_disposition_internal(context, message.clone(), disposition.clone()).await {
+            let result = match self
+                .crew_complete_with_disposition_internal(context, message.clone(), disposition.clone(), decision_ledger_ref.clone())
+                .await
+            {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
@@ -9728,6 +9745,8 @@ impl InProcessDaemon {
             .collect::<Vec<_>>();
         crew_deliveries.sort_by(|left, right| left.session.cmp(&right.session));
 
+        let decision_ledgers = explained_decision_ledgers(convoy.status.as_ref());
+
         Ok(ConvoyExplanation {
             namespace,
             convoy: name.to_string(),
@@ -9738,9 +9757,28 @@ impl InProcessDaemon {
             change_requests,
             subscriptions,
             crew_deliveries,
+            decision_ledgers,
             settlement,
         })
     }
+}
+
+fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDecisionLedger> {
+    status
+        .into_iter()
+        .flat_map(|status| &status.crew_work)
+        .flat_map(|(vessel, crew)| {
+            crew.iter().filter(|(_, claim)| matches!(claim.phase, CrewWorkPhase::Done | CrewWorkPhase::HandedBack)).map(
+                move |(role, claim)| ExplainedDecisionLedger {
+                    vessel: vessel.clone(),
+                    role: role.clone(),
+                    claimed_at: claim.finished_at.map(|at| at.to_rfc3339()),
+                    comment_url: claim.decision_ledger_ref.clone(),
+                    missing: claim.decision_ledger_ref.is_none(),
+                },
+            )
+        })
+        .collect()
 }
 
 #[async_trait]

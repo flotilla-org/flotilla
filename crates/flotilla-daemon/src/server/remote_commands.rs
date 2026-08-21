@@ -47,6 +47,7 @@ pub(super) struct PendingCrewCompletionRoute {
     context: CrewCommandContext,
     message: Option<String>,
     disposition: Option<String>,
+    decision_ledger_ref: Option<String>,
     authority: Option<HostName>,
 }
 
@@ -960,7 +961,9 @@ impl RemoteStepExecutor for RemoteCommandRouter {
 impl RemoteCommandRouter {
     async fn resolve_crew_command_routing(&self, action: &mut CommandAction) -> Result<Option<PendingCrewCompletionRoute>, String> {
         let (context, completion) = match action {
-            CommandAction::CrewComplete { context, message, disposition } => (context, Some((message.clone(), disposition.clone()))),
+            CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref } => {
+                (context, Some((message.clone(), disposition.clone(), decision_ledger_ref.clone())))
+            }
             CommandAction::CrewFail { context, .. }
             | CommandAction::CrewHandoff { context, .. }
             | CommandAction::QueryCrewList { context } => (context, None),
@@ -968,7 +971,7 @@ impl RemoteCommandRouter {
         };
         let routing = self.daemon.resolve_crew_routing_context(context).await?;
         *context = routing.command_context.clone();
-        let Some((message, disposition)) = completion else { return Ok(None) };
+        let Some((message, disposition, decision_ledger_ref)) = completion else { return Ok(None) };
         let Some(session_name) = routing.session_name else { return Ok(None) };
         Ok(Some(PendingCrewCompletionRoute {
             namespace: context.namespace.clone().expect("resolved crew context has namespace"),
@@ -977,6 +980,7 @@ impl RemoteCommandRouter {
             context: context.clone(),
             message,
             disposition,
+            decision_ledger_ref,
             authority: None,
         }))
     }
@@ -989,6 +993,7 @@ impl RemoteCommandRouter {
         let pending = CrewCompletionPending {
             message: completion.message.clone(),
             disposition: completion.disposition.clone(),
+            decision_ledger_ref: completion.decision_ledger_ref.clone(),
             attempted_at: chrono::Utc::now(),
             authority: authority.to_string(),
             last_error: last_error.to_string(),
@@ -1037,6 +1042,7 @@ impl RemoteCommandRouter {
                         context: state.completion.context.clone(),
                         message: state.completion.message.clone(),
                         disposition: state.completion.disposition.clone(),
+                        decision_ledger_ref: state.completion.decision_ledger_ref.clone(),
                     },
                 };
                 if router.dispatch_execute_for_principal(command, None).await.is_ok() {
@@ -1068,6 +1074,7 @@ impl RemoteCommandRouter {
                 context,
                 message: pending.message,
                 disposition: pending.disposition,
+                decision_ledger_ref: pending.decision_ledger_ref,
                 authority: Some(HostName::new(pending.authority)),
             });
         }

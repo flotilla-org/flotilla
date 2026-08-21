@@ -1,10 +1,47 @@
 use std::collections::HashMap;
 
 use flotilla_protocol::{
-    CommandValue, DaemonEvent, EnvironmentId, HostName, HostSnapshot, HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey,
+    CommandValue, ConvoyExplanation, DaemonEvent, EnvironmentId, ExplainedDecisionLedger, ExplainedSettlement, HostName, HostSnapshot,
+    HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey,
 };
 
-use super::{event_stream_seq, format_command_result, format_event_human};
+use super::{event_stream_seq, format_command_result, format_convoy_explanation_human, format_event_human};
+
+#[test]
+fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
+    let explanation = ConvoyExplanation {
+        namespace: "flotilla".into(),
+        convoy: "ledger".into(),
+        phase: "Landing".into(),
+        evidence_ttl_seconds: 30,
+        change_request_stale_after_seconds: 30,
+        checkouts: Vec::new(),
+        change_requests: Vec::new(),
+        subscriptions: Vec::new(),
+        crew_deliveries: Vec::new(),
+        decision_ledgers: vec![
+            ExplainedDecisionLedger {
+                vessel: "work".into(),
+                role: "coder".into(),
+                claimed_at: Some("2026-08-21T12:00:00Z".into()),
+                comment_url: Some("https://example.test/pull/1#comment-2".into()),
+                missing: false,
+            },
+            ExplainedDecisionLedger {
+                vessel: "review".into(),
+                role: "reviewer".into(),
+                claimed_at: Some("2026-08-21T12:01:00Z".into()),
+                comment_url: None,
+                missing: true,
+            },
+        ],
+        settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
+    };
+
+    let output = format_convoy_explanation_human(&explanation);
+    assert!(output.contains("work/coder claimed_at=2026-08-21T12:00:00Z comment=https://example.test/pull/1#comment-2"));
+    assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (flagged; claim accepted)"));
+}
 
 #[test]
 fn replaced_pending_brief_echoes_the_displaced_text() {
