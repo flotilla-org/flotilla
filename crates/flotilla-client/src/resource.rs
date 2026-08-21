@@ -47,6 +47,8 @@ pub struct ResourceClient {
 }
 
 const SINGLE_HOME_SWEEP_KINDS: &[&str] = &["hosts", "placementpolicies"];
+const PLACEMENT_SNAPSHOT_PREFIX: &str = "placement-snapshot-";
+const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapshot";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DedupSweepDeletion {
@@ -125,6 +127,7 @@ impl ResourceClient {
     /// that home actually holds an authored copy.
     pub async fn dedup_single_home_records(&self, namespace: &str) -> Result<DedupSweepReport, String> {
         let roots = self.sweep_roots().await?;
+        let placement_snapshot_homes = self.placement_snapshot_homes(namespace, &roots).await?;
         let mut records = BTreeMap::<(String, String), Vec<AuthoredRecord>>::new();
         for root in &roots {
             for kind in SINGLE_HOME_SWEEP_KINDS {
@@ -148,7 +151,7 @@ impl ResourceClient {
                         .and_then(serde_json::Value::as_str)
                         .ok_or_else(|| format!("inventory {kind} on root {} returned an object without metadata.name", root.host_id))?
                         .to_string();
-                    let natural_home = natural_home(kind, &object);
+                    let natural_home = natural_home(kind, &object, &placement_snapshot_homes);
                     records.entry(((*kind).to_string(), name.clone())).or_default().push(AuthoredRecord {
                         root: root.clone(),
                         namespace: namespace.to_string(),
@@ -176,6 +179,38 @@ impl ResourceClient {
         }
         deletions.sort_by(|a, b| (&a.kind, &a.name, &a.deleted_root).cmp(&(&b.kind, &b.name, &b.deleted_root)));
         Ok(DedupSweepReport { inspected_roots: roots.len(), duplicate_records, deletions })
+    }
+
+    async fn placement_snapshot_homes(&self, namespace: &str, roots: &[SweepRoot]) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+        let mut homes = BTreeMap::<String, BTreeSet<String>>::new();
+        for root in roots {
+            let listed = self
+                .list(
+                    ResourceListRequest::builder()
+                        .kind("convoys".to_string())
+                        .namespace(namespace.to_string())
+                        .node_id(root.node_id.clone())
+                        .include_replicas(false)
+                        .build(),
+                )
+                .await
+                .map_err(|error| format!("inventory convoys on root {}: {error}", root.host_id))?;
+            for record in listed.records {
+                let Some(object) = record.object else {
+                    continue;
+                };
+                let Some(snapshot) = object
+                    .pointer("/metadata/annotations")
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|annotations| annotations.get(PLACEMENT_SNAPSHOT_ANNOTATION))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                homes.entry(snapshot.to_string()).or_default().insert(root.host_id.clone());
+            }
+        }
+        Ok(homes)
     }
 
     async fn sweep_roots(&self) -> Result<Vec<SweepRoot>, String> {
@@ -314,14 +349,21 @@ fn sweep_roots_from_hosts(hosts: &[HostListEntry]) -> Result<Vec<SweepRoot>, Str
     Ok(roots)
 }
 
-fn natural_home(kind: &str, object: &serde_json::Value) -> Option<String> {
+fn natural_home(kind: &str, object: &serde_json::Value, placement_snapshot_homes: &BTreeMap<String, BTreeSet<String>>) -> Option<String> {
     match kind {
         "hosts" => object.pointer("/metadata/name").and_then(serde_json::Value::as_str).map(ToOwned::to_owned),
-        "placementpolicies" => object
-            .pointer("/spec/host_direct/host_ref")
-            .or_else(|| object.pointer("/spec/docker_per_vessel/host_ref"))
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned),
+        "placementpolicies" => {
+            let name = object.pointer("/metadata/name").and_then(serde_json::Value::as_str)?;
+            if name.starts_with(PLACEMENT_SNAPSHOT_PREFIX) {
+                let homes = placement_snapshot_homes.get(name)?;
+                return (homes.len() == 1).then(|| homes.first().expect("one placement snapshot home").clone());
+            }
+            object
+                .pointer("/spec/host_direct/host_ref")
+                .or_else(|| object.pointer("/spec/docker_per_vessel/host_ref"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        }
         _ => None,
     }
 }
@@ -461,6 +503,19 @@ mod tests {
     fn duplicated_three_root_fixture() -> BTreeMap<(String, String), Vec<serde_json::Value>> {
         let mut fixture = BTreeMap::new();
         for root in ["a", "b", "c"] {
+            fixture.insert(
+                (format!("root-{root}"), "convoys".to_string()),
+                if root == "a" {
+                    vec![serde_json::json!({
+                        "metadata": {
+                            "name": "andamento-governor",
+                            "annotations": {PLACEMENT_SNAPSHOT_ANNOTATION: "placement-snapshot-012345abcdef"}
+                        }
+                    })]
+                } else {
+                    Vec::new()
+                },
+            );
             fixture.insert(
                 (format!("root-{root}"), "hosts".to_string()),
                 ["a", "b", "c"]
@@ -666,6 +721,29 @@ mod tests {
                 next_command_id += 1;
 
                 for root in ["a", "b", "c"] {
+                    let Some(Message::Request { id, request: Request::Execute { command } }) =
+                        server_session.read().await.expect("read convoy inventory")
+                    else {
+                        panic!("expected convoy inventory request");
+                    };
+                    assert_eq!(command.node_id, Some(NodeId::new(format!("root-{root}"))));
+                    assert!(matches!(
+                        command.action,
+                        CommandAction::QueryResourceList { ref kind, include_replicas: false, .. } if kind == "convoys"
+                    ));
+                    let node_id = command.node_id.expect("convoy inventory target");
+                    let objects = fixture.get(&(node_id.to_string(), "convoys".to_string())).cloned().expect("convoy fixture root");
+                    server_session
+                        .write(Message::ok_response(id, Response::QueryResult {
+                            command_id: next_command_id,
+                            value: CommandValue::ResourceRead(Box::new(list_envelope("convoys", &node_id, objects))),
+                        }))
+                        .await
+                        .expect("write convoy inventory");
+                    next_command_id += 1;
+                }
+
+                for root in ["a", "b", "c"] {
                     for kind in SINGLE_HOME_SWEEP_KINDS {
                         let Some(Message::Request { id, request: Request::Execute { command } }) =
                             server_session.read().await.expect("read resource inventory")
@@ -740,6 +818,9 @@ mod tests {
         assert_eq!(report.inspected_roots, 3);
         assert_eq!(report.duplicate_records, 7);
         assert_eq!(report.deletions.len(), 14);
+        assert!(report.deletions.iter().any(|deletion| {
+            deletion.name == "placement-snapshot-012345abcdef" && deletion.deleted_root == "host-b" && deletion.home_root == "host-a"
+        }));
 
         let second = client.dedup_single_home_records("flotilla").await.expect("repeat sweep");
         assert_eq!(second.duplicate_records, 0);
@@ -748,6 +829,9 @@ mod tests {
         let fixture = server.await.expect("server task");
         let mut federated_counts = BTreeMap::<(String, String), usize>::new();
         for ((_, kind), objects) in fixture {
+            if kind == "convoys" {
+                continue;
+            }
             for object in objects {
                 let name = object.pointer("/metadata/name").and_then(serde_json::Value::as_str).expect("fixture name");
                 *federated_counts.entry((kind.clone(), name.to_string())).or_default() += 1;
