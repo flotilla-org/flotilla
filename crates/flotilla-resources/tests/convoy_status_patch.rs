@@ -287,15 +287,24 @@ fn crew_completion_updates_only_the_calling_agent() {
         ts(20),
         Some("ready for review".to_string()),
         Some("changes-pushed".to_string()),
+        Some("https://example.test/pull/1#comment-2".to_string()),
     )
     .apply(&mut status);
-    external_patches::mark_crew_completed("implement".to_string(), "coder".to_string(), ts(30), Some("still ready".to_string()), None)
-        .apply(&mut status);
+    external_patches::mark_crew_completed(
+        "implement".to_string(),
+        "coder".to_string(),
+        ts(30),
+        Some("still ready".to_string()),
+        None,
+        None,
+    )
+    .apply(&mut status);
 
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Done);
     assert_eq!(status.crew_work["implement"]["coder"].finished_at, Some(ts(20)));
     assert_eq!(status.crew_work["implement"]["coder"].message.as_deref(), Some("still ready"));
     assert_eq!(status.crew_work["implement"]["coder"].disposition.as_deref(), Some("changes-pushed"));
+    assert_eq!(status.crew_work["implement"]["coder"].decision_ledger_ref.as_deref(), Some("https://example.test/pull/1#comment-2"));
     assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Working);
     assert_eq!(status.work["implement"].phase, WorkPhase::Running);
     assert_eq!(status.phase, ConvoyPhase::Active);
@@ -329,7 +338,7 @@ fn final_crew_completion_claim_enters_landing_idempotently() {
     };
 
     let patch =
-        external_patches::mark_crew_completed("implement".to_string(), "coder".to_string(), ts(20), Some("ready".to_string()), None);
+        external_patches::mark_crew_completed("implement".to_string(), "coder".to_string(), ts(20), Some("ready".to_string()), None, None);
     patch.apply(&mut status);
     patch.apply(&mut status);
 
@@ -356,8 +365,15 @@ fn crew_failure_records_terminal_state_and_message() {
         attention: None,
     };
 
-    external_patches::mark_crew_completed("implement".to_string(), "coder".to_string(), ts(15), Some("initially done".to_string()), None)
-        .apply(&mut status);
+    external_patches::mark_crew_completed(
+        "implement".to_string(),
+        "coder".to_string(),
+        ts(15),
+        Some("initially done".to_string()),
+        None,
+        None,
+    )
+    .apply(&mut status);
     external_patches::mark_crew_failed("implement".to_string(), "coder".to_string(), ts(20), "blocked by missing credentials".to_string())
         .apply(&mut status);
     external_patches::mark_crew_failed("implement".to_string(), "coder".to_string(), ts(30), "still blocked".to_string())

@@ -605,6 +605,11 @@ pub struct CrewWorkState {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
+    /// Durable pointer to the PR comment containing the claim's decision ledger.
+    /// Absence on a completed claim is an advisory fence flag, never grounds
+    /// for rejecting the claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_ledger_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -707,6 +712,7 @@ pub enum ConvoyStatusPatch {
         finished_at: DateTime<Utc>,
         message: Option<String>,
         disposition: Option<String>,
+        decision_ledger_ref: Option<String>,
     },
     MarkCrewFailed {
         vessel: String,
@@ -738,6 +744,7 @@ pub enum ConvoyStatusPatch {
         content: String,
         completion_message: Option<String>,
         disposition: Option<String>,
+        decision_ledger_ref: Option<String>,
     },
     RecordTurnDelivery {
         source: String,
@@ -942,7 +949,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
                 clear_operator_pending_brief(status);
             }
-            Self::MarkCrewCompleted { vessel, role, finished_at, message, disposition } => {
+            Self::MarkCrewCompleted { vessel, role, finished_at, message, disposition, decision_ledger_ref } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     // Duplicate settlement is sticky; changing the settled outcome records its own time.
                     if state.phase != CrewWorkPhase::Done
@@ -955,6 +962,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.message = message.clone();
                     if disposition.is_some() {
                         state.disposition = disposition.clone();
+                    }
+                    if decision_ledger_ref.is_some() {
+                        state.decision_ledger_ref = decision_ledger_ref.clone();
                     }
                 }
                 enter_landing_if_completion_claims_settled(status);
@@ -1018,7 +1028,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::ClearPendingBrief => {
                 clear_operator_pending_brief(status);
             }
-            Self::DeliverPendingBrief { vessel, role, delivered_at, content, completion_message, disposition } => {
+            Self::DeliverPendingBrief { vessel, role, delivered_at, content, completion_message, disposition, decision_ledger_ref } => {
                 let matches_pending =
                     status.pending_brief().is_some_and(|brief| brief.vessel == *vessel && brief.role == *role && brief.content == *content);
                 if !matches_pending {
@@ -1030,6 +1040,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.message = completion_message.clone();
                     if disposition.is_some() {
                         state.disposition = disposition.clone();
+                    }
+                    if decision_ledger_ref.is_some() {
+                        state.decision_ledger_ref = decision_ledger_ref.clone();
                     }
                 }
                 clear_operator_pending_brief(status);
@@ -1207,8 +1220,9 @@ pub mod external_patches {
         finished_at: DateTime<Utc>,
         message: Option<String>,
         disposition: Option<String>,
+        decision_ledger_ref: Option<String>,
     ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::MarkCrewCompleted { vessel, role, finished_at, message, disposition }
+        ConvoyStatusPatch::MarkCrewCompleted { vessel, role, finished_at, message, disposition, decision_ledger_ref }
     }
 
     pub fn mark_crew_failed(vessel: String, role: String, finished_at: DateTime<Utc>, message: String) -> ConvoyStatusPatch {
@@ -1244,8 +1258,9 @@ pub mod external_patches {
         content: String,
         completion_message: Option<String>,
         disposition: Option<String>,
+        decision_ledger_ref: Option<String>,
     ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::DeliverPendingBrief { vessel, role, delivered_at, content, completion_message, disposition }
+        ConvoyStatusPatch::DeliverPendingBrief { vessel, role, delivered_at, content, completion_message, disposition, decision_ledger_ref }
     }
 
     pub fn record_turn_delivery(

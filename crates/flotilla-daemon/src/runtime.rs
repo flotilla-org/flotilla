@@ -8801,6 +8801,7 @@ mod tests {
                         context: crew_context.clone(),
                         message: Some("implementation ready".to_string()),
                         disposition: None,
+                        decision_ledger_ref: None,
                     })
                     .build(),
             )
@@ -8993,6 +8994,7 @@ mod tests {
                         context: CrewCommandContext { crew_id: Some(revived_coder_id.clone()), ..Default::default() },
                         message: Some("review findings addressed".to_string()),
                         disposition: None,
+                        decision_ledger_ref: None,
                     })
                     .build(),
             )
@@ -9045,6 +9047,7 @@ mod tests {
                         context: CrewCommandContext { crew_id: Some(reviewer_id), ..Default::default() },
                         message: Some("changes accepted".to_string()),
                         disposition: None,
+                        decision_ledger_ref: None,
                     })
                     .build(),
             )

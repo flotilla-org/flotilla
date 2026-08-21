@@ -5136,6 +5136,7 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
             },
             Some("first turn complete".to_string()),
             Some("satisfied".to_string()),
+            None,
         )
         .await
         .expect("complete first turn");
