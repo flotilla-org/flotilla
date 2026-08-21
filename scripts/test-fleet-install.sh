@@ -56,7 +56,7 @@ make_generation() {
   local bundle="$test_root/bundle-$generation/fleet-candidate-linux-x86_64-gnu2.36"
   mkdir -p "$directory" "$bundle/bin" "$bundle/lib"
   for name in flotilla flotillad cleat; do
-    printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == host && "${3:-}" == list ]]; then\n  [[ -n "${FLEET_HOST_LIST_JSON:-}" ]] || exit 1\n  printf "%%s\\n" "$FLEET_HOST_LIST_JSON"\n  exit 0\nfi\nprintf "%s from %s\\n"\n' "$name" "$name" "$generation" >"$bundle/bin/$name"
+    printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == fleet ]]; then\n  [[ "${FLEET_HEALTH_FAIL_FOR:-}" != "%s" ]] || exit 1\n  printf '\''{"kind":"fleet_health","hosts":[{"host":"test","is_local":true,"daemon_generation":"%s"}],"dispatch_queue":{"entries":[]}}\\n'\''\n  exit 0\nfi\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == host && "${3:-}" == list ]]; then\n  [[ -n "${FLEET_HOST_LIST_JSON:-}" ]] || exit 1\n  printf "%%s\\n" "$FLEET_HOST_LIST_JSON"\n  exit 0\nfi\nprintf "%s from %s\\n"\n' "$name" "$generation" "$generation" "$name" "$name" "$generation" >"$bundle/bin/$name"
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty\n' >"$bundle/lib/libghostty-vt.so.0"
@@ -137,7 +137,7 @@ add_darwin_derivative() {
   local bundle="$test_root/darwin-$generation/fleet-signed-darwin-aarch64"
   mkdir -p "$bundle/bin" "$bundle/lib"
   for name in flotilla flotillad cleat; do
-    printf '%s signed for %s\n' "$name" "$generation" >"$bundle/bin/$name"
+    printf '#!/usr/bin/env bash\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == fleet ]]; then\n  [[ "${FLEET_HEALTH_FAIL_FOR:-}" != "%s" ]] || exit 1\n  printf '\''{"kind":"fleet_health","hosts":[{"host":"test","is_local":true,"daemon_generation":"%s"}],"dispatch_queue":{"entries":[]}}\\n'\''\n  exit 0\nfi\nprintf "%s signed for %s\\n"\n' "$name" "$generation" "$generation" "$name" "$generation" >"$bundle/bin/$name"
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty signed\n' >"$bundle/lib/libghostty-vt.dylib"
@@ -387,6 +387,7 @@ run_installer() {
     FLEET_INSTALL_UNAME_M=x86_64 \
     FLEET_INSTALL_API_URL="https://test.invalid/api/v1" \
     FLEET_INSTALL_PACKAGE_URL="https://test.invalid/api/packages" \
+    FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS="${FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS:-30}" \
     "$installer" "$@"
 }
 
@@ -412,6 +413,7 @@ run_darwin_installer() {
     FLEET_INSTALL_UNAME_M=arm64 \
     FLEET_INSTALL_API_URL="https://test.invalid/api/v1" \
     FLEET_INSTALL_PACKAGE_URL="https://test.invalid/api/packages" \
+    FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS="${FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS:-30}" \
     "$installer" "$@"
 }
 
@@ -441,6 +443,8 @@ grep -Fq 'not reachable through the login shell' "$test_root/login-path.out" \
 grep -Fq '~/.zshenv' "$test_root/login-path.out" || fail 'zsh PATH failure omitted ~/.zshenv'
 
 run_installer "$generation_one" >"$test_root/install-one.out"
+grep -Fq "generation $generation_one confirmed healthy" "$test_root/install-one.out" \
+  || fail 'healthy Linux install was not confirmed'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'exact generation was not selected'
 test -x "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/bin/flotilla" || fail 'candidate binaries were not staged'
 test ! -w "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json" || fail 'selected generation is writable'
@@ -539,7 +543,23 @@ fi
 grep -Fq 'flotilla daemon stop' "$test_root/daemon.out" || fail 'daemon refusal omitted recovery instruction'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'failed daemon preflight switched current'
 
+: >"$test_root/systemctl.log"
+if FLEET_HEALTH_FAIL_FOR="$generation_two" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=0 \
+  run_installer "$generation_two" >"$test_root/health-rollback.out" 2>&1; then
+  fail 'unhealthy Linux generation was accepted'
+fi
+test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
+  || fail 'unhealthy Linux generation did not roll current back'
+test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" = "$generation_two" \
+  || fail 'unhealthy Linux generation was not retained as previous'
+test "$(grep -Fxc -- '--user restart flotillad.service' "$test_root/systemctl.log")" = 2 \
+  || fail 'Linux health failure did not restart the candidate and restored daemon'
+grep -Fq "generation $generation_two failed health confirmation; rolled back to $generation_one" \
+  "$test_root/health-rollback.out" || fail 'Linux automatic rollback was not reported loudly'
+
 DAEMON_RUNNING=1 STOP_FAIL=0 run_installer latest >"$test_root/latest.out"
+grep -Fq "generation $generation_two confirmed healthy" "$test_root/latest.out" \
+  || fail 'healthy Linux upgrade was not confirmed'
 grep -Fq "$generation_one -> $generation_two" "$test_root/latest.out" || fail 'latest did not print the exact transition'
 grep -Fq 'daemon stop requested' "$test_root/latest.out" || fail 'running daemon was not stopped before switching'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_two" || fail 'latest did not select newest promoted generation'
@@ -567,6 +587,19 @@ darwin_home="$test_root/darwin-home"
 mkdir -p "$darwin_home/.config/flotilla"
 cp "$test_root/home/.config/flotilla/fleet-reader-token" "$darwin_home/.config/flotilla/fleet-reader-token"
 run_darwin_installer "$darwin_home" "$generation_one" >"$test_root/darwin-install-one.out"
+: >"$test_root/launchctl.log"
+if FLEET_HEALTH_FAIL_FOR="$generation_two" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=0 \
+  run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-health-rollback.out" 2>&1; then
+  fail 'unhealthy Darwin generation was accepted'
+fi
+test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
+  || fail 'unhealthy Darwin generation did not roll current back'
+grep -Eq "^kickstart -k gui/[0-9]+/work\\.flotilla\\.flotillad\\|releases/$generation_two$" "$test_root/launchctl.log" \
+  || fail 'Darwin health check did not start the candidate generation'
+grep -Eq "^kickstart -k gui/[0-9]+/work\\.flotilla\\.flotillad\\|releases/$generation_one$" "$test_root/launchctl.log" \
+  || fail 'Darwin health failure did not restart the restored generation'
+grep -Fq "generation $generation_two failed health confirmation; rolled back to $generation_one" \
+  "$test_root/darwin-health-rollback.out" || fail 'Darwin automatic rollback was not reported loudly'
 : >"$test_root/codesign.log"
 : >"$test_root/launchctl.log"
 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-install.out"
