@@ -935,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn default_brief_template_matches_legacy_bytes() {
+    fn default_brief_template_includes_decision_ledger_contract() {
         let content = build_crew_brief(
             &TerminalCrewContext {
                 namespace: "flotilla".to_string(),
@@ -953,10 +953,16 @@ mod tests {
         )
         .content;
 
-        assert_eq!(
-            content,
-            "# Flotilla crew brief\n\nYou are `coder` in convoy `fix-delivery`, aboard vessel `work` (`vessel-fix-delivery-work`).\n\n## Crew\n\n- `coder`: active\n- `reviewer`: latent\n- `watcher`: active\n\nRun `flotilla crew list` for current crew state.\nClone scratch repositories outside the vessel checkout (for example under a `mktemp -d` directory); embedded repositories make teardown refuse by default.\nHand off to reviewer with `flotilla crew reviewer handoff --message '...'`.\nFor assignments that change a repository, delivery is part of the assignment. The pull-request destination is the repository URL and target ref named in `## Work context`; the issue source may be a different forge. Inspect the existing remotes and push to the one whose URL matches that destination; never add or repoint a remote. Open a pull request that closes the issue (ready for review, never a draft), and shepherd it until all checks pass; if it is a draft for any reason, mark it ready once checks are green. For a Forgejo destination, use the injected `FORGEJO_SERVER_URL`, `FORGEJO_API_URL`, `FORGEJO_USERNAME`, and `FORGEJO_TOKEN_FILE` values for API operations; Git is configured with a destination-scoped credential helper. Do not use `gh`, a GitHub-only shepherding helper, or ambient human credentials for Forgejo delivery. Use a shepherding tool only when it explicitly supports the destination forge; otherwise inspect the Forgejo PR, reviews, and checks through its API. If those credentials are unavailable or rejected, fail the assignment instead of delivering to another forge. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`. For other assignments, complete with `flotilla crew complete --message '...'`. If the assignment cannot be completed, report the failure with `flotilla crew fail --message '...'`. Run the applicable `flotilla crew complete` command as your final act so the convoy can enter landing.\n\n## Assignment\n\nFix the flux capacitor.\n"
-        );
+        assert!(content.contains("## Decision ledger"));
+        assert!(content.contains("ordered least-confident first"));
+        assert!(content.contains("**Brief silence:**"));
+        assert!(content.contains("**Choice:**"));
+        assert!(content.contains("**Alternative:**"));
+        assert!(content.contains("**If asking were free:**"));
+        assert!(content.contains("No decisions beyond the brief."));
+        assert!(content.contains("--decision-ledger-ref '<comment URL>'"));
+        assert!(content.contains("A claim without this pointer is accepted but flagged"));
+        assert!(content.contains("## Assignment\n\nFix the flux capacitor."));
     }
 
     #[test]
@@ -979,6 +985,7 @@ mod tests {
         .expect("render brief");
 
         assert!(brief.content.contains("Complete when the local demo is ready."));
+        assert!(brief.content.contains("## Decision ledger"));
         assert!(brief.content.contains("## Assignment\n\nDemo the override."));
         assert!(!brief.content.contains("For assignments that change a repository"));
     }
@@ -1059,6 +1066,8 @@ mod tests {
         assert!(brief.contains("with the `pr-shepherd` skill for a GitHub destination, or through the injected Forgejo API credentials for a Forgejo destination"));
         assert!(!brief.contains("pull request using the `pr-shepherd` skill"));
         assert!(brief.contains("Future events belong to a later engagement"));
+        assert!(brief.contains("claim's linked `## Decision ledger` comment"));
+        assert!(brief.contains("A missing ledger is a finding, not grounds to reject or wedge the claim"));
         assert!(brief.contains("flotilla crew complete --message '<PR URL>'"));
         assert!(!brief.contains("wait-for-checks"));
         assert!(!brief.contains("No assignment was provided"));

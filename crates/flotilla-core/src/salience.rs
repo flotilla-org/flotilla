@@ -58,7 +58,7 @@ pub fn compute_salience(
 ) -> Salience {
     let attention_needs_human = matches!(attention, Some(TerminalAttentionState::NeedsInput))
         || matches!(attention, Some(TerminalAttentionState::Idle)) && work_unsettled;
-    let demand_is_unacknowledged = matches!(demand, Some(DemandState::Raised | DemandState::Satisfied));
+    let demand_is_unacknowledged = matches!(demand, Some(DemandState::Raised | DemandState::Satisfied | DemandState::Escalated));
     if demand_is_unacknowledged && regard_covers && attention_needs_human {
         return Salience::Urgent;
     }
@@ -66,6 +66,7 @@ pub fn compute_salience(
     let demand_salience = match demand {
         Some(DemandState::Raised) => Salience::Attention,
         Some(DemandState::Satisfied) => Salience::Info,
+        Some(DemandState::Escalated) => Salience::Urgent,
         Some(DemandState::Acknowledged) | None => Salience::None,
     };
     let attention_salience = match attention {
@@ -210,6 +211,7 @@ mod tests {
                 "out-of-searchlight demand",
             ),
             (Some(DemandState::Satisfied), false, None, true, Salience::Info, "satisfied demand awaiting acknowledgement"),
+            (Some(DemandState::Escalated), false, None, true, Salience::Urgent, "expired demand escalated"),
             (
                 Some(DemandState::Satisfied),
                 true,

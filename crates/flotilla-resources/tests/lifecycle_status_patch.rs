@@ -133,6 +133,7 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
         TerminalSessionStatusPatch::MarkReconcileDegraded { .. } => PatchKind::TerminalMarkReconcileDegraded,
         TerminalSessionStatusPatch::ClearReconcileDegraded => PatchKind::TerminalClearReconcileDegraded,
         TerminalSessionStatusPatch::ObserveAttention { .. } => PatchKind::TerminalObserveAttention,
+        TerminalSessionStatusPatch::Observe { .. } => PatchKind::TerminalObserveAttention,
         TerminalSessionStatusPatch::MarkCompletionPending { .. } => PatchKind::TerminalMarkCompletionPending,
         TerminalSessionStatusPatch::ClearCompletionPending => PatchKind::TerminalClearCompletionPending,
     }
@@ -202,7 +203,7 @@ fn work_state(phase: WorkPhase, started_at: Option<DateTime<Utc>>, finished_at: 
 }
 
 fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> CrewWorkState {
-    CrewWorkState { phase, started_at, finished_at, message: None, disposition: None }
+    CrewWorkState { phase, started_at, finished_at, message: None, disposition: None, decision_ledger_ref: None }
 }
 
 fn pending_brief() -> PendingBrief {
@@ -537,6 +538,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     finished_at: ts(30),
                     message: Some("still complete".to_string()),
                     disposition: None,
+                    decision_ledger_ref: None,
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, crew_timestamps(&status))
@@ -577,6 +579,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     launch_command: Some("bash".to_string()),
                     delivered_message_id: None,
                     attention: None,
+                    occupancy: Default::default(),
                     completion_pending: None,
                     degraded: None,
                 };
@@ -815,6 +818,7 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                     content: "address review".to_string(),
                     completion_message: Some("first turn complete".to_string()),
                     disposition: Some("satisfied".to_string()),
+                    decision_ledger_ref: None,
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
@@ -994,6 +998,7 @@ fn settling_again_after_a_continuation_records_the_new_outcome_time() {
                     finished_at: ts(30),
                     message: Some("addressed".to_string()),
                     disposition: None,
+                    decision_ledger_ref: None,
                 };
                 apply_and_replay(&mut status, &resettle);
                 (before, crew_timestamps(&status))

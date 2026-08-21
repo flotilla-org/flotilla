@@ -1524,6 +1524,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
                     context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
                     message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
                     disposition: None,
+                    decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1300#issuecomment-1".into()),
                 })
                 .build(),
         )
@@ -1546,6 +1547,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
                     context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
                     message: Some("https://github.com/flotilla-org/flotilla/pull/1301".into()),
                     disposition: None,
+                    decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1301#issuecomment-2".into()),
                 })
                 .build(),
         )
@@ -1560,6 +1562,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
         .completion_pending
         .expect("corrected durable completion intent");
     assert_eq!(pending.message.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/1301"));
+    assert_eq!(pending.decision_ledger_ref.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/1301#issuecomment-2"));
 
     let delivered = Arc::new(StdMutex::new(Vec::new()));
     peer_manager.lock().await.register_sender(node("feta"), Arc::new(CapturePeerSender(Arc::clone(&delivered))));
@@ -1607,6 +1610,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
                     context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
                     message: Some("https://github.com/flotilla-org/flotilla/pull/1302".into()),
                     disposition: None,
+                    decision_ledger_ref: None,
                 })
                 .build(),
         )

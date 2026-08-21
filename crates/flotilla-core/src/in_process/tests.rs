@@ -4,10 +4,10 @@ use chrono::TimeZone;
 use flotilla_resources::{
     controller_patches, ConvoyEnsureStatus, ConvoyStatus, CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector,
     CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
-    CrewSource, CrewSpec, CrewWorkPhase, Environment as ResourceEnvironment, EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec,
-    EnvironmentStatus as ResourceEnvironmentStatus, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Selector, Stance, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment, EnvironmentPhase,
+    EnvironmentSpec as ResourceEnvironmentSpec, EnvironmentStatus as ResourceEnvironmentStatus, HostCondition, HostDirectEnvironmentSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Selector,
+    Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
     TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, VirtualClock, WorkflowTemplateSpec,
     AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
@@ -15,6 +15,35 @@ use flotilla_resources::{
 
 use super::*;
 use crate::providers::discovery::test_support::fake_discovery;
+
+#[test]
+fn completed_claims_without_a_decision_ledger_are_flagged_not_hidden() {
+    let claimed_at = chrono::Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).single().expect("timestamp");
+    let status = ConvoyStatus {
+        crew_work: BTreeMap::from([(
+            "work".to_string(),
+            BTreeMap::from([
+                ("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Done).finished_at(claimed_at).build()),
+                (
+                    "reviewer".to_string(),
+                    CrewWorkState::builder()
+                        .phase(CrewWorkPhase::Done)
+                        .finished_at(claimed_at)
+                        .decision_ledger_ref("https://example.test/pull/1#comment-2".to_string())
+                        .build(),
+                ),
+            ]),
+        )]),
+        ..Default::default()
+    };
+
+    let ledgers = explained_decision_ledgers(Some(&status));
+    assert_eq!(ledgers.len(), 2);
+    assert!(ledgers.iter().any(|ledger| ledger.role == "coder" && ledger.missing && ledger.comment_url.is_none()));
+    assert!(ledgers.iter().any(|ledger| {
+        ledger.role == "reviewer" && !ledger.missing && ledger.comment_url.as_deref() == Some("https://example.test/pull/1#comment-2")
+    }));
+}
 
 fn test_meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
