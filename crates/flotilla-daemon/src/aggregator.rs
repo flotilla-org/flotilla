@@ -1685,7 +1685,7 @@ impl Aggregator {
         let mut pane_exits = self
             .pane_exit_as_of
             .iter()
-            .filter_map(|((repo, id), (exit, as_of))| {
+            .filter_map(|((repo, id), (_exit, as_of))| {
                 let terminal = self.managed_terminals_by_repo.get(repo)?.get(id)?;
                 let checkout = self
                     .observed_checkouts
@@ -1696,11 +1696,7 @@ impl Aggregator {
                     })
                     .max_by_key(|(_, path_len)| *path_len)?
                     .0;
-                Some(PaneExitFact {
-                    target: self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name),
-                    flavor: exit.flavor,
-                    as_of: *as_of,
-                })
+                Some(PaneExitFact { target: self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name), as_of: *as_of })
             })
             .collect::<Vec<_>>();
         pane_exits.sort_by(|left, right| {
@@ -2650,7 +2646,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_pane_exits_surface_once_with_flavored_checkout_salience() {
+    async fn managed_pane_exits_surface_once_as_checkout_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(16);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
@@ -2680,24 +2676,11 @@ mod tests {
         assert!(!aggregator.rebuild_salience_projection().await);
         assert_eq!(checkout_salience(&state).await, flotilla_protocol::Salience::None);
 
-        let completion = managed_terminal_snapshot(
-            repo_identity.clone(),
-            "pane-1",
-            Some(PaneExitAttention { flavor: flotilla_protocol::PaneExitAttentionFlavor::Completion, exit_code: 0 }),
-        );
-        assert!(aggregator.replace_managed_terminals(&completion));
-        assert!(aggregator.rebuild_salience_projection().await);
-        assert_eq!(checkout_salience(&state).await, flotilla_protocol::Salience::Info);
-        assert!(!aggregator.replace_managed_terminals(&completion), "the same exit is not admitted twice");
-
-        let failure = managed_terminal_snapshot(
-            repo_identity,
-            "pane-1",
-            Some(PaneExitAttention { flavor: flotilla_protocol::PaneExitAttentionFlavor::Failure, exit_code: 7 }),
-        );
-        assert!(aggregator.replace_managed_terminals(&failure));
+        let exited = managed_terminal_snapshot(repo_identity, "pane-1", Some(PaneExitAttention { exit_code: 7 }));
+        assert!(aggregator.replace_managed_terminals(&exited));
         assert!(aggregator.rebuild_salience_projection().await);
         assert_eq!(checkout_salience(&state).await, flotilla_protocol::Salience::Attention);
+        assert!(!aggregator.replace_managed_terminals(&exited), "the same exit is not admitted twice");
     }
 
     fn attention_meta(name: &str, creation_timestamp: chrono::DateTime<Utc>) -> ObjectMeta {
@@ -3149,9 +3132,6 @@ mod tests {
             status: attention.as_ref().map_or(flotilla_protocol::TerminalStatus::Running, |attention| {
                 flotilla_protocol::TerminalStatus::Exited(attention.exit_code)
             }),
-            expected_to_persist: attention
-                .as_ref()
-                .is_some_and(|attention| attention.flavor == flotilla_protocol::PaneExitAttentionFlavor::Failure),
             attention,
         });
         RepoSnapshot {

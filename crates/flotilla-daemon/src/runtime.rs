@@ -471,6 +471,7 @@ impl DaemonRuntime {
                 options.heartbeat_interval,
             ),
             spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
+            spawn_managed_terminal_attention_task(Arc::clone(&daemon), options.heartbeat_interval),
             spawn_adopted_checkout_reconciliation_task(Arc::clone(&daemon), options.namespace.clone(), options.controller_resync_interval),
             spawn_projection_parity_task(
                 daemon.resource_backend(),
@@ -1360,6 +1361,13 @@ fn spawn_replica_refresh_task(daemon: Arc<InProcessDaemon>, interval: Duration) 
                 warn!(%err, "failed to refresh fleet replicas");
             }
         }
+    })
+}
+
+fn spawn_managed_terminal_attention_task(daemon: Arc<InProcessDaemon>, interval: Duration) -> JoinHandle<()> {
+    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
+        let daemon = Arc::clone(&daemon);
+        async move { daemon.refresh_managed_terminal_attention().await }
     })
 }
 

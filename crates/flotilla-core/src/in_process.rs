@@ -6115,24 +6115,69 @@ impl InProcessDaemon {
                 None
             }
         };
-        let snapshot_identity = self.tracked_repo_identity_for_path(&repo).await.unwrap_or(identity);
-        let registry = {
-            let repos = self.repos.read().await;
-            repos.get(&snapshot_identity).map(|state| state.registry())
-        };
-        if let Some(registry) = registry {
-            let providers = self.executor_provider_data(&snapshot_identity, &repo, &registry).await;
-            let _ = self.event_tx.send(DaemonEvent::RepoSnapshot(Box::new(flotilla_protocol::RepoSnapshot {
-                seq: 0,
-                repo_identity: snapshot_identity,
-                repo: Some(repo.clone()),
-                node_id: self.node_id.clone(),
-                providers,
-                provider_health: HashMap::new(),
-                errors: Vec::new(),
-            })));
-        }
         Ok(identity_change)
+    }
+
+    /// Refresh host-local bare pane state and publish one repo-scoped snapshot
+    /// per affected terminal pool. Pools are scanned once even when several
+    /// tracked repositories share the same host-scoped provider.
+    pub async fn refresh_managed_terminal_attention(&self) {
+        struct RepoTerminals {
+            identity: RepoIdentity,
+            roots: Vec<PathBuf>,
+            pool_key: usize,
+        }
+
+        let (repos, pools) = {
+            let tracked = self.repos.read().await;
+            let mut repos = Vec::new();
+            let mut pools = HashMap::new();
+            for state in tracked.values() {
+                let registry = state.registry();
+                let Some(pool) = registry.terminal_pools.preferred().cloned() else { continue };
+                let pool_key = Arc::as_ptr(&pool) as *const () as usize;
+                pools.entry(pool_key).or_insert(pool);
+                repos.push(RepoTerminals { identity: state.identity().clone(), roots: state.local_paths(), pool_key });
+            }
+            (repos, pools)
+        };
+
+        let store = self.discovery.shared_attachable_store(&self.config);
+        for (pool_key, pool) in pools {
+            let manager = crate::terminal_manager::TerminalManager::new(pool, store.clone(), self.host_name.clone());
+            let terminals = match manager.refresh().await {
+                Ok(terminals) => terminals,
+                Err(error) => {
+                    warn!(%error, "failed to refresh managed terminal attention");
+                    continue;
+                }
+            };
+            for repo in repos.iter().filter(|repo| repo.pool_key == pool_key) {
+                let mut providers = ProviderData::default();
+                for terminal in &terminals {
+                    if !repo.roots.iter().any(|root| terminal.working_directory.as_path().starts_with(root)) {
+                        continue;
+                    }
+                    providers.managed_terminals.insert(terminal.attachable_id.clone(), flotilla_protocol::ManagedTerminal {
+                        set_id: terminal.attachable_set_id.clone(),
+                        role: terminal.role.clone(),
+                        command: terminal.command.clone(),
+                        working_directory: terminal.working_directory.as_path().to_path_buf(),
+                        status: terminal.status.clone(),
+                        attention: terminal.attention.clone(),
+                    });
+                }
+                let _ = self.event_tx.send(DaemonEvent::RepoSnapshot(Box::new(flotilla_protocol::RepoSnapshot {
+                    seq: 0,
+                    repo_identity: repo.identity.clone(),
+                    repo: repo.roots.first().cloned(),
+                    node_id: self.node_id.clone(),
+                    providers,
+                    provider_health: HashMap::new(),
+                    errors: Vec::new(),
+                })));
+            }
+        }
     }
 
     /// Resolve a path that might be a git worktree to the main repo root.
@@ -8452,34 +8497,6 @@ impl InProcessDaemon {
                 Err(error) => {
                     warn!(repo = %repo_identity, provider = %descriptor.display_name, %error, "failed to read sessions for command execution")
                 }
-            }
-        }
-
-        if let Some(pool) = registry.terminal_pools.preferred() {
-            let manager = crate::terminal_manager::TerminalManager::new(
-                Arc::clone(pool),
-                self.discovery.shared_attachable_store(&self.config),
-                self.host_name.clone(),
-            );
-            match manager.refresh().await {
-                Ok(terminals) => {
-                    let checkout_paths = providers.checkouts.keys().map(|path| path.path.clone()).collect::<Vec<_>>();
-                    for terminal in terminals {
-                        if !checkout_paths.iter().any(|path| terminal.working_directory.as_path().starts_with(path)) {
-                            continue;
-                        }
-                        providers.managed_terminals.insert(terminal.attachable_id, flotilla_protocol::ManagedTerminal {
-                            set_id: terminal.attachable_set_id,
-                            role: terminal.role,
-                            command: terminal.command,
-                            working_directory: terminal.working_directory.into_path_buf(),
-                            status: terminal.status,
-                            expected_to_persist: terminal.expected_to_persist,
-                            attention: terminal.attention,
-                        });
-                    }
-                }
-                Err(error) => warn!(repo = %repo_identity, %error, "failed to refresh managed terminals"),
             }
         }
 

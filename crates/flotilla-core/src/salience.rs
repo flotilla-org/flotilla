@@ -1,7 +1,7 @@
 //! Central salience policy for the awareness projection.
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{PaneExitAttentionFlavor, ResourceRef, Salience};
+use flotilla_protocol::{ResourceRef, Salience};
 use flotilla_resources::{DemandState, PrincipalRef, TerminalAttentionState};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -38,7 +38,6 @@ pub struct AttentionFact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneExitFact {
     pub target: ResourceRef,
-    pub flavor: PaneExitAttentionFlavor,
     pub as_of: DateTime<Utc>,
 }
 
@@ -109,10 +108,7 @@ pub fn evaluate_entry(
         }
     }
     for exit in pane_exits {
-        result.salience = result.salience.max(match exit.flavor {
-            PaneExitAttentionFlavor::Completion => Salience::Info,
-            PaneExitAttentionFlavor::Failure => Salience::Attention,
-        });
+        result.salience = result.salience.max(Salience::Attention);
         result.as_of = result.as_of.max(exit.as_of);
     }
     result
