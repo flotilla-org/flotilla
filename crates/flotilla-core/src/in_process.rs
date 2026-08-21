@@ -49,17 +49,16 @@ use flotilla_resources::{
     ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase,
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending,
     CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandKind, DemandSpec, Environment as ResourceEnvironment, EnvironmentPhase,
-    HoldAct, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
-    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
-    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ReadResourceObject,
-    Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
-    SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
-    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
-    WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, PROJECT_LABEL, ROLE_LABEL,
-    VESSEL_LABEL, VESSEL_REF_LABEL,
+    HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
+    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
+    PendingBrief, PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation, Project, ProjectRepositoryRole,
+    ProjectRepositorySpec, ProjectSpec, ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend,
+    ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief,
+    TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch,
+    TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
+    WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS,
+    MANAGED_BY_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -96,7 +95,6 @@ use crate::{
         SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
     },
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
-    placement_policy::reconcile_registered_policy,
     project_declaration::{
         parse_project_declaration, ProjectDeclaration, BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION,
         BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE, DECLARATION_FILE_ANNOTATION,
@@ -1228,7 +1226,9 @@ fn canonical_placement_host_ref_from_sources(
     let Some(canonical) = canonical else {
         return Ok(None);
     };
-    let resolved = authoritative_host_source(hosts.iter().filter(|host| host.object.metadata.name == canonical.as_str()))
+    let resolved = hosts
+        .iter()
+        .find(|host| host.object.metadata.name == canonical.as_str())
         .expect("canonical host resolver selected an existing host");
     let display_name = if resolved.object.spec.display_name.is_empty() {
         resolved.object.metadata.name.clone()
@@ -1238,40 +1238,18 @@ fn canonical_placement_host_ref_from_sources(
     Ok(Some(PlacementTargetHost { reference: canonical, display_name }))
 }
 
-/// Select the target daemon's self-report over a locally materialized peer-summary row.
-///
-/// The transitional peer-summary path writes a ready local Host observation with
-/// adapter and pool capabilities, but it has no daemon identity fields. Resource
-/// replication separately brings in the full self-report. Among self-reports, a
-/// later daemon start supersedes an earlier generation and heartbeat breaks ties.
-fn authoritative_host_source<'a>(
-    sources: impl Iterator<Item = &'a ReadResourceObject<ResourceHost>>,
-) -> Option<&'a ReadResourceObject<ResourceHost>> {
-    sources.max_by_key(|source| {
-        let status = source.object.status.as_ref();
-        (
-            status.and_then(|status| status.daemon_generation.as_ref()).is_some(),
-            status.and_then(|status| status.daemon_started_at),
-            status.and_then(|status| status.heartbeat_at),
-            source.object.metadata.creation_timestamp,
-        )
-    })
-}
-
 async fn authoritative_placement_host(
     backend: &ResourceBackend,
     namespace: &str,
     target_host: &PlacementTargetHost,
     placement_name: &str,
 ) -> Result<ResourceObject<ResourceHost>, String> {
-    let sources = backend
+    backend
         .including_replicas::<ResourceHost>(namespace)
-        .list()
+        .get(target_host.reference.as_str())
         .await
-        .map_err(|error| format!("placement `{placement_name}` target host is not ready: {error}"))?;
-    authoritative_host_source(sources.items.iter().filter(|source| source.object.metadata.name == target_host.reference.as_str()))
-        .map(|source| source.object.clone())
-        .ok_or_else(|| format!("placement `{placement_name}` target host is not ready: resource not found: {}", target_host.reference))
+        .map(|source| source.object)
+        .map_err(|error| format!("placement `{placement_name}` target host is not ready: {error}"))
 }
 
 fn host_generation(status: Option<&ResourceHostStatus>) -> &str {
@@ -2841,88 +2819,11 @@ impl InProcessDaemon {
     }
 
     pub async fn publish_peer_summary(&self, summary: HostSummary) {
-        if let Err(error) = self.materialize_peer_host_direct_placement(&summary).await {
-            warn!(peer = %summary.node.node_id, %error, "failed to materialize peer host-direct placement");
-        }
         self.host_registry
             .publish_peer_summary(summary, &|e| {
                 let _ = self.event_tx.send(e);
             })
             .await;
-    }
-
-    /// Keep locally materialized peer hosts ready while their transport route is live.
-    pub async fn refresh_connected_peer_host_heartbeats(&self) {
-        for summary in self.host_registry.connected_peer_summaries().await {
-            if let Err(error) = self.materialize_peer_host_direct_placement(&summary).await {
-                warn!(peer = %summary.node.node_id, %error, "failed to refresh connected peer host heartbeat");
-            }
-        }
-    }
-
-    async fn materialize_peer_host_direct_placement(&self, summary: &HostSummary) -> Result<(), String> {
-        let Some(host_id) = summary.environment_id.host_id() else {
-            return Ok(());
-        };
-        if self.local_host_id().as_ref() == Some(host_id) {
-            return Ok(());
-        }
-
-        let namespace = self.provisioning_namespace().await;
-        let hosts = self.resource_backend.clone().using::<ResourceHost>(&namespace);
-        let host_name = host_id.to_string();
-        let host = match hosts.get(&host_name).await {
-            Ok(host) if host.spec.display_name == summary.node.display_name => host,
-            Ok(host) => hosts
-                .update(&InputMeta::from(&host.metadata), &host.metadata.resource_version, &flotilla_resources::HostSpec {
-                    display_name: summary.node.display_name.clone(),
-                })
-                .await
-                .map_err(|error| error.to_string())?,
-            Err(ResourceError::NotFound { .. }) => hosts
-                .create(&InputMeta::builder().name(host_name.clone()).build(), &flotilla_resources::HostSpec {
-                    display_name: summary.node.display_name.clone(),
-                })
-                .await
-                .map_err(|error| error.to_string())?,
-            Err(error) => return Err(error.to_string()),
-        };
-
-        let agent_adapters = summary
-            .providers
-            .iter()
-            .filter(|provider| provider.healthy && provider.category == AGENT_ADAPTER_PROVIDER_CATEGORY)
-            .map(|provider| provider.implementation.clone())
-            .collect::<BTreeSet<_>>();
-        let terminal_pools = summary
-            .providers
-            .iter()
-            .filter(|provider| provider.healthy && provider.category == TERMINAL_POOL_PROVIDER_CATEGORY)
-            .map(|provider| provider.implementation.clone())
-            .collect::<BTreeSet<_>>();
-        let capabilities = BTreeMap::from([
-            (flotilla_resources::AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters)),
-            (flotilla_resources::TERMINAL_POOLS_CAPABILITY.to_string(), serde_json::json!(terminal_pools)),
-        ]);
-        hosts
-            .update_status(
-                &host_name,
-                &host.metadata.resource_version,
-                &flotilla_resources::HostStatus::builder().capabilities(capabilities).heartbeat_at(Utc::now()).ready(true).build(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-
-        let policy_name = format!("host-direct-{host_name}");
-        let pool = terminal_pools.into_iter().next().unwrap_or_else(|| "passthrough".to_string());
-        let desired = PlacementPolicySpec::builder()
-            .pool(pool)
-            .host_direct(HostDirectPlacementPolicySpec {
-                host_ref: host_name.clone(),
-                checkout: HostDirectPlacementPolicyCheckout::Worktree,
-            })
-            .build();
-        reconcile_registered_policy(&self.resource_backend, &namespace, &policy_name, &desired).await
     }
 
     pub async fn remote_placement_host(

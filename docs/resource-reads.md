@@ -87,3 +87,35 @@ last successfully processed cursor and resume after an error.
 `--host <name>` routes all three reads to that peer. The same wire-generation
 handshake used by every CLI connection rejects an incompatible daemon before
 the read starts.
+
+## One-time single-home duplicate sweep
+
+[ADR 0033](adr/0033-homing-in-practice-creation-cascade-mutation-routing-enforcement.md)
+enforces single-home authorship for new records, but fleets upgrading from the
+transitional multi-author behavior may still contain Host and PlacementPolicy
+records authored on several roots. With every fleet host upgraded, online, and
+connected, run:
+
+```bash
+flotilla resource dedup-sweep
+flotilla resource dedup-sweep --json
+```
+
+Run the sweep as the migration step immediately after deploying the ADR 0033
+behavior, before relying on placement decisions. Until the standing duplicates
+are removed, ordinary replica lookup may select an older authored copy and the
+collision condition will remain active.
+
+The command inventories each root's local authored rows, keeps the copy on the
+host named by the Host or placement policy, and uses the raw resource-delete
+path for every non-home copy. It refuses before deleting a record if the copies
+disagree about their home or the home has no authored copy. The report names
+each deletion. A successful second run reports zero duplicates and zero
+deletions.
+
+The automated sweep covers Host records and host-scoped PlacementPolicies:
+`host_direct` and `docker_per_vessel`, including snapshots of those policies.
+A duplicated policy with neither strategy has no natural home the tool can
+prove from the record. The sweep refuses the complete plan before deleting
+anything; resolve that policy explicitly with `resource delete --host` on the
+non-home roots, then rerun the sweep.
