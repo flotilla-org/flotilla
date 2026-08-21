@@ -1439,6 +1439,12 @@ mod tests {
             ("CLAUDE_CONFIG_DIR".to_string(), "/home/crew/flotilla/credentials/claude-max/claude".to_string()),
         ];
 
+        let missing = claude
+            .prepare_with_environment(&workspace, &brief, &Vec::new())
+            .await
+            .expect_err("contained Claude must refuse a session without delivered authentication");
+        assert_eq!(missing, "contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`");
+
         claude.prepare_with_environment(&workspace, &brief, &invocation_environment).await.expect("prepare contained Claude");
         let plan = claude
             .launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief, environment: invocation_environment })
