@@ -112,3 +112,10 @@ path for every non-home copy. It refuses before deleting a record if the copies
 disagree about their home or the home has no authored copy. The report names
 each deletion. A successful second run reports zero duplicates and zero
 deletions.
+
+The automated sweep covers Host records and host-scoped PlacementPolicies:
+`host_direct` and `docker_per_vessel`, including snapshots of those policies.
+A duplicated policy with neither strategy has no natural home the tool can
+prove from the record. The sweep refuses the complete plan before deleting
+anything; resolve that policy explicitly with `resource delete --host` on the
+non-home roots, then rerun the sweep.

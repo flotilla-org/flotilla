@@ -268,6 +268,11 @@ fn plan_dedup_deletions(
             continue;
         }
         duplicate_records += 1;
+        if sources.iter().any(|source| source.natural_home.is_none()) {
+            return Err(format!(
+                "refusing to sweep {kind}/{name}: at least one authored copy has no host-scoped natural home; resolve it with a raw resource delete on its root before rerunning the sweep"
+            ));
+        }
         let homes = sources.iter().filter_map(|source| source.natural_home.as_deref()).collect::<BTreeSet<_>>();
         if homes.len() != 1 {
             return Err(format!(
@@ -529,6 +534,24 @@ mod tests {
 
         let error = plan_dedup_deletions(records).expect_err("missing home copy must abort the plan");
         assert!(error.contains("natural home host-c has no authored copy"));
+    }
+
+    #[test]
+    fn dedup_plan_refuses_an_unscoped_policy_before_returning_deletions() {
+        let records = BTreeMap::from([(("placementpolicies".to_string(), "shared".to_string()), vec![
+            authored_policy("host-a", "shared", "host-a"),
+            AuthoredRecord {
+                root: SweepRoot { host_id: "host-b".to_string(), node_id: NodeId::new("node-host-b") },
+                namespace: "flotilla".to_string(),
+                kind: "placementpolicies".to_string(),
+                name: "shared".to_string(),
+                natural_home: None,
+            },
+        ])]);
+
+        let error = plan_dedup_deletions(records).expect_err("unscoped policy must abort the complete plan");
+        assert!(error.contains("has no host-scoped natural home"));
+        assert!(error.contains("raw resource delete"));
     }
 
     #[test]
