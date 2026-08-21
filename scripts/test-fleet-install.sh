@@ -395,6 +395,8 @@ run_darwin_installer() {
   shift
   : "${LAUNCHCTL_LOG:=$test_root/launchctl.log}"
   HOME="$home" \
+    XDG_CONFIG_HOME="$home/.config" \
+    XDG_STATE_HOME="$home/.local/state" \
     PATH="$home/.local/bin:$fake_bin:$PATH" \
     SHELL="$fake_bin/zsh" \
     LOGIN_SHELL_PATH="$home/.local/bin:$fake_bin:/usr/bin:/bin" \
