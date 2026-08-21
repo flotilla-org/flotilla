@@ -160,28 +160,7 @@ impl ResourceClient {
             }
         }
 
-        let mut duplicate_records = 0;
-        let mut planned_deletions = Vec::new();
-        for ((kind, name), sources) in records {
-            if sources.len() < 2 {
-                continue;
-            }
-            duplicate_records += 1;
-            let homes = sources.iter().filter_map(|source| source.natural_home.as_deref()).collect::<BTreeSet<_>>();
-            if homes.len() != 1 {
-                return Err(format!(
-                    "refusing to sweep {kind}/{name}: authored copies do not agree on exactly one natural home ({})",
-                    homes.into_iter().collect::<Vec<_>>().join(", ")
-                ));
-            }
-            let home = homes.into_iter().next().expect("one natural home").to_string();
-            if !sources.iter().any(|source| source.root.host_id == home) {
-                return Err(format!("refusing to sweep {kind}/{name}: natural home {home} has no authored copy"));
-            }
-            for source in sources.into_iter().filter(|source| source.root.host_id != home) {
-                planned_deletions.push((source, home.clone()));
-            }
-        }
+        let (duplicate_records, planned_deletions) = plan_dedup_deletions(records)?;
 
         let mut deletions = Vec::new();
         for (source, home) in planned_deletions {
@@ -271,6 +250,34 @@ impl ResourceClient {
             .await?;
         Ok(ResourceWatch { daemon: Arc::clone(&self.daemon), events, command_id, finished: false })
     }
+}
+
+fn plan_dedup_deletions(
+    records: BTreeMap<(String, String), Vec<AuthoredRecord>>,
+) -> Result<(usize, Vec<(AuthoredRecord, String)>), String> {
+    let mut duplicate_records = 0;
+    let mut planned_deletions = Vec::new();
+    for ((kind, name), sources) in records {
+        if sources.len() < 2 {
+            continue;
+        }
+        duplicate_records += 1;
+        let homes = sources.iter().filter_map(|source| source.natural_home.as_deref()).collect::<BTreeSet<_>>();
+        if homes.len() != 1 {
+            return Err(format!(
+                "refusing to sweep {kind}/{name}: authored copies do not agree on exactly one natural home ({})",
+                homes.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        let home = homes.into_iter().next().expect("one natural home").to_string();
+        if !sources.iter().any(|source| source.root.host_id == home) {
+            return Err(format!("refusing to sweep {kind}/{name}: natural home {home} has no authored copy"));
+        }
+        for source in sources.into_iter().filter(|source| source.root.host_id != home) {
+            planned_deletions.push((source, home.clone()));
+        }
+    }
+    Ok((duplicate_records, planned_deletions))
 }
 
 fn sweep_roots_from_hosts(hosts: &[HostListEntry]) -> Result<Vec<SweepRoot>, String> {
@@ -466,6 +473,66 @@ mod tests {
             fixture.insert((format!("root-{root}"), "placementpolicies".to_string()), policies);
         }
         fixture
+    }
+
+    fn authored_policy(root: &str, name: &str, home: &str) -> AuthoredRecord {
+        AuthoredRecord {
+            root: SweepRoot { host_id: root.to_string(), node_id: NodeId::new(format!("node-{root}")) },
+            namespace: "flotilla".to_string(),
+            kind: "placementpolicies".to_string(),
+            name: name.to_string(),
+            natural_home: Some(home.to_string()),
+        }
+    }
+
+    #[test]
+    fn dedup_plan_refuses_disagreeing_homes_before_returning_deletions() {
+        let records = BTreeMap::from([
+            (("hosts".to_string(), "host-a".to_string()), vec![
+                AuthoredRecord {
+                    root: SweepRoot { host_id: "host-a".to_string(), node_id: NodeId::new("node-a") },
+                    namespace: "flotilla".to_string(),
+                    kind: "hosts".to_string(),
+                    name: "host-a".to_string(),
+                    natural_home: Some("host-a".to_string()),
+                },
+                AuthoredRecord {
+                    root: SweepRoot { host_id: "host-b".to_string(), node_id: NodeId::new("node-b") },
+                    namespace: "flotilla".to_string(),
+                    kind: "hosts".to_string(),
+                    name: "host-a".to_string(),
+                    natural_home: Some("host-a".to_string()),
+                },
+            ]),
+            (("placementpolicies".to_string(), "shared".to_string()), vec![
+                authored_policy("host-a", "shared", "host-a"),
+                authored_policy("host-b", "shared", "host-b"),
+            ]),
+        ]);
+
+        let error = plan_dedup_deletions(records).expect_err("disagreement must abort the complete plan");
+        assert!(error.contains("do not agree on exactly one natural home"));
+    }
+
+    #[test]
+    fn dedup_plan_refuses_when_the_natural_home_has_no_authored_copy() {
+        let records = BTreeMap::from([(("placementpolicies".to_string(), "shared".to_string()), vec![
+            authored_policy("host-a", "shared", "host-c"),
+            authored_policy("host-b", "shared", "host-c"),
+        ])]);
+
+        let error = plan_dedup_deletions(records).expect_err("missing home copy must abort the plan");
+        assert!(error.contains("natural home host-c has no authored copy"));
+    }
+
+    #[test]
+    fn dedup_sweep_refuses_an_unreachable_fleet_host() {
+        let mut hosts = three_root_hosts();
+        hosts[1].connection_status = PeerConnectionState::Disconnected;
+
+        let error = sweep_roots_from_hosts(&hosts).expect_err("unreachable host must abort inventory");
+        assert!(error.contains("host-b"));
+        assert!(error.contains("unreachable"));
     }
 
     #[tokio::test]

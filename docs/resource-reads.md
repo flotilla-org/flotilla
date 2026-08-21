@@ -98,6 +98,10 @@ flotilla resource dedup-sweep
 flotilla resource dedup-sweep --json
 ```
 
+Run the sweep immediately when deploying the single-home resource behavior,
+before relying on placement decisions. Until the standing duplicates are
+removed, ordinary replica lookup may select an older authored copy.
+
 The command inventories each root's local authored rows, keeps the copy on the
 host named by the Host or placement policy, and uses the raw resource-delete
 path for every non-home copy. It refuses before deleting a record if the copies
