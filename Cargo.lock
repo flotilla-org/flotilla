@@ -1101,6 +1101,7 @@ dependencies = [
  "bon",
  "flotilla-core",
  "flotilla-protocol",
+ "flotilla-resources",
  "flotilla-test-support",
  "flotilla-transport",
  "libc",

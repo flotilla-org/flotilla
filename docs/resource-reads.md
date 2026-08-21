@@ -107,15 +107,18 @@ are removed, ordinary replica lookup may select an older authored copy and the
 collision condition will remain active.
 
 The command inventories each root's local authored rows, keeps the copy on the
-host named by the Host or placement policy, and uses the raw resource-delete
-path for every non-home copy. It refuses before deleting a record if the copies
-disagree about their home or the home has no authored copy. The report names
+host named by the Host or ordinary placement policy, and keeps a placement
+snapshot with the authored convoy that references it. It uses the raw
+resource-delete path for every non-home copy. It refuses before deleting a
+record if the copies disagree about their home, a placement snapshot has no
+unique authored convoy home, or the home has no authored copy. The report names
 each deletion. A successful second run reports zero duplicates and zero
 deletions.
 
 The automated sweep covers Host records and host-scoped PlacementPolicies:
-`host_direct` and `docker_per_vessel`, including snapshots of those policies.
-A duplicated policy with neither strategy has no natural home the tool can
-prove from the record. The sweep refuses the complete plan before deleting
-anything; resolve that policy explicitly with `resource delete --host` on the
-non-home roots, then rerun the sweep.
+`host_direct` and `docker_per_vessel`. Placement snapshots are convoy-owned, so
+their embedded strategy host does not determine their home. A duplicated policy
+with neither strategy, or a snapshot without one authored convoy home, has no
+natural home the tool can prove. The sweep refuses the complete plan before
+deleting anything; resolve that policy explicitly with `resource delete --host`
+on the non-home roots, then rerun the sweep.
