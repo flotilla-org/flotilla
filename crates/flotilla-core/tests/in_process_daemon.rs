@@ -3907,7 +3907,6 @@ async fn daemon_restart_preserves_standing_convoy_and_terminal_session() {
         crew: None,
         launch_command: "cleat attach standing".to_string(),
         delivered_message_id: None,
-        delivery_unconfirmed_message_id: None,
     })
     .await
     .expect("mark terminal running");

@@ -1121,7 +1121,6 @@ async fn managed_claude_permission_prompt_marks_terminal_as_needing_input() {
         crew: None,
         launch_command: "claude".into(),
         delivered_message_id: None,
-        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     sessions.update_status("terminal-demo-coder", &created.metadata.resource_version, &status).await.expect("running status");
@@ -1506,7 +1505,6 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
         ),
         launch_command: "codex".into(),
         delivered_message_id: None,
-        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     sessions.update_status(&created.metadata.name, &created.metadata.resource_version, &status).await.expect("running terminal");

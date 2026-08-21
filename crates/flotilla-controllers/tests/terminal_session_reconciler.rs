@@ -243,7 +243,6 @@ async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
         crew: None,
         launch_command: "cargo test".to_string(),
         delivered_message_id: None,
-        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut running);
     sessions.update_status(&created.metadata.name, &created.metadata.resource_version, &running).await.expect("terminal should be running");
@@ -362,7 +361,6 @@ async fn foreign_actuator_runtime_failure_is_skipped_and_convoy_stays_active() {
         crew: None,
         launch_command: "cargo test".to_string(),
         delivered_message_id: None,
-        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut running);
     sessions.update_status(&created.metadata.name, &created.metadata.resource_version, &running).await.expect("terminal should be running");
@@ -495,7 +493,6 @@ impl TerminalRuntime for GhostRecoveryRuntime {
             crew: None,
             launch_command: "codex".to_string(),
             delivered_message_id: None,
-            delivery_unconfirmed_message_id: None,
         })
     }
 
@@ -626,7 +623,6 @@ async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
         crew: None,
         launch_command: "codex".to_string(),
         delivered_message_id: None,
-        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     let session = sessions
@@ -746,7 +742,6 @@ impl TerminalRuntime for TagRecordingRuntime {
             crew: None,
             launch_command: "tail -f log".into(),
             delivered_message_id: None,
-            delivery_unconfirmed_message_id: None,
         })
     }
 
@@ -792,7 +787,6 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
         crew: None,
         launch_command: "codex".into(),
         delivered_message_id: None,
-        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
@@ -874,7 +868,6 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
         crew: None,
         launch_command: "claude".into(),
         delivered_message_id: Some("message-old".into()),
-        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     flotilla_resources::TerminalSessionStatusPatch::MarkReconcileDegraded {
@@ -948,7 +941,6 @@ async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
         crew: None,
         launch_command: "claude".into(),
         delivered_message_id: None,
-        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
@@ -991,7 +983,6 @@ async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_s
         crew: None,
         launch_command: "cargo test".into(),
         delivered_message_id: None,
-        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
@@ -1055,7 +1046,6 @@ async fn terminal_finalizer_cleans_agent_artifacts() {
         crew: None,
         launch_command: "codex".into(),
         delivered_message_id: None,
-        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
@@ -1164,7 +1154,6 @@ async fn stale_hook_attention_decays_to_unobservable_without_changing_phase() {
         crew: None,
         launch_command: "cargo test".into(),
         delivered_message_id: None,
-        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     status.attention = Some(TerminalAttention {

@@ -765,7 +765,6 @@ async fn create_running_terminal(backend: &ResourceBackend, name: &str, env_ref:
         crew: None,
         launch_command: "bash".to_string(),
         delivered_message_id: None,
-        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     sessions.update_status(name, &created.metadata.resource_version, &status).await.expect("session status update should succeed");

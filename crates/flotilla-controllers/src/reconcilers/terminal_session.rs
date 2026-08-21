@@ -22,7 +22,6 @@ pub struct TerminalRuntimeState {
     pub crew: Option<flotilla_resources::CrewSessionStatus>,
     pub launch_command: String,
     pub delivered_message_id: Option<String>,
-    pub delivery_unconfirmed_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +32,7 @@ pub struct TerminalObservation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalDeliveryOutcome {
+    Pending,
     Confirmed,
     Unconfirmed,
 }
@@ -161,6 +161,7 @@ pub enum TerminalPrepared {
     Waiting,
     Running(TerminalRuntimeState),
     MessageDelivered(String),
+    MessageDeliveryPending,
     MessageDeliveryUnconfirmed(String),
     Stopped,
     Attention(TerminalObservation),
@@ -213,6 +214,7 @@ where
                     // a handoff is worse, and exactly-once requires acknowledgement by the agent.
                     return Ok(
                         match self.runtime.deliver_message(session_id, &obj.spec, &message.text).await.map_err(ResourceError::other)? {
+                            TerminalDeliveryOutcome::Pending => TerminalPrepared::MessageDeliveryPending,
                             TerminalDeliveryOutcome::Confirmed => TerminalPrepared::MessageDelivered(message.id.clone()),
                             TerminalDeliveryOutcome::Unconfirmed => TerminalPrepared::MessageDeliveryUnconfirmed(message.id.clone()),
                         },
@@ -279,7 +281,6 @@ where
                     crew: state.crew.clone(),
                     launch_command: state.launch_command.clone(),
                     delivered_message_id: state.delivered_message_id.clone(),
-                    delivery_unconfirmed_message_id: state.delivery_unconfirmed_message_id.clone(),
                 }),
                 TerminalPrepared::Failed(message) => {
                     Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })
@@ -288,6 +289,7 @@ where
                 | TerminalPrepared::None
                 | TerminalPrepared::Stopped
                 | TerminalPrepared::MessageDelivered(_)
+                | TerminalPrepared::MessageDeliveryPending
                 | TerminalPrepared::MessageDeliveryUnconfirmed(_)
                 | TerminalPrepared::Attention(_)
                 | TerminalPrepared::AttentionStale
@@ -359,7 +361,11 @@ where
             }
             _ => Vec::new(),
         };
-        ReconcileOutcome::with_actuations(patch, actuations)
+        let mut outcome = ReconcileOutcome::with_actuations(patch, actuations);
+        if matches!(prepared, TerminalPrepared::MessageDeliveryPending) {
+            outcome.requeue_after = Some(Duration::from_millis(200));
+        }
+        outcome
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {

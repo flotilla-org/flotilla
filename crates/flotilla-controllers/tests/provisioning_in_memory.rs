@@ -212,7 +212,6 @@ impl TerminalRuntime for FakeTerminalRuntime {
             crew: None,
             launch_command: "bash".to_string(),
             delivered_message_id: None,
-            delivery_unconfirmed_message_id: None,
         })
     }
 
@@ -822,7 +821,6 @@ async fn presentation_controller_marks_presentation_active_for_live_convoy_sessi
                 crew: None,
                 launch_command: "cargo test".to_string(),
                 delivered_message_id: None,
-                delivery_unconfirmed_message_id: None,
             }
             .apply(&mut status);
             status

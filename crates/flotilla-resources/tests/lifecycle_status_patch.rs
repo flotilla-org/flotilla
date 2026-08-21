@@ -593,7 +593,6 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     crew: None,
                     launch_command: "bash".to_string(),
                     delivered_message_id: None,
-                    delivery_unconfirmed_message_id: None,
                 };
                 apply_and_replay(&mut status, &patch);
                 let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
@@ -881,7 +880,6 @@ fn new_attempt_transitions_replace_attempt_timestamps() {
                     crew: None,
                     launch_command: "bash".to_string(),
                     delivered_message_id: None,
-                    delivery_unconfirmed_message_id: None,
                 };
                 apply_and_replay(&mut status, &patch);
                 let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };

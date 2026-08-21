@@ -302,7 +302,6 @@ pub enum TerminalSessionStatusPatch {
         crew: Option<CrewSessionStatus>,
         launch_command: String,
         delivered_message_id: Option<String>,
-        delivery_unconfirmed_message_id: Option<String>,
     },
     MarkMessageDelivered {
         message_id: String,
@@ -347,15 +346,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 let completion_pending = status.completion_pending.take();
                 *status = TerminalSessionStatus { completion_pending, ..Default::default() };
             }
-            Self::MarkRunning {
-                session_id,
-                pid,
-                started_at,
-                crew,
-                launch_command,
-                delivered_message_id,
-                delivery_unconfirmed_message_id,
-            } => {
+            Self::MarkRunning { session_id, pid, started_at, crew, launch_command, delivered_message_id } => {
                 status.phase = TerminalSessionPhase::Running;
                 status.session_id = Some(session_id.clone());
                 status.pid = *pid;
@@ -365,16 +356,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.crew = crew.clone();
                 status.launch_command = Some(launch_command.clone());
                 status.delivered_message_id = delivered_message_id.clone();
-                if delivery_unconfirmed_message_id.is_some() {
-                    status.message = Some("agent composer still contained the delivered text after submit and one retry".to_string());
-                }
-                status.degraded = delivery_unconfirmed_message_id.as_ref().map(|message_id| TerminalSessionDegradedCondition {
-                    reason: "DeliveryUnconfirmed".to_string(),
-                    message: "agent composer still contained the delivered text after submit and one retry".to_string(),
-                    message_id: Some(message_id.clone()),
-                    consecutive_failures: 1,
-                    observed_at: *started_at,
-                });
+                status.degraded = None;
             }
             Self::MarkMessageDelivered { message_id } => {
                 status.delivered_message_id = Some(message_id.clone());

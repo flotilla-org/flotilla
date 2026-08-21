@@ -646,6 +646,12 @@ struct ControllerRuntimeState {
     agent_material: Option<Arc<AgentMaterialRegistry>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     clone_flights: Arc<CloneFlights>,
+    terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
+}
+
+struct PendingTerminalDelivery {
+    message: String,
+    task: JoinHandle<Result<TerminalDeliveryOutcome, String>>,
 }
 
 struct GhForgeDefaultBranchResolver {
@@ -688,6 +694,7 @@ impl ControllerRuntimeState {
             agent_material: None,
             provisioned_environments: Mutex::new(HashMap::new()),
             clone_flights: Arc::new(CloneFlights::default()),
+            terminal_deliveries: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -3035,13 +3042,11 @@ async fn delivery_pending(
 ) -> Result<Option<bool>, String> {
     tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
     let session = pool.list_sessions().await?.into_iter().find(|session| session.session_name == session_id);
-    if session.as_ref().and_then(|session| session.screen_activity) == Some(ScreenActivity::Active) {
-        return Ok(Some(false));
-    }
     let Some(screen) = pool.capture_screen(session_id).await? else {
-        return Ok(None);
+        return Ok((session.as_ref().and_then(|session| session.screen_activity) == Some(ScreenActivity::Active)).then_some(false));
     };
-    Ok(composer_has_text(&screen))
+    Ok(composer_has_text(&screen)
+        .or_else(|| (session.as_ref().and_then(|session| session.screen_activity) == Some(ScreenActivity::Active)).then_some(false)))
 }
 
 async fn confirm_delivery(
@@ -3115,9 +3120,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
             None if credential_refs.is_empty() => Vec::new(),
             None => return Err("host-local credential store unavailable".to_string()),
         };
-        let (command, mut env, crew, initial_message) = match &spec.source {
-            TerminalSessionSource::Tool { command } => (command.clone(), credential_env.clone(), None, None),
-            TerminalSessionSource::Agent { selector, brief, context, message } => {
+        let (command, mut env, crew) = match &spec.source {
+            TerminalSessionSource::Tool { command } => (command.clone(), credential_env.clone(), None),
+            TerminalSessionSource::Agent { selector, brief, context, .. } => {
                 let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
                 let adapter = registry
                     .agent_adapters
@@ -3152,7 +3157,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     ("FLOTILLA_NAMESPACE".to_string(), context.namespace.clone()),
                     ("FLOTILLA_TERMINAL_SESSION".to_string(), name.to_string()),
                 ]);
-                (plan.command, env, Some(crew), message.clone())
+                (plan.command, env, Some(crew))
             }
         };
         env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
@@ -3163,32 +3168,13 @@ impl TerminalRuntime for TerminalControllerRuntime {
             pool.kill_session(name).await?;
         }
         pool.ensure_session(name, &command, &cwd, &env, &pool_tags).await?;
-        let mut delivered_message_id = None;
-        let mut delivery_unconfirmed_message_id = None;
-        if let Some(message) = initial_message {
-            let TerminalSessionSource::Agent { selector, .. } = &spec.source else { unreachable!("initial messages belong to agents") };
-            let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
-            let adapter = registry
-                .agent_adapters
-                .get(&requirement.adapter)
-                .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
-            match deliver_and_confirm(&*pool, &|screen| adapter.composer_has_text(screen), name, &message.text).await {
-                Ok(TerminalDeliveryOutcome::Confirmed) => delivered_message_id = Some(message.id),
-                Ok(TerminalDeliveryOutcome::Unconfirmed) => delivery_unconfirmed_message_id = Some(message.id),
-                Err(err) => {
-                    let _ = pool.kill_session(name).await;
-                    return Err(format!("deliver initial crew message: {err}"));
-                }
-            }
-        }
         Ok(TerminalRuntimeState::builder()
             .session_id(name.to_string())
             .maybe_pid(None)
             .started_at(Utc::now())
             .maybe_crew(crew)
             .launch_command(command)
-            .maybe_delivered_message_id(delivered_message_id)
-            .maybe_delivery_unconfirmed_message_id(delivery_unconfirmed_message_id)
+            .maybe_delivered_message_id(None)
             .build())
     }
 
@@ -3273,10 +3259,40 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .get(&requirement.adapter)
             .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
         let pool = self.pool_for_spec(spec)?;
-        deliver_and_confirm(&*pool, &|screen| adapter.composer_has_text(screen), session_id, message).await
+        let completed = {
+            let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
+            match deliveries.get(session_id) {
+                Some(delivery) if delivery.message == message && !delivery.task.is_finished() => {
+                    return Ok(TerminalDeliveryOutcome::Pending)
+                }
+                Some(_) => deliveries.remove(session_id),
+                None => None,
+            }
+        };
+        if let Some(delivery) = completed {
+            if delivery.message == message {
+                return delivery.task.await.map_err(|error| format!("delivery confirmation task failed: {error}"))?;
+            }
+            delivery.task.abort();
+        }
+        let adapter = Arc::clone(adapter);
+        let session_id_owned = session_id.to_string();
+        let message_owned = message.to_string();
+        let task = tokio::spawn(async move {
+            deliver_and_confirm(&*pool, &|screen| adapter.composer_has_text(screen), &session_id_owned, &message_owned).await
+        });
+        self.state
+            .terminal_deliveries
+            .lock()
+            .expect("terminal deliveries lock poisoned")
+            .insert(session_id.to_string(), PendingTerminalDelivery { message: message.to_string(), task });
+        Ok(TerminalDeliveryOutcome::Pending)
     }
 
     async fn kill_session(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+        if let Some(delivery) = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned").remove(session_id) {
+            delivery.task.abort();
+        }
         let pool = self.pool_for_spec(spec)?;
         if pool.tracks_session_liveness() {
             match pool.list_sessions().await {
@@ -7494,7 +7510,9 @@ mod tests {
                 status: TerminalStatus::Running,
                 command: Some("claude".to_string()),
                 working_directory: Some(ExecutionEnvironmentPath::new("/workspace")),
-                screen_activity: Some(ScreenActivity::Stable),
+                // Composer evidence must outrank this coarse activity signal;
+                // incidental redraws cannot confirm text that is still loaded.
+                screen_activity: Some(ScreenActivity::Active),
             }])
         }
 
@@ -7728,7 +7746,6 @@ mod tests {
             crew: None,
             launch_command: "cargo test".to_string(),
             delivered_message_id: None,
-            delivery_unconfirmed_message_id: None,
         }
         .apply(&mut running);
         sessions.update_status(session_name, &session.metadata.resource_version, &running).await.expect("mark terminal running");
