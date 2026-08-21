@@ -309,7 +309,7 @@ fn resolve_fleet_cleat_launcher(path: &Path) -> Result<Option<PathBuf>, String> 
         return Ok(None);
     }
     let command = lines.next().ok_or_else(|| format!("fleet cleat launcher has no exec command: {}", path.display()))?;
-    if lines.next().is_some() {
+    if lines.any(|line| !line.trim().is_empty()) {
         return Err(format!("fleet cleat launcher has unexpected trailing content: {}", path.display()));
     }
     let encoded_target = command
@@ -484,6 +484,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_fleet_cleat_launcher_with_a_relative_target() {
+        let temp = TempDir::new().expect("tempdir");
+        let launcher = temp.path().join("cleat");
+        fs::write(&launcher, format!("#!/usr/bin/env bash\n{FLEET_INSTALL_MARKER}\nexec relative/bin/cleat \"$@\"\n"))
+            .expect("fleet launcher");
+
+        let error = resolve_fleet_cleat_launcher(&launcher).expect_err("relative launcher target should fail");
+
+        assert_eq!(error, "fleet cleat launcher target is not absolute: relative/bin/cleat");
+    }
+
+    #[test]
+    fn rejects_unexpected_commands_in_a_fleet_cleat_launcher() {
+        let temp = TempDir::new().expect("tempdir");
+        let launcher = temp.path().join("cleat");
+        fs::write(
+            &launcher,
+            format!("#!/usr/bin/env bash\n{FLEET_INSTALL_MARKER}\nexec /fleet/current/bin/cleat \"$@\"\necho unexpected\n"),
+        )
+        .expect("fleet launcher");
+
+        let error = resolve_fleet_cleat_launcher(&launcher).expect_err("extra launcher command should fail");
+
+        assert_eq!(error, format!("fleet cleat launcher has unexpected trailing content: {}", launcher.display()));
+    }
+
+    #[test]
     fn resolves_flotilla_binary_adjacent_to_daemon() {
         let temp = TempDir::new().expect("tempdir");
         let daemon_binary = temp.path().join("flotillad");
@@ -551,19 +578,18 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_the_cleat_vt_library_from_the_host_asset_set() {
+        let temp = TempDir::new().expect("tempdir");
+        let binary = temp.path().join("direct/bin/cleat");
+        let library = temp.path().join("runtime/libghostty-vt.so.0");
+        let binary_arg = binary.to_string_lossy().into_owned();
+        let library_arg = library.to_string_lossy().into_owned();
         let runner = DiscoveryMockRunner::builder()
-            .on_run(
-                "ldd",
-                &["/opt/flotilla/bin/cleat"],
-                Ok("\tlibghostty-vt.so.0 => /opt/flotilla/lib/libghostty-vt.so.0 (0x00007f)\n".to_string()),
-            )
+            .on_run("ldd", &[&binary_arg], Ok(format!("\tlibghostty-vt.so.0 => {library_arg} (0x00007f)\n")))
             .build();
 
-        let library = resolve_cleat_ghostty_library(Some(&runner), &DaemonHostPath::new("/opt/flotilla/bin/cleat"))
-            .await
-            .expect("resolve ghostty library");
+        let resolved = resolve_cleat_ghostty_library(Some(&runner), &DaemonHostPath::new(binary)).await.expect("resolve ghostty library");
 
-        assert_eq!(library, DaemonHostPath::new("/opt/flotilla/lib/libghostty-vt.so.0"));
+        assert_eq!(resolved, DaemonHostPath::new(library));
     }
 
     #[tokio::test]
