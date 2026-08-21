@@ -5,15 +5,20 @@
 **Relates to:** ADR 0016 (overlay replication — this ADR amends it from
 operational evidence), ADR 0032 (convoy identity — its admission and
 actuation-locality rulings become this ADR's two homing seams). Incident
-provenance: #1592 (admission blind to a peer-homed placement policy),
-#1593 (one logical `ConvoyEnsure` independently stored at all three
-roots, quarantining every daemon under one schema change), #1594 and its
-2026-08-21 escalation comment (terminal records unaddressable; a raw
-single-root delete of `Convoy/command-builder` resurrecting within hours
-via re-federation). The remaining observation — placement policies and
-snapshots listed two and three times in `resource list` — was seen
-repeatedly during the same period (2026-08-18 to -21) but has no issue of
-its own; this ADR is its record.
+provenance: #1593 (one logical `ConvoyEnsure` independently stored at all
+three roots, quarantining every daemon under one schema change; #1592 is
+the refusal-opacity side of the same incident), #1594 and its 2026-08-21
+escalation comment (terminal records unaddressable; a raw single-root
+delete of `Convoy/command-builder` resurrecting within hours via
+re-federation). Two further observations from the same period
+(2026-08-18 to -21) have no issue of their own and this ADR is their
+record: placement policies and snapshots listed two and three times in
+`resource list`, and dispatch refusals from different roots naming
+different candidate sets — kiwi's admission error omitted three records
+(among them the feta-authored crew-image policy) that feta's own error
+listed, because admission lists placement policies through the local-only
+read (`using::<PlacementPolicy>` at `in_process.rs`), not the
+include-replicas view.
 
 ADR 0016 ruled the cross-root model: convergent facts union, definitions
 merge, home-bound runtime is reconciled only at home. One week of running
@@ -96,10 +101,15 @@ catch-up story rather than bolted on.
 ## Reads: decide against the merge view, reconcile only what you home
 
 0016 built the include-replicas read layer with local-only as the
-default. The codex-placement incident showed the remaining hazard: kiwi's
-admission listed placement policies from its local store only, could not
-see the feta-homed crew-image policy sitting in the merge view the whole
-time, and refused every dispatch with an error naming neither cause.
+default. Diagnosing the quarantine incident exposed the remaining hazard:
+admission lists placement policies through the local-only read
+(`using::<PlacementPolicy>`, confirmed in `in_process.rs`), so the same
+dispatch refused from kiwi and from feta named different candidate sets —
+kiwi's omitted the feta-authored crew-image policy that sat in the merge
+view the whole time. The failures' root cause that day was the readiness
+gate (#1592/#1593), but the read-scope blindness is real in the code and
+would produce wrong admission decisions on its own the moment a needed
+record is homed elsewhere.
 
 **Decision-making reads — admission, placement resolution, role and
 record resolution, CLI and aggregator surfaces — are required to read
