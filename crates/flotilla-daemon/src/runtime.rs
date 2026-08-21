@@ -31,7 +31,7 @@ use flotilla_core::{
         discovery::{run_provisioned_host_detectors, EnvironmentBag},
         environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate},
         registry::ProviderRegistry,
-        terminal::{ScreenActivity, TerminalPool},
+        terminal::{ScreenActivity, TerminalPool, TerminalSize},
         vcs::{CloneInspection, CloneProvisioner, GitCloneProvisioner},
         ChannelLabel, CommandRunner,
     },
@@ -78,6 +78,7 @@ const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 const BUILTIN_MANAGED_BY_VALUE: &str = "builtin";
 const RECLAIM_REFUSAL_ATTENTION_AFTER: u64 = 3;
 const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
+const CREW_SESSION_SIZE: TerminalSize = TerminalSize::new(200, 50);
 
 fn compose_agent_environment(fragments: impl IntoIterator<Item = Fragment>) -> Result<Option<ComposedFile>, String> {
     let fragments = fragments.into_iter().collect::<Vec<_>>();
@@ -3109,7 +3110,8 @@ impl TerminalRuntime for TerminalControllerRuntime {
         {
             pool.kill_session(name).await?;
         }
-        pool.ensure_session(name, &command, &cwd, &env, &pool_tags).await?;
+        let initial_size = matches!(spec.source, TerminalSessionSource::Agent { .. }).then_some(CREW_SESSION_SIZE);
+        pool.ensure_session_with_size(name, &command, &cwd, &env, &pool_tags, initial_size).await?;
         let delivered_message_id = initial_message.as_ref().map(|message| message.id.clone());
         if let Some(message) = initial_message {
             if let Err(err) = pool.deliver(name, &message.text, true).await {
@@ -7430,6 +7432,18 @@ mod tests {
             self.inner.ensure_session(session_name, command, cwd, env_vars, tags).await
         }
 
+        async fn ensure_session_with_size(
+            &self,
+            session_name: &str,
+            command: &str,
+            cwd: &ExecutionEnvironmentPath,
+            env_vars: &TerminalEnvVars,
+            tags: &[TerminalSessionTag],
+            initial_size: Option<TerminalSize>,
+        ) -> Result<(), String> {
+            self.inner.ensure_session_with_size(session_name, command, cwd, env_vars, tags, initial_size).await
+        }
+
         fn attach_args(
             &self,
             session_name: &str,
@@ -8453,6 +8467,7 @@ mod tests {
                 .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == crew_config_dir.to_str().expect("UTF-8 path")),
             "the contained Claude process must receive the config directory owned by its adapter"
         );
+        assert_eq!(launch.initial_size, Some(CREW_SESSION_SIZE));
     }
 
     #[tokio::test]
