@@ -6843,7 +6843,7 @@ impl InProcessDaemon {
     ) -> Result<(), String> {
         if decision_ledger_ref.as_deref().is_some_and(|reference| !(reference.starts_with("https://") || reference.starts_with("http://")))
         {
-            return Err("decision ledger reference must be an HTTP(S) PR-comment URL".to_string());
+            return Err("decision ledger reference must use an HTTP(S) URL".to_string());
         }
         let routing = self.resolve_crew_routing_context(requested).await?;
         let namespace = routing.command_context.namespace.as_deref().expect("resolved crew routing context has a namespace");

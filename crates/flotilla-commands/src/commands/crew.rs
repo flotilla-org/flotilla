@@ -49,13 +49,6 @@ pub enum CrewVerb {
 
 impl CrewNoun {
     pub fn resolve_with_crew_id(self, ambient_crew_id: Option<String>) -> Result<Resolved, String> {
-        if self
-            .decision_ledger_ref
-            .as_deref()
-            .is_some_and(|reference| !(reference.starts_with("https://") || reference.starts_with("http://")))
-        {
-            return Err("--decision-ledger-ref must be an HTTP(S) PR-comment URL".to_string());
-        }
         let context = CrewCommandContext::builder()
             .maybe_crew_id(self.crew_id.or(ambient_crew_id))
             .maybe_namespace(self.namespace)
@@ -73,12 +66,21 @@ impl CrewNoun {
             ("list", SubjectInterpretation::Ordinary, None) => {
                 return Err("`flotilla crew list` does not accept --message, --disposition, or --decision-ledger-ref".to_string());
             }
-            ("complete", SubjectInterpretation::Ordinary, None) => CommandAction::CrewComplete {
-                context,
-                message: self.message,
-                disposition: self.disposition,
-                decision_ledger_ref: self.decision_ledger_ref,
-            },
+            ("complete", SubjectInterpretation::Ordinary, None) => {
+                if self
+                    .decision_ledger_ref
+                    .as_deref()
+                    .is_some_and(|reference| !(reference.starts_with("https://") || reference.starts_with("http://")))
+                {
+                    return Err("--decision-ledger-ref must use an HTTP(S) URL".to_string());
+                }
+                CommandAction::CrewComplete {
+                    context,
+                    message: self.message,
+                    disposition: self.disposition,
+                    decision_ledger_ref: self.decision_ledger_ref,
+                }
+            }
             ("fail", SubjectInterpretation::Ordinary, None) if self.disposition.is_some() || self.decision_ledger_ref.is_some() => {
                 return Err("`flotilla crew fail` does not accept --disposition or --decision-ledger-ref".to_string());
             }
@@ -250,7 +252,17 @@ mod tests {
             CrewNoun::try_parse_from(["crew", "complete", "--decision-ledger-ref", "not-a-url"]).expect("parse invalid ledger pointer");
         assert_eq!(
             noun.resolve_with_crew_id(Some("crew-123".into())).expect_err("invalid pointer should fail"),
-            "--decision-ledger-ref must be an HTTP(S) PR-comment URL"
+            "--decision-ledger-ref must use an HTTP(S) URL"
+        );
+    }
+
+    #[test]
+    fn unsupported_verb_error_precedes_decision_ledger_url_validation() {
+        let noun =
+            CrewNoun::try_parse_from(["crew", "list", "--decision-ledger-ref", "not-a-url"]).expect("parse unsupported ledger pointer");
+        assert_eq!(
+            noun.resolve_with_crew_id(Some("crew-123".into())).expect_err("list should reject pointer"),
+            "`flotilla crew list` does not accept --message, --disposition, or --decision-ledger-ref"
         );
     }
 
