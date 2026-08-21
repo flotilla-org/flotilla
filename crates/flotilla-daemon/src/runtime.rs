@@ -12,8 +12,8 @@ use flotilla_controllers::reconcilers::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
     DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler, ForgeDefaultBranchResolver,
     HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
-    RepositoryReconciler, TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselPlacementProjector,
-    VesselReconciler,
+    RepositoryReconciler, TerminalDeliveryOutcome, TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler,
+    VesselPlacementProjector, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
@@ -3025,6 +3025,59 @@ struct TerminalControllerRuntime {
     state: Arc<ControllerRuntimeState>,
 }
 
+const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(200);
+const DELIVERY_CONFIRMATION_POLLS: usize = 10;
+
+async fn delivery_pending(
+    pool: &dyn TerminalPool,
+    composer_has_text: &(dyn Fn(&str) -> Option<bool> + Sync),
+    session_id: &str,
+) -> Result<Option<bool>, String> {
+    tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
+    let session = pool.list_sessions().await?.into_iter().find(|session| session.session_name == session_id);
+    if session.as_ref().and_then(|session| session.screen_activity) == Some(ScreenActivity::Active) {
+        return Ok(Some(false));
+    }
+    let Some(screen) = pool.capture_screen(session_id).await? else {
+        return Ok(None);
+    };
+    Ok(composer_has_text(&screen))
+}
+
+async fn confirm_delivery(
+    pool: &dyn TerminalPool,
+    composer_has_text: &(dyn Fn(&str) -> Option<bool> + Sync),
+    session_id: &str,
+) -> Result<bool, String> {
+    for _ in 0..DELIVERY_CONFIRMATION_POLLS {
+        match delivery_pending(pool, composer_has_text, session_id).await? {
+            Some(true) => {}
+            Some(false) | None => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+async fn deliver_and_confirm(
+    pool: &dyn TerminalPool,
+    composer_has_text: &(dyn Fn(&str) -> Option<bool> + Sync),
+    session_id: &str,
+    message: &str,
+) -> Result<TerminalDeliveryOutcome, String> {
+    pool.deliver(session_id, message, true).await?;
+    if confirm_delivery(pool, composer_has_text, session_id).await? {
+        return Ok(TerminalDeliveryOutcome::Confirmed);
+    }
+    warn!(%session_id, "agent composer retained delivered text; retrying submission once");
+    pool.retry_delivery(session_id, message).await?;
+    if confirm_delivery(pool, composer_has_text, session_id).await? {
+        Ok(TerminalDeliveryOutcome::Confirmed)
+    } else {
+        warn!(%session_id, "agent composer retained delivered text after submission retry");
+        Ok(TerminalDeliveryOutcome::Unconfirmed)
+    }
+}
+
 #[async_trait]
 impl TerminalRuntime for TerminalControllerRuntime {
     async fn ensure_session(
@@ -3110,11 +3163,22 @@ impl TerminalRuntime for TerminalControllerRuntime {
             pool.kill_session(name).await?;
         }
         pool.ensure_session(name, &command, &cwd, &env, &pool_tags).await?;
-        let delivered_message_id = initial_message.as_ref().map(|message| message.id.clone());
+        let mut delivered_message_id = None;
+        let mut delivery_unconfirmed_message_id = None;
         if let Some(message) = initial_message {
-            if let Err(err) = pool.deliver(name, &message.text, true).await {
-                let _ = pool.kill_session(name).await;
-                return Err(format!("deliver initial crew message: {err}"));
+            let TerminalSessionSource::Agent { selector, .. } = &spec.source else { unreachable!("initial messages belong to agents") };
+            let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
+            let adapter = registry
+                .agent_adapters
+                .get(&requirement.adapter)
+                .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
+            match deliver_and_confirm(&*pool, &|screen| adapter.composer_has_text(screen), name, &message.text).await {
+                Ok(TerminalDeliveryOutcome::Confirmed) => delivered_message_id = Some(message.id),
+                Ok(TerminalDeliveryOutcome::Unconfirmed) => delivery_unconfirmed_message_id = Some(message.id),
+                Err(err) => {
+                    let _ = pool.kill_session(name).await;
+                    return Err(format!("deliver initial crew message: {err}"));
+                }
             }
         }
         Ok(TerminalRuntimeState::builder()
@@ -3124,6 +3188,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .maybe_crew(crew)
             .launch_command(command)
             .maybe_delivered_message_id(delivered_message_id)
+            .maybe_delivery_unconfirmed_message_id(delivery_unconfirmed_message_id)
             .build())
     }
 
@@ -3192,8 +3257,23 @@ impl TerminalRuntime for TerminalControllerRuntime {
         }))
     }
 
-    async fn deliver_message(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec, message: &str) -> Result<(), String> {
-        self.pool_for_spec(spec)?.deliver(session_id, message, true).await
+    async fn deliver_message(
+        &self,
+        session_id: &str,
+        spec: &flotilla_resources::TerminalSessionSpec,
+        message: &str,
+    ) -> Result<TerminalDeliveryOutcome, String> {
+        let TerminalSessionSource::Agent { selector, .. } = &spec.source else {
+            return Err("crew message delivery requires an agent terminal".to_string());
+        };
+        let registry = self.registry_for_env(&spec.env_ref)?;
+        let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
+        let adapter = registry
+            .agent_adapters
+            .get(&requirement.adapter)
+            .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
+        let pool = self.pool_for_spec(spec)?;
+        deliver_and_confirm(&*pool, &|screen| adapter.composer_has_text(screen), session_id, message).await
     }
 
     async fn kill_session(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
@@ -7396,6 +7476,82 @@ mod tests {
         available: AtomicBool,
     }
 
+    #[derive(Default)]
+    struct StuckComposerPool {
+        deliveries: AtomicUsize,
+        retries: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TerminalPool for StuckComposerPool {
+        fn tracks_session_liveness(&self) -> bool {
+            true
+        }
+
+        async fn list_sessions(&self) -> Result<Vec<ProviderTerminalSession>, String> {
+            Ok(vec![ProviderTerminalSession {
+                session_name: "agent".to_string(),
+                status: TerminalStatus::Running,
+                command: Some("claude".to_string()),
+                working_directory: Some(ExecutionEnvironmentPath::new("/workspace")),
+                screen_activity: Some(ScreenActivity::Stable),
+            }])
+        }
+
+        async fn ensure_session(
+            &self,
+            _session_name: &str,
+            _command: &str,
+            _cwd: &ExecutionEnvironmentPath,
+            _env_vars: &TerminalEnvVars,
+            _tags: &[TerminalSessionTag],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn attach_args(
+            &self,
+            _session_name: &str,
+            _command: &str,
+            _cwd: &ExecutionEnvironmentPath,
+            _env_vars: &TerminalEnvVars,
+        ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn capture_screen(&self, _session_name: &str) -> Result<Option<String>, String> {
+            Ok(Some("❯ stuck handoff".to_string()))
+        }
+
+        async fn deliver(&self, _session_name: &str, _text: &str, submit: bool) -> Result<(), String> {
+            assert!(submit);
+            self.deliveries.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn retry_delivery(&self, _session_name: &str, _text: &str) -> Result<(), String> {
+            self.retries.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_confirmation_retries_once_then_returns_unconfirmed() {
+        let pool = StuckComposerPool::default();
+
+        let outcome = deliver_and_confirm(&pool, &|screen| Some(screen.contains("stuck handoff")), "agent", "stuck handoff")
+            .await
+            .expect("delivery outcome");
+
+        assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed);
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.retries.load(Ordering::SeqCst), 1);
+    }
+
     impl TransientTerminalPool {
         fn new() -> Self {
             Self { inner: FakeTerminalPool::new(), available: AtomicBool::new(true) }
@@ -7572,6 +7728,7 @@ mod tests {
             crew: None,
             launch_command: "cargo test".to_string(),
             delivered_message_id: None,
+            delivery_unconfirmed_message_id: None,
         }
         .apply(&mut running);
         sessions.update_status(session_name, &session.metadata.resource_version, &running).await.expect("mark terminal running");

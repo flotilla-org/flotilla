@@ -76,6 +76,7 @@ define_patch_kinds! {
     TerminalMarkStarting => NEW_ATTEMPT,
     TerminalMarkRunning => DUPLICATE,
     TerminalMarkMessageDelivered => NONE,
+    TerminalMarkDeliveryUnconfirmed => NONE,
     TerminalObserveAttention => NONE,
     TerminalMarkCompletionPending => NONE,
     TerminalClearCompletionPending => NONE,
@@ -128,6 +129,7 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
         TerminalSessionStatusPatch::MarkStarting => PatchKind::TerminalMarkStarting,
         TerminalSessionStatusPatch::MarkRunning { .. } => PatchKind::TerminalMarkRunning,
         TerminalSessionStatusPatch::MarkMessageDelivered { .. } => PatchKind::TerminalMarkMessageDelivered,
+        TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { .. } => PatchKind::TerminalMarkDeliveryUnconfirmed,
         TerminalSessionStatusPatch::MarkStopped { .. } => PatchKind::TerminalMarkStopped,
         TerminalSessionStatusPatch::MarkFailed { .. } => PatchKind::TerminalMarkFailed,
         TerminalSessionStatusPatch::MarkReconcileDegraded { .. } => PatchKind::TerminalMarkReconcileDegraded,
@@ -591,6 +593,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     crew: None,
                     launch_command: "bash".to_string(),
                     delivered_message_id: None,
+                    delivery_unconfirmed_message_id: None,
                 };
                 apply_and_replay(&mut status, &patch);
                 let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
@@ -878,6 +881,7 @@ fn new_attempt_transitions_replace_attempt_timestamps() {
                     crew: None,
                     launch_command: "bash".to_string(),
                     delivered_message_id: None,
+                    delivery_unconfirmed_message_id: None,
                 };
                 apply_and_replay(&mut status, &patch);
                 let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };

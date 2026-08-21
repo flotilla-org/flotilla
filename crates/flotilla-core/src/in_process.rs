@@ -747,6 +747,9 @@ fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
 
 fn crew_attention(status: Option<&TerminalSessionStatus>, work_unsettled: bool, now: DateTime<Utc>) -> Option<CrewAttention> {
     let status = status.filter(|status| status.phase == ResourceTerminalSessionPhase::Running)?;
+    if status.degraded.as_ref().is_some_and(|condition| condition.reason == "DeliveryUnconfirmed") {
+        return Some(CrewAttention::DeliveryUnconfirmed);
+    }
     let attention = status.attention.as_ref()?;
     if attention.is_stale_at(now) {
         return Some(CrewAttention::Unobservable);

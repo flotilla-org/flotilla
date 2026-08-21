@@ -9,7 +9,9 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_controllers::reconcilers::{TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
+use flotilla_controllers::reconcilers::{
+    TerminalDeliveryOutcome, TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler,
+};
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
     test_support::{
@@ -241,6 +243,7 @@ async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
         crew: None,
         launch_command: "cargo test".to_string(),
         delivered_message_id: None,
+        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut running);
     sessions.update_status(&created.metadata.name, &created.metadata.resource_version, &running).await.expect("terminal should be running");
@@ -359,6 +362,7 @@ async fn foreign_actuator_runtime_failure_is_skipped_and_convoy_stays_active() {
         crew: None,
         launch_command: "cargo test".to_string(),
         delivered_message_id: None,
+        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut running);
     sessions.update_status(&created.metadata.name, &created.metadata.resource_version, &running).await.expect("terminal should be running");
@@ -491,6 +495,7 @@ impl TerminalRuntime for GhostRecoveryRuntime {
             crew: None,
             launch_command: "codex".to_string(),
             delivered_message_id: None,
+            delivery_unconfirmed_message_id: None,
         })
     }
 
@@ -621,6 +626,7 @@ async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
         crew: None,
         launch_command: "codex".to_string(),
         delivered_message_id: None,
+        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     let session = sessions
@@ -740,6 +746,7 @@ impl TerminalRuntime for TagRecordingRuntime {
             crew: None,
             launch_command: "tail -f log".into(),
             delivered_message_id: None,
+            delivery_unconfirmed_message_id: None,
         })
     }
 
@@ -785,6 +792,7 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
         crew: None,
         launch_command: "codex".into(),
         delivered_message_id: None,
+        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
@@ -866,6 +874,7 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
         crew: None,
         launch_command: "claude".into(),
         delivered_message_id: Some("message-old".into()),
+        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     flotilla_resources::TerminalSessionStatusPatch::MarkReconcileDegraded {
@@ -900,6 +909,67 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
 }
 
 #[tokio::test]
+async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(&meta("term-a"), &TerminalSessionSpec {
+            env_ref: "env-a".to_string(),
+            role: "reviewer".to_string(),
+            source: flotilla_resources::TerminalSessionSource::Agent {
+                selector: flotilla_resources::Selector::for_capability("review"),
+                brief: flotilla_resources::TerminalBrief {
+                    path: ".flotilla/briefs/reviewer.md".into(),
+                    content: "brief".into(),
+                    copies: Vec::new(),
+                },
+                context: Box::new(flotilla_resources::TerminalCrewContext {
+                    namespace: "flotilla".into(),
+                    convoy: "demo".into(),
+                    vessel_ref: "demo-review".into(),
+                }),
+                message: Some(flotilla_resources::TerminalCrewMessage {
+                    id: "message-new".into(),
+                    text: "Review the amended commit".into(),
+                }),
+            },
+            cwd: "/workspace".to_string(),
+            pool: "cleat".to_string(),
+        })
+        .await
+        .expect("session");
+    let mut status = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "cleat-session".into(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "claude".into(),
+        delivered_message_id: None,
+        delivery_unconfirmed_message_id: None,
+    }
+    .apply(&mut status);
+    let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
+    let runtime = Arc::new(DeliveringTerminalRuntime { delivered: Mutex::default(), unconfirmed: true });
+    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+
+    let prepared = reconciler.prepare(&session).await.expect("attempt delivery");
+    let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
+    let mut flagged_status = session.status.clone().expect("status");
+    outcome.patch.expect("delivery condition patch").apply(&mut flagged_status);
+    assert_eq!(flagged_status.degraded.as_ref().map(|condition| condition.reason.as_str()), Some("DeliveryUnconfirmed"));
+    assert_eq!(flagged_status.degraded.as_ref().and_then(|condition| condition.message_id.as_deref()), Some("message-new"));
+    let flagged = sessions.update_status("term-a", &session.metadata.resource_version, &flagged_status).await.expect("flag session");
+
+    let prepared = reconciler.prepare(&flagged).await.expect("observe flag");
+    assert!(matches!(prepared, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::None));
+    assert!(reconciler.reconcile(&flagged, &prepared, Utc::now()).patch.is_none());
+    assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), 1);
+}
+
+#[tokio::test]
 async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_still_true() {
     let backend = ResourceBackend::InMemory(Default::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
@@ -921,6 +991,7 @@ async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_s
         crew: None,
         launch_command: "cargo test".into(),
         delivered_message_id: None,
+        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
@@ -984,6 +1055,7 @@ async fn terminal_finalizer_cleans_agent_artifacts() {
         crew: None,
         launch_command: "codex".into(),
         delivered_message_id: None,
+        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
@@ -999,6 +1071,7 @@ async fn terminal_finalizer_cleans_agent_artifacts() {
 #[derive(Default)]
 struct DeliveringTerminalRuntime {
     delivered: Mutex<Vec<(String, String)>>,
+    unconfirmed: bool,
 }
 
 #[derive(Default)]
@@ -1042,9 +1115,14 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
         panic!("running sessions should not be ensured")
     }
 
-    async fn deliver_message(&self, session_id: &str, _spec: &TerminalSessionSpec, message: &str) -> Result<(), String> {
+    async fn deliver_message(
+        &self,
+        session_id: &str,
+        _spec: &TerminalSessionSpec,
+        message: &str,
+    ) -> Result<TerminalDeliveryOutcome, String> {
         self.delivered.lock().expect("delivered mutex").push((session_id.to_string(), message.to_string()));
-        Ok(())
+        Ok(if self.unconfirmed { TerminalDeliveryOutcome::Unconfirmed } else { TerminalDeliveryOutcome::Confirmed })
     }
 
     async fn observe_attention(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {
@@ -1086,6 +1164,7 @@ async fn stale_hook_attention_decays_to_unobservable_without_changing_phase() {
         crew: None,
         launch_command: "cargo test".into(),
         delivered_message_id: None,
+        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     status.attention = Some(TerminalAttention {

@@ -72,6 +72,7 @@ pub enum CrewAttention {
     Working,
     NeedsInput,
     Stalled,
+    DeliveryUnconfirmed,
     Idle,
     Unobservable,
 }
@@ -82,6 +83,7 @@ impl std::fmt::Display for CrewAttention {
             Self::Working => "working",
             Self::NeedsInput => "needs input",
             Self::Stalled => "stalled",
+            Self::DeliveryUnconfirmed => "delivery unconfirmed",
             Self::Idle => "idle",
             Self::Unobservable => "unobservable",
         })

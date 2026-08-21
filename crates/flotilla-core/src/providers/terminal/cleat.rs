@@ -192,6 +192,11 @@ impl TerminalPool for CleatTerminalPool {
         run!(self.runner, &self.binary, &args, Path::new("/"))?;
         Ok(())
     }
+
+    async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
+        run!(self.runner, &self.binary, &["send-keys", session_name, "C-u"], Path::new("/"))?;
+        self.deliver(session_name, text, true).await
+    }
 }
 
 #[cfg(test)]
@@ -504,5 +509,17 @@ mod tests {
         let term_pos = cmd_val.find("TERM=").expect("should contain TERM");
         let foo_pos = cmd_val.find("FOO=").expect("should contain FOO");
         assert!(term_pos < foo_pos, "terminal defaults should appear before caller env vars: {cmd_val}");
+    }
+
+    #[tokio::test]
+    async fn retry_delivery_clears_a_stuck_composer_before_resubmitting() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok(String::new())]));
+        let pool = CleatTerminalPool::new(runner.clone(), "cleat");
+
+        pool.retry_delivery("reviewer-session", "Please review commit abc123").await.expect("retry delivery");
+
+        let calls = runner.calls();
+        assert_eq!(calls[0].1, vec!["send-keys", "reviewer-session", "C-u"]);
+        assert_eq!(calls[1].1, vec!["send", "reviewer-session", "Please review commit abc123", "--submit"]);
     }
 }

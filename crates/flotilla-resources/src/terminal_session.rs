@@ -204,6 +204,8 @@ pub struct CrewCompletionPending {
 pub struct TerminalSessionDegradedCondition {
     pub reason: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     pub consecutive_failures: u32,
     pub observed_at: DateTime<Utc>,
 }
@@ -300,9 +302,14 @@ pub enum TerminalSessionStatusPatch {
         crew: Option<CrewSessionStatus>,
         launch_command: String,
         delivered_message_id: Option<String>,
+        delivery_unconfirmed_message_id: Option<String>,
     },
     MarkMessageDelivered {
         message_id: String,
+    },
+    MarkDeliveryUnconfirmed {
+        message_id: String,
+        observed_at: DateTime<Utc>,
     },
     MarkStopped {
         stopped_at: DateTime<Utc>,
@@ -340,7 +347,15 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 let completion_pending = status.completion_pending.take();
                 *status = TerminalSessionStatus { completion_pending, ..Default::default() };
             }
-            Self::MarkRunning { session_id, pid, started_at, crew, launch_command, delivered_message_id } => {
+            Self::MarkRunning {
+                session_id,
+                pid,
+                started_at,
+                crew,
+                launch_command,
+                delivered_message_id,
+                delivery_unconfirmed_message_id,
+            } => {
                 status.phase = TerminalSessionPhase::Running;
                 status.session_id = Some(session_id.clone());
                 status.pid = *pid;
@@ -350,12 +365,32 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.crew = crew.clone();
                 status.launch_command = Some(launch_command.clone());
                 status.delivered_message_id = delivered_message_id.clone();
-                status.degraded = None;
+                if delivery_unconfirmed_message_id.is_some() {
+                    status.message = Some("agent composer still contained the delivered text after submit and one retry".to_string());
+                }
+                status.degraded = delivery_unconfirmed_message_id.as_ref().map(|message_id| TerminalSessionDegradedCondition {
+                    reason: "DeliveryUnconfirmed".to_string(),
+                    message: "agent composer still contained the delivered text after submit and one retry".to_string(),
+                    message_id: Some(message_id.clone()),
+                    consecutive_failures: 1,
+                    observed_at: *started_at,
+                });
             }
             Self::MarkMessageDelivered { message_id } => {
                 status.delivered_message_id = Some(message_id.clone());
                 status.message = None;
                 status.degraded = None;
+            }
+            Self::MarkDeliveryUnconfirmed { message_id, observed_at } => {
+                let message = "agent composer still contained the delivered text after submit and one retry".to_string();
+                status.message = Some(message.clone());
+                status.degraded = Some(TerminalSessionDegradedCondition {
+                    reason: "DeliveryUnconfirmed".to_string(),
+                    message,
+                    message_id: Some(message_id.clone()),
+                    consecutive_failures: 1,
+                    observed_at: *observed_at,
+                });
             }
             Self::MarkStopped { stopped_at, inner_command_status, inner_exit_code, message } => {
                 status.phase = TerminalSessionPhase::Stopped;
@@ -388,6 +423,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.degraded = Some(TerminalSessionDegradedCondition {
                     reason: "ReconcileBackoff".to_string(),
                     message: message.clone(),
+                    message_id: None,
                     consecutive_failures: *consecutive_failures,
                     observed_at: *observed_at,
                 });

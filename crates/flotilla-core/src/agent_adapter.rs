@@ -482,6 +482,12 @@ pub trait AgentAdapter: Send + Sync {
     fn classify_screen_attention(&self, _screen: &str) -> Option<TerminalAttentionState> {
         None
     }
+    /// Whether a captured agent screen still has text in its composer after a
+    /// machinery delivery. `None` means this adapter cannot classify the
+    /// screen; callers must not turn an unobservable composer into a failure.
+    fn composer_has_text(&self, _screen: &str) -> Option<bool> {
+        None
+    }
     fn launch(&self, request: &AgentLaunchRequest) -> Result<AgentLaunchPlan, String>;
 }
 
@@ -635,6 +641,16 @@ impl AgentAdapter for CliAgentAdapter {
             AdapterFlavor::ClaudeCode { .. } => None,
             AdapterFlavor::Codex { .. } => codex_screen_needs_input(screen).then_some(TerminalAttentionState::NeedsInput),
         }
+    }
+
+    fn composer_has_text(&self, screen: &str) -> Option<bool> {
+        let (marker, placeholders): (char, &[&str]) = match &self.flavor {
+            AdapterFlavor::ClaudeCode { .. } => ('❯', &["Try \""]),
+            AdapterFlavor::Codex { .. } => ('›', &["Implement {feature}"]),
+        };
+        let composer =
+            screen.lines().rev().find_map(|line| line.trim_start().strip_prefix(marker))?.trim_start_matches([' ', '\u{a0}']).trim();
+        Some(!composer.is_empty() && !placeholders.iter().any(|placeholder| composer.starts_with(placeholder)))
     }
 
     fn launch(&self, request: &AgentLaunchRequest) -> Result<AgentLaunchPlan, String> {
@@ -1546,6 +1562,18 @@ mod tests {
         assert_eq!(claude.classify_screen_attention("Do you trust the contents of this directory?"), None);
     }
 
+    #[test]
+    fn claude_delivery_confirmation_distinguishes_a_loaded_composer_from_an_empty_one() {
+        let registry = discovered_registry();
+        let claude = registry.get("claude-code").expect("claude adapter");
+        // Captured from a recorded cleat session against Claude Code v2.1.238.
+        let loaded = "❯\u{a0}Reply with exactly CLAUDE_DELIVERY_OK.\n────\n  ⏵⏵ bypass permissions on";
+        let submitted = "❯ Reply with exactly CLAUDE_DELIVERY_OK.\n\n⏺ CLAUDE_DELIVERY_OK\n────\n❯\u{a0}\n────";
+
+        assert_eq!(claude.composer_has_text(loaded), Some(true));
+        assert_eq!(claude.composer_has_text(submitted), Some(false));
+    }
+
     #[tokio::test]
     async fn codex_prepare_preserves_config_while_trusting_the_canonical_workspace() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1601,6 +1629,19 @@ mod tests {
         let screen = "• Working (57s • esc to interrupt)\n\n› Run /review on my current changes\n\ngpt-5.6-sol high · /workspace";
 
         assert_eq!(codex.classify_screen_attention(screen), None);
+    }
+
+    #[test]
+    fn codex_delivery_confirmation_distinguishes_a_loaded_composer_from_its_placeholder() {
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+        // Captured from a recorded cleat session against Codex v0.147.0.
+        let loaded = "› Reply with exactly CODEX_DELIVERY_OK.\n\n  gpt-5.6-sol medium · /workspace";
+        let submitted =
+            "› Reply with exactly CODEX_DELIVERY_OK.\n\n• CODEX_DELIVERY_OK\n\n› Implement {feature}\n\n  gpt-5.6-sol medium · /workspace";
+
+        assert_eq!(codex.composer_has_text(loaded), Some(true));
+        assert_eq!(codex.composer_has_text(submitted), Some(false));
     }
 
     #[tokio::test]

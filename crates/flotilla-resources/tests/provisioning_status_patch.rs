@@ -182,6 +182,7 @@ fn terminal_session_status_patch_marks_running_and_stopped() {
         crew: None,
         launch_command: "bash".to_string(),
         delivered_message_id: None,
+        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     TerminalSessionStatusPatch::MarkRunning {
@@ -191,6 +192,7 @@ fn terminal_session_status_patch_marks_running_and_stopped() {
         crew: None,
         launch_command: "bash".to_string(),
         delivered_message_id: None,
+        delivery_unconfirmed_message_id: None,
     }
     .apply(&mut status);
     assert_eq!(status.phase, TerminalSessionPhase::Running);

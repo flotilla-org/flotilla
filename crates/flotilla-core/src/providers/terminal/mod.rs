@@ -160,4 +160,10 @@ pub trait TerminalPool: Send + Sync {
     async fn deliver(&self, _session_name: &str, _text: &str, _submit: bool) -> Result<(), String> {
         Err("terminal pool does not support delivery".to_string())
     }
+
+    /// Retry a delivery whose text is still present in a TUI composer. Pools
+    /// with keyboard-level control should clear that text before resubmitting.
+    async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
+        self.deliver(session_name, text, true).await
+    }
 }

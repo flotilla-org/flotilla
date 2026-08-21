@@ -763,6 +763,16 @@ fn crew_attention_keeps_monitoring_distinct_from_lifecycle_state() {
     assert_eq!(crew_attention(Some(&status), true, now), Some(CrewAttention::Stalled));
     assert_eq!(crew_attention(Some(&status), false, now), Some(CrewAttention::Idle));
 
+    status.degraded = Some(flotilla_resources::TerminalSessionDegradedCondition {
+        reason: "DeliveryUnconfirmed".to_string(),
+        message: "composer retained delivery".to_string(),
+        message_id: Some("handoff-1".to_string()),
+        consecutive_failures: 1,
+        observed_at: now,
+    });
+    assert_eq!(crew_attention(Some(&status), true, now), Some(CrewAttention::DeliveryUnconfirmed));
+    status.degraded = None;
+
     status.attention.as_mut().expect("attention").as_of = now - chrono::Duration::seconds(31);
     assert_eq!(crew_attention(Some(&status), true, now), Some(CrewAttention::Unobservable));
 
