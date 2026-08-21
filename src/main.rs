@@ -314,8 +314,17 @@ enum ResourceSubCommand {
     Get(ResourceGetArgs),
     /// Delete exactly one raw resource object, bypassing lifecycle gates
     Delete(ResourceDeleteArgs),
+    /// Remove standing multi-authored Host and PlacementPolicy records from non-home roots
+    DedupSweep(ResourceDedupSweepArgs),
     /// Watch resources of a kind
     Watch(ResourceWatchArgs),
+}
+
+#[derive(clap::Args)]
+struct ResourceDedupSweepArgs {
+    /// Resource namespace
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
 }
 
 #[derive(clap::Args, bon::Builder)]
@@ -1357,6 +1366,43 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 format,
             )
             .await
+        }
+        ResourceSubCommand::DedupSweep(args) => {
+            let daemon = connect_daemon(cli).await?;
+            let report = flotilla_client::resource::ResourceClient::new(daemon)
+                .dedup_single_home_records(&args.namespace)
+                .await
+                .map_err(color_eyre::eyre::Report::msg)?;
+            match format {
+                OutputFormat::Json => println!(
+                    "{}",
+                    flotilla_protocol::output::json_pretty(&serde_json::json!({
+                        "inspected_roots": report.inspected_roots,
+                        "duplicate_records": report.duplicate_records,
+                        "deletions": report.deletions.iter().map(|deletion| serde_json::json!({
+                            "kind": deletion.kind,
+                            "name": deletion.name,
+                            "deleted_root": deletion.deleted_root,
+                            "home_root": deletion.home_root,
+                        })).collect::<Vec<_>>(),
+                    }))
+                ),
+                OutputFormat::Human => {
+                    println!(
+                        "inspected {} roots; found {} duplicated records; deleted {} non-home copies",
+                        report.inspected_roots,
+                        report.duplicate_records,
+                        report.deletions.len()
+                    );
+                    for deletion in report.deletions {
+                        println!(
+                            "deleted {}/{} from root {} (home: {})",
+                            deletion.kind, deletion.name, deletion.deleted_root, deletion.home_root
+                        );
+                    }
+                }
+            }
+            Ok(())
         }
         ResourceSubCommand::Watch(args) => run_resource_watch(cli, args, format).await,
     }
