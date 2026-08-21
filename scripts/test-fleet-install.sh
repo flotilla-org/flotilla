@@ -595,14 +595,17 @@ test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = 
 test "$(grep -Fxc -- '--user restart flotillad.service' "$test_root/systemctl.log")" = 2 \
   || fail 'detached Linux watchdog did not restart the candidate and restored daemon'
 orphan_confirmation_log=""
-for candidate_log in "$test_root/home/.local/opt/flotilla-fleet"/.confirmation.*.log; do
-  [[ -f "$candidate_log" ]] || continue
-  orphan_confirmation_log="$candidate_log"
-  break
+for _ in {1..50}; do
+  for candidate_log in "$test_root/home/.local/opt/flotilla-fleet"/.confirmation.*.log; do
+    [[ -f "$candidate_log.done" ]] || continue
+    if grep -Fq "generation $generation_two failed health confirmation; rolled back to $generation_one" "$candidate_log"; then
+      orphan_confirmation_log="$candidate_log"
+      break 2
+    fi
+  done
+  sleep 0.1
 done
-[[ -n "$orphan_confirmation_log" ]] || fail 'detached watchdog did not retain its confirmation log'
-grep -Fq "generation $generation_two failed health confirmation; rolled back to $generation_one" "$orphan_confirmation_log" \
-  || fail 'detached watchdog log did not explain its rollback'
+[[ -n "$orphan_confirmation_log" ]] || fail 'detached watchdog did not retain a completed rollback audit log'
 
 DAEMON_RUNNING=1 STOP_FAIL=0 run_installer latest >"$test_root/latest.out"
 grep -Fq "generation $generation_two confirmed healthy" "$test_root/latest.out" \
