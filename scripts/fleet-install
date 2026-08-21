@@ -913,15 +913,15 @@ automatic_rollback() {
   [[ -n "$rollback_generation" ]] || return 1
   [[ -d "$RELEASES_DIR/$rollback_generation" ]] || return 1
   [[ -f "$RELEASES_DIR/$rollback_generation/.generation.json" ]] || return 1
-  verify_installed_release "$RELEASES_DIR/$rollback_generation" "$RELEASES_DIR/$rollback_generation/.generation.json"
+  verify_installed_release "$RELEASES_DIR/$rollback_generation" "$RELEASES_DIR/$rollback_generation/.generation.json" || return 1
   # launchd must unload the candidate before the symlink flip. systemd has no
   # equivalent race and its stable unit was already refreshed by the parent.
-  prepare_darwin_daemon_service
-  atomic_link "releases/$rollback_generation" "$CURRENT_LINK"
-  atomic_link "releases/$failed_generation" "$PREVIOUS_LINK"
-  restart_linux_daemon_service
-  restart_darwin_daemon_service
-  wait_for_daemon_generation "$rollback_generation"
+  prepare_darwin_daemon_service || return 1
+  atomic_link "releases/$rollback_generation" "$CURRENT_LINK" || return 1
+  atomic_link "releases/$failed_generation" "$PREVIOUS_LINK" || return 1
+  restart_linux_daemon_service || return 1
+  restart_darwin_daemon_service || return 1
+  wait_for_daemon_generation "$rollback_generation" || return 1
 }
 
 confirmation_watchdog() {
