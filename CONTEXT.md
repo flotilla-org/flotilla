@@ -231,6 +231,18 @@ completers proposing fuller specs; admission remains the backstop.
 _Avoid_: Defaulting webhook, enrichment, the governor's job, the crew's
 turn-ending report (that is a **Settlement Claim**, ADR 0017).
 
+**Decision Ledger**:
+The claims-plane disclosure a crew reports at **Settlement Claim** time:
+every decision made where the **Brief** was silent, ranked least-confident
+first — what was chosen, the alternative, and what the crew would have
+asked if asking were free. Review material pre-merge (wrong decisions get
+revised); triaged by the governor at settlement, each entry dispositioned
+*fine* / *revised* / *graduated* into an ADR, a glossary entry, an issue,
+or a brief-template fix. Lives on the change request, never as files in
+the repo. (ADR 0034.)
+_Avoid_: Audit (that is the future independent completeness check),
+decision log (too close to ADR), changelog.
+
 **Independent**:
 A terminal session with no **Convoy** association — sailing alone, per the
 convoy-era term. Adopted attachables, persistent agents, loose work sessions.
