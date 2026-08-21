@@ -108,14 +108,20 @@ collision condition will remain active.
 
 The command inventories each root's local authored rows, keeps the copy on the
 host named by the Host or placement policy, and uses the raw resource-delete
-path for every non-home copy. It refuses before deleting a record if the copies
-disagree about their home or the home has no authored copy. The report names
-each deletion. A successful second run reports zero duplicates and zero
-deletions.
+path for every non-home copy. It does not delete a record if the copies cannot
+establish exactly one home with an authored copy. That record is skipped,
+the report marks it as `needs manual resolution` with the reason, and the sweep
+continues deleting other records it can resolve. The report also names each
+deletion. A second run reports any manually unresolved duplicates again while
+performing no additional deletions for records already converged.
 
 The automated sweep covers Host records and host-scoped PlacementPolicies:
 `host_direct` and `docker_per_vessel`, including snapshots of those policies.
 A duplicated policy with neither strategy has no natural home the tool can
-prove from the record. The sweep refuses the complete plan before deleting
-anything; resolve that policy explicitly with `resource delete --host` on the
-non-home roots, then rerun the sweep.
+prove from the record. The sweep reports that policy for manual resolution and
+continues; resolve it explicitly with `resource delete --host` on the non-home
+roots, then rerun the sweep.
+
+Convoy husks mentioned by ADR 0033 are intentionally outside this migration
+sweep's scope. This command only deduplicates Host and PlacementPolicy records;
+resolve any standing multi-authored Convoy husks separately.

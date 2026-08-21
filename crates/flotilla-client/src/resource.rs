@@ -57,10 +57,18 @@ pub struct DedupSweepDeletion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DedupSweepSkipped {
+    pub kind: String,
+    pub name: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DedupSweepReport {
     pub inspected_roots: usize,
     pub duplicate_records: usize,
     pub deletions: Vec<DedupSweepDeletion>,
+    pub skipped: Vec<DedupSweepSkipped>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,8 +129,8 @@ impl ResourceClient {
 
     /// Remove standing multi-authored Host and PlacementPolicy records from all
     /// non-home roots. This is deliberately an inventory-then-delete operation:
-    /// no mutation occurs unless every duplicate agrees on one natural home and
-    /// that home actually holds an authored copy.
+    /// each duplicate is only mutated if all its copies agree on one natural
+    /// home and that home actually holds an authored copy.
     pub async fn dedup_single_home_records(&self, namespace: &str) -> Result<DedupSweepReport, String> {
         let roots = self.sweep_roots().await?;
         let mut records = BTreeMap::<(String, String), Vec<AuthoredRecord>>::new();
@@ -160,7 +168,7 @@ impl ResourceClient {
             }
         }
 
-        let (duplicate_records, planned_deletions) = plan_dedup_deletions(records)?;
+        let (duplicate_records, planned_deletions, mut skipped) = plan_dedup_deletions(records);
 
         let mut deletions = Vec::new();
         for (source, home) in planned_deletions {
@@ -175,7 +183,8 @@ impl ResourceClient {
             }
         }
         deletions.sort_by(|a, b| (&a.kind, &a.name, &a.deleted_root).cmp(&(&b.kind, &b.name, &b.deleted_root)));
-        Ok(DedupSweepReport { inspected_roots: roots.len(), duplicate_records, deletions })
+        skipped.sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
+        Ok(DedupSweepReport { inspected_roots: roots.len(), duplicate_records, deletions, skipped })
     }
 
     async fn sweep_roots(&self) -> Result<Vec<SweepRoot>, String> {
@@ -260,35 +269,53 @@ impl ResourceClient {
 
 fn plan_dedup_deletions(
     records: BTreeMap<(String, String), Vec<AuthoredRecord>>,
-) -> Result<(usize, Vec<(AuthoredRecord, String)>), String> {
+) -> (usize, Vec<(AuthoredRecord, String)>, Vec<DedupSweepSkipped>) {
     let mut duplicate_records = 0;
     let mut planned_deletions = Vec::new();
+    let mut skipped = Vec::new();
     for ((kind, name), sources) in records {
         if sources.len() < 2 {
             continue;
         }
         duplicate_records += 1;
-        if sources.iter().any(|source| source.natural_home.is_none()) {
-            return Err(format!(
-                "refusing to sweep {kind}/{name}: at least one authored copy has no host-scoped natural home; resolve it with a raw resource delete on its root before rerunning the sweep"
-            ));
-        }
         let homes = sources.iter().filter_map(|source| source.natural_home.as_deref()).collect::<BTreeSet<_>>();
-        if homes.len() != 1 {
-            return Err(format!(
-                "refusing to sweep {kind}/{name}: authored copies do not agree on exactly one natural home ({})",
-                homes.into_iter().collect::<Vec<_>>().join(", ")
-            ));
+        if homes.is_empty() {
+            skipped.push(DedupSweepSkipped {
+                kind,
+                name,
+                reason: "no natural home: no authored copy names a host-scoped placement strategy".to_string(),
+            });
+            continue;
+        }
+        if sources.iter().any(|source| source.natural_home.is_none()) {
+            skipped.push(DedupSweepSkipped {
+                kind,
+                name,
+                reason: format!(
+                    "homes disagree: some authored copies name {}, while others have no natural home",
+                    homes.iter().copied().collect::<Vec<_>>().join(", ")
+                ),
+            });
+            continue;
+        }
+        if homes.len() > 1 {
+            skipped.push(DedupSweepSkipped {
+                kind,
+                name,
+                reason: format!("homes disagree: authored copies name {}", homes.iter().copied().collect::<Vec<_>>().join(", ")),
+            });
+            continue;
         }
         let home = homes.into_iter().next().expect("one natural home").to_string();
         if !sources.iter().any(|source| source.root.host_id == home) {
-            return Err(format!("refusing to sweep {kind}/{name}: natural home {home} has no authored copy"));
+            skipped.push(DedupSweepSkipped { kind, name, reason: format!("natural home {home} has no authored copy") });
+            continue;
         }
         for source in sources.into_iter().filter(|source| source.root.host_id != home) {
             planned_deletions.push((source, home.clone()));
         }
     }
-    Ok((duplicate_records, planned_deletions))
+    (duplicate_records, planned_deletions, skipped)
 }
 
 fn sweep_roots_from_hosts(hosts: &[HostListEntry]) -> Result<Vec<SweepRoot>, String> {
@@ -481,6 +508,10 @@ mod tests {
                 "metadata": {"name": "placement-snapshot-012345abcdef"},
                 "spec": {"pool": "cleat", "docker_per_vessel": {"host_ref": "host-b", "image": "crew:latest"}}
             }));
+            policies.push(serde_json::json!({
+                "metadata": {"name": "pool-only"},
+                "spec": {"pool": "cleat", "host_direct": null, "docker_per_vessel": null}
+            }));
             fixture.insert((format!("root-{root}"), "placementpolicies".to_string()), policies);
         }
         fixture
@@ -497,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_plan_refuses_disagreeing_homes_before_returning_deletions() {
+    fn dedup_plan_skips_disagreeing_homes_and_keeps_resolvable_deletions() {
         let records = BTreeMap::from([
             (("hosts".to_string(), "host-a".to_string()), vec![
                 AuthoredRecord {
@@ -521,37 +552,73 @@ mod tests {
             ]),
         ]);
 
-        let error = plan_dedup_deletions(records).expect_err("disagreement must abort the complete plan");
-        assert!(error.contains("do not agree on exactly one natural home"));
+        let (duplicate_records, deletions, skipped) = plan_dedup_deletions(records);
+        assert_eq!(duplicate_records, 2);
+        assert_eq!(deletions.len(), 1);
+        assert_eq!(deletions[0].0.name, "host-a");
+        assert_eq!(skipped, vec![DedupSweepSkipped {
+            kind: "placementpolicies".to_string(),
+            name: "shared".to_string(),
+            reason: "homes disagree: authored copies name host-a, host-b".to_string(),
+        }]);
     }
 
     #[test]
-    fn dedup_plan_refuses_when_the_natural_home_has_no_authored_copy() {
+    fn dedup_plan_skips_when_the_natural_home_has_no_authored_copy() {
         let records = BTreeMap::from([(("placementpolicies".to_string(), "shared".to_string()), vec![
             authored_policy("host-a", "shared", "host-c"),
             authored_policy("host-b", "shared", "host-c"),
         ])]);
 
-        let error = plan_dedup_deletions(records).expect_err("missing home copy must abort the plan");
-        assert!(error.contains("natural home host-c has no authored copy"));
+        let (duplicate_records, deletions, skipped) = plan_dedup_deletions(records);
+        assert_eq!(duplicate_records, 1);
+        assert!(deletions.is_empty());
+        assert_eq!(skipped[0].reason, "natural home host-c has no authored copy");
     }
 
     #[test]
-    fn dedup_plan_refuses_an_unscoped_policy_before_returning_deletions() {
-        let records = BTreeMap::from([(("placementpolicies".to_string(), "shared".to_string()), vec![
-            authored_policy("host-a", "shared", "host-a"),
-            AuthoredRecord {
-                root: SweepRoot { host_id: "host-b".to_string(), node_id: NodeId::new("node-host-b") },
-                namespace: "flotilla".to_string(),
-                kind: "placementpolicies".to_string(),
-                name: "shared".to_string(),
-                natural_home: None,
-            },
-        ])]);
+    fn dedup_plan_skips_pool_only_duplicate_without_blocking_resolvable_deletions() {
+        let pool_only_policy = serde_json::json!({
+            "metadata": {"name": "pool-only"},
+            "spec": {"pool": "cleat", "host_direct": null, "docker_per_vessel": null}
+        });
+        assert_eq!(natural_home("placementpolicies", &pool_only_policy), None);
+        let pool_only_copy = |root: &str| AuthoredRecord {
+            root: SweepRoot { host_id: root.to_string(), node_id: NodeId::new(format!("node-{root}")) },
+            namespace: "flotilla".to_string(),
+            kind: "placementpolicies".to_string(),
+            name: "pool-only".to_string(),
+            natural_home: natural_home("placementpolicies", &pool_only_policy),
+        };
+        let records = BTreeMap::from([
+            (("hosts".to_string(), "host-a".to_string()), vec![
+                AuthoredRecord {
+                    root: SweepRoot { host_id: "host-a".to_string(), node_id: NodeId::new("node-a") },
+                    namespace: "flotilla".to_string(),
+                    kind: "hosts".to_string(),
+                    name: "host-a".to_string(),
+                    natural_home: Some("host-a".to_string()),
+                },
+                AuthoredRecord {
+                    root: SweepRoot { host_id: "host-b".to_string(), node_id: NodeId::new("node-b") },
+                    namespace: "flotilla".to_string(),
+                    kind: "hosts".to_string(),
+                    name: "host-a".to_string(),
+                    natural_home: Some("host-a".to_string()),
+                },
+            ]),
+            (("placementpolicies".to_string(), "pool-only".to_string()), vec![pool_only_copy("host-a"), pool_only_copy("host-b")]),
+        ]);
 
-        let error = plan_dedup_deletions(records).expect_err("unscoped policy must abort the complete plan");
-        assert!(error.contains("has no host-scoped natural home"));
-        assert!(error.contains("raw resource delete"));
+        let (duplicate_records, deletions, skipped) = plan_dedup_deletions(records);
+        assert_eq!(duplicate_records, 2);
+        assert_eq!(deletions.len(), 1);
+        assert_eq!(deletions[0].0.name, "host-a");
+        assert_eq!(skipped, vec![DedupSweepSkipped {
+            kind: "placementpolicies".to_string(),
+            name: "pool-only".to_string(),
+            reason: "no natural home: no authored copy names a host-scoped placement strategy".to_string(),
+        }]);
     }
 
     #[test]
@@ -738,12 +805,18 @@ mod tests {
 
         let report = client.dedup_single_home_records("flotilla").await.expect("sweep duplicates");
         assert_eq!(report.inspected_roots, 3);
-        assert_eq!(report.duplicate_records, 7);
+        assert_eq!(report.duplicate_records, 8);
         assert_eq!(report.deletions.len(), 14);
+        assert_eq!(report.skipped, vec![DedupSweepSkipped {
+            kind: "placementpolicies".to_string(),
+            name: "pool-only".to_string(),
+            reason: "no natural home: no authored copy names a host-scoped placement strategy".to_string(),
+        }]);
 
         let second = client.dedup_single_home_records("flotilla").await.expect("repeat sweep");
-        assert_eq!(second.duplicate_records, 0);
+        assert_eq!(second.duplicate_records, 1);
         assert!(second.deletions.is_empty());
+        assert_eq!(second.skipped, report.skipped);
 
         let fixture = server.await.expect("server task");
         let mut federated_counts = BTreeMap::<(String, String), usize>::new();
@@ -753,7 +826,8 @@ mod tests {
                 *federated_counts.entry((kind.clone(), name.to_string())).or_default() += 1;
             }
         }
-        assert_eq!(federated_counts.len(), 7);
+        assert_eq!(federated_counts.len(), 8);
+        assert_eq!(federated_counts.remove(&("placementpolicies".to_string(), "pool-only".to_string())), Some(3));
         assert!(federated_counts.values().all(|count| *count == 1));
     }
 }

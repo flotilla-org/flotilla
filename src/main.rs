@@ -1385,20 +1385,30 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                             "deleted_root": deletion.deleted_root,
                             "home_root": deletion.home_root,
                         })).collect::<Vec<_>>(),
+                        "skipped": report.skipped.iter().map(|skipped| serde_json::json!({
+                            "kind": skipped.kind,
+                            "name": skipped.name,
+                            "status": "needs manual resolution",
+                            "reason": skipped.reason,
+                        })).collect::<Vec<_>>(),
                     }))
                 ),
                 OutputFormat::Human => {
                     println!(
-                        "inspected {} roots; found {} duplicated records; deleted {} non-home copies",
+                        "inspected {} roots; found {} duplicated records; deleted {} non-home copies; {} need manual resolution",
                         report.inspected_roots,
                         report.duplicate_records,
-                        report.deletions.len()
+                        report.deletions.len(),
+                        report.skipped.len()
                     );
                     for deletion in report.deletions {
                         println!(
                             "deleted {}/{} from root {} (home: {})",
                             deletion.kind, deletion.name, deletion.deleted_root, deletion.home_root
                         );
+                    }
+                    for skipped in report.skipped {
+                        println!("needs manual resolution {}/{}: {}", skipped.kind, skipped.name, skipped.reason);
                     }
                 }
             }
