@@ -145,13 +145,16 @@ fn managed_terminal_changes_are_field_scoped_and_deduplicated() {
 async fn managed_terminal_refresh_assigns_nested_cwd_to_most_specific_repo() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"pane-owner-test\"\n").expect("daemon config");
-    let outer = temp.path().join("outer");
-    let inner = outer.join("nested");
-    std::fs::create_dir_all(&inner).expect("nested repository roots");
+    let canonical_outer = temp.path().join("private").join("outer");
+    let canonical_inner = canonical_outer.join("nested");
+    let configured_outer = temp.path().join("outer-alias");
+    let configured_inner = configured_outer.join("nested");
+    std::fs::create_dir_all(&canonical_inner).expect("nested repository roots");
+    std::os::unix::fs::symlink(&canonical_outer, &configured_outer).expect("configured repository alias");
 
     let pool = Arc::new(FakeTerminalPool::new());
     let terminal_id = flotilla_protocol::AttachableId::new("pane-1");
-    let working_directory = ExecutionEnvironmentPath::new(inner.join("app"));
+    let working_directory = ExecutionEnvironmentPath::new(canonical_inner.join("app"));
     let metadata = ManagedSessionMetadata::builder()
         .set_id(flotilla_protocol::AttachableSetId::new("set-1"))
         .attachable_id(terminal_id.clone())
@@ -168,9 +171,9 @@ async fn managed_terminal_refresh_assigns_nested_cwd_to_most_specific_repo() {
         screen_activity: None,
     }])
     .await;
-    let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(pool));
+    let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(pool.clone()));
     let daemon = InProcessDaemon::new(
-        vec![outer.clone(), inner.clone()],
+        vec![configured_outer, configured_inner.clone()],
         Arc::new(ConfigStore::with_base(temp.path())),
         discovery,
         HostName::new("local-host"),
@@ -187,7 +190,7 @@ async fn managed_terminal_refresh_assigns_nested_cwd_to_most_specific_repo() {
         })
         .collect::<Vec<_>>();
     assert_eq!(deltas.len(), 1, "one pane must be attributed to one repository");
-    assert_eq!(deltas[0].repo_identity, fallback_repo_identity(&inner));
+    assert_eq!(deltas[0].repo_identity, fallback_repo_identity(&configured_inner));
     assert!(matches!(
         deltas[0].changes.as_slice(),
         [Change::ManagedTerminal { key, op: EntryOp::Added(terminal) }]

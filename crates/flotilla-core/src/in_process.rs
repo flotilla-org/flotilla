@@ -95,7 +95,7 @@ use crate::{
         MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
         SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
     },
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
+    path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath},
     project_declaration::{
         parse_project_declaration, ProjectDeclaration, BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION,
         BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE, DECLARATION_FILE_ANNOTATION,
@@ -6064,7 +6064,8 @@ impl InProcessDaemon {
                 let Some(pool) = registry.terminal_pools.preferred().cloned() else { continue };
                 let pool_key = Arc::as_ptr(&pool) as *const () as usize;
                 pools.entry(pool_key).or_insert(pool);
-                repos.push(RepoTerminals { identity: state.identity().clone(), roots: state.local_paths(), pool_key });
+                let roots = state.local_paths().into_iter().map(|root| canonical_or_original(&root)).collect();
+                repos.push(RepoTerminals { identity: state.identity().clone(), roots, pool_key });
             }
             (repos, pools)
         };
@@ -6082,13 +6083,14 @@ impl InProcessDaemon {
             let pool_repos = repos.iter().filter(|repo| repo.pool_key == pool_key).collect::<Vec<_>>();
             let mut current = pool_repos.iter().map(|repo| (repo.identity.clone(), HashMap::new())).collect::<HashMap<_, HashMap<_, _>>>();
             for terminal in &terminals {
+                let working_directory = canonical_or_original(terminal.working_directory.as_path());
                 // A nested checkout can share a path prefix with another
                 // tracked repository. Attribute the pane to the most-specific
                 // root only so one exit cannot surface on multiple checkouts.
                 let owner = pool_repos
                     .iter()
                     .flat_map(|repo| repo.roots.iter().map(move |root| (*repo, root)))
-                    .filter(|(_, root)| terminal.working_directory.as_path().starts_with(root))
+                    .filter(|(_, root)| working_directory.starts_with(root))
                     .max_by_key(|(_, root)| root.components().count())
                     .map(|(repo, _)| repo);
                 if let Some(repo) = owner {

@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use flotilla_core::{
     aggregator_projection::AggregatorProjectionState,
     in_process::InProcessDaemon,
+    path_context::canonical_or_original,
     salience::{AttentionFact, DemandFact, PaneExitFact, RegardFact, SalienceFacts},
 };
 use flotilla_protocol::{
@@ -2102,10 +2103,6 @@ fn session_key(session: &ReadResourceObject<TerminalSession>) -> SessionKey {
         ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
     };
     (session.object.metadata.namespace.clone(), session.object.metadata.name.clone(), origin)
-}
-
-fn canonical_or_original(path: &std::path::Path) -> std::path::PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn regard_as_of(regard: &ResourceObject<Regard>) -> chrono::DateTime<chrono::Utc> {
