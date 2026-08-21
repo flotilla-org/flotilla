@@ -373,7 +373,11 @@ fn evaluate_landing_settlement_with_disposition(
             disposition = Some(entry.disposition);
             break;
         }
-        table_unmet.extend(entry_unmet);
+        for expectation in entry_unmet {
+            if !table_unmet.contains(&expectation) {
+                table_unmet.push(expectation);
+            }
+        }
     }
 
     let mut unmet = if disposition.is_some() { Vec::new() } else { table_unmet };

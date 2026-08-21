@@ -1118,6 +1118,12 @@ mod tests {
         .await
         .expect("boot must rederive a ReconcilerWake row");
         assert_eq!(convoys.get("wake").await.expect("open convoy").status.expect("status").phase, ConvoyPhase::Landing);
+        let change_request = backend
+            .using::<ChangeRequest>("flotilla")
+            .get(&flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 1364))
+            .await
+            .expect("home authority must publish the demanded change request record");
+        assert_eq!(change_request.spec.observing_authority, "authority");
 
         source.merged.store(true, Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(2), async {
