@@ -4,18 +4,22 @@
 **Date:** 2026-08-21
 **Relates to:** ADR 0016 (overlay replication — this ADR amends it from
 operational evidence), ADR 0032 (convoy identity — its admission and
-actuation-locality rulings become this ADR's two homing seams), issues
-#1590–#1594, #1609 (the incident set that forced the questions).
+actuation-locality rulings become this ADR's two homing seams). Incident
+provenance: #1592 (admission blind to a peer-homed placement policy),
+#1593 (one logical `ConvoyEnsure` independently stored at all three
+roots, quarantining every daemon under one schema change), #1594 and its
+2026-08-21 escalation comment (terminal records unaddressable; a raw
+single-root delete of `Convoy/command-builder` resurrecting within hours
+via re-federation). The remaining observation — placement policies and
+snapshots listed two and three times in `resource list` — was seen
+repeatedly during the same period (2026-08-18 to -21) but has no issue of
+its own; this ADR is its record.
 
 ADR 0016 ruled the cross-root model: convergent facts union, definitions
 merge, home-bound runtime is reconciled only at home. One week of running
 the fleet through daemon restarts, a schema change, and a generation roll
-produced five incidents — records listed two and three times, a raw delete
-resurrecting within hours, admission blind to another root's placement
-policy, one logical `ConvoyEnsure` authored independently by all three
-roots, and terminal records unaddressable anywhere. None of them falsified
-0016. Every one of them was the implementation failing to hold an
-invariant 0016 assumed by construction. This ADR closes the gap: who
+produced the incidents above — none falsified 0016. Every one was the
+implementation failing to hold an invariant 0016 assumed by construction. This ADR closes the gap: who
 authors a new record, how mutations reach a record's home, what reads are
 required to see, and what enforces all of it.
 
