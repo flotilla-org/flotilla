@@ -77,11 +77,15 @@ Two implementation rules he states explicitly:
   claude-review, adversarial verification patterns); his
   "never blocks, cannot change code" rule is a crisp constraint worth
   stating in the review-workflow docs.
-- **Fog-of-war scouting is convergent evolution with wayfinder** —
-  quadrant sweeps ≈ breadth-first frontier mapping; "decision tables to
-  react to rather than asking someone to imagine" ≈ prototype tickets;
-  territories ≈ the fog/ticket distinction. Worth a comparative read of
-  `explore-unknowns` before evolving wayfinder further.
+- **Fog-of-war scouting is convergent evolution with the wayfinder skill**
+  (Matt Pocock's, in local use here) — quadrant sweeps ≈ breadth-first
+  frontier mapping; "decision tables to react to rather than asking
+  someone to imagine" ≈ prototype tickets; territories ≈ the fog/ticket
+  distinction. Two independent authors landing on the same shape is
+  evidence the shape is right. Since the local skill set is adjustable,
+  `explore-unknowns` is worth a comparative read for pieces to
+  incorporate — or to adopt alongside — rather than treating either as
+  fixed.
 - **Seams-and-sensors** restates the repo's own testing philosophy
   (behavior contracts over implementation reads) at codebase scale, and
   is the same instinct as the drydock extraction: pieces with interfaces
