@@ -18,7 +18,9 @@ readonly LAUNCH_LOG_DIR="$HOME/Library/Logs/flotilla"
 readonly RELEASES_DIR="$FLEET_ROOT/releases"
 readonly CURRENT_LINK="$FLEET_ROOT/current"
 readonly PREVIOUS_LINK="$FLEET_ROOT/previous"
+readonly PENDING_CONFIRMATION="$FLEET_ROOT/.pending-confirmation"
 readonly TRUSTED_APPLE_TEAM_ID="973L4GV58R"
+readonly CONFIRM_TIMEOUT_SECONDS="${FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS:-30}"
 PLATFORM=""
 AUTH_HEADER_FILE=""
 WORK_DIR=""
@@ -27,6 +29,9 @@ INSTALL_LOCK_PATH=""
 INSTALL_LOCK_OWNER=""
 INSTALL_LOCK_HELD=0
 DARWIN_AGENT_DISABLED=0
+CONFIRMATION_PID=""
+CONFIRMATION_LOG=""
+CONFIRMATION_DONE=""
 readonly GENERATION_INCOMPLETE_EXIT=20
 
 die() {
@@ -49,6 +54,7 @@ except FileNotFoundError:
     pass
 PY
   fi
+  [[ -z "$CONFIRMATION_DONE" ]] || touch -- "$CONFIRMATION_DONE"
 }
 trap cleanup EXIT
 
@@ -830,6 +836,168 @@ restart_darwin_daemon_service() {
   launchctl kickstart -k "$target"
 }
 
+probe_daemon_health() {
+  local response="$WORK_DIR/daemon-health.json"
+  # This candidate CLI's socket hello requires an exact build and protocol
+  # fingerprint match. A successful fleet query therefore proves both that
+  # the selected daemon answered and that its control plane is ready.
+  if ! FLOTILLA_CONTAINED_HOST_DAEMON=1 "$CURRENT_LINK/bin/flotilla" --json fleet >"$response" 2>/dev/null; then
+    return 1
+  fi
+  python3 - "$response" <<'PY'
+import json
+import sys
+
+try:
+    response = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    raise SystemExit(1)
+if not isinstance(response, dict) or response.get("kind") != "fleet_health":
+    raise SystemExit(1)
+hosts = response.get("hosts")
+if not isinstance(hosts, list):
+    raise SystemExit(1)
+if not any(isinstance(host, dict) and host.get("is_local") is True for host in hosts):
+    raise SystemExit(1)
+PY
+}
+
+wait_for_daemon_generation() {
+  local generation="$1"
+  [[ "$CONFIRM_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] \
+    || die "health confirmation timeout must be a non-negative integer: $CONFIRM_TIMEOUT_SECONDS"
+  local deadline=$((SECONDS + CONFIRM_TIMEOUT_SECONDS))
+  while true; do
+    if [[ "$(current_generation)" == "$generation" ]] && probe_daemon_health; then
+      return 0
+    fi
+    ((SECONDS < deadline)) || return 1
+    sleep 1
+  done
+}
+
+arm_health_confirmation() {
+  local generation="$1"
+  local rollback_generation="$2"
+  local token="$3"
+  local temporary="$FLEET_ROOT/.pending-confirmation.new.$$"
+  printf 'candidate=%s\nrollback=%s\ntoken=%s\n' "$generation" "$rollback_generation" "$token" >"$temporary"
+  mv -f "$temporary" "$PENDING_CONFIRMATION"
+}
+
+confirmation_is_armed() {
+  local token="$1"
+  [[ -f "$PENDING_CONFIRMATION" ]] && grep -Fxq "token=$token" "$PENDING_CONFIRMATION"
+}
+
+disarm_health_confirmation() {
+  local token="$1"
+  python3 - "$PENDING_CONFIRMATION" "$token" <<'PY'
+import os
+import sys
+
+path, token = sys.argv[1:]
+try:
+    with open(path) as source:
+        armed = any(line.rstrip("\n") == f"token={token}" for line in source)
+    if armed:
+        os.unlink(path)
+except FileNotFoundError:
+    pass
+PY
+}
+
+automatic_rollback() {
+  local failed_generation="$1"
+  local rollback_generation="$2"
+  [[ -n "$rollback_generation" ]] || return 1
+  [[ -d "$RELEASES_DIR/$rollback_generation" ]] || return 1
+  [[ -f "$RELEASES_DIR/$rollback_generation/.generation.json" ]] || return 1
+  verify_installed_release "$RELEASES_DIR/$rollback_generation" "$RELEASES_DIR/$rollback_generation/.generation.json" || return 1
+  # launchd must unload the candidate before the symlink flip. systemd has no
+  # equivalent race and its stable unit was already refreshed by the parent.
+  prepare_darwin_daemon_service || return 1
+  atomic_link "releases/$rollback_generation" "$CURRENT_LINK" || return 1
+  atomic_link "releases/$failed_generation" "$PREVIOUS_LINK" || return 1
+  restart_linux_daemon_service || return 1
+  restart_darwin_daemon_service || return 1
+  wait_for_daemon_generation "$rollback_generation" || return 1
+}
+
+confirmation_watchdog() {
+  local generation="$1"
+  local rollback_generation="$2"
+  local token="$3"
+  make_work_dir
+  local activation_deadline=$((SECONDS + 10))
+  while [[ "$(current_generation)" != "$generation" ]]; do
+    confirmation_is_armed "$token" || return 0
+    if ((SECONDS >= activation_deadline)); then
+      disarm_health_confirmation "$token"
+      return 0
+    fi
+    sleep 0.1
+  done
+  if wait_for_daemon_generation "$generation"; then
+    disarm_health_confirmation "$token"
+    printf 'fleet-install: generation %s confirmed healthy\n' "$generation"
+    return 0
+  fi
+  confirmation_is_armed "$token" || return 0
+  local parent_pid="${token%%-*}"
+  if ! kill -0 "$parent_pid" 2>/dev/null; then
+    # The foreground installer normally holds this lock for the watchdog's
+    # lifetime. If it died, reclaim that protection before mutating links so
+    # a replacement install cannot race the orphaned rollback.
+    acquire_install_lock
+    confirmation_is_armed "$token" || return 0
+  fi
+  if automatic_rollback "$generation" "$rollback_generation"; then
+    disarm_health_confirmation "$token"
+    printf 'fleet-install: generation %s failed health confirmation; rolled back to %s\n' "$generation" "$rollback_generation" >&2
+    return 10
+  fi
+  printf 'fleet-install: generation %s failed health confirmation and no healthy previous generation could be restored\n' "$generation" >&2
+  return 1
+}
+
+start_confirmation_watchdog() {
+  local generation="$1"
+  local rollback_generation="$2"
+  local token="$3"
+  local installer
+  installer="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  # A detached watchdog keeps its log as an audit trail if the foreground
+  # installer dies. Prune only logs whose watchdog marked them complete.
+  local completed_log
+  for completed_log in "$FLEET_ROOT"/.confirmation.*.log.done; do
+    [[ -f "$completed_log" ]] || continue
+    rm -f -- "${completed_log%.done}" "$completed_log"
+  done
+  CONFIRMATION_LOG="$FLEET_ROOT/.confirmation.$token.log"
+  nohup "$installer" __confirm "$generation" "$rollback_generation" "$token" >"$CONFIRMATION_LOG" 2>&1 </dev/null &
+  CONFIRMATION_PID=$!
+}
+
+await_confirmation_watchdog() {
+  local generation="$1"
+  local rollback_generation="$2"
+  local result
+  if wait "$CONFIRMATION_PID"; then
+    result=0
+  else
+    result=$?
+  fi
+  [[ ! -f "$CONFIRMATION_LOG" ]] || cat "$CONFIRMATION_LOG"
+  rm -f -- "$CONFIRMATION_LOG" "$CONFIRMATION_LOG.done"
+  CONFIRMATION_LOG=""
+  case "$result" in
+    0) return 0 ;;
+    10) die "generation $generation failed health confirmation; rolled back to $rollback_generation" ;;
+    *) die "generation $generation failed health confirmation and no healthy previous generation could be restored" ;;
+  esac
+}
+
 daemon_preflight() {
   pgrep -u "$(id -u)" -x flotillad >/dev/null 2>&1 || return 0
   local cli
@@ -860,10 +1028,22 @@ PY
 
 switch_to() {
   local generation="$1"
+  local rollback_generation="$2"
+  local confirmation_token="$3"
   local old
   old="$(current_generation)"
-  [[ "$old" != "$generation" ]] || return 0
+  if [[ "$old" == "$generation" ]]; then
+    arm_health_confirmation "$generation" "$rollback_generation" "$confirmation_token"
+    if ((!DARWIN_AGENT_DISABLED)); then
+      start_confirmation_watchdog "$generation" "$rollback_generation" "$confirmation_token"
+    fi
+    return 0
+  fi
   daemon_preflight
+  arm_health_confirmation "$generation" "$rollback_generation" "$confirmation_token"
+  if ((!DARWIN_AGENT_DISABLED)); then
+    start_confirmation_watchdog "$generation" "$rollback_generation" "$confirmation_token"
+  fi
   if [[ -n "$old" ]]; then
     atomic_link "releases/$old" "$PREVIOUS_LINK"
   fi
@@ -875,8 +1055,23 @@ install_generation() {
   require_generation "$generation"
   acquire_install_lock
   mkdir -p "$RELEASES_DIR"
-  local old
+  local old rollback_generation confirmation_token
   old="$(current_generation)"
+  rollback_generation="$old"
+  if [[ "$old" == "$generation" && -L "$PREVIOUS_LINK" ]]; then
+    local previous_target
+    previous_target="$(readlink "$PREVIOUS_LINK")"
+    if [[ "$previous_target" =~ ^releases/[^/]+$ ]]; then
+      rollback_generation="${previous_target#releases/}"
+    fi
+  fi
+  [[ "$rollback_generation" != "$generation" ]] || rollback_generation=""
+  confirmation_token="$$-$(python3 - <<'PY'
+import secrets
+
+print(secrets.token_hex(8))
+PY
+)"
   printf 'fleet-install: %s -> %s\n' "${old:-<none>}" "$generation"
   if [[ -d "$RELEASES_DIR/$generation" ]]; then
     make_work_dir
@@ -886,9 +1081,15 @@ install_generation() {
     ensure_launchers_and_path
     prepare_linux_daemon_service
     prepare_darwin_daemon_service
-    switch_to "$generation"
+    switch_to "$generation" "$rollback_generation" "$confirmation_token"
     restart_linux_daemon_service
     restart_darwin_daemon_service
+    if ((DARWIN_AGENT_DISABLED)); then
+      disarm_health_confirmation "$confirmation_token"
+      printf 'fleet-install: health confirmation skipped while flotillad dev mode is active\n'
+    else
+      await_confirmation_watchdog "$generation" "$rollback_generation"
+    fi
     printf 'fleet-install: generation %s is installed\n' "$generation"
     return
   fi
@@ -914,9 +1115,15 @@ install_generation() {
   ensure_launchers_and_path
   prepare_linux_daemon_service
   prepare_darwin_daemon_service
-  switch_to "$generation"
+  switch_to "$generation" "$rollback_generation" "$confirmation_token"
   restart_linux_daemon_service
   restart_darwin_daemon_service
+  if ((DARWIN_AGENT_DISABLED)); then
+    disarm_health_confirmation "$confirmation_token"
+    printf 'fleet-install: health confirmation skipped while flotillad dev mode is active\n'
+  else
+    await_confirmation_watchdog "$generation" "$rollback_generation"
+  fi
   printf 'fleet-install: generation %s is installed\n' "$generation"
 }
 
@@ -968,6 +1175,13 @@ usage() {
 }
 
 main() {
+  if [[ "${1:-}" == __confirm ]]; then
+    [[ $# -eq 4 ]] || usage
+    PLATFORM="$(host_platform)"
+    CONFIRMATION_DONE="$FLEET_ROOT/.confirmation.$4.log.done"
+    confirmation_watchdog "$2" "$3" "$4"
+    return
+  fi
   [[ $# -eq 1 ]] || usage
   PLATFORM="$(host_platform)"
   case "$1" in
