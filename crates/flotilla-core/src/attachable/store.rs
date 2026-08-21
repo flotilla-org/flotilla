@@ -218,7 +218,6 @@ impl AttachableStoreState {
             command: command.to_string(),
             working_directory,
             status,
-            expected_to_persist: false,
         });
         if let Some(existing_id) = self.lookup_binding(provider_category, provider_name, BindingObjectKind::Attachable, external_ref) {
             let attachable_id = AttachableId::new(existing_id.to_string());

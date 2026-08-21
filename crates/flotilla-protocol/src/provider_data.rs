@@ -344,19 +344,6 @@ pub enum TerminalStatus {
     Exited(i32),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PaneExitAttentionFlavor {
-    Completion,
-    Failure,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneExitAttention {
-    pub flavor: PaneExitAttentionFlavor,
-    pub exit_code: i32,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedTerminal {
     pub set_id: AttachableSetId,
@@ -364,10 +351,6 @@ pub struct ManagedTerminal {
     pub command: String,
     pub working_directory: PathBuf,
     pub status: TerminalStatus,
-    #[serde(default)]
-    pub expected_to_persist: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attention: Option<PaneExitAttention>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

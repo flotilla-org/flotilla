@@ -21,8 +21,6 @@ pub struct PaneTemplate {
     pub surfaces: Vec<SurfaceTemplate>,
     #[serde(default)]
     pub focus: bool,
-    #[serde(default)]
-    pub expected_to_persist: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,8 +55,6 @@ pub struct ContentEntry {
     pub command: String,
     #[serde(default)]
     pub count: Option<u32>,
-    #[serde(default, alias = "expected-to-persist")]
-    pub expected_to_persist: bool,
 }
 
 fn default_content_type() -> String {
@@ -122,11 +118,7 @@ pub fn resolve_template_commands(
         .filter(|e| e.content_type == "terminal")
         .flat_map(|e| {
             let count = e.count.unwrap_or(1);
-            (0..count).map(move |_| flotilla_protocol::PreparedTerminalCommand {
-                role: e.role.clone(),
-                command: e.command.clone(),
-                expected_to_persist: e.expected_to_persist,
-            })
+            (0..count).map(move |_| flotilla_protocol::PreparedTerminalCommand { role: e.role.clone(), command: e.command.clone() })
         })
         .collect()
 }
@@ -139,7 +131,6 @@ pub fn default_template() -> WorkspaceTemplate {
             content_type: "terminal".to_string(),
             command: "{main_command}".to_string(),
             count: None,
-            expected_to_persist: false,
         }],
         layout: vec![LayoutSlot { slot: "main".to_string(), split: None, parent: None, overflow: None, gap: None, focus: true }],
     }
@@ -160,7 +151,6 @@ content:
     count: 2
   - role: build
     command: "cargo watch -x check"
-    expected_to_persist: true
 
 layout:
   - slot: shell
@@ -180,8 +170,6 @@ layout:
         assert_eq!(template.content[1].role, "agent");
         assert_eq!(template.content[1].count, Some(2));
         assert_eq!(template.content[2].role, "build");
-        assert!(template.content[2].expected_to_persist);
-        assert!(!template.content[0].expected_to_persist);
         assert_eq!(template.layout.len(), 3);
         assert_eq!(template.layout[0].slot, "shell");
         assert!(template.layout[0].split.is_none());

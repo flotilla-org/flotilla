@@ -75,7 +75,6 @@ fn build_pane_layout(tmpl: &WorkspaceTemplate, resolved: &[(String, String)]) ->
             parent: slot.parent.clone(),
             surfaces,
             focus: slot.focus,
-            expected_to_persist: tmpl.content.iter().find(|entry| entry.role == slot.slot).is_some_and(|entry| entry.expected_to_persist),
         });
     }
 
@@ -91,20 +90,8 @@ mod tests {
     fn build_pane_layout_maps_layout_to_panes() {
         let tmpl = WorkspaceTemplate {
             content: vec![
-                ContentEntry {
-                    role: "shell".into(),
-                    content_type: "terminal".into(),
-                    command: "bash".into(),
-                    count: None,
-                    expected_to_persist: true,
-                },
-                ContentEntry {
-                    role: "agent".into(),
-                    content_type: "terminal".into(),
-                    command: "claude".into(),
-                    count: Some(2),
-                    expected_to_persist: false,
-                },
+                ContentEntry { role: "shell".into(), content_type: "terminal".into(), command: "bash".into(), count: None },
+                ContentEntry { role: "agent".into(), content_type: "terminal".into(), command: "claude".into(), count: Some(2) },
             ],
             layout: vec![
                 LayoutSlot { slot: "shell".into(), split: None, parent: None, overflow: None, gap: None, focus: true },
@@ -131,8 +118,6 @@ mod tests {
         assert_eq!(layout.panes[0].name, "shell");
         assert!(layout.panes[0].split.is_none());
         assert!(layout.panes[0].focus);
-        assert!(layout.panes[0].expected_to_persist);
-        assert!(!layout.panes[1].expected_to_persist);
         assert_eq!(layout.panes[0].surfaces.len(), 1);
         assert!(layout.panes[0].surfaces[0].command.contains("shell/0"));
 

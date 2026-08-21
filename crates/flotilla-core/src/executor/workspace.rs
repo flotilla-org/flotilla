@@ -320,7 +320,7 @@ fn workspace_attach_request_from_config(config: crate::providers::types::Workspa
         .working_directory(config.working_directory)
         .template_vars(config.template_vars)
         .maybe_template_yaml(config.template_yaml)
-        .attach_commands(config.resolved_commands.unwrap_or_default().into_iter().map(|(role, command, _)| (role, command)).collect())
+        .attach_commands(config.resolved_commands.unwrap_or_default())
         .build()
 }
 

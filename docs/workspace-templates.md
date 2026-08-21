@@ -11,7 +11,6 @@ content:
     command: <string>       # Shell command to run (empty = default shell)
     type: terminal          # Content type (default: "terminal")
     count: <number>         # How many instances (default: 1)
-    expected_to_persist: <bool> # Exit is failure-flavored attention (default: false)
 
 # How to arrange them in the workspace
 layout:
@@ -22,8 +21,6 @@ layout:
 ```
 
 The variable `{main_command}` is substituted with the primary command (typically `claude`, or `claude --teleport <id>` for session teleport).
-
-Set `expected_to_persist: true` for long-running panes such as development servers. A running pane does not request attention. On exit, an expected-to-persist pane surfaces failure-flavored attention; any other pane surfaces completion-flavored attention.
 
 ## Example
 
