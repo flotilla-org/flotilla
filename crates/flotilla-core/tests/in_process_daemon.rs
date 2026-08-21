@@ -5095,13 +5095,22 @@ async fn convoy_resume_delivers_immediately_when_working_crew_is_already_idle() 
     convoys
         .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
             phase: ConvoyPhase::Active,
-            crew_work: BTreeMap::from([(
-                "work".to_string(),
-                BTreeMap::from([(
-                    "coder".to_string(),
-                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                )]),
-            )]),
+            crew_work: BTreeMap::from([
+                (
+                    "work".to_string(),
+                    BTreeMap::from([(
+                        "coder".to_string(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                    )]),
+                ),
+                (
+                    "review".to_string(),
+                    BTreeMap::from([(
+                        "qa".to_string(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Done).build(),
+                    )]),
+                ),
+            ]),
             ..Default::default()
         })
         .await
@@ -5140,12 +5149,56 @@ async fn convoy_resume_delivers_immediately_when_working_crew_is_already_idle() 
         })
         .await
         .expect("observe working crew session");
+    let review_session = sessions
+        .create(
+            &InputMeta::builder()
+                .name("idle-review-session".to_string())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "idle-convoy".to_string()),
+                    (VESSEL_LABEL.to_string(), "review".to_string()),
+                    (ROLE_LABEL.to_string(), "qa".to_string()),
+                ]))
+                .build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("idle-environment".to_string())
+                .role("qa".to_string())
+                .source(TerminalSessionSource::Tool { command: "codex".to_string() })
+                .cwd("/workspace".to_string())
+                .pool("fake-terminals".to_string())
+                .build(),
+        )
+        .await
+        .expect("create review crew session");
+    sessions
+        .update_status(&review_session.metadata.name, &review_session.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            session_id: Some("idle-review".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("mark review crew session running");
 
     let queued = daemon
         .convoy_resume_internal("flotilla", "idle-convoy", "Finish the current turn", Some("work"), Some("coder"))
         .await
         .expect("queue brief while crew is working");
     assert_eq!(queued, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: None });
+    let unrelated = daemon
+        .convoy_resume_internal("flotilla", "idle-convoy", "Start the review", Some("review"), Some("qa"))
+        .await
+        .expect("resume unrelated crew");
+    assert_eq!(unrelated, flotilla_core::in_process::ConvoyResumeOutcome::Delivered { displaced: None });
+    assert_eq!(
+        convoys
+            .get("idle-convoy")
+            .await
+            .expect("read convoy with queued brief")
+            .status
+            .expect("convoy status")
+            .pending_brief()
+            .map(|brief| brief.content.as_str()),
+        Some("Finish the current turn")
+    );
     apply_status_patch(&sessions, "idle-coder-session", &TerminalSessionStatusPatch::ObserveAttention {
         attention: TerminalAttention {
             state: TerminalAttentionState::Idle,
@@ -5164,7 +5217,10 @@ async fn convoy_resume_delivers_immediately_when_working_crew_is_already_idle() 
     assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Delivered {
         displaced: Some("Finish the current turn".to_string())
     });
-    assert_eq!(*terminal_pool.delivered.lock().await, vec![("idle-coder".to_string(), "Start the next turn".to_string(), true)]);
+    assert_eq!(*terminal_pool.delivered.lock().await, vec![
+        ("idle-review".to_string(), "Start the review".to_string(), true),
+        ("idle-coder".to_string(), "Start the next turn".to_string(), true),
+    ]);
     let status = convoys.get("idle-convoy").await.expect("read resumed convoy").status.expect("convoy status");
     assert!(status.pending_brief().is_none());
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);

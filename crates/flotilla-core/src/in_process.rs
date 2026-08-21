@@ -7307,7 +7307,8 @@ impl InProcessDaemon {
             return Ok(ConvoyResumeOutcome::Queued { displaced });
         }
 
-        let displaced = status.pending_brief().map(|brief| brief.content.clone());
+        let displaced =
+            status.pending_brief().filter(|brief| brief.vessel == vessel && brief.role == role).map(|brief| brief.content.clone());
         let session = session?.ok_or_else(|| format!("crew member `{role}` on vessel `{vessel}` has no intact terminal session"))?;
         match session.status.as_ref().map(|status| status.phase) {
             Some(ResourceTerminalSessionPhase::Running) => self.deliver_to_crew_session(&session, prompt).await?,
