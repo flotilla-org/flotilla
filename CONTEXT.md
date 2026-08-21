@@ -335,6 +335,24 @@ home yields readable memory and a truthful inventory, never resurrection.
 (ADR 0016.)
 _Avoid_: Local resource, host-pinned.
 
+**Homing seam**:
+One of exactly two places where a new record's home departs from its
+parent's: admission placement (a **Convoy** is born at its primary
+placement host) and per-child actuation locality (a convoy's vessels,
+environments, and terminal sessions are born where each is actuated).
+Everywhere else, a controller authors a child record only at the home of
+its parent — the creation cascade. (ADR 0033; seams ruled in ADR 0032.)
+_Avoid_: Re-home (reserved against by **Succession**), handoff, migration.
+
+**Code-seeded Builtin**:
+The micro-class of records seeded identically by code at every root's
+startup — builtin **WorkflowTemplates** such as `scratch`. Same-name
+multi-root authorship is legal for exactly this class; content is
+determined by the running generation, so divergence is expected only
+mid-roll and surfaces as a condition if it persists on a settled fleet.
+A human edit makes the record a **Definition** shadowing a seed. (ADR 0033.)
+_Avoid_: Builtin definition (conflates the classes), seeded default.
+
 **Succession**:
 How a **Convoy** record changes home: a new home authors a successor record
 (`succeeded_from` ref) and each vessel's host repoints its convoy ref —
