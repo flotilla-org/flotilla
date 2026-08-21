@@ -1267,6 +1267,37 @@ RestartBudgetExhausted: resource controller stopped after repeated failures"
     );
 }
 
+#[tokio::test]
+async fn default_placement_accepts_a_host_with_an_authorship_collision() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    create_host_direct_placement(&backend, "host-direct-feta", "feta", BTreeSet::from(["codex".to_string()])).await;
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let host = hosts.get("feta").await.expect("host");
+    hosts
+        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
+            capabilities: host.status.expect("host status").capabilities,
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            conditions: vec![HostCondition::builder()
+                .condition_type("ResourceReplication/AuthorshipCollision")
+                .value(ConditionValue::False)
+                .reason("HomeBoundRecordAuthoredAtMultipleRoots")
+                .message("Convoy/flotilla/standing-collision is authored at multiple roots")
+                .observed_at(Utc::now())
+                .blocks_readiness(false)
+                .build()],
+            ..HostStatus::default()
+        })
+        .await
+        .expect("host status with advisory collision");
+
+    let resolution = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), None)
+        .await
+        .expect("standing authorship collisions must not freeze dispatch placement");
+
+    assert_eq!(resolution.selected.expect("viable placement").metadata.name, "host-direct-feta");
+}
+
 async fn create_test_environment(daemon: &InProcessDaemon, name: &str, host_ref: &str) -> String {
     daemon
         .resource_backend()
