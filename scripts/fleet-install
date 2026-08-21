@@ -11,6 +11,10 @@ readonly FLEET_TOKEN_FILE="${FLEET_INSTALL_TOKEN_FILE:-$HOME/.config/flotilla/fl
 readonly SYSTEMD_USER_DIR="${FLEET_INSTALL_SYSTEMD_USER_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
 readonly LAUNCH_AGENT_DIR="${FLEET_INSTALL_LAUNCH_AGENT_DIR:-$HOME/Library/LaunchAgents}"
 readonly LAUNCH_AGENT_LABEL="work.flotilla.flotillad"
+readonly DAEMON_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/flotilla"
+readonly DAEMON_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/flotilla"
+readonly DAEMON_SOCKET="$DAEMON_CONFIG_DIR/run/flotilla.sock"
+readonly LAUNCH_LOG_DIR="$HOME/Library/Logs/flotilla"
 readonly RELEASES_DIR="$FLEET_ROOT/releases"
 readonly CURRENT_LINK="$FLEET_ROOT/current"
 readonly PREVIOUS_LINK="$FLEET_ROOT/previous"
@@ -757,20 +761,33 @@ restart_linux_daemon_service() {
 write_launchd_agent() {
   [[ "$PLATFORM" == darwin-* ]] || return 0
   local plist="$LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist"
-  local temporary daemon_path daemon_path_value
+  local temporary daemon_path daemon_path_value stderr_path stdout_path
   daemon_path="$FLEET_ROOT/current/bin/flotillad"
-  daemon_path_value="$FLEET_BIN_DIR:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-  mkdir -p "$LAUNCH_AGENT_DIR"
+  daemon_path_value="$FLEET_BIN_DIR:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  stderr_path="$LAUNCH_LOG_DIR/flotillad.stderr.log"
+  stdout_path="$LAUNCH_LOG_DIR/flotillad.stdout.log"
+  mkdir -p "$LAUNCH_AGENT_DIR" "$LAUNCH_LOG_DIR"
   temporary="$(mktemp "$LAUNCH_AGENT_DIR/.$LAUNCH_AGENT_LABEL.plist.fleet-install.XXXXXX")"
-  python3 - "$temporary" "$LAUNCH_AGENT_LABEL" "$daemon_path" "$daemon_path_value" <<'PY'
+  python3 - "$temporary" "$LAUNCH_AGENT_LABEL" "$daemon_path" "$daemon_path_value" \
+    "$DAEMON_CONFIG_DIR" "$DAEMON_STATE_DIR" "$DAEMON_SOCKET" "$stderr_path" "$stdout_path" <<'PY'
 import plistlib
 import sys
 
-destination, label, daemon, path = sys.argv[1:]
+destination, label, daemon, path, config_dir, state_dir, socket, stderr_path, stdout_path = sys.argv[1:]
 content = {
     "Label": label,
-    "ProgramArguments": [daemon],
+    "ProgramArguments": [
+        daemon,
+        "--config-dir",
+        config_dir,
+        "--state-dir",
+        state_dir,
+        "--socket",
+        socket,
+    ],
     "EnvironmentVariables": {"PATH": path},
+    "StandardErrorPath": stderr_path,
+    "StandardOutPath": stdout_path,
     "RunAtLoad": True,
     "KeepAlive": {"SuccessfulExit": False},
 }
