@@ -1,5 +1,6 @@
 use std::{
     env,
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -30,7 +31,9 @@ pub(crate) const ENVIRONMENT_CLEAT_LIBRARY_DIR: &str = "/usr/local/lib/flotilla"
 pub(crate) const ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH: &str = "/usr/local/lib/flotilla/libghostty-vt.so.0";
 pub(crate) const ENVIRONMENT_CLEAT_RUNTIME_DIR: &str = "/var/lib/flotilla/cleat";
 const CLEAT_GHOSTTY_LIBRARY: &str = "libghostty-vt.so.0";
+#[cfg(test)]
 const FLEET_INSTALL_MARKER: &str = "# managed by fleet-install";
+const FLEET_INSTALL_LAUNCHER_PREFIX: &[u8] = b"#!/usr/bin/env bash\n# managed by fleet-install\n";
 
 #[async_trait]
 pub(crate) trait EnvironmentToolFactory: Send + Sync {
@@ -55,7 +58,7 @@ impl EnvironmentToolProvisioner {
         let cleat_binary_path = daemon
             .local_environment_bag()
             .and_then(|bag| bag.find_binary("cleat").cloned())
-            .map(|path| resolve_host_binary(path.as_path()))
+            .map(|path| resolve_cleat_binary(path.as_path()))
             .transpose()
             .and_then(|path| path.ok_or_else(|| "binary unavailable for contained environment delivery".to_string()));
         let flotilla_binary_path = running_daemon_flotilla_binary()
@@ -280,7 +283,7 @@ impl EnvironmentToolFactory for FailingTool {
     }
 }
 
-fn resolve_host_binary_from(path: &Path, current_dir: &Path, search_path: Option<&std::ffi::OsStr>) -> Result<DaemonHostPath, String> {
+fn resolve_cleat_binary_from(path: &Path, current_dir: &Path, search_path: Option<&std::ffi::OsStr>) -> Result<DaemonHostPath, String> {
     let candidate = if path.is_absolute() {
         path.to_path_buf()
     } else if path.components().count() > 1 {
@@ -301,13 +304,16 @@ fn resolve_host_binary_from(path: &Path, current_dir: &Path, search_path: Option
 }
 
 fn resolve_fleet_cleat_launcher(path: &Path) -> Result<Option<PathBuf>, String> {
-    let Ok(contents) = std::fs::read_to_string(path) else {
+    let Ok(mut file) = std::fs::File::open(path) else {
         return Ok(None);
     };
-    let mut lines = contents.lines();
-    if lines.next() != Some("#!/usr/bin/env bash") || lines.next() != Some(FLEET_INSTALL_MARKER) {
+    let mut prefix = [0; FLEET_INSTALL_LAUNCHER_PREFIX.len()];
+    if file.read_exact(&mut prefix).is_err() || prefix != FLEET_INSTALL_LAUNCHER_PREFIX {
         return Ok(None);
     }
+    let mut command_text = String::new();
+    file.read_to_string(&mut command_text).map_err(|error| format!("read fleet cleat launcher {}: {error}", path.display()))?;
+    let mut lines = command_text.lines();
     let command = lines.next().ok_or_else(|| format!("fleet cleat launcher has no exec command: {}", path.display()))?;
     if lines.any(|line| !line.trim().is_empty()) {
         return Err(format!("fleet cleat launcher has unexpected trailing content: {}", path.display()));
@@ -350,10 +356,10 @@ fn decode_bash_printf_q_word(encoded: &str) -> Option<String> {
     Some(decoded)
 }
 
-fn resolve_host_binary(path: &Path) -> Result<DaemonHostPath, String> {
+fn resolve_cleat_binary(path: &Path) -> Result<DaemonHostPath, String> {
     let current_dir = env::current_dir().map_err(|error| format!("resolve current directory for {}: {error}", path.display()))?;
     let search_path = env::var_os("PATH");
-    resolve_host_binary_from(path, &current_dir, search_path.as_deref())
+    resolve_cleat_binary_from(path, &current_dir, search_path.as_deref())
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -440,7 +446,7 @@ mod tests {
         let search_path = env::join_paths([temp.path()]).expect("search path");
 
         let resolved =
-            resolve_host_binary_from(Path::new("cleat"), Path::new("/not-used"), Some(&search_path)).expect("resolve detected binary");
+            resolve_cleat_binary_from(Path::new("cleat"), Path::new("/not-used"), Some(&search_path)).expect("resolve detected binary");
 
         assert_eq!(resolved.as_path(), binary.canonicalize().expect("canonical binary"));
     }
@@ -467,7 +473,7 @@ mod tests {
             .expect("fleet launcher");
         let search_path = env::join_paths([launcher_directory]).expect("search path");
 
-        let resolved = resolve_host_binary_from(Path::new("cleat"), Path::new("/not-used"), Some(&search_path))
+        let resolved = resolve_cleat_binary_from(Path::new("cleat"), Path::new("/not-used"), Some(&search_path))
             .expect("resolve generation binary from launcher");
         let tool = CleatTool {
             binary_path: Ok(resolved),
