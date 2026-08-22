@@ -4499,11 +4499,7 @@ impl InProcessDaemon {
         for ensure in ensures {
             match local_projects.get(&ensure.spec.project_ref).await {
                 Ok(project) if project.metadata.deletion_timestamp.is_none() => {}
-                Ok(_) => {
-                    errors.push(format!("ConvoyEnsure/{}: parent Project/{} is absent", ensure.metadata.name, ensure.spec.project_ref));
-                    continue;
-                }
-                Err(ResourceError::NotFound { .. }) => {
+                Ok(_) | Err(ResourceError::NotFound { .. }) => {
                     match self.resource_backend.clone().definitions::<Project>(namespace).get(&ensure.spec.project_ref).await {
                         Ok(_) => {
                             debug!(
