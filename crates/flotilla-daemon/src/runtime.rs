@@ -12,8 +12,8 @@ use flotilla_controllers::reconcilers::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
     DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler, ForgeDefaultBranchResolver,
     HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
-    RepositoryReconciler, TerminalDeliveryOutcome, TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler,
-    VesselPlacementProjector, VesselReconciler,
+    RepositoryReconciler, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation, TerminalRuntime, TerminalRuntimeState,
+    TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
@@ -3058,8 +3058,9 @@ const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(200);
 const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(2);
 const DELIVERY_READY_POLLS: usize = 150;
 
-async fn wait_for_delivery_ready(pool: &dyn TerminalPool, session_id: &str) -> Result<bool, String> {
-    for _ in 0..DELIVERY_READY_POLLS {
+async fn wait_for_delivery_ready(pool: &dyn TerminalPool, session_id: &str, readiness: TerminalDeliveryReadiness) -> Result<bool, String> {
+    let mut polls = 0;
+    loop {
         let session = pool
             .list_sessions()
             .await?
@@ -3069,9 +3070,12 @@ async fn wait_for_delivery_ready(pool: &dyn TerminalPool, session_id: &str) -> R
         if session.screen_activity != Some(ScreenActivity::Active) {
             return Ok(true);
         }
+        polls += 1;
+        if readiness == TerminalDeliveryReadiness::Startup && polls >= DELIVERY_READY_POLLS {
+            return Ok(false);
+        }
         tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
     }
-    Ok(false)
 }
 
 async fn session_busy_after_delivery_grace(pool: &dyn TerminalPool, session_id: &str) -> Result<bool, String> {
@@ -3085,11 +3089,16 @@ async fn session_busy_after_delivery_grace(pool: &dyn TerminalPool, session_id: 
     Ok(session.screen_activity != Some(ScreenActivity::Stable))
 }
 
-async fn deliver_and_confirm(pool: &dyn TerminalPool, session_id: &str, message: &str) -> Result<TerminalDeliveryOutcome, String> {
+async fn deliver_and_confirm(
+    pool: &dyn TerminalPool,
+    session_id: &str,
+    message: &str,
+    readiness: TerminalDeliveryReadiness,
+) -> Result<TerminalDeliveryOutcome, String> {
     // PTY input sent during agent startup can be consumed before the TUI has
     // enabled its composer input modes. A newly launched agent reports active,
     // so wait for its first idle observation before sending delivery bytes.
-    if !wait_for_delivery_ready(pool, session_id).await? {
+    if !wait_for_delivery_ready(pool, session_id, readiness).await? {
         warn!(%session_id, "agent session did not become idle before message delivery deadline");
         return Ok(TerminalDeliveryOutcome::Unconfirmed);
     }
@@ -3272,6 +3281,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         session_id: &str,
         spec: &flotilla_resources::TerminalSessionSpec,
         message: &str,
+        readiness: TerminalDeliveryReadiness,
     ) -> Result<TerminalDeliveryOutcome, String> {
         let TerminalSessionSource::Agent { .. } = &spec.source else {
             return Err("crew message delivery requires an agent terminal".to_string());
@@ -3287,7 +3297,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         }
         let session_id_owned = session_id.to_string();
         let message_owned = message.to_string();
-        let task = tokio::spawn(async move { deliver_and_confirm(&*pool, &session_id_owned, &message_owned).await });
+        let task = tokio::spawn(async move { deliver_and_confirm(&*pool, &session_id_owned, &message_owned, readiness).await });
         self.state
             .terminal_deliveries
             .lock()
@@ -7577,7 +7587,9 @@ mod tests {
     async fn delivery_waits_for_the_agent_tui_to_become_idle_before_submitting() {
         let pool = DeliveryProbePool::new(vec![ScreenActivity::Active, ScreenActivity::Stable, ScreenActivity::Active]);
 
-        let outcome = deliver_and_confirm(&pool, "agent", "first line\n\nsecond line").await.expect("delivery outcome");
+        let outcome = deliver_and_confirm(&pool, "agent", "first line\n\nsecond line", TerminalDeliveryReadiness::Startup)
+            .await
+            .expect("delivery outcome");
 
         assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
         assert!(pool.observations.load(Ordering::SeqCst) >= 3);
@@ -7588,7 +7600,8 @@ mod tests {
     async fn delivery_confirmation_retries_once_then_flags_a_session_that_stays_idle() {
         let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
 
-        let outcome = deliver_and_confirm(&pool, "agent", "stuck handoff").await.expect("delivery outcome");
+        let outcome =
+            deliver_and_confirm(&pool, "agent", "stuck handoff", TerminalDeliveryReadiness::Startup).await.expect("delivery outcome");
 
         assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed);
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
@@ -7599,12 +7612,28 @@ mod tests {
     async fn delivery_flags_a_session_that_never_becomes_idle_without_sending_bytes() {
         let pool = DeliveryProbePool::new(vec![ScreenActivity::Active]);
 
-        let outcome = deliver_and_confirm(&pool, "agent", "unsafe handoff").await.expect("delivery outcome");
+        let outcome =
+            deliver_and_confirm(&pool, "agent", "unsafe handoff", TerminalDeliveryReadiness::Startup).await.expect("delivery outcome");
 
         assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed);
         assert_eq!(pool.observations.load(Ordering::SeqCst), DELIVERY_READY_POLLS);
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 0);
         assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_to_an_established_busy_agent_waits_past_the_startup_deadline() {
+        let mut activities = vec![ScreenActivity::Active; DELIVERY_READY_POLLS + 10];
+        activities.extend([ScreenActivity::Stable, ScreenActivity::Active]);
+        let pool = DeliveryProbePool::new(activities);
+
+        let outcome = deliver_and_confirm(&pool, "agent", "handoff after this turn", TerminalDeliveryReadiness::TurnBoundary)
+            .await
+            .expect("delivery outcome");
+
+        assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
+        assert!(pool.observations.load(Ordering::SeqCst) > DELIVERY_READY_POLLS);
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

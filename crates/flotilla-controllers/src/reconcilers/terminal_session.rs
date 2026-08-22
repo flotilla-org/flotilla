@@ -37,6 +37,12 @@ pub enum TerminalDeliveryOutcome {
     Unconfirmed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalDeliveryReadiness {
+    Startup,
+    TurnBoundary,
+}
+
 #[async_trait]
 pub trait TerminalRuntime: Send + Sync {
     async fn ensure_session(
@@ -60,6 +66,7 @@ pub trait TerminalRuntime: Send + Sync {
         _session_id: &str,
         _spec: &flotilla_resources::TerminalSessionSpec,
         _message: &str,
+        _readiness: TerminalDeliveryReadiness,
     ) -> Result<TerminalDeliveryOutcome, String> {
         Err("terminal runtime does not support crew message delivery".to_string())
     }
@@ -212,8 +219,20 @@ where
                     // Delivery is deliberately at-least-once. A crash after the pool accepts the
                     // message but before MarkMessageDelivered is persisted may redeliver it; losing
                     // a handoff is worse, and exactly-once requires acknowledgement by the agent.
+                    let is_first_unobserved_delivery =
+                        obj.status.as_ref().is_none_or(|status| status.delivered_message_id.is_none() && status.attention.is_none());
+                    let readiness = if is_first_unobserved_delivery {
+                        TerminalDeliveryReadiness::Startup
+                    } else {
+                        TerminalDeliveryReadiness::TurnBoundary
+                    };
                     return Ok(
-                        match self.runtime.deliver_message(session_id, &obj.spec, &message.text).await.map_err(ResourceError::other)? {
+                        match self
+                            .runtime
+                            .deliver_message(session_id, &obj.spec, &message.text, readiness)
+                            .await
+                            .map_err(ResourceError::other)?
+                        {
                             TerminalDeliveryOutcome::Pending => TerminalPrepared::MessageDeliveryPending,
                             TerminalDeliveryOutcome::Confirmed => TerminalPrepared::MessageDelivered(message.id.clone()),
                             TerminalDeliveryOutcome::Unconfirmed => TerminalPrepared::MessageDeliveryUnconfirmed(message.id.clone()),

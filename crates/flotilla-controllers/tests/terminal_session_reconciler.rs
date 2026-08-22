@@ -10,7 +10,8 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
-    TerminalDeliveryOutcome, TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler,
+    TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation, TerminalRuntime, TerminalRuntimeState,
+    TerminalSessionReconciler,
 };
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
@@ -883,7 +884,8 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     let deps = reconciler.prepare(&session).await.expect("observe pending message");
     assert_eq!(runtime.delivered.lock().expect("delivered mutex").as_slice(), &[(
         "cleat-session".to_string(),
-        "Review the amended commit".to_string()
+        "Review the amended commit".to_string(),
+        TerminalDeliveryReadiness::TurnBoundary,
     )]);
     let outcome = reconciler.reconcile(&session, &deps, Utc::now());
     assert!(matches!(
@@ -956,6 +958,7 @@ async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
     assert_eq!(pending.requeue_after, Some(Duration::from_millis(200)));
 
     let prepared = reconciler.prepare(&session).await.expect("attempt delivery");
+    assert_eq!(runtime.delivered.lock().expect("delivered mutex")[0].2, TerminalDeliveryReadiness::Startup);
     let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
     let mut flagged_status = session.status.clone().expect("status");
     outcome.patch.expect("delivery condition patch").apply(&mut flagged_status);
@@ -1068,7 +1071,7 @@ async fn terminal_finalizer_cleans_agent_artifacts() {
 
 #[derive(Default)]
 struct DeliveringTerminalRuntime {
-    delivered: Mutex<Vec<(String, String)>>,
+    delivered: Mutex<Vec<(String, String, TerminalDeliveryReadiness)>>,
     unconfirmed: bool,
 }
 
@@ -1118,8 +1121,9 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
         session_id: &str,
         _spec: &TerminalSessionSpec,
         message: &str,
+        readiness: TerminalDeliveryReadiness,
     ) -> Result<TerminalDeliveryOutcome, String> {
-        self.delivered.lock().expect("delivered mutex").push((session_id.to_string(), message.to_string()));
+        self.delivered.lock().expect("delivered mutex").push((session_id.to_string(), message.to_string(), readiness));
         Ok(if self.unconfirmed { TerminalDeliveryOutcome::Unconfirmed } else { TerminalDeliveryOutcome::Confirmed })
     }
 
