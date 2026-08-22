@@ -5091,7 +5091,7 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
 }
 
 #[tokio::test]
-async fn convoy_resume_delivers_immediately_when_working_crew_is_already_idle() {
+async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_idle() {
     let terminal_pool = Arc::new(FakeTerminalPool::new());
     let discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_terminal_pool(Arc::clone(&terminal_pool) as Arc<dyn TerminalPool>),
@@ -5162,7 +5162,20 @@ async fn convoy_resume_delivers_immediately_when_working_crew_is_already_idle() 
             &TerminalSessionSpec::builder()
                 .env_ref("idle-environment".to_string())
                 .role("coder".to_string())
-                .source(TerminalSessionSource::Tool { command: "codex".to_string() })
+                .source(TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: ".flotilla/briefs/coder.md".to_string(),
+                        content: "Initial turn".to_string(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "idle-convoy".to_string(),
+                        vessel_ref: "work-vessel".to_string(),
+                    }),
+                    message: None,
+                })
                 .cwd("/workspace".to_string())
                 .pool("fake-terminals".to_string())
                 .build(),
@@ -5195,7 +5208,20 @@ async fn convoy_resume_delivers_immediately_when_working_crew_is_already_idle() 
             &TerminalSessionSpec::builder()
                 .env_ref("idle-environment".to_string())
                 .role("qa".to_string())
-                .source(TerminalSessionSource::Tool { command: "codex".to_string() })
+                .source(TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("review"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: ".flotilla/briefs/qa.md".to_string(),
+                        content: "Initial turn".to_string(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "idle-convoy".to_string(),
+                        vessel_ref: "review-vessel".to_string(),
+                    }),
+                    message: None,
+                })
                 .cwd("/workspace".to_string())
                 .pool("fake-terminals".to_string())
                 .build(),
@@ -5250,10 +5276,17 @@ async fn convoy_resume_delivers_immediately_when_working_crew_is_already_idle() 
     assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Delivered {
         displaced: Some("Finish the current turn".to_string())
     });
-    assert_eq!(*terminal_pool.delivered.lock().await, vec![
-        ("idle-review".to_string(), "Start the review".to_string(), true),
-        ("idle-coder".to_string(), "Start the next turn".to_string(), true),
-    ]);
+    assert!(terminal_pool.delivered.lock().await.is_empty(), "agent messages should await reconciled delivery confirmation");
+    let review_session = sessions.get("idle-review-session").await.expect("read queued review session");
+    let TerminalSessionSource::Agent { message: review_message, .. } = review_session.spec.source else {
+        panic!("review session should remain agent-backed")
+    };
+    assert_eq!(review_message.expect("queued review delivery").text, "Start the review");
+    let coder_session = sessions.get("idle-coder-session").await.expect("read queued coder session");
+    let TerminalSessionSource::Agent { message: coder_message, .. } = coder_session.spec.source else {
+        panic!("coder session should remain agent-backed")
+    };
+    assert_eq!(coder_message.expect("queued coder delivery").text, "Start the next turn");
     let status = convoys.get("idle-convoy").await.expect("read resumed convoy").status.expect("convoy status");
     assert!(status.pending_brief().is_none());
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);

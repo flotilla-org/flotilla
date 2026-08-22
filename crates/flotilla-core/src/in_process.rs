@@ -747,6 +747,9 @@ fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
 
 fn crew_attention(status: Option<&TerminalSessionStatus>, work_unsettled: bool, now: DateTime<Utc>) -> Option<CrewAttention> {
     let status = status.filter(|status| status.phase == ResourceTerminalSessionPhase::Running)?;
+    if status.degraded.as_ref().is_some_and(|condition| condition.reason == "DeliveryUnconfirmed") {
+        return Some(CrewAttention::DeliveryUnconfirmed);
+    }
     let attention = status.attention.as_ref()?;
     if attention.is_stale_at(now) {
         return Some(CrewAttention::Unobservable);
@@ -7276,7 +7279,7 @@ impl InProcessDaemon {
         let terminal_name = identity.name();
         let handoff_result = match sessions.get(&terminal_name).await {
             Ok(existing) => match existing.status.as_ref().map(|status| status.phase) {
-                Some(ResourceTerminalSessionPhase::Running) => self.deliver_to_crew_session(&existing, &delivered_message).await,
+                Some(ResourceTerminalSessionPhase::Running) => queue_pending_crew_message(&sessions, &existing, &delivered_message).await,
                 Some(ResourceTerminalSessionPhase::Stopped) => {
                     queue_pending_crew_message(&sessions, &existing, &delivered_message).await?;
                     apply_resource_status_patch(&sessions, &terminal_name, &TerminalSessionStatusPatch::MarkStarting)
@@ -7452,7 +7455,7 @@ impl InProcessDaemon {
             status.pending_brief().filter(|brief| brief.vessel == vessel && brief.role == role).map(|brief| brief.content.clone());
         let session = session?.ok_or_else(|| format!("crew member `{role}` on vessel `{vessel}` has no intact terminal session"))?;
         match session.status.as_ref().map(|status| status.phase) {
-            Some(ResourceTerminalSessionPhase::Running) => self.deliver_to_crew_session(&session, prompt).await?,
+            Some(ResourceTerminalSessionPhase::Running) => queue_pending_crew_message(&sessions, &session, prompt).await?,
             Some(ResourceTerminalSessionPhase::Stopped) => {
                 queue_pending_crew_message(&sessions, &session, prompt).await?;
                 apply_resource_status_patch(&sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
@@ -7580,29 +7583,6 @@ impl InProcessDaemon {
             .run("gh", &["pr", "comment", &bound.id, "-R", repository_name, "--body", &comment], Path::new("/"), &ChannelLabel::Default)
             .await
             .map(|_| ())
-    }
-
-    async fn deliver_to_crew_session(
-        &self,
-        session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
-        message: &str,
-    ) -> Result<(), String> {
-        let namespace = session.metadata.namespace.clone();
-        let environment = self
-            .resource_backend
-            .clone()
-            .using::<ResourceEnvironment>(&namespace)
-            .get(&session.spec.env_ref)
-            .await
-            .map_err(|err| err.to_string())?;
-        let registry = self.registry_for_resource_environment(&environment, Path::new(&session.spec.cwd)).await?;
-        let pool = registry
-            .terminal_pools
-            .get(&session.spec.pool)
-            .map(|(_, pool)| Arc::clone(pool))
-            .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
-        let session_id = session.status.as_ref().and_then(|status| status.session_id.as_deref()).unwrap_or(session.metadata.name.as_str());
-        pool.deliver(session_id, message, true).await
     }
 
     pub async fn refresh_fleet_replicas_once(&self) -> Result<(), String> {

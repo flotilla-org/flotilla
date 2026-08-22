@@ -18,6 +18,9 @@ pub use presentation::{
     ProviderPresentationRuntime, RenderedWorkspace, ResolvedProcess,
 };
 pub use repository::{ForgeDefaultBranchResolver, RepositoryReconciler};
-pub use terminal_session::{TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
+pub use terminal_session::{
+    TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation, TerminalRuntime,
+    TerminalRuntimeState, TerminalSessionReconciler,
+};
 pub use vessel::{VesselPrepared, VesselReconciler};
 pub use vessel_placement::{VesselPlacementProjector, VesselPlacementSync};

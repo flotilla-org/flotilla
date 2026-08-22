@@ -12,8 +12,8 @@ use flotilla_controllers::reconcilers::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
     DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler, ForgeDefaultBranchResolver,
     HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
-    RepositoryReconciler, TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselPlacementProjector,
-    VesselReconciler,
+    RepositoryReconciler, TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation,
+    TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
@@ -648,6 +648,31 @@ struct ControllerRuntimeState {
     agent_material: Option<Arc<AgentMaterialRegistry>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     clone_flights: Arc<CloneFlights>,
+    terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
+}
+
+struct PendingTerminalDelivery {
+    message: String,
+    task: JoinHandle<Result<TerminalDeliveryOutcome, String>>,
+}
+
+enum TerminalDeliveryLookup {
+    InFlight,
+    Vacant,
+    Taken(PendingTerminalDelivery),
+}
+
+fn lookup_terminal_delivery(
+    deliveries: &StdMutex<HashMap<String, PendingTerminalDelivery>>,
+    session_id: &str,
+    message: &str,
+) -> TerminalDeliveryLookup {
+    let mut deliveries = deliveries.lock().expect("terminal deliveries lock poisoned");
+    match deliveries.get(session_id) {
+        Some(delivery) if delivery.message == message && !delivery.task.is_finished() => TerminalDeliveryLookup::InFlight,
+        Some(_) => TerminalDeliveryLookup::Taken(deliveries.remove(session_id).expect("observed terminal delivery")),
+        None => TerminalDeliveryLookup::Vacant,
+    }
 }
 
 struct GhForgeDefaultBranchResolver {
@@ -690,6 +715,7 @@ impl ControllerRuntimeState {
             agent_material: None,
             provisioned_environments: Mutex::new(HashMap::new()),
             clone_flights: Arc::new(CloneFlights::default()),
+            terminal_deliveries: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -3028,6 +3054,77 @@ struct TerminalControllerRuntime {
     state: Arc<ControllerRuntimeState>,
 }
 
+const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(200);
+const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(2);
+const DELIVERY_READY_POLLS: usize = 150;
+
+async fn wait_for_delivery_ready(pool: &dyn TerminalPool, session_id: &str, readiness: TerminalDeliveryReadiness) -> Result<bool, String> {
+    let mut polls = 0;
+    loop {
+        let session = pool
+            .list_sessions()
+            .await?
+            .into_iter()
+            .find(|session| session.session_name == session_id)
+            .ok_or_else(|| format!("terminal session {session_id} disappeared before message delivery"))?;
+        // Pools without screen activity cannot provide readiness evidence; retain
+        // their historical best-effort delivery behavior instead of blocking forever.
+        if session.screen_activity != Some(ScreenActivity::Active) {
+            return Ok(true);
+        }
+        polls += 1;
+        if readiness == TerminalDeliveryReadiness::Startup && polls >= DELIVERY_READY_POLLS {
+            return Ok(false);
+        }
+        tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
+    }
+}
+
+async fn session_busy_after_delivery_grace(pool: &dyn TerminalPool, session_id: &str) -> Result<bool, String> {
+    tokio::time::sleep(DELIVERY_CONFIRMATION_GRACE).await;
+    let session = pool
+        .list_sessions()
+        .await?
+        .into_iter()
+        .find(|session| session.session_name == session_id)
+        .ok_or_else(|| format!("terminal session {session_id} disappeared after message delivery"))?;
+    // An unavailable activity signal cannot disprove submission, so preserve
+    // best-effort confirmation for pools without a VT activity observer.
+    Ok(session.screen_activity != Some(ScreenActivity::Stable))
+}
+
+async fn deliver_and_confirm(
+    pool: &dyn TerminalPool,
+    session_id: &str,
+    message: &str,
+    readiness: TerminalDeliveryReadiness,
+    clear_before_delivery: bool,
+) -> Result<TerminalDeliveryOutcome, String> {
+    // PTY input sent during agent startup can be consumed before the TUI has
+    // enabled its composer input modes. A newly launched agent reports active,
+    // so wait for its first idle observation before sending delivery bytes.
+    if !wait_for_delivery_ready(pool, session_id, readiness).await? {
+        warn!(%session_id, "agent session did not become idle before message delivery deadline");
+        return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
+    }
+    if clear_before_delivery {
+        pool.retry_delivery(session_id, message).await?;
+    } else {
+        pool.deliver(session_id, message).await?;
+    }
+    if session_busy_after_delivery_grace(pool, session_id).await? {
+        return Ok(TerminalDeliveryOutcome::Confirmed);
+    }
+    warn!(%session_id, "agent session remained idle after message delivery; retrying submission once");
+    pool.retry_delivery(session_id, message).await?;
+    if session_busy_after_delivery_grace(pool, session_id).await? {
+        Ok(TerminalDeliveryOutcome::Confirmed)
+    } else {
+        warn!(%session_id, "agent session remained idle after message delivery retry");
+        Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed))
+    }
+}
+
 #[async_trait]
 impl TerminalRuntime for TerminalControllerRuntime {
     async fn ensure_session(
@@ -3065,9 +3162,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
             None if credential_refs.is_empty() => Vec::new(),
             None => return Err("host-local credential store unavailable".to_string()),
         };
-        let (command, mut env, crew, initial_message) = match &spec.source {
-            TerminalSessionSource::Tool { command } => (command.clone(), credential_env.clone(), None, None),
-            TerminalSessionSource::Agent { selector, brief, context, message } => {
+        let (command, mut env, crew) = match &spec.source {
+            TerminalSessionSource::Tool { command } => (command.clone(), credential_env.clone(), None),
+            TerminalSessionSource::Agent { selector, brief, context, .. } => {
                 let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
                 let adapter = registry
                     .agent_adapters
@@ -3102,7 +3199,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     ("FLOTILLA_NAMESPACE".to_string(), context.namespace.clone()),
                     ("FLOTILLA_TERMINAL_SESSION".to_string(), name.to_string()),
                 ]);
-                (plan.command, env, Some(crew), message.clone())
+                (plan.command, env, Some(crew))
             }
         };
         env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
@@ -3113,20 +3210,13 @@ impl TerminalRuntime for TerminalControllerRuntime {
         }
         let initial_size = is_agent_session.then_some(CREW_SESSION_SIZE);
         pool.ensure_session_with_size(name, &command, &cwd, &env, &pool_tags, initial_size).await?;
-        let delivered_message_id = initial_message.as_ref().map(|message| message.id.clone());
-        if let Some(message) = initial_message {
-            if let Err(err) = pool.deliver(name, &message.text, true).await {
-                let _ = pool.kill_session(name).await;
-                return Err(format!("deliver initial crew message: {err}"));
-            }
-        }
         Ok(TerminalRuntimeState::builder()
             .session_id(name.to_string())
             .maybe_pid(None)
             .started_at(Utc::now())
             .maybe_crew(crew)
             .launch_command(command)
-            .maybe_delivered_message_id(delivered_message_id)
+            .maybe_delivered_message_id(None)
             .build())
     }
 
@@ -3195,11 +3285,47 @@ impl TerminalRuntime for TerminalControllerRuntime {
         }))
     }
 
-    async fn deliver_message(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec, message: &str) -> Result<(), String> {
-        self.pool_for_spec(spec)?.deliver(session_id, message, true).await
+    async fn deliver_message(
+        &self,
+        session_id: &str,
+        spec: &flotilla_resources::TerminalSessionSpec,
+        message: &str,
+        readiness: TerminalDeliveryReadiness,
+    ) -> Result<TerminalDeliveryOutcome, String> {
+        let TerminalSessionSource::Agent { .. } = &spec.source else {
+            return Err("crew message delivery requires an agent terminal".to_string());
+        };
+        let pool = self.pool_for_spec(spec)?;
+        let clear_before_delivery = match lookup_terminal_delivery(&self.state.terminal_deliveries, session_id, message) {
+            TerminalDeliveryLookup::InFlight => return Ok(TerminalDeliveryOutcome::Pending),
+            TerminalDeliveryLookup::Taken(delivery) if delivery.message == message => {
+                return delivery.task.await.map_err(|error| format!("delivery confirmation task failed: {error}"))?
+            }
+            TerminalDeliveryLookup::Taken(delivery) => {
+                delivery.task.abort();
+                let _ = delivery.task.await;
+                true
+            }
+            TerminalDeliveryLookup::Vacant => false,
+        };
+        let session_id_owned = session_id.to_string();
+        let message_owned = message.to_string();
+        let task =
+            tokio::spawn(
+                async move { deliver_and_confirm(&*pool, &session_id_owned, &message_owned, readiness, clear_before_delivery).await },
+            );
+        self.state
+            .terminal_deliveries
+            .lock()
+            .expect("terminal deliveries lock poisoned")
+            .insert(session_id.to_string(), PendingTerminalDelivery { message: message.to_string(), task });
+        Ok(TerminalDeliveryOutcome::Pending)
     }
 
     async fn kill_session(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+        if let Some(delivery) = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned").remove(session_id) {
+            delivery.task.abort();
+        }
         let pool = self.pool_for_spec(spec)?;
         if pool.tracks_session_liveness() {
             match pool.list_sessions().await {
@@ -7404,6 +7530,177 @@ mod tests {
         available: AtomicBool,
     }
 
+    struct DeliveryProbePool {
+        activities: Vec<ScreenActivity>,
+        observations: AtomicUsize,
+        deliveries: AtomicUsize,
+        retries: AtomicUsize,
+    }
+
+    impl DeliveryProbePool {
+        fn new(activities: Vec<ScreenActivity>) -> Self {
+            assert!(!activities.is_empty(), "delivery probe needs at least one activity state");
+            Self { activities, observations: AtomicUsize::new(0), deliveries: AtomicUsize::new(0), retries: AtomicUsize::new(0) }
+        }
+    }
+
+    #[async_trait]
+    impl TerminalPool for DeliveryProbePool {
+        fn tracks_session_liveness(&self) -> bool {
+            true
+        }
+
+        async fn list_sessions(&self) -> Result<Vec<ProviderTerminalSession>, String> {
+            let observation = self.observations.fetch_add(1, Ordering::SeqCst);
+            let screen_activity =
+                self.activities.get(observation).copied().unwrap_or_else(|| *self.activities.last().expect("activity state"));
+            Ok(vec![ProviderTerminalSession {
+                session_name: "agent".to_string(),
+                status: TerminalStatus::Running,
+                command: Some("claude".to_string()),
+                working_directory: Some(ExecutionEnvironmentPath::new("/workspace")),
+                screen_activity: Some(screen_activity),
+            }])
+        }
+
+        async fn ensure_session(
+            &self,
+            _session_name: &str,
+            _command: &str,
+            _cwd: &ExecutionEnvironmentPath,
+            _env_vars: &TerminalEnvVars,
+            _tags: &[TerminalSessionTag],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn attach_args(
+            &self,
+            _session_name: &str,
+            _command: &str,
+            _cwd: &ExecutionEnvironmentPath,
+            _env_vars: &TerminalEnvVars,
+        ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn deliver(&self, _session_name: &str, _text: &str) -> Result<(), String> {
+            self.deliveries.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn retry_delivery(&self, _session_name: &str, _text: &str) -> Result<(), String> {
+            self.retries.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_waits_for_the_agent_tui_to_become_idle_before_submitting() {
+        let pool = DeliveryProbePool::new(vec![ScreenActivity::Active, ScreenActivity::Stable, ScreenActivity::Active]);
+
+        let outcome = deliver_and_confirm(&pool, "agent", "first line\n\nsecond line", TerminalDeliveryReadiness::Startup, false)
+            .await
+            .expect("delivery outcome");
+
+        assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
+        assert!(pool.observations.load(Ordering::SeqCst) >= 3);
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_confirmation_retries_once_then_flags_a_session_that_stays_idle() {
+        let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
+
+        let outcome = deliver_and_confirm(&pool, "agent", "stuck handoff", TerminalDeliveryReadiness::Startup, false)
+            .await
+            .expect("delivery outcome");
+
+        assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.retries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_flags_a_session_that_never_becomes_idle_without_sending_bytes() {
+        let pool = DeliveryProbePool::new(vec![ScreenActivity::Active]);
+
+        let outcome = deliver_and_confirm(&pool, "agent", "unsafe handoff", TerminalDeliveryReadiness::Startup, false)
+            .await
+            .expect("delivery outcome");
+
+        assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
+        assert_eq!(pool.observations.load(Ordering::SeqCst), DELIVERY_READY_POLLS);
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_to_an_established_busy_agent_waits_past_the_startup_deadline() {
+        let mut activities = vec![ScreenActivity::Active; DELIVERY_READY_POLLS + 10];
+        activities.extend([ScreenActivity::Stable, ScreenActivity::Active]);
+        let pool = DeliveryProbePool::new(activities);
+
+        let outcome = deliver_and_confirm(&pool, "agent", "handoff after this turn", TerminalDeliveryReadiness::TurnBoundary, false)
+            .await
+            .expect("delivery outcome");
+
+        assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
+        assert!(pool.observations.load(Ordering::SeqCst) > DELIVERY_READY_POLLS);
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_delivery_clears_the_composer_before_submitting() {
+        let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable, ScreenActivity::Active]);
+
+        let outcome = deliver_and_confirm(&pool, "agent", "replacement handoff", TerminalDeliveryReadiness::TurnBoundary, true)
+            .await
+            .expect("delivery outcome");
+
+        assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.retries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_delivery_lookup_deduplicates_same_message_and_replaces_a_different_one() {
+        let deliveries = StdMutex::new(HashMap::new());
+        let pending_task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(TerminalDeliveryOutcome::Confirmed)
+        });
+        deliveries
+            .lock()
+            .expect("delivery lock")
+            .insert("agent".to_string(), PendingTerminalDelivery { message: "first".to_string(), task: pending_task });
+
+        assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", "first"), TerminalDeliveryLookup::InFlight));
+        let TerminalDeliveryLookup::Taken(replaced) = lookup_terminal_delivery(&deliveries, "agent", "second") else {
+            panic!("different message should replace the in-flight delivery")
+        };
+        assert_eq!(replaced.message, "first");
+        replaced.task.abort();
+        assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", "second"), TerminalDeliveryLookup::Vacant));
+
+        let completed_task = tokio::spawn(async { Ok(TerminalDeliveryOutcome::Confirmed) });
+        while !completed_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        deliveries
+            .lock()
+            .expect("delivery lock")
+            .insert("agent".to_string(), PendingTerminalDelivery { message: "second".to_string(), task: completed_task });
+        let TerminalDeliveryLookup::Taken(completed) = lookup_terminal_delivery(&deliveries, "agent", "second") else {
+            panic!("finished delivery should be drained")
+        };
+        assert_eq!(completed.task.await.expect("delivery task").expect("delivery result"), TerminalDeliveryOutcome::Confirmed);
+    }
+
     impl TransientTerminalPool {
         fn new() -> Self {
             Self { inner: FakeTerminalPool::new(), available: AtomicBool::new(true) }
@@ -8904,11 +9201,15 @@ mod tests {
             .expect("reviewer session");
         let reviewer_id = reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).expect("reviewer identity").id.clone();
         assert_eq!(reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.adapter.as_str()), Some("codex"));
-        let delivered = pool.delivered.lock().await;
-        assert!(delivered.iter().any(|(session, text, submit)| {
-            session.ends_with("-reviewer") && text == "handoff from coder@implement\n\nReview commit abc123" && *submit
-        }));
-        drop(delivered);
+        wait_until(|| {
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.delivered.lock().await.iter().any(|(session, text, submit)| {
+                    session.ends_with("-reviewer") && text == "handoff from coder@implement\n\nReview commit abc123" && *submit
+                })
+            }
+        })
+        .await;
 
         let mut rx = daemon.subscribe();
         let hand_back_id = daemon
@@ -8924,11 +9225,43 @@ mod tests {
             .await
             .expect("hand back to coder");
         assert_eq!(wait_for_command_result(&mut rx, hand_back_id).await, CommandValue::Ok);
-        let delivered = pool.delivered.lock().await;
-        assert!(delivered.iter().any(|(session, text, submit)| {
-            session.ends_with("-coder") && text == "handoff from reviewer@implement\n\nAddress the review findings" && *submit
-        }));
-        drop(delivered);
+        let coder_delivery_id = terminals
+            .list()
+            .await
+            .expect("terminal list")
+            .items
+            .into_iter()
+            .find(|session| session.spec.role == "coder")
+            .and_then(|session| match session.spec.source {
+                TerminalSessionSource::Agent { message, .. } => message.map(|message| message.id),
+                TerminalSessionSource::Tool { .. } => None,
+            })
+            .expect("running coder handoff should be queued through the reconciler");
+        wait_until(|| {
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.delivered.lock().await.iter().any(|(session, text, submit)| {
+                    session.ends_with("-coder") && text == "handoff from reviewer@implement\n\nAddress the review findings" && *submit
+                })
+            }
+        })
+        .await;
+        wait_until_with_timeout(Duration::from_secs(5), || {
+            let terminals = terminals.clone();
+            let coder_delivery_id = coder_delivery_id.clone();
+            async move {
+                terminals
+                    .list()
+                    .await
+                    .ok()
+                    .and_then(|list| list.items.into_iter().find(|session| session.spec.role == "coder"))
+                    .and_then(|session| session.status)
+                    .and_then(|status| status.delivered_message_id)
+                    .as_deref()
+                    == Some(coder_delivery_id.as_str())
+            }
+        })
+        .await;
         wait_until(|| {
             let convoys = convoys.clone();
             let crew_record = crew_record.clone();

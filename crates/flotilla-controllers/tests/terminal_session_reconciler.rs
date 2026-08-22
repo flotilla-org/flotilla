@@ -9,7 +9,10 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_controllers::reconcilers::{TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
+use flotilla_controllers::reconcilers::{
+    TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation, TerminalRuntime,
+    TerminalRuntimeState, TerminalSessionReconciler,
+};
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
     test_support::{
@@ -881,7 +884,8 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     let deps = reconciler.prepare(&session).await.expect("observe pending message");
     assert_eq!(runtime.delivered.lock().expect("delivered mutex").as_slice(), &[(
         "cleat-session".to_string(),
-        "Review the amended commit".to_string()
+        "Review the amended commit".to_string(),
+        TerminalDeliveryReadiness::TurnBoundary,
     )]);
     let outcome = reconciler.reconcile(&session, &deps, Utc::now());
     assert!(matches!(
@@ -896,6 +900,79 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
 
     let deps = reconciler.prepare(&acknowledged).await.expect("observe acknowledged message");
     assert!(matches!(deps, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
+    assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), 1);
+}
+
+#[tokio::test]
+async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(&meta("term-a"), &TerminalSessionSpec {
+            env_ref: "env-a".to_string(),
+            role: "reviewer".to_string(),
+            source: flotilla_resources::TerminalSessionSource::Agent {
+                selector: flotilla_resources::Selector::for_capability("review"),
+                brief: flotilla_resources::TerminalBrief {
+                    path: ".flotilla/briefs/reviewer.md".into(),
+                    content: "brief".into(),
+                    copies: Vec::new(),
+                },
+                context: Box::new(flotilla_resources::TerminalCrewContext {
+                    namespace: "flotilla".into(),
+                    convoy: "demo".into(),
+                    vessel_ref: "demo-review".into(),
+                }),
+                message: Some(flotilla_resources::TerminalCrewMessage {
+                    id: "message-new".into(),
+                    text: "Review the amended commit".into(),
+                }),
+            },
+            cwd: "/workspace".to_string(),
+            pool: "cleat".to_string(),
+        })
+        .await
+        .expect("session");
+    let mut status = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "cleat-session".into(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "claude".into(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
+    let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
+    let runtime = Arc::new(DeliveringTerminalRuntime { delivered: Mutex::default(), unconfirmed: true });
+    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+
+    let pending = reconciler.reconcile(
+        &session,
+        &flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryPending,
+        Utc::now(),
+    );
+    assert!(pending.patch.is_none());
+    assert_eq!(pending.requeue_after, Some(Duration::from_millis(200)));
+
+    let prepared = reconciler.prepare(&session).await.expect("attempt delivery");
+    assert_eq!(runtime.delivered.lock().expect("delivered mutex")[0].2, TerminalDeliveryReadiness::Startup);
+    let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
+    let mut flagged_status = session.status.clone().expect("status");
+    outcome.patch.expect("delivery condition patch").apply(&mut flagged_status);
+    assert_eq!(flagged_status.degraded.as_ref().map(|condition| condition.reason.as_str()), Some("DeliveryUnconfirmed"));
+    assert_eq!(flagged_status.degraded.as_ref().and_then(|condition| condition.message_id.as_deref()), Some("message-new"));
+    assert_eq!(
+        flagged_status.degraded.as_ref().map(|condition| condition.message.as_str()),
+        Some("agent session remained idle after submit and one retry")
+    );
+    let flagged = sessions.update_status("term-a", &session.metadata.resource_version, &flagged_status).await.expect("flag session");
+
+    let prepared = reconciler.prepare(&flagged).await.expect("observe flag");
+    assert!(matches!(prepared, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::None));
+    assert!(reconciler.reconcile(&flagged, &prepared, Utc::now()).patch.is_none());
     assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), 1);
 }
 
@@ -998,7 +1075,8 @@ async fn terminal_finalizer_cleans_agent_artifacts() {
 
 #[derive(Default)]
 struct DeliveringTerminalRuntime {
-    delivered: Mutex<Vec<(String, String)>>,
+    delivered: Mutex<Vec<(String, String, TerminalDeliveryReadiness)>>,
+    unconfirmed: bool,
 }
 
 #[derive(Default)]
@@ -1042,9 +1120,19 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
         panic!("running sessions should not be ensured")
     }
 
-    async fn deliver_message(&self, session_id: &str, _spec: &TerminalSessionSpec, message: &str) -> Result<(), String> {
-        self.delivered.lock().expect("delivered mutex").push((session_id.to_string(), message.to_string()));
-        Ok(())
+    async fn deliver_message(
+        &self,
+        session_id: &str,
+        _spec: &TerminalSessionSpec,
+        message: &str,
+        readiness: TerminalDeliveryReadiness,
+    ) -> Result<TerminalDeliveryOutcome, String> {
+        self.delivered.lock().expect("delivered mutex").push((session_id.to_string(), message.to_string(), readiness));
+        Ok(if self.unconfirmed {
+            TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)
+        } else {
+            TerminalDeliveryOutcome::Confirmed
+        })
     }
 
     async fn observe_attention(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {

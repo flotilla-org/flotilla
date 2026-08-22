@@ -30,6 +30,34 @@ pub struct TerminalObservation {
     pub occupancy: TerminalOccupancy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalDeliveryOutcome {
+    Pending,
+    Confirmed,
+    Unconfirmed(TerminalDeliveryFailure),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalDeliveryFailure {
+    StartupNotReady,
+    SubmissionUnconfirmed,
+}
+
+impl TerminalDeliveryFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::StartupNotReady => "agent TUI did not become ready before the message delivery deadline; no text was sent",
+            Self::SubmissionUnconfirmed => "agent session remained idle after submit and one retry",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalDeliveryReadiness {
+    Startup,
+    TurnBoundary,
+}
+
 #[async_trait]
 pub trait TerminalRuntime: Send + Sync {
     async fn ensure_session(
@@ -53,7 +81,8 @@ pub trait TerminalRuntime: Send + Sync {
         _session_id: &str,
         _spec: &flotilla_resources::TerminalSessionSpec,
         _message: &str,
-    ) -> Result<(), String> {
+        _readiness: TerminalDeliveryReadiness,
+    ) -> Result<TerminalDeliveryOutcome, String> {
         Err("terminal runtime does not support crew message delivery".to_string())
     }
     async fn kill_session(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String>;
@@ -154,6 +183,8 @@ pub enum TerminalPrepared {
     Waiting,
     Running(TerminalRuntimeState),
     MessageDelivered(String),
+    MessageDeliveryPending,
+    MessageDeliveryUnconfirmed { message_id: String, message: String },
     Stopped,
     Attention(TerminalObservation),
     AttentionStale,
@@ -194,12 +225,37 @@ where
             }
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(message), .. } = &obj.spec.source {
                 if obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()) != Some(message.id.as_str()) {
+                    if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
+                        condition.reason == "DeliveryUnconfirmed" && condition.message_id.as_deref() == Some(message.id.as_str())
+                    }) {
+                        return Ok(TerminalPrepared::None);
+                    }
                     // A continuous attention signal must not starve a queued handoff.
                     // Delivery is deliberately at-least-once. A crash after the pool accepts the
                     // message but before MarkMessageDelivered is persisted may redeliver it; losing
                     // a handoff is worse, and exactly-once requires acknowledgement by the agent.
-                    self.runtime.deliver_message(session_id, &obj.spec, &message.text).await.map_err(ResourceError::other)?;
-                    return Ok(TerminalPrepared::MessageDelivered(message.id.clone()));
+                    let is_first_unobserved_delivery =
+                        obj.status.as_ref().is_none_or(|status| status.delivered_message_id.is_none() && status.attention.is_none());
+                    let readiness = if is_first_unobserved_delivery {
+                        TerminalDeliveryReadiness::Startup
+                    } else {
+                        TerminalDeliveryReadiness::TurnBoundary
+                    };
+                    return Ok(
+                        match self
+                            .runtime
+                            .deliver_message(session_id, &obj.spec, &message.text, readiness)
+                            .await
+                            .map_err(ResourceError::other)?
+                        {
+                            TerminalDeliveryOutcome::Pending => TerminalPrepared::MessageDeliveryPending,
+                            TerminalDeliveryOutcome::Confirmed => TerminalPrepared::MessageDelivered(message.id.clone()),
+                            TerminalDeliveryOutcome::Unconfirmed(failure) => TerminalPrepared::MessageDeliveryUnconfirmed {
+                                message_id: message.id.clone(),
+                                message: failure.message().to_string(),
+                            },
+                        },
+                    );
                 }
             }
             if let Some(observation) = self.runtime.observe_attention(session_id, &obj.spec).await.map_err(ResourceError::other)? {
@@ -270,6 +326,8 @@ where
                 | TerminalPrepared::None
                 | TerminalPrepared::Stopped
                 | TerminalPrepared::MessageDelivered(_)
+                | TerminalPrepared::MessageDeliveryPending
+                | TerminalPrepared::MessageDeliveryUnconfirmed { .. }
                 | TerminalPrepared::Attention(_)
                 | TerminalPrepared::AttentionStale
                 | TerminalPrepared::OwnerMissing => None,
@@ -285,6 +343,13 @@ where
             TerminalSessionPhase::Running => match prepared {
                 TerminalPrepared::MessageDelivered(message_id) => {
                     Some(TerminalSessionStatusPatch::MarkMessageDelivered { message_id: message_id.clone() })
+                }
+                TerminalPrepared::MessageDeliveryUnconfirmed { message_id, message } => {
+                    Some(TerminalSessionStatusPatch::MarkDeliveryUnconfirmed {
+                        message_id: message_id.clone(),
+                        message: message.clone(),
+                        observed_at: now,
+                    })
                 }
                 TerminalPrepared::Attention(observation) => {
                     let current = obj.status.as_ref();
@@ -323,7 +388,8 @@ where
         .or_else(|| {
             obj.status
                 .as_ref()
-                .is_some_and(|status| status.degraded.is_some())
+                .and_then(|status| status.degraded.as_ref())
+                .is_some_and(|condition| condition.reason != "DeliveryUnconfirmed")
                 .then_some(TerminalSessionStatusPatch::ClearReconcileDegraded)
         });
 
@@ -336,7 +402,11 @@ where
             }
             _ => Vec::new(),
         };
-        ReconcileOutcome::with_actuations(patch, actuations)
+        let mut outcome = ReconcileOutcome::with_actuations(patch, actuations);
+        if matches!(prepared, TerminalPrepared::MessageDeliveryPending) {
+            outcome.requeue_after = Some(Duration::from_millis(200));
+        }
+        outcome
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {

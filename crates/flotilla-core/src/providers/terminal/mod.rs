@@ -187,9 +187,15 @@ pub trait TerminalPool: Send + Sync {
         Ok(None)
     }
 
-    /// Deliver text to a running session. This trait grows only for concrete
-    /// flotilla consumers; it is not intended to mirror a pool backend's API.
-    async fn deliver(&self, _session_name: &str, _text: &str, _submit: bool) -> Result<(), String> {
+    /// Deliver and submit machinery text to a running agent session. This
+    /// operation must use the pool's reliable TUI-composer submission path.
+    async fn deliver(&self, _session_name: &str, _text: &str) -> Result<(), String> {
         Err("terminal pool does not support delivery".to_string())
+    }
+
+    /// Retry a delivery whose text is still present in a TUI composer. Pools
+    /// with keyboard-level control should clear that text before resubmitting.
+    async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
+        self.deliver(session_name, text).await
     }
 }
