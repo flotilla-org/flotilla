@@ -932,10 +932,13 @@ async fn mirror_and_canonical_roots_materialize_one_repository_and_project() {
     config.save_repo(&ExecutionEnvironmentPath::new(mirror_path.clone()));
     let repo_config_path = std::fs::read_dir(config_dir.join("repos"))
         .expect("repo config directory")
-        .next()
-        .expect("mirror repo config")
-        .expect("repo config entry")
-        .path();
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            std::fs::read_to_string(path)
+                .is_ok_and(|contents| contents.lines().any(|line| line == format!("path = \"{}\"", mirror_path.display())))
+        })
+        .expect("mirror repo config");
     std::fs::write(repo_config_path, format!("path = \"{}\"\nremotes = [\"{mirror_url}\", \"{canonical_url}\"]\n", mirror_path.display()))
         .expect("conflicting mirror declaration");
     let error = daemon.inspect_repository_path(&mirror_path, None).await.expect_err("canonical order must not flap across roots");
