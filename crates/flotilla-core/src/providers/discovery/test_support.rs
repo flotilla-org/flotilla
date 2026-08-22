@@ -915,8 +915,8 @@ impl TerminalPool for FakeTerminalPool {
         Ok(self.captured_screens.lock().await.get(session_name).cloned())
     }
 
-    async fn deliver(&self, session_name: &str, text: &str, submit: bool) -> Result<(), String> {
-        self.delivered.lock().await.push((session_name.to_string(), text.to_string(), submit));
+    async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
+        self.delivered.lock().await.push((session_name.to_string(), text.to_string(), true));
         Ok(())
     }
 }

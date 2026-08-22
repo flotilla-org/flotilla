@@ -7585,7 +7585,7 @@ impl InProcessDaemon {
             .map(|(_, pool)| Arc::clone(pool))
             .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
         let session_id = session.status.as_ref().and_then(|status| status.session_id.as_deref()).unwrap_or(session.metadata.name.as_str());
-        pool.deliver(session_id, message, true).await
+        pool.deliver(session_id, message).await
     }
 
     pub async fn refresh_fleet_replicas_once(&self) -> Result<(), String> {

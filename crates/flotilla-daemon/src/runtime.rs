@@ -3033,52 +3033,49 @@ struct TerminalControllerRuntime {
 }
 
 const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(200);
-const DELIVERY_CONFIRMATION_POLLS: usize = 10;
+const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(2);
 
-async fn delivery_pending(
-    pool: &dyn TerminalPool,
-    composer_has_text: &(dyn Fn(&str) -> Option<bool> + Sync),
-    session_id: &str,
-) -> Result<Option<bool>, String> {
-    tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
-    let session = pool.list_sessions().await?.into_iter().find(|session| session.session_name == session_id);
-    let Some(screen) = pool.capture_screen(session_id).await? else {
-        return Ok((session.as_ref().and_then(|session| session.screen_activity) == Some(ScreenActivity::Active)).then_some(false));
-    };
-    Ok(composer_has_text(&screen)
-        .or_else(|| (session.as_ref().and_then(|session| session.screen_activity) == Some(ScreenActivity::Active)).then_some(false)))
-}
-
-async fn confirm_delivery(
-    pool: &dyn TerminalPool,
-    composer_has_text: &(dyn Fn(&str) -> Option<bool> + Sync),
-    session_id: &str,
-) -> Result<bool, String> {
-    for _ in 0..DELIVERY_CONFIRMATION_POLLS {
-        match delivery_pending(pool, composer_has_text, session_id).await? {
-            Some(true) => {}
-            Some(false) | None => return Ok(true),
+async fn wait_for_delivery_ready(pool: &dyn TerminalPool, session_id: &str) -> Result<(), String> {
+    loop {
+        let session = pool
+            .list_sessions()
+            .await?
+            .into_iter()
+            .find(|session| session.session_name == session_id)
+            .ok_or_else(|| format!("terminal session {session_id} disappeared before message delivery"))?;
+        if session.screen_activity != Some(ScreenActivity::Active) {
+            return Ok(());
         }
+        tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
     }
-    Ok(false)
 }
 
-async fn deliver_and_confirm(
-    pool: &dyn TerminalPool,
-    composer_has_text: &(dyn Fn(&str) -> Option<bool> + Sync),
-    session_id: &str,
-    message: &str,
-) -> Result<TerminalDeliveryOutcome, String> {
-    pool.deliver(session_id, message, true).await?;
-    if confirm_delivery(pool, composer_has_text, session_id).await? {
+async fn session_busy_after_delivery_grace(pool: &dyn TerminalPool, session_id: &str) -> Result<bool, String> {
+    tokio::time::sleep(DELIVERY_CONFIRMATION_GRACE).await;
+    let session = pool
+        .list_sessions()
+        .await?
+        .into_iter()
+        .find(|session| session.session_name == session_id)
+        .ok_or_else(|| format!("terminal session {session_id} disappeared after message delivery"))?;
+    Ok(session.screen_activity != Some(ScreenActivity::Stable))
+}
+
+async fn deliver_and_confirm(pool: &dyn TerminalPool, session_id: &str, message: &str) -> Result<TerminalDeliveryOutcome, String> {
+    // PTY input sent during agent startup can be consumed before the TUI has
+    // enabled its composer input modes. A newly launched agent reports active,
+    // so wait for its first idle observation before sending delivery bytes.
+    wait_for_delivery_ready(pool, session_id).await?;
+    pool.deliver(session_id, message).await?;
+    if session_busy_after_delivery_grace(pool, session_id).await? {
         return Ok(TerminalDeliveryOutcome::Confirmed);
     }
-    warn!(%session_id, "agent composer retained delivered text; retrying submission once");
+    warn!(%session_id, "agent session remained idle after message delivery; retrying submission once");
     pool.retry_delivery(session_id, message).await?;
-    if confirm_delivery(pool, composer_has_text, session_id).await? {
+    if session_busy_after_delivery_grace(pool, session_id).await? {
         Ok(TerminalDeliveryOutcome::Confirmed)
     } else {
-        warn!(%session_id, "agent composer retained delivered text after submission retry");
+        warn!(%session_id, "agent session remained idle after message delivery retry");
         Ok(TerminalDeliveryOutcome::Unconfirmed)
     }
 }
@@ -3249,15 +3246,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
         spec: &flotilla_resources::TerminalSessionSpec,
         message: &str,
     ) -> Result<TerminalDeliveryOutcome, String> {
-        let TerminalSessionSource::Agent { selector, .. } = &spec.source else {
+        let TerminalSessionSource::Agent { .. } = &spec.source else {
             return Err("crew message delivery requires an agent terminal".to_string());
         };
-        let registry = self.registry_for_env(&spec.env_ref)?;
-        let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
-        let adapter = registry
-            .agent_adapters
-            .get(&requirement.adapter)
-            .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
         let pool = self.pool_for_spec(spec)?;
         let completed = {
             let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
@@ -3275,12 +3266,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
             }
             delivery.task.abort();
         }
-        let adapter = Arc::clone(adapter);
         let session_id_owned = session_id.to_string();
         let message_owned = message.to_string();
-        let task = tokio::spawn(async move {
-            deliver_and_confirm(&*pool, &|screen| adapter.composer_has_text(screen), &session_id_owned, &message_owned).await
-        });
+        let task = tokio::spawn(async move { deliver_and_confirm(&*pool, &session_id_owned, &message_owned).await });
         self.state
             .terminal_deliveries
             .lock()
@@ -7493,26 +7481,36 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct StuckComposerPool {
+    struct IdleAfterDeliveryPool {
         deliveries: AtomicUsize,
         retries: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct StartingAgentPool {
+        observations: AtomicUsize,
+        deliveries: AtomicUsize,
+    }
+
     #[async_trait]
-    impl TerminalPool for StuckComposerPool {
+    impl TerminalPool for StartingAgentPool {
         fn tracks_session_liveness(&self) -> bool {
             true
         }
 
         async fn list_sessions(&self) -> Result<Vec<ProviderTerminalSession>, String> {
+            let observation = self.observations.fetch_add(1, Ordering::SeqCst);
+            let screen_activity = match observation {
+                0 => ScreenActivity::Active,
+                1 => ScreenActivity::Stable,
+                _ => ScreenActivity::Active,
+            };
             Ok(vec![ProviderTerminalSession {
                 session_name: "agent".to_string(),
                 status: TerminalStatus::Running,
                 command: Some("claude".to_string()),
                 working_directory: Some(ExecutionEnvironmentPath::new("/workspace")),
-                // Composer evidence must outrank this coarse activity signal;
-                // incidental redraws cannot confirm text that is still loaded.
-                screen_activity: Some(ScreenActivity::Active),
+                screen_activity: Some(screen_activity),
             }])
         }
 
@@ -7541,12 +7539,65 @@ mod tests {
             Ok(())
         }
 
-        async fn capture_screen(&self, _session_name: &str) -> Result<Option<String>, String> {
-            Ok(Some("❯ stuck handoff".to_string()))
+        async fn deliver(&self, _session_name: &str, _text: &str) -> Result<(), String> {
+            assert!(self.observations.load(Ordering::SeqCst) >= 2, "delivery ran before the agent TUI became idle");
+            self.deliveries.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_waits_for_the_agent_tui_to_become_idle_before_submitting() {
+        let pool = StartingAgentPool::default();
+
+        let outcome = deliver_and_confirm(&pool, "agent", "first line\n\nsecond line").await.expect("delivery outcome");
+
+        assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
+    }
+
+    #[async_trait]
+    impl TerminalPool for IdleAfterDeliveryPool {
+        fn tracks_session_liveness(&self) -> bool {
+            true
         }
 
-        async fn deliver(&self, _session_name: &str, _text: &str, submit: bool) -> Result<(), String> {
-            assert!(submit);
+        async fn list_sessions(&self) -> Result<Vec<ProviderTerminalSession>, String> {
+            Ok(vec![ProviderTerminalSession {
+                session_name: "agent".to_string(),
+                status: TerminalStatus::Running,
+                command: Some("claude".to_string()),
+                working_directory: Some(ExecutionEnvironmentPath::new("/workspace")),
+                screen_activity: Some(ScreenActivity::Stable),
+            }])
+        }
+
+        async fn ensure_session(
+            &self,
+            _session_name: &str,
+            _command: &str,
+            _cwd: &ExecutionEnvironmentPath,
+            _env_vars: &TerminalEnvVars,
+            _tags: &[TerminalSessionTag],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn attach_args(
+            &self,
+            _session_name: &str,
+            _command: &str,
+            _cwd: &ExecutionEnvironmentPath,
+            _env_vars: &TerminalEnvVars,
+        ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn deliver(&self, _session_name: &str, _text: &str) -> Result<(), String> {
             self.deliveries.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -7558,12 +7609,10 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn delivery_confirmation_retries_once_then_returns_unconfirmed() {
-        let pool = StuckComposerPool::default();
+    async fn delivery_confirmation_retries_once_then_flags_a_session_that_stays_idle() {
+        let pool = IdleAfterDeliveryPool::default();
 
-        let outcome = deliver_and_confirm(&pool, &|screen| Some(screen.contains("stuck handoff")), "agent", "stuck handoff")
-            .await
-            .expect("delivery outcome");
+        let outcome = deliver_and_confirm(&pool, "agent", "stuck handoff").await.expect("delivery outcome");
 
         assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed);
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);

@@ -203,8 +203,8 @@ impl TerminalPool for SharedTerminalPool {
         result
     }
 
-    async fn deliver(&self, session_name: &str, text: &str, submit: bool) -> Result<(), String> {
-        self.inner.deliver(session_name, text, submit).await
+    async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
+        self.inner.deliver(session_name, text).await
     }
 }
 
