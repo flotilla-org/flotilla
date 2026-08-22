@@ -31,7 +31,7 @@ use flotilla_core::{
         discovery::{run_provisioned_host_detectors, EnvironmentBag},
         environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate},
         registry::ProviderRegistry,
-        terminal::{ScreenActivity, TerminalPool},
+        terminal::{ScreenActivity, TerminalPool, TerminalSize},
         vcs::{CloneInspection, CloneProvisioner, GitCloneProvisioner},
         ChannelLabel, CommandRunner,
     },
@@ -78,6 +78,7 @@ const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 const BUILTIN_MANAGED_BY_VALUE: &str = "builtin";
 const RECLAIM_REFUSAL_ATTENTION_AFTER: u64 = 3;
 const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
+const CREW_SESSION_SIZE: TerminalSize = TerminalSize::new(200, 50);
 
 fn compose_agent_environment(fragments: impl IntoIterator<Item = Fragment>) -> Result<Option<ComposedFile>, String> {
     let fragments = fragments.into_iter().collect::<Vec<_>>();
@@ -312,6 +313,7 @@ impl RuntimeHealth {
                             frequency.window.as_secs() / 60
                         ))
                         .observed_at(Utc::now())
+                        .blocks_readiness(false)
                         .build(),
                 ),
                 Ok(_) => None,
@@ -1603,7 +1605,7 @@ async fn apply_host_heartbeat_with_credentials(
         capabilities: host_capabilities(&summary, profile, &held_credentials, &credential_expiry),
         agent_adapter_baseline: Some(adapter_assessment.baseline),
         heartbeat_at: Some(Utc::now()),
-        ready: conditions.is_empty(),
+        ready: !conditions.iter().any(HostCondition::blocks_readiness),
         resource_store,
         daemon_generation: health.generation.clone(),
         daemon_version: Some(health.version.clone()),
@@ -1643,6 +1645,7 @@ async fn resource_authorship_collision_condition(daemon: &Arc<InProcessDaemon>, 
                 if collisions.len() == 1 { "" } else { "s" },
             ))
             .observed_at(Utc::now())
+            .blocks_readiness(false)
             .build(),
     ))
 }
@@ -3159,12 +3162,12 @@ impl TerminalRuntime for TerminalControllerRuntime {
         };
         env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
 
-        if matches!(spec.source, TerminalSessionSource::Agent { .. })
-            && pool.list_sessions().await?.iter().any(|session| session.session_name == name)
-        {
+        let is_agent_session = matches!(spec.source, TerminalSessionSource::Agent { .. });
+        if is_agent_session && pool.list_sessions().await?.iter().any(|session| session.session_name == name) {
             pool.kill_session(name).await?;
         }
-        pool.ensure_session(name, &command, &cwd, &env, &pool_tags).await?;
+        let initial_size = is_agent_session.then_some(CREW_SESSION_SIZE);
+        pool.ensure_session_with_size(name, &command, &cwd, &env, &pool_tags, initial_size).await?;
         Ok(TerminalRuntimeState::builder()
             .session_id(name.to_string())
             .maybe_pid(None)
@@ -3806,7 +3809,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn home_bound_authorship_collision_degrades_the_host_and_clears_after_removal() {
+    async fn home_bound_authorship_collision_is_advisory_and_clears_after_removal() {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("local");
         fs::create_dir_all(&config_base).expect("config directory");
@@ -3848,7 +3851,9 @@ mod tests {
         ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "local").await.expect("register local Host");
         apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("publish degraded heartbeat");
         let degraded = daemon.resource_backend().using::<Host>(NAMESPACE).get(&host_id).await.expect("read degraded Host");
-        assert!(degraded.status.expect("degraded Host status").conditions.iter().any(|condition| {
+        let status = degraded.status.expect("degraded Host status");
+        assert!(status.ready, "an authorship collision must not make the host unavailable for placement");
+        assert!(status.conditions.iter().any(|condition| {
             condition.condition_type == "ResourceReplication/AuthorshipCollision"
                 && condition.message.contains("Convoy/flotilla/command-builder")
         }));
@@ -7467,6 +7472,9 @@ mod tests {
             "fleet diagnosis should surface the restart window: {:?}",
             local.degraded_conditions
         );
+        let host_id = daemon.local_host_id().expect("local Host identity");
+        let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id.as_str()).await.expect("local Host");
+        assert!(host.status.expect("local Host status").ready, "historical abnormal exits must not block placement after recovery");
 
         runtime.shutdown();
     }
@@ -7651,6 +7659,18 @@ mod tests {
             tags: &[TerminalSessionTag],
         ) -> Result<(), String> {
             self.inner.ensure_session(session_name, command, cwd, env_vars, tags).await
+        }
+
+        async fn ensure_session_with_size(
+            &self,
+            session_name: &str,
+            command: &str,
+            cwd: &ExecutionEnvironmentPath,
+            env_vars: &TerminalEnvVars,
+            tags: &[TerminalSessionTag],
+            initial_size: Option<TerminalSize>,
+        ) -> Result<(), String> {
+            self.inner.ensure_session_with_size(session_name, command, cwd, env_vars, tags, initial_size).await
         }
 
         fn attach_args(
@@ -8676,6 +8696,7 @@ mod tests {
                 .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == crew_config_dir.to_str().expect("UTF-8 path")),
             "the contained Claude process must receive the config directory owned by its adapter"
         );
+        assert_eq!(launch.initial_size, Some(CREW_SESSION_SIZE));
     }
 
     #[tokio::test]

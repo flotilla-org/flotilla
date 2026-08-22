@@ -11,6 +11,24 @@ use crate::path_context::ExecutionEnvironmentPath;
 /// Environment variables to inject into the terminal session.
 pub type TerminalEnvVars = Vec<(String, String)>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSize {
+    pub columns: u16,
+    pub rows: u16,
+}
+
+impl TerminalSize {
+    pub const fn new(columns: u16, rows: u16) -> Self {
+        Self { columns, rows }
+    }
+}
+
+impl std::fmt::Display for TerminalSize {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}x{}", self.columns, self.rows)
+    }
+}
+
 /// Raw session data returned by a terminal pool CLI adapter.
 /// No AttachableId — the manager handles identity mapping.
 #[derive(Debug, Clone, bon::Builder)]
@@ -99,6 +117,20 @@ pub trait TerminalPool: Send + Sync {
         env_vars: &TerminalEnvVars,
         tags: &[TerminalSessionTag],
     ) -> Result<(), String>;
+
+    /// Ensure a session with an explicit initial terminal size when supported.
+    /// Pools without launch-time sizing retain their normal behavior.
+    async fn ensure_session_with_size(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        tags: &[TerminalSessionTag],
+        _initial_size: Option<TerminalSize>,
+    ) -> Result<(), String> {
+        self.ensure_session(session_name, command, cwd, env_vars, tags).await
+    }
 
     /// Returns a structured `Arg` tree representing the attach command.
     /// Callers that need a flat string can use `flatten(&args, 0)`.

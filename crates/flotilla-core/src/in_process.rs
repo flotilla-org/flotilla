@@ -58,8 +58,8 @@ use flotilla_resources::{
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
     WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, PROJECT_LABEL, ROLE_LABEL,
-    VESSEL_LABEL, VESSEL_REF_LABEL,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, GENERATION_LABEL,
+    HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -1264,7 +1264,7 @@ fn placement_host_not_ready_reason(placement_name: &str, host_label: &str, gener
     let mut failing_conditions = status
         .conditions
         .iter()
-        .filter(|condition| condition.value == ConditionValue::False)
+        .filter(|condition| condition.blocks_readiness())
         .map(|condition| format!("{}: {}", condition.reason, condition.message))
         .collect::<Vec<_>>();
     failing_conditions.sort();
@@ -1641,6 +1641,22 @@ fn crew_handoff_address_error(target: &str, vessel: &str) -> String {
 
 fn crew_handoff_message(context: &ResolvedCrewContext, message: &str) -> String {
     format!("handoff from {}@{}\n\n{message}", context.caller_role, context.vessel)
+}
+
+fn terminal_meta_with_vessel_credentials(mut meta: InputMeta, requirement: &flotilla_resources::VesselRequirement) -> InputMeta {
+    if !requirement.credential_refs.is_empty() {
+        meta.annotations.insert(
+            CREDENTIAL_REFS_ANNOTATION.to_string(),
+            serde_json::to_string(&requirement.credential_refs).expect("credential names serialize"),
+        );
+    }
+    if !requirement.credential_scopes.is_empty() {
+        meta.annotations.insert(
+            CREDENTIAL_SCOPES_ANNOTATION.to_string(),
+            serde_json::to_string(&requirement.credential_scopes).expect("credential scopes serialize"),
+        );
+    }
+    meta
 }
 
 async fn queue_pending_crew_message(
@@ -7306,8 +7322,9 @@ impl InProcessDaemon {
                     );
                 let brief =
                     handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, &repository_refs, &render_options)?;
+                let terminal_meta = terminal_meta_with_vessel_credentials(identity.input_meta(), task);
                 sessions
-                    .create(&identity.input_meta(), &flotilla_resources::TerminalSessionSpec {
+                    .create(&terminal_meta, &flotilla_resources::TerminalSessionSpec {
                         env_ref: anchor.spec.env_ref,
                         role: target.to_string(),
                         source: TerminalSessionSource::Agent {

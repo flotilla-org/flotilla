@@ -52,6 +52,152 @@ fn test_meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
 }
 
+#[tokio::test]
+async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_reviewer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"two-crew-contained-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    let repository = RepositoryKey("github.com-flotilla-org-flotilla".to_string());
+    let requirement = VesselRequirement::builder()
+        .name("work".to_string())
+        .stance(Stance::Contained)
+        .credential_refs(BTreeSet::from(["claude-max".to_string(), "github-crew-pr".to_string()]))
+        .credential_scopes(BTreeMap::from([
+            ("claude-max".to_string(), BTreeSet::from([repository.clone()])),
+            ("github-crew-pr".to_string(), BTreeSet::from([repository])),
+        ]))
+        .crew(vec![
+            CrewSpec::builder()
+                .role("coder".to_string())
+                .source(CrewSource::Agent {
+                    selector: Selector { capability: "code".to_string(), adapter: Some("codex".to_string()), model: None },
+                    prompt: None,
+                    brief_template: None,
+                })
+                .build(),
+            CrewSpec::builder()
+                .role("reviewer".to_string())
+                .source(CrewSource::Agent {
+                    selector: Selector { capability: "code-review".to_string(), adapter: Some("claude-code".to_string()), model: None },
+                    prompt: Some("Review the coder's implementation.".to_string()),
+                    brief_template: None,
+                })
+                .build(),
+        ])
+        .build();
+
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let convoy = convoys
+        .create(&test_meta("convoy-two-crew"), &ConvoySpec::builder().workflow_ref("implement-review".to_string()).build())
+        .await
+        .expect("convoy");
+    convoys
+        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: flotilla_resources::ConvoyPhase::Active,
+            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                exit: None,
+                turn_delivery: Default::default(),
+                vessels: vec![requirement.clone()],
+            }),
+            crew_work: BTreeMap::from([(
+                "work".to_string(),
+                BTreeMap::from([
+                    ("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
+                    ("reviewer".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()),
+                ]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("active convoy");
+    backend
+        .clone()
+        .using::<Vessel>("flotilla")
+        .create(&test_meta("convoy-two-crew-work"), &flotilla_resources::VesselSpec {
+            convoy_ref: "convoy-two-crew".to_string(),
+            vessel_name: "work".to_string(),
+            placement_policy_ref: "contained".to_string(),
+            adopted_checkout_refs: BTreeMap::new(),
+        })
+        .await
+        .expect("vessel");
+
+    let coder_identity = TerminalSessionIdentity::builder()
+        .vessel_ref("convoy-two-crew-work".to_string())
+        .convoy("convoy-two-crew".to_string())
+        .vessel("work".to_string())
+        .role("coder".to_string())
+        .vessel_index(0)
+        .crew_index(0)
+        .build();
+    let coder_meta = terminal_meta_with_vessel_credentials(coder_identity.input_meta(), &requirement);
+    backend
+        .clone()
+        .using::<ResourceTerminalSession>("flotilla")
+        .create(&coder_meta, &ResourceTerminalSessionSpec {
+            env_ref: "contained-env".to_string(),
+            role: "coder".to_string(),
+            source: TerminalSessionSource::Agent {
+                selector: Selector { capability: "code".to_string(), adapter: Some("codex".to_string()), model: None },
+                brief: flotilla_resources::TerminalBrief {
+                    path: ".flotilla/briefs/coder.md".to_string(),
+                    content: "Implement the issue.".to_string(),
+                    copies: Vec::new(),
+                },
+                context: Box::new(flotilla_resources::TerminalCrewContext {
+                    namespace: "flotilla".to_string(),
+                    convoy: "convoy-two-crew".to_string(),
+                    vessel_ref: "convoy-two-crew-work".to_string(),
+                }),
+                message: None,
+            },
+            cwd: "/workspace".to_string(),
+            pool: "contained".to_string(),
+        })
+        .await
+        .expect("eager coder terminal");
+
+    daemon
+        .crew_handoff_internal(
+            &CrewCommandContext {
+                crew_id: None,
+                namespace: Some("flotilla".to_string()),
+                convoy: Some("convoy-two-crew".to_string()),
+                vessel_ref: Some("convoy-two-crew-work".to_string()),
+                role: Some("coder".to_string()),
+            },
+            "reviewer",
+            "Please review the implementation.",
+        )
+        .await
+        .expect("handoff to latent reviewer");
+
+    let reviewer = backend
+        .using::<ResourceTerminalSession>("flotilla")
+        .get("terminal-convoy-two-crew-work-reviewer")
+        .await
+        .expect("latent reviewer terminal");
+    let TerminalSessionSource::Agent { selector, .. } = &reviewer.spec.source else {
+        panic!("reviewer must be an agent session");
+    };
+    assert_eq!(selector.adapter.as_deref(), Some("claude-code"));
+    assert_eq!(reviewer.spec.env_ref, "contained-env");
+    assert_eq!(reviewer.metadata.annotations.get(CREDENTIAL_REFS_ANNOTATION), Some(&r#"["claude-max","github-crew-pr"]"#.to_string()));
+    assert_eq!(
+        reviewer.metadata.annotations.get(CREDENTIAL_SCOPES_ANNOTATION),
+        Some(&r#"{"claude-max":["github.com-flotilla-org-flotilla"],"github-crew-pr":["github.com-flotilla-org-flotilla"]}"#.to_string())
+    );
+    assert_eq!(reviewer.metadata.annotations, coder_meta.annotations);
+}
+
 async fn create_identity_convoy(backend: &ResourceBackend, record: &str, role: &str, project: Option<&str>) {
     let labels = BTreeMap::from([
         (PROJECT_LABEL.to_string(), project.unwrap_or_default().to_string()),
@@ -1275,6 +1421,37 @@ StoredObjectDecodeFailed: ConvoyEnsure/quarantined-record failed typed decode\n\
 - `host-direct-udder`: placement `host-direct-udder` host `udder` generation `udder-generation` is not ready: \
 RestartBudgetExhausted: resource controller stopped after repeated failures"
     );
+}
+
+#[tokio::test]
+async fn default_placement_accepts_a_host_with_an_authorship_collision() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    create_host_direct_placement(&backend, "host-direct-feta", "feta", BTreeSet::from(["codex".to_string()])).await;
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let host = hosts.get("feta").await.expect("host");
+    hosts
+        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
+            capabilities: host.status.expect("host status").capabilities,
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            conditions: vec![HostCondition::builder()
+                .condition_type("ResourceReplication/AuthorshipCollision")
+                .value(ConditionValue::False)
+                .reason("HomeBoundRecordAuthoredAtMultipleRoots")
+                .message("Convoy/flotilla/standing-collision is authored at multiple roots")
+                .observed_at(Utc::now())
+                .blocks_readiness(false)
+                .build()],
+            ..HostStatus::default()
+        })
+        .await
+        .expect("host status with advisory collision");
+
+    let resolution = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), None)
+        .await
+        .expect("standing authorship collisions must not freeze dispatch placement");
+
+    assert_eq!(resolution.selected.expect("viable placement").metadata.name, "host-direct-feta");
 }
 
 async fn create_test_environment(daemon: &InProcessDaemon, name: &str, host_ref: &str) -> String {

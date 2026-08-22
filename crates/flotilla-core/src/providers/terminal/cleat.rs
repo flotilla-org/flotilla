@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use flotilla_protocol::{arg::Arg, commands::AttachMode};
 use serde::Deserialize;
 
-use super::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag};
+use super::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag, TerminalSize};
 use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{run, CommandRunner},
@@ -69,6 +69,46 @@ impl CleatTerminalPool {
         args.push(Arg::Literal(session_name.into()));
         args
     }
+
+    async fn ensure_session_at_size(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        tags: &[TerminalSessionTag],
+        initial_size: Option<TerminalSize>,
+    ) -> Result<(), String> {
+        let existing = self.list_sessions().await.unwrap_or_default();
+        if existing.iter().any(|session| session.session_name == session_name) {
+            return Ok(());
+        }
+
+        let has_env = !env_vars.is_empty() || !self.terminal_env_defaults.is_empty();
+        let effective_cmd = if !has_env {
+            command.to_string()
+        } else {
+            let mut parts = vec!["env".to_string()];
+            for (key, value) in self.terminal_env_defaults.iter().chain(env_vars) {
+                parts.push(format!("{key}={}", flotilla_protocol::arg::shell_quote(value)));
+            }
+            parts.push(command.to_string());
+            parts.join(" ")
+        };
+        let cwd = cwd.as_path().display().to_string();
+        let mut args = vec!["launch", "--json", "--record", session_name, "--cwd", &cwd, "--cmd", &effective_cmd];
+        let encoded_size = initial_size.map(|size| size.to_string());
+        if let Some(size) = &encoded_size {
+            args.extend(["--size", size]);
+        }
+        let encoded_tags = tags.iter().map(|tag| format!("{}={}", tag.key, tag.value)).collect::<Vec<_>>();
+        for tag in &encoded_tags {
+            args.push("--tag");
+            args.push(tag);
+        }
+        run!(self.runner, &self.binary, &args, Path::new("/"))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -109,31 +149,19 @@ impl TerminalPool for CleatTerminalPool {
         env_vars: &TerminalEnvVars,
         tags: &[TerminalSessionTag],
     ) -> Result<(), String> {
-        let existing = self.list_sessions().await.unwrap_or_default();
-        if existing.iter().any(|session| session.session_name == session_name) {
-            return Ok(());
-        }
+        self.ensure_session_at_size(session_name, command, cwd, env_vars, tags, None).await
+    }
 
-        let has_env = !env_vars.is_empty() || !self.terminal_env_defaults.is_empty();
-        let effective_cmd = if !has_env {
-            command.to_string()
-        } else {
-            let mut parts = vec!["env".to_string()];
-            for (key, value) in self.terminal_env_defaults.iter().chain(env_vars) {
-                parts.push(format!("{key}={}", flotilla_protocol::arg::shell_quote(value)));
-            }
-            parts.push(command.to_string());
-            parts.join(" ")
-        };
-        let cwd = cwd.as_path().display().to_string();
-        let mut args = vec!["launch", "--json", "--record", session_name, "--cwd", &cwd, "--cmd", &effective_cmd];
-        let encoded_tags = tags.iter().map(|tag| format!("{}={}", tag.key, tag.value)).collect::<Vec<_>>();
-        for tag in &encoded_tags {
-            args.push("--tag");
-            args.push(tag);
-        }
-        run!(self.runner, &self.binary, &args, Path::new("/"))?;
-        Ok(())
+    async fn ensure_session_with_size(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        tags: &[TerminalSessionTag],
+        initial_size: Option<TerminalSize>,
+    ) -> Result<(), String> {
+        self.ensure_session_at_size(session_name, command, cwd, env_vars, tags, initial_size).await
     }
 
     fn attach_args(
@@ -265,6 +293,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_launches_session_with_requested_initial_size() {
+        let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("{}".into())]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+
+        pool.ensure_session_with_size(
+            "my-session",
+            "bash",
+            &ExecutionEnvironmentPath::new("/repo"),
+            &vec![],
+            &[],
+            Some(TerminalSize::new(200, 50)),
+        )
+        .await
+        .expect("ensure sized session");
+
+        assert_eq!(runner.calls()[1].1, vec![
+            "launch",
+            "--json",
+            "--record",
+            "my-session",
+            "--cwd",
+            "/repo",
+            "--cmd",
+            "bash",
+            "--size",
+            "200x50",
+        ]);
+    }
+
+    #[tokio::test]
     async fn ensure_session_includes_env_vars_in_cmd() {
         let create_json = r#"{"id":"my-session","cwd":"/repo","cmd":"env FOO='bar' claude","status":"Detached"}"#;
         let runner = Arc::new(MockRunner::new(vec![
@@ -315,7 +373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_session_skips_if_session_exists() {
+    async fn ensure_sized_session_preserves_existing_live_session() {
         let list_json = r#"[{"id":"my-session","cwd":"/repo","cmd":"claude","status":"Detached"}]"#;
         let runner = Arc::new(MockRunner::new(vec![
             Ok(list_json.into()), // list_sessions: session exists
@@ -323,7 +381,16 @@ mod tests {
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
         let env = vec![("FOO".to_string(), "bar".to_string())];
 
-        pool.ensure_session("my-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env, &[]).await.expect("ensure session");
+        pool.ensure_session_with_size(
+            "my-session",
+            "claude",
+            &ExecutionEnvironmentPath::new("/repo"),
+            &env,
+            &[],
+            Some(TerminalSize::new(200, 50)),
+        )
+        .await
+        .expect("ensure session");
 
         let calls = runner.calls();
         assert_eq!(calls.len(), 1, "should only call list, not launch: {calls:?}");

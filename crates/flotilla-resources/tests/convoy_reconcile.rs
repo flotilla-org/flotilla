@@ -11,14 +11,15 @@ use common::{
 use flotilla_resources::{
     change_request_record_name,
     controller::{Actuation, Reconciler},
-    controller_patches, interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest, ChangeRequestReviewObservation,
-    ChangeRequestSpec, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus,
-    CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatus, ConvoyStatusPatch,
-    ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, LandedEvidence,
-    LifecycleAuthority, Observation, ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability,
-    OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, StatusPatch, TargetMismatch, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority,
-    WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
+    controller_patches, evaluate_landing_settlement, interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest,
+    ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutPhase,
+    CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler,
+    ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue,
+    IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation, ObservedChangeRequestState, ObservedCheckoutSpec,
+    ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, StatusPatch,
+    TargetMismatch, TerminalSession, TerminalSessionSource, TerminalSessionSpec, UnmetSettlementExpectation, ValidationError, Vessel,
+    VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
+    VESSEL_LABEL,
 };
 
 struct AlwaysEligible;
@@ -719,6 +720,45 @@ fn landing_convoy_with_no_declared_exit_never_settles() {
     let outcome = reconcile(&convoy, None, timestamp(40));
 
     assert_eq!(outcome.patch, None, "an absent exit must not synthesize a Landed transition");
+}
+
+#[test]
+fn missing_change_request_is_reported_once_across_terminal_exit_entries() {
+    let mut status = bootstrapped_convoy_status();
+    status.phase = ConvoyPhase::Landing;
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+    let repo_ref = RepositoryKey("repo-a".to_string());
+    let mut spec = valid_convoy_spec();
+    spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec::builder()
+        .url("https://github.com/flotilla-org/flotilla".to_string())
+        .repo_ref(repo_ref.clone())
+        .source_ref("feature/missing-observation".to_string())
+        .target_ref("main".to_string())
+        .workspace_slug("flotilla".to_string())
+        .subpaths(Vec::new())
+        .build()];
+    spec.change_request =
+        Some(BoundChangeRequest::builder().id("1624".to_string()).repository_ref(repo_ref).title("merged change".to_string()).build());
+    let convoy = convoy_object("missing-observation", spec, Some(status));
+
+    let evaluation = evaluate_landing_settlement(
+        &convoy,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        Duration::from_secs(180),
+        Duration::from_secs(180),
+        timestamp(40),
+    );
+
+    assert_eq!(
+        evaluation
+            .unmet
+            .iter()
+            .filter(|expectation| matches!(expectation, UnmetSettlementExpectation::MissingChangeRequest { .. }))
+            .count(),
+        1,
+        "merged and closed exit entries must not duplicate the same missing observation"
+    );
 }
 
 #[tokio::test]
