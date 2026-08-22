@@ -781,6 +781,7 @@ async fn convoy_start_routes_to_placement_host_when_presentation_membership_is_s
                             .project_ref("flotilla".to_string())
                             .name("remote-work".to_string())
                             .branch("fix/remote-work".to_string())
+                            .workflow_ref("remote-workflow".to_string())
                             .placement_policy(placement_policy)
                             .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                             .build(),
@@ -917,6 +918,7 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
                             .project_ref("flotilla".to_string())
                             .name("kiwi-to-feta".to_string())
                             .branch("fix/kiwi-to-feta".to_string())
+                            .workflow_ref("remote-workflow".to_string())
                             .placement_policy(placement_policy)
                             .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                             .build(),
