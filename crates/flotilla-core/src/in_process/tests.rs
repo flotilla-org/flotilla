@@ -806,6 +806,33 @@ async fn concurrent_ensure_admission_creates_only_one_live_generation() {
 }
 
 #[tokio::test]
+async fn replicated_ensure_is_not_reconciled_away_from_its_project_home() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    let project = backend.using::<Project>("flotilla").get("standing-project").await.expect("local project");
+    let ensure = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("local ensure");
+
+    backend.using::<ConvoyEnsure>("flotilla").delete("quartermaster").await.expect("remove local ensure");
+    backend.using::<Project>("flotilla").delete("standing-project").await.expect("remove local project");
+
+    let origin = ResourceBackend::InMemory(InMemoryBackend::default());
+    origin.using::<Project>("flotilla").create(&InputMeta::from(&project.metadata), &project.spec).await.expect("remote project");
+    origin.using::<ConvoyEnsure>("flotilla").create(&InputMeta::from(&ensure.metadata), &ensure.spec).await.expect("remote ensure");
+    backend
+        .replica_writer::<Project>(NodeId::new("remote-root"), "flotilla")
+        .replace(&origin.using::<Project>("flotilla").list().await.expect("remote projects"), Utc::now())
+        .await
+        .expect("replicate project");
+    backend
+        .replica_writer::<ConvoyEnsure>(NodeId::new("remote-root"), "flotilla")
+        .replace(&origin.using::<ConvoyEnsure>("flotilla").list().await.expect("remote ensures"), Utc::now())
+        .await
+        .expect("replicate ensure");
+
+    assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("skip remote ensure").is_empty());
+    assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("local convoys").items.is_empty());
+}
+
+#[tokio::test]
 async fn statusless_ensured_generation_is_live_even_when_address_labels_are_missing() {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
