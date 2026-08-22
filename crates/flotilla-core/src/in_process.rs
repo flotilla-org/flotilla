@@ -2423,18 +2423,17 @@ impl InProcessDaemon {
 
     pub async fn inspect_repository_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
         let mut inspection = self.repository_inspector().await?.inspect_path(path, remote).await?;
-        inspection.spec = self.resolve_declared_repository(inspection.spec).await?;
-        let resolved_spec = inspection.spec;
-        let configured_spec =
-            self.config.configure_repository_spec(&ExecutionEnvironmentPath::new(&inspection.checkout.path), resolved_spec.clone())?;
-        if resolved_spec.remotes().len() > 1 && configured_spec.key() != resolved_spec.key() {
-            return Err(format!(
-                "repository config for {} changes the canonical remote of an existing declaration",
-                inspection.checkout.path.display()
-            ));
-        }
-        inspection.spec = configured_spec;
+        inspection.spec = self.configure_inspected_repository(&inspection.checkout.path, inspection.spec).await?;
         Ok(inspection)
+    }
+
+    async fn configure_inspected_repository(&self, path: &Path, spec: RepositorySpec) -> Result<RepositorySpec, String> {
+        let resolved_spec = self.resolve_declared_repository(spec).await?;
+        let configured_spec = self.config.configure_repository_spec(&ExecutionEnvironmentPath::new(path), resolved_spec.clone())?;
+        if resolved_spec.remotes().len() > 1 && configured_spec.key() != resolved_spec.key() {
+            return Err(format!("repository config for {} changes the canonical remote of an existing declaration", path.display()));
+        }
+        Ok(configured_spec)
     }
 
     pub async fn repository_key_for_path(&self, path: &Path) -> Option<RepositoryKey> {
@@ -2482,10 +2481,10 @@ impl InProcessDaemon {
         git_ref: Option<&str>,
     ) -> Result<RepositoryInspection, String> {
         if let (Some(repository_url), Some(git_ref)) = (repository_url, git_ref) {
-            if let Ok(mut spec) = RepositorySpec::remote(repository_url) {
+            if let Ok(spec) = RepositorySpec::remote(repository_url) {
                 let path = std::fs::canonicalize(path)
                     .map_err(|error| format!("adopted checkout path {} cannot be resolved: {error}", path.display()))?;
-                spec = self.config.configure_repository_spec(&ExecutionEnvironmentPath::new(&path), spec)?;
+                let spec = self.configure_inspected_repository(&path, spec).await?;
                 let host_ref = self.local_host_id().ok_or_else(|| "local Host identity is unavailable".to_string())?.to_string();
                 return Ok(RepositoryInspection {
                     spec,
