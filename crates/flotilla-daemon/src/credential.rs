@@ -1191,9 +1191,13 @@ async fn remove_registry_config(path: &Path) -> Result<(), std::io::Error> {
 
 /// The claude CLI writes millisecond epochs; treat implausibly-large
 /// second values as milliseconds so either unit decodes to the same instant.
+/// Non-positive values are sentinels for absent metadata, not dates.
 fn epoch_to_datetime(value: i64) -> Option<DateTime<Utc>> {
     const MILLISECOND_THRESHOLD: i64 = 100_000_000_000;
-    if value.abs() >= MILLISECOND_THRESHOLD {
+    if value <= 0 {
+        return None;
+    }
+    if value >= MILLISECOND_THRESHOLD {
         DateTime::from_timestamp_millis(value)
     } else {
         DateTime::from_timestamp(value, 0)
@@ -1448,6 +1452,36 @@ mod tests {
 
         tokio::fs::write(claude_dir.join(".credentials.json"), "not json").await.expect("write malformed file");
         assert_eq!(store.credential_expiry().await, BTreeMap::new());
+    }
+
+    #[tokio::test]
+    async fn ambient_claude_expiry_probe_treats_non_positive_timestamps_as_absent() {
+        let home = tempfile::tempdir().expect("home dir");
+        let claude_dir = home.path().join(".claude");
+        tokio::fs::create_dir_all(&claude_dir).await.expect("create claude dir");
+        tokio::fs::write(claude_dir.join(".credentials.json"), r#"{"claudeAiOauth":{"expiresAt":0,"refreshTokenExpiresAt":-1}}"#)
+            .await
+            .expect("write credentials file");
+        let store = store_with_env(BTreeMap::from([("HOME".to_string(), home.path().to_string_lossy().into_owned())]));
+
+        assert_eq!(store.credential_expiry().await, BTreeMap::new());
+    }
+
+    #[tokio::test]
+    async fn ambient_claude_expiry_probe_preserves_live_metadata_alongside_a_sentinel() {
+        let home = tempfile::tempdir().expect("home dir");
+        let claude_dir = home.path().join(".claude");
+        tokio::fs::create_dir_all(&claude_dir).await.expect("create claude dir");
+        let refresh_expires_at_ms: i64 = 1_756_000_000_000;
+        let credentials = format!(r#"{{"claudeAiOauth":{{"expiresAt":0,"refreshTokenExpiresAt":{refresh_expires_at_ms}}}}}"#);
+        tokio::fs::write(claude_dir.join(".credentials.json"), credentials).await.expect("write credentials file");
+        let store = store_with_env(BTreeMap::from([("HOME".to_string(), home.path().to_string_lossy().into_owned())]));
+
+        let expiry = store.credential_expiry().await;
+
+        let ambient = expiry.get(AMBIENT_CLAUDE_CREDENTIAL_SCOPE).expect("ambient claude entry");
+        assert_eq!(ambient.expires_at, None);
+        assert_eq!(ambient.refresh_expires_at, DateTime::from_timestamp_millis(refresh_expires_at_ms));
     }
 
     #[tokio::test]
