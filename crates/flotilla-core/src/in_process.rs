@@ -2423,6 +2423,7 @@ impl InProcessDaemon {
 
     pub async fn inspect_repository_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
         let mut inspection = self.repository_inspector().await?.inspect_path(path, remote).await?;
+        inspection.spec = self.resolve_declared_repository(inspection.spec).await?;
         inspection.spec =
             self.config.configure_repository_spec(&ExecutionEnvironmentPath::new(&inspection.checkout.path), inspection.spec)?;
         Ok(inspection)
@@ -2433,7 +2434,37 @@ impl InProcessDaemon {
     }
 
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
-        self.repository_inspector().await?.resolve_remote(remote).await
+        let spec = self.repository_inspector().await?.resolve_remote(remote).await?;
+        self.resolve_declared_repository(spec).await
+    }
+
+    async fn resolve_declared_repository(&self, observed: RepositorySpec) -> Result<RepositorySpec, String> {
+        let flotilla_resources::RepositoryIdentity::Remote { canonical_remote } = observed.identity() else {
+            return Ok(observed);
+        };
+        let namespace = self.provisioning_namespace().await;
+        let matches = self
+            .resource_backend
+            .clone()
+            .using::<Repository>(&namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .filter(|repository| repository.spec.declares_remote(canonical_remote))
+            .collect::<Vec<_>>();
+        let declared = matches.iter().filter(|repository| repository.spec.remotes().len() > 1).collect::<Vec<_>>();
+        match declared.as_slice() {
+            [repository] => return Ok(repository.spec.clone()),
+            [_, _, ..] => return Err(format!("remote `{canonical_remote}` is declared by multiple Repositories")),
+            [] => {}
+        }
+        match matches.as_slice() {
+            [] => Ok(observed),
+            [repository] => Ok(repository.spec.clone()),
+            _ => Err(format!("remote `{canonical_remote}` is declared by multiple Repositories")),
+        }
     }
 
     async fn inspect_adopted_checkout(
@@ -5924,6 +5955,7 @@ impl InProcessDaemon {
             .map(|repository| (RepositoryKey(repository.metadata.name.clone()), repository.spec.clone()))
             .collect::<BTreeMap<_, _>>();
         let mut superseded_keys = BTreeSet::new();
+        let mut declared_alias_keys = BTreeSet::new();
         let previous_tracked_key = self
             .repository_keys_by_path
             .read()
@@ -5935,8 +5967,12 @@ impl InProcessDaemon {
             superseded_keys.insert(previous.clone());
         }
         for (key, spec) in &repository_specs {
-            if key != &repository_key && local_repository_matches_checkout(spec, &inspection.checkout) {
+            let aliases_current_repository = spec.remotes().iter().any(|remote| repository_spec.declares_remote(remote));
+            if key != &repository_key && (local_repository_matches_checkout(spec, &inspection.checkout) || aliases_current_repository) {
                 superseded_keys.insert(key.clone());
+                if aliases_current_repository {
+                    declared_alias_keys.insert(key.clone());
+                }
             }
         }
         for checkout in self
@@ -5963,11 +5999,13 @@ impl InProcessDaemon {
             .filter(|(path, _)| *path != &inspection.checkout.path)
             .map(|(_, key)| key.clone())
             .collect::<BTreeSet<_>>();
-        let migratable_keys = superseded_keys.difference(&other_tracked_keys).cloned().collect::<BTreeSet<_>>();
+        let mut migratable_keys = superseded_keys.difference(&other_tracked_keys).cloned().collect::<BTreeSet<_>>();
+        migratable_keys.extend(declared_alias_keys);
 
         let mut project_objects = projects.list().await.map_err(|error| error.to_string())?;
         let display_name = normalize_project_name(&repository_spec.leaf_slug())?;
-        let mut generated_names = whole_repository_project_names(repository_spec)?.into_iter().collect::<BTreeSet<_>>();
+        let canonical_generated_names = whole_repository_project_names(repository_spec)?.into_iter().collect::<BTreeSet<_>>();
+        let mut generated_names = canonical_generated_names.clone();
         let mut generated_display_names = BTreeSet::from([display_name.clone()]);
         for key in &migratable_keys {
             if let Some(spec) = repository_specs.get(key) {
@@ -5975,6 +6013,21 @@ impl InProcessDaemon {
                 generated_display_names.insert(normalize_project_name(&spec.leaf_slug())?);
             }
         }
+        let obsolete_mirror_projects = project_objects
+            .iter()
+            .filter(|project| {
+                project.metadata.labels.get(MANAGED_BY_LABEL).is_some_and(|value| value == WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE)
+                    && !canonical_generated_names.contains(&project.metadata.name)
+                    && (generated_names.contains(&project.metadata.name) || project.metadata.name.ends_with("-lab"))
+                    && matches!(project.spec.repositories.as_slice(), [entry] if migratable_keys.contains(&entry.repo))
+                    && repository_specs.get(&project.spec.repositories[0].repo).is_some_and(|spec| !spec.remotes().is_empty())
+            })
+            .map(|project| project.metadata.name.clone())
+            .collect::<BTreeSet<_>>();
+        for project_name in &obsolete_mirror_projects {
+            projects.delete(project_name).await.map_err(|error| error.to_string())?;
+        }
+        project_objects.retain(|project| !obsolete_mirror_projects.contains(&project.metadata.name));
         let mut migrated_project_names = BTreeSet::new();
         for project in &mut project_objects {
             if is_declaration_backed_project(project) {

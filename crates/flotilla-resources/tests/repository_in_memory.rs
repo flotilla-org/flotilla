@@ -157,6 +157,27 @@ fn remote_less_worktrees_converge_on_host_and_git_common_directory() {
 }
 
 #[test]
+fn declared_remotes_share_the_first_remote_identity() {
+    let canonical = "https://github.com/flotilla-org/flotilla";
+    let mirror = "https://forgejo.lab/lab/flotilla.git";
+    let repository =
+        RepositorySpec::remote(mirror).expect("mirror observation").with_remotes([canonical, mirror]).expect("multi-remote declaration");
+
+    assert_eq!(repository.key(), RepositorySpec::remote(canonical).expect("canonical repository").key());
+    assert_eq!(repository.remotes(), [canonical, "https://forgejo.lab/lab/flotilla"]);
+    assert!(repository.declares_remote(mirror));
+    assert_eq!(repository.forge().expect("canonical forge").service_url, "https://github.com");
+    assert_eq!(repository.repo_fact_value(), "flotilla-org/flotilla");
+}
+
+#[test]
+fn declared_remotes_must_include_the_observed_repository_and_remain_unique() {
+    let observed = RepositorySpec::remote("https://forgejo.lab/lab/flotilla").expect("mirror observation");
+    assert!(observed.clone().with_remotes(["https://github.com/flotilla-org/flotilla"]).is_err());
+    assert!(observed.with_remotes(["https://forgejo.lab/lab/flotilla", "https://forgejo.lab/lab/flotilla.git"]).is_err());
+}
+
+#[test]
 fn repository_display_labels_use_forge_slugs_and_qualify_collisions() {
     let flotilla = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository");
     let flotilla_widgets = RepositorySpec::remote("https://github.com/flotilla-org/widgets").expect("flotilla widgets repository");
