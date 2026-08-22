@@ -2456,13 +2456,13 @@ impl InProcessDaemon {
             .collect::<Vec<_>>();
         let declared = matches.iter().filter(|repository| repository.spec.remotes().len() > 1).collect::<Vec<_>>();
         match declared.as_slice() {
-            [repository] => return Ok(repository.spec.clone()),
+            [repository] => return observed.with_remotes(repository.spec.remotes().iter().cloned()),
             [_, _, ..] => return Err(format!("remote `{canonical_remote}` is declared by multiple Repositories")),
             [] => {}
         }
         match matches.as_slice() {
             [] => Ok(observed),
-            [repository] => Ok(repository.spec.clone()),
+            [repository] => observed.with_remotes(repository.spec.remotes().iter().cloned()),
             _ => Err(format!("remote `{canonical_remote}` is declared by multiple Repositories")),
         }
     }
