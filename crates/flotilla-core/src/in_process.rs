@@ -4599,6 +4599,7 @@ impl InProcessDaemon {
             if self.ensure_attention_is_active(namespace, &ensure.metadata.name).await? {
                 return Ok(None);
             }
+            self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
             self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
             return Ok(Some(format!("ConvoyEnsure/{} restart hold cleared", ensure.metadata.name)));
         }

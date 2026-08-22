@@ -4,7 +4,7 @@ use chrono::TimeZone;
 use flotilla_resources::{
     controller_patches, ConvoyEnsureStatus, ConvoyStatus, CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector,
     CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
-    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment, EnvironmentPhase,
+    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DemandStatusPatch, Environment as ResourceEnvironment, EnvironmentPhase,
     EnvironmentSpec as ResourceEnvironmentSpec, EnvironmentStatus as ResourceEnvironmentStatus, HostCondition, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Selector,
     Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
@@ -765,8 +765,17 @@ async fn standing_ensure_holds_after_three_failed_generations_and_resumes_when_a
         .is_empty());
     assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 3);
 
-    demands.delete("ensure-attention-quartermaster").await.expect("operator clears escalation");
+    apply_resource_status_patch(&demands, "ensure-attention-quartermaster", &DemandStatusPatch::Acknowledge {
+        as_of: clock.now(),
+        authority: "operator".to_string(),
+    })
+    .await
+    .expect("operator acknowledges escalation");
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("clear hold");
+    assert!(
+        matches!(demands.get("ensure-attention-quartermaster").await, Err(ResourceError::NotFound { .. })),
+        "clearing a restart hold must retire its resolved demand before another hold can reuse the name"
+    );
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("schedule fresh episode");
     clock.advance(ChronoDuration::seconds(30));
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("resume admission");
