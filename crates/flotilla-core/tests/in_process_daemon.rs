@@ -1661,7 +1661,7 @@ async fn create_test_host_direct_policy(
 }
 
 #[tokio::test]
-async fn bare_convoy_start_uses_priority_and_records_every_placement_candidate() {
+async fn trusted_host_direct_convoy_start_requires_explicit_workflow_acknowledgement() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -1708,7 +1708,7 @@ async fn bare_convoy_start_uses_priority_and_records_every_placement_candidate()
     create_test_host_direct_policy(&backend, "host-direct-z-local", &local_host_ref, -100, BTreeSet::from(["codex".to_string()])).await;
 
     let mut events = daemon.subscribe();
-    let command_id = daemon
+    let implicit_command_id = daemon
         .execute(Command {
             node_id: None,
             provisioning_target: None,
@@ -1732,6 +1732,40 @@ async fn bare_convoy_start_uses_priority_and_records_every_placement_candidate()
         })
         .await
         .expect("start command accepted");
+
+    let implicit_result = recv_command_finished(&mut events, implicit_command_id).await;
+    let CommandValue::Error { message } = implicit_result else {
+        panic!("expected implicit trusted dispatch to be rejected, got {implicit_result:?}");
+    };
+    assert!(message.contains("trusted host-direct placement `host-direct-b-remote` on `remote-host`"));
+    assert!(message.contains("inherit ambient human credentials"));
+    assert!(message.contains("operator's forge identity"));
+    assert!(message.contains("--workflow single-agent-trusted"));
+
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "flotilla".into(),
+                    change_request: None,
+                    issues: Vec::new(),
+                    name: Some("local-default".into()),
+                    branch: Some("fix/local-default".into()),
+                    workflow_ref: Some("single-agent-trusted".into()),
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: None,
+                    agent_overrides: Vec::new(),
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                }),
+            },
+        })
+        .await
+        .expect("explicitly acknowledged start command accepted");
 
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         loop {

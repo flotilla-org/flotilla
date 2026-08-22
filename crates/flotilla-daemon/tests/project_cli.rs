@@ -2,9 +2,8 @@
 
 use std::{
     collections::BTreeMap,
-    io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -28,21 +27,6 @@ use flotilla_resources::{
     ProjectRepositoryRole, ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend, Stance,
     WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
 };
-use tracing::instrument::WithSubscriber;
-#[derive(Clone)]
-struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for LogCaptureWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().expect("log capture lock should be healthy").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 fn test_config(dir: PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&dir).expect("create config dir");
     std::fs::write(dir.join("daemon.toml"), "machine_id = \"test-project-cli\"\n").expect("write daemon config");
@@ -647,7 +631,7 @@ async fn tracking_repo_materializes_whole_repo_project() {
 }
 
 #[tokio::test]
-async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_custom_fields() {
+async fn tracked_repo_labels_materialized_project_without_overwriting_user_fields() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("tracked");
@@ -666,59 +650,35 @@ async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_cu
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
 
     let projects = backend.definitions::<Project>("flotilla");
-    let log_output = Arc::new(Mutex::new(Vec::new()));
-    let writer = LogCaptureWriter(Arc::clone(&log_output));
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_target(false)
-        .with_max_level(tracing::Level::WARN)
-        .with_writer(move || writer.clone())
-        .finish();
+    let user_spec = ProjectSpec::builder()
+        .display_name("My Tracked Repository".to_string())
+        .default_workflow_ref("single-agent-contained".to_string())
+        .maybe_issue_source(Some(IssueSource { service: "https://linear.app".to_string(), scope: "TRACK".to_string() }))
+        .repositories(vec![flotilla_resources::ProjectRepositorySpec {
+            repo: repository_key,
+            alias: None,
+            roles: Default::default(),
+            subpath: None,
+            default_branch: Some("release".to_string()),
+        }])
+        .build();
     projects
         .create(
             &InputMeta::builder()
                 .name("tracked".to_string())
                 .labels(BTreeMap::from([("example.com/preserved".to_string(), "true".to_string())]))
                 .build(),
-            &ProjectSpec::builder()
-                .display_name("My Tracked Repository".to_string())
-                .default_workflow_ref("single-agent-contained".to_string())
-                .maybe_issue_source(Some(IssueSource { service: "https://linear.app".to_string(), scope: "TRACK".to_string() }))
-                .repositories(vec![flotilla_resources::ProjectRepositorySpec {
-                    repo: repository_key,
-                    alias: None,
-                    roles: Default::default(),
-                    subpath: None,
-                    default_branch: Some("release".to_string()),
-                }])
-                .build(),
+            &user_spec,
         )
         .await
         .expect("stale whole-repository Project should be created");
 
-    daemon.materialize_tracked_repo_projects().with_subscriber(subscriber).await.expect("tracked Project reconciliation should succeed");
+    daemon.materialize_tracked_repo_projects().await.expect("tracked Project reconciliation should succeed");
 
     let reconciled = projects.get("tracked").await.expect("tracked Project should remain");
-    assert_eq!(reconciled.spec.display_name, "My Tracked Repository");
-    assert_eq!(reconciled.spec.issue_source, Some(IssueSource { service: "https://linear.app".to_string(), scope: "TRACK".to_string() }));
-    assert_eq!(reconciled.spec.default_workflow_ref, "single-agent-trusted");
-    assert_eq!(reconciled.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
-        repo: RepositorySpec::remote("https://github.com/org/tracked.git").expect("repository spec").key(),
-        alias: None,
-        roles: Default::default(),
-        subpath: None,
-        default_branch: None,
-    }]);
+    assert_eq!(reconciled.spec, user_spec);
     assert_eq!(reconciled.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("whole-repository-project"));
     assert_eq!(reconciled.metadata.labels.get("example.com/preserved").map(String::as_str), Some("true"));
-    let logs = String::from_utf8(log_output.lock().expect("log capture lock should be healthy").clone()).expect("logs should be utf-8");
-    assert!(
-        logs.contains("stored generator-owned whole-repository Project fields diverged; overwriting"),
-        "expected generator-field divergence warning; captured logs: {logs:?}"
-    );
-    assert!(logs.contains("tracked"), "expected warning to identify project `tracked`; captured logs: {logs:?}");
-
     daemon.materialize_tracked_repo_projects().await.expect("steady-state reconciliation should succeed");
     let unchanged = projects.get("tracked").await.expect("tracked Project should remain");
     assert_eq!(unchanged.metadata.resource_version, reconciled.metadata.resource_version);
@@ -1510,7 +1470,7 @@ async fn concurrent_project_adds_of_one_identity_converge_on_one_verified_reposi
 }
 
 #[tokio::test]
-async fn repeated_project_add_reconciles_owned_fields_and_preserves_custom_fields() {
+async fn repeated_project_add_preserves_user_edits_to_materialized_project() {
     let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
     let spec = RepositorySpec::remote("https://github.com/org/repo.git").expect("repository spec");
     let key = spec.key();
@@ -1539,9 +1499,7 @@ async fn repeated_project_add_reconciles_owned_fields_and_preserves_custom_field
         name: "core".into()
     });
     let reconciled = projects.get("core").await.expect("project");
-    assert_eq!(reconciled.spec.display_name, "Evolved");
-    assert_eq!(reconciled.spec.issue_source, evolved.issue_source);
-    assert_eq!(reconciled.spec.default_workflow_ref, "single-agent-trusted");
+    assert_eq!(reconciled.spec, evolved);
     assert_eq!(reconciled.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("whole-repository-project"));
     assert!(matches!(
         execute_project_add(&daemon, &mut rx, "repo".to_string(), Some("core"), Some("Contradiction")).await,
