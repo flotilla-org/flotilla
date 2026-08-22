@@ -75,7 +75,7 @@ spec:
                         type: string
                       value:
                         type: string
-                        enum: [True, False, Unknown]
+                        enum: ["true", "false", "unknown"]
                       reason:
                         type: string
                       message:

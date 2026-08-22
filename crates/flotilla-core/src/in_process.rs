@@ -4502,23 +4502,31 @@ impl InProcessDaemon {
                 let target = match canonical_placement_host_ref(&self.resource_backend, namespace, driver_ref).await {
                     Ok(Some(target)) => target,
                     Ok(None) => {
-                        self.set_ensure_driver_condition(
-                            namespace,
-                            &ensure,
-                            "UnknownDriver",
-                            format!("driver host `{driver_ref}` is unknown"),
-                        )
-                        .await?;
+                        if let Err(error) = self
+                            .set_ensure_driver_condition(
+                                namespace,
+                                &ensure,
+                                "UnknownDriver",
+                                format!("driver host `{driver_ref}` is unknown"),
+                            )
+                            .await
+                        {
+                            errors.push(format!("ConvoyEnsure/{}: could not record driver condition: {error}", ensure.metadata.name));
+                        }
                         continue;
                     }
                     Err(error) => {
-                        self.set_ensure_driver_condition(
-                            namespace,
-                            &ensure,
-                            "DriverUnreachable",
-                            format!("driver host `{driver_ref}` could not be resolved: {error}"),
-                        )
-                        .await?;
+                        if let Err(patch_error) = self
+                            .set_ensure_driver_condition(
+                                namespace,
+                                &ensure,
+                                "DriverUnreachable",
+                                format!("driver host `{driver_ref}` could not be resolved: {error}"),
+                            )
+                            .await
+                        {
+                            errors.push(format!("ConvoyEnsure/{}: could not record driver condition: {patch_error}", ensure.metadata.name));
+                        }
                         continue;
                     }
                 };
@@ -4531,19 +4539,28 @@ impl InProcessDaemon {
                         .find(|host| host.object.metadata.name == target.reference.as_str())
                         .is_some_and(|host| host.object.status.as_ref().is_some_and(|status| status.ready));
                     if reachable {
-                        self.clear_ensure_driver_condition(namespace, &ensure).await?;
+                        if let Err(error) = self.clear_ensure_driver_condition(namespace, &ensure).await {
+                            errors.push(format!("ConvoyEnsure/{}: could not clear driver condition: {error}", ensure.metadata.name));
+                        }
                     } else {
-                        self.set_ensure_driver_condition(
-                            namespace,
-                            &ensure,
-                            "DriverUnreachable",
-                            format!("driver host `{driver_ref}` is not reachable"),
-                        )
-                        .await?;
+                        if let Err(error) = self
+                            .set_ensure_driver_condition(
+                                namespace,
+                                &ensure,
+                                "DriverUnreachable",
+                                format!("driver host `{driver_ref}` is not reachable"),
+                            )
+                            .await
+                        {
+                            errors.push(format!("ConvoyEnsure/{}: could not record driver condition: {error}", ensure.metadata.name));
+                        }
                     }
                     continue;
                 }
-                self.clear_ensure_driver_condition(namespace, &ensure).await?;
+                if let Err(error) = self.clear_ensure_driver_condition(namespace, &ensure).await {
+                    errors.push(format!("ConvoyEnsure/{}: could not clear driver condition: {error}", ensure.metadata.name));
+                    continue;
+                }
             } else {
                 match local_projects.get(&ensure.spec.project_ref).await {
                     Ok(project) if project.metadata.deletion_timestamp.is_none() => {}
