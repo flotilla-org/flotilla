@@ -814,20 +814,23 @@ async fn replicated_ensure_is_not_reconciled_away_from_its_project_home() {
     backend.using::<ConvoyEnsure>("flotilla").delete("quartermaster").await.expect("remove local ensure");
     backend.using::<Project>("flotilla").delete("standing-project").await.expect("remove local project");
 
-    let origin = ResourceBackend::InMemory(InMemoryBackend::default());
+    let remote_root = NodeId::new("remote-root");
+    let origin = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(remote_root.clone());
     origin.using::<Project>("flotilla").create(&InputMeta::from(&project.metadata), &project.spec).await.expect("remote project");
     origin.using::<ConvoyEnsure>("flotilla").create(&InputMeta::from(&ensure.metadata), &ensure.spec).await.expect("remote ensure");
     backend
-        .replica_writer::<Project>(NodeId::new("remote-root"), "flotilla")
+        .replica_writer::<Project>(remote_root.clone(), "flotilla")
         .replace(&origin.using::<Project>("flotilla").list().await.expect("remote projects"), Utc::now())
         .await
         .expect("replicate project");
     backend
-        .replica_writer::<ConvoyEnsure>(NodeId::new("remote-root"), "flotilla")
+        .replica_writer::<ConvoyEnsure>(remote_root, "flotilla")
         .replace(&origin.using::<ConvoyEnsure>("flotilla").list().await.expect("remote ensures"), Utc::now())
         .await
         .expect("replicate ensure");
 
+    assert!(backend.definitions::<Project>("flotilla").get("standing-project").await.is_ok(), "replicated project should be visible");
+    assert!(backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.is_ok(), "replicated ensure should be visible");
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("skip remote ensure").is_empty());
     assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("local convoys").items.is_empty());
 }
