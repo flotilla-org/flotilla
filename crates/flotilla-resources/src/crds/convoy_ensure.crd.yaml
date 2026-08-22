@@ -57,3 +57,8 @@ spec:
                   format: date-time
                 last_failure:
                   type: string
+                hold_reason:
+                  type: string
+                  enum: [backing_unverified, restart_limit]
+                observed_config_hash:
+                  type: string

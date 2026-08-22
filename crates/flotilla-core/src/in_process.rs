@@ -46,15 +46,15 @@ use flotilla_resources::{
     terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
     watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
-    ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec,
-    CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandKind, DemandSpec, Environment as ResourceEnvironment,
-    EnvironmentPhase, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue,
-    IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
-    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ReadResourceObject,
-    Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
-    SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue,
+    ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec,
+    CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind,
+    DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, HoldAct, Host as ResourceHost,
+    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy,
+    PlacementPolicySpec, Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
+    ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
     WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
@@ -2117,12 +2117,19 @@ pub const DEFAULT_PROVISIONING_NAMESPACE: &str = "flotilla";
 const FLEET_REPLICA_FRESH_SECS: i64 = 90;
 const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 const ENSURE_BACKOFF_RESET_AFTER: ChronoDuration = ChronoDuration::minutes(10);
-const ENSURE_HOLD_ATTENTION_PREFIX: &str = "reclaim-refusal-";
+const ENSURE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+const ENSURE_ESCALATION_AFTER: ChronoDuration = ChronoDuration::minutes(15);
+const ENSURE_HOLD_ATTENTION_PREFIX: &str = "ensure-attention-";
 const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
 
 fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
     let exponent = restart_count.min(5);
     ChronoDuration::seconds((30_i64.saturating_mul(1_i64 << exponent)).min(15 * 60))
+}
+
+fn ensure_config_hash(spec: &ConvoyEnsureSpec) -> Result<String, String> {
+    let encoded = serde_json::to_vec(spec).map_err(|error| format!("serialize ensure config: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
 /// Verifies the provider backing of a terminal standing convoy before the
@@ -4515,7 +4522,24 @@ impl InProcessDaemon {
     ) -> Result<Option<String>, String> {
         let now = self.clock.now();
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let status = ensure.status.clone().unwrap_or_default();
+        let mut status = ensure.status.clone().unwrap_or_default();
+        let config_hash = ensure_config_hash(&ensure.spec)?;
+        if status.observed_config_hash.as_deref() != Some(&config_hash) {
+            let changed = status.observed_config_hash.is_some();
+            self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ObserveConfig {
+                config_hash: config_hash.clone(),
+                changed,
+            })
+            .await?;
+            status.observed_config_hash = Some(config_hash);
+            if changed {
+                self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+                status.restart_count = 0;
+                status.retry_at = None;
+                status.last_failure = None;
+                status.hold_reason = None;
+            }
+        }
         let convoy = match status.convoy_ref.as_deref() {
             Some(convoy_ref) => match convoys.get(convoy_ref).await {
                 Ok(convoy) if convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name) => Some(convoy),
@@ -4571,11 +4595,19 @@ impl InProcessDaemon {
         }
 
         let convoy = convoy.expect("terminal branch requires an existing convoy");
+        if status.hold_reason == Some(ConvoyEnsureHoldReason::RestartLimit) {
+            if self.ensure_attention_is_active(namespace, &ensure.metadata.name).await? {
+                return Ok(None);
+            }
+            self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+            self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
+            return Ok(Some(format!("ConvoyEnsure/{} restart hold cleared", ensure.metadata.name)));
+        }
         let operator_forced = convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned);
         if !operator_forced {
             if let Err(reason) = backing_inspector.verify_backing_dead(&convoy).await {
                 let failure = format!("standing convoy teardown held: {reason}");
-                self.raise_ensure_attention(&convoy, &failure).await?;
+                self.raise_ensure_attention(ensure, &convoy, &failure, None).await?;
                 if status.retry_at.is_some() || status.last_failure.as_deref() != Some(&failure) {
                     self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Holding {
                         convoy_ref: convoy.metadata.name.clone(),
@@ -4591,6 +4623,16 @@ impl InProcessDaemon {
 
         if status.retry_at.is_none() {
             let failure = "ensured convoy entered a terminal failure phase";
+            if status.restart_count.saturating_add(1) >= ENSURE_MAX_CONSECUTIVE_FAILURES {
+                let failure = format!("{failure}; {} consecutive generations failed", ENSURE_MAX_CONSECUTIVE_FAILURES);
+                self.raise_ensure_attention(ensure, &convoy, &failure, Some(now + ENSURE_ESCALATION_AFTER)).await?;
+                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::RestartLimitReached {
+                    convoy_ref: convoy.metadata.name.clone(),
+                    failure,
+                })
+                .await?;
+                return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
+            }
             let retry_at = now + ensure_retry_delay(status.restart_count);
             self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::BackingOff {
                 retry_at,
@@ -4688,9 +4730,15 @@ impl InProcessDaemon {
         }
     }
 
-    async fn raise_ensure_attention(&self, convoy: &ResourceObject<ResourceConvoy>, reason: &str) -> Result<(), String> {
+    async fn raise_ensure_attention(
+        &self,
+        ensure: &ResourceObject<ConvoyEnsure>,
+        convoy: &ResourceObject<ResourceConvoy>,
+        reason: &str,
+        escalation_deadline: Option<DateTime<Utc>>,
+    ) -> Result<(), String> {
         let demands = self.resource_backend.clone().using::<ResourceDemand>(&convoy.metadata.namespace);
-        let name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{}", convoy.metadata.name);
+        let name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{}", ensure.metadata.name);
         let target = ResourceRef::new(
             api_version(ResourceConvoy::API_PATHS),
             ResourceConvoy::API_PATHS.kind,
@@ -4701,7 +4749,8 @@ impl InProcessDaemon {
             .name(name)
             .annotations(BTreeMap::from([(RECLAIM_REFUSAL_REASON_ANNOTATION.to_string(), reason.to_string())]))
             .build();
-        let spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, convoy.spec.dispatching_principal_ref.clone());
+        let mut spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, convoy.spec.dispatching_principal_ref.clone());
+        spec.expiry = escalation_deadline.map(|deadline| DemandExpiry { deadline, disposition: DemandExpiryDisposition::Escalate });
         match demands.create(&meta, &spec).await {
             Ok(_) => Ok(()),
             Err(ResourceError::Conflict { .. }) => {
@@ -4712,8 +4761,19 @@ impl InProcessDaemon {
         }
     }
 
-    async fn clear_ensure_attention(&self, namespace: &str, convoy_name: &str) -> Result<(), String> {
-        let name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{convoy_name}");
+    async fn ensure_attention_is_active(&self, namespace: &str, ensure_name: &str) -> Result<bool, String> {
+        let name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{ensure_name}");
+        match self.resource_backend.clone().using::<ResourceDemand>(namespace).get(&name).await {
+            Ok(demand) => {
+                Ok(demand.status.as_ref().is_none_or(|status| matches!(status.state, DemandState::Raised | DemandState::Escalated)))
+            }
+            Err(ResourceError::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    async fn clear_ensure_attention(&self, namespace: &str, ensure_name: &str) -> Result<(), String> {
+        let name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{ensure_name}");
         match self.resource_backend.clone().using::<ResourceDemand>(namespace).delete(&name).await {
             Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
             Err(error) => Err(error.to_string()),
@@ -4774,6 +4834,29 @@ impl InProcessDaemon {
             annotations.insert(PRESENTS_AS_ANNOTATION.to_string(), presents_as.clone());
         }
         let _admission_guard = self.convoy_admission.lock().await;
+        let selector = BTreeMap::from([
+            (PROJECT_LABEL.to_string(), ensure.spec.project_ref.clone()),
+            (ROLE_LABEL.to_string(), ensure.spec.role.clone()),
+        ]);
+        if let Some(existing) = self
+            .resource_backend
+            .clone()
+            .using::<ResourceConvoy>(namespace)
+            .list_matching_labels(&selector)
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .find(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
+        {
+            if existing.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name) {
+                return Ok(existing.metadata.name);
+            }
+            return Err(format!(
+                "live convoy {} already exists outside this ensure",
+                convoy_address(&ensure.spec.role, Some(&ensure.spec.project_ref))
+            ));
+        }
         admission.name = convoy_record_name();
         admission.spec.generation =
             allocate_convoy_generation(&self.resource_backend, namespace, admission.spec.project_ref.as_deref(), &admission.spec.role)
