@@ -18,6 +18,7 @@ use flotilla_core::{
         MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
         SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
     },
+    path_context::ExecutionEnvironmentPath,
     project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
     providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote},
     repository_inspection::{LocalCheckoutInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
@@ -851,9 +852,11 @@ async fn mirror_and_canonical_roots_materialize_one_repository_and_project() {
     std::fs::create_dir_all(&mirror_root).expect("mirror checkout");
     std::fs::create_dir_all(&github_root).expect("GitHub checkout");
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let config_dir = tmp.path().join("config");
+    let config = test_config(config_dir.clone());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
-        test_config(tmp.path().join("config")),
+        Arc::clone(&config),
         fake_discovery(false),
         HostName::new("local"),
         backend.clone(),
@@ -924,6 +927,19 @@ async fn mirror_and_canonical_roots_materialize_one_repository_and_project() {
     assert!(repositories.get(&fork.key().to_string()).await.expect("fork remains").spec.is_fork());
     assert_eq!(daemon.repository_key_for_path(&tmp.path().join("mirror-root")).await, Some(canonical.key()));
     assert_eq!(daemon.repository_key_for_path(&tmp.path().join("github-root")).await, Some(canonical.key()));
+
+    let mirror_path = tmp.path().join("mirror-root");
+    config.save_repo(&ExecutionEnvironmentPath::new(mirror_path.clone()));
+    let repo_config_path = std::fs::read_dir(config_dir.join("repos"))
+        .expect("repo config directory")
+        .next()
+        .expect("mirror repo config")
+        .expect("repo config entry")
+        .path();
+    std::fs::write(repo_config_path, format!("path = \"{}\"\nremotes = [\"{mirror_url}\", \"{canonical_url}\"]\n", mirror_path.display()))
+        .expect("conflicting mirror declaration");
+    let error = daemon.inspect_repository_path(&mirror_path, None).await.expect_err("canonical order must not flap across roots");
+    assert!(error.contains("changes the canonical remote of an existing declaration"));
 }
 
 #[tokio::test]
