@@ -4498,14 +4498,36 @@ impl InProcessDaemon {
         let mut errors = Vec::new();
         for ensure in ensures {
             match local_projects.get(&ensure.spec.project_ref).await {
-                Ok(_) => {}
-                Err(ResourceError::NotFound { .. }) => {
-                    debug!(
-                        ensure = %ensure.metadata.name,
-                        project = %ensure.spec.project_ref,
-                        "skipping standing convoy ensure away from its project home"
-                    );
+                Ok(project) if project.metadata.deletion_timestamp.is_none() => {}
+                Ok(_) => {
+                    errors.push(format!("ConvoyEnsure/{}: parent Project/{} is absent", ensure.metadata.name, ensure.spec.project_ref));
                     continue;
+                }
+                Err(ResourceError::NotFound { .. }) => {
+                    match self.resource_backend.clone().definitions::<Project>(namespace).get(&ensure.spec.project_ref).await {
+                        Ok(_) => {
+                            debug!(
+                                ensure = %ensure.metadata.name,
+                                project = %ensure.spec.project_ref,
+                                "skipping standing convoy ensure away from its project home"
+                            );
+                            continue;
+                        }
+                        Err(ResourceError::NotFound { .. }) => {
+                            errors.push(format!(
+                                "ConvoyEnsure/{}: parent Project/{} is absent",
+                                ensure.metadata.name, ensure.spec.project_ref
+                            ));
+                            continue;
+                        }
+                        Err(error) => {
+                            errors.push(format!(
+                                "ConvoyEnsure/{}: could not resolve Project/{} authority: {error}",
+                                ensure.metadata.name, ensure.spec.project_ref
+                            ));
+                            continue;
+                        }
+                    }
                 }
                 Err(error) => {
                     errors.push(format!(

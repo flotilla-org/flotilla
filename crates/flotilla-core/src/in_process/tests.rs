@@ -833,6 +833,16 @@ async fn replicated_ensure_is_not_reconciled_away_from_its_project_home() {
 }
 
 #[tokio::test]
+async fn orphaned_ensure_reports_its_absent_parent_project() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    backend.definitions::<Project>("flotilla").delete("standing-project").await.expect("remove parent project");
+
+    let error = daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("orphaned ensure must remain visible");
+    assert_eq!(error, "ConvoyEnsure/quartermaster: parent Project/standing-project is absent");
+    assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("local convoys").items.is_empty());
+}
+
+#[tokio::test]
 async fn statusless_ensured_generation_is_live_even_when_address_labels_are_missing() {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
