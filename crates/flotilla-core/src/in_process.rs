@@ -1748,12 +1748,9 @@ pub struct LiveConvoyRecord {
 }
 
 async fn allocate_convoy_generation(backend: &ResourceBackend, namespace: &str, project: Option<&str>, role: &str) -> Result<u64, String> {
-    let mut selector = BTreeMap::from([(ROLE_LABEL.to_string(), role.to_string())]);
-    selector.insert(PROJECT_LABEL.to_string(), project.unwrap_or_default().to_string());
-    let generations =
-        backend.clone().using::<ResourceConvoy>(namespace).list_matching_labels(&selector).await.map_err(|error| error.to_string())?;
+    let generations = backend.clone().using::<ResourceConvoy>(namespace).list().await.map_err(|error| error.to_string())?;
     let mut maximum = 0;
-    for convoy in generations.items {
+    for convoy in generations.items.into_iter().filter(|convoy| convoy.spec.project_ref.as_deref() == project && convoy.spec.role == role) {
         let generation =
             convoy.metadata.labels.get(GENERATION_LABEL).and_then(|value| value.parse::<u64>().ok()).unwrap_or(convoy.spec.generation);
         maximum = maximum.max(generation);

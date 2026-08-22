@@ -839,6 +839,28 @@ async fn statusless_ensured_generation_is_live_even_when_address_labels_are_miss
 }
 
 #[tokio::test]
+async fn foreign_statusless_generation_at_ensure_address_blocks_admission_without_labels() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    backend
+        .using::<ResourceConvoy>("flotilla")
+        .create(
+            &test_meta("foreign-generation"),
+            &ConvoySpec::builder()
+                .workflow_ref("quartermaster".to_string())
+                .role("quartermaster".to_string())
+                .generation(1)
+                .project_ref("standing-project".to_string())
+                .build(),
+        )
+        .await
+        .expect("foreign statusless generation");
+
+    let error = daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("foreign live address must block ensure admission");
+    assert!(error.contains("live convoy quartermaster@standing-project already exists outside this ensure"), "{error}");
+    assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items.len(), 1);
+}
+
+#[tokio::test]
 async fn changing_ensure_config_starts_a_fresh_retry_episode() {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
