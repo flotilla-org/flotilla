@@ -656,6 +656,25 @@ struct PendingTerminalDelivery {
     task: JoinHandle<Result<TerminalDeliveryOutcome, String>>,
 }
 
+enum TerminalDeliveryLookup {
+    InFlight,
+    Vacant,
+    Taken(PendingTerminalDelivery),
+}
+
+fn lookup_terminal_delivery(
+    deliveries: &StdMutex<HashMap<String, PendingTerminalDelivery>>,
+    session_id: &str,
+    message: &str,
+) -> TerminalDeliveryLookup {
+    let mut deliveries = deliveries.lock().expect("terminal deliveries lock poisoned");
+    match deliveries.get(session_id) {
+        Some(delivery) if delivery.message == message && !delivery.task.is_finished() => TerminalDeliveryLookup::InFlight,
+        Some(_) => TerminalDeliveryLookup::Taken(deliveries.remove(session_id).expect("observed terminal delivery")),
+        None => TerminalDeliveryLookup::Vacant,
+    }
+}
+
 struct GhForgeDefaultBranchResolver {
     runner: Arc<dyn CommandRunner>,
 }
@@ -3037,9 +3056,10 @@ struct TerminalControllerRuntime {
 
 const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(200);
 const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(2);
+const DELIVERY_READY_POLLS: usize = 150;
 
-async fn wait_for_delivery_ready(pool: &dyn TerminalPool, session_id: &str) -> Result<(), String> {
-    loop {
+async fn wait_for_delivery_ready(pool: &dyn TerminalPool, session_id: &str) -> Result<bool, String> {
+    for _ in 0..DELIVERY_READY_POLLS {
         let session = pool
             .list_sessions()
             .await?
@@ -3047,10 +3067,11 @@ async fn wait_for_delivery_ready(pool: &dyn TerminalPool, session_id: &str) -> R
             .find(|session| session.session_name == session_id)
             .ok_or_else(|| format!("terminal session {session_id} disappeared before message delivery"))?;
         if session.screen_activity != Some(ScreenActivity::Active) {
-            return Ok(());
+            return Ok(true);
         }
         tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
     }
+    Ok(false)
 }
 
 async fn session_busy_after_delivery_grace(pool: &dyn TerminalPool, session_id: &str) -> Result<bool, String> {
@@ -3068,7 +3089,10 @@ async fn deliver_and_confirm(pool: &dyn TerminalPool, session_id: &str, message:
     // PTY input sent during agent startup can be consumed before the TUI has
     // enabled its composer input modes. A newly launched agent reports active,
     // so wait for its first idle observation before sending delivery bytes.
-    wait_for_delivery_ready(pool, session_id).await?;
+    if !wait_for_delivery_ready(pool, session_id).await? {
+        warn!(%session_id, "agent session did not become idle before message delivery deadline");
+        return Ok(TerminalDeliveryOutcome::Unconfirmed);
+    }
     pool.deliver(session_id, message).await?;
     if session_busy_after_delivery_grace(pool, session_id).await? {
         return Ok(TerminalDeliveryOutcome::Confirmed);
@@ -3253,21 +3277,13 @@ impl TerminalRuntime for TerminalControllerRuntime {
             return Err("crew message delivery requires an agent terminal".to_string());
         };
         let pool = self.pool_for_spec(spec)?;
-        let completed = {
-            let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
-            match deliveries.get(session_id) {
-                Some(delivery) if delivery.message == message && !delivery.task.is_finished() => {
-                    return Ok(TerminalDeliveryOutcome::Pending)
-                }
-                Some(_) => deliveries.remove(session_id),
-                None => None,
+        match lookup_terminal_delivery(&self.state.terminal_deliveries, session_id, message) {
+            TerminalDeliveryLookup::InFlight => return Ok(TerminalDeliveryOutcome::Pending),
+            TerminalDeliveryLookup::Taken(delivery) if delivery.message == message => {
+                return delivery.task.await.map_err(|error| format!("delivery confirmation task failed: {error}"))?
             }
-        };
-        if let Some(delivery) = completed {
-            if delivery.message == message {
-                return delivery.task.await.map_err(|error| format!("delivery confirmation task failed: {error}"))?;
-            }
-            delivery.task.abort();
+            TerminalDeliveryLookup::Taken(delivery) => delivery.task.abort(),
+            TerminalDeliveryLookup::Vacant => {}
         }
         let session_id_owned = session_id.to_string();
         let message_owned = message.to_string();
@@ -7488,95 +7504,36 @@ mod tests {
         available: AtomicBool,
     }
 
-    #[derive(Default)]
-    struct IdleAfterDeliveryPool {
+    struct DeliveryProbePool {
+        activities: Vec<ScreenActivity>,
+        observations: AtomicUsize,
         deliveries: AtomicUsize,
         retries: AtomicUsize,
     }
 
-    #[derive(Default)]
-    struct StartingAgentPool {
-        observations: AtomicUsize,
-        deliveries: AtomicUsize,
+    impl DeliveryProbePool {
+        fn new(activities: Vec<ScreenActivity>) -> Self {
+            assert!(!activities.is_empty(), "delivery probe needs at least one activity state");
+            Self { activities, observations: AtomicUsize::new(0), deliveries: AtomicUsize::new(0), retries: AtomicUsize::new(0) }
+        }
     }
 
     #[async_trait]
-    impl TerminalPool for StartingAgentPool {
+    impl TerminalPool for DeliveryProbePool {
         fn tracks_session_liveness(&self) -> bool {
             true
         }
 
         async fn list_sessions(&self) -> Result<Vec<ProviderTerminalSession>, String> {
             let observation = self.observations.fetch_add(1, Ordering::SeqCst);
-            let screen_activity = match observation {
-                0 => ScreenActivity::Active,
-                1 => ScreenActivity::Stable,
-                _ => ScreenActivity::Active,
-            };
+            let screen_activity =
+                self.activities.get(observation).copied().unwrap_or_else(|| *self.activities.last().expect("activity state"));
             Ok(vec![ProviderTerminalSession {
                 session_name: "agent".to_string(),
                 status: TerminalStatus::Running,
                 command: Some("claude".to_string()),
                 working_directory: Some(ExecutionEnvironmentPath::new("/workspace")),
                 screen_activity: Some(screen_activity),
-            }])
-        }
-
-        async fn ensure_session(
-            &self,
-            _session_name: &str,
-            _command: &str,
-            _cwd: &ExecutionEnvironmentPath,
-            _env_vars: &TerminalEnvVars,
-            _tags: &[TerminalSessionTag],
-        ) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn attach_args(
-            &self,
-            _session_name: &str,
-            _command: &str,
-            _cwd: &ExecutionEnvironmentPath,
-            _env_vars: &TerminalEnvVars,
-        ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
-            Ok(Vec::new())
-        }
-
-        async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn deliver(&self, _session_name: &str, _text: &str) -> Result<(), String> {
-            assert!(self.observations.load(Ordering::SeqCst) >= 2, "delivery ran before the agent TUI became idle");
-            self.deliveries.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn delivery_waits_for_the_agent_tui_to_become_idle_before_submitting() {
-        let pool = StartingAgentPool::default();
-
-        let outcome = deliver_and_confirm(&pool, "agent", "first line\n\nsecond line").await.expect("delivery outcome");
-
-        assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
-        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
-    }
-
-    #[async_trait]
-    impl TerminalPool for IdleAfterDeliveryPool {
-        fn tracks_session_liveness(&self) -> bool {
-            true
-        }
-
-        async fn list_sessions(&self) -> Result<Vec<ProviderTerminalSession>, String> {
-            Ok(vec![ProviderTerminalSession {
-                session_name: "agent".to_string(),
-                status: TerminalStatus::Running,
-                command: Some("claude".to_string()),
-                working_directory: Some(ExecutionEnvironmentPath::new("/workspace")),
-                screen_activity: Some(ScreenActivity::Stable),
             }])
         }
 
@@ -7617,14 +7574,71 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn delivery_waits_for_the_agent_tui_to_become_idle_before_submitting() {
+        let pool = DeliveryProbePool::new(vec![ScreenActivity::Active, ScreenActivity::Stable, ScreenActivity::Active]);
+
+        let outcome = deliver_and_confirm(&pool, "agent", "first line\n\nsecond line").await.expect("delivery outcome");
+
+        assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
+        assert!(pool.observations.load(Ordering::SeqCst) >= 3);
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn delivery_confirmation_retries_once_then_flags_a_session_that_stays_idle() {
-        let pool = IdleAfterDeliveryPool::default();
+        let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
 
         let outcome = deliver_and_confirm(&pool, "agent", "stuck handoff").await.expect("delivery outcome");
 
         assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed);
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
         assert_eq!(pool.retries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_flags_a_session_that_never_becomes_idle_without_sending_bytes() {
+        let pool = DeliveryProbePool::new(vec![ScreenActivity::Active]);
+
+        let outcome = deliver_and_confirm(&pool, "agent", "unsafe handoff").await.expect("delivery outcome");
+
+        assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed);
+        assert_eq!(pool.observations.load(Ordering::SeqCst), DELIVERY_READY_POLLS);
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_delivery_lookup_deduplicates_same_message_and_replaces_a_different_one() {
+        let deliveries = StdMutex::new(HashMap::new());
+        let pending_task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(TerminalDeliveryOutcome::Confirmed)
+        });
+        deliveries
+            .lock()
+            .expect("delivery lock")
+            .insert("agent".to_string(), PendingTerminalDelivery { message: "first".to_string(), task: pending_task });
+
+        assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", "first"), TerminalDeliveryLookup::InFlight));
+        let TerminalDeliveryLookup::Taken(replaced) = lookup_terminal_delivery(&deliveries, "agent", "second") else {
+            panic!("different message should replace the in-flight delivery")
+        };
+        assert_eq!(replaced.message, "first");
+        replaced.task.abort();
+        assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", "second"), TerminalDeliveryLookup::Vacant));
+
+        let completed_task = tokio::spawn(async { Ok(TerminalDeliveryOutcome::Confirmed) });
+        while !completed_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        deliveries
+            .lock()
+            .expect("delivery lock")
+            .insert("agent".to_string(), PendingTerminalDelivery { message: "second".to_string(), task: completed_task });
+        let TerminalDeliveryLookup::Taken(completed) = lookup_terminal_delivery(&deliveries, "agent", "second") else {
+            panic!("finished delivery should be drained")
+        };
+        assert_eq!(completed.task.await.expect("delivery task").expect("delivery result"), TerminalDeliveryOutcome::Confirmed);
     }
 
     impl TransientTerminalPool {

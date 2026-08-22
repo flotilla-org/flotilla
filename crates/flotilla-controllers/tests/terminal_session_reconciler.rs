@@ -947,6 +947,14 @@ async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
     let runtime = Arc::new(DeliveringTerminalRuntime { delivered: Mutex::default(), unconfirmed: true });
     let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
 
+    let pending = reconciler.reconcile(
+        &session,
+        &flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryPending,
+        Utc::now(),
+    );
+    assert!(pending.patch.is_none());
+    assert_eq!(pending.requeue_after, Some(Duration::from_millis(200)));
+
     let prepared = reconciler.prepare(&session).await.expect("attempt delivery");
     let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
     let mut flagged_status = session.status.clone().expect("status");

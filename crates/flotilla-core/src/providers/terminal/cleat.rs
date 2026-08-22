@@ -225,7 +225,7 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
-        run!(self.runner, &self.binary, &["send-keys", session_name, "C-u"], Path::new("/"))?;
+        run!(self.runner, &self.binary, &["send-keys", session_name, "C-c"], Path::new("/"))?;
         self.deliver(session_name, text).await
     }
 }
@@ -604,7 +604,7 @@ mod tests {
         pool.retry_delivery("reviewer-session", "Please review commit abc123").await.expect("retry delivery");
 
         let calls = runner.calls();
-        assert_eq!(calls[0].1, vec!["send-keys", "reviewer-session", "C-u"]);
+        assert_eq!(calls[0].1, vec!["send-keys", "reviewer-session", "C-c"]);
         assert_eq!(calls[1].1, vec!["send", "reviewer-session", "\x1b[200~Please review commit abc123\x1b[201~", "--no-enter"]);
         assert_eq!(calls[2].1, vec!["send-keys", "reviewer-session", "Enter"]);
     }
