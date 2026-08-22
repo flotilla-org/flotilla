@@ -10,8 +10,8 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
-    TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation, TerminalRuntime, TerminalRuntimeState,
-    TerminalSessionReconciler,
+    TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation, TerminalRuntime,
+    TerminalRuntimeState, TerminalSessionReconciler,
 };
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
@@ -964,6 +964,10 @@ async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
     outcome.patch.expect("delivery condition patch").apply(&mut flagged_status);
     assert_eq!(flagged_status.degraded.as_ref().map(|condition| condition.reason.as_str()), Some("DeliveryUnconfirmed"));
     assert_eq!(flagged_status.degraded.as_ref().and_then(|condition| condition.message_id.as_deref()), Some("message-new"));
+    assert_eq!(
+        flagged_status.degraded.as_ref().map(|condition| condition.message.as_str()),
+        Some("agent session remained idle after submit and one retry")
+    );
     let flagged = sessions.update_status("term-a", &session.metadata.resource_version, &flagged_status).await.expect("flag session");
 
     let prepared = reconciler.prepare(&flagged).await.expect("observe flag");
@@ -1124,7 +1128,11 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
         readiness: TerminalDeliveryReadiness,
     ) -> Result<TerminalDeliveryOutcome, String> {
         self.delivered.lock().expect("delivered mutex").push((session_id.to_string(), message.to_string(), readiness));
-        Ok(if self.unconfirmed { TerminalDeliveryOutcome::Unconfirmed } else { TerminalDeliveryOutcome::Confirmed })
+        Ok(if self.unconfirmed {
+            TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)
+        } else {
+            TerminalDeliveryOutcome::Confirmed
+        })
     }
 
     async fn observe_attention(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {

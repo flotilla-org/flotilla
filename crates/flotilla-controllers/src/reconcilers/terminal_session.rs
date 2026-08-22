@@ -34,7 +34,22 @@ pub struct TerminalObservation {
 pub enum TerminalDeliveryOutcome {
     Pending,
     Confirmed,
-    Unconfirmed,
+    Unconfirmed(TerminalDeliveryFailure),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalDeliveryFailure {
+    StartupNotReady,
+    SubmissionUnconfirmed,
+}
+
+impl TerminalDeliveryFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::StartupNotReady => "agent TUI did not become ready before the message delivery deadline; no text was sent",
+            Self::SubmissionUnconfirmed => "agent session remained idle after submit and one retry",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,7 +184,7 @@ pub enum TerminalPrepared {
     Running(TerminalRuntimeState),
     MessageDelivered(String),
     MessageDeliveryPending,
-    MessageDeliveryUnconfirmed(String),
+    MessageDeliveryUnconfirmed { message_id: String, message: String },
     Stopped,
     Attention(TerminalObservation),
     AttentionStale,
@@ -235,7 +250,10 @@ where
                         {
                             TerminalDeliveryOutcome::Pending => TerminalPrepared::MessageDeliveryPending,
                             TerminalDeliveryOutcome::Confirmed => TerminalPrepared::MessageDelivered(message.id.clone()),
-                            TerminalDeliveryOutcome::Unconfirmed => TerminalPrepared::MessageDeliveryUnconfirmed(message.id.clone()),
+                            TerminalDeliveryOutcome::Unconfirmed(failure) => TerminalPrepared::MessageDeliveryUnconfirmed {
+                                message_id: message.id.clone(),
+                                message: failure.message().to_string(),
+                            },
                         },
                     );
                 }
@@ -309,7 +327,7 @@ where
                 | TerminalPrepared::Stopped
                 | TerminalPrepared::MessageDelivered(_)
                 | TerminalPrepared::MessageDeliveryPending
-                | TerminalPrepared::MessageDeliveryUnconfirmed(_)
+                | TerminalPrepared::MessageDeliveryUnconfirmed { .. }
                 | TerminalPrepared::Attention(_)
                 | TerminalPrepared::AttentionStale
                 | TerminalPrepared::OwnerMissing => None,
@@ -326,8 +344,12 @@ where
                 TerminalPrepared::MessageDelivered(message_id) => {
                     Some(TerminalSessionStatusPatch::MarkMessageDelivered { message_id: message_id.clone() })
                 }
-                TerminalPrepared::MessageDeliveryUnconfirmed(message_id) => {
-                    Some(TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { message_id: message_id.clone(), observed_at: now })
+                TerminalPrepared::MessageDeliveryUnconfirmed { message_id, message } => {
+                    Some(TerminalSessionStatusPatch::MarkDeliveryUnconfirmed {
+                        message_id: message_id.clone(),
+                        message: message.clone(),
+                        observed_at: now,
+                    })
                 }
                 TerminalPrepared::Attention(observation) => {
                     let current = obj.status.as_ref();

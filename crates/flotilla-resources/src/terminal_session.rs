@@ -308,6 +308,7 @@ pub enum TerminalSessionStatusPatch {
     },
     MarkDeliveryUnconfirmed {
         message_id: String,
+        message: String,
         observed_at: DateTime<Utc>,
     },
     MarkStopped {
@@ -363,12 +364,11 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.message = None;
                 status.degraded = None;
             }
-            Self::MarkDeliveryUnconfirmed { message_id, observed_at } => {
-                let message = "agent composer still contained the delivered text after submit and one retry".to_string();
+            Self::MarkDeliveryUnconfirmed { message_id, message, observed_at } => {
                 status.message = Some(message.clone());
                 status.degraded = Some(TerminalSessionDegradedCondition {
                     reason: "DeliveryUnconfirmed".to_string(),
-                    message,
+                    message: message.clone(),
                     message_id: Some(message_id.clone()),
                     consecutive_failures: 1,
                     observed_at: *observed_at,
@@ -516,6 +516,26 @@ mod tests {
             .apply(&mut status);
 
         assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Unobservable);
+    }
+
+    #[test]
+    fn delivery_unconfirmed_preserves_the_specific_failure_diagnostic() {
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).single().expect("valid timestamp");
+        let message = "agent TUI did not become ready before the message delivery deadline; no text was sent";
+        let mut status = TerminalSessionStatus::default();
+
+        TerminalSessionStatusPatch::MarkDeliveryUnconfirmed {
+            message_id: "handoff-1".to_string(),
+            message: message.to_string(),
+            observed_at,
+        }
+        .apply(&mut status);
+
+        assert_eq!(status.message.as_deref(), Some(message));
+        let condition = status.degraded.expect("delivery condition");
+        assert_eq!(condition.reason, "DeliveryUnconfirmed");
+        assert_eq!(condition.message, message);
+        assert_eq!(condition.message_id.as_deref(), Some("handoff-1"));
     }
 
     #[test]

@@ -12,8 +12,8 @@ use flotilla_controllers::reconcilers::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
     DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler, ForgeDefaultBranchResolver,
     HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
-    RepositoryReconciler, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation, TerminalRuntime, TerminalRuntimeState,
-    TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
+    RepositoryReconciler, TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation,
+    TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
@@ -3100,7 +3100,7 @@ async fn deliver_and_confirm(
     // so wait for its first idle observation before sending delivery bytes.
     if !wait_for_delivery_ready(pool, session_id, readiness).await? {
         warn!(%session_id, "agent session did not become idle before message delivery deadline");
-        return Ok(TerminalDeliveryOutcome::Unconfirmed);
+        return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
     }
     pool.deliver(session_id, message).await?;
     if session_busy_after_delivery_grace(pool, session_id).await? {
@@ -3112,7 +3112,7 @@ async fn deliver_and_confirm(
         Ok(TerminalDeliveryOutcome::Confirmed)
     } else {
         warn!(%session_id, "agent session remained idle after message delivery retry");
-        Ok(TerminalDeliveryOutcome::Unconfirmed)
+        Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed))
     }
 }
 
@@ -7603,7 +7603,7 @@ mod tests {
         let outcome =
             deliver_and_confirm(&pool, "agent", "stuck handoff", TerminalDeliveryReadiness::Startup).await.expect("delivery outcome");
 
-        assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed);
+        assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
         assert_eq!(pool.retries.load(Ordering::SeqCst), 1);
     }
@@ -7615,7 +7615,7 @@ mod tests {
         let outcome =
             deliver_and_confirm(&pool, "agent", "unsafe handoff", TerminalDeliveryReadiness::Startup).await.expect("delivery outcome");
 
-        assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed);
+        assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
         assert_eq!(pool.observations.load(Ordering::SeqCst), DELIVERY_READY_POLLS);
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 0);
         assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
