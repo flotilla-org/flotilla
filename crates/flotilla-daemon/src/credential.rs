@@ -217,7 +217,7 @@ impl GitCredentialPreflight {
                             &git_config_path,
                         ],
                         Path::new("/"),
-                        &ChannelLabel::Noop,
+                        &ChannelLabel::Default,
                         material.as_bytes(),
                     )
                     .await
@@ -235,7 +235,7 @@ impl GitCredentialPreflight {
                         &git_config_path,
                     ],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await
                 .map(|_| ())
@@ -253,7 +253,7 @@ impl GitCredentialPreflight {
                         host,
                     ],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await
                 .map(|_| ())
@@ -621,13 +621,13 @@ impl CredentialStore {
                     "docker",
                     &["--config", &config, "login", "--username", username, "--password-stdin", registry],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                     material.as_bytes(),
                 )
                 .await
                 .map_err(|error| format!("login preflight failed: {}", error.replace(material, "[redacted]")))?;
             self.host_runner
-                .run("docker", &["--config", &config, "pull", image], Path::new("/"), &ChannelLabel::Noop)
+                .run("docker", &["--config", &config, "pull", image], Path::new("/"), &ChannelLabel::Default)
                 .await
                 .map_err(|error| format!("pull preflight failed: {}", error.replace(material, "[redacted]")))
         }
@@ -733,7 +733,7 @@ impl CredentialStore {
             CredentialSource::IssueCommand { command, args } => {
                 let args = args.iter().map(String::as_str).collect::<Vec<_>>();
                 self.host_runner
-                    .run(command, &args, Path::new("/"), &ChannelLabel::Noop)
+                    .run(command, &args, Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|_| "issue command failed".to_string())?
             }
@@ -862,7 +862,7 @@ impl CredentialStore {
                             "sh",
                             &["-c", "IFS= read -r token; GH_TOKEN=\"$token\" gh api user --silent"],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                             material.as_bytes(),
                         )
                         .await
@@ -881,7 +881,7 @@ impl CredentialStore {
                 write_github_app_token_file(&*runner, &token_file, material).await?;
                 let token_file = token_file.to_string_lossy().into_owned();
                 let gh_path = runner
-                    .run("sh", &["-c", "command -v gh"], Path::new("/"), &ChannelLabel::Noop)
+                    .run("sh", &["-c", "command -v gh"], Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|error| format!("locate gh binary: {error}"))?;
                 let gh_path = gh_path.trim();
@@ -889,7 +889,7 @@ impl CredentialStore {
                     return Err("locate gh binary: command returned an empty path".to_string());
                 }
                 let path = runner
-                    .run("sh", &["-c", "printf '%s' \"$PATH\""], Path::new("/"), &ChannelLabel::Noop)
+                    .run("sh", &["-c", "printf '%s' \"$PATH\""], Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|error| format!("read executable search path: {error}"))?;
                 let gh_wrapper = credential_dir.join("gh");
@@ -913,7 +913,7 @@ impl CredentialStore {
                             &gh_wrapper_path,
                         ],
                         Path::new("/"),
-                        &ChannelLabel::Noop,
+                        &ChannelLabel::Default,
                     )
                     .await
                     .map_err(|error| format!("installation authentication preflight failed: {error}"))?;
@@ -947,7 +947,7 @@ impl CredentialStore {
                 if !already_prepared {
                     runner.write_file(Path::new(&path), material).await.map_err(|error| format!("write token file: {error}"))?;
                     runner
-                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Noop)
+                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("protect token file: {error}"))?;
                     let helper = format!(
@@ -959,7 +959,7 @@ impl CredentialStore {
                         .await
                         .map_err(|error| format!("write Git credential helper: {error}"))?;
                     runner
-                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Noop)
+                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("protect Git credential helper: {error}"))?;
                     let url = format!("{server_url}/api/v1/user");
@@ -969,7 +969,7 @@ impl CredentialStore {
                         sanitize_curl_config(&url)
                     );
                     runner
-                        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Noop, curl_config.as_bytes())
+                        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Default, curl_config.as_bytes())
                         .await
                         .map_err(|error| format!("authentication preflight failed: {error}"))?;
                 }
@@ -1020,7 +1020,7 @@ impl CredentialStore {
                 if !already_prepared {
                     let config_dir = self.claude_preflight_config_dir(name, &*runner).await?;
                     runner
-                        .run("mkdir", &["-p", &config_dir], Path::new("/"), &ChannelLabel::Noop)
+                        .run("mkdir", &["-p", &config_dir], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("create writable config directory: {error}"))?;
                     // Preflight: a trivial `claude -p` request under the token.
@@ -1048,7 +1048,7 @@ impl CredentialStore {
                                 &config_dir,
                             ],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                             material.as_bytes(),
                         )
                         .await
@@ -1068,7 +1068,7 @@ impl CredentialStore {
                     // persistent-base fallback would otherwise accumulate
                     // whatever `claude -p` writes for the daemon's lifetime,
                     // and removal guarantees the next probe starts empty.
-                    if let Err(error) = runner.run("rm", &["-rf", &config_dir], Path::new("/"), &ChannelLabel::Noop).await {
+                    if let Err(error) = runner.run("rm", &["-rf", &config_dir], Path::new("/"), &ChannelLabel::Default).await {
                         tracing::warn!(credential = %name, %error, "failed to remove Claude OAuth preflight scratch directory");
                     }
                     probe?;
@@ -1084,7 +1084,7 @@ impl CredentialStore {
                 let codex_home = delivery_paths.credential_dir(name).join("codex").to_string_lossy().into_owned();
                 if !already_prepared {
                     runner
-                        .run("mkdir", &["-p", &codex_home], Path::new("/"), &ChannelLabel::Noop)
+                        .run("mkdir", &["-p", &codex_home], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("create writable login cache: {error}"))?;
                     runner
@@ -1092,7 +1092,7 @@ impl CredentialStore {
                             "sh",
                             &["-c", "CODEX_HOME=\"$1\" codex login --with-api-key", "flotilla-codex-login", &codex_home],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                             material.as_bytes(),
                         )
                         .await
@@ -1102,7 +1102,7 @@ impl CredentialStore {
                             "sh",
                             &["-c", "CODEX_HOME=\"$1\" codex login status", "flotilla-codex-status", &codex_home],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                         )
                         .await
                         .map_err(|error| format!("login preflight failed: {error}"))?;
@@ -1142,7 +1142,7 @@ async fn write_github_app_token_file(runner: &dyn CommandRunner, path: &Path, to
     runner.write_file(path, token).await.map_err(|error| format!("write token file: {error}"))?;
     let path = path.to_string_lossy();
     runner
-        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Noop)
+        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
         .await
         .map(|_| ())
         .map_err(|error| format!("protect token file: {error}"))
@@ -1152,7 +1152,7 @@ async fn write_executable(runner: &dyn CommandRunner, path: &Path, contents: &st
     runner.write_file(path, contents).await.map_err(|error| format!("write {context}: {error}"))?;
     let path = path.to_string_lossy();
     runner
-        .run("chmod", &["0700", &path], Path::new("/"), &ChannelLabel::Noop)
+        .run("chmod", &["0700", &path], Path::new("/"), &ChannelLabel::Default)
         .await
         .map(|_| ())
         .map_err(|error| format!("protect {context}: {error}"))
@@ -1175,7 +1175,7 @@ async fn api_key_preflight(runner: &dyn CommandRunner, url: &str, headers: &[(&s
     }
     config.push_str(&format!("url = \"{}\"\n", sanitize_curl_config(url)));
     runner
-        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Noop, config.as_bytes())
+        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Default, config.as_bytes())
         .await
         .map(|_| ())
         .map_err(|error| format!("authentication preflight failed: {error}"))

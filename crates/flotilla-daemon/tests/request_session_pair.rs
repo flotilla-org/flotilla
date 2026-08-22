@@ -17,7 +17,7 @@ use flotilla_core::{
 };
 use flotilla_daemon::server::test_support::{
     apply_convoy_replica_feed, seed_trusted_remote_convoy_project, spawn_in_memory_request_topology,
-    spawn_in_memory_request_topology_stateful, spawn_in_memory_request_topology_stateful_with_surface,
+    spawn_in_memory_request_topology_stateful, spawn_in_memory_request_topology_stateful_with_surface, InMemoryRequestTopology,
 };
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
@@ -28,10 +28,25 @@ use flotilla_protocol::{
 use flotilla_resources::{
     api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
     CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host, HostSpec, HostStatus, InputMeta, PlacementPolicy,
-    PlacementPolicySpec, Regard, Resource, ResourceError, ResourceProvenance, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
+    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, Regard,
+    Resource, ResourceBackend, ResourceError, ResourceProvenance, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate,
+    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
 };
+
+async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
+    backend
+        .using::<Convoy>("flotilla")
+        .list_matching_labels(&BTreeMap::from([(ROLE_LABEL.to_string(), role.to_string())]))
+        .await
+        .expect("list convoys by role")
+        .items
+        .into_iter()
+        .next()
+        .expect("convoy should exist")
+        .metadata
+        .name
+}
 
 fn test_config_store(config_dir: std::path::PathBuf) -> Arc<ConfigStore> {
     test_config_store_with_floor(config_dir, None)
@@ -63,7 +78,11 @@ async fn seed_host_capacity(daemon: &Arc<InProcessDaemon>, free_bytes: u64, floo
         .expect("create host capacity resource");
     hosts
         .update_status(&host_id, &host.metadata.resource_version, &HostStatus {
+            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
+            heartbeat_at: Some(Utc::now()),
             ready: true,
+            daemon_generation: Some("test-generation".to_string()),
+            daemon_started_at: Some(Utc::now()),
             disk_free_bytes: Some(free_bytes),
             admission_free_space_floor_bytes: Some(floor_bytes),
             ..HostStatus::default()
@@ -97,8 +116,49 @@ async fn await_host_capacity(daemon: &Arc<InProcessDaemon>, host_id: &str) {
     .expect("host capacity should replicate");
 }
 
-fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
-    ConvoySpec::builder().workflow_ref(workflow_ref.to_string()).build()
+async fn seed_target_placement_policy(topology: &InMemoryRequestTopology, namespace: &str, policy_name: &str) {
+    let host_ref = topology.follower.local_host_id().expect("placement host identity").to_string();
+    let policies = topology.follower.resource_backend().using::<PlacementPolicy>(namespace);
+    policies
+        .create(
+            &InputMeta::builder().name(policy_name.to_string()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("cleat".to_string())
+                .host_direct(HostDirectPlacementPolicySpec { host_ref, checkout: HostDirectPlacementPolicyCheckout::Worktree })
+                .build(),
+        )
+        .await
+        .expect("placement host should register its local placement policy");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if topology.leader.resource_backend().including_replicas::<PlacementPolicy>(namespace).get(policy_name).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("home-authored placement policy should replicate to origin");
+}
+
+fn convoy_spec(workflow_ref: &str, role: &str) -> ConvoySpec {
+    ConvoySpec::builder()
+        .workflow_ref(workflow_ref.to_string())
+        .project_ref("flotilla".to_string())
+        .role(role.to_string())
+        .generation(1)
+        .build()
+}
+
+fn convoy_meta(record_name: &str, role: &str) -> InputMeta {
+    InputMeta::builder()
+        .name(record_name.to_string())
+        .labels(BTreeMap::from([
+            (PROJECT_LABEL.to_string(), "flotilla".to_string()),
+            (ROLE_LABEL.to_string(), role.to_string()),
+            (GENERATION_LABEL.to_string(), "1".to_string()),
+        ]))
+        .build()
 }
 
 async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
@@ -113,6 +173,91 @@ async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEv
     })
     .await
     .expect("timed out waiting for command result")
+}
+
+#[tokio::test]
+async fn convoy_delete_routes_to_the_home_and_its_tombstone_does_not_resurrect() {
+    let kiwi = empty_daemon_named("kiwi").await;
+    let feta = empty_daemon_named("feta").await;
+    let namespace = "flotilla";
+    let name = "feta-homed";
+    feta.resource_backend()
+        .using::<Convoy>(namespace)
+        .create(
+            &convoy_meta(name, name),
+            &ConvoySpec::builder().workflow_ref("scratch".to_string()).project_ref("flotilla".to_string()).role(name.to_string()).build(),
+        )
+        .await
+        .expect("create feta-homed convoy");
+
+    let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect kiwi and feta");
+    let action = CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: name.to_string(), force: true };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if kiwi.resource_backend().including_replicas::<Convoy>(namespace).get(name).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("feta-homed convoy should replicate to kiwi");
+    apply_convoy_replica_feed(&kiwi, namespace, name, HostName::new("feta")).await;
+    assert_eq!(
+        kiwi.resolve_existing_convoy_target(&action).await.expect("resolve replica home").expect("remote target").home,
+        HostName::new("feta")
+    );
+
+    let mut events = topology.leader.subscribe();
+    let command_id = topology.client.execute(Command::builder().action(action).build()).await.expect("dispatch convoy delete from kiwi");
+    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::Ok);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let absent_at_home =
+                matches!(feta.resource_backend().using::<Convoy>(namespace).get(name).await, Err(ResourceError::NotFound { .. }));
+            let absent_from_peer = matches!(
+                kiwi.resource_backend().including_replicas::<Convoy>(namespace).get(name).await,
+                Err(ResourceError::NotFound { .. })
+            );
+            if absent_at_home && absent_from_peer {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("home deletion should propagate to kiwi");
+
+    drop(topology);
+    let reconnected = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("reconnect kiwi and feta");
+    feta.resource_backend()
+        .using::<Convoy>(namespace)
+        .create(
+            &convoy_meta("after-reconnect", "after-reconnect"),
+            &ConvoySpec::builder()
+                .workflow_ref("scratch".to_string())
+                .project_ref("flotilla".to_string())
+                .role("after-reconnect".to_string())
+                .build(),
+        )
+        .await
+        .expect("create convergence marker");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if kiwi.resource_backend().including_replicas::<Convoy>(namespace).get("after-reconnect").await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reconnected replication should converge");
+    assert!(
+        matches!(kiwi.resource_backend().including_replicas::<Convoy>(namespace).get(name).await, Err(ResourceError::NotFound { .. })),
+        "the deleted convoy must not resurrect after federation reconnects"
+    );
+    drop(reconnected);
 }
 
 #[tokio::test]
@@ -166,6 +311,7 @@ async fn default_focal_surface_uses_the_daemons_provisioning_principal() {
 #[tokio::test]
 async fn convoy_creation_attributes_provenance_and_regard_to_the_surface_principal() {
     let leader = empty_daemon_named("leader").await;
+    seed_host_capacity(&leader, 2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024).await;
     leader
         .resource_backend()
         .using::<WorkflowTemplate>("flotilla")
@@ -187,26 +333,27 @@ async fn convoy_creation_attributes_provenance_and_regard_to_the_surface_princip
 
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "alice-dispatch".to_string(),
-                workflow_ref: "empty".to_string(),
-                inputs: Vec::new(),
-                repository_url: None,
-                r#ref: None,
-                project_ref: None,
-                placement_policy: None,
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "alice-dispatch".to_string(),
+                    workflow_ref: "empty".to_string(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: None,
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("dispatch convoy creation");
     assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyCreated { name: "alice-dispatch".to_string() });
 
-    let convoy = leader.resource_backend().using::<Convoy>("flotilla").get("alice-dispatch").await.expect("created convoy");
+    let backend = leader.resource_backend();
+    let convoy =
+        backend.using::<Convoy>("flotilla").get(&convoy_record_name(&backend, "alice-dispatch").await).await.expect("created convoy");
     assert_eq!(convoy.spec.dispatching_principal_ref, principal_ref);
     let regards = leader.resource_backend().using::<Regard>("flotilla").list().await.expect("list regards");
     assert_eq!(regards.items.len(), 1);
@@ -255,12 +402,10 @@ async fn in_memory_request_client_routes_remote_command_result() {
     let result = topology
         .client
         .execute_query(
-            Command {
-                node_id: Some(follower_node_id.clone()),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryHostStatus { target_environment_id: follower_environment_id.clone() },
-            },
+            Command::builder()
+                .action(CommandAction::QueryHostStatus { target_environment_id: follower_environment_id.clone() })
+                .node_id(follower_node_id.clone())
+                .build(),
             uuid::Uuid::nil(),
         )
         .await
@@ -291,19 +436,19 @@ async fn resource_mutations_targeting_a_peer_modify_only_the_peer_store() {
     let mut events = topology.leader.subscribe();
     let apply_id = topology
         .client
-        .execute(Command {
-            node_id: Some(follower_node_id.clone()),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceApply {
-                namespace: namespace.to_string(),
-                document: serde_json::json!({
-                    "kind": "WorkflowTemplate",
-                    "metadata": {"name": name},
-                    "spec": {"vessels": []},
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceApply {
+                    namespace: namespace.to_string(),
+                    document: serde_json::json!({
+                        "kind": "WorkflowTemplate",
+                        "metadata": {"name": name},
+                        "spec": {"vessels": []},
+                    }),
+                })
+                .node_id(follower_node_id.clone())
+                .build(),
+        )
         .await
         .expect("dispatch peer resource apply");
 
@@ -316,17 +461,17 @@ async fn resource_mutations_targeting_a_peer_modify_only_the_peer_store() {
 
     let delete_id = topology
         .client
-        .execute(Command {
-            node_id: Some(follower_node_id),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceDelete {
-                namespace: namespace.to_string(),
-                kind: "workflowtemplates".to_string(),
-                name: name.to_string(),
-                replica_origin: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: namespace.to_string(),
+                    kind: "workflowtemplates".to_string(),
+                    name: name.to_string(),
+                    replica_origin: None,
+                })
+                .node_id(follower_node_id)
+                .build(),
+        )
         .await
         .expect("dispatch peer resource delete");
 
@@ -347,7 +492,7 @@ async fn hostless_convoy_delete_routes_to_remote_home() {
 
     let follower_convoys = topology.follower.resource_backend().using::<Convoy>(namespace);
     follower_convoys
-        .create(&InputMeta::builder().name(convoy_name.to_string()).build(), &convoy_spec("scratch"))
+        .create(&convoy_meta(convoy_name, convoy_name), &convoy_spec("scratch", convoy_name))
         .await
         .expect("create remote-homed convoy");
 
@@ -356,12 +501,11 @@ async fn hostless_convoy_delete_routes_to_remote_home() {
     let mut rx = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true })
+                .build(),
+        )
         .await
         .expect("dispatch hostless convoy delete");
 
@@ -386,7 +530,7 @@ async fn mistargeted_convoy_delete_routes_to_remote_home() {
 
     let follower_convoys = topology.follower.resource_backend().using::<Convoy>(namespace);
     follower_convoys
-        .create(&InputMeta::builder().name(convoy_name.to_string()).build(), &convoy_spec("scratch"))
+        .create(&convoy_meta(convoy_name, convoy_name), &convoy_spec("scratch", convoy_name))
         .await
         .expect("create remote-homed convoy");
     apply_convoy_replica_feed(&topology.leader, namespace, convoy_name, topology.follower_host.clone()).await;
@@ -394,12 +538,12 @@ async fn mistargeted_convoy_delete_routes_to_remote_home() {
     let mut rx = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: Some(topology.leader.node_id().clone()),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true })
+                .node_id(topology.leader.node_id().clone())
+                .build(),
+        )
         .await
         .expect("dispatch mistargeted convoy delete");
 
@@ -420,7 +564,7 @@ async fn hostless_convoy_abandon_routes_to_remote_home() {
 
     let follower_convoys = topology.follower.resource_backend().using::<Convoy>(namespace);
     follower_convoys
-        .create(&InputMeta::builder().name(convoy_name.to_string()).build(), &convoy_spec("scratch"))
+        .create(&convoy_meta(convoy_name, convoy_name), &convoy_spec("scratch", convoy_name))
         .await
         .expect("create remote-homed convoy");
     apply_convoy_replica_feed(&topology.leader, namespace, convoy_name, topology.follower_host.clone()).await;
@@ -428,16 +572,15 @@ async fn hostless_convoy_abandon_routes_to_remote_home() {
     let mut rx = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyAbandon {
-                namespace: Some(namespace.to_string()),
-                name: convoy_name.to_string(),
-                reason: "accepted loss".to_string(),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyAbandon {
+                    namespace: Some(namespace.to_string()),
+                    name: convoy_name.to_string(),
+                    reason: "accepted loss".to_string(),
+                })
+                .build(),
+        )
         .await
         .expect("dispatch hostless convoy abandon");
 
@@ -462,7 +605,7 @@ async fn hostless_convoy_work_complete_routes_to_remote_home() {
 
     let follower_convoys = topology.follower.resource_backend().using::<Convoy>(namespace);
     let created = follower_convoys
-        .create(&InputMeta::builder().name(convoy_name.to_string()).build(), &convoy_spec("scratch"))
+        .create(&convoy_meta(convoy_name, convoy_name), &convoy_spec("scratch", convoy_name))
         .await
         .expect("create remote-homed convoy");
     follower_convoys
@@ -478,16 +621,15 @@ async fn hostless_convoy_work_complete_routes_to_remote_home() {
     let mut rx = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyWorkForceComplete {
-                convoy: convoy_name.to_string(),
-                work: work_name.to_string(),
-                message: Some("done".to_string()),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyWorkForceComplete {
+                    convoy: convoy_name.to_string(),
+                    work: work_name.to_string(),
+                    message: Some("done".to_string()),
+                })
+                .build(),
+        )
         .await
         .expect("dispatch hostless work completion");
 
@@ -507,23 +649,46 @@ async fn hostless_convoy_command_explains_missing_home_route() {
     let convoy_name = "stranded";
 
     apply_convoy_replica_feed(&topology.leader, namespace, convoy_name, HostName::new("feta")).await;
+    let replica_fixture = ResourceBackend::InMemory(InMemoryBackend::default());
+    replica_fixture
+        .using::<Convoy>(namespace)
+        .create(
+            &convoy_meta(convoy_name, convoy_name),
+            &ConvoySpec::builder().workflow_ref("scratch".to_string()).role(convoy_name.to_string()).build(),
+        )
+        .await
+        .expect("create stranded replica fixture");
+    let replica_snapshot = replica_fixture.using::<Convoy>(namespace).list().await.expect("list stranded replica fixture");
+    topology
+        .leader
+        .resource_backend()
+        .replica_writer::<Convoy>(flotilla_protocol::NodeId::new("feta-root"), namespace)
+        .replace(
+            &replica_snapshot,
+            chrono::DateTime::parse_from_rfc3339("2026-08-21T11:22:33Z").expect("fixed last-seen time").with_timezone(&Utc),
+        )
+        .await
+        .expect("seed stranded replica provenance");
 
     let message = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyAbandon {
-                namespace: Some(namespace.to_string()),
-                name: convoy_name.to_string(),
-                reason: "lost host".to_string(),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyAbandon {
+                    namespace: Some(namespace.to_string()),
+                    name: convoy_name.to_string(),
+                    reason: "lost host".to_string(),
+                })
+                .build(),
+        )
         .await
         .expect_err("unreachable convoy home should reject dispatch");
 
-    assert_eq!(message, "connect to feta for convoy stranded: no routed node address found for host");
+    assert_eq!(
+        message,
+        "convoy flotilla/stranded is homed at feta, last seen 2026-08-21T11:22:33+00:00; home is unreachable: \
+         no routed node address found for host. Break glass: flotilla resource delete convoys stranded --namespace flotilla --host feta"
+    );
 }
 
 #[tokio::test]
@@ -545,19 +710,18 @@ async fn hostless_convoy_delete_uses_live_peer_route_when_connection_status_is_s
 
     let follower_convoys = topology.follower.resource_backend().using::<Convoy>(namespace);
     follower_convoys
-        .create(&InputMeta::builder().name(convoy_name.to_string()).build(), &convoy_spec("scratch"))
+        .create(&convoy_meta(convoy_name, convoy_name), &convoy_spec("scratch", convoy_name))
         .await
         .expect("create remote-homed convoy");
 
     let mut rx = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true })
+                .build(),
+        )
         .await
         .expect("live peer route should take precedence over stale connection status");
 
@@ -569,7 +733,7 @@ async fn hostless_convoy_delete_uses_live_peer_route_when_connection_status_is_s
 }
 
 #[tokio::test]
-async fn convoy_start_stays_on_admitting_store_when_placement_membership_is_stale() {
+async fn convoy_start_routes_to_placement_host_when_presentation_membership_is_stale() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named("follower").await;
     seed_host_capacity(&follower, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
@@ -579,19 +743,10 @@ async fn convoy_start_stays_on_admitting_store_when_placement_membership_is_stal
     let remote_host_id = topology.follower.local_host_id().expect("follower host identity").to_string();
     let placement_policy = format!("host-direct-{remote_host_id}");
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if topology.leader.resource_backend().using::<PlacementPolicy>(namespace).get(&placement_policy).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("peer host summary should materialize placement policy");
+    seed_target_placement_policy(&topology, namespace, &placement_policy).await;
     await_host_capacity(&topology.leader, &remote_host_id).await;
 
-    seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
+    seed_trusted_remote_convoy_project(&topology.follower, namespace).await;
 
     apply_convoy_replica_feed(&topology.leader, namespace, "fresh-feed", topology.follower_host.clone()).await;
     topology
@@ -618,44 +773,39 @@ async fn convoy_start_stays_on_admitting_store_when_placement_membership_is_stal
     let mut events = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(
-                    ConvoyStartIntent::builder()
-                        .project_ref("flotilla".to_string())
-                        .name("remote-work".to_string())
-                        .branch("fix/remote-work".to_string())
-                        .placement_policy(placement_policy)
-                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                        .build(),
-                ),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".to_string())
+                            .name("remote-work".to_string())
+                            .branch("fix/remote-work".to_string())
+                            .placement_policy(placement_policy)
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
         .await
-        .expect("admitting store should accept remote placement despite stale presentation membership");
+        .expect("origin should route remote placement despite stale presentation membership");
 
     assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted {
-        name: "remote-work".to_string(),
+        name: "remote-work@flotilla".to_string(),
         attach_plan: None,
         binding: None
     });
-    topology
+    let origin_convoys = topology
         .leader
         .resource_backend()
         .using::<Convoy>(namespace)
-        .get("remote-work")
+        .list_matching_labels(&BTreeMap::from([(ROLE_LABEL.to_string(), "remote-work".to_string())]))
         .await
-        .expect("convoy should remain on the admitting store");
-    assert!(
-        matches!(
-            topology.follower.resource_backend().using::<Convoy>(namespace).get("remote-work").await,
-            Err(ResourceError::NotFound { .. })
-        ),
-        "placement host must not become the convoy authority"
-    );
+        .expect("list origin convoys");
+    assert!(origin_convoys.items.is_empty(), "the origin must not own an always-on convoy record");
+    let record_name = convoy_record_name(&topology.follower.resource_backend(), "remote-work").await;
+    topology.follower.resource_backend().using::<Convoy>(namespace).get(&record_name).await.expect("placement host should own the convoy");
 }
 
 #[tokio::test]
@@ -683,6 +833,7 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
     let namespace = "flotilla";
     let placement_policy = format!("host-direct-{remote_host_id}");
+    seed_target_placement_policy(&topology, namespace, &placement_policy).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let sources = topology
@@ -696,13 +847,6 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
                 .into_iter()
                 .filter(|source| source.object.metadata.name == remote_host_id)
                 .collect::<Vec<_>>();
-            let stale_local =
-                sources.iter().any(|source| {
-                    matches!(source.provenance, ResourceProvenance::Local)
-                        && source.object.status.as_ref().is_some_and(|status| {
-                            status.held_credentials().expect("decode local held credentials").is_empty() && status.ready
-                        })
-                });
             let fresh_replica = sources.iter().any(|source| {
                 matches!(source.provenance, ResourceProvenance::Replica { .. })
                     && source.object.status.as_ref().is_some_and(|status| {
@@ -710,20 +854,17 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
                             && status.held_credentials().expect("decode replica held credentials").contains("claude-max")
                     })
             });
-            if stale_local
-                && fresh_replica
-                && topology.leader.resource_backend().using::<PlacementPolicy>(namespace).get(&placement_policy).await.is_ok()
-            {
+            if sources.len() == 1 && fresh_replica {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("kiwi should reproduce the stale local and fresh feta Host rows");
+    .expect("kiwi should read feta's single home-authored Host replica");
 
-    seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
-    let workflows = topology.leader.resource_backend().using::<WorkflowTemplate>(namespace);
+    seed_trusted_remote_convoy_project(&topology.follower, namespace).await;
+    let workflows = topology.follower.resource_backend().using::<WorkflowTemplate>(namespace);
     let workflow = workflows.get("remote-workflow").await.expect("remote workflow");
     let mut workflow_spec = workflow.spec;
     let flotilla_resources::CrewSource::Agent { selector, .. } = &mut workflow_spec.vessels[0].crew[0].source else {
@@ -735,7 +876,7 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
         .await
         .expect("select claude-code for the remote workflow");
     topology
-        .leader
+        .follower
         .resource_backend()
         .definitions::<CredentialSpec>(namespace)
         .create(&InputMeta::builder().name("claude-max".to_string()).build(), &CredentialSpecSpec {
@@ -747,7 +888,7 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
         .await
         .expect("create Claude credential declaration");
     topology
-        .leader
+        .follower
         .resource_backend()
         .definitions::<CredentialGrant>(namespace)
         .create(
@@ -768,34 +909,33 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
     let mut events = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(
-                    ConvoyStartIntent::builder()
-                        .project_ref("flotilla".to_string())
-                        .name("kiwi-to-feta".to_string())
-                        .branch("fix/kiwi-to-feta".to_string())
-                        .placement_policy(placement_policy)
-                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                        .build(),
-                ),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".to_string())
+                            .name("kiwi-to-feta".to_string())
+                            .branch("fix/kiwi-to-feta".to_string())
+                            .placement_policy(placement_policy)
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
         .await
         .expect("dispatch kiwi-to-feta convoy start");
 
     assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted {
-        name: "kiwi-to-feta".to_string(),
+        name: "kiwi-to-feta@flotilla".to_string(),
         attach_plan: None,
         binding: None
     });
 }
 
 #[tokio::test]
-async fn remote_convoy_start_enforces_target_capacity_without_moving_authority() {
+async fn routed_convoy_start_enforces_placement_host_capacity_before_persistence() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named_with_floor("follower", Some(1_000_000)).await;
     seed_host_capacity(&follower, 0, 1_000_000 * 1024 * 1024 * 1024).await;
@@ -805,38 +945,28 @@ async fn remote_convoy_start_enforces_target_capacity_without_moving_authority()
     let remote_host_id = topology.follower.local_host_id().expect("follower host identity").to_string();
     let placement_policy = format!("host-direct-{remote_host_id}");
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if topology.leader.resource_backend().using::<PlacementPolicy>(namespace).get(&placement_policy).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("peer host summary should materialize placement policy");
+    seed_target_placement_policy(&topology, namespace, &placement_policy).await;
     await_host_capacity(&topology.leader, &remote_host_id).await;
-    seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
+    seed_trusted_remote_convoy_project(&topology.follower, namespace).await;
 
     let mut events = topology.leader.subscribe();
     let command_id = topology
         .client
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(
-                    ConvoyStartIntent::builder()
-                        .project_ref("flotilla".to_string())
-                        .name("remote-disk-hungry".to_string())
-                        .branch("fix/remote-disk-hungry".to_string())
-                        .placement_policy(placement_policy)
-                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                        .build(),
-                ),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".to_string())
+                            .name("remote-disk-hungry".to_string())
+                            .branch("fix/remote-disk-hungry".to_string())
+                            .placement_policy(placement_policy)
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
         .await
         .expect("admitting store should evaluate the convoy");
 
@@ -910,22 +1040,21 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
 
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(
-                    ConvoyStartIntent::builder()
-                        .project_ref("flotilla".to_string())
-                        .name("remote-docker-work".to_string())
-                        .branch("fix/remote-docker-work".to_string())
-                        .placement_policy("remote-docker".to_string())
-                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                        .build(),
-                ),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".to_string())
+                            .name("remote-docker-work".to_string())
+                            .branch("fix/remote-docker-work".to_string())
+                            .placement_policy("remote-docker".to_string())
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
         .await
         .expect("dispatch remote Docker admission");
 
@@ -940,21 +1069,20 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
     );
 
     let legacy_command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "legacy-remote-docker-work".to_string(),
-                workflow_ref: "remote-workflow".to_string(),
-                inputs: Vec::new(),
-                repository_url: None,
-                r#ref: None,
-                project_ref: None,
-                placement_policy: Some("remote-docker".to_string()),
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "legacy-remote-docker-work".to_string(),
+                    workflow_ref: "remote-workflow".to_string(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: Some("remote-docker".to_string()),
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("dispatch legacy remote Docker admission");
     let legacy_result = await_command_result(&mut events, legacy_command_id).await;
@@ -994,17 +1122,15 @@ async fn remote_issue_query_returns_results() {
     let result = topology
         .client
         .execute_query(
-            Command {
-                node_id: Some(follower_node_id),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryIssues {
+            Command::builder()
+                .action(CommandAction::QueryIssues {
                     repo: RepoSelector::Path(follower_repo.clone()),
                     params: IssueQuery::default(),
                     page: 1,
                     count: 10,
-                },
-            },
+                })
+                .node_id(follower_node_id)
+                .build(),
             uuid::Uuid::nil(),
         )
         .await

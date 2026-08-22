@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Resolve the reference repo (.git common dir)
     let git_common_dir = runner
-        .run("git", &["rev-parse", "--git-common-dir"], &repo_path, &ChannelLabel::Noop)
+        .run("git", &["rev-parse", "--git-common-dir"], &repo_path, &ChannelLabel::Default)
         .await
         .map_err(|e| format!("not a git repo: {e}"))?;
     let reference_repo = DaemonHostPath::new(std::fs::canonicalize(repo_path.join(git_common_dir.trim()))?);
@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Installing git in container ---");
     let env_runner = handle.runner();
     env_runner
-        .run("sh", &["-c", "apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1"], Path::new("/"), &ChannelLabel::Noop)
+        .run("sh", &["-c", "apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1"], Path::new("/"), &ChannelLabel::Default)
         .await?;
     println!("git installed");
 
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Verify files exist inside the container
                 let ls_output = env_runner
-                    .run("ls", &["-la"], path.as_path(), &ChannelLabel::Noop)
+                    .run("ls", &["-la"], path.as_path(), &ChannelLabel::Default)
                     .await
                     .unwrap_or_else(|e| format!("(ls failed: {e})"));
                 println!("\n--- Contents of {path} ---");

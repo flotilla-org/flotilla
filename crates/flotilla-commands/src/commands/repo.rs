@@ -121,7 +121,7 @@ mod tests {
     use std::path::PathBuf;
 
     use clap::Parser;
-    use flotilla_protocol::{CheckoutTarget, Command, CommandAction, RepoSelector};
+    use flotilla_protocol::{CheckoutTarget, CommandAction, RepoSelector};
 
     use super::RepoNoun;
     use crate::{test_utils::assert_round_trip, Resolved};
@@ -133,187 +133,97 @@ mod tests {
     #[test]
     fn repo_add() {
         let resolved = parse(&["repo", "add", "/tmp/test"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::TrackRepoPath { path: PathBuf::from("/tmp/test") },
-            })
-        );
+        crate::test_utils::assert_ready(resolved, CommandAction::TrackRepoPath { path: PathBuf::from("/tmp/test") });
     }
 
     #[test]
     fn repo_remove() {
         let resolved = parse(&["repo", "remove", "owner/repo"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::UntrackRepo { repo: RepoSelector::Query("owner/repo".into()) },
-            })
-        );
+        crate::test_utils::assert_ready(resolved, CommandAction::UntrackRepo { repo: RepoSelector::Query("owner/repo".into()) });
     }
 
     #[test]
     fn repo_refresh_all() {
         let resolved = parse(&["repo", "refresh"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Refresh { repo: None }
-            })
-        );
+        crate::test_utils::assert_ready(resolved, CommandAction::Refresh { repo: None });
     }
 
     #[test]
     fn repo_refresh_specific() {
         // noun-subject-verb form: `repo owner/repo refresh`
         let resolved = parse(&["repo", "owner/repo", "refresh"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Refresh { repo: Some(RepoSelector::Query("owner/repo".into())) },
-            })
-        );
+        crate::test_utils::assert_ready(resolved, CommandAction::Refresh { repo: Some(RepoSelector::Query("owner/repo".into())) });
     }
 
     #[test]
     fn repo_all_refresh() {
         // `repo all refresh` is the explicit "refresh everything" form
         let resolved = parse(&["repo", "all", "refresh"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Refresh { repo: None }
-            })
-        );
+        crate::test_utils::assert_ready(resolved, CommandAction::Refresh { repo: None });
     }
 
     #[test]
     fn repo_query_providers() {
         let resolved = parse(&["repo", "myslug", "providers"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryRepoProviders { repo: RepoSelector::Query("myslug".into()) },
-            })
-        );
+        crate::test_utils::assert_ready(resolved, CommandAction::QueryRepoProviders { repo: RepoSelector::Query("myslug".into()) });
     }
 
     #[test]
     fn marked_subject_disambiguates_repo_named_refresh() {
         let resolved = parse(&["repo", "@refresh", "providers"]).resolve().expect("resolve marked repo subject");
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryRepoProviders { repo: RepoSelector::Query("refresh".into()) },
-            })
-        );
+        crate::test_utils::assert_ready(resolved, CommandAction::QueryRepoProviders { repo: RepoSelector::Query("refresh".into()) });
     }
 
     #[test]
     fn explicit_subject_preserves_repo_beginning_with_marker() {
         let resolved = parse(&["repo", "--subject", "@refresh", "providers"]).resolve().expect("resolve explicit repo subject");
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryRepoProviders { repo: RepoSelector::Query("@refresh".into()) },
-            })
-        );
+        crate::test_utils::assert_ready(resolved, CommandAction::QueryRepoProviders { repo: RepoSelector::Query("@refresh".into()) });
     }
 
     #[test]
     fn repo_checkout_existing_branch() {
         let resolved = parse(&["repo", "myslug", "checkout", "feat-x"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Checkout {
-                    repo: RepoSelector::Query("myslug".into()),
-                    target: CheckoutTarget::Branch("feat-x".into()),
-                    issue_ids: vec![],
-                },
-            })
-        );
+        crate::test_utils::assert_ready(resolved, CommandAction::Checkout {
+            repo: RepoSelector::Query("myslug".into()),
+            target: CheckoutTarget::Branch("feat-x".into()),
+            issue_ids: vec![],
+        });
     }
 
     #[test]
     fn repo_checkout_fresh_branch() {
         let resolved = parse(&["repo", "myslug", "checkout", "--fresh", "feat-x"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Checkout {
-                    repo: RepoSelector::Query("myslug".into()),
-                    target: CheckoutTarget::FreshBranch("feat-x".into()),
-                    issue_ids: vec![],
-                },
-            })
-        );
+        crate::test_utils::assert_ready(resolved, CommandAction::Checkout {
+            repo: RepoSelector::Query("myslug".into()),
+            target: CheckoutTarget::FreshBranch("feat-x".into()),
+            issue_ids: vec![],
+        });
     }
 
     #[test]
     fn repo_prepare_terminal() {
         let resolved = parse(&["repo", "myslug", "prepare-terminal", "/tmp/path"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Query("myslug".into())),
-                action: CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/tmp/path"), commands: vec![] },
-            })
-        );
+        let Resolved::Ready(command) = resolved else { panic!("expected a ready command") };
+        assert_eq!(command.action, CommandAction::PrepareTerminalForCheckout {
+            checkout_path: PathBuf::from("/tmp/path"),
+            commands: vec![]
+        });
+        assert_eq!(command.context_repo, Some(RepoSelector::Query("myslug".into())));
     }
 
     #[test]
     fn repo_subject_form_refresh() {
         // `repo myslug refresh` — subject used as repo (noun-subject-verb canonical form)
         let resolved = parse(&["repo", "myslug", "refresh"]).resolve().unwrap();
-        assert!(matches!(resolved, Resolved::Ready(Command { action: CommandAction::Refresh { repo: Some(_) }, .. })));
+        let Resolved::Ready(command) = resolved else { panic!("expected a ready command") };
+        assert!(matches!(command.action, CommandAction::Refresh { repo: Some(_) }));
     }
 
     #[test]
     fn repo_refresh_no_subject_is_all() {
         // `repo refresh` with no subject means refresh all (shorthand for `repo all refresh`)
         let resolved = parse(&["repo", "refresh"]).resolve().unwrap();
-        assert_eq!(
-            resolved,
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Refresh { repo: None }
-            })
-        );
+        crate::test_utils::assert_ready(resolved, CommandAction::Refresh { repo: None });
     }
 
     #[test]

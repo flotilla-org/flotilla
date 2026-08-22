@@ -219,12 +219,12 @@ mod tests {
             requester_node_id: NodeId::new("workstation"),
             target_node_id: NodeId::new("feta"),
             remaining_hops: 7,
-            command: Box::new(Command {
-                node_id: Some(NodeId::new("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Refresh { repo: Some(RepoSelector::Query("flotilla".into())) },
-            }),
+            command: Box::new(
+                Command::builder()
+                    .action(CommandAction::Refresh { repo: Some(RepoSelector::Query("flotilla".into())) })
+                    .node_id(NodeId::new("feta"))
+                    .build(),
+            ),
             session_id: None,
         };
         let json_value = serde_json::to_value(&msg).expect("serialize");

@@ -13,11 +13,11 @@ pub use checkout::{
 pub use clone::{CloneReconciler, CloneRuntime};
 pub use environment::{DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler};
 pub use presentation::{
-    AppliedPresentation, ApplyPresentationError, DefaultPolicy, HopChainContext, PolicyContext, PresentationDeps, PresentationPlan,
-    PresentationPolicy, PresentationPolicyRegistry, PresentationReconciler, PresentationRuntime, PreviousWorkspace,
+    AppliedPresentation, ApplyPresentationError, DefaultPolicy, HopChainContext, PolicyContext, PresentationPlan, PresentationPolicy,
+    PresentationPolicyRegistry, PresentationPrepared, PresentationReconciler, PresentationRuntime, PreviousWorkspace,
     ProviderPresentationRuntime, RenderedWorkspace, ResolvedProcess,
 };
 pub use repository::{ForgeDefaultBranchResolver, RepositoryReconciler};
-pub use terminal_session::{TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
-pub use vessel::{VesselDeps, VesselReconciler};
+pub use terminal_session::{TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
+pub use vessel::{VesselPrepared, VesselReconciler};
 pub use vessel_placement::{VesselPlacementProjector, VesselPlacementSync};

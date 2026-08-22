@@ -30,10 +30,10 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus, Host,
-    HostSpec, HostStatus, HttpBackend, InMemoryBackend, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
-    ResourceBackend, ResourceError, ResourceList, ResourceProvenance, Selector, SqliteBackend, Stance, StatusPatch, TerminalAttentionState,
-    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
-    TerminalSessionStatusPatch, WatchEvent, WatchStart, WorkflowTemplate,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HttpBackend, InMemoryBackend, InputMeta,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, ResourceBackend, ResourceError,
+    ResourceList, ResourceProvenance, Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
+    TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, WatchEvent, WatchStart,
 };
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
@@ -49,7 +49,7 @@ use super::{
     client_connection::QuerySubscriptions,
     handle_client, handle_client_session,
     peer_connection::PEER_IDLE_TIMEOUT,
-    peer_runtime::{forward_with_keepalive_for_test, send_link_state, ForwardResult},
+    peer_runtime::{forward_with_keepalive_for_test, retry_with_backoff_for_test, send_link_state, ForwardResult},
     publish_socket_path,
     remote_commands::{
         extract_command_repo_identity, ForwardedCommand, ForwardedCommandMap, ForwardedCommandState, PendingRemoteCancelMap,
@@ -64,6 +64,33 @@ use super::{
     CONNECTION_PREFACE_TIMEOUT, HELLO_HANDSHAKE_TIMEOUT,
 };
 use crate::peer::{ConnectionDirection, ConnectionMeta};
+
+#[tokio::test(start_paused = true)]
+async fn peer_reconnect_survives_sustained_failures_and_recovers() {
+    const OBSERVED_STALL_ATTEMPT: usize = 732;
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_dial = Arc::clone(&attempts);
+    let recovered_attempt = retry_with_backoff_for_test(
+        |_, _| async {},
+        move || {
+            let attempts = Arc::clone(&attempts_for_dial);
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt <= OBSERVED_STALL_ATTEMPT + 1 {
+                    Err("remote unavailable".to_string())
+                } else {
+                    Ok(attempt)
+                }
+            }
+        },
+        |_, _| async {},
+    )
+    .await;
+
+    assert_eq!(recovered_attempt, OBSERVED_STALL_ATTEMPT + 2);
+    assert_eq!(attempts.load(Ordering::SeqCst), OBSERVED_STALL_ATTEMPT + 2);
+}
 
 #[tokio::test]
 async fn socket_guard_does_not_unlink_replacement_listener() {
@@ -584,7 +611,7 @@ async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
 }
 
 use crate::peer::{
-    test_support::{ensure_test_connection_generation, wait_for_command_result, BlockingPeerSender, MockPeerSender},
+    test_support::{ensure_test_connection_generation, BlockingPeerSender, MockPeerSender},
     InboundPeerEnvelope, PeerConnectionStatus, PeerManager, PeerSender, PeerTransport,
 };
 
@@ -609,7 +636,11 @@ fn current_client_hello() -> Message {
     Message::Hello {
         protocol_version: PROTOCOL_VERSION,
         node_id: NodeId::new("client"),
-        display_name: flotilla_protocol::hello_display_name("client", env!("FLOTILLA_BUILD_ID")),
+        display_name: flotilla_protocol::hello_display_name(
+            "client",
+            "intentionally-different-client-build",
+            flotilla_protocol::PROTOCOL_FINGERPRINT,
+        ),
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
@@ -902,6 +933,8 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
     backend
         .using::<Convoy>("flotilla")
         .create(&InputMeta::builder().name("persisted".to_string()).build(), &ConvoySpec {
+            role: String::new(),
+            generation: 1,
             workflow_ref: "scratch".to_string(),
             dispatching_principal_ref: Default::default(),
             inputs: Default::default(),
@@ -1267,14 +1300,14 @@ async fn dispatch_execute_remote_query_routes_through_peer_manager() {
     );
 
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(node("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::QueryHostStatus {
-                target_environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host")),
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::QueryHostStatus {
+                    target_environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host")),
+                })
+                .node_id(node("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch_execute should succeed");
 
@@ -1287,14 +1320,15 @@ async fn dispatch_execute_remote_query_routes_through_peer_manager() {
         PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { requester_node_id, target_node_id, command, .. }) => {
             assert_eq!(requester_node_id, daemon.node_id());
             assert_eq!(target_node_id, &node("feta"));
-            assert_eq!(command.as_ref(), &Command {
-                node_id: Some(node("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryHostStatus {
-                    target_environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host"))
-                }
-            });
+            assert_eq!(
+                command.as_ref(),
+                &Command::builder()
+                    .action(CommandAction::QueryHostStatus {
+                        target_environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host"))
+                    })
+                    .node_id(node("feta"))
+                    .build()
+            );
         }
         other => panic!("expected routed command request, got {other:?}"),
     }
@@ -1321,19 +1355,19 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
     let cursor = ResourceCursor::from_position("42", Some("generation-a".to_string()));
 
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(node("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceWatch {
-                namespace: "flotilla".into(),
-                kind: "convoys".into(),
-                name: Some("demo".into()),
-                include_replicas: false,
-                replica_sources: false,
-                cursor: Some(cursor.clone()),
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::ResourceWatch {
+                    namespace: "flotilla".into(),
+                    kind: "convoys".into(),
+                    name: Some("demo".into()),
+                    include_replicas: false,
+                    replica_sources: false,
+                    cursor: Some(cursor.clone()),
+                })
+                .node_id(node("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch_execute should succeed");
 
@@ -1346,19 +1380,20 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
         PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { requester_node_id, target_node_id, command, .. }) => {
             assert_eq!(requester_node_id, daemon.node_id());
             assert_eq!(target_node_id, &node("feta"));
-            assert_eq!(command.as_ref(), &Command {
-                node_id: Some(node("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ResourceWatch {
-                    namespace: "flotilla".into(),
-                    kind: "convoys".into(),
-                    name: Some("demo".into()),
-                    include_replicas: false,
-                    replica_sources: false,
-                    cursor: Some(cursor),
-                }
-            });
+            assert_eq!(
+                command.as_ref(),
+                &Command::builder()
+                    .action(CommandAction::ResourceWatch {
+                        namespace: "flotilla".into(),
+                        kind: "convoys".into(),
+                        name: Some("demo".into()),
+                        include_replicas: false,
+                        replica_sources: false,
+                        cursor: Some(cursor),
+                    })
+                    .node_id(node("feta"))
+                    .build()
+            );
         }
         other => panic!("expected routed command request, got {other:?}"),
     }
@@ -1369,6 +1404,23 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
     let (_tmp, daemon) = empty_daemon().await;
     let home = HostName::new("feta");
     apply_convoy_replica_feed(&daemon, "flotilla", "stranded", home.clone()).await;
+    let replica_fixture = ResourceBackend::InMemory(InMemoryBackend::default());
+    replica_fixture
+        .using::<Convoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("stranded".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+        )
+        .await
+        .expect("create replica fixture");
+    let replica_snapshot = replica_fixture.using::<Convoy>("flotilla").list().await.expect("list replica fixture");
+    let last_seen_at = chrono::DateTime::parse_from_rfc3339("2026-08-21T12:34:56Z").expect("fixed timestamp").with_timezone(&chrono::Utc);
+    daemon
+        .resource_backend()
+        .replica_writer::<Convoy>(node("feta"), "flotilla")
+        .replace(&replica_snapshot, last_seen_at)
+        .await
+        .expect("seed last-seen replica");
     daemon
         .publish_peer_summary(
             HostSummary::builder()
@@ -1390,16 +1442,20 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
     let remote_command_router = empty_remote_command_router(&daemon, &peer_manager);
 
     let message = remote_command_router
-        .dispatch_execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyDelete { namespace: Some("flotilla".to_string()), name: "stranded".to_string(), force: true },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".to_string()), name: "stranded".to_string(), force: true })
+                .build(),
+        )
         .await
         .expect_err("failed peer send should reject dispatch");
 
-    assert_eq!(message, "connect to feta at ssh://feta.example: outbound channel closed");
+    assert_eq!(
+        message,
+        "convoy flotilla/stranded is homed at feta, last seen 2026-08-21T12:34:56+00:00; home is unreachable: \
+         connect to feta at ssh://feta.example: outbound channel closed. Break glass: flotilla resource delete convoys stranded \
+         --namespace flotilla --host feta"
+    );
 }
 
 #[tokio::test]
@@ -1462,16 +1518,16 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
     let router = empty_remote_command_router(&daemon, &peer_manager);
 
     let error = router
-        .dispatch_execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::CrewComplete {
-                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
-                message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
-                disposition: None,
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::CrewComplete {
+                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                    message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
+                    disposition: None,
+                    decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1300#issuecomment-1".into()),
+                })
+                .build(),
+        )
         .await
         .expect_err("partitioned completion should report that it was queued");
 
@@ -1485,16 +1541,16 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
     assert!(pending.last_error.contains("authority unreachable for stranded"));
 
     router
-        .dispatch_execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::CrewComplete {
-                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
-                message: Some("https://github.com/flotilla-org/flotilla/pull/1301".into()),
-                disposition: None,
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::CrewComplete {
+                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                    message: Some("https://github.com/flotilla-org/flotilla/pull/1301".into()),
+                    disposition: None,
+                    decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1301#issuecomment-2".into()),
+                })
+                .build(),
+        )
         .await
         .expect_err("corrected completion should remain queued during the partition");
     let pending = sessions
@@ -1506,6 +1562,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
         .completion_pending
         .expect("corrected durable completion intent");
     assert_eq!(pending.message.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/1301"));
+    assert_eq!(pending.decision_ledger_ref.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/1301#issuecomment-2"));
 
     let delivered = Arc::new(StdMutex::new(Vec::new()));
     peer_manager.lock().await.register_sender(node("feta"), Arc::new(CapturePeerSender(Arc::clone(&delivered))));
@@ -1547,16 +1604,16 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
     assert_eq!(delivered.lock().expect("delivered lock").len(), 1, "permanent authority rejection must not retry");
 
     router
-        .dispatch_execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::CrewComplete {
-                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
-                message: Some("https://github.com/flotilla-org/flotilla/pull/1302".into()),
-                disposition: None,
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::CrewComplete {
+                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                    message: Some("https://github.com/flotilla-org/flotilla/pull/1302".into()),
+                    disposition: None,
+                    decision_ledger_ref: None,
+                })
+                .build(),
+        )
         .await
         .expect("reachable authority should accept a fresh completion");
     let request_id = match delivered.lock().expect("delivered lock").get(1).expect("fresh completion") {
@@ -1579,14 +1636,11 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
     peer_manager.lock().await.register_sender(node("feta"), Arc::new(FailingPeerSender));
     let query_error = router
         .dispatch_query(
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryCrewList {
+            Command::builder()
+                .action(CommandAction::QueryCrewList {
                     context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
-                },
-            },
+                })
+                .build(),
             uuid::Uuid::nil(),
         )
         .await
@@ -1595,7 +1649,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
 }
 
 #[tokio::test]
-async fn dispatch_execute_keeps_remote_placement_convoy_on_the_admitting_store() {
+async fn dispatch_execute_routes_remote_placement_admission_to_the_actuator() {
     let (_tmp, daemon) = empty_daemon().await;
     let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
     let remote_host_id = "feta-host-id".to_string();
@@ -1620,6 +1674,26 @@ async fn dispatch_execute_keeps_remote_placement_convoy_on_the_admitting_store()
         .await
         .expect("replicate remote host capacity");
     let remote_policy_name = format!("host-direct-{remote_host_id}");
+    let remote_policies = remote_daemon.resource_backend().using::<PlacementPolicy>("flotilla");
+    remote_policies
+        .create(
+            &InputMeta::builder().name(remote_policy_name.clone()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("cleat".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: remote_host_id.clone(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("create remote placement policy at its home");
+    daemon
+        .resource_backend()
+        .replica_writer::<PlacementPolicy>(node("feta"), "flotilla")
+        .replace(&remote_policies.list().await.expect("list remote placement policies"), chrono::Utc::now())
+        .await
+        .expect("replicate remote placement policy");
     let remote_summary = HostSummary::builder()
         .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(&remote_host_id)))
         .host_name(HostName::new("feta"))
@@ -1639,7 +1713,7 @@ async fn dispatch_execute_keeps_remote_placement_convoy_on_the_admitting_store()
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
     let mut peer_manager_guard = peer_manager.lock().await;
-    peer_manager_guard.store_host_summary(remote_summary);
+    peer_manager_guard.store_host_summary(remote_summary.clone());
     peer_manager_guard.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
     drop(peer_manager_guard);
     let remote_command_router = make_remote_command_router(
@@ -1664,45 +1738,57 @@ async fn dispatch_execute_keeps_remote_placement_convoy_on_the_admitting_store()
         })
         .build();
 
-    let mut events = daemon.subscribe();
-    let command_id = remote_command_router.dispatch_execute(command).await.expect("admitting daemon should accept remote placement");
-    assert_eq!(wait_for_command_result(&mut events, command_id, StdDuration::from_secs(5)).await, CommandValue::ConvoyStarted {
-        name: "remote-work".to_string(),
-        attach_plan: None,
-        binding: None
-    });
-    assert!(pending_remote_commands.lock().await.is_empty(), "placement must not create a routed command");
-    assert!(sent.lock().expect("sent messages").is_empty(), "placement availability preflight must not route the admission command");
+    remote_command_router.dispatch_execute(command).await.expect("origin should route remote placement");
+    assert_eq!(pending_remote_commands.lock().await.len(), 1, "placement admission must wait on the routed command");
+    {
+        let sent = sent.lock().expect("sent messages");
+        assert_eq!(sent.len(), 1, "placement admission must be sent to the actuator");
+        let PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { target_node_id, command, .. }) = &sent[0] else {
+            panic!("expected routed admission, got {:?}", sent[0]);
+        };
+        assert_eq!(target_node_id, &node("feta"));
+        assert!(matches!(command.action, CommandAction::ConvoyStart { .. }));
+    }
+    let origin_convoys = daemon
+        .resource_backend()
+        .using::<Convoy>("flotilla")
+        .list_matching_labels(&BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "remote-work".to_string())]))
+        .await
+        .expect("list origin convoys");
+    assert!(origin_convoys.items.is_empty(), "the origin must not half-admit a routed convoy");
 
-    let admitting_backend = daemon.resource_backend();
-    let convoy =
-        admitting_backend.clone().using::<Convoy>("flotilla").get("remote-work").await.expect("admitting daemon should own the convoy");
-    assert_eq!(convoy.spec.workflow_ref, "remote-workflow");
-    assert_eq!(convoy.spec.placement_policy.as_deref(), Some(remote_policy_name.as_str()));
-    let workflow_snapshot_name =
-        convoy.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).expect("pinned workflow annotation");
-    let placement_snapshot_name =
-        convoy.metadata.annotations.get(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION).expect("pinned placement annotation");
-    let admitting_workflow = admitting_backend
-        .clone()
-        .using::<WorkflowTemplate>("flotilla")
-        .get(workflow_snapshot_name)
+    let disconnected_peers = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    disconnected_peers.lock().await.store_host_summary(remote_summary);
+    let disconnected_router = make_remote_command_router(
+        &daemon,
+        &disconnected_peers,
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(AtomicU64::new(1 << 62)),
+    );
+    let error = disconnected_router
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla/flotilla".to_string())
+                            .name("unreachable-work".to_string())
+                            .branch("feat/unreachable-work".to_string())
+                            .placement_policy(remote_policy_name)
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
         .await
-        .expect("admitting daemon should retain the pinned workflow");
-    assert_eq!(admitting_workflow.spec.vessels[0].stance, Stance::Trusted);
-    let admitting_placement = admitting_backend
-        .clone()
-        .using::<PlacementPolicy>("flotilla")
-        .get(placement_snapshot_name)
-        .await
-        .expect("admitting daemon should retain the pinned placement");
-    assert_eq!(admitting_placement.spec.host_direct.expect("host-direct snapshot").host_ref, remote_host_id);
+        .expect_err("an unreachable placement host must refuse admission");
+    assert_eq!(error, "peer host feta is not connected");
     assert!(
-        matches!(
-            remote_daemon.resource_backend().using::<Convoy>("flotilla").get("remote-work").await,
-            Err(ResourceError::NotFound { .. })
-        ),
-        "placement host must not become convoy authority"
+        matches!(daemon.resource_backend().using::<Convoy>("flotilla").get("unreachable-work").await, Err(ResourceError::NotFound { .. })),
+        "unreachable placement must not leave a half-admitted record"
     );
 }
 
@@ -1793,9 +1879,7 @@ async fn query_commands_return_directed_response_instead_of_remote_dispatch() {
 
     // Local query commands (host=None) execute directly and return QueryResult.
     let response = request_dispatcher
-        .dispatch(401, Request::Execute {
-            command: Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
-        })
+        .dispatch(401, Request::Execute { command: Command::builder().action(CommandAction::QueryHostList {}).build() })
         .await;
 
     match ok_response(response, 401) {
@@ -1847,18 +1931,16 @@ async fn request_dispatcher_forwards_daemon_log_query_through_peer_manager() {
             );
             request_dispatcher
                 .dispatch(402, Request::Execute {
-                    command: Command {
-                        node_id: Some(node("feta")),
-                        provisioning_target: None,
-                        context_repo: None,
-                        action: CommandAction::QueryDaemonLogs {
+                    command: Command::builder()
+                        .action(CommandAction::QueryDaemonLogs {
                             query: DaemonLogQuery {
                                 since_seconds: Some(7200),
                                 level: Some("warn".into()),
                                 target: Some("flotilla_daemon::peer".into()),
                             },
-                        },
-                    },
+                        })
+                        .node_id(node("feta"))
+                        .build(),
                 })
                 .await
         }
@@ -1952,16 +2034,14 @@ async fn remote_command_mutations_route_remote_step_requests() {
 
     let response = request_dispatcher
         .dispatch(402, Request::Execute {
-            command: Command {
-                node_id: Some(NodeId::new("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Checkout {
+            command: Command::builder()
+                .action(CommandAction::Checkout {
                     repo: RepoSelector::Identity(repo_identity.clone()),
                     target: CheckoutTarget::FreshBranch("feat-remote-step".into()),
                     issue_ids: vec![("github".into(), "123".into())],
-                },
-            },
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
         })
         .await;
 
@@ -2035,16 +2115,16 @@ async fn remote_command_remote_step_events_remap_to_presentation_command_id_and_
 
     let mut rx = daemon.subscribe();
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(NodeId::new("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Identity(repo_identity.clone()),
-                target: CheckoutTarget::FreshBranch("feat-remap".into()),
-                issue_ids: vec![("github".into(), "321".into())],
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Identity(repo_identity.clone()),
+                    target: CheckoutTarget::FreshBranch("feat-remap".into()),
+                    issue_ids: vec![("github".into(), "321".into())],
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch execute");
 
@@ -2138,16 +2218,16 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
 
     let mut rx = daemon.subscribe();
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(NodeId::new("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Path(repo.clone()),
-                target: CheckoutTarget::FreshBranch("feat-workspace-local".into()),
-                issue_ids: vec![],
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Path(repo.clone()),
+                    target: CheckoutTarget::FreshBranch("feat-workspace-local".into()),
+                    issue_ids: vec![],
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch execute");
 
@@ -2220,7 +2300,7 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
                 branch: "feat-workspace-local".into(),
                 path: QualifiedPath::from_host_name(&HostName::new("feta"), "/srv/feta/repo/wt-feat-workspace-local"),
             }),
-            StepOutcome::Produced(CommandValue::PreparedWorkspace(PreparedWorkspace {
+            StepOutcome::Produced(CommandValue::PreparedWorkspace(Box::new(PreparedWorkspace {
                 label: "feat-workspace-local@feta".into(),
                 target_node_id: NodeId::new("feta"),
                 display_host: Some(HostName::new("feta")),
@@ -2231,7 +2311,7 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
                 container_name: None,
                 template_yaml: None,
                 prepared_commands: vec![],
-            })),
+            }))),
         ])
         .await;
 
@@ -2309,16 +2389,16 @@ async fn remote_checkout_failure_with_empty_response_still_stops_local_workspace
 
     let mut rx = daemon.subscribe();
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(NodeId::new("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Path(repo.clone()),
-                target: CheckoutTarget::FreshBranch("feat-workspace-failure".into()),
-                issue_ids: vec![],
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Path(repo.clone()),
+                    target: CheckoutTarget::FreshBranch("feat-workspace-failure".into()),
+                    issue_ids: vec![],
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch execute");
 
@@ -2415,14 +2495,14 @@ async fn dispatch_execute_remote_does_not_hold_peer_manager_lock_across_send() {
             &next_remote_command_id_for_task,
         );
         remote_command_router
-            .dispatch_execute(Command {
-                node_id: Some(NodeId::new("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryHostStatus {
-                    target_environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host")),
-                },
-            })
+            .dispatch_execute(
+                Command::builder()
+                    .action(CommandAction::QueryHostStatus {
+                        target_environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host")),
+                    })
+                    .node_id(NodeId::new("feta"))
+                    .build(),
+            )
             .await
     });
 
@@ -2549,16 +2629,16 @@ async fn cancel_active_remote_segment_routes_remote_step_cancel_and_finishes_com
 
     let mut rx = daemon.subscribe();
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(NodeId::new("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Identity(repo_identity.clone()),
-                target: CheckoutTarget::FreshBranch("feat-cancel-active-remote".into()),
-                issue_ids: vec![("github".into(), "123".into())],
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Identity(repo_identity.clone()),
+                    target: CheckoutTarget::FreshBranch("feat-cancel-active-remote".into()),
+                    issue_ids: vec![("github".into(), "123".into())],
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch execute");
 
@@ -2708,16 +2788,16 @@ async fn cancel_disconnect_of_active_remote_segment_finishes_pending_command() {
 
     let mut rx = daemon.subscribe();
     let command_id = remote_command_router
-        .dispatch_execute(Command {
-            node_id: Some(NodeId::new("feta")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Identity(repo_identity.clone()),
-                target: CheckoutTarget::FreshBranch("feat-cancel-disconnect".into()),
-                issue_ids: vec![],
-            },
-        })
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Identity(repo_identity.clone()),
+                    target: CheckoutTarget::FreshBranch("feat-cancel-disconnect".into()),
+                    issue_ids: vec![],
+                })
+                .node_id(NodeId::new("feta"))
+                .build(),
+        )
         .await
         .expect("dispatch execute");
 
@@ -2782,12 +2862,9 @@ async fn handle_inbound_command_request_does_not_hold_peer_manager_lock_across_s
                         requester_node_id: NodeId::new("desktop"),
                         target_node_id: NodeId::new("relay"),
                         remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                        command: Box::new(Command {
-                            node_id: Some(NodeId::new("relay")),
-                            provisioning_target: None,
-                            context_repo: None,
-                            action: CommandAction::Refresh { repo: None },
-                        }),
+                        command: Box::new(
+                            Command::builder().action(CommandAction::Refresh { repo: None }).node_id(NodeId::new("relay")).build(),
+                        ),
                         session_id: None,
                     }),
                     connection_generation: generation,
@@ -2812,12 +2889,11 @@ async fn handle_inbound_command_request_does_not_hold_peer_manager_lock_across_s
 #[test]
 fn extract_command_repo_identity_uses_context_repo_for_prepare_terminal() {
     let identity = RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() };
-    let command = Command {
-        node_id: Some(NodeId::new("remote")),
-        provisioning_target: None,
-        context_repo: Some(RepoSelector::Identity(identity.clone())),
-        action: CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/tmp/repo.checkout"), commands: vec![] },
-    };
+    let command = Command::builder()
+        .action(CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/tmp/repo.checkout"), commands: vec![] })
+        .node_id(NodeId::new("remote"))
+        .context_repo(RepoSelector::Identity(identity.clone()))
+        .build();
 
     assert_eq!(extract_command_repo_identity(&command), Some(identity));
 }
@@ -2908,12 +2984,7 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
             7,
             NodeId::new("desktop"),
             NodeId::new("relay"),
-            Command {
-                node_id: Some(daemon.node_id().clone()),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Refresh { repo: None },
-            },
+            Command::builder().action(CommandAction::Refresh { repo: None }).node_id(daemon.node_id().clone()).build(),
             ready,
         )
         .await;
@@ -3013,16 +3084,14 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
             9,
             NodeId::new("desktop"),
             NodeId::new("relay"),
-            Command {
-                node_id: Some(daemon.node_id().clone()),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Checkout {
+            Command::builder()
+                .action(CommandAction::Checkout {
                     repo: RepoSelector::Identity(repo_identity.clone()),
                     target: CheckoutTarget::FreshBranch("feat-routed".into()),
                     issue_ids: vec![],
-                },
-            },
+                })
+                .node_id(daemon.node_id().clone())
+                .build(),
             ready,
         )
         .await;
@@ -3599,7 +3668,7 @@ async fn wire_generation_mismatched_client_can_request_shutdown() {
     let hello = Message::Hello {
         protocol_version: PROTOCOL_VERSION,
         node_id: NodeId::new("newer-client"),
-        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation"),
+        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation", "newer-client-fingerprint"),
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
@@ -3631,7 +3700,7 @@ async fn wire_generation_mismatched_client_cannot_request_rich_rpc() {
     let hello = Message::Hello {
         protocol_version: PROTOCOL_VERSION,
         node_id: NodeId::new("newer-client"),
-        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation"),
+        display_name: flotilla_protocol::hello_display_name("client", "newer-client-generation", "newer-client-fingerprint"),
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,

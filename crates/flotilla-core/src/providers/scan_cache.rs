@@ -12,7 +12,7 @@ use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{
         presentation::PresentationManager,
-        terminal::{ManagedSessionMetadata, TerminalEnvVars, TerminalPool, TerminalSession},
+        terminal::{ManagedSessionMetadata, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSize},
         types::{Workspace, WorkspaceAttachRequest},
     },
 };
@@ -154,6 +154,22 @@ impl TerminalPool for SharedTerminalPool {
         tags: &[super::terminal::TerminalSessionTag],
     ) -> Result<(), String> {
         let result = self.inner.ensure_session(session_name, command, cwd, env_vars, tags).await;
+        if result.is_ok() {
+            self.sessions.invalidate();
+        }
+        result
+    }
+
+    async fn ensure_session_with_size(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        tags: &[super::terminal::TerminalSessionTag],
+        initial_size: Option<TerminalSize>,
+    ) -> Result<(), String> {
+        let result = self.inner.ensure_session_with_size(session_name, command, cwd, env_vars, tags, initial_size).await;
         if result.is_ok() {
             self.sessions.invalidate();
         }

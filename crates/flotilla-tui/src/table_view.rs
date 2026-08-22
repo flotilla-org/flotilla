@@ -873,7 +873,7 @@ static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 7] = [
         label: "CONVOY",
         width: WidthHint::Flexible { minimum: 12, weight: 2 },
         alignment: Alignment::Left,
-        extract: |row| CellValue::plain(if row.needs_attention { format!("⚠ {}", row.name) } else { row.name.clone() }),
+        extract: |row| CellValue::plain(if row.needs_attention { format!("⚠ {}", row.display_name()) } else { row.display_name() }),
     },
     ColumnSpec {
         id: "workflow",
@@ -1119,7 +1119,7 @@ fn convoy_scope(row: &ConvoySummary) -> CellValue {
 fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
     let mut fields = vec![
         DetailField { label: "Namespace", value: row.namespace.clone() },
-        DetailField { label: "Convoy", value: row.name.clone() },
+        DetailField { label: "Convoy", value: row.display_name() },
         DetailField { label: "Workflow", value: row.workflow_ref.clone() },
         DetailField {
             label: "Dispatcher",
@@ -1189,7 +1189,7 @@ fn open_convoy_in_pm(row: &ConvoySummary) -> Option<TableIntent> {
     );
     Some(TableIntent::OpenInPm(OpenInPmTarget {
         namespace: row.namespace.clone(),
-        convoy: row.name.clone(),
+        convoy: row.address(),
         vessel: vessel.map(|vessel| vessel.name.clone()),
         label,
         host: row.origin_host.clone().or_else(|| vessel.and_then(|vessel| vessel.host.clone())),
@@ -1204,7 +1204,7 @@ fn delete_convoy(row: &ConvoySummary) -> Option<TableIntent> {
     Some(TableIntent::DeleteConvoy {
         row_id: convoy_id(row),
         namespace: row.namespace.clone(),
-        name: row.name.clone(),
+        name: row.address(),
         host: row.origin_host.clone(),
     })
 }
@@ -1421,6 +1421,7 @@ mod tests {
 
     fn convoy(vessels: Vec<VesselSummary>) -> ConvoySummary {
         ConvoySummary {
+            generation: 1,
             placement_decision: None,
             id: ConvoyId::new("dev", "tables"),
             namespace: "dev".into(),
@@ -1456,6 +1457,17 @@ mod tests {
     }
 
     #[test]
+    fn convoy_human_surfaces_render_and_target_the_role_address() {
+        let convoy = convoy(Vec::new());
+        let table = project_convoys("convoys/dev", &[&convoy]).expect("project convoy table");
+        assert_eq!(table.rows[0].cells[0].text, "tables @ flotilla");
+        assert!(matches!(
+            delete_convoy(&convoy),
+            Some(TableIntent::DeleteConvoy { name, .. }) if name == "tables@flotilla"
+        ));
+    }
+
+    #[test]
     fn convoy_projection_exposes_honest_phase_message_and_drill_target() {
         let mut row = convoy(vec![vessel("implement", &[], WorkPhase::Running)]);
         row.phase = ConvoyPhase::Failed;
@@ -1474,15 +1486,24 @@ mod tests {
     fn convoy_and_vessel_details_render_placement_decisions_with_refusals() {
         let decision = flotilla_protocol::PlacementDecision {
             policy_name: "host-direct-kiwi".into(),
-            target_host: flotilla_protocol::PlacementTargetHost { reference: "01HXYZ".into(), display_name: "kiwi".into() },
+            target_host: flotilla_protocol::PlacementTargetHost {
+                reference: flotilla_protocol::CanonicalHostId::resolved("01HXYZ"),
+                display_name: "kiwi".into(),
+            },
             refused_candidates: vec![flotilla_protocol::PlacementRefusal {
                 policy_name: "host-direct-feta".into(),
-                target_host: flotilla_protocol::PlacementTargetHost { reference: "02HXYZ".into(), display_name: "feta".into() },
+                target_host: flotilla_protocol::PlacementTargetHost {
+                    reference: flotilla_protocol::CanonicalHostId::resolved("02HXYZ"),
+                    display_name: "feta".into(),
+                },
                 reason: "disk below admission floor".into(),
             }],
             viable_not_selected: vec![flotilla_protocol::PlacementViableCandidate {
                 policy_name: "host-direct-gouda".into(),
-                target_host: flotilla_protocol::PlacementTargetHost { reference: "03HXYZ".into(), display_name: "gouda".into() },
+                target_host: flotilla_protocol::PlacementTargetHost {
+                    reference: flotilla_protocol::CanonicalHostId::resolved("03HXYZ"),
+                    display_name: "gouda".into(),
+                },
                 reason: "priority 0 is lower than selected policy `host-direct-kiwi` priority 100".into(),
             }],
         };
@@ -1532,7 +1553,7 @@ mod tests {
 
         let view = project_convoys("convoys/dev", &[&row]).expect("convoy table");
 
-        assert_eq!(view.rows[0].cells[0].text, "⚠ tables");
+        assert_eq!(view.rows[0].cells[0].text, "⚠ tables @ flotilla");
     }
 
     #[test]
@@ -1583,7 +1604,7 @@ mod tests {
                     intent: TableIntent::DeleteConvoy {
                         row_id: RowId::new("dev/tables"),
                         namespace: "dev".into(),
-                        name: "tables".into(),
+                        name: "tables@flotilla".into(),
                         host: Some(HostName::new("kiwi")),
                     },
                 }
@@ -1757,7 +1778,7 @@ mod tests {
             Salience::Info,
         ]);
         assert!(panels.iter().all(|panel| panel.table.meta.as_of == Some(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)));
-        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
+        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables @ roadmap");
         assert_eq!(panels[1].table.rows[0].cells[1].text, "/work/flotilla");
         assert_eq!(panels[2].table.rows[0].actions[0].intent, TableIntent::StartConvoy {
             namespace: "flotilla".into(),
@@ -1785,7 +1806,7 @@ mod tests {
 
         let panels = project_panels(&address, &TableRows { convoys: vec![&convoy], ..TableRows::default() }).expect("project panels");
 
-        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
+        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables @ roadmap");
         assert_eq!(panels[1].table.meta.availability, TableAvailability::Loading);
         assert_eq!(panels[2].table.meta.availability, TableAvailability::Loading);
         assert_eq!(panels[3].table.meta.availability, TableAvailability::Loading);
@@ -1914,11 +1935,11 @@ mod tests {
         let mut state = TableState::default();
         state.reconcile(&view);
         state.select_delta(&view, 1);
-        assert_eq!(state.selected_row(&view).map(|row| row.cells[0].text.as_str()), Some("other"));
+        assert_eq!(state.selected_row(&view).map(|row| row.cells[0].text.as_str()), Some("other @ flotilla"));
 
         let changed = project(&address, &TableRows { convoys: vec![&first], ..TableRows::default() }).expect("project table");
         state.reconcile(&changed);
-        assert_eq!(state.selected_row(&changed).map(|row| row.cells[0].text.as_str()), Some("tables"));
+        assert_eq!(state.selected_row(&changed).map(|row| row.cells[0].text.as_str()), Some("tables @ flotilla"));
     }
 
     #[test]
@@ -2004,6 +2025,6 @@ mod tests {
         let view = project_convoys("convoys/dev", &[&failed, &active]).expect("project table").filtered("DSK F");
 
         assert_eq!(view.rows.len(), 1);
-        assert_eq!(view.rows[0].cells[0].text, "tables");
+        assert_eq!(view.rows[0].cells[0].text, "tables @ flotilla");
     }
 }
