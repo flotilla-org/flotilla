@@ -34,7 +34,7 @@ identity.** The remotes list is part of the Repository record
   survive installations with different or no lab forge).
 - An undeclared second remote observed in the wild (a checkout whose
   origin matches no known Repository remote) materializes a provisional
-  Repository as today, with the provenance-edge machinery (ADR 0014's
+  Repository as today, with the provenance-edge machinery (ADR 0020's
   identity-upgrade path) merging it into the canonical Repository when
   the declaration is added.
 
