@@ -4603,6 +4603,23 @@ impl InProcessDaemon {
                     }
                     continue;
                 }
+                let ensure_is_local = match self.resource_backend.clone().using::<ConvoyEnsure>(namespace).get(&ensure.metadata.name).await
+                {
+                    Ok(_) => true,
+                    Err(ResourceError::NotFound { .. }) => false,
+                    Err(error) => {
+                        errors.push(format!("ConvoyEnsure/{}: could not determine ensure authority: {error}", ensure.metadata.name));
+                        continue;
+                    }
+                };
+                if !ensure_is_local {
+                    match self.reconcile_replica_driven_convoy_ensure(namespace, &ensure).await {
+                        Ok(Some(change)) => changes.push(change),
+                        Ok(None) => {}
+                        Err(error) => errors.push(format!("ConvoyEnsure/{}: {error}", ensure.metadata.name)),
+                    }
+                    continue;
+                }
                 if let Err(error) = self.clear_ensure_driver_condition(namespace, &ensure).await {
                     errors.push(format!("ConvoyEnsure/{}: could not clear driver condition: {error}", ensure.metadata.name));
                     continue;
@@ -4658,6 +4675,35 @@ impl InProcessDaemon {
         } else {
             Err(format!("{}; successful changes: {}", errors.join("; "), changes.join(", ")))
         }
+    }
+
+    /// Admit an ensure whose definition is homed at another root.
+    ///
+    /// The driver decides from the merged definition view, but does not write
+    /// status onto its read-only replica.
+    async fn reconcile_replica_driven_convoy_ensure(
+        &self,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
+    ) -> Result<Option<String>, String> {
+        let has_live_generation = self
+            .resource_backend
+            .clone()
+            .using::<ResourceConvoy>(namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .iter()
+            .any(|convoy| {
+                convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name)
+                    && convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
+            });
+        if has_live_generation {
+            return Ok(None);
+        }
+        self.start_ensured_convoy(namespace, ensure).await?;
+        Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
     }
 
     async fn set_ensure_driver_condition(

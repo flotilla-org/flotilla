@@ -619,8 +619,15 @@ async fn projectless_convoys_do_not_share_an_identity_bucket_with_a_project_name
 }
 
 async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<VirtualClock>, tempfile::TempDir) {
+    standing_ensure_fixture_for("local", true).await
+}
+
+async fn standing_ensure_fixture_for(
+    host: &str,
+    materialize_ensure: bool,
+) -> (Arc<InProcessDaemon>, ResourceBackend, Arc<VirtualClock>, tempfile::TempDir) {
     let temp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"standing-test\"\n").expect("daemon config");
+    std::fs::write(temp.path().join("daemon.toml"), format!("machine_id = \"standing-{host}\"\n")).expect("daemon config");
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let now = Utc.with_ymd_and_hms(2026, 8, 15, 12, 0, 0).single().expect("timestamp");
     let clock = Arc::new(VirtualClock::new(now));
@@ -628,7 +635,7 @@ async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Ar
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
-        HostName::local(),
+        HostName::new(host),
         backend.clone(),
         clock.clone(),
     )
@@ -636,24 +643,26 @@ async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Ar
     let repository_spec = RepositorySpec::remote("https://github.com/acme/standing").expect("repository spec");
     let repository_key = repository_spec.key();
     backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository_spec).await.expect("repository");
-    backend
-        .definitions::<Project>("flotilla")
-        .create(
-            &test_meta("standing-project"),
-            &ProjectSpec::builder()
-                .display_name("Standing Project".to_string())
-                .default_workflow_ref("quartermaster".to_string())
-                .repositories(vec![ProjectRepositorySpec {
-                    repo: repository_key.clone(),
-                    alias: Some("app".to_string()),
-                    roles: BTreeSet::from([ProjectRepositoryRole::Code]),
-                    subpath: None,
-                    default_branch: Some("main".to_string()),
-                }])
-                .build(),
-        )
-        .await
-        .expect("project");
+    if materialize_ensure {
+        backend
+            .definitions::<Project>("flotilla")
+            .create(
+                &test_meta("standing-project"),
+                &ProjectSpec::builder()
+                    .display_name("Standing Project".to_string())
+                    .default_workflow_ref("quartermaster".to_string())
+                    .repositories(vec![ProjectRepositorySpec {
+                        repo: repository_key.clone(),
+                        alias: Some("app".to_string()),
+                        roles: BTreeSet::from([ProjectRepositoryRole::Code]),
+                        subpath: None,
+                        default_branch: Some("main".to_string()),
+                    }])
+                    .build(),
+            )
+            .await
+            .expect("project");
+    }
     backend
         .using::<WorkflowTemplate>("flotilla")
         .create(
@@ -669,31 +678,33 @@ async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Ar
         )
         .await
         .expect("standing workflow");
-    backend
-        .definitions::<ConvoyEnsure>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("quartermaster".to_string())
-                .annotations(BTreeMap::from([
-                    (MATERIALIZED_PROJECT_ANNOTATION.to_string(), "standing-project".to_string()),
-                    (SOURCE_REPOSITORY_ANNOTATION.to_string(), repository_key.to_string()),
-                    (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
-                    (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), "ops/quartermaster.md".to_string()),
-                ]))
-                .build(),
-            &ConvoyEnsureSpec {
-                project_ref: "standing-project".to_string(),
-                role: "quartermaster".to_string(),
-                driver_ref: None,
-                workflow_ref: "quartermaster".to_string(),
-                placement_policy: None,
-                stance: Some(Stance::Trusted),
-                repositories: vec![repository_key],
-                presents_as: Some("fleet".to_string()),
-            },
-        )
-        .await
-        .expect("ensure declaration");
+    if materialize_ensure {
+        backend
+            .definitions::<ConvoyEnsure>("flotilla")
+            .create(
+                &InputMeta::builder()
+                    .name("quartermaster".to_string())
+                    .annotations(BTreeMap::from([
+                        (MATERIALIZED_PROJECT_ANNOTATION.to_string(), "standing-project".to_string()),
+                        (SOURCE_REPOSITORY_ANNOTATION.to_string(), repository_key.to_string()),
+                        (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
+                        (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), "ops/quartermaster.md".to_string()),
+                    ]))
+                    .build(),
+                &ConvoyEnsureSpec {
+                    project_ref: "standing-project".to_string(),
+                    role: "quartermaster".to_string(),
+                    driver_ref: None,
+                    workflow_ref: "quartermaster".to_string(),
+                    placement_policy: None,
+                    stance: Some(Stance::Trusted),
+                    repositories: vec![repository_key],
+                    presents_as: Some("fleet".to_string()),
+                },
+            )
+            .await
+            .expect("ensure declaration");
+    }
     (daemon, backend, clock, temp)
 }
 
@@ -845,12 +856,26 @@ async fn set_ensure_driver(backend: &ResourceBackend, driver_ref: &str) {
 }
 
 #[tokio::test]
-async fn declared_driver_admits_on_exactly_one_of_multiple_locally_authored_project_roots() {
-    let (driver, driver_backend, _clock, _temp) = standing_ensure_fixture().await;
-    let (other, other_backend, _other_clock, _other_temp) = standing_ensure_fixture().await;
+async fn declared_driver_admits_replica_homed_at_another_root_exactly_once() {
+    let (authority, authority_backend, _authority_clock, _authority_temp) = standing_ensure_fixture_for("kiwi", true).await;
+    let (driver, driver_backend, _driver_clock, _driver_temp) = standing_ensure_fixture_for("udder", false).await;
+    let (other, other_backend, _other_clock, _other_temp) = standing_ensure_fixture_for("feta", false).await;
     let driver_id = driver.local_host_id().expect("driver host identity").to_string();
-    set_ensure_driver(&driver_backend, &driver_id).await;
-    set_ensure_driver(&other_backend, &driver_id).await;
+    set_ensure_driver(&authority_backend, &driver_id).await;
+
+    let authority_root = authority.node_id().clone();
+    for backend in [&driver_backend, &other_backend] {
+        backend
+            .replica_writer::<Project>(authority_root.clone(), "flotilla")
+            .replace(&authority_backend.using::<Project>("flotilla").list().await.expect("authority projects"), Utc::now())
+            .await
+            .expect("replicate projects");
+        backend
+            .replica_writer::<ConvoyEnsure>(authority_root.clone(), "flotilla")
+            .replace(&authority_backend.using::<ConvoyEnsure>("flotilla").list().await.expect("authority ensures"), Utc::now())
+            .await
+            .expect("replicate ensures");
+    }
 
     let host_origin = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(driver.node_id().clone());
     let hosts = host_origin.using::<ResourceHost>("flotilla");
@@ -860,7 +885,7 @@ async fn declared_driver_admits_on_exactly_one_of_multiple_locally_authored_proj
         .await
         .expect("ready driver host");
     let host_snapshot = hosts.list().await.expect("driver host snapshot");
-    for backend in [&driver_backend, &other_backend] {
+    for backend in [&authority_backend, &driver_backend, &other_backend] {
         backend
             .replica_writer::<ResourceHost>(driver.node_id().clone(), "flotilla")
             .replace(&host_snapshot, Utc::now())
@@ -868,10 +893,14 @@ async fn declared_driver_admits_on_exactly_one_of_multiple_locally_authored_proj
             .expect("replicate driver host");
     }
 
+    assert!(authority.reconcile_convoy_ensures_once("flotilla").await.expect("authority skip").is_empty());
     assert_eq!(driver.reconcile_convoy_ensures_once("flotilla").await.expect("driver admission").len(), 1);
     assert!(other.reconcile_convoy_ensures_once("flotilla").await.expect("non-driver skip").is_empty());
+    assert!(driver.reconcile_convoy_ensures_once("flotilla").await.expect("steady-state driver pass").is_empty());
     assert_eq!(driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("driver convoys").items.len(), 1);
+    assert!(authority_backend.using::<ResourceConvoy>("flotilla").list().await.expect("authority convoys").items.is_empty());
     assert!(other_backend.using::<ResourceConvoy>("flotilla").list().await.expect("other convoys").items.is_empty());
+    assert!(driver_backend.using::<ConvoyEnsure>("flotilla").list().await.expect("driver local ensures").items.is_empty());
 }
 
 #[tokio::test]
