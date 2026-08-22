@@ -9141,11 +9141,15 @@ mod tests {
             .expect("reviewer session");
         let reviewer_id = reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).expect("reviewer identity").id.clone();
         assert_eq!(reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.adapter.as_str()), Some("codex"));
-        let delivered = pool.delivered.lock().await;
-        assert!(delivered.iter().any(|(session, text, submit)| {
-            session.ends_with("-reviewer") && text == "handoff from coder@implement\n\nReview commit abc123" && *submit
-        }));
-        drop(delivered);
+        wait_until(|| {
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.delivered.lock().await.iter().any(|(session, text, submit)| {
+                    session.ends_with("-reviewer") && text == "handoff from coder@implement\n\nReview commit abc123" && *submit
+                })
+            }
+        })
+        .await;
 
         let mut rx = daemon.subscribe();
         let hand_back_id = daemon
@@ -9161,11 +9165,43 @@ mod tests {
             .await
             .expect("hand back to coder");
         assert_eq!(wait_for_command_result(&mut rx, hand_back_id).await, CommandValue::Ok);
-        let delivered = pool.delivered.lock().await;
-        assert!(delivered.iter().any(|(session, text, submit)| {
-            session.ends_with("-coder") && text == "handoff from reviewer@implement\n\nAddress the review findings" && *submit
-        }));
-        drop(delivered);
+        let coder_delivery_id = terminals
+            .list()
+            .await
+            .expect("terminal list")
+            .items
+            .into_iter()
+            .find(|session| session.spec.role == "coder")
+            .and_then(|session| match session.spec.source {
+                TerminalSessionSource::Agent { message, .. } => message.map(|message| message.id),
+                TerminalSessionSource::Tool { .. } => None,
+            })
+            .expect("running coder handoff should be queued through the reconciler");
+        wait_until(|| {
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.delivered.lock().await.iter().any(|(session, text, submit)| {
+                    session.ends_with("-coder") && text == "handoff from reviewer@implement\n\nAddress the review findings" && *submit
+                })
+            }
+        })
+        .await;
+        wait_until_with_timeout(Duration::from_secs(5), || {
+            let terminals = terminals.clone();
+            let coder_delivery_id = coder_delivery_id.clone();
+            async move {
+                terminals
+                    .list()
+                    .await
+                    .ok()
+                    .and_then(|list| list.items.into_iter().find(|session| session.spec.role == "coder"))
+                    .and_then(|session| session.status)
+                    .and_then(|status| status.delivered_message_id)
+                    .as_deref()
+                    == Some(coder_delivery_id.as_str())
+            }
+        })
+        .await;
         wait_until(|| {
             let convoys = convoys.clone();
             let crew_record = crew_record.clone();
