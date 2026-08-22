@@ -4493,9 +4493,50 @@ impl InProcessDaemon {
         backing_inspector: &dyn StandingConvoyBackingInspector,
     ) -> Result<Vec<String>, String> {
         let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace).list().await.map_err(|e| e.to_string())?;
+        let local_projects = self.resource_backend.clone().using::<Project>(namespace);
         let mut changes = Vec::new();
         let mut errors = Vec::new();
         for ensure in ensures {
+            match local_projects.get(&ensure.spec.project_ref).await {
+                Ok(project) if project.metadata.deletion_timestamp.is_none() => {}
+                Ok(_) => {
+                    errors.push(format!("ConvoyEnsure/{}: parent Project/{} is absent", ensure.metadata.name, ensure.spec.project_ref));
+                    continue;
+                }
+                Err(ResourceError::NotFound { .. }) => {
+                    match self.resource_backend.clone().definitions::<Project>(namespace).get(&ensure.spec.project_ref).await {
+                        Ok(_) => {
+                            debug!(
+                                ensure = %ensure.metadata.name,
+                                project = %ensure.spec.project_ref,
+                                "skipping standing convoy ensure away from its project home"
+                            );
+                            continue;
+                        }
+                        Err(ResourceError::NotFound { .. }) => {
+                            errors.push(format!(
+                                "ConvoyEnsure/{}: parent Project/{} is absent",
+                                ensure.metadata.name, ensure.spec.project_ref
+                            ));
+                            continue;
+                        }
+                        Err(error) => {
+                            errors.push(format!(
+                                "ConvoyEnsure/{}: could not resolve Project/{} authority: {error}",
+                                ensure.metadata.name, ensure.spec.project_ref
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    errors.push(format!(
+                        "ConvoyEnsure/{}: could not verify local Project/{} authority: {error}",
+                        ensure.metadata.name, ensure.spec.project_ref
+                    ));
+                    continue;
+                }
+            }
             match self.reconcile_convoy_ensure(namespace, &ensure, backing_inspector).await {
                 Ok(Some(change)) => changes.push(change),
                 Ok(None) => {}
