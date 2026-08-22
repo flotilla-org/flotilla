@@ -806,6 +806,39 @@ async fn concurrent_ensure_admission_creates_only_one_live_generation() {
 }
 
 #[tokio::test]
+async fn statusless_ensured_generation_is_live_even_when_address_labels_are_missing() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+
+    let ensures = backend.using::<ConvoyEnsure>("flotilla");
+    let ensure = ensures.get("quartermaster").await.expect("ensure");
+    let convoy_ref = ensure.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("admitted generation");
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let convoy = convoys.get(&convoy_ref).await.expect("statusless generation");
+    convoys
+        .update(
+            &InputMeta::builder().name(convoy.metadata.name.clone()).annotations(convoy.metadata.annotations.clone()).build(),
+            &convoy.metadata.resource_version,
+            &convoy.spec,
+        )
+        .await
+        .expect("simulate generation whose address labels have not materialized");
+    ensures
+        .update_status(&ensure.metadata.name, &ensure.metadata.resource_version, &ConvoyEnsureStatus {
+            observed_config_hash: ensure.status.and_then(|status| status.observed_config_hash),
+            ..Default::default()
+        })
+        .await
+        .expect("simulate lost ensure status update");
+
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("rediscover admitted generation"), vec![
+        "ConvoyEnsure/quartermaster observed running"
+    ]);
+    assert_eq!(convoys.list().await.expect("convoys").items.len(), 1);
+    assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.and_then(|status| status.convoy_ref), Some(convoy_ref));
+}
+
+#[tokio::test]
 async fn changing_ensure_config_starts_a_fresh_retry_episode() {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
