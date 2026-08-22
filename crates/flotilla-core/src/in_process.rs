@@ -2424,8 +2424,16 @@ impl InProcessDaemon {
     pub async fn inspect_repository_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
         let mut inspection = self.repository_inspector().await?.inspect_path(path, remote).await?;
         inspection.spec = self.resolve_declared_repository(inspection.spec).await?;
-        inspection.spec =
-            self.config.configure_repository_spec(&ExecutionEnvironmentPath::new(&inspection.checkout.path), inspection.spec)?;
+        let resolved_spec = inspection.spec;
+        let configured_spec =
+            self.config.configure_repository_spec(&ExecutionEnvironmentPath::new(&inspection.checkout.path), resolved_spec.clone())?;
+        if resolved_spec.remotes().len() > 1 && configured_spec.key() != resolved_spec.key() {
+            return Err(format!(
+                "repository config for {} changes the canonical remote of an existing declaration",
+                inspection.checkout.path.display()
+            ));
+        }
+        inspection.spec = configured_spec;
         Ok(inspection)
     }
 
@@ -6016,6 +6024,8 @@ impl InProcessDaemon {
         let obsolete_mirror_projects = project_objects
             .iter()
             .filter(|project| {
+                // The standing lab mirrors predate deterministic generated
+                // names and were explicitly materialized as `<name>-lab`.
                 project.metadata.labels.get(MANAGED_BY_LABEL).is_some_and(|value| value == WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE)
                     && !canonical_generated_names.contains(&project.metadata.name)
                     && (generated_names.contains(&project.metadata.name) || project.metadata.name.ends_with("-lab"))
