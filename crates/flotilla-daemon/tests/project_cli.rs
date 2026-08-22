@@ -18,6 +18,7 @@ use flotilla_core::{
         MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
         SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
     },
+    path_context::ExecutionEnvironmentPath,
     project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
     providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote},
     repository_inspection::{LocalCheckoutInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
@@ -85,6 +86,27 @@ struct FixedInspector {
 #[derive(Clone)]
 struct MutableInspector {
     spec: Arc<RwLock<RepositorySpec>>,
+}
+
+#[derive(Clone)]
+struct PerPathInspector {
+    specs: BTreeMap<PathBuf, RepositorySpec>,
+}
+
+#[async_trait]
+impl RepositoryInspector for PerPathInspector {
+    async fn inspect_path(&self, path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        Ok(RepositoryInspection {
+            spec: self.specs.get(path).ok_or_else(|| format!("unexpected checkout path {}", path.display()))?.clone(),
+            checkout: LocalCheckoutInspection {
+                path: path.to_path_buf(),
+                host_ref: if path.ends_with("mirror-root") { "host-mirror" } else { "host-github" }.to_string(),
+                git_ref: "main".to_string(),
+                is_main: true,
+            },
+            transport_url: None,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -801,7 +823,7 @@ async fn tracked_repo_labels_materialized_project_without_overwriting_user_field
         }])
         .build();
     projects
-        .create(
+        .apply(
             &InputMeta::builder()
                 .name("tracked".to_string())
                 .labels(BTreeMap::from([("example.com/preserved".to_string(), "true".to_string())]))
@@ -820,6 +842,107 @@ async fn tracked_repo_labels_materialized_project_without_overwriting_user_field
     daemon.materialize_tracked_repo_projects().await.expect("steady-state reconciliation should succeed");
     let unchanged = projects.get("tracked").await.expect("tracked Project should remain");
     assert_eq!(unchanged.metadata.resource_version, reconciled.metadata.resource_version);
+}
+
+#[tokio::test]
+async fn mirror_and_canonical_roots_materialize_one_repository_and_project() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mirror_root = tmp.path().join("mirror-root");
+    let github_root = tmp.path().join("github-root");
+    std::fs::create_dir_all(&mirror_root).expect("mirror checkout");
+    std::fs::create_dir_all(&github_root).expect("GitHub checkout");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let config_dir = tmp.path().join("config");
+    let config = test_config(config_dir.clone());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+
+    let canonical_url = "https://github.com/flotilla-org/flotilla";
+    let mirror_url = "https://forgejo.lab/lab/flotilla";
+    let canonical = RepositorySpec::remote(mirror_url)
+        .expect("mirror observation")
+        .with_remotes([canonical_url, mirror_url])
+        .expect("canonical declaration");
+    let mirror = RepositorySpec::remote(mirror_url).expect("old mirror repository");
+    let fork = RepositorySpec::remote("https://forgejo.lab/forks/zellij")
+        .expect("fork repository")
+        .with_upstream("https://github.com/zellij-org/zellij", flotilla_resources::RepositoryRelation::Fork)
+        .expect("fork provenance");
+    let repositories = backend.clone().using::<Repository>("flotilla");
+    for spec in [&canonical, &mirror, &fork] {
+        repositories.create(&InputMeta::builder().name(spec.key().to_string()).build(), spec).await.expect("seed repository");
+    }
+    backend
+        .clone()
+        .definitions::<Project>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("flotilla-lab".to_string())
+                .labels(BTreeMap::from([(MANAGED_BY_LABEL.to_string(), "whole-repository-project".to_string())]))
+                .build(),
+            &ProjectSpec::builder()
+                .display_name("flotilla-lab".to_string())
+                .default_workflow_ref("single-agent-trusted".to_string())
+                .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(mirror.key()).build()])
+                .build(),
+        )
+        .await
+        .expect("old mirror project");
+    daemon
+        .set_repository_inspector(Arc::new(PerPathInspector {
+            specs: BTreeMap::from([
+                (mirror_root, RepositorySpec::remote(mirror_url).expect("mirror clone")),
+                (github_root, RepositorySpec::remote(canonical_url).expect("GitHub clone")),
+            ]),
+        }))
+        .await;
+
+    let resolved_mirror = daemon.inspect_repository_path(tmp.path().join("mirror-root").as_path(), None).await.expect("resolve mirror");
+    assert_eq!(resolved_mirror.spec, canonical);
+    let mut events = daemon.subscribe();
+    for path in [tmp.path().join("mirror-root"), tmp.path().join("github-root")] {
+        let command_id =
+            daemon.execute(Command::builder().action(CommandAction::TrackRepoPath { path }).build()).await.expect("track root");
+        assert!(matches!(await_command_result(&mut events, command_id).await, CommandValue::RepoTracked { .. }));
+    }
+
+    let projects = backend.clone().definitions::<Project>("flotilla").list().await.expect("project list");
+    assert_eq!(
+        projects.len(),
+        1,
+        "remaining projects: {:?}",
+        projects.iter().map(|project| (&project.metadata.name, &project.spec.repositories)).collect::<Vec<_>>()
+    );
+    assert_eq!(projects[0].spec.repositories[0].repo, canonical.key());
+    assert_ne!(projects[0].metadata.name, "flotilla-lab");
+    let repository_items = repositories.list().await.expect("repository list");
+    assert_eq!(repository_items.items.len(), 2, "canonical repository and unrelated fork remain");
+    assert!(repositories.get(&mirror.key().to_string()).await.is_err(), "provisional mirror repository is retired");
+    assert!(repositories.get(&fork.key().to_string()).await.expect("fork remains").spec.is_fork());
+    assert_eq!(daemon.repository_key_for_path(&tmp.path().join("mirror-root")).await, Some(canonical.key()));
+    assert_eq!(daemon.repository_key_for_path(&tmp.path().join("github-root")).await, Some(canonical.key()));
+
+    let mirror_path = tmp.path().join("mirror-root");
+    config.save_repo(&ExecutionEnvironmentPath::new(mirror_path.clone()));
+    let repo_config_path = std::fs::read_dir(config_dir.join("repos"))
+        .expect("repo config directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            std::fs::read_to_string(path)
+                .is_ok_and(|contents| contents.lines().any(|line| line == format!("path = \"{}\"", mirror_path.display())))
+        })
+        .expect("mirror repo config");
+    std::fs::write(repo_config_path, format!("path = \"{}\"\nremotes = [\"{mirror_url}\", \"{canonical_url}\"]\n", mirror_path.display()))
+        .expect("conflicting mirror declaration");
+    let error = daemon.inspect_repository_path(&mirror_path, None).await.expect_err("canonical order must not flap across roots");
+    assert!(error.contains("changes the canonical remote of an existing declaration"));
 }
 
 #[tokio::test]
