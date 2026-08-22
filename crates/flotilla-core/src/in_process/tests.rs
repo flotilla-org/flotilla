@@ -684,6 +684,7 @@ async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Ar
             &ConvoyEnsureSpec {
                 project_ref: "standing-project".to_string(),
                 role: "quartermaster".to_string(),
+                driver_ref: None,
                 workflow_ref: "quartermaster".to_string(),
                 placement_policy: None,
                 stance: Some(Stance::Trusted),
@@ -833,6 +834,78 @@ async fn replicated_ensure_is_not_reconciled_away_from_its_project_home() {
     assert!(backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.is_ok(), "replicated ensure should be visible");
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("skip remote ensure").is_empty());
     assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("local convoys").items.is_empty());
+}
+
+async fn set_ensure_driver(backend: &ResourceBackend, driver_ref: &str) {
+    let ensures = backend.using::<ConvoyEnsure>("flotilla");
+    let ensure = ensures.get("quartermaster").await.expect("ensure");
+    let mut spec = ensure.spec;
+    spec.driver_ref = Some(driver_ref.to_string());
+    ensures.update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &spec).await.expect("set ensure driver");
+}
+
+#[tokio::test]
+async fn declared_driver_admits_on_exactly_one_of_multiple_locally_authored_project_roots() {
+    let (driver, driver_backend, _clock, _temp) = standing_ensure_fixture().await;
+    let (other, other_backend, _other_clock, _other_temp) = standing_ensure_fixture().await;
+    let driver_id = driver.local_host_id().expect("driver host identity").to_string();
+    set_ensure_driver(&driver_backend, &driver_id).await;
+    set_ensure_driver(&other_backend, &driver_id).await;
+
+    let host_origin = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(driver.node_id().clone());
+    let hosts = host_origin.using::<ResourceHost>("flotilla");
+    let host = hosts.create(&test_meta(&driver_id), &HostSpec { display_name: "udder".to_string() }).await.expect("driver host");
+    hosts
+        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus { ready: true, ..Default::default() })
+        .await
+        .expect("ready driver host");
+    let host_snapshot = hosts.list().await.expect("driver host snapshot");
+    for backend in [&driver_backend, &other_backend] {
+        backend
+            .replica_writer::<ResourceHost>(driver.node_id().clone(), "flotilla")
+            .replace(&host_snapshot, Utc::now())
+            .await
+            .expect("replicate driver host");
+    }
+
+    assert_eq!(driver.reconcile_convoy_ensures_once("flotilla").await.expect("driver admission").len(), 1);
+    assert!(other.reconcile_convoy_ensures_once("flotilla").await.expect("non-driver skip").is_empty());
+    assert_eq!(driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("driver convoys").items.len(), 1);
+    assert!(other_backend.using::<ResourceConvoy>("flotilla").list().await.expect("other convoys").items.is_empty());
+}
+
+#[tokio::test]
+async fn unavailable_declared_driver_surfaces_named_admission_conditions_without_fallback() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    set_ensure_driver(&backend, "missing-driver").await;
+    assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("unknown driver skip").is_empty());
+    let ensure = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("conditioned ensure");
+    let condition = ensure
+        .status
+        .as_ref()
+        .expect("ensure status")
+        .conditions
+        .iter()
+        .find(|condition| condition.condition_type == DRIVER_ADMISSION_CONDITION_TYPE)
+        .expect("driver admission condition");
+    assert_eq!(condition.reason, "UnknownDriver");
+    assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items.is_empty());
+
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    hosts
+        .create(&test_meta("missing-driver"), &HostSpec { display_name: "missing-driver".to_string() })
+        .await
+        .expect("known but unreachable driver");
+    assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("unreachable driver skip").is_empty());
+    let ensure = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("conditioned ensure");
+    let condition = ensure
+        .status
+        .expect("ensure status")
+        .conditions
+        .into_iter()
+        .find(|condition| condition.condition_type == DRIVER_ADMISSION_CONDITION_TYPE)
+        .expect("driver admission condition");
+    assert_eq!(condition.reason, "DriverUnreachable");
 }
 
 #[tokio::test]
@@ -1088,6 +1161,7 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
             last_failure: None,
             hold_reason: None,
             observed_config_hash: None,
+            conditions: Vec::new(),
         })
         .await
         .expect("seed crash budget");

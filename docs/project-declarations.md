@@ -95,6 +95,7 @@ generation as `role@project` and render it as `role @ project`.
 ---
 kind: ensure
 role: quartermaster
+driver: feta
 repos: [app]
 ---
 workflow: quartermaster
@@ -103,7 +104,12 @@ stance: trusted
 presents-as: fleet
 ```
 
-`placement`, `stance`, and `presents-as` are optional. A stance preference
+`driver` is an optional host reference in the frontmatter. When declared, only
+that host's resource-store root admits the standing convoy. An unknown or
+unreachable driver is reported as a `DriverAdmission` condition and never
+silently falls back. Without `driver`, admission falls back to the root holding
+the tracked bootstrap-repository checkout. `placement`, `stance`, and
+`presents-as` are optional. A stance preference
 overrides every vessel in the pinned workflow snapshot. `presents-as` is only
 a presentation annotation; `fleet` has no special scope semantics. Fleet-level
 standing convoys are declared by convention in the fleet project.

@@ -31,16 +31,25 @@ pub enum OperationalEntryDefinition {
     Ensure(EnsureEntry),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnsureEntry {
+    pub driver: Option<String>,
     pub workflow: String,
-    #[serde(default)]
     pub placement: Option<String>,
-    #[serde(default)]
     pub stance: Option<Stance>,
-    #[serde(default, alias = "presents-as")]
     pub presents_as: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnsureBody {
+    workflow: String,
+    #[serde(default)]
+    placement: Option<String>,
+    #[serde(default)]
+    stance: Option<Stance>,
+    #[serde(default, alias = "presents-as")]
+    presents_as: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +58,7 @@ struct EntryFrontmatter {
     kind: EntryKind,
     name: Option<String>,
     role: Option<String>,
+    driver: Option<String>,
     repos: Option<Vec<String>>,
 }
 
@@ -90,6 +100,9 @@ pub fn parse_operational_entry(contents: &str) -> Result<Option<OperationalEntry
             (None, None) => return Err("operational entry name cannot be empty".to_string()),
         },
     };
+    if !matches!(frontmatter.kind, EntryKind::Ensure) && frontmatter.driver.is_some() {
+        return Err("only ensure entries declare `driver`".to_string());
+    }
     let repos = frontmatter
         .repos
         .map(|repos| {
@@ -109,7 +122,14 @@ pub fn parse_operational_entry(contents: &str) -> Result<Option<OperationalEntry
             OperationalEntryDefinition::VerificationCommand { command: required(body.command, "command")? }
         }
         EntryKind::Ensure => {
-            let mut body: EnsureEntry = serde_yml::from_str(body).map_err(|error| format!("invalid ensure entry `{name}`: {error}"))?;
+            let body: EnsureBody = serde_yml::from_str(body).map_err(|error| format!("invalid ensure entry `{name}`: {error}"))?;
+            let mut body = EnsureEntry {
+                driver: frontmatter.driver.map(|value| required(value, "driver")).transpose()?,
+                workflow: body.workflow,
+                placement: body.placement,
+                stance: body.stance,
+                presents_as: body.presents_as,
+            };
             body.workflow = required(body.workflow, "workflow")?;
             body.placement = body.placement.map(|value| required(value, "placement")).transpose()?;
             body.presents_as = body.presents_as.map(|value| required(value, "presents_as")).transpose()?;
@@ -156,7 +176,7 @@ mod tests {
     #[test]
     fn parses_standing_convoy_ensure_preferences() {
         let entry = parse_operational_entry(
-            "---\nkind: ensure\nrole: quartermaster\nrepos: [project-map]\n---\nworkflow: quartermaster\nplacement: feta\nstance: trusted\npresents-as: fleet\n",
+            "---\nkind: ensure\nrole: quartermaster\ndriver: udder\nrepos: [project-map]\n---\nworkflow: quartermaster\nplacement: feta\nstance: trusted\npresents-as: fleet\n",
         )
         .expect("parse")
         .expect("entry");
@@ -164,12 +184,20 @@ mod tests {
         assert!(matches!(
             entry.definition,
             OperationalEntryDefinition::Ensure(super::EnsureEntry {
+                driver: Some(driver),
                 workflow,
                 placement: Some(placement),
                 stance: Some(flotilla_resources::Stance::Trusted),
                 presents_as: Some(presents_as),
-            }) if workflow == "quartermaster" && placement == "feta" && presents_as == "fleet"
+            }) if driver == "udder" && workflow == "quartermaster" && placement == "feta" && presents_as == "fleet"
         ));
+    }
+
+    #[test]
+    fn driver_is_ensure_frontmatter_not_body() {
+        let error = parse_operational_entry("---\nkind: ensure\nrole: quartermaster\n---\nworkflow: quartermaster\ndriver: udder\n")
+            .expect_err("body driver must be rejected");
+        assert!(error.contains("unknown field `driver`"));
     }
 
     #[test]
@@ -192,6 +220,7 @@ mod tests {
         assert!(matches!(
             ensure.definition,
             OperationalEntryDefinition::Ensure(super::EnsureEntry {
+                driver: None,
                 workflow,
                 placement: Some(placement),
                 stance: Some(flotilla_resources::Stance::Trusted),

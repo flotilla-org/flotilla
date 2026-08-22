@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, ReplicationClass, RepositoryKey, Stance};
+use crate::{checkout::ConditionValue, resource::define_resource, status_patch::StatusPatch, ReplicationClass, RepositoryKey, Stance};
+
+pub const DRIVER_ADMISSION_CONDITION_TYPE: &str = "DriverAdmission";
 
 define_resource!(
     ConvoyEnsure,
@@ -21,6 +23,8 @@ define_resource!(
 pub struct ConvoyEnsureSpec {
     pub project_ref: String,
     pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_ref: Option<String>,
     pub workflow_ref: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_policy: Option<String>,
@@ -47,6 +51,18 @@ pub struct ConvoyEnsureStatus {
     pub hold_reason: Option<ConvoyEnsureHoldReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_config_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<ConvoyEnsureCondition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvoyEnsureCondition {
+    #[serde(rename = "type")]
+    pub condition_type: String,
+    pub value: ConditionValue,
+    pub reason: String,
+    pub message: String,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +81,7 @@ pub enum ConvoyEnsureStatusPatch {
     RestartLimitReached { convoy_ref: String, failure: String },
     ObserveConfig { config_hash: String, changed: bool },
     ResetBackoff,
+    DriverAdmission { condition: Option<ConvoyEnsureCondition> },
 }
 
 impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
@@ -120,6 +137,12 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                 status.retry_at = None;
                 status.last_failure = None;
                 status.hold_reason = None;
+            }
+            Self::DriverAdmission { condition } => {
+                status.conditions.retain(|existing| existing.condition_type != DRIVER_ADMISSION_CONDITION_TYPE);
+                if let Some(condition) = condition {
+                    status.conditions.push(condition.clone());
+                }
             }
         }
     }
