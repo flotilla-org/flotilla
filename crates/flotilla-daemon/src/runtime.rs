@@ -3067,6 +3067,8 @@ async fn wait_for_delivery_ready(pool: &dyn TerminalPool, session_id: &str, read
             .into_iter()
             .find(|session| session.session_name == session_id)
             .ok_or_else(|| format!("terminal session {session_id} disappeared before message delivery"))?;
+        // Pools without screen activity cannot provide readiness evidence; retain
+        // their historical best-effort delivery behavior instead of blocking forever.
         if session.screen_activity != Some(ScreenActivity::Active) {
             return Ok(true);
         }
@@ -3086,6 +3088,8 @@ async fn session_busy_after_delivery_grace(pool: &dyn TerminalPool, session_id: 
         .into_iter()
         .find(|session| session.session_name == session_id)
         .ok_or_else(|| format!("terminal session {session_id} disappeared after message delivery"))?;
+    // An unavailable activity signal cannot disprove submission, so preserve
+    // best-effort confirmation for pools without a VT activity observer.
     Ok(session.screen_activity != Some(ScreenActivity::Stable))
 }
 
@@ -3094,6 +3098,7 @@ async fn deliver_and_confirm(
     session_id: &str,
     message: &str,
     readiness: TerminalDeliveryReadiness,
+    clear_before_delivery: bool,
 ) -> Result<TerminalDeliveryOutcome, String> {
     // PTY input sent during agent startup can be consumed before the TUI has
     // enabled its composer input modes. A newly launched agent reports active,
@@ -3102,7 +3107,11 @@ async fn deliver_and_confirm(
         warn!(%session_id, "agent session did not become idle before message delivery deadline");
         return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
     }
-    pool.deliver(session_id, message).await?;
+    if clear_before_delivery {
+        pool.retry_delivery(session_id, message).await?;
+    } else {
+        pool.deliver(session_id, message).await?;
+    }
     if session_busy_after_delivery_grace(pool, session_id).await? {
         return Ok(TerminalDeliveryOutcome::Confirmed);
     }
@@ -3287,17 +3296,24 @@ impl TerminalRuntime for TerminalControllerRuntime {
             return Err("crew message delivery requires an agent terminal".to_string());
         };
         let pool = self.pool_for_spec(spec)?;
-        match lookup_terminal_delivery(&self.state.terminal_deliveries, session_id, message) {
+        let clear_before_delivery = match lookup_terminal_delivery(&self.state.terminal_deliveries, session_id, message) {
             TerminalDeliveryLookup::InFlight => return Ok(TerminalDeliveryOutcome::Pending),
             TerminalDeliveryLookup::Taken(delivery) if delivery.message == message => {
                 return delivery.task.await.map_err(|error| format!("delivery confirmation task failed: {error}"))?
             }
-            TerminalDeliveryLookup::Taken(delivery) => delivery.task.abort(),
-            TerminalDeliveryLookup::Vacant => {}
-        }
+            TerminalDeliveryLookup::Taken(delivery) => {
+                delivery.task.abort();
+                let _ = delivery.task.await;
+                true
+            }
+            TerminalDeliveryLookup::Vacant => false,
+        };
         let session_id_owned = session_id.to_string();
         let message_owned = message.to_string();
-        let task = tokio::spawn(async move { deliver_and_confirm(&*pool, &session_id_owned, &message_owned, readiness).await });
+        let task =
+            tokio::spawn(
+                async move { deliver_and_confirm(&*pool, &session_id_owned, &message_owned, readiness, clear_before_delivery).await },
+            );
         self.state
             .terminal_deliveries
             .lock()
@@ -7587,7 +7603,7 @@ mod tests {
     async fn delivery_waits_for_the_agent_tui_to_become_idle_before_submitting() {
         let pool = DeliveryProbePool::new(vec![ScreenActivity::Active, ScreenActivity::Stable, ScreenActivity::Active]);
 
-        let outcome = deliver_and_confirm(&pool, "agent", "first line\n\nsecond line", TerminalDeliveryReadiness::Startup)
+        let outcome = deliver_and_confirm(&pool, "agent", "first line\n\nsecond line", TerminalDeliveryReadiness::Startup, false)
             .await
             .expect("delivery outcome");
 
@@ -7600,8 +7616,9 @@ mod tests {
     async fn delivery_confirmation_retries_once_then_flags_a_session_that_stays_idle() {
         let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
 
-        let outcome =
-            deliver_and_confirm(&pool, "agent", "stuck handoff", TerminalDeliveryReadiness::Startup).await.expect("delivery outcome");
+        let outcome = deliver_and_confirm(&pool, "agent", "stuck handoff", TerminalDeliveryReadiness::Startup, false)
+            .await
+            .expect("delivery outcome");
 
         assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
@@ -7612,8 +7629,9 @@ mod tests {
     async fn delivery_flags_a_session_that_never_becomes_idle_without_sending_bytes() {
         let pool = DeliveryProbePool::new(vec![ScreenActivity::Active]);
 
-        let outcome =
-            deliver_and_confirm(&pool, "agent", "unsafe handoff", TerminalDeliveryReadiness::Startup).await.expect("delivery outcome");
+        let outcome = deliver_and_confirm(&pool, "agent", "unsafe handoff", TerminalDeliveryReadiness::Startup, false)
+            .await
+            .expect("delivery outcome");
 
         assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
         assert_eq!(pool.observations.load(Ordering::SeqCst), DELIVERY_READY_POLLS);
@@ -7627,13 +7645,26 @@ mod tests {
         activities.extend([ScreenActivity::Stable, ScreenActivity::Active]);
         let pool = DeliveryProbePool::new(activities);
 
-        let outcome = deliver_and_confirm(&pool, "agent", "handoff after this turn", TerminalDeliveryReadiness::TurnBoundary)
+        let outcome = deliver_and_confirm(&pool, "agent", "handoff after this turn", TerminalDeliveryReadiness::TurnBoundary, false)
             .await
             .expect("delivery outcome");
 
         assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
         assert!(pool.observations.load(Ordering::SeqCst) > DELIVERY_READY_POLLS);
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_delivery_clears_the_composer_before_submitting() {
+        let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable, ScreenActivity::Active]);
+
+        let outcome = deliver_and_confirm(&pool, "agent", "replacement handoff", TerminalDeliveryReadiness::TurnBoundary, true)
+            .await
+            .expect("delivery outcome");
+
+        assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.retries.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
