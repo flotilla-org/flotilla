@@ -46,20 +46,21 @@ use flotilla_resources::{
     terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
     watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
-    ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue,
-    ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec,
-    CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind,
-    DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, HoldAct, Host as ResourceHost,
-    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
-    IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy,
-    PlacementPolicySpec, Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
-    ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
-    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
-    WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, GENERATION_LABEL,
-    HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec,
+    ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
+    CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand,
+    DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase,
+    HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
+    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
+    PendingBrief, PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation, Project, ProjectRepositoryRole,
+    ProjectRepositorySpec, ProjectSpec, ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend,
+    ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief,
+    TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch,
+    TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
+    WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION,
+    CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
+    PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -4497,40 +4498,88 @@ impl InProcessDaemon {
         let mut changes = Vec::new();
         let mut errors = Vec::new();
         for ensure in ensures {
-            match local_projects.get(&ensure.spec.project_ref).await {
-                Ok(project) if project.metadata.deletion_timestamp.is_none() => {}
-                Ok(_) | Err(ResourceError::NotFound { .. }) => {
-                    match self.resource_backend.clone().definitions::<Project>(namespace).get(&ensure.spec.project_ref).await {
-                        Ok(_) => {
-                            debug!(
-                                ensure = %ensure.metadata.name,
-                                project = %ensure.spec.project_ref,
-                                "skipping standing convoy ensure away from its project home"
-                            );
-                            continue;
-                        }
-                        Err(ResourceError::NotFound { .. }) => {
-                            errors.push(format!(
-                                "ConvoyEnsure/{}: parent Project/{} is absent",
-                                ensure.metadata.name, ensure.spec.project_ref
-                            ));
-                            continue;
-                        }
-                        Err(error) => {
-                            errors.push(format!(
-                                "ConvoyEnsure/{}: could not resolve Project/{} authority: {error}",
-                                ensure.metadata.name, ensure.spec.project_ref
-                            ));
-                            continue;
+            if let Some(driver_ref) = &ensure.spec.driver_ref {
+                let target = match canonical_placement_host_ref(&self.resource_backend, namespace, driver_ref).await {
+                    Ok(Some(target)) => target,
+                    Ok(None) => {
+                        self.set_ensure_driver_condition(
+                            namespace,
+                            &ensure,
+                            "UnknownDriver",
+                            format!("driver host `{driver_ref}` is unknown"),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(error) => {
+                        self.set_ensure_driver_condition(
+                            namespace,
+                            &ensure,
+                            "DriverUnreachable",
+                            format!("driver host `{driver_ref}` could not be resolved: {error}"),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                if self.canonical_local_host_id().as_ref() != Some(&target.reference) {
+                    let hosts =
+                        self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|e| e.to_string())?;
+                    let reachable = hosts
+                        .items
+                        .iter()
+                        .find(|host| host.object.metadata.name == target.reference.as_str())
+                        .is_some_and(|host| host.object.status.as_ref().is_some_and(|status| status.ready));
+                    if reachable {
+                        self.clear_ensure_driver_condition(namespace, &ensure).await?;
+                    } else {
+                        self.set_ensure_driver_condition(
+                            namespace,
+                            &ensure,
+                            "DriverUnreachable",
+                            format!("driver host `{driver_ref}` is not reachable"),
+                        )
+                        .await?;
+                    }
+                    continue;
+                }
+                self.clear_ensure_driver_condition(namespace, &ensure).await?;
+            } else {
+                match local_projects.get(&ensure.spec.project_ref).await {
+                    Ok(project) if project.metadata.deletion_timestamp.is_none() => {}
+                    Ok(_) | Err(ResourceError::NotFound { .. }) => {
+                        match self.resource_backend.clone().definitions::<Project>(namespace).get(&ensure.spec.project_ref).await {
+                            Ok(_) => {
+                                debug!(
+                                    ensure = %ensure.metadata.name,
+                                    project = %ensure.spec.project_ref,
+                                    "skipping standing convoy ensure away from its project home"
+                                );
+                                continue;
+                            }
+                            Err(ResourceError::NotFound { .. }) => {
+                                errors.push(format!(
+                                    "ConvoyEnsure/{}: parent Project/{} is absent",
+                                    ensure.metadata.name, ensure.spec.project_ref
+                                ));
+                                continue;
+                            }
+                            Err(error) => {
+                                errors.push(format!(
+                                    "ConvoyEnsure/{}: could not resolve Project/{} authority: {error}",
+                                    ensure.metadata.name, ensure.spec.project_ref
+                                ));
+                                continue;
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    errors.push(format!(
-                        "ConvoyEnsure/{}: could not verify local Project/{} authority: {error}",
-                        ensure.metadata.name, ensure.spec.project_ref
-                    ));
-                    continue;
+                    Err(error) => {
+                        errors.push(format!(
+                            "ConvoyEnsure/{}: could not verify local Project/{} authority: {error}",
+                            ensure.metadata.name, ensure.spec.project_ref
+                        ));
+                        continue;
+                    }
                 }
             }
             match self.reconcile_convoy_ensure(namespace, &ensure, backing_inspector).await {
@@ -4546,6 +4595,45 @@ impl InProcessDaemon {
         } else {
             Err(format!("{}; successful changes: {}", errors.join("; "), changes.join(", ")))
         }
+    }
+
+    async fn set_ensure_driver_condition(
+        &self,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
+        reason: &str,
+        message: String,
+    ) -> Result<(), String> {
+        let unchanged = ensure.status.as_ref().is_some_and(|status| {
+            status.conditions.iter().any(|condition| {
+                condition.condition_type == DRIVER_ADMISSION_CONDITION_TYPE && condition.reason == reason && condition.message == message
+            })
+        });
+        if unchanged {
+            return Ok(());
+        }
+        self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::DriverAdmission {
+            condition: Some(ConvoyEnsureCondition {
+                condition_type: DRIVER_ADMISSION_CONDITION_TYPE.to_string(),
+                value: ConditionValue::False,
+                reason: reason.to_string(),
+                message,
+                observed_at: self.clock.now(),
+            }),
+        })
+        .await
+    }
+
+    async fn clear_ensure_driver_condition(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<(), String> {
+        if ensure
+            .status
+            .as_ref()
+            .is_some_and(|status| status.conditions.iter().any(|condition| condition.condition_type == DRIVER_ADMISSION_CONDITION_TYPE))
+        {
+            self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::DriverAdmission { condition: None })
+                .await?;
+        }
+        Ok(())
     }
 
     async fn reconcile_convoy_ensure(
@@ -5784,6 +5872,7 @@ impl InProcessDaemon {
                     let spec = ConvoyEnsureSpec {
                         project_ref: project_name.to_string(),
                         role: role.clone(),
+                        driver_ref: ensure.driver,
                         workflow_ref: ensure.workflow,
                         placement_policy: ensure.placement,
                         stance: ensure.stance,

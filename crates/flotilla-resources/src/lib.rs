@@ -64,7 +64,10 @@ pub use convoy::{
     TargetMismatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation,
     WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
-pub use convoy_ensure::{ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch};
+pub use convoy_ensure::{
+    ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch,
+    DRIVER_ADMISSION_CONDITION_TYPE,
+};
 pub use credential::{
     CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
