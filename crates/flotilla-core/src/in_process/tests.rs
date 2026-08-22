@@ -696,6 +696,144 @@ async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Ar
     (daemon, backend, clock, temp)
 }
 
+struct VerifiedDeadBacking;
+
+#[async_trait]
+impl StandingConvoyBackingInspector for VerifiedDeadBacking {
+    async fn verify_backing_dead(&self, _convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+async fn fail_ensured_generation(backend: &ResourceBackend, clock: &VirtualClock) -> String {
+    let convoy_ref = backend
+        .using::<ConvoyEnsure>("flotilla")
+        .get("quartermaster")
+        .await
+        .expect("ensure")
+        .status
+        .and_then(|status| status.convoy_ref)
+        .expect("live generation");
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let convoy = convoys.get(&convoy_ref).await.expect("generation");
+    convoys
+        .update_status(&convoy_ref, &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Failed,
+            message: Some("placement failed".to_string()),
+            started_at: Some(clock.now()),
+            finished_at: Some(clock.now()),
+            ..Default::default()
+        })
+        .await
+        .expect("fail generation");
+    convoy_ref
+}
+
+#[tokio::test]
+async fn standing_ensure_holds_after_three_failed_generations_and_resumes_when_attention_is_cleared() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+
+    for delay in [30, 60] {
+        fail_ensured_generation(&backend, &clock).await;
+        daemon
+            .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+            .await
+            .expect("record failed generation");
+        clock.advance(ChronoDuration::seconds(delay));
+        daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("admit replacement");
+    }
+
+    fail_ensured_generation(&backend, &clock).await;
+    assert_eq!(
+        daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("exhaust retry budget"),
+        vec!["ConvoyEnsure/quartermaster exhausted restart budget"]
+    );
+    let ensures = backend.using::<ConvoyEnsure>("flotilla");
+    let held = ensures.get("quartermaster").await.expect("held ensure");
+    assert_eq!(held.status.as_ref().expect("status").restart_count, 3);
+    assert_eq!(held.status.as_ref().expect("status").hold_reason, Some(ConvoyEnsureHoldReason::RestartLimit));
+    let demands = backend.using::<ResourceDemand>("flotilla");
+    let demand = demands.get("ensure-attention-quartermaster").await.expect("restart escalation");
+    assert!(demand.spec.expiry.is_some(), "restart exhaustion must carry an escalation deadline");
+
+    clock.advance(ChronoDuration::hours(6));
+    assert!(daemon
+        .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+        .await
+        .expect("remain held")
+        .is_empty());
+    assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 3);
+
+    demands.delete("ensure-attention-quartermaster").await.expect("operator clears escalation");
+    daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("clear hold");
+    daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("schedule fresh episode");
+    clock.advance(ChronoDuration::seconds(30));
+    daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("resume admission");
+    assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 4);
+}
+
+#[tokio::test]
+async fn concurrent_ensure_admission_creates_only_one_live_generation() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    let (left, right) = tokio::join!(daemon.reconcile_convoy_ensures_once("flotilla"), daemon.reconcile_convoy_ensures_once("flotilla"));
+    left.expect("left reconcile");
+    right.expect("right reconcile");
+
+    let live = backend
+        .using::<ResourceConvoy>("flotilla")
+        .list()
+        .await
+        .expect("convoys")
+        .items
+        .into_iter()
+        .filter(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
+        .collect::<Vec<_>>();
+    assert_eq!(live.len(), 1);
+    assert_eq!(
+        backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.unwrap().convoy_ref,
+        Some(live[0].metadata.name.clone())
+    );
+}
+
+#[tokio::test]
+async fn changing_ensure_config_starts_a_fresh_retry_episode() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+    for delay in [30, 60] {
+        fail_ensured_generation(&backend, &clock).await;
+        daemon
+            .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+            .await
+            .expect("record failed generation");
+        clock.advance(ChronoDuration::seconds(delay));
+        daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("admit replacement");
+    }
+    fail_ensured_generation(&backend, &clock).await;
+    daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("exhaust retry budget");
+
+    let definitions = backend.definitions::<ConvoyEnsure>("flotilla");
+    let ensure = definitions.get("quartermaster").await.expect("ensure definition");
+    let mut changed_spec = ensure.spec.clone();
+    changed_spec.presents_as = Some("updated-fleet".to_string());
+    definitions.apply(&InputMeta::from(&ensure.metadata), &changed_spec).await.expect("change ensure config");
+
+    daemon
+        .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+        .await
+        .expect("config change opens a fresh episode");
+    let status = definitions.get("quartermaster").await.expect("ensure").status.expect("status");
+    assert_eq!(status.restart_count, 1);
+    assert_eq!(status.hold_reason, None);
+    assert!(backend.using::<ResourceDemand>("flotilla").list().await.expect("demands").items.is_empty());
+    clock.advance(ChronoDuration::seconds(30));
+    daemon
+        .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+        .await
+        .expect("admit after config change backoff");
+    assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 4);
+}
+
 #[tokio::test]
 async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts_after_verified_death() {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
@@ -844,6 +982,8 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
             running_since: Some(clock.now()),
             retry_at: None,
             last_failure: None,
+            hold_reason: None,
+            observed_config_hash: None,
         })
         .await
         .expect("seed crash budget");
