@@ -1748,12 +1748,9 @@ pub struct LiveConvoyRecord {
 }
 
 async fn allocate_convoy_generation(backend: &ResourceBackend, namespace: &str, project: Option<&str>, role: &str) -> Result<u64, String> {
-    let mut selector = BTreeMap::from([(ROLE_LABEL.to_string(), role.to_string())]);
-    selector.insert(PROJECT_LABEL.to_string(), project.unwrap_or_default().to_string());
-    let generations =
-        backend.clone().using::<ResourceConvoy>(namespace).list_matching_labels(&selector).await.map_err(|error| error.to_string())?;
+    let generations = backend.clone().using::<ResourceConvoy>(namespace).list().await.map_err(|error| error.to_string())?;
     let mut maximum = 0;
-    for convoy in generations.items {
+    for convoy in generations.items.into_iter().filter(|convoy| convoy.spec.project_ref.as_deref() == project && convoy.spec.role == role) {
         let generation =
             convoy.metadata.labels.get(GENERATION_LABEL).and_then(|value| value.parse::<u64>().ok()).unwrap_or(convoy.spec.generation);
         maximum = maximum.max(generation);
@@ -4547,20 +4544,17 @@ impl InProcessDaemon {
                 Err(ResourceError::NotFound { .. }) => None,
                 Err(error) => return Err(error.to_string()),
             },
-            None => {
-                let selector = BTreeMap::from([
-                    (PROJECT_LABEL.to_string(), ensure.spec.project_ref.clone()),
-                    (ROLE_LABEL.to_string(), ensure.spec.role.clone()),
-                ]);
-                convoys
-                    .list_matching_labels(&selector)
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .items
-                    .into_iter()
-                    .filter(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
-                    .max_by_key(|convoy| convoy.spec.generation)
-            }
+            None => convoys
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+                .into_iter()
+                .filter(|convoy| {
+                    convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name)
+                        && convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
+                })
+                .max_by_key(|convoy| convoy.spec.generation),
         };
         let terminal = convoy
             .as_ref()
@@ -4834,24 +4828,28 @@ impl InProcessDaemon {
             annotations.insert(PRESENTS_AS_ANNOTATION.to_string(), presents_as.clone());
         }
         let _admission_guard = self.convoy_admission.lock().await;
-        let selector = BTreeMap::from([
-            (PROJECT_LABEL.to_string(), ensure.spec.project_ref.clone()),
-            (ROLE_LABEL.to_string(), ensure.spec.role.clone()),
-        ]);
-        if let Some(existing) = self
+        let existing = self
             .resource_backend
             .clone()
             .using::<ResourceConvoy>(namespace)
-            .list_matching_labels(&selector)
+            .list()
             .await
             .map_err(|error| error.to_string())?
             .items
             .into_iter()
-            .find(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
+            .filter(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
+            .collect::<Vec<_>>();
+        if let Some(existing) = existing
+            .iter()
+            .filter(|convoy| convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name))
+            .max_by_key(|convoy| convoy.spec.generation)
         {
-            if existing.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name) {
-                return Ok(existing.metadata.name);
-            }
+            return Ok(existing.metadata.name.clone());
+        }
+        if existing
+            .iter()
+            .any(|convoy| convoy.spec.project_ref.as_deref() == Some(&ensure.spec.project_ref) && convoy.spec.role == ensure.spec.role)
+        {
             return Err(format!(
                 "live convoy {} already exists outside this ensure",
                 convoy_address(&ensure.spec.role, Some(&ensure.spec.project_ref))
