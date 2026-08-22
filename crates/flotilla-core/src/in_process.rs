@@ -4531,8 +4531,16 @@ impl InProcessDaemon {
                     }
                 };
                 if self.canonical_local_host_id().as_ref() != Some(&target.reference) {
-                    let hosts =
-                        self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|e| e.to_string())?;
+                    let hosts = match self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await {
+                        Ok(hosts) => hosts,
+                        Err(error) => {
+                            errors.push(format!(
+                                "ConvoyEnsure/{}: could not inspect driver host `{driver_ref}` reachability: {error}",
+                                ensure.metadata.name
+                            ));
+                            continue;
+                        }
+                    };
                     let reachable = hosts
                         .items
                         .iter()
