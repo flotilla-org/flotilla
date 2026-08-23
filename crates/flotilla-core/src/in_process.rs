@@ -1929,6 +1929,12 @@ struct ResolvedConvoyChangeRequestAdmission {
     base_ref: String,
 }
 
+struct RepositoryChangeRequestProvider {
+    service_url: String,
+    repository: String,
+    provider: Arc<dyn ChangeRequestTracker>,
+}
+
 fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<String> {
     let role = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
     let identity = convoy.spec.project_ref.as_ref().map_or_else(|| role.clone(), |project| format!("{role}@{project}"));
@@ -2069,6 +2075,7 @@ pub struct InProcessDaemon {
     /// Mutated under `observed_checkout_reconciliation` so removal deletes
     /// observations using the identity that originally created them.
     repository_keys_by_path: RwLock<HashMap<PathBuf, RepositoryKey>>,
+    repository_change_requests: RwLock<HashMap<RepositoryKey, RepositoryChangeRequestProvider>>,
     host_registry: crate::host_registry::HostRegistry,
     local_environment_id: EnvironmentId,
     environment_manager: Arc<EnvironmentManager>,
@@ -2310,6 +2317,7 @@ impl InProcessDaemon {
             host_name: host_name.clone(),
             path_identities: RwLock::new(path_identities),
             repository_keys_by_path: RwLock::new(repository_keys_by_path),
+            repository_change_requests: RwLock::new(HashMap::new()),
             host_registry: crate::host_registry::HostRegistry::new(
                 NodeInfo::new(local_node_id.clone(), host_name.to_string()),
                 local_host_summary,
@@ -3360,14 +3368,25 @@ impl InProcessDaemon {
                 failures.push(format!("repository {}: change request provider unavailable for {}", forge.repository, forge.service_url));
                 continue;
             }
+            if let Some(cached) = self.repository_change_requests.read().await.get(repository_key) {
+                if cached.service_url == forge.service_url && cached.repository == forge.repository {
+                    candidates.push((repository_key.clone(), forge.repository.clone(), Arc::clone(&cached.provider)));
+                    continue;
+                }
+            }
             let runner = self.discovery.runner.clone();
-            let provider = GitHubChangeRequest::new(
+            let provider = Arc::new(GitHubChangeRequest::new(
                 "github".to_string(),
                 forge.repository.clone(),
                 Arc::new(GhApiClient::new(runner.clone())),
                 runner,
-            );
-            candidates.push((repository_key.clone(), forge.repository.clone(), Arc::new(provider) as Arc<dyn ChangeRequestTracker>));
+            )) as Arc<dyn ChangeRequestTracker>;
+            self.repository_change_requests.write().await.insert(repository_key.clone(), RepositoryChangeRequestProvider {
+                service_url: forge.service_url.clone(),
+                repository: forge.repository.clone(),
+                provider: Arc::clone(&provider),
+            });
+            candidates.push((repository_key.clone(), forge.repository.clone(), provider));
         }
         (candidates, failures)
     }

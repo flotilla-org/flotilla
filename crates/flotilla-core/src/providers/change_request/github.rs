@@ -10,6 +10,10 @@ use crate::providers::{
     CommandRunner,
 };
 
+fn execution_root() -> &'static Path {
+    Path::new("/")
+}
+
 pub struct GitHubChangeRequest {
     provider_name: String,
     repo_slug: String,
@@ -85,7 +89,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
     async fn list_change_requests(&self, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         let per_page = clamp_per_page(limit);
         let endpoint = format!("repos/{}/pulls?state=open&per_page={}", self.repo_slug, per_page);
-        let body = gh_api_get!(self.api, &endpoint, Path::new("/"))?;
+        let body = gh_api_get!(self.api, &endpoint, execution_root())?;
         let items: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
         Ok(items
@@ -99,7 +103,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
 
     async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, String> {
         let endpoint = format!("repos/{}/pulls?state=all&per_page=100", self.repo_slug);
-        let body = gh_api_get!(self.api, &endpoint, Path::new("/"))?;
+        let body = gh_api_get!(self.api, &endpoint, execution_root())?;
         let items: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|error| error.to_string())?;
         Ok(items
             .iter()
@@ -110,7 +114,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
 
     async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
         let endpoint = format!("repos/{}/pulls/{}", self.repo_slug, id);
-        let body = gh_api_get!(self.api, &endpoint, Path::new("/"))?;
+        let body = gh_api_get!(self.api, &endpoint, execution_root())?;
         let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
         let pr = Self::parse_pull_request(&v).ok_or("malformed pull request")?;
@@ -119,7 +123,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
 
     async fn get_change_request_for_admission(&self, id: &str) -> Result<super::ChangeRequestAdmission, String> {
         let endpoint = format!("repos/{}/pulls/{}", self.repo_slug, id);
-        let body = gh_api_get!(self.api, &endpoint, Path::new("/"))?;
+        let body = gh_api_get!(self.api, &endpoint, execution_root())?;
         let value: serde_json::Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
         let pull_request = Self::parse_pull_request(&value).ok_or("malformed pull request")?;
         let (id, change_request) = self.gh_pr_to_change_request(&pull_request);
@@ -127,24 +131,24 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
     }
 
     async fn open_in_browser(&self, id: &str) -> Result<(), String> {
-        run!(self.runner, "gh", &["pr", "view", id, "--repo", &self.repo_slug, "--web"], Path::new("/"))?;
+        run!(self.runner, "gh", &["pr", "view", id, "--repo", &self.repo_slug, "--web"], execution_root())?;
         Ok(())
     }
 
     async fn close_change_request(&self, id: &str) -> Result<(), String> {
-        run!(self.runner, "gh", &["pr", "close", id, "--repo", &self.repo_slug], Path::new("/"))?;
+        run!(self.runner, "gh", &["pr", "close", id, "--repo", &self.repo_slug], execution_root())?;
         Ok(())
     }
 
     async fn merge_change_request(&self, id: &str) -> Result<(), String> {
-        run!(self.runner, "gh", &["pr", "merge", id, "--repo", &self.repo_slug, "--squash"], Path::new("/"))?;
+        run!(self.runner, "gh", &["pr", "merge", id, "--repo", &self.repo_slug, "--squash"], execution_root())?;
         Ok(())
     }
 
     async fn list_merged_branch_names(&self, limit: usize) -> Result<Vec<String>, String> {
         let per_page = clamp_per_page(limit);
         let endpoint = format!("repos/{}/pulls?state=closed&sort=updated&direction=desc&per_page={}", self.repo_slug, per_page);
-        let body = gh_api_get!(self.api, &endpoint, Path::new("/"))?;
+        let body = gh_api_get!(self.api, &endpoint, execution_root())?;
         let items: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
         Ok(items

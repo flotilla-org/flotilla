@@ -1485,13 +1485,18 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
 #[tokio::test]
 async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
     let response = concat!(
-        "HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n",
+        "HTTP/2.0 200 OK\r\nEtag: \"pr-1071\"\r\nContent-Type: application/json\r\n\r\n",
         r#"{"number":1071,"title":"Convoy adoption of an existing PR","head":{"ref":"feat/existing-pr"},"base":{"ref":"main"},"state":"open","body":"Existing implementation work.","draft":false,"merged_at":null}"#,
     );
     let runner = Arc::new(
         DiscoveryMockRunner::builder()
             .on_run("git", &["--version"], Ok("git version 2.43.0".to_string()))
             .on_run("gh", &["api", "--include", "repos/owner/repo/pulls/1071"], Ok(response.to_string()))
+            .on_run(
+                "gh",
+                &["api", "--include", "repos/owner/repo/pulls/1071", "-H", "If-None-Match: \"pr-1071\""],
+                Ok("HTTP/2.0 304 Not Modified\r\nEtag: \"pr-1071\"\r\n\r\n".to_string()),
+            )
             .build(),
     );
     let temp = tempfile::tempdir().expect("create tempdir");
@@ -1574,12 +1579,23 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
         convoy.spec.change_request,
         Some(flotilla_resources::BoundChangeRequest {
             id: "1071".to_string(),
-            repository_ref: repository_key,
+            repository_ref: repository_key.clone(),
             title: "Convoy adoption of an existing PR".to_string(),
         })
     );
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");
     assert_eq!(convoy.spec.repositories[0].target_ref, "main");
+    assert_eq!(
+        daemon
+            .resolve_convoy_change_request(std::slice::from_ref(&repository_key), "feat/existing-pr", Some("1071"))
+            .await
+            .expect("repeated change request resolution"),
+        Some(flotilla_protocol::ConvoyChangeRequest {
+            id: "1071".to_string(),
+            status: flotilla_protocol::ChangeRequestStatus::Open,
+            repository_key,
+        })
+    );
 }
 
 #[tokio::test]
