@@ -24,16 +24,16 @@ use flotilla_protocol::{
     commands::{AttachMode, RepositoryIdentityChange},
     qualified_path::{HostId, QualifiedPath},
     result_set::{CheckoutRow, ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
-    AttachBinding, CanonicalHostId, Change, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation,
-    CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent,
-    DispatchQueueResponse, DispatchQueueRow, EntryOp, EnvironmentId, EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout,
-    ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription,
-    ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow,
-    FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProviderStatus,
-    HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState,
-    PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry,
-    ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoIdentity, RepoInfo,
-    RepoProvidersResponse, RepoSummary, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse,
+    AttachBinding, CanonicalHostId, Change, CheckoutArchiveOutcome, CheckoutArchiveStatus, Command, CommandAction, CommandValue,
+    ConvoyDispatchRegard, ConvoyExplanation, CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext,
+    CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse, DispatchQueueRow, EntryOp, EnvironmentId, EvidenceFreshness,
+    ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedLeafFiring,
+    ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness,
+    FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse,
+    HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal, NodeId, NodeInfo,
+    PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef,
+    ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoIdentity,
+    RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse,
     ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus,
     StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY,
     TERMINAL_POOL_PROVIDER_CATEGORY,
@@ -7710,28 +7710,70 @@ impl InProcessDaemon {
         }
     }
 
-    async fn archive_convoy_checkouts_best_effort(&self, namespace: &str, name: &str) -> Result<(), String> {
+    async fn archive_convoy_checkouts_best_effort(&self, namespace: &str, name: &str) -> Result<Vec<CheckoutArchiveOutcome>, String> {
         let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
         let checkout_list = checkouts
             .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]))
             .await
             .map_err(|err| err.to_string())?
             .items;
+        let mut outcomes = Vec::new();
         for checkout in checkout_list {
             let Some(path) = checkout_path(&checkout) else {
                 continue;
             };
-            let Ok(runner) = self.runner_for_resource_checkout(&checkout).await else {
+            if checkout.status.as_ref().is_some_and(|status| {
+                condition_is_true(&status.integration.pushed)
+                    && integration_condition_is_fresh(&status.integration.pushed, self.clock.now())
+            }) {
+                outcomes.push(
+                    CheckoutArchiveOutcome::builder()
+                        .checkout(checkout.metadata.name)
+                        .status(CheckoutArchiveStatus::NothingToArchive)
+                        .build(),
+                );
                 continue;
+            }
+            let runner = match self.runner_for_resource_checkout(&checkout).await {
+                Ok(runner) => runner,
+                Err(error) => {
+                    warn!(checkout = %checkout.metadata.name, %error, "best-effort abandon archive push failed");
+                    outcomes.push(
+                        CheckoutArchiveOutcome::builder()
+                            .checkout(checkout.metadata.name)
+                            .status(CheckoutArchiveStatus::Failed)
+                            .detail(error)
+                            .build(),
+                    );
+                    continue;
+                }
             };
             let output = runner.run_output("git", &["push", "-u", "origin", "HEAD"], Path::new(path), &ChannelLabel::Default).await;
-            if let Ok(output) = output {
-                if !output.success {
-                    warn!(checkout = %checkout.metadata.name, stderr = %output.stderr.trim(), "best-effort abandon archive push failed");
+            let outcome = match output {
+                Ok(output) if output.success => {
+                    CheckoutArchiveOutcome::builder().checkout(checkout.metadata.name).status(CheckoutArchiveStatus::Archived).build()
                 }
-            }
+                Ok(output) => {
+                    let detail = output.stderr.trim().to_string();
+                    warn!(checkout = %checkout.metadata.name, stderr = %detail, "best-effort abandon archive push failed");
+                    CheckoutArchiveOutcome::builder()
+                        .checkout(checkout.metadata.name)
+                        .status(CheckoutArchiveStatus::Failed)
+                        .detail(detail)
+                        .build()
+                }
+                Err(error) => {
+                    warn!(checkout = %checkout.metadata.name, %error, "best-effort abandon archive push failed");
+                    CheckoutArchiveOutcome::builder()
+                        .checkout(checkout.metadata.name)
+                        .status(CheckoutArchiveStatus::Failed)
+                        .detail(error)
+                        .build()
+                }
+            };
+            outcomes.push(outcome);
         }
-        Ok(())
+        Ok(outcomes)
     }
 
     async fn abandon_convoy_internal(
@@ -7740,11 +7782,11 @@ impl InProcessDaemon {
         name: &str,
         reason: &str,
         principal_ref: Option<&PrincipalRef>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<CheckoutArchiveOutcome>, String> {
         if reason.trim().is_empty() {
             return Err("convoy abandon requires a non-empty reason".to_string());
         }
-        self.archive_convoy_checkouts_best_effort(namespace, name).await?;
+        let archives = self.archive_convoy_checkouts_best_effort(namespace, name).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let authority = match principal_ref {
             Some(principal) if principal.name == PrincipalRef::IMPLICIT_NAME => WorkCompletionAuthority::HumanOverride,
@@ -7761,7 +7803,7 @@ impl InProcessDaemon {
         // Abandonment is an explicit terminal override: the phase stamp above is
         // the teardown gate, after the best-effort archive push has run. The
         // lifecycle reconciler reclaims children while retaining the convoy.
-        Ok(())
+        Ok(archives)
     }
 
     async fn apply_crew_work_patch(
@@ -9347,7 +9389,7 @@ impl InProcessDaemon {
             let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
                 Ok(record_name) => {
                     match self.abandon_convoy_internal(&namespace, &record_name, reason, dispatching_principal_ref.as_ref()).await {
-                        Ok(()) => flotilla_protocol::CommandValue::Ok,
+                        Ok(archives) => flotilla_protocol::CommandValue::ConvoyAbandoned { name: name.clone(), archives },
                         Err(message) => flotilla_protocol::CommandValue::Error { message },
                     }
                 }

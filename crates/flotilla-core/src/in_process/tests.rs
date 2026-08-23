@@ -15,8 +15,11 @@ use flotilla_resources::{
 
 use super::*;
 use crate::providers::{
-    discovery::test_support::{fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders, FakeTerminalPool},
+    discovery::test_support::{
+        fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_runner, FakeDiscoveryProviders, FakeTerminalPool,
+    },
     terminal::{managed_session_name, ManagedSessionMetadata, TerminalSession},
+    testing::MockRunner,
 };
 
 #[test]
@@ -60,6 +63,82 @@ fn recursive_attach_preserves_take_preference_and_explicit_watch() {
 
 fn test_meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
+}
+
+#[tokio::test]
+async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push_failure() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").expect("daemon config");
+    let runner = Arc::new(MockRunner::new(vec![
+        Ok("git version 2.43.0".to_string()),
+        Ok("archived".to_string()),
+        Err("remote rejected".to_string()),
+        Ok("archived stale head".to_string()),
+    ]));
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery_with_runner(false, runner.clone()),
+        HostName::local(),
+        backend.clone(),
+    )
+    .await;
+    let repository = RepositorySpec::remote("https://github.com/acme/archive").expect("repository spec").key();
+    let checkouts = backend.using::<ResourceCheckout>("flotilla");
+    let fresh = Utc::now().to_rfc3339();
+    for (name, pushed, observed_at) in [
+        ("already-pushed", ConditionValue::True, fresh.as_str()),
+        ("needs-push", ConditionValue::False, fresh.as_str()),
+        ("push-fails", ConditionValue::False, fresh.as_str()),
+        ("stale-pushed", ConditionValue::True, "2020-01-01T00:00:00Z"),
+    ] {
+        let checkout = checkouts
+            .create(
+                &InputMeta::builder()
+                    .name(name.to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "archive-convoy".to_string())]))
+                    .build(),
+                &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                    r#ref: name.to_string(),
+                    path: format!("/checkouts/{name}"),
+                    repo_ref: repository.clone(),
+                    host_ref: "archive-test".to_string(),
+                    is_main: false,
+                }),
+            )
+            .await
+            .expect("checkout");
+        checkouts
+            .update_status(
+                name,
+                &checkout.metadata.resource_version,
+                &ResourceCheckoutStatus::builder()
+                    .phase(ResourceCheckoutPhase::Ready)
+                    .path(format!("/checkouts/{name}"))
+                    .integration(CheckoutIntegrationStatus {
+                        pushed: IntegrationCondition::builder().value(pushed).observed_at(observed_at.to_string()).build(),
+                        ..CheckoutIntegrationStatus::default()
+                    })
+                    .build(),
+            )
+            .await
+            .expect("checkout status");
+    }
+
+    let outcomes = daemon.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.expect("best-effort archive");
+
+    assert_eq!(outcomes.iter().map(|outcome| (outcome.checkout.as_str(), outcome.status)).collect::<Vec<_>>(), vec![
+        ("already-pushed", CheckoutArchiveStatus::NothingToArchive),
+        ("needs-push", CheckoutArchiveStatus::Archived),
+        ("push-fails", CheckoutArchiveStatus::Failed),
+        ("stale-pushed", CheckoutArchiveStatus::Archived),
+    ]);
+    assert_eq!(outcomes[2].detail.as_deref(), Some("remote rejected"));
+    assert_eq!(
+        runner.calls().iter().filter(|(command, args)| command == "git" && args.first().is_some_and(|arg| arg == "push")).count(),
+        3
+    );
 }
 
 #[tokio::test]
