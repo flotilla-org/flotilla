@@ -311,6 +311,10 @@ enum ResourceSubCommand {
     List(ResourceListArgs),
     /// Create or update a raw resource document
     Apply(ResourceApplyArgs),
+    /// Make the manifest overwrite a drifted live spec
+    Sync(ResourceManifestResolutionArgs),
+    /// Write the live spec back to its manifest
+    Adopt(ResourceManifestResolutionArgs),
     /// Replace the status subresource after typed validation
     PatchStatus(ResourceStatusPatchArgs),
     /// Get one resource by name
@@ -358,6 +362,20 @@ struct ResourceGetArgs {
     #[arg(long, default_value = "flotilla")]
     namespace: String,
     /// Route the query to a peer host
+    #[arg(long)]
+    host: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct ResourceManifestResolutionArgs {
+    /// Exact resource kind or plural name
+    kind: String,
+    /// Exact resource name
+    name: String,
+    /// Resource namespace
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
+    /// Route the mutation to a peer host
     #[arg(long)]
     host: Option<String>,
 }
@@ -1345,6 +1363,8 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
             )
             .await
         }
+        ResourceSubCommand::Sync(args) => run_manifest_resolution(cli, args, flotilla_protocol::ManifestResolution::Sync, format).await,
+        ResourceSubCommand::Adopt(args) => run_manifest_resolution(cli, args, flotilla_protocol::ManifestResolution::Adopt, format).await,
         ResourceSubCommand::PatchStatus(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
             let raw = std::fs::read_to_string(&args.file)
@@ -1421,6 +1441,26 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
         }
         ResourceSubCommand::Watch(args) => run_resource_watch(cli, args, format).await,
     }
+}
+
+async fn run_manifest_resolution(
+    cli: &Cli,
+    args: ResourceManifestResolutionArgs,
+    resolution: flotilla_protocol::ManifestResolution,
+    format: OutputFormat,
+) -> Result<()> {
+    let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
+    run_control_command(
+        cli,
+        Command {
+            node_id,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ResourceManifestResolve { namespace: args.namespace, kind: args.kind, name: args.name, resolution },
+        },
+        format,
+    )
+    .await
 }
 
 async fn resolve_optional_host_node(cli: &Cli, host: Option<&str>) -> Result<Option<flotilla_protocol::NodeId>> {
@@ -2092,8 +2132,8 @@ mod tests {
         format_human_resource_value, host_daemon_socket_required, incompatible_daemon_reexec_failure, provisioning_target_for_environment,
         replace_host_ids, run_replica_snapshot, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
         should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, Cli, CliPaths, CommandValue, DaemonSubCommand,
-        DevModeSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceStatusPatchArgs,
-        ResourceSubCommand, ResourceWatchArgs, SubCommand,
+        DevModeSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs,
+        ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
 
     #[test]
@@ -2388,6 +2428,23 @@ mod tests {
             Some(SubCommand::Resource {
                 command: ResourceSubCommand::Get(ResourceGetArgs { kind, name, namespace, host: None })
             }) if kind == "convoys" && name == "demo" && namespace == "ops"
+        ));
+
+        let sync = Cli::try_parse_from(["flotilla", "resource", "sync", "projects", "cleat", "--namespace", "ops"])
+            .expect("manifest sync should parse");
+        assert!(matches!(
+            sync.command,
+            Some(SubCommand::Resource {
+                command: ResourceSubCommand::Sync(ResourceManifestResolutionArgs { kind, name, namespace, host: None })
+            }) if kind == "projects" && name == "cleat" && namespace == "ops"
+        ));
+        let adopt = Cli::try_parse_from(["flotilla", "resource", "adopt", "projects", "cleat", "--namespace", "ops"])
+            .expect("manifest adopt should parse");
+        assert!(matches!(
+            adopt.command,
+            Some(SubCommand::Resource {
+                command: ResourceSubCommand::Adopt(ResourceManifestResolutionArgs { kind, name, namespace, host: None })
+            }) if kind == "projects" && name == "cleat" && namespace == "ops"
         ));
 
         let delete =

@@ -192,6 +192,7 @@ pub async fn build_plan(
         | CommandAction::QueryResourceGet { .. }
         | CommandAction::QueryExplainConvoy { .. }
         | CommandAction::ResourceApply { .. }
+        | CommandAction::ResourceManifestResolve { .. }
         | CommandAction::ResourceStatusPatch { .. }
         | CommandAction::ResourceDelete { .. }
         | CommandAction::ResourceWatch { .. } => {

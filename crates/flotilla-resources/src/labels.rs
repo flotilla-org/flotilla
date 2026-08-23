@@ -11,6 +11,7 @@ pub const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
 pub const VESSEL_ORDINAL_LABEL: &str = "flotilla.work/vessel_ordinal";
 pub const CREW_ORDINAL_LABEL: &str = "flotilla.work/crew_ordinal";
 pub const MANAGED_BY_LABEL: &str = "flotilla.work/managed-by";
+pub const MANIFEST_RESOLUTION_ANNOTATION: &str = "flotilla.work/manifest-resolution";
 pub const REPO_LABEL: &str = "flotilla.work/repo";
 pub const CHANGE_REQUEST_ID_LABEL: &str = "flotilla.work/change-request-id";
 pub const RESERVED_PREFIX: &str = "flotilla.work/";

@@ -44,9 +44,9 @@ use flotilla_resources::{
     change_request_record_name, controller::delete_lifecycle_owned_matching, ensure_repository, evaluate_landing_settlement,
     expected_change_request_leaves, expected_checkout_refs, external_patches as convoy_external_patches,
     get_resource_kind_including_replicas, list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec,
-    repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
-    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
-    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
+    patch_resource_annotation, repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target,
+    watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources,
+    BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
     ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec,
     ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
@@ -62,8 +62,8 @@ use flotilla_resources::{
     TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
     WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
-    DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
-    VESSEL_REF_LABEL,
+    DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, MANIFEST_RESOLUTION_ANNOTATION,
+    PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -9129,6 +9129,29 @@ impl InProcessDaemon {
                 })),
                 Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
             };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ResourceManifestResolve { namespace, kind, name, resolution } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let resolution = match resolution {
+                flotilla_protocol::ManifestResolution::Sync => "sync",
+                flotilla_protocol::ManifestResolution::Adopt => "adopt",
+            };
+            let result =
+                match patch_resource_annotation(&self.resource_backend, namespace, kind, name, MANIFEST_RESOLUTION_ANNOTATION, resolution)
+                    .await
+                {
+                    Ok(applied) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
+                        kind: applied.kind,
+                        plural: applied.plural,
+                        namespace: applied.namespace,
+                        value: applied.value,
+                        replica_origin: None,
+                    })),
+                    Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                };
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }

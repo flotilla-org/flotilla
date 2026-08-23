@@ -494,6 +494,48 @@ pub async fn apply_resource_document(
     dispatch_apply_resource_kind!(lookup_resource_kind(&document.kind)?.resource, backend, &namespace, document.metadata, document.spec)
 }
 
+pub async fn patch_resource_annotation(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    name: &str,
+    key: &str,
+    value: &str,
+) -> Result<DynamicResourceObject, ResourceError> {
+    dispatch_resource_kind!(
+        lookup_resource_kind(requested_kind)?.resource,
+        patch_annotation_typed(backend, namespace, name, key, value).await
+    )
+}
+
+async fn patch_annotation_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    name: &str,
+    key: &str,
+    value: &str,
+) -> Result<DynamicResourceObject, ResourceError> {
+    let updated = if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
+        let resolver = backend.definitions::<T>(namespace);
+        let existing = resolver.get(name).await?;
+        let mut meta = InputMeta::from(&existing.metadata);
+        meta.annotations.insert(key.to_string(), value.to_string());
+        resolver.apply(&meta, &existing.spec).await?
+    } else {
+        let resolver = backend.using::<T>(namespace);
+        let existing = resolver.get(name).await?;
+        let mut meta = InputMeta::from(&existing.metadata);
+        meta.annotations.insert(key.to_string(), value.to_string());
+        resolver.update(&meta, &existing.metadata.resource_version, &existing.spec).await?
+    };
+    Ok(DynamicResourceObject {
+        kind: T::API_PATHS.kind.to_string(),
+        plural: T::API_PATHS.plural.to_string(),
+        namespace: namespace.to_string(),
+        value: object_value(&updated)?,
+    })
+}
+
 pub async fn apply_manifest_resource_document(
     backend: &ResourceBackend,
     default_namespace: &str,
