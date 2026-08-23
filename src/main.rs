@@ -540,11 +540,22 @@ async fn connect_cli_socket(
     state_dir: &Path,
     require_host_daemon: bool,
 ) -> Result<Arc<flotilla_tui::socket::SocketDaemon>, String> {
+    let surface =
+        cli_surface_from(std::env::var("FLOTILLA_CREW_ROLE").ok().as_deref(), std::env::var("FLOTILLA_NAMESPACE").ok().as_deref());
     if require_host_daemon {
-        flotilla_tui::socket::connect_required_host_daemon(socket_path).await
+        flotilla_tui::socket::connect_required_host_daemon_with_surface(socket_path, surface).await
     } else {
-        flotilla_tui::socket::connect_or_spawn(socket_path, config_dir, state_dir).await
+        flotilla_tui::socket::connect_or_spawn_with_surface(socket_path, config_dir, state_dir, surface).await
     }
+}
+
+fn cli_surface_from(crew_role: Option<&str>, namespace: Option<&str>) -> flotilla_protocol::SurfaceDeclaration {
+    let namespace = namespace.unwrap_or("flotilla");
+    let principal_ref = match crew_role.filter(|role| !role.trim().is_empty()) {
+        Some(role) => flotilla_protocol::PrincipalRef { namespace: namespace.to_string(), name: format!("{role} agent") },
+        None => flotilla_protocol::PrincipalRef::implicit_for_namespace(namespace),
+    };
+    flotilla_protocol::SurfaceDeclaration { principal_ref, character: flotilla_protocol::SurfaceCharacter::Focal }
 }
 
 #[tokio::main]
@@ -2077,13 +2088,28 @@ mod tests {
     };
 
     use super::{
-        attach_mode, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing, format_human_resource_value,
-        host_daemon_socket_required, incompatible_daemon_reexec_failure, provisioning_target_for_environment, replace_host_ids,
-        run_replica_snapshot, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
+        attach_mode, cli_surface_from, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing,
+        format_human_resource_value, host_daemon_socket_required, incompatible_daemon_reexec_failure, provisioning_target_for_environment,
+        replace_host_ids, run_replica_snapshot, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
         should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, Cli, CliPaths, CommandValue, DaemonSubCommand,
         DevModeSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceStatusPatchArgs,
         ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
+
+    #[test]
+    fn crew_cli_surface_identifies_the_agent_role() {
+        let surface = cli_surface_from(Some("governor"), Some("fleet"));
+
+        assert_eq!(surface.principal_ref.namespace, "fleet");
+        assert_eq!(surface.principal_ref.name, "governor agent");
+    }
+
+    #[test]
+    fn human_cli_surface_uses_the_implicit_principal() {
+        let surface = cli_surface_from(None, Some("fleet"));
+
+        assert_eq!(surface.principal_ref, flotilla_protocol::PrincipalRef::implicit_for_namespace("fleet"));
+    }
 
     #[test]
     fn default_convoy_start_does_not_auto_attach_non_interactively() {

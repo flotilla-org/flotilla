@@ -628,8 +628,9 @@ async fn refused_convoy_reclaim_leaves_runtime_children_untouched() {
         "refusal must retain the terminal session"
     );
 
+    let principal = PrincipalRef::implicit_for_namespace("flotilla");
     daemon
-        .abandon_convoy_internal("flotilla", convoy_name, "operator accepts the unprovisioned checkout")
+        .abandon_convoy_internal("flotilla", convoy_name, "operator accepts the unprovisioned checkout", Some(&principal))
         .await
         .expect("the refused shape must remain recoverable through convoy abandon");
     let abandoned = convoys.get(convoy_name).await.expect("abandon retains the convoy record");
@@ -1524,7 +1525,11 @@ async fn abandoned_ensure_generation_survives_a_stale_reconcile_write_and_is_sup
     let workflow_snapshot_ref =
         first.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).cloned().expect("workflow archive pointer");
 
-    daemon.abandon_convoy_internal("flotilla", &first_ref, "operator requested replacement").await.expect("abandon generation");
+    let principal = PrincipalRef::implicit_for_namespace("flotilla");
+    daemon
+        .abandon_convoy_internal("flotilla", &first_ref, "operator requested replacement", Some(&principal))
+        .await
+        .expect("abandon generation");
 
     // This patch represents a reconcile that read the generation while it was
     // still active and lost the optimistic write race to the abandon command.
@@ -1545,7 +1550,7 @@ async fn abandoned_ensure_generation_survives_a_stale_reconcile_write_and_is_sup
     let abandoned_status = abandoned.status.as_ref().expect("abandoned status");
     assert_eq!(abandoned.spec.generation, 1);
     assert_eq!(abandoned_status.phase, ConvoyPhase::Abandoned);
-    assert_eq!(abandoned_status.message.as_deref(), Some("abandoned by HumanOverride: operator requested replacement"));
+    assert_eq!(abandoned_status.message.as_deref(), Some("abandoned by human override: operator requested replacement"));
     assert_eq!(abandoned.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION), Some(&workflow_snapshot_ref));
     assert!(generations.iter().any(|convoy| convoy.spec.generation == 2 && convoy.metadata.name != first_ref));
 }

@@ -62,6 +62,11 @@ pub(super) struct ForwardedCommand {
     pub(super) state: ForwardedCommandState,
 }
 
+struct ForwardedCommandOrigin {
+    principal_ref: Option<flotilla_protocol::PrincipalRef>,
+    session_id: Option<uuid::Uuid>,
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum ForwardedCommandState {
     Launching { ready: Arc<Notify> },
@@ -249,6 +254,7 @@ impl RemoteCommandRouter {
                     target_node_id: target_node_id.clone(),
                     remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                     command: Box::new(command),
+                    principal_ref: dispatching_principal_ref,
                     session_id: None,
                 };
                 let send_result = match &existing_convoy_target {
@@ -328,6 +334,7 @@ impl RemoteCommandRouter {
             target_node_id: target_node_id.clone(),
             remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
             command: Box::new(command),
+            principal_ref: None,
             session_id: Some(session_id),
         };
         if let Err(err) = self.send_routed_to(&target_node_id, routed).await {
@@ -408,6 +415,7 @@ impl RemoteCommandRouter {
         requester_node_id: NodeId,
         reply_via: NodeId,
         command: Command,
+        principal_ref: Option<flotilla_protocol::PrincipalRef>,
         session_id: Option<uuid::Uuid>,
     ) {
         let ready = Arc::new(Notify::new());
@@ -417,7 +425,8 @@ impl RemoteCommandRouter {
             .insert(request_id, ForwardedCommand { state: ForwardedCommandState::Launching { ready: Arc::clone(&ready) } });
         let router = self.clone();
         tokio::spawn(async move {
-            router.execute_forwarded_command(request_id, requester_node_id, reply_via, command, session_id, ready).await;
+            let origin = ForwardedCommandOrigin { principal_ref, session_id };
+            router.execute_forwarded_command(request_id, requester_node_id, reply_via, command, origin, ready).await;
         });
     }
 
@@ -694,7 +703,7 @@ impl RemoteCommandRouter {
         requester_node_id: NodeId,
         reply_via: NodeId,
         command: Command,
-        session_id: Option<uuid::Uuid>,
+        origin: ForwardedCommandOrigin,
         ready: Arc<Notify>,
     ) {
         let responder_node_id = self.daemon.node_id().clone();
@@ -702,7 +711,7 @@ impl RemoteCommandRouter {
         // Query commands: execute synchronously via execute_query, send the
         // result back directly without subscribing to the event stream.
         if command.action.is_query() {
-            let query_session = session_id.unwrap_or(uuid::Uuid::nil());
+            let query_session = origin.session_id.unwrap_or(uuid::Uuid::nil());
             let result = match self.execute_projected_query(command, query_session).await {
                 Ok(value) => value,
                 Err(message) => CommandValue::Error { message },
@@ -721,7 +730,7 @@ impl RemoteCommandRouter {
         }
 
         let mut event_rx = self.daemon.subscribe();
-        let command_id = match self.daemon.execute(command).await {
+        let command_id = match self.daemon.execute_for_principal(command, origin.principal_ref).await {
             Ok(command_id) => command_id,
             Err(message) => {
                 self.forwarded_commands.lock().await.remove(&request_id);
@@ -832,7 +841,8 @@ impl RemoteCommandRouter {
         command: Command,
         ready: Arc<Notify>,
     ) {
-        self.execute_forwarded_command(request_id, requester_node_id, reply_via, command, None, ready).await;
+        let origin = ForwardedCommandOrigin { principal_ref: None, session_id: None };
+        self.execute_forwarded_command(request_id, requester_node_id, reply_via, command, origin, ready).await;
     }
 
     #[cfg(test)]

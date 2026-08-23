@@ -545,8 +545,7 @@ impl ConvoyPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct WorkState {
     pub phase: WorkPhase,
-    /// A human explicitly completed this vessel's work at the roll-up level.
-    /// Crew-owned state remains unchanged while this override is active.
+    /// Authority responsible for settling this work at the roll-up level.
     #[builder(default)]
     #[serde(default, skip_serializing_if = "WorkCompletionAuthority::is_crew_rollup")]
     pub completion_authority: WorkCompletionAuthority,
@@ -581,11 +580,13 @@ impl WorkPhase {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum WorkCompletionAuthority {
     #[default]
     CrewRollup,
     HumanOverride,
+    Principal(PrincipalRef),
+    Unattributed,
 }
 
 impl WorkCompletionAuthority {
@@ -940,10 +941,16 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::MarkConvoyAbandoned { finished_at, authority, reason } => {
                 status.phase = ConvoyPhase::Abandoned;
                 status.finished_at.get_or_insert(*finished_at);
-                status.message = Some(format!("abandoned by {authority:?}: {reason}"));
+                let actor = match authority {
+                    WorkCompletionAuthority::CrewRollup => "crew rollup".to_string(),
+                    WorkCompletionAuthority::HumanOverride => "human override".to_string(),
+                    WorkCompletionAuthority::Principal(principal) => principal.name.clone(),
+                    WorkCompletionAuthority::Unattributed => "unattributed".to_string(),
+                };
+                status.message = Some(format!("abandoned by {actor}: {reason}"));
                 for state in status.work.values_mut().filter(|state| !state.phase.is_terminal()) {
                     state.phase = WorkPhase::Abandoned;
-                    state.completion_authority = *authority;
+                    state.completion_authority = authority.clone();
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(reason.clone());
                 }
