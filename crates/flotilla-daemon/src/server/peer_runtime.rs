@@ -32,6 +32,7 @@ enum PostHandleAction {
         requester_node_id: NodeId,
         reply_via: NodeId,
         command: flotilla_protocol::Command,
+        principal_ref: Option<flotilla_protocol::PrincipalRef>,
         session_id: Option<uuid::Uuid>,
     },
     CommandCancelRequested {
@@ -384,8 +385,8 @@ impl PeerRuntime {
                                 let mut pm = peer_manager_task.lock().await;
                                 let post_handle_action = match pm.handle_inbound(env).await {
                                     HandleResult::ReconnectSuppressed { peer } => PostHandleAction::ReconnectSuppressed { peer },
-                                    HandleResult::CommandRequested { request_id, requester_node_id, reply_via, command, session_id } => {
-                                        PostHandleAction::CommandRequested { request_id, requester_node_id, reply_via, command, session_id }
+                                    HandleResult::CommandRequested { request_id, requester_node_id, reply_via, command, principal_ref, session_id } => {
+                                        PostHandleAction::CommandRequested { request_id, requester_node_id, reply_via, command, principal_ref, session_id }
                                     }
                                     HandleResult::CommandCancelRequested { cancel_id, requester_node_id, reply_via, command_request_id } => {
                                         PostHandleAction::CommandCancelRequested { cancel_id, requester_node_id, reply_via, command_request_id }
@@ -457,9 +458,9 @@ impl PeerRuntime {
                                 PostHandleAction::ReconnectSuppressed { peer } => {
                                     info!(peer = %peer, "peer requested reconnect suppression");
                                 }
-                                PostHandleAction::CommandRequested { request_id, requester_node_id, reply_via, command, session_id } => {
+                                PostHandleAction::CommandRequested { request_id, requester_node_id, reply_via, command, principal_ref, session_id } => {
                                     remote_command_router_task
-                                        .spawn_forwarded_command(request_id, requester_node_id, reply_via, command, session_id)
+                                        .spawn_forwarded_command(request_id, requester_node_id, reply_via, command, principal_ref, session_id)
                                         .await;
                                 }
                                 PostHandleAction::CommandCancelRequested { cancel_id, requester_node_id, reply_via, command_request_id } => {

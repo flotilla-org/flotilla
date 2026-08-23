@@ -22,7 +22,14 @@ pub enum HandleResult {
     /// Peer intentionally retired this connection; reconnect should be suppressed briefly.
     ReconnectSuppressed { peer: NodeId },
     /// A routed command targeted this daemon and should be executed locally.
-    CommandRequested { request_id: u64, requester_node_id: NodeId, reply_via: NodeId, command: Command, session_id: Option<uuid::Uuid> },
+    CommandRequested {
+        request_id: u64,
+        requester_node_id: NodeId,
+        reply_via: NodeId,
+        command: Command,
+        principal_ref: Option<flotilla_protocol::PrincipalRef>,
+        session_id: Option<uuid::Uuid>,
+    },
     /// A routed command cancel request targeted this daemon.
     CommandCancelRequested { cancel_id: u64, requester_node_id: NodeId, reply_via: NodeId, command_request_id: u64 },
     /// A routed command lifecycle event reached the original requester.
@@ -597,7 +604,15 @@ impl PeerManager {
 
     fn handle_routed(&mut self, connection_peer: NodeId, connection_generation: u64, msg: RoutedPeerMessage) -> HandleResult {
         match msg {
-            RoutedPeerMessage::CommandRequest { request_id, requester_node_id, target_node_id, remaining_hops, command, session_id } => {
+            RoutedPeerMessage::CommandRequest {
+                request_id,
+                requester_node_id,
+                target_node_id,
+                remaining_hops,
+                command,
+                principal_ref,
+                session_id,
+            } => {
                 if remaining_hops == 0 {
                     return HandleResult::Ignored;
                 }
@@ -607,6 +622,7 @@ impl PeerManager {
                         requester_node_id,
                         reply_via: connection_peer,
                         command: *command,
+                        principal_ref,
                         session_id,
                     };
                 }
@@ -629,6 +645,7 @@ impl PeerManager {
                     target_node_id: target_node_id.clone(),
                     remaining_hops: remaining_hops.saturating_sub(1),
                     command,
+                    principal_ref,
                     session_id,
                 };
                 self.queue_send_to(&target_node_id, PeerWireMessage::Routed(forwarded));

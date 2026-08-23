@@ -30,8 +30,9 @@ use flotilla_resources::{
     CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
     CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, Regard,
-    Resource, ResourceBackend, ResourceError, ResourceProvenance, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
+    Resource, ResourceBackend, ResourceError, ResourceProvenance, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkState,
+    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL,
+    ROLE_LABEL,
 };
 
 async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
@@ -358,6 +359,61 @@ async fn convoy_creation_attributes_provenance_and_regard_to_the_surface_princip
     let regards = leader.resource_backend().using::<Regard>("flotilla").list().await.expect("list regards");
     assert_eq!(regards.items.len(), 1);
     assert_eq!(regards.items[0].spec.principal_ref, convoy.spec.dispatching_principal_ref);
+}
+
+async fn assert_abandon_attribution(principal_ref: PrincipalRef, expected_authority: WorkCompletionAuthority, expected_actor: &str) {
+    let leader = empty_daemon_named("leader").await;
+    let follower = empty_daemon_named("follower").await;
+    let topology = spawn_in_memory_request_topology_stateful_with_surface(Arc::clone(&leader), follower, SurfaceDeclaration {
+        principal_ref,
+        character: SurfaceCharacter::Focal,
+    })
+    .await
+    .expect("spawn attributed client topology");
+    let convoys = leader.resource_backend().using::<Convoy>("flotilla");
+    let role = "attributed-abandon";
+    let created = convoys.create(&convoy_meta("attributed-abandon-g1", role), &convoy_spec("empty", role)).await.expect("create convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
+            phase: ResourceConvoyPhase::Active,
+            work: BTreeMap::from([("implement".to_string(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
+            ..Default::default()
+        })
+        .await
+        .expect("seed convoy status");
+    let mut events = leader.subscribe();
+
+    let command_id = topology
+        .client
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyAbandon {
+                namespace: Some("flotilla".to_string()),
+                name: role.to_string(),
+                reason: "no longer needed".to_string(),
+            },
+        })
+        .await
+        .expect("dispatch abandon");
+    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::Ok);
+
+    let status = convoys.get(&created.metadata.name).await.expect("abandoned convoy").status.expect("convoy status");
+    assert_eq!(status.work["implement"].completion_authority, expected_authority);
+    assert_eq!(status.message.as_deref(), Some(format!("abandoned by {expected_actor}: no longer needed").as_str()));
+}
+
+#[tokio::test]
+async fn agent_abandon_is_attributed_to_the_acting_principal() {
+    let principal = PrincipalRef { namespace: "flotilla".to_string(), name: "governor agent".to_string() };
+    assert_abandon_attribution(principal.clone(), WorkCompletionAuthority::Principal(principal), "governor agent").await;
+}
+
+#[tokio::test]
+async fn implicit_human_abandon_remains_a_human_override() {
+    assert_abandon_attribution(PrincipalRef::implicit_for_namespace("flotilla"), WorkCompletionAuthority::HumanOverride, "human override")
+        .await;
 }
 
 // ---------------------------------------------------------------------------

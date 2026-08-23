@@ -184,7 +184,7 @@ pub use snapshot::{CategoryLabels, ProviderError, RepoInfo, RepoKey, RepoLabels,
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Deterministic SHA-256 over the relative paths and contents beneath this
 /// crate's `src` directory.

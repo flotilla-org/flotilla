@@ -7685,16 +7685,27 @@ impl InProcessDaemon {
         Ok(())
     }
 
-    async fn abandon_convoy_internal(&self, namespace: &str, name: &str, reason: &str) -> Result<(), String> {
+    async fn abandon_convoy_internal(
+        &self,
+        namespace: &str,
+        name: &str,
+        reason: &str,
+        principal_ref: Option<&PrincipalRef>,
+    ) -> Result<(), String> {
         if reason.trim().is_empty() {
             return Err("convoy abandon requires a non-empty reason".to_string());
         }
         self.archive_convoy_checkouts_best_effort(namespace, name).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let authority = match principal_ref {
+            Some(principal) if principal.name == PrincipalRef::IMPLICIT_NAME => WorkCompletionAuthority::HumanOverride,
+            Some(principal) => WorkCompletionAuthority::Principal(principal.clone()),
+            None => WorkCompletionAuthority::Unattributed,
+        };
         apply_resource_status_patch(
             &convoys,
             name,
-            &convoy_external_patches::mark_convoy_abandoned(Utc::now(), WorkCompletionAuthority::HumanOverride, reason.to_string()),
+            &convoy_external_patches::mark_convoy_abandoned(Utc::now(), authority, reason.to_string()),
         )
         .await
         .map_err(|err| err.to_string())?;
@@ -9285,10 +9296,12 @@ impl InProcessDaemon {
                 None => self.provisioning_namespace().await,
             };
             let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
-                Ok(record_name) => match self.abandon_convoy_internal(&namespace, &record_name, reason).await {
-                    Ok(()) => flotilla_protocol::CommandValue::Ok,
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                },
+                Ok(record_name) => {
+                    match self.abandon_convoy_internal(&namespace, &record_name, reason, dispatching_principal_ref.as_ref()).await {
+                        Ok(()) => flotilla_protocol::CommandValue::Ok,
+                        Err(message) => flotilla_protocol::CommandValue::Error { message },
+                    }
+                }
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             self.finish_context_free_command(id, empty_identity, result);

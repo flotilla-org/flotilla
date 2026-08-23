@@ -227,7 +227,7 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
 
     assert_eq!(status.phase, ConvoyPhase::Abandoned);
     assert_eq!(status.finished_at, Some(ts(50)));
-    assert_eq!(status.message.as_deref(), Some("abandoned by HumanOverride: superseded by operator"));
+    assert_eq!(status.message.as_deref(), Some("abandoned by human override: superseded by operator"));
     assert_eq!(status.work["implement"].phase, WorkPhase::Abandoned);
     assert_eq!(status.work["implement"].completion_authority, WorkCompletionAuthority::HumanOverride);
     assert_eq!(status.work["implement"].message.as_deref(), Some("superseded by operator"));

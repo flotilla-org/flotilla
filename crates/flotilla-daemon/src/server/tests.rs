@@ -2865,6 +2865,7 @@ async fn handle_inbound_command_request_does_not_hold_peer_manager_lock_across_s
                         command: Box::new(
                             Command::builder().action(CommandAction::Refresh { repo: None }).node_id(NodeId::new("relay")).build(),
                         ),
+                        principal_ref: None,
                         session_id: None,
                     }),
                     connection_generation: generation,
