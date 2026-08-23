@@ -106,10 +106,12 @@ use crate::{
     },
     providers::{
         ai_utility::{AiUtility, ConvoyNames},
+        change_request::{github::GitHubChangeRequest, ChangeRequestTracker},
         discovery::{
             discover_providers_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion,
             EnvironmentBag,
         },
+        github_api::GhApiClient,
         issue_tracker::{forge_issue_source, IssueProvider},
         registry::ProviderRegistry,
         ssh_runner::SshCommandRunner,
@@ -1927,6 +1929,12 @@ struct ResolvedConvoyChangeRequestAdmission {
     base_ref: String,
 }
 
+struct RepositoryChangeRequestProvider {
+    service_url: String,
+    repository: String,
+    provider: Arc<dyn ChangeRequestTracker>,
+}
+
 fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<String> {
     let role = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
     let identity = convoy.spec.project_ref.as_ref().map_or_else(|| role.clone(), |project| format!("{role}@{project}"));
@@ -2067,6 +2075,7 @@ pub struct InProcessDaemon {
     /// Mutated under `observed_checkout_reconciliation` so removal deletes
     /// observations using the identity that originally created them.
     repository_keys_by_path: RwLock<HashMap<PathBuf, RepositoryKey>>,
+    repository_change_requests: RwLock<HashMap<RepositoryKey, RepositoryChangeRequestProvider>>,
     host_registry: crate::host_registry::HostRegistry,
     local_environment_id: EnvironmentId,
     environment_manager: Arc<EnvironmentManager>,
@@ -2308,6 +2317,7 @@ impl InProcessDaemon {
             host_name: host_name.clone(),
             path_identities: RwLock::new(path_identities),
             repository_keys_by_path: RwLock::new(repository_keys_by_path),
+            repository_change_requests: RwLock::new(HashMap::new()),
             host_registry: crate::host_registry::HostRegistry::new(
                 NodeInfo::new(local_node_id.clone(), host_name.to_string()),
                 local_host_summary,
@@ -3293,70 +3303,92 @@ impl InProcessDaemon {
         repository_keys: &[RepositoryKey],
         requested_id: &str,
     ) -> Result<ResolvedConvoyChangeRequestAdmission, String> {
-        let candidates = {
-            let keys_by_path = self.repository_keys_by_path.read().await;
-            let repos = self.repos.read().await;
-            let order = self.repo_order.read().await;
-            let mut seen = HashSet::new();
-            let mut candidates = Vec::new();
-            for identity in order.iter() {
-                let Some(state) = repos.get(identity) else { continue };
-                for root in &state.roots {
-                    let Some(repository) = keys_by_path.get(&root.path).filter(|repository| repository_keys.contains(repository)) else {
-                        continue;
-                    };
-                    if seen.contains(repository) {
-                        continue;
-                    }
-                    let providers =
-                        root.model.registry.change_requests.iter().map(|(_, provider)| Arc::clone(provider)).collect::<Vec<_>>();
-                    if !providers.is_empty() {
-                        seen.insert(repository.clone());
-                        candidates.push((repository.clone(), root.path.clone(), providers));
-                    }
-                }
-            }
-            candidates
-        };
+        let (candidates, mut failures) = self.repository_change_request_candidates(repository_keys).await;
+        let consulted = candidates.iter().map(|(_, scope, _)| scope.clone()).collect::<Vec<_>>();
 
         let mut matches = Vec::new();
-        let mut failures = Vec::new();
-        for (repository, path, providers) in candidates {
-            let mut matched = None;
-            for provider in providers {
-                match provider.get_change_request_for_admission(&path, requested_id).await {
-                    Ok(admission) => {
-                        let Some(base_ref) = admission.base_ref else {
-                            failures.push(format!("repository {repository}: change request {} did not report a base ref", admission.id));
-                            continue;
-                        };
-                        matched = Some(ResolvedConvoyChangeRequestAdmission {
-                            binding: BoundChangeRequest {
-                                id: admission.id,
-                                repository_ref: repository.clone(),
-                                title: admission.change_request.title,
-                            },
-                            branch: admission.change_request.branch,
-                            base_ref,
-                        });
-                        break;
-                    }
-                    Err(error) => failures.push(format!("repository {repository}: {error}")),
+        let mut matched_repositories = Vec::new();
+        for (repository, scope, provider) in candidates {
+            match provider.get_change_request_for_admission(requested_id).await {
+                Ok(admission) => {
+                    let Some(base_ref) = admission.base_ref else {
+                        failures.push(format!("repository {scope}: change request {} did not report a base ref", admission.id));
+                        continue;
+                    };
+                    matches.push(ResolvedConvoyChangeRequestAdmission {
+                        binding: BoundChangeRequest { id: admission.id, repository_ref: repository, title: admission.change_request.title },
+                        branch: admission.change_request.branch,
+                        base_ref,
+                    });
+                    matched_repositories.push(scope);
                 }
-            }
-            if let Some(matched) = matched {
-                matches.push(matched);
+                Err(error) => failures.push(format!("repository {scope}: {error}")),
             }
         }
 
         match matches.len() {
             1 => Ok(matches.remove(0)),
-            0 => Err(format!(
-                "change request {requested_id} was not found in project repositories{}",
+            0 if consulted.is_empty() => Err(format!(
+                "change request {requested_id} could not be resolved because no project repository could be consulted{}",
                 if failures.is_empty() { String::new() } else { format!(": {}", failures.join("; ")) }
             )),
-            count => Err(format!("change request {requested_id} is ambiguous across {count} project repositories")),
+            0 => Err(format!(
+                "change request {requested_id} was not found in consulted repositories [{}]{}",
+                consulted.join(", "),
+                if failures.is_empty() { String::new() } else { format!(": {}", failures.join("; ")) }
+            )),
+            count => Err(format!(
+                "change request {requested_id} is ambiguous across {count} consulted repositories [{}]",
+                matched_repositories.join(", ")
+            )),
         }
+    }
+
+    async fn repository_change_request_candidates(
+        &self,
+        repository_keys: &[RepositoryKey],
+    ) -> (Vec<(RepositoryKey, String, Arc<dyn ChangeRequestTracker>)>, Vec<String>) {
+        let namespace = self.provisioning_namespace().await;
+        let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
+        let mut candidates = Vec::new();
+        let mut failures = Vec::new();
+        for repository_key in repository_keys {
+            let repository = match repositories.get(&repository_key.to_string()).await {
+                Ok(repository) => repository,
+                Err(error) => {
+                    failures.push(format!("repository {repository_key}: {error}"));
+                    continue;
+                }
+            };
+            let Some(forge) = repository.spec.forge() else {
+                failures.push(format!("repository {repository_key}: no forge identity"));
+                continue;
+            };
+            if forge.service_url.trim_end_matches('/') != "https://github.com" {
+                failures.push(format!("repository {}: change request provider unavailable for {}", forge.repository, forge.service_url));
+                continue;
+            }
+            if let Some(cached) = self.repository_change_requests.read().await.get(repository_key) {
+                if cached.service_url == forge.service_url && cached.repository == forge.repository {
+                    candidates.push((repository_key.clone(), forge.repository.clone(), Arc::clone(&cached.provider)));
+                    continue;
+                }
+            }
+            let runner = self.discovery.runner.clone();
+            let provider = Arc::new(GitHubChangeRequest::new(
+                "github".to_string(),
+                forge.repository.clone(),
+                Arc::new(GhApiClient::new(runner.clone())),
+                runner,
+            )) as Arc<dyn ChangeRequestTracker>;
+            self.repository_change_requests.write().await.insert(repository_key.clone(), RepositoryChangeRequestProvider {
+                service_url: forge.service_url.clone(),
+                repository: forge.repository.clone(),
+                provider: Arc::clone(&provider),
+            });
+            candidates.push((repository_key.clone(), forge.repository.clone(), provider));
+        }
+        (candidates, failures)
     }
 
     /// Resolve the first change request whose head matches a convoy branch
@@ -3371,61 +3403,21 @@ impl InProcessDaemon {
             return Ok(Some(change_request));
         }
 
-        let live_candidates = {
-            let keys_by_path = self.repository_keys_by_path.read().await;
-            let repos = self.repos.read().await;
-            let order = self.repo_order.read().await;
-            let mut live_by_key = HashMap::new();
+        let (live_candidates, setup_failures) = self.repository_change_request_candidates(repository_keys).await;
 
-            for identity in order.iter() {
-                let Some(state) = repos.get(identity) else { continue };
-                let Some(repository) = state
-                    .roots
-                    .iter()
-                    .filter_map(|root| keys_by_path.get(&root.path))
-                    .find(|repository| repository_keys.contains(repository))
-                    .cloned()
-                else {
-                    continue;
-                };
-
-                if !live_by_key.contains_key(&repository) {
-                    for root in &state.roots {
-                        if keys_by_path.get(&root.path) != Some(&repository) {
-                            continue;
-                        }
-                        let providers =
-                            root.model.registry.change_requests.iter().map(|(_, provider)| Arc::clone(provider)).collect::<Vec<_>>();
-                        if !providers.is_empty() {
-                            live_by_key.insert(repository.clone(), (root.path.clone(), providers));
-                            break;
-                        }
-                    }
+        let mut first_error = setup_failures.into_iter().next();
+        for (repository, _, provider) in live_candidates {
+            let resolved = match change_request_id {
+                Some(id) => provider.get_change_request(id).await.map(Some),
+                None => provider.find_change_request_by_branch(branch).await,
+            };
+            match resolved {
+                Ok(Some((id, request))) => {
+                    return Ok(Some(ConvoyChangeRequest { id, status: request.status, repository_key: repository }));
                 }
-            }
-
-            let live_candidates = repository_keys
-                .iter()
-                .filter_map(|repository| live_by_key.remove(repository).map(|(path, providers)| (repository.clone(), path, providers)))
-                .collect::<Vec<_>>();
-            live_candidates
-        };
-
-        let mut first_error = None;
-        for (repository, path, providers) in live_candidates {
-            for provider in providers {
-                let resolved = match change_request_id {
-                    Some(id) => provider.get_change_request(&path, id).await.map(Some),
-                    None => provider.find_change_request_by_branch(&path, branch).await,
-                };
-                match resolved {
-                    Ok(Some((id, request))) => {
-                        return Ok(Some(ConvoyChangeRequest { id, status: request.status, repository_key: repository }));
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                    }
+                Ok(None) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
                 }
             }
         }

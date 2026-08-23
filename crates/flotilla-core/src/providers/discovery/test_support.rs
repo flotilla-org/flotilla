@@ -958,30 +958,26 @@ impl FakeChangeRequest {
 
 #[async_trait::async_trait]
 impl ChangeRequestTracker for FakeChangeRequest {
-    async fn list_change_requests(&self, _repo_root: &Path, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+    async fn list_change_requests(&self, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         let store = self.change_requests.lock().await;
         Ok(store.iter().take(limit).cloned().collect())
     }
 
-    async fn get_change_request(&self, _repo_root: &Path, id: &str) -> Result<(String, ChangeRequest), String> {
+    async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
         let store = self.change_requests.lock().await;
         store.iter().find(|(cr_id, _)| cr_id == id).cloned().ok_or_else(|| format!("change request {id} not found"))
     }
 
-    async fn get_change_request_for_admission(
-        &self,
-        repo_root: &Path,
-        id: &str,
-    ) -> Result<super::super::change_request::ChangeRequestAdmission, String> {
-        let (id, change_request) = self.get_change_request(repo_root, id).await?;
+    async fn get_change_request_for_admission(&self, id: &str) -> Result<super::super::change_request::ChangeRequestAdmission, String> {
+        let (id, change_request) = self.get_change_request(id).await?;
         Ok(super::super::change_request::ChangeRequestAdmission { id, change_request, base_ref: Some(self.admission_base_ref.clone()) })
     }
 
-    async fn open_in_browser(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
+    async fn open_in_browser(&self, _id: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn close_change_request(&self, _repo_root: &Path, id: &str) -> Result<(), String> {
+    async fn close_change_request(&self, id: &str) -> Result<(), String> {
         let mut store = self.change_requests.lock().await;
         if let Some((_, cr)) = store.iter_mut().find(|(cr_id, _)| cr_id == id) {
             cr.status = ChangeRequestStatus::Closed;
@@ -991,7 +987,7 @@ impl ChangeRequestTracker for FakeChangeRequest {
         }
     }
 
-    async fn merge_change_request(&self, _repo_root: &Path, id: &str) -> Result<(), String> {
+    async fn merge_change_request(&self, id: &str) -> Result<(), String> {
         let mut store = self.change_requests.lock().await;
         if let Some((_, cr)) = store.iter_mut().find(|(cr_id, _)| cr_id == id) {
             cr.status = ChangeRequestStatus::Merged;
@@ -1001,7 +997,7 @@ impl ChangeRequestTracker for FakeChangeRequest {
         }
     }
 
-    async fn list_merged_branch_names(&self, _repo_root: &Path, limit: usize) -> Result<Vec<String>, String> {
+    async fn list_merged_branch_names(&self, limit: usize) -> Result<Vec<String>, String> {
         let store = self.merged_branches.lock().await;
         Ok(store.iter().take(limit).cloned().collect())
     }

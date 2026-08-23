@@ -88,22 +88,22 @@ impl CheckoutManager for StubCheckoutManager {
 struct StubChangeRequestTracker;
 #[async_trait]
 impl ChangeRequestTracker for StubChangeRequestTracker {
-    async fn list_change_requests(&self, _: &Path, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+    async fn list_change_requests(&self, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         Ok(vec![])
     }
-    async fn get_change_request(&self, _: &Path, _: &str) -> Result<(String, ChangeRequest), String> {
+    async fn get_change_request(&self, _: &str) -> Result<(String, ChangeRequest), String> {
         Err("stub".into())
     }
-    async fn open_in_browser(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn open_in_browser(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn close_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn close_change_request(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn merge_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn merge_change_request(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn list_merged_branch_names(&self, _: &Path, _: usize) -> Result<Vec<String>, String> {
+    async fn list_merged_branch_names(&self, _: usize) -> Result<Vec<String>, String> {
         Ok(vec![])
     }
 }

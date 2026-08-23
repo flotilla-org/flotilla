@@ -191,22 +191,22 @@ struct MockChangeRequestTracker;
 
 #[async_trait]
 impl ChangeRequestTracker for MockChangeRequestTracker {
-    async fn list_change_requests(&self, _repo_root: &Path, _limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+    async fn list_change_requests(&self, _limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         Ok(vec![])
     }
-    async fn get_change_request(&self, _repo_root: &Path, _id: &str) -> Result<(String, ChangeRequest), String> {
+    async fn get_change_request(&self, _id: &str) -> Result<(String, ChangeRequest), String> {
         Err("not implemented".to_string())
     }
-    async fn open_in_browser(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
+    async fn open_in_browser(&self, _id: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn close_change_request(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
+    async fn close_change_request(&self, _id: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn merge_change_request(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
+    async fn merge_change_request(&self, _id: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn list_merged_branch_names(&self, _repo_root: &Path, _limit: usize) -> Result<Vec<String>, String> {
+    async fn list_merged_branch_names(&self, _limit: usize) -> Result<Vec<String>, String> {
         Ok(vec![])
     }
 }
@@ -218,23 +218,23 @@ struct MergeChangeRequestTracker {
 
 #[async_trait]
 impl ChangeRequestTracker for MergeChangeRequestTracker {
-    async fn list_change_requests(&self, _repo_root: &Path, _limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+    async fn list_change_requests(&self, _limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         Ok(vec![])
     }
-    async fn get_change_request(&self, _repo_root: &Path, _id: &str) -> Result<(String, ChangeRequest), String> {
+    async fn get_change_request(&self, _id: &str) -> Result<(String, ChangeRequest), String> {
         Err("not implemented".to_string())
     }
-    async fn open_in_browser(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
+    async fn open_in_browser(&self, _id: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn close_change_request(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
+    async fn close_change_request(&self, _id: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn merge_change_request(&self, _repo_root: &Path, id: &str) -> Result<(), String> {
+    async fn merge_change_request(&self, id: &str) -> Result<(), String> {
         self.calls.lock().await.push(id.to_string());
         self.result.clone()
     }
-    async fn list_merged_branch_names(&self, _repo_root: &Path, _limit: usize) -> Result<Vec<String>, String> {
+    async fn list_merged_branch_names(&self, _limit: usize) -> Result<Vec<String>, String> {
         Ok(vec![])
     }
 }

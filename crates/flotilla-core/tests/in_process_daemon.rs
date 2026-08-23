@@ -24,10 +24,10 @@ use flotilla_core::{
         coding_agent::CloudAgentService,
         discovery::{
             test_support::{
-                fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_providers, fake_vcs_discovery, git_process_discovery,
-                init_git_repo, init_git_repo_with_remote, DiscoveryMockRunner, FakeChangeRequest, FakeCheckoutManager,
-                FakeCheckoutManagerFactory, FakeDiscoveryProviders, FakeIssueProvider, FakePresentationManager, FakeTerminalPool,
-                FakeVcsFactory, FakeVcsState, TestEnvVars,
+                fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_providers, fake_discovery_with_runner,
+                fake_vcs_discovery, git_process_discovery, init_git_repo, init_git_repo_with_remote, DiscoveryMockRunner,
+                FakeChangeRequest, FakeCheckoutManager, FakeCheckoutManagerFactory, FakeDiscoveryProviders, FakeIssueProvider,
+                FakePresentationManager, FakeTerminalPool, FakeVcsFactory, FakeVcsState, TestEnvVars,
             },
             DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, Factory, HostDetector, HostPlatform, ProviderCategory,
             ProviderDescriptor, RepoDetector, UnmetRequirement,
@@ -49,17 +49,17 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     apply_status_patch, controller_patches as convoy_controller_patches, implement_review_workflow_spec,
-    single_agent_contained_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
-    CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase, CredentialConsumer, CredentialGrant,
-    CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host as ResourceHost,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, LifecycleAuthority,
-    ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy,
-    RegardSource, Repository, RepositoryRelation, RepositorySpec, ResourceBackend, ResourceError, SqliteBackend, Stance, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, TerminalSessionStatusPatch, TypedResolver, WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot,
-    WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL,
-    VESSEL_LABEL,
+    single_agent_contained_workflow_spec, single_agent_shepherd_workflow_spec, Checkout as ResourceCheckout,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase,
+    CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
+    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, DockerCheckoutStrategy,
+    DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
+    HostStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
+    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryRelation, RepositorySpec, ResourceBackend, ResourceError,
+    SqliteBackend, Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TypedResolver, WatchEvent, WatchStart,
+    WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, HELD_CREDENTIALS_CAPABILITY,
+    REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::Notify;
@@ -632,27 +632,27 @@ struct FailingChangeRequestTracker;
 
 #[async_trait]
 impl ChangeRequestTracker for FailingChangeRequestTracker {
-    async fn list_change_requests(&self, _: &Path, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+    async fn list_change_requests(&self, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         Err("change request listing failed".into())
     }
 
-    async fn get_change_request(&self, _: &Path, id: &str) -> Result<(String, ChangeRequest), String> {
+    async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
         Err(format!("change request {id} not found"))
     }
 
-    async fn open_in_browser(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn open_in_browser(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn close_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn close_change_request(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn merge_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn merge_change_request(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn list_merged_branch_names(&self, _: &Path, _: usize) -> Result<Vec<String>, String> {
+    async fn list_merged_branch_names(&self, _: usize) -> Result<Vec<String>, String> {
         Err("merged branch listing failed".into())
     }
 }
@@ -663,28 +663,28 @@ struct CountingChangeRequestTracker {
 
 #[async_trait]
 impl ChangeRequestTracker for CountingChangeRequestTracker {
-    async fn list_change_requests(&self, _: &Path, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+    async fn list_change_requests(&self, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         self.polls.fetch_add(1, Ordering::SeqCst);
         Ok(Vec::new())
     }
 
-    async fn get_change_request(&self, _: &Path, id: &str) -> Result<(String, ChangeRequest), String> {
+    async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
         Err(format!("change request {id} not found"))
     }
 
-    async fn open_in_browser(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn open_in_browser(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn close_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn close_change_request(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn merge_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn merge_change_request(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn list_merged_branch_names(&self, _: &Path, _: usize) -> Result<Vec<String>, String> {
+    async fn list_merged_branch_names(&self, _: usize) -> Result<Vec<String>, String> {
         self.polls.fetch_add(1, Ordering::SeqCst);
         Ok(Vec::new())
     }
@@ -1484,23 +1484,44 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
 
 #[tokio::test]
 async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
-    let provider = Arc::new(FakeChangeRequest::new());
-    provider
-        .add_change_requests(vec![("1071".to_string(), ChangeRequest {
-            title: "Convoy adoption of an existing PR".to_string(),
-            branch: "feat/existing-pr".to_string(),
-            status: flotilla_protocol::ChangeRequestStatus::Open,
-            body: Some("Existing implementation work.".to_string()),
-            provider_name: "fake-cr".to_string(),
-            provider_display_name: "Fake PRs".to_string(),
-        })])
-        .await;
-    let discovery =
-        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_change_request(provider as Arc<dyn ChangeRequestTracker>));
-    let (_temp, repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
-    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repository");
-    let repository_key = daemon.repository_key_for_path(&repo).await.expect("repository key");
+    let response = concat!(
+        "HTTP/2.0 200 OK\r\nEtag: \"pr-1071\"\r\nContent-Type: application/json\r\n\r\n",
+        r#"{"number":1071,"title":"Convoy adoption of an existing PR","head":{"ref":"feat/existing-pr"},"base":{"ref":"main"},"state":"open","body":"Existing implementation work.","draft":false,"merged_at":null}"#,
+    );
+    let runner = Arc::new(
+        DiscoveryMockRunner::builder()
+            .on_run("git", &["--version"], Ok("git version 2.43.0".to_string()))
+            .on_run("gh", &["api", "--include", "repos/owner/repo/pulls/1071"], Ok(response.to_string()))
+            .on_run(
+                "gh",
+                &["api", "--include", "repos/owner/repo/pulls/1071", "-H", "If-None-Match: \"pr-1071\""],
+                Ok("HTTP/2.0 304 Not Modified\r\nEtag: \"pr-1071\"\r\n\r\n".to_string()),
+            )
+            .build(),
+    );
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        test_config_store(temp.path().join("config")),
+        fake_discovery_with_runner(false, runner),
+        HostName::local(),
+    )
+    .await;
     let backend = daemon.resource_backend();
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("single-agent-shepherd".to_string()).build(), &single_agent_shepherd_workflow_spec())
+        .await
+        .expect("shepherd workflow create");
+    let repository_spec = RepositorySpec::remote("https://github.com/owner/repo").expect("repository spec");
+    let repository_key = repository_spec.key();
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
+        .await
+        .expect("repository create");
     create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
@@ -1558,12 +1579,23 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
         convoy.spec.change_request,
         Some(flotilla_resources::BoundChangeRequest {
             id: "1071".to_string(),
-            repository_ref: repository_key,
+            repository_ref: repository_key.clone(),
             title: "Convoy adoption of an existing PR".to_string(),
         })
     );
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");
     assert_eq!(convoy.spec.repositories[0].target_ref, "main");
+    assert_eq!(
+        daemon
+            .resolve_convoy_change_request(std::slice::from_ref(&repository_key), "feat/existing-pr", Some("1071"))
+            .await
+            .expect("repeated change request resolution"),
+        Some(flotilla_protocol::ConvoyChangeRequest {
+            id: "1071".to_string(),
+            status: flotilla_protocol::ChangeRequestStatus::Open,
+            repository_key,
+        })
+    );
 }
 
 #[tokio::test]
@@ -1608,7 +1640,7 @@ async fn fork_stance_refuses_change_request_merge_without_calling_provider() {
     assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::Error {
         message: "merging change request 42 is forbidden for fork-stance repository; landing is human-only".to_string(),
     });
-    let (_, request) = provider.get_change_request(Path::new("/unused"), "42").await.expect("change request should remain available");
+    let (_, request) = provider.get_change_request("42").await.expect("change request should remain available");
     assert_eq!(request.status, flotilla_protocol::ChangeRequestStatus::Open);
 }
 
