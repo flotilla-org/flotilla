@@ -62,6 +62,7 @@ impl CleatTerminalPool {
         let mut args = vec![Arg::Literal(self.binary.clone()), Arg::Literal("attach".into()), Arg::Literal("--no-create".into())];
         match mode {
             AttachMode::Default => {}
+            AttachMode::PreferTake => args.push(Arg::Literal("--take".into())),
             AttachMode::Strict => args.push(Arg::Literal("--strict".into())),
             AttachMode::Take => args.push(Arg::Literal("--take".into())),
         }
@@ -473,17 +474,17 @@ mod tests {
     }
 
     #[test]
-    fn attach_args_pass_through_controller_seat_flags() {
+    fn human_take_attach_adds_take_while_watch_omits_it() {
         let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
-        let strict = pool
-            .attach_args_for_mode("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachMode::Strict)
-            .expect("strict attach args");
         let take = pool
-            .attach_args_for_mode("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachMode::Take)
+            .attach_args_for_mode("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachMode::PreferTake)
             .expect("take attach args");
+        let watch = pool
+            .attach_args_for_mode("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachMode::Default)
+            .expect("watch attach args");
 
-        assert_eq!(flotilla_protocol::arg::flatten(&strict, 0), "cleat attach --no-create --strict my-session");
         assert_eq!(flotilla_protocol::arg::flatten(&take, 0), "cleat attach --no-create --take my-session");
+        assert_eq!(flotilla_protocol::arg::flatten(&watch, 0), "cleat attach --no-create my-session");
     }
 
     #[tokio::test]

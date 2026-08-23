@@ -8403,7 +8403,7 @@ impl InProcessDaemon {
         reference: &str,
         host: Option<&HostName>,
     ) -> Result<ResolvedAttach, String> {
-        self.resolve_attach_with_mode_internal(reference, host, false, AttachMode::Default).await
+        self.resolve_attach_with_mode_internal(reference, host, false, AttachMode::PreferTake).await
     }
 
     async fn resolve_attach_with_mode_internal(
@@ -8738,19 +8738,7 @@ impl InProcessDaemon {
         }
 
         let resolver = ssh_resolver_from_config(self.config.base_path())?;
-        let mut command =
-            vec![flotilla_protocol::arg::Arg::Literal("flotilla".to_string()), flotilla_protocol::arg::Arg::Literal("attach".to_string())];
-        command.push(flotilla_protocol::arg::Arg::Literal("--host".to_string()));
-        command.push(flotilla_protocol::arg::Arg::Quoted(target_host.to_string()));
-        // Recursive attaches only traverse transport boundaries; Presentation
-        // Manager identity belongs to the original foreground attach.
-        command.push(flotilla_protocol::arg::Arg::Literal("--transient".to_string()));
-        match seat {
-            AttachMode::Default => {}
-            AttachMode::Strict => command.push(flotilla_protocol::arg::Arg::Literal("--strict".to_string())),
-            AttachMode::Take => command.push(flotilla_protocol::arg::Arg::Literal("--take".to_string())),
-        }
-        command.push(flotilla_protocol::arg::Arg::Quoted(reference.to_string()));
+        let command = recursive_attach_command(target_host, reference, seat);
         resolver
             .one_hop_command_args(&next_hop, command)
             .map(ResolvedAttachPlan::command)
@@ -8763,7 +8751,7 @@ impl InProcessDaemon {
             .as_deref()
             .or(binding.convoy.as_deref())
             .ok_or_else(|| "remote attach binding has neither a session nor convoy reference".to_string())?;
-        self.recursive_attach_plan_for_remote(&binding.host, reference, AttachMode::Default).await
+        self.recursive_attach_plan_for_remote(&binding.host, reference, AttachMode::PreferTake).await
     }
 
     async fn local_attach_plan_for_session(
@@ -10106,6 +10094,24 @@ impl InProcessDaemon {
 
         Ok(id)
     }
+}
+
+fn recursive_attach_command(target_host: &HostName, reference: &str, seat: AttachMode) -> Vec<flotilla_protocol::arg::Arg> {
+    let mut command =
+        vec![flotilla_protocol::arg::Arg::Literal("flotilla".to_string()), flotilla_protocol::arg::Arg::Literal("attach".to_string())];
+    command.push(flotilla_protocol::arg::Arg::Literal("--host".to_string()));
+    command.push(flotilla_protocol::arg::Arg::Quoted(target_host.to_string()));
+    // Recursive attaches only traverse transport boundaries; Presentation
+    // Manager identity belongs to the original foreground attach.
+    command.push(flotilla_protocol::arg::Arg::Literal("--transient".to_string()));
+    match seat {
+        AttachMode::Default => command.push(flotilla_protocol::arg::Arg::Literal("--watch".to_string())),
+        AttachMode::PreferTake => {}
+        AttachMode::Strict => command.push(flotilla_protocol::arg::Arg::Literal("--strict".to_string())),
+        AttachMode::Take => command.push(flotilla_protocol::arg::Arg::Literal("--take".to_string())),
+    }
+    command.push(flotilla_protocol::arg::Arg::Quoted(reference.to_string()));
+    command
 }
 
 fn transient_checkout_session_name(checkout: &CheckoutRow) -> String {

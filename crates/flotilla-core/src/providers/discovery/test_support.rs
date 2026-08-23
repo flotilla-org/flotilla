@@ -913,6 +913,7 @@ impl TerminalPool for FakeTerminalPool {
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         let flag = match mode {
             flotilla_protocol::commands::AttachMode::Default => "",
+            flotilla_protocol::commands::AttachMode::PreferTake => " --take",
             flotilla_protocol::commands::AttachMode::Strict => " --strict",
             flotilla_protocol::commands::AttachMode::Take => " --take",
         };

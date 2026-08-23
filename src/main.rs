@@ -137,11 +137,14 @@ enum SubCommand {
     Ls,
     /// Attach to a running convoy crew session
     Attach {
+        /// Observe without taking the controller seat from another client
+        #[arg(long, conflicts_with_all = ["strict", "take"])]
+        watch: bool,
         /// Refuse when another attachment holds the controller seat
-        #[arg(long, conflicts_with = "take")]
+        #[arg(long, conflicts_with_all = ["watch", "take"])]
         strict: bool,
         /// Take control and demote the current controller to watcher
-        #[arg(long, conflicts_with = "strict")]
+        #[arg(long, conflicts_with_all = ["watch", "strict"])]
         take: bool,
         /// Convoy, vessel, role, terminal session, or unique prefix
         reference: String,
@@ -577,8 +580,8 @@ async fn main() -> Result<()> {
         Some(SubCommand::Logs { host, since, level, target }) => run_logs(&cli, host.as_deref(), since, level, target).await,
         Some(SubCommand::Fleet) => run_fleet_health(&cli, format).await,
         Some(SubCommand::Ls) => run_fleet_list(&cli, format).await,
-        Some(SubCommand::Attach { reference, strict, take, transient, host }) => {
-            run_attach(&cli, &reference, attach_mode(strict, take), transient, host.as_deref(), format).await
+        Some(SubCommand::Attach { reference, watch, strict, take, transient, host }) => {
+            run_attach(&cli, &reference, attach_mode(watch, strict, take), transient, host.as_deref(), format).await
         }
         Some(SubCommand::ReplicaSnapshot) => run_replica_snapshot(&cli).await,
         Some(SubCommand::Hook { harness, event_type }) => run_hook(&cli, &harness, &event_type).await,
@@ -1148,12 +1151,13 @@ fn exit_command_error(message: String, format: OutputFormat) -> ! {
     std::process::exit(1);
 }
 
-fn attach_mode(strict: bool, take: bool) -> flotilla_protocol::commands::AttachMode {
-    match (strict, take) {
-        (true, false) => flotilla_protocol::commands::AttachMode::Strict,
-        (false, true) => flotilla_protocol::commands::AttachMode::Take,
-        (false, false) => flotilla_protocol::commands::AttachMode::Default,
-        (true, true) => unreachable!("clap rejects --strict with --take"),
+fn attach_mode(watch: bool, strict: bool, take: bool) -> flotilla_protocol::commands::AttachMode {
+    match (watch, strict, take) {
+        (true, false, false) => flotilla_protocol::commands::AttachMode::Default,
+        (false, true, false) => flotilla_protocol::commands::AttachMode::Strict,
+        (false, false, true) => flotilla_protocol::commands::AttachMode::Take,
+        (false, false, false) => flotilla_protocol::commands::AttachMode::PreferTake,
+        _ => unreachable!("clap rejects conflicting attach seat options"),
     }
 }
 
@@ -2073,7 +2077,7 @@ mod tests {
     };
 
     use super::{
-        client_dirs_from, confirm_command, daemon_paths_from, default_project_landing, format_human_resource_value,
+        attach_mode, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing, format_human_resource_value,
         host_daemon_socket_required, incompatible_daemon_reexec_failure, provisioning_target_for_environment, replace_host_ids,
         run_replica_snapshot, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
         should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, Cli, CliPaths, CommandValue, DaemonSubCommand,
@@ -2500,9 +2504,10 @@ mod tests {
         let cli = Cli::try_parse_from(["flotilla", "attach", "convoy-a/implement/coder"]).expect("attach cli should parse");
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Attach { reference, strict: false, take: false, transient: false, host: None })
+            Some(SubCommand::Attach { reference, watch: false, strict: false, take: false, transient: false, host: None })
                 if reference == "convoy-a/implement/coder"
         ));
+        assert_eq!(attach_mode(false, false, false), flotilla_protocol::commands::AttachMode::PreferTake);
     }
 
     #[test]
@@ -2511,16 +2516,25 @@ mod tests {
             Cli::try_parse_from(["flotilla", "attach", "--strict", "convoy-a/implement/coder"]).expect("strict attach cli should parse");
         assert!(matches!(
             strict.command,
-            Some(SubCommand::Attach { reference, strict: true, take: false, transient: false, host: None })
+            Some(SubCommand::Attach { reference, watch: false, strict: true, take: false, transient: false, host: None })
                 if reference == "convoy-a/implement/coder"
         ));
         let take = Cli::try_parse_from(["flotilla", "attach", "--take", "convoy-a/implement/coder"]).expect("take attach cli should parse");
         assert!(matches!(
             take.command,
-            Some(SubCommand::Attach { reference, strict: false, take: true, transient: false, host: None })
+            Some(SubCommand::Attach { reference, watch: false, strict: false, take: true, transient: false, host: None })
                 if reference == "convoy-a/implement/coder"
         ));
+        let watch =
+            Cli::try_parse_from(["flotilla", "attach", "--watch", "convoy-a/implement/coder"]).expect("watch attach cli should parse");
+        assert!(matches!(
+            watch.command,
+            Some(SubCommand::Attach { reference, watch: true, strict: false, take: false, transient: false, host: None })
+                if reference == "convoy-a/implement/coder"
+        ));
+        assert_eq!(attach_mode(true, false, false), flotilla_protocol::commands::AttachMode::Default);
         assert!(Cli::try_parse_from(["flotilla", "attach", "--strict", "--take", "convoy-a/implement/coder"]).is_err());
+        assert!(Cli::try_parse_from(["flotilla", "attach", "--watch", "--take", "convoy-a/implement/coder"]).is_err());
     }
 
     #[test]
@@ -2675,7 +2689,7 @@ mod tests {
             .expect("transient attach cli should parse");
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Attach { reference, strict: false, take: false, transient: true, host: Some(host) })
+            Some(SubCommand::Attach { reference, watch: false, strict: false, take: false, transient: true, host: Some(host) })
                 if reference == "terminal-scratch" && host == "feta"
         ));
     }
@@ -2686,7 +2700,7 @@ mod tests {
             .expect("host-qualified attach cli should parse");
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Attach { reference, strict: false, take: false, transient: false, host: Some(host) })
+            Some(SubCommand::Attach { reference, watch: false, strict: false, take: false, transient: false, host: Some(host) })
                 if reference == "terminal-scratch" && host == "feta"
         ));
     }

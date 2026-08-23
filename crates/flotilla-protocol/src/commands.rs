@@ -366,6 +366,8 @@ pub enum AttachMode {
     /// Request control, degrading to a read-only watcher when control is held.
     #[default]
     Default,
+    /// Take control when the terminal pool supports controller seats, otherwise attach normally.
+    PreferTake,
     /// Refuse when another attachment holds control.
     Strict,
     /// Take control and demote the current controller to watcher.

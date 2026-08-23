@@ -145,7 +145,7 @@ pub trait TerminalPool: Send + Sync {
     /// Verify that the resolved pool supports the requested seat semantics.
     async fn preflight_attach(&self, mode: AttachMode) -> Result<(), String> {
         match mode {
-            AttachMode::Default => Ok(()),
+            AttachMode::Default | AttachMode::PreferTake => Ok(()),
             AttachMode::Strict | AttachMode::Take => Err("terminal pool does not support controller-seat attach options".to_string()),
         }
     }
@@ -160,7 +160,7 @@ pub trait TerminalPool: Send + Sync {
         mode: AttachMode,
     ) -> Result<Vec<Arg>, String> {
         match mode {
-            AttachMode::Default => self.attach_args(session_name, command, cwd, env_vars),
+            AttachMode::Default | AttachMode::PreferTake => self.attach_args(session_name, command, cwd, env_vars),
             AttachMode::Strict | AttachMode::Take => Err("terminal pool does not support controller-seat attach options".to_string()),
         }
     }
