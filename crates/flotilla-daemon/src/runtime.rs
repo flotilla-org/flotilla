@@ -936,6 +936,15 @@ async fn reconcile_provisioned_environment(
         }
     }
 
+    if let Some(store) = &state.credential_store {
+        let credential_refs = credential_refs_from_environment(spec)?;
+        let credential_scopes = credential_scopes_from_environment(spec)?;
+        if let Err(error) = store.adopt_github_app_deliveries(env_id.as_str(), &credential_refs, &credential_scopes, handle.runner()).await
+        {
+            return fail_unavailable_environment(state, namespace, &env_id, &format!("credential delivery adoption failed: {error}")).await;
+        }
+    }
+
     if state.daemon.environment_registry_for_environment(&env_id).is_none() {
         let adoption = async {
             let (bag, registry) = probe_provisioned_environment(state, &env_id, &handle).await?;
@@ -1362,7 +1371,16 @@ fn spawn_heartbeat_task_with_credentials(
         async move {
             if let Some(store) = credential_store.as_ref().as_ref() {
                 for error in store.refresh_due_github_app_tokens().await {
-                    warn!(%error, "failed to refresh GitHub App credential delivery");
+                    warn!(error = %error.message, environment = %error.environment_ref, "failed to refresh GitHub App credential delivery");
+                    if let Err(status_error) = flotilla_resources::apply_status_patch(
+                        &daemon.resource_backend().using::<Environment>(&namespace),
+                        &error.environment_ref,
+                        &EnvironmentStatusPatch::MarkFailed { message: format!("GitHub App credential refresh failed: {}", error.message) },
+                    )
+                    .await
+                    {
+                        warn!(%status_error, environment = %error.environment_ref, "failed to surface credential refresh failure");
+                    }
                 }
             }
             if let Err(err) =
