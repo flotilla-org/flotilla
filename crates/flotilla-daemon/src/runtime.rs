@@ -9384,7 +9384,7 @@ mod tests {
         let [flotilla_protocol::ResolvedAttachAction::Command(args)] = attach.plan.0.as_slice() else {
             panic!("expected one local attach command, got {:?}", attach.plan);
         };
-        assert!(flotilla_protocol::arg::flatten(args, 0).contains(&format!("attach {}", revived_coder.metadata.name)));
+        assert!(flotilla_protocol::arg::flatten(args, 0).contains(&format!("attach --take {}", revived_coder.metadata.name)));
 
         let mut rx = daemon.subscribe();
         let coder_recomplete_id = daemon
