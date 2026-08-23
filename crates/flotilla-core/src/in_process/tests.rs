@@ -1832,7 +1832,10 @@ async fn default_remote_placement_routes_before_admission() {
             &test_meta("andamento-governor"),
             &CredentialGrantSpec::builder()
                 .selector(
-                    CredentialGrantSelector::builder().stance(Stance::Trusted).projects(BTreeSet::from(["andamento".to_string()])).build(),
+                    CredentialGrantSelector::builder()
+                        .stance(Stance::Contained)
+                        .projects(BTreeSet::from(["andamento".to_string()]))
+                        .build(),
                 )
                 .credentials(BTreeSet::from(["claude-max".to_string()]))
                 .build(),
@@ -1903,10 +1906,9 @@ async fn default_remote_placement_routes_before_admission() {
         .expect("replicate remote placement policy");
 
     let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("andamento".to_string()).build();
-    let (_, resolved_workflow) = daemon
+    let (_, mut resolved_workflow) = daemon
         .resolve_convoy_admission_workflow(
             "flotilla",
-            "andamento",
             &backend.definitions::<Project>("flotilla").get("andamento").await.expect("project").spec,
             &[],
             &intent,
@@ -1914,9 +1916,12 @@ async fn default_remote_placement_routes_before_admission() {
         )
         .await
         .expect("resolve admission workflow");
-    assert_eq!(resolved_workflow.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
     let placement =
         backend.including_replicas::<PlacementPolicy>("flotilla").get("docker-udder-id").await.expect("placement replica").object;
+    resolve_workflow_credentials(&backend, "flotilla", Some("andamento"), &[], Some(&placement), &mut resolved_workflow)
+        .await
+        .expect("resolve replicated credential grant");
+    assert_eq!(resolved_workflow.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
     validate_workflow_agent_adapters(&backend, "flotilla", &resolved_workflow, Some(&placement))
         .await
         .expect("placement should provide agent adapter");
@@ -1979,10 +1984,16 @@ async fn placement_decision_prefers_local_home_copy_over_same_name_replica() {
         .await
         .expect("replicate colliding policy");
 
-    let resolution =
-        default_convoy_placement_policy(&backend, "flotilla", &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(), None)
-            .await
-            .expect("resolve placement");
+    let resolution = default_convoy_placement_policy(
+        &backend,
+        "flotilla",
+        None,
+        &[],
+        &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        None,
+    )
+    .await
+    .expect("resolve placement");
     let selected = resolution.selected.expect("select local home policy");
 
     assert_eq!(placement_host_ref(&selected), Some("local-host"));
@@ -2065,7 +2076,7 @@ async fn default_placement_prefers_local_host_referenced_by_display_name() {
     placement_policy(&backend, "host-direct-z-local", "local-host").await;
 
     let local_host_id = flotilla_protocol::CanonicalHostId::resolved("local-host-id");
-    let resolution = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), Some(&local_host_id))
+    let resolution = default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted_codex_workflow(), Some(&local_host_id))
         .await
         .expect("default placement");
     assert_eq!(resolution.selected.expect("viable placement").metadata.name, "host-direct-z-local");
@@ -2088,7 +2099,7 @@ async fn default_placement_refuses_unknown_host_without_blocking_tool_workflow()
             .build()])
         .build();
 
-    let resolution = default_convoy_placement_policy(&backend, "flotilla", &workflow, None).await.expect("clean candidate");
+    let resolution = default_convoy_placement_policy(&backend, "flotilla", None, &[], &workflow, None).await.expect("clean candidate");
     assert_eq!(resolution.selected.expect("clean placement").metadata.name, "z-clean");
     assert_eq!(resolution.refused_candidates[0].policy_name, "a-unknown-host");
 }
@@ -2122,7 +2133,7 @@ async fn default_placement_error_lists_each_refusal_and_failed_host_condition_re
             .expect("degraded host status");
     }
 
-    let error = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), None)
+    let error = default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted_codex_workflow(), None)
         .await
         .expect_err("all placement candidates should be refused");
 
@@ -2160,7 +2171,7 @@ async fn default_placement_accepts_a_host_with_an_authorship_collision() {
         .await
         .expect("host status with advisory collision");
 
-    let resolution = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), None)
+    let resolution = default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted_codex_workflow(), None)
         .await
         .expect("standing authorship collisions must not freeze dispatch placement");
 
@@ -2308,7 +2319,7 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
         .build();
 
     let mut without_grant = workflow.clone();
-    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut without_grant)
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], None, &mut without_grant)
         .await
         .expect("resolve default-deny grants");
     let error = validate_workflow_credentials(&backend, "flotilla", &without_grant, None)
@@ -2334,7 +2345,7 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
         .await
         .expect("create project-selected Claude grant");
     let mut with_grant = workflow;
-    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut with_grant)
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], None, &mut with_grant)
         .await
         .expect("resolve matching Claude grant");
     assert_eq!(with_grant.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
@@ -2344,6 +2355,51 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
     validate_workflow_credentials(&backend, "flotilla", &with_grant, Some(&placement))
         .await
         .expect("matching held OAuth grant admits contained Claude");
+}
+
+#[tokio::test]
+async fn docker_placement_selects_credentials_for_the_effective_contained_stance() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    backend
+        .clone()
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&test_meta("github-crew-pr"), &CredentialSpecSpec {
+            consumer: CredentialConsumer::Gh,
+            source: CredentialSource::Env { name: "GITHUB_TOKEN".to_string() },
+            lifecycle: CredentialLifecycle::Static,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("create GitHub credential declaration");
+    backend
+        .clone()
+        .definitions::<CredentialGrant>("flotilla")
+        .create(
+            &test_meta("github-contained"),
+            &CredentialGrantSpec::builder()
+                .selector(
+                    CredentialGrantSelector::builder().stance(Stance::Contained).projects(BTreeSet::from(["flotilla".to_string()])).build(),
+                )
+                .credentials(BTreeSet::from(["github-crew-pr".to_string()]))
+                .build(),
+        )
+        .await
+        .expect("create contained GitHub grant");
+    create_docker_placement(&backend, "docker-crew", "host-a", BTreeSet::from(["github-crew-pr".to_string()])).await;
+    let placement = backend.using::<PlacementPolicy>("flotilla").get("docker-crew").await.expect("get Docker placement");
+    let mut workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder().name("work".to_string()).stance(Stance::Trusted).crew(Vec::new()).build()])
+        .build();
+
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], Some(&placement), &mut workflow)
+        .await
+        .expect("resolve credentials against effective stance");
+
+    assert_eq!(workflow.vessels[0].stance, Stance::Trusted, "requested stance remains part of the workflow contract");
+    assert_eq!(workflow.vessels[0].credential_refs, BTreeSet::from(["github-crew-pr".to_string()]));
+    validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect("contained grant held by the placement admits dispatch");
 }
 
 #[tokio::test]
@@ -2449,7 +2505,7 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
         .build();
 
     let mut without_grant = workflow.clone();
-    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut without_grant)
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], None, &mut without_grant)
         .await
         .expect("resolve default-deny grants");
     let error = validate_workflow_credentials(&backend, "flotilla", &without_grant, None)
@@ -2472,7 +2528,7 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
         .await
         .expect("create project-selected trusted Claude grant");
     let mut with_grant = workflow;
-    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut with_grant)
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], None, &mut with_grant)
         .await
         .expect("resolve matching trusted Claude grant");
     assert_eq!(with_grant.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
