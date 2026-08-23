@@ -295,10 +295,10 @@ pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
         .build()
 }
 
-/// Interim default while contained crews lack credential seeding
-/// (flotilla-org/flotilla#1140): the single-agent coding workflow with a
-/// trusted stance. Retire in favour of `single-agent-contained` once the
-/// contained smoke passes with credentials.
+/// Single-agent coding workflow with explicit trusted host access.
+///
+/// This remains available for operators to select explicitly; ordinary
+/// project dispatch defaults to `single-agent-contained`.
 pub fn single_agent_trusted_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
         .exit(ExitDeclaration::standard_table())

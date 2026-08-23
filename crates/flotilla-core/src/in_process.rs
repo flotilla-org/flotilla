@@ -3691,7 +3691,7 @@ async fn ensure_repository_and_default_project_workflow(
 fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: String) -> Result<ProjectSpec, String> {
     normalize_project_spec(ProjectSpec {
         display_name,
-        default_workflow_ref: "single-agent-trusted".to_string(),
+        default_workflow_ref: "single-agent-contained".to_string(),
         issue_source: None,
         repositories: vec![ProjectRepositorySpec {
             repo: repository_key,
@@ -5744,7 +5744,7 @@ impl InProcessDaemon {
         }
         let spec = normalize_project_spec(ProjectSpec {
             display_name: declaration.name.clone(),
-            default_workflow_ref: "single-agent-trusted".to_string(),
+            default_workflow_ref: "single-agent-contained".to_string(),
             issue_source: None,
             repositories: members,
             dispatch_policy: existing_project.as_ref().and_then(|project| project.spec.dispatch_policy.clone()),
