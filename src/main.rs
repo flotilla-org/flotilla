@@ -1155,7 +1155,8 @@ fn attach_mode(watch: bool, strict: bool, take: bool) -> flotilla_protocol::comm
     match (watch, strict, take) {
         (true, false, false) => flotilla_protocol::commands::AttachMode::Default,
         (false, true, false) => flotilla_protocol::commands::AttachMode::Strict,
-        (false, false, _) => flotilla_protocol::commands::AttachMode::Take,
+        (false, false, true) => flotilla_protocol::commands::AttachMode::Take,
+        (false, false, false) => flotilla_protocol::commands::AttachMode::PreferTake,
         _ => unreachable!("clap rejects conflicting attach seat options"),
     }
 }
@@ -2506,7 +2507,7 @@ mod tests {
             Some(SubCommand::Attach { reference, watch: false, strict: false, take: false, transient: false, host: None })
                 if reference == "convoy-a/implement/coder"
         ));
-        assert_eq!(attach_mode(false, false, false), flotilla_protocol::commands::AttachMode::Take);
+        assert_eq!(attach_mode(false, false, false), flotilla_protocol::commands::AttachMode::PreferTake);
     }
 
     #[test]

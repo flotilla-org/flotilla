@@ -48,6 +48,16 @@ fn completed_claims_without_a_decision_ledger_are_flagged_not_hidden() {
     }));
 }
 
+#[test]
+fn recursive_attach_preserves_take_preference_and_explicit_watch() {
+    let host = HostName::new("udder");
+    let take = flotilla_protocol::arg::flatten(&recursive_attach_command(&host, "crew-session", AttachMode::PreferTake), 0);
+    let watch = flotilla_protocol::arg::flatten(&recursive_attach_command(&host, "crew-session", AttachMode::Default), 0);
+
+    assert_eq!(take, "flotilla attach --host 'udder' --transient 'crew-session'");
+    assert_eq!(watch, "flotilla attach --host 'udder' --transient --watch 'crew-session'");
+}
+
 fn test_meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
 }

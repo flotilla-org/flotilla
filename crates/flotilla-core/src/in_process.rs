@@ -8733,19 +8733,7 @@ impl InProcessDaemon {
         }
 
         let resolver = ssh_resolver_from_config(self.config.base_path())?;
-        let mut command =
-            vec![flotilla_protocol::arg::Arg::Literal("flotilla".to_string()), flotilla_protocol::arg::Arg::Literal("attach".to_string())];
-        command.push(flotilla_protocol::arg::Arg::Literal("--host".to_string()));
-        command.push(flotilla_protocol::arg::Arg::Quoted(target_host.to_string()));
-        // Recursive attaches only traverse transport boundaries; Presentation
-        // Manager identity belongs to the original foreground attach.
-        command.push(flotilla_protocol::arg::Arg::Literal("--transient".to_string()));
-        match seat {
-            AttachMode::Default => {}
-            AttachMode::Strict => command.push(flotilla_protocol::arg::Arg::Literal("--strict".to_string())),
-            AttachMode::Take => command.push(flotilla_protocol::arg::Arg::Literal("--take".to_string())),
-        }
-        command.push(flotilla_protocol::arg::Arg::Quoted(reference.to_string()));
+        let command = recursive_attach_command(target_host, reference, seat);
         resolver
             .one_hop_command_args(&next_hop, command)
             .map(ResolvedAttachPlan::command)
@@ -10101,6 +10089,24 @@ impl InProcessDaemon {
 
         Ok(id)
     }
+}
+
+fn recursive_attach_command(target_host: &HostName, reference: &str, seat: AttachMode) -> Vec<flotilla_protocol::arg::Arg> {
+    let mut command =
+        vec![flotilla_protocol::arg::Arg::Literal("flotilla".to_string()), flotilla_protocol::arg::Arg::Literal("attach".to_string())];
+    command.push(flotilla_protocol::arg::Arg::Literal("--host".to_string()));
+    command.push(flotilla_protocol::arg::Arg::Quoted(target_host.to_string()));
+    // Recursive attaches only traverse transport boundaries; Presentation
+    // Manager identity belongs to the original foreground attach.
+    command.push(flotilla_protocol::arg::Arg::Literal("--transient".to_string()));
+    match seat {
+        AttachMode::Default => command.push(flotilla_protocol::arg::Arg::Literal("--watch".to_string())),
+        AttachMode::PreferTake => {}
+        AttachMode::Strict => command.push(flotilla_protocol::arg::Arg::Literal("--strict".to_string())),
+        AttachMode::Take => command.push(flotilla_protocol::arg::Arg::Literal("--take".to_string())),
+    }
+    command.push(flotilla_protocol::arg::Arg::Quoted(reference.to_string()));
+    command
 }
 
 fn transient_checkout_session_name(checkout: &CheckoutRow) -> String {

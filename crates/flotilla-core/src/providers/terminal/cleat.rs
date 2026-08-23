@@ -62,6 +62,7 @@ impl CleatTerminalPool {
         let mut args = vec![Arg::Literal(self.binary.clone()), Arg::Literal("attach".into()), Arg::Literal("--no-create".into())];
         match mode {
             AttachMode::Default => {}
+            AttachMode::PreferTake => args.push(Arg::Literal("--take".into())),
             AttachMode::Strict => args.push(Arg::Literal("--strict".into())),
             AttachMode::Take => args.push(Arg::Literal("--take".into())),
         }
@@ -174,10 +175,7 @@ impl TerminalPool for CleatTerminalPool {
         Ok(self.build_attach_args(session_name, AttachMode::Default))
     }
 
-    async fn preflight_attach(&self, mode: AttachMode) -> Result<(), String> {
-        if mode == AttachMode::Default {
-            return Ok(());
-        }
+    async fn preflight_attach(&self, _mode: AttachMode) -> Result<(), String> {
         // These flags arrived with cleat's controller-seat handshake, default
         // degrade-to-watch behavior, and watcher banner. Check before starting
         // the interactive attach so a stale selected pool fails on the primary screen.
@@ -190,7 +188,7 @@ impl TerminalPool for CleatTerminalPool {
                 let version = run!(self.runner, &self.binary, &["--version"], Path::new("/"))
                     .unwrap_or_else(|error| format!("version unavailable: {error}"));
                 Err(format!(
-                    "stale cleat binary '{}' in the selected environment lacks controller-seat attach support (--strict/--take); detected {}. If this is a crew container, rebuild its crew image with the current cleat",
+                    "cleat terminal pool binary '{}' lacks controller-seat attach support (--strict/--take); detected {}",
                     self.binary,
                     version.trim()
                 ))
@@ -479,7 +477,7 @@ mod tests {
     fn human_take_attach_adds_take_while_watch_omits_it() {
         let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
         let take = pool
-            .attach_args_for_mode("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachMode::Take)
+            .attach_args_for_mode("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachMode::PreferTake)
             .expect("take attach args");
         let watch = pool
             .attach_args_for_mode("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachMode::Default)
@@ -494,8 +492,8 @@ mod tests {
         let runner = Arc::new(MockRunner::new(vec![Ok("Options:\n  --strict\n  --take\n".into())]));
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "/pool/bin/cleat");
 
-        pool.preflight_attach(AttachMode::Take).await.expect("modern cleat should pass preflight");
-        pool.preflight_attach(AttachMode::Strict).await.expect("capability result should be cached");
+        pool.preflight_attach(AttachMode::Default).await.expect("modern cleat should pass preflight");
+        pool.preflight_attach(AttachMode::Take).await.expect("capability result should be cached");
 
         assert_eq!(runner.calls(), [("/pool/bin/cleat".to_string(), vec!["attach".to_string(), "--help".to_string()])]);
     }
@@ -505,12 +503,11 @@ mod tests {
         let runner = Arc::new(MockRunner::new(vec![Ok("Options:\n  --no-create\n".into()), Ok("cleat 0.5.0".into())]));
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "/pool/bin/cleat");
 
-        let error = pool.preflight_attach(AttachMode::Take).await.expect_err("stale cleat should fail preflight");
+        let error = pool.preflight_attach(AttachMode::Default).await.expect_err("stale cleat should fail preflight");
 
         assert!(error.contains("/pool/bin/cleat"), "{error}");
         assert!(error.contains("cleat 0.5.0"), "{error}");
         assert!(error.contains("--strict/--take"), "{error}");
-        assert!(error.contains("rebuild its crew image"), "{error}");
     }
 
     #[tokio::test]
@@ -522,8 +519,8 @@ mod tests {
         ]));
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "/pool/bin/cleat");
 
-        pool.preflight_attach(AttachMode::Take).await.expect_err("stale cleat should fail preflight");
-        pool.preflight_attach(AttachMode::Take).await.expect("upgraded cleat should pass without restarting the daemon");
+        pool.preflight_attach(AttachMode::Default).await.expect_err("stale cleat should fail preflight");
+        pool.preflight_attach(AttachMode::Default).await.expect("upgraded cleat should pass without restarting the daemon");
 
         assert_eq!(runner.calls().len(), 3, "failed capability probes must not be cached");
     }
