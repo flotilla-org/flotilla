@@ -196,7 +196,7 @@ impl ResourceManifestReconciler {
             clear_manifest_state(&mut document)?;
             self.apply_manifest_document(document).await.map_err(|error| format!("{identity}: {error}"))?;
             self.clear_warnings(&identity);
-            report.unchanged += 1;
+            report.updated += 1;
             return Ok(());
         }
 
@@ -684,7 +684,7 @@ mod tests {
         let object = resolver.get("convergent").await.expect("policy");
         let digest = resource_document_spec_hash(&serde_json::to_value(object.to_k8s_object()).expect("document")).expect("digest");
 
-        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.updated, 1);
         assert_eq!(report.drifted, 0);
         assert_eq!(report.unmanaged, 0);
         assert_eq!(object.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(MANIFEST_MANAGED_BY_VALUE));
@@ -706,6 +706,36 @@ mod tests {
         assert_eq!(next.unchanged, 1);
         assert_eq!(next.drifted, 0);
         assert_eq!(object.metadata.annotations.get(LAST_APPLIED_HASH_ANNOTATION), Some(&digest));
+    }
+
+    #[tokio::test]
+    async fn suspended_object_is_untouched_and_resumes_after_unsuspension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("policy.yaml");
+        write(&path, &manifest("suspended", "manifest"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
+        reconciler.reconcile_once().await.expect("creation");
+        let applied = resolver.get("suspended").await.expect("policy");
+        let mut meta = InputMeta::from(&applied.metadata);
+        meta.annotations.insert(MANIFEST_SUSPEND_ANNOTATION.to_string(), "true".to_string());
+        resolver
+            .update(&meta, &applied.metadata.resource_version, &PlacementPolicySpec::builder().pool("hotfix".to_string()).build())
+            .await
+            .expect("suspend and hotfix");
+
+        write(&path, &manifest("suspended", "new-manifest"));
+        assert_eq!(reconciler.reconcile_once().await.expect("suspended pass").unchanged, 1);
+        let suspended = resolver.get("suspended").await.expect("suspended policy");
+        assert_eq!(suspended.spec.pool, "hotfix");
+
+        let mut meta = InputMeta::from(&suspended.metadata);
+        meta.annotations.remove(MANIFEST_SUSPEND_ANNOTATION);
+        meta.annotations.insert(MANIFEST_RESOLUTION_ANNOTATION.to_string(), "sync".to_string());
+        resolver.update(&meta, &suspended.metadata.resource_version, &suspended.spec).await.expect("resume with sync");
+        assert_eq!(reconciler.reconcile_once().await.expect("resumed pass").updated, 1);
+        assert_eq!(resolver.get("suspended").await.expect("resumed policy").spec.pool, "new-manifest");
     }
 
     #[tokio::test]
