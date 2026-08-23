@@ -191,10 +191,12 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
             let failed = archives.iter().filter(|archive| archive.status == flotilla_protocol::CheckoutArchiveStatus::Failed).count();
             let archived = archives.iter().filter(|archive| archive.status == flotilla_protocol::CheckoutArchiveStatus::Archived).count();
             info!(%name, %archived, %failed, "convoy abandoned");
-            app.set_status_message(Some(format!(
-                "Convoy abandoned: {name} ({failed} archive warning{})",
-                if failed == 1 { "" } else { "s" }
-            )));
+            let warning = match failed {
+                0 => String::new(),
+                1 => " (1 archive warning)".to_string(),
+                count => format!(" ({count} archive warnings)"),
+            };
+            app.set_status_message(Some(format!("Convoy abandoned: {name}{warning}")));
         }
         CommandValue::ConvoyStarted { name, attach_plan, .. } => {
             info!(%name, "convoy started");

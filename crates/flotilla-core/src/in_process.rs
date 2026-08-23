@@ -7722,7 +7722,10 @@ impl InProcessDaemon {
             let Some(path) = checkout_path(&checkout) else {
                 continue;
             };
-            if checkout.status.as_ref().is_some_and(|status| condition_is_true(&status.integration.pushed)) {
+            if checkout.status.as_ref().is_some_and(|status| {
+                condition_is_true(&status.integration.pushed)
+                    && integration_condition_is_fresh(&status.integration.pushed, self.clock.now())
+            }) {
                 outcomes.push(
                     CheckoutArchiveOutcome::builder()
                         .checkout(checkout.metadata.name)
