@@ -53,8 +53,8 @@ use flotilla_resources::{
     HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
     IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
     PendingBrief, PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation, Project, ProjectRepositoryRole,
-    ProjectRepositorySpec, ProjectSpec, ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend,
-    ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief,
+    ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch, ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource,
+    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief,
     TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch,
     TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
@@ -2979,7 +2979,7 @@ impl InProcessDaemon {
             .await
             .map(|source| source.object)
             .map_err(|error| project_not_ready_error(&project_namespace, &project_ref, error))?;
-        let repositories = self.snapshot_project_repositories(&project_namespace, &project_ref).await?;
+        let repositories = self.snapshot_project_repositories(&project_namespace, &project_ref, None).await?;
         let (_, workflow) =
             self.resolve_convoy_admission_workflow(&project_namespace, &project_ref, &project.spec, &repositories, intent, None).await?;
         let placement = self.resolve_and_validate_convoy_placement(&project_namespace, &workflow, None).await?;
@@ -4385,7 +4385,7 @@ impl InProcessDaemon {
             .await
             .map(|project| project.object)
             .map_err(|error| project_not_ready_error(namespace, project_ref, error))?;
-        let mut repositories_snapshot = self.snapshot_project_repositories(namespace, project_ref).await?;
+        let mut repositories_snapshot = self.snapshot_project_repositories(namespace, project_ref, repositories).await?;
         if let Some(selected) = repositories {
             let available = repositories_snapshot.iter().map(|repository| &repository.repo_ref).collect::<BTreeSet<_>>();
             if let Some(missing) = selected.iter().find(|repository| !available.contains(repository)) {
@@ -5438,7 +5438,12 @@ impl InProcessDaemon {
         }
     }
 
-    async fn snapshot_project_repositories(&self, namespace: &str, project_ref: &str) -> Result<Vec<ConvoyRepositorySpec>, String> {
+    async fn snapshot_project_repositories(
+        &self,
+        namespace: &str,
+        project_ref: &str,
+        selected: Option<&[RepositoryKey]>,
+    ) -> Result<Vec<ConvoyRepositorySpec>, String> {
         let project = self
             .resource_backend
             .clone()
@@ -5451,7 +5456,10 @@ impl InProcessDaemon {
         let mut unresolved = Vec::new();
         let mut snapshots = BTreeMap::<RepositoryKey, (String, RepositorySpec, Option<String>, BTreeSet<String>)>::new();
         for entry in &project.spec.repositories {
-            if !entry.roles.is_empty() && !entry.roles.contains(&ProjectRepositoryRole::Code) {
+            if !entry.roles.is_empty()
+                && !entry.roles.contains(&ProjectRepositoryRole::Code)
+                && selected.is_none_or(|selected| !selected.contains(&entry.repo))
+            {
                 continue;
             }
             match repositories.get(&entry.repo.to_string()).await {
@@ -5575,7 +5583,7 @@ impl InProcessDaemon {
         Ok((name, project.spec.repositories.len()))
     }
 
-    async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>), String> {
+    async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
         validate_project_name(name)?;
         let namespace = self.provisioning_namespace().await;
         let project =
@@ -5594,7 +5602,7 @@ impl InProcessDaemon {
                 declaration.name
             ));
         }
-        let changes = self.materialize_project_declaration(declaration, inspection).await?;
+        let (changes, operational_entries) = self.materialize_project_declaration(declaration, inspection).await?;
         let members = self
             .resource_backend
             .clone()
@@ -5605,14 +5613,14 @@ impl InProcessDaemon {
             .spec
             .repositories
             .len();
-        Ok((members, !changes.is_empty(), changes))
+        Ok((members, !changes.is_empty(), changes, operational_entries))
     }
 
     async fn materialize_project_declaration(
         &self,
         declaration: ProjectDeclaration,
         inspection: ProjectDeclarationInspection,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<(Vec<String>, Vec<String>), String> {
         validate_project_name(&declaration.name)?;
         let namespace = self.provisioning_namespace().await;
         let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
@@ -5629,7 +5637,7 @@ impl InProcessDaemon {
         };
         if existing_project.is_some() && !locally_homed {
             debug!(project = %declaration.name, "skipping project materialization away from its home");
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let aliases = existing_project
             .as_ref()
@@ -5701,15 +5709,23 @@ impl InProcessDaemon {
             existing_project.as_ref().is_none_or(|project| project.spec != spec || project.metadata.annotations != meta.annotations);
         projects.apply(&meta, &spec).await.map_err(|error| error.to_string())?;
         let mut changes = if converged { vec![format!("Project/{}", declaration.name)] } else { Vec::new() };
-        changes.extend(self.materialize_project_operational_entries(&declaration.name, &bootstrap_inspection).await?);
-        Ok(changes)
+        let (operational_changes, operational_entries) =
+            match self.materialize_project_operational_entries(&declaration.name, &bootstrap_inspection).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.patch_project_operational_entries(&namespace, &declaration.name, false, &error).await?;
+                    return Err(format!("operational entry refused: {error}"));
+                }
+            };
+        changes.extend(operational_changes);
+        Ok((changes, operational_entries))
     }
 
     async fn materialize_project_operational_entries(
         &self,
         project_name: &str,
         bootstrap: &ProjectDeclarationInspection,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<(Vec<String>, Vec<String>), String> {
         let namespace = self.provisioning_namespace().await;
         let project =
             self.resource_backend.clone().definitions::<Project>(&namespace).get(project_name).await.map_err(|e| e.to_string())?;
@@ -5779,13 +5795,16 @@ impl InProcessDaemon {
         // unavailable source: that could erase definitions materialized by a
         // previous refresh on a host that had the checkout.
         if unavailable_source {
-            return Ok(Vec::new());
+            let message = "operational entries refused: an ops member has no local checkout on this host".to_string();
+            self.patch_project_operational_entries(&namespace, project_name, false, &message).await?;
+            return Ok((Vec::new(), vec![message]));
         }
 
         let mut workflows = BTreeMap::new();
         let mut ensures = BTreeMap::new();
         let mut commands = BTreeMap::<RepositoryKey, BTreeMap<String, String>>::new();
         let mut command_provenance = BTreeMap::<RepositoryKey, Vec<serde_json::Value>>::new();
+        let mut outcomes = Vec::new();
         for source in sources {
             self.collect_operational_entries(
                 project_name,
@@ -5796,6 +5815,7 @@ impl InProcessDaemon {
                 &mut ensures,
                 &mut commands,
                 &mut command_provenance,
+                &mut outcomes,
             )?;
         }
 
@@ -5936,7 +5956,25 @@ impl InProcessDaemon {
             changes.push(format!("Repository/{} verification commands", stale.metadata.name));
         }
         changes.sort();
-        Ok(changes)
+        self.patch_project_operational_entries(&namespace, project_name, true, &outcomes.join("; ")).await?;
+        Ok((changes, outcomes))
+    }
+
+    async fn patch_project_operational_entries(
+        &self,
+        namespace: &str,
+        project_name: &str,
+        ready: bool,
+        message: &str,
+    ) -> Result<(), String> {
+        apply_resource_status_patch(
+            &self.resource_backend.clone().using::<Project>(namespace),
+            project_name,
+            &ProjectStatusPatch::ReplaceOperationalEntries { ready, message: message.to_string() },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5950,14 +5988,14 @@ impl InProcessDaemon {
         ensures: &mut BTreeMap<String, (InputMeta, ConvoyEnsureSpec)>,
         commands: &mut BTreeMap<RepositoryKey, BTreeMap<String, String>>,
         command_provenance: &mut BTreeMap<RepositoryKey, Vec<serde_json::Value>>,
+        outcomes: &mut Vec<String>,
     ) -> Result<(), String> {
         let source_repository = source.repository.key();
         for file in source.files {
             let Some(entry) = parse_operational_entry(&file.contents).map_err(|error| format!("{}: {error}", file.path))? else {
                 continue;
             };
-            let requires_code_role =
-                matches!(&entry.definition, OperationalEntryDefinition::VerificationCommand { .. } | OperationalEntryDefinition::Ensure(_));
+            let requires_code_role = matches!(&entry.definition, OperationalEntryDefinition::VerificationCommand { .. });
             let targets = match entry.repos {
                 Some(repo_aliases) => repo_aliases
                     .into_iter()
@@ -5987,6 +6025,7 @@ impl InProcessDaemon {
             });
             match entry.definition {
                 OperationalEntryDefinition::WorkflowTemplate(mut spec) => {
+                    outcomes.push(format!("{}: WorkflowTemplate/{} accepted", file.path, entry.name));
                     for vessel in &mut spec.vessels {
                         vessel.repository_refs = Some(targets.clone());
                     }
@@ -6008,6 +6047,7 @@ impl InProcessDaemon {
                     }
                 }
                 OperationalEntryDefinition::VerificationCommand { command } => {
+                    outcomes.push(format!("{}: verification command `{}` accepted", file.path, entry.name));
                     for target in targets {
                         if commands.entry(target.clone()).or_default().insert(entry.name.clone(), command.clone()).is_some() {
                             return Err(format!("duplicate verification command `{}` for repository {target}", entry.name));
@@ -6018,6 +6058,7 @@ impl InProcessDaemon {
                 OperationalEntryDefinition::Ensure(ensure) => {
                     let role = entry.name;
                     let ensure_name = convoy_ensure_name(project_name, &role);
+                    outcomes.push(format!("{}: ConvoyEnsure/{} accepted", file.path, ensure_name));
                     let mut meta = InputMeta::builder()
                         .name(ensure_name.clone())
                         .annotations(BTreeMap::from([
@@ -9374,7 +9415,7 @@ impl InProcessDaemon {
                 }
             };
             let project_repositories = if let Some(project_ref) = project_ref {
-                match self.snapshot_project_repositories(&namespace, project_ref).await {
+                match self.snapshot_project_repositories(&namespace, project_ref, None).await {
                     Ok(repositories) => Some(repositories),
                     Err(message) => {
                         let _ = self.event_tx.send(DaemonEvent::CommandFinished {
@@ -9791,7 +9832,9 @@ impl InProcessDaemon {
                 description: command.description().to_string(),
             });
             let result = match self.project_refresh(name).await {
-                Ok((members, converged, changes)) => CommandValue::ProjectRefreshed { name: name.clone(), members, converged, changes },
+                Ok((members, converged, changes, operational_entries)) => {
+                    CommandValue::ProjectRefreshed { name: name.clone(), members, converged, changes, operational_entries }
+                }
                 Err(message) => CommandValue::Error { message },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {

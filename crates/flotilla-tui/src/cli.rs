@@ -775,9 +775,10 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::ProjectAdded { name } => format!("project added: {name}"),
         CommandValue::ProjectApplied { name } => format!("project applied: {name}"),
         CommandValue::ProjectRegistered { name, members } => format!("project registered: {name} ({members} members)"),
-        CommandValue::ProjectRefreshed { name, members, converged, changes } => {
+        CommandValue::ProjectRefreshed { name, members, converged, changes, operational_entries } => {
             let outcome = if *converged { format!("changed: {}", changes.join(", ")) } else { "already current".to_string() };
-            format!("project refreshed: {name} ({members} members, {outcome})")
+            let entries = if operational_entries.is_empty() { String::new() } else { format!("\n{}", operational_entries.join("\n")) };
+            format!("project refreshed: {name} ({members} members, {outcome}){entries}")
         }
     }
 }

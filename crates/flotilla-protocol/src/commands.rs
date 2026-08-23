@@ -965,6 +965,8 @@ pub enum CommandValue {
         converged: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         changes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        operational_entries: Vec<String>,
     },
 }
 
