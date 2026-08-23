@@ -684,10 +684,15 @@ impl ReconcilerWake {
 }
 
 fn same_standing_row(left: &LeafSubscriptionRow, right: &LeafSubscriptionRow) -> bool {
+    let same_freshness = left.freshness_demand == right.freshness_demand
+        || (matches!(left.watcher, LeafWatcher::ReconcilerWake { .. })
+            && matches!(right.watcher, LeafWatcher::ReconcilerWake { .. })
+            && left.freshness_demand.is_some()
+            && right.freshness_demand.is_some());
     left.namespace == right.namespace
         && left.leaves == right.leaves
         && left.watcher == right.watcher
-        && left.freshness_demand == right.freshness_demand
+        && same_freshness
         && left.episode_key == right.episode_key
 }
 
@@ -785,6 +790,24 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn reconciler_row_identity_ignores_regenerated_freshness_instant() {
+        let row = |freshness_demand| LeafSubscriptionRow {
+            id: uuid::Uuid::nil(),
+            namespace: "flotilla".to_string(),
+            leaves: vec!["cr/github.com/flotilla-org/flotilla/1699 .state == merged".parse().expect("leaf")],
+            watcher: LeafWatcher::ReconcilerWake { convoy: "landing".to_string() },
+            freshness_demand: Some(freshness_demand),
+            created_at: freshness_demand,
+            episode_key: EpisodeKeyFields::default(),
+        };
+
+        assert!(same_standing_row(
+            &row("2026-08-23T14:00:00Z".parse().expect("first instant")),
+            &row("2026-08-23T14:01:00Z".parse().expect("second instant")),
+        ));
+    }
 
     struct UnavailableChangeRequests;
 

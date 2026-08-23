@@ -9041,21 +9041,20 @@ impl InProcessDaemon {
         }
         let change_request_objects =
             selected_change_requests.iter().map(|(name, source)| (name.clone(), source.object.clone())).collect::<BTreeMap<_, _>>();
-        let expected_change_requests = expected_change_request_leaves(&convoy, &selected_checkouts)
-            .map_err(|error| format!("derive expected change requests: {error}"))?
-            .into_iter()
-            .filter_map(|leaf| match leaf.address {
+        let expected_change_request_leaves = expected_change_request_leaves(&convoy, &selected_checkouts)
+            .map_err(|error| format!("derive expected change requests: {error}"))?;
+        let expected_change_requests = expected_change_request_leaves
+            .iter()
+            .filter_map(|leaf| match &leaf.address {
                 flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } => {
-                    Some(flotilla_resources::change_request_record_name(&service, &scope, number))
+                    Some(flotilla_resources::change_request_record_name(service, scope, *number))
                 }
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
         let bound_name = bound_change_request_record_name(&convoy).map_err(|error| format!("derive bound change request: {error}"))?;
         let mut observation_errors = BTreeMap::new();
-        for leaf in expected_change_request_leaves(&convoy, &selected_checkouts)
-            .map_err(|error| format!("derive expected change requests: {error}"))?
-        {
+        for leaf in expected_change_request_leaves {
             if let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = leaf.address {
                 let subject = crate::change_request_observer::ChangeRequestRef { namespace: namespace.clone(), service, scope, number };
                 if let Some(error) = self.leaf_subscriptions.change_request_observation_error(&subject).await {
