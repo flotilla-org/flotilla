@@ -161,6 +161,22 @@ pub enum EvidenceFreshness {
     Missing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckoutArchiveStatus {
+    Archived,
+    NothingToArchive,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CheckoutArchiveOutcome {
+    pub checkout: String,
+    pub status: CheckoutArchiveStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainedCondition {
     pub value: String,
@@ -943,6 +959,10 @@ pub enum CommandValue {
     ConvoyCreated {
         name: String,
     },
+    ConvoyAbandoned {
+        name: String,
+        archives: Vec<CheckoutArchiveOutcome>,
+    },
     ConvoyStarted {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1512,6 +1532,13 @@ mod tests {
             CommandValue::IssuePage(crate::issue_query::IssueResultPage { items: vec![], total: Some(10), has_more: true }),
             CommandValue::IssuesByIds { items: vec![] },
             CommandValue::ConvoyCreated { name: "my-convoy".into() },
+            CommandValue::ConvoyAbandoned {
+                name: "my-convoy".into(),
+                archives: vec![CheckoutArchiveOutcome::builder()
+                    .checkout("work".to_string())
+                    .status(CheckoutArchiveStatus::NothingToArchive)
+                    .build()],
+            },
             CommandValue::WorkflowTemplateApplied { name: "scratch".into() },
             CommandValue::ProjectAdded { name: "my-project".into() },
             CommandValue::ProjectApplied { name: "my-project".into() },

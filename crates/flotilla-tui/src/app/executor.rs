@@ -187,6 +187,15 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
             info!(%name, "convoy created");
             app.set_status_message(Some(format!("Convoy created: {name}")));
         }
+        CommandValue::ConvoyAbandoned { name, archives } => {
+            let failed = archives.iter().filter(|archive| archive.status == flotilla_protocol::CheckoutArchiveStatus::Failed).count();
+            let archived = archives.iter().filter(|archive| archive.status == flotilla_protocol::CheckoutArchiveStatus::Archived).count();
+            info!(%name, %archived, %failed, "convoy abandoned");
+            app.set_status_message(Some(format!(
+                "Convoy abandoned: {name} ({failed} archive warning{})",
+                if failed == 1 { "" } else { "s" }
+            )));
+        }
         CommandValue::ConvoyStarted { name, attach_plan, .. } => {
             info!(%name, "convoy started");
             app.set_status_message(Some(format!("Convoy started: {name}")));

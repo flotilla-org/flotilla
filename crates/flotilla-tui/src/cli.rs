@@ -771,6 +771,21 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::IssuePage(page) => format!("issue page: {} items, has_more={}", page.items.len(), page.has_more),
         CommandValue::IssuesByIds { items } => format!("issues by ids: {} items", items.len()),
         CommandValue::ConvoyCreated { name } => format!("convoy created: {name}"),
+        CommandValue::ConvoyAbandoned { name, archives } => {
+            let mut output = format!("convoy abandoned: {name}");
+            for archive in archives {
+                let result = match archive.status {
+                    flotilla_protocol::CheckoutArchiveStatus::Archived => "archived".to_string(),
+                    flotilla_protocol::CheckoutArchiveStatus::NothingToArchive => "nothing to archive".to_string(),
+                    flotilla_protocol::CheckoutArchiveStatus::Failed => match archive.detail.as_deref() {
+                        Some(detail) if !detail.is_empty() => format!("failed to archive: {detail}"),
+                        _ => "failed to archive".to_string(),
+                    },
+                };
+                output.push_str(&format!("\n  {}: {result}", archive.checkout));
+            }
+            output
+        }
         CommandValue::ConvoyStarted { name, attach_plan, .. } => {
             format!("convoy started: {name}{}", if attach_plan.is_some() { " (crew ready)" } else { "" })
         }
