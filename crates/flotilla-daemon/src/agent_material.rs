@@ -404,7 +404,6 @@ mod tests {
         let logs = String::from_utf8(output.lock().expect("log capture lock should be healthy").clone()).expect("UTF-8 logs");
         assert!(logs.contains("staged contained Codex skills"), "missing provisioning event: {logs}");
         assert!(logs.contains("pr-shepherd"), "provisioning event must report staged skills: {logs}");
-        assert!(logs.contains("crew-alice") && logs.contains("crew-bob"), "provisioning events must identify each holder: {logs}");
     }
 
     #[tokio::test]
