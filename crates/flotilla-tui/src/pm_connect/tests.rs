@@ -117,6 +117,21 @@ fn gaps_and_unseeded_deltas_request_resubscription() {
 }
 
 #[test]
+fn awareness_subscription_uses_the_unbounded_default() {
+    let state = ConnectorState::default();
+    let awareness = state
+        .cursors()
+        .into_iter()
+        .find_map(|cursor| match cursor.query {
+            QueryId::Awareness { limit, .. } => Some(limit),
+            _ => None,
+        })
+        .expect("awareness cursor");
+
+    assert_eq!(awareness, AwarenessLimit::default());
+}
+
+#[test]
 fn rebuild_publishes_diffs_not_repeats() {
     let mut state = ConnectorState::default();
     state.apply_event(&independents_set(1, vec![independent_row("scratch", SessionPhase::Running)]));

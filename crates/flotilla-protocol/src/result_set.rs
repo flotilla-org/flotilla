@@ -423,8 +423,12 @@ pub struct AwarenessLimit {
 
 impl Default for AwarenessLimit {
     fn default() -> Self {
-        Self { groups: 32, entries: 32 }
+        Self::UNBOUNDED
     }
+}
+
+impl AwarenessLimit {
+    pub const UNBOUNDED: Self = Self { groups: usize::MAX, entries: usize::MAX };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

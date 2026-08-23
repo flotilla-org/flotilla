@@ -693,7 +693,7 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
     let convoys = project(&convoys_address, data).unwrap_or_else(|_| pending_project_table(&convoys_address));
     let checkouts_address = ViewAddress::Checkouts { scope: Some(scope.clone()) };
     let issues_address = ViewAddress::Issues { scope: scope.clone() };
-    let independents_address = ViewAddress::Independents { scope: Some(scope) };
+    let independents_address = ViewAddress::Independents { scope: Some(scope.clone()) };
     let awareness = awareness_for_project(namespace, name, data);
     let mut checkouts = project(&checkouts_address, data).unwrap_or_else(|_| pending_project_table(&checkouts_address));
     let mut issues = project(&issues_address, data).unwrap_or_else(|_| pending_project_table(&issues_address));
@@ -718,6 +718,24 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
         apply_family_summary(&mut independents, awareness, AwarenessFamily::Independents);
     }
     let mut convoys = TableView { title: convoys_title, ..convoys };
+    // The enclosing Project page already supplies this scope. The shared
+    // convoy projection decorates names for fleet-wide surfaces; omit that
+    // suffix here.
+    for row in &mut convoys.rows {
+        let name = &mut row.cells[0].text;
+        for suffix in [format!(" @ {}/{}", scope.namespace, scope.name), format!(" @ {}", scope.name)] {
+            if let Some(bare) = name.strip_suffix(&suffix) {
+                *name = bare.to_owned();
+                break;
+            }
+        }
+    }
+    if let Some(scope_column) = convoys.columns.iter().position(|column| column.id == "scope") {
+        convoys.columns.remove(scope_column);
+        for row in &mut convoys.rows {
+            row.cells.remove(scope_column);
+        }
+    }
     if let Some(awareness) = awareness {
         apply_family_summary(&mut convoys, awareness, AwarenessFamily::Convoys);
     }
@@ -1771,6 +1789,8 @@ mod tests {
             "Issues (1)",
             "Independents (1)",
         ]);
+        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
+        assert!(panels[0].table.columns.iter().all(|column| column.id != "scope"));
         assert_eq!(panels.iter().map(|panel| panel.table.meta.salience).collect::<Vec<_>>(), vec![
             Salience::Urgent,
             Salience::None,
@@ -1778,7 +1798,7 @@ mod tests {
             Salience::Info,
         ]);
         assert!(panels.iter().all(|panel| panel.table.meta.as_of == Some(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)));
-        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables @ roadmap");
+        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
         assert_eq!(panels[1].table.rows[0].cells[1].text, "/work/flotilla");
         assert_eq!(panels[2].table.rows[0].actions[0].intent, TableIntent::StartConvoy {
             namespace: "flotilla".into(),
@@ -1806,7 +1826,7 @@ mod tests {
 
         let panels = project_panels(&address, &TableRows { convoys: vec![&convoy], ..TableRows::default() }).expect("project panels");
 
-        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables @ roadmap");
+        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
         assert_eq!(panels[1].table.meta.availability, TableAvailability::Loading);
         assert_eq!(panels[2].table.meta.availability, TableAvailability::Loading);
         assert_eq!(panels[3].table.meta.availability, TableAvailability::Loading);

@@ -225,6 +225,39 @@ fn awareness_composed_text_is_unchanged_alongside_granular_facts() {
 }
 
 #[test]
+fn truncated_awareness_summary_reports_exact_omitted_count() {
+    let node = AwarenessNode::builder()
+        .id("project/dev/platform".to_owned())
+        .kind(AwarenessKind::Project)
+        .label("platform".to_owned())
+        .scope(flotilla_protocol::QueryScope::new("dev", "platform"))
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .counts(AwarenessCounts::builder().total(5).convoys(5).build())
+        .entries(vec![
+            AwarenessEntry::builder()
+                .id("convoy/dev/one".to_owned())
+                .kind(AwarenessKind::Convoy)
+                .label("one".to_owned())
+                .state(AwarenessState::Active)
+                .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                .build(),
+            AwarenessEntry::builder()
+                .id("convoy/dev/two".to_owned())
+                .kind(AwarenessKind::Convoy)
+                .label("two".to_owned())
+                .state(AwarenessState::Done)
+                .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                .build(),
+        ])
+        .build();
+
+    let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
+    let project = find_entity(&patches, &entity::project("dev", "platform", "fleet"));
+    assert!(text(project, KEY_SUMMARY_TEXT).ends_with("+3 more"));
+}
+
+#[test]
 fn standing_checkout_mints_a_transient_terminal_action_but_convoy_checkout_does_not() {
     let checkout = |id: &str, path: &str, links: Vec<AwarenessLink>| {
         AwarenessEntry::builder()
