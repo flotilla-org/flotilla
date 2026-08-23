@@ -941,7 +941,10 @@ async fn reconcile_provisioned_environment(
         let credential_scopes = credential_scopes_from_environment(spec)?;
         if let Err(error) = store.adopt_github_app_deliveries(env_id.as_str(), &credential_refs, &credential_scopes, handle.runner()).await
         {
-            return fail_unavailable_environment(state, namespace, &env_id, &format!("credential delivery adoption failed: {error}")).await;
+            if error.should_surface {
+                surface_credential_refresh_error(&state.daemon, namespace, &error).await?;
+            }
+            return Err(format!("credential delivery adoption failed: {}; will retry", error.message));
         }
     }
 

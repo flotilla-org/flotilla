@@ -143,6 +143,7 @@ pub(crate) struct CredentialStore {
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
     github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
+    github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
 }
 
 const GITHUB_APP_REFRESH_MARGIN: Duration = Duration::minutes(5);
@@ -157,6 +158,7 @@ struct GithubAppDelivery {
     refresh_failures: usize,
 }
 
+#[derive(Debug)]
 pub(crate) struct CredentialRefreshError {
     pub(crate) environment_ref: String,
     pub(crate) message: String,
@@ -330,6 +332,7 @@ impl CredentialStore {
             git_config_fragments: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
             github_app_deliveries: Mutex::new(BTreeMap::new()),
+            github_app_adoption_failures: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -595,10 +598,14 @@ impl CredentialStore {
         credential_refs: &BTreeSet<String>,
         credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
         runner: Arc<dyn CommandRunner>,
-    ) -> Result<(), String> {
+    ) -> Result<(), CredentialRefreshError> {
         let mut github_app_refs = Vec::new();
         for name in credential_refs {
-            if matches!(self.spec(name).await?.consumer, CredentialConsumer::GithubApp { .. }) {
+            let spec = match self.spec(name).await {
+                Ok(spec) => spec,
+                Err(message) => return Err(self.record_adoption_failure(environment_ref, message).await),
+            };
+            if matches!(spec.consumer, CredentialConsumer::GithubApp { .. }) {
                 github_app_refs.push(name);
             }
         }
@@ -606,10 +613,25 @@ impl CredentialStore {
         let already_adopted = github_app_refs.iter().all(|name| deliveries.contains_key(&(environment_ref.to_string(), (*name).clone())));
         drop(deliveries);
         if github_app_refs.is_empty() || already_adopted {
+            self.github_app_adoption_failures.lock().await.remove(environment_ref);
             return Ok(());
         }
-        self.prepare_scoped(environment_ref, credential_refs, credential_scopes, runner).await?;
+        if let Err(message) = self.prepare_scoped(environment_ref, credential_refs, credential_scopes, runner).await {
+            return Err(self.record_adoption_failure(environment_ref, message).await);
+        }
+        self.github_app_adoption_failures.lock().await.remove(environment_ref);
         Ok(())
+    }
+
+    async fn record_adoption_failure(&self, environment_ref: &str, message: String) -> CredentialRefreshError {
+        let mut failures = self.github_app_adoption_failures.lock().await;
+        let failures = failures.entry(environment_ref.to_string()).or_default();
+        *failures += 1;
+        CredentialRefreshError {
+            environment_ref: environment_ref.to_string(),
+            message,
+            should_surface: *failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD,
+        }
     }
 
     pub(crate) async fn prepare_registry_pull(
@@ -688,6 +710,7 @@ impl CredentialStore {
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
         self.git_config_fragments.lock().await.remove(environment_ref);
         self.github_app_deliveries.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
+        self.github_app_adoption_failures.lock().await.remove(environment_ref);
         let config_dir = self.registry_configs.lock().await.remove(environment_ref);
         if let Some(config_dir) = config_dir {
             remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
@@ -1644,6 +1667,9 @@ interactions:
         let minter = Arc::new(FakeGithubAppTokenMinter {
             tokens: StdMutex::new(VecDeque::from([
                 Ok(GithubAppToken { value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) }),
+                Err("temporary adoption outage one".to_string()),
+                Err("temporary adoption outage two".to_string()),
+                Err("persistent adoption outage".to_string()),
                 Ok(GithubAppToken { value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) }),
                 Err("temporary outage one".to_string()),
                 Err("temporary outage two".to_string()),
@@ -1719,8 +1745,13 @@ interactions:
             GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
             PathBuf::from("/state"),
         );
+        for expected_surface in [false, false, true] {
+            let error =
+                store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect_err("adoption outage");
+            assert_eq!(error.should_surface, expected_surface);
+        }
         store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect("re-adopt standing vessel");
-        assert_eq!(minter.requests.lock().expect("requests lock").len(), 2, "startup adoption must rebuild the delivery registration");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 5, "startup adoption retries and rebuilds the registration");
 
         clock.advance(Duration::minutes(115));
         let first_failure = store.refresh_due_github_app_tokens().await;
@@ -1731,7 +1762,7 @@ interactions:
         let third_failure = store.refresh_due_github_app_tokens().await;
         assert!(third_failure[0].should_surface, "a repeated unrefreshable delivery must become visible");
         assert!(store.refresh_due_github_app_tokens().await.is_empty());
-        assert_eq!(minter.requests.lock().expect("requests lock").len(), 6, "recovered material keeps retrying and eventually rotates");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 9, "recovered material keeps retrying and eventually rotates");
         let token_writes =
             runner.writes.lock().expect("writes lock").iter().filter(|(path, _)| path.ends_with("token")).cloned().collect::<Vec<_>>();
         assert_eq!(token_writes.len(), 3);
