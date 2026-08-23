@@ -7697,9 +7697,8 @@ impl InProcessDaemon {
         }
         self.archive_convoy_checkouts_best_effort(namespace, name).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let implicit_principal = PrincipalRef::implicit_for_namespace(namespace);
         let authority = match principal_ref {
-            Some(principal) if principal == &implicit_principal => WorkCompletionAuthority::HumanOverride,
+            Some(principal) if principal.name == PrincipalRef::IMPLICIT_NAME => WorkCompletionAuthority::HumanOverride,
             Some(principal) => WorkCompletionAuthority::Principal(principal.clone()),
             None => WorkCompletionAuthority::Unattributed,
         };
@@ -9354,7 +9353,8 @@ impl InProcessDaemon {
 
         if let flotilla_protocol::CommandAction::ConvoyStart { intent } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let default_namespace = intent.namespace.clone().unwrap_or(self.provisioning_namespace().await);
+            let acting_namespace = self.provisioning_namespace().await;
+            let default_namespace = intent.namespace.clone().unwrap_or_else(|| acting_namespace.clone());
             let (namespace, intent) = match normalize_convoy_start_intent(&default_namespace, intent) {
                 Ok(resolved) => resolved,
                 Err(message) => {
@@ -9363,7 +9363,7 @@ impl InProcessDaemon {
                 }
             };
             let dispatching_principal_ref =
-                dispatching_principal_ref.clone().unwrap_or_else(|| PrincipalRef::implicit_for_namespace(&namespace));
+                dispatching_principal_ref.clone().unwrap_or_else(|| PrincipalRef::implicit_for_namespace(&acting_namespace));
             let key = ConvoyStartKey::new(namespace, &intent);
             if !self.pending_convoy_starts.lock().await.insert(key.clone()) {
                 self.finish_context_free_command(id, empty_identity, flotilla_protocol::CommandValue::Error {

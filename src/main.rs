@@ -2089,9 +2089,8 @@ mod tests {
 
     use super::{
         attach_mode, cli_surface_from, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing,
-        format_human_resource_value,
-        host_daemon_socket_required, incompatible_daemon_reexec_failure, provisioning_target_for_environment, replace_host_ids,
-        run_replica_snapshot, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
+        format_human_resource_value, host_daemon_socket_required, incompatible_daemon_reexec_failure, provisioning_target_for_environment,
+        replace_host_ids, run_replica_snapshot, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
         should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, Cli, CliPaths, CommandValue, DaemonSubCommand,
         DevModeSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceStatusPatchArgs,
         ResourceSubCommand, ResourceWatchArgs, SubCommand,

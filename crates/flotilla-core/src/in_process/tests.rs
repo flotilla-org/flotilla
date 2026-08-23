@@ -628,8 +628,9 @@ async fn refused_convoy_reclaim_leaves_runtime_children_untouched() {
         "refusal must retain the terminal session"
     );
 
+    let principal = PrincipalRef::implicit_for_namespace("flotilla");
     daemon
-        .abandon_convoy_internal("flotilla", convoy_name, "operator accepts the unprovisioned checkout")
+        .abandon_convoy_internal("flotilla", convoy_name, "operator accepts the unprovisioned checkout", Some(&principal))
         .await
         .expect("the refused shape must remain recoverable through convoy abandon");
     let abandoned = convoys.get(convoy_name).await.expect("abandon retains the convoy record");
