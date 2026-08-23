@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use url::Url;
 
-use crate::vessel_config::{agent_environment_fragment, compose, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey};
+use crate::vessel_config::{
+    agent_environment_fragment, compose, crew_gitconfig_fragments, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey,
+};
 
 #[derive(Serialize)]
 struct GithubAppJwtClaims {
@@ -545,10 +547,11 @@ impl CredentialStore {
             let mut fragments_by_environment = self.git_config_fragments.lock().await;
             let mut composed_fragments = fragments_by_environment.get(environment_ref).cloned().unwrap_or_default();
             composed_fragments.extend(new_git_config_fragments);
-            let gitconfig = match compose(TargetId::GitConfig, composed_fragments.values().cloned()) {
-                Ok(gitconfig) => gitconfig,
-                Err(error) => return Err(format!("compose shared Git config: {error}")),
-            };
+            let gitconfig =
+                match compose(TargetId::GitConfig, crew_gitconfig_fragments().into_iter().chain(composed_fragments.values().cloned())) {
+                    Ok(gitconfig) => gitconfig,
+                    Err(error) => return Err(format!("compose shared Git config: {error}")),
+                };
             let delivery_paths = delivery_paths.as_ref().expect("Git credential adapters resolve delivery paths");
             if let Err(error) = runner.write_file(&delivery_paths.git_config, &gitconfig.contents).await {
                 let (name, adapter, cache_key) = git_config_owner.expect("Git config fragments have an owner");
@@ -2300,7 +2303,7 @@ interactions:
         let writes = runner.writes.lock().expect("writes lock");
         assert_eq!(writes.as_slice(), &[(
             PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
-            "# fragment: credential/gh github\n[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n".to_string()
+            "# fragment: credential/gh github\n[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
         )]);
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, input)| {
@@ -2463,7 +2466,7 @@ interactions:
             writes[2],
             (
                 PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
-                "# fragment: credential/forgejo lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo\n".to_string()
+                "# fragment: credential/forgejo lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
             )
         );
         let calls = runner.calls.lock().expect("calls lock");
