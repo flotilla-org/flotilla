@@ -397,7 +397,10 @@ async fn assert_abandon_attribution(principal_ref: PrincipalRef, expected_author
         })
         .await
         .expect("dispatch abandon");
-    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::Ok);
+    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyAbandoned {
+        name: role.to_string(),
+        archives: Vec::new()
+    });
 
     let status = convoys.get(&created.metadata.name).await.expect("abandoned convoy").status.expect("convoy status");
     assert_eq!(status.work["implement"].completion_authority, expected_authority);
@@ -646,7 +649,10 @@ async fn hostless_convoy_abandon_routes_to_remote_home() {
         .await
         .expect("dispatch hostless convoy abandon");
 
-    assert_eq!(await_command_result(&mut rx, command_id).await, CommandValue::Ok);
+    assert_eq!(await_command_result(&mut rx, command_id).await, CommandValue::ConvoyAbandoned {
+        name: convoy_name.to_string(),
+        archives: Vec::new()
+    });
     let status = follower_convoys
         .get(convoy_name)
         .await
