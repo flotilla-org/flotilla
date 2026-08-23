@@ -170,7 +170,7 @@ impl fmt::Display for HostNounPartial {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use flotilla_protocol::{Command, CommandAction, HostName, ProvisioningTarget, RepoSelector};
+    use flotilla_protocol::{CommandAction, HostName, ProvisioningTarget, RepoSelector};
 
     use super::HostNounPartial;
     use crate::{
@@ -185,15 +185,7 @@ mod tests {
 
     #[test]
     fn host_list() {
-        assert_eq!(
-            parse_and_resolve(&["host", "list"]),
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryFleetHealth {}
-            })
-        );
+        crate::test_utils::assert_ready(parse_and_resolve(&["host", "list"]), CommandAction::QueryFleetHealth {});
     }
 
     #[test]
@@ -231,37 +223,20 @@ mod tests {
     #[test]
     fn host_refresh_bare() {
         let resolved = parse_and_resolve(&["host", "alpha", "refresh"]);
-        assert!(matches!(
-            resolved,
-            Resolved::NeedsContext {
-                command: Command {
-                    node_id: None,
-                    provisioning_target: Some(ProvisioningTarget::Host { ref host }),
-                    context_repo: None,
-                    action: CommandAction::Refresh { repo: None },
-                },
-                repo: RepoContext::None,
-                host: HostResolution::Explicit(ref explicit),
-            } if host == &HostName::new("alpha") && explicit == &HostName::new("alpha")
-        ));
+        let Resolved::NeedsContext { command, repo, host } = resolved else { panic!("expected context command") };
+        assert_eq!(command.action, CommandAction::Refresh { repo: None });
+        assert_eq!(command.provisioning_target, Some(ProvisioningTarget::Host { host: HostName::new("alpha") }));
+        assert_eq!(repo, RepoContext::None);
+        assert_eq!(host, HostResolution::Explicit(HostName::new("alpha")));
     }
 
     #[test]
     fn host_refresh_with_repo() {
         let resolved = parse_and_resolve(&["host", "alpha", "refresh", "my-repo"]);
-        assert!(matches!(
-            resolved,
-            Resolved::NeedsContext {
-                command: Command {
-                    node_id: None,
-                    provisioning_target: Some(ProvisioningTarget::Host { ref host }),
-                    action: CommandAction::Refresh { repo: Some(RepoSelector::Query(ref q)) },
-                    ..
-                },
-                host: HostResolution::Explicit(ref explicit),
-                ..
-            } if host == &HostName::new("alpha") && explicit == &HostName::new("alpha") && q == "my-repo"
-        ));
+        let Resolved::NeedsContext { command, host, .. } = resolved else { panic!("expected context command") };
+        assert_eq!(command.action, CommandAction::Refresh { repo: Some(RepoSelector::Query("my-repo".into())) });
+        assert_eq!(command.provisioning_target, Some(ProvisioningTarget::Host { host: HostName::new("alpha") }));
+        assert_eq!(host, HostResolution::Explicit(HostName::new("alpha")));
     }
 
     #[test]

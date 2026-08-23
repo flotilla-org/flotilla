@@ -158,7 +158,7 @@ async fn inspect_checkout_integration_with_association(
 }
 
 async fn inspect_clean(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
-    match runner.run_output("git", &["status", "--porcelain"], checkout_path, &ChannelLabel::Noop).await {
+    match runner.run_output("git", &["status", "--porcelain"], checkout_path, &ChannelLabel::Default).await {
         Ok(output) if output.success => {
             let mut details = output
                 .stdout
@@ -205,7 +205,7 @@ async fn inspect_embedded_repositories(runner: &dyn CommandRunner, checkout_path
             "find",
             &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"],
             checkout_path,
-            &ChannelLabel::Noop,
+            &ChannelLabel::Default,
         )
         .await
         .map_err(|error| format!("embedded repository scan could not run: {error}"))?;
@@ -226,7 +226,15 @@ async fn inspect_embedded_repositories(runner: &dyn CommandRunner, checkout_path
 
     let mut repositories = Vec::new();
     for path in paths {
-        repositories.push(inspect_embedded_repository(runner, checkout_path, path).await);
+        let path_arg = path.to_string_lossy();
+        let ignored = runner
+            .run_output("git", &["check-ignore", "--quiet", "--", &path_arg], checkout_path, &ChannelLabel::Default)
+            .await
+            .is_ok_and(|output| output.success);
+        let repository = inspect_embedded_repository(runner, checkout_path, path).await;
+        if !ignored || repository.local_commits != Some(0) {
+            repositories.push(repository);
+        }
     }
     Ok(repositories)
 }
@@ -234,28 +242,31 @@ async fn inspect_embedded_repositories(runner: &dyn CommandRunner, checkout_path
 async fn inspect_embedded_repository(runner: &dyn CommandRunner, checkout_path: &Path, path: PathBuf) -> EmbeddedRepository {
     let path_arg = path.to_string_lossy();
     let branch = match runner
-        .run_output("git", &["-C", &path_arg, "symbolic-ref", "--short", "-q", "HEAD"], checkout_path, &ChannelLabel::Noop)
+        .run_output("git", &["-C", &path_arg, "symbolic-ref", "--short", "-q", "HEAD"], checkout_path, &ChannelLabel::Default)
         .await
     {
         Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-        _ => match runner.run_output("git", &["-C", &path_arg, "rev-parse", "--short", "HEAD"], checkout_path, &ChannelLabel::Noop).await {
-            Ok(output) if output.success && !output.stdout.trim().is_empty() => format!("detached at {}", output.stdout.trim()),
-            _ => "unknown".to_string(),
-        },
+        _ => {
+            match runner.run_output("git", &["-C", &path_arg, "rev-parse", "--short", "HEAD"], checkout_path, &ChannelLabel::Default).await
+            {
+                Ok(output) if output.success && !output.stdout.trim().is_empty() => format!("detached at {}", output.stdout.trim()),
+                _ => "unknown".to_string(),
+            }
+        }
     };
     let local_commits = runner
         .run_output(
             "git",
             &["-C", &path_arg, "rev-list", "--count", "HEAD", "--all", "--not", "--remotes"],
             checkout_path,
-            &ChannelLabel::Noop,
+            &ChannelLabel::Default,
         )
         .await
         .ok()
         .filter(|output| output.success)
         .and_then(|output| output.stdout.trim().parse().ok());
     let uncommitted_entries = runner
-        .run_output("git", &["-C", &path_arg, "status", "--porcelain"], checkout_path, &ChannelLabel::Noop)
+        .run_output("git", &["-C", &path_arg, "status", "--porcelain"], checkout_path, &ChannelLabel::Default)
         .await
         .ok()
         .filter(|output| output.success)
@@ -279,7 +290,7 @@ async fn inspect_pushed(
         .and_then(|status| status.head_sha.value.as_deref())
     {
         let ancestor =
-            runner.run_output("git", &["merge-base", "--is-ancestor", "HEAD", head_sha], checkout_path, &ChannelLabel::Noop).await;
+            runner.run_output("git", &["merge-base", "--is-ancestor", "HEAD", head_sha], checkout_path, &ChannelLabel::Default).await;
         if ancestor.is_ok_and(|output| output.success) {
             return IntegrationCondition::builder()
                 .value(ConditionValue::True)
@@ -289,28 +300,13 @@ async fn inspect_pushed(
         }
     }
 
-    let upstream = match runner.run_output("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], checkout_path, &ChannelLabel::Noop).await {
+    let upstream = runner.run_output("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], checkout_path, &ChannelLabel::Default).await;
+    let upstream = match upstream {
         Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-        _ => match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Noop).await {
-            Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-            Ok(output) => {
-                return IntegrationCondition::builder()
-                    .value(ConditionValue::Unknown)
-                    .details(vec![non_empty_output_or("could not determine upstream for pushed check", &output.stderr)])
-                    .observed_at(observed_at.to_string())
-                    .build();
-            }
-            Err(error) => {
-                return IntegrationCondition::builder()
-                    .value(ConditionValue::Unknown)
-                    .details(vec![format!("could not determine upstream for pushed check: {error}")])
-                    .observed_at(observed_at.to_string())
-                    .build();
-            }
-        },
+        _ => return inspect_pushed_without_upstream(runner, checkout_path, observed_at).await,
     };
     let range = format!("{upstream}..HEAD");
-    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Noop).await {
+    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Default).await {
         Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
             Ok(0) => IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build(),
             Ok(count) => IntegrationCondition::builder()
@@ -337,6 +333,54 @@ async fn inspect_pushed(
     }
 }
 
+async fn inspect_pushed_without_upstream(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
+    match runner.run_output("git", &["branch", "--remotes", "--contains", "HEAD"], checkout_path, &ChannelLabel::Default).await {
+        Ok(output) if output.success && !output.stdout.trim().is_empty() => {
+            IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build()
+        }
+        Ok(output) if output.success => {
+            match runner
+                .run_output("git", &["rev-list", "--count", "HEAD", "--not", "--remotes"], checkout_path, &ChannelLabel::Default)
+                .await
+            {
+                Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
+                    Ok(0) => IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build(),
+                    Ok(count) => IntegrationCondition::builder()
+                        .value(ConditionValue::False)
+                        .details(vec![format!("{count} unpushed commit{}", if count == 1 { "" } else { "s" })])
+                        .observed_at(observed_at.to_string())
+                        .build(),
+                    Err(_) => IntegrationCondition::builder()
+                        .value(ConditionValue::Unknown)
+                        .details(vec![format!("could not parse unpushed commit count: {}", output.stdout.trim())])
+                        .observed_at(observed_at.to_string())
+                        .build(),
+                },
+                Ok(output) => IntegrationCondition::builder()
+                    .value(ConditionValue::Unknown)
+                    .details(vec![non_empty_output_or("git rev-list failed", &output.stderr)])
+                    .observed_at(observed_at.to_string())
+                    .build(),
+                Err(error) => IntegrationCondition::builder()
+                    .value(ConditionValue::Unknown)
+                    .details(vec![format!("git rev-list could not run: {error}")])
+                    .observed_at(observed_at.to_string())
+                    .build(),
+            }
+        }
+        Ok(output) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![non_empty_output_or("could not inspect remote branches for pushed check", &output.stderr)])
+            .observed_at(observed_at.to_string())
+            .build(),
+        Err(error) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![format!("could not inspect remote branches for pushed check: {error}")])
+            .observed_at(observed_at.to_string())
+            .build(),
+    }
+}
+
 async fn inspect_landed(
     runner: &dyn CommandRunner,
     checkout_path: &Path,
@@ -357,7 +401,7 @@ async fn inspect_landed(
             vec!["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt,baseRefName,mergeable", "--limit", "1"]
         }
     };
-    match runner.run_output("gh", &args, checkout_path, &ChannelLabel::Noop).await {
+    match runner.run_output("gh", &args, checkout_path, &ChannelLabel::Default).await {
         Ok(output) if output.success => match serde_json::from_str::<serde_json::Value>(&output.stdout) {
             Ok(value) => {
                 let item = match value {
@@ -464,18 +508,20 @@ enum BaseComparison {
 async fn compare_branch_to_base(runner: &dyn CommandRunner, checkout_path: &Path, base_ref: Option<&str>) -> BaseComparison {
     let base_ref = match base_ref {
         Some(base_ref) => base_ref.to_string(),
-        None => match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Noop).await {
-            Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-            Ok(output) => {
-                return BaseComparison::Indeterminate {
-                    detail: non_empty_output_or("the base ref could not be determined", &output.stderr),
-                };
+        None => {
+            match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Default).await {
+                Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+                Ok(output) => {
+                    return BaseComparison::Indeterminate {
+                        detail: non_empty_output_or("the base ref could not be determined", &output.stderr),
+                    };
+                }
+                Err(error) => return BaseComparison::Indeterminate { detail: format!("the base ref could not be determined: {error}") },
             }
-            Err(error) => return BaseComparison::Indeterminate { detail: format!("the base ref could not be determined: {error}") },
-        },
+        }
     };
     let range = format!("{base_ref}..HEAD");
-    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Noop).await {
+    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Default).await {
         Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
             Ok(count) => BaseComparison::Counted { base_ref, count },
             Err(_) => BaseComparison::Indeterminate {
@@ -571,18 +617,43 @@ mod tests {
 
     #[tokio::test]
     async fn commit_after_squash_merged_head_remains_unpushed() {
-        let runner = MockRunner::new(vec![
-            Err("not an ancestor".into()),
-            Err("upstream branch was deleted".into()),
-            Ok("origin/main\n".into()),
-            Ok("1\n".into()),
-        ]);
+        let runner = MockRunner::new(vec![Err("not an ancestor".into()), Ok("origin/feature\n".into()), Ok("1\n".into())]);
         let change_request = merged_change_request("merged-head");
 
         let pushed = inspect_pushed(&runner, Path::new("/checkout"), Some(&change_request), "2026-08-04T12:00:00Z").await;
 
         assert_eq!(pushed.value, ConditionValue::False);
         assert_eq!(pushed.details, vec!["1 unpushed commit"]);
+    }
+
+    #[tokio::test]
+    async fn squash_merged_branch_without_upstream_is_pushed_when_remote_ref_contains_head() {
+        let runner = MockRunner::new(vec![Err("no upstream configured".into()), Ok("  origin/feature\n".into())]);
+
+        let pushed = inspect_pushed(&runner, Path::new("/checkout"), None, "2026-08-04T12:00:00Z").await;
+
+        assert_eq!(pushed.value, ConditionValue::True);
+        assert_eq!(runner.calls()[1].1, vec!["branch", "--remotes", "--contains", "HEAD"]);
+    }
+
+    #[tokio::test]
+    async fn branch_without_upstream_or_containing_remote_reports_unpushed_commit_count() {
+        let runner = MockRunner::new(vec![Err("no upstream configured".into()), Ok(String::new()), Ok("2\n".into())]);
+
+        let pushed = inspect_pushed(&runner, Path::new("/checkout"), None, "2026-08-04T12:00:00Z").await;
+
+        assert_eq!(pushed.value, ConditionValue::False);
+        assert_eq!(pushed.details, vec!["2 unpushed commits"]);
+        assert_eq!(runner.calls()[2].1, vec!["rev-list", "--count", "HEAD", "--not", "--remotes"]);
+    }
+
+    #[tokio::test]
+    async fn branch_pushed_between_no_upstream_probes_reports_pushed() {
+        let runner = MockRunner::new(vec![Err("no upstream configured".into()), Ok(String::new()), Ok("0\n".into())]);
+
+        let pushed = inspect_pushed(&runner, Path::new("/checkout"), None, "2026-08-04T12:00:00Z").await;
+
+        assert_eq!(pushed.value, ConditionValue::True);
     }
 
     #[tokio::test]
@@ -593,6 +664,41 @@ mod tests {
 
         assert_eq!(pushed.value, ConditionValue::True);
         assert_eq!(runner.calls()[0].1, vec!["rev-parse", "--abbrev-ref", "@{upstream}"]);
+    }
+
+    #[tokio::test]
+    async fn ignored_embedded_repository_without_local_commits_keeps_checkout_clean() {
+        let runner = MockRunner::new(vec![
+            Ok(String::new()),
+            Ok("./.tools/ghostty-src/.git\n".into()),
+            Ok(String::new()),
+            Err("detached".into()),
+            Ok("64daa599c\n".into()),
+            Ok("0\n".into()),
+            Ok(String::new()),
+        ]);
+
+        let clean = inspect_clean(&runner, Path::new("/checkout"), "2026-08-04T12:00:00Z").await;
+
+        assert_eq!(clean.value, ConditionValue::True);
+        assert_eq!(runner.calls()[2].1, vec!["check-ignore", "--quiet", "--", ".tools/ghostty-src"]);
+    }
+
+    #[tokio::test]
+    async fn ignored_embedded_repository_with_local_commits_makes_checkout_unclean() {
+        let runner = MockRunner::new(vec![
+            Ok(String::new()),
+            Ok("./.tools/ghostty-src/.git\n".into()),
+            Ok(String::new()),
+            Ok("feature/local-work\n".into()),
+            Ok("2\n".into()),
+            Ok(String::new()),
+        ]);
+
+        let clean = inspect_clean(&runner, Path::new("/checkout"), "2026-08-04T12:00:00Z").await;
+
+        assert_eq!(clean.value, ConditionValue::False);
+        assert_eq!(clean.details, vec!["embedded repository .tools/ghostty-src/ (branch feature/local-work, 2 local commits)"]);
     }
 
     async fn landed_with_responses(responses: Vec<Result<String, String>>) -> IntegrationCondition {

@@ -27,6 +27,14 @@ pub const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapsho
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoySpec {
     pub workflow_ref: String,
+    /// Stable human-facing role within `project_ref`.
+    #[builder(default)]
+    #[serde(default)]
+    pub role: String,
+    /// Monotonic incarnation number within `{project_ref, role}`.
+    #[builder(default)]
+    #[serde(default)]
+    pub generation: u64,
     #[builder(default)]
     #[serde(default)]
     pub dispatching_principal_ref: PrincipalRef,
@@ -321,7 +329,7 @@ fn bound_change_request_addresses(
     }))
 }
 
-fn change_request_address(repository_url: &str, id: &str) -> Result<LeafAddress, String> {
+pub fn change_request_address(repository_url: &str, id: &str) -> Result<LeafAddress, String> {
     let canonical = crate::canonicalize_repo_url(repository_url)?;
     let without_scheme = canonical
         .split_once("://")
@@ -429,6 +437,14 @@ pub struct ConvoyStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct PendingBrief {
+    pub vessel: String,
+    pub role: String,
+    pub content: String,
+    pub queued_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct TargetMismatch {
     pub repo_ref: RepositoryKey,
     pub change_request_id: String,
@@ -449,6 +465,32 @@ pub struct WorkflowSnapshot {
 pub struct TurnDeliveryStatus {
     #[serde(default)]
     pub episodes: Vec<TurnDeliveryEpisode>,
+    /// The operator brief waiting for its target crew member's turn boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_brief: Option<PendingBrief>,
+}
+
+pub const PENDING_BRIEF_DELIVERY_SOURCE: &str = "operator";
+
+impl ConvoyStatus {
+    pub fn pending_brief(&self) -> Option<&PendingBrief> {
+        self.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).and_then(|delivery| delivery.pending_brief.as_ref())
+    }
+}
+
+fn clear_operator_pending_brief(status: &mut ConvoyStatus) {
+    if let Some(delivery) = status.turn_deliveries.get_mut(PENDING_BRIEF_DELIVERY_SOURCE) {
+        delivery.pending_brief = None;
+    }
+    if status.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).is_some_and(|delivery| delivery.episodes.is_empty()) {
+        status.turn_deliveries.remove(PENDING_BRIEF_DELIVERY_SOURCE);
+    }
+}
+
+fn clear_pending_brief_for(status: &mut ConvoyStatus, vessel: &str, role: &str) {
+    if status.pending_brief().is_some_and(|brief| brief.vessel == vessel && brief.role == role) {
+        clear_operator_pending_brief(status);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -503,8 +545,7 @@ impl ConvoyPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct WorkState {
     pub phase: WorkPhase,
-    /// A human explicitly completed this vessel's work at the roll-up level.
-    /// Crew-owned state remains unchanged while this override is active.
+    /// Authority responsible for settling this work at the roll-up level.
     #[builder(default)]
     #[serde(default, skip_serializing_if = "WorkCompletionAuthority::is_crew_rollup")]
     pub completion_authority: WorkCompletionAuthority,
@@ -539,11 +580,13 @@ impl WorkPhase {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum WorkCompletionAuthority {
     #[default]
     CrewRollup,
     HumanOverride,
+    Principal(PrincipalRef),
+    Unattributed,
 }
 
 impl WorkCompletionAuthority {
@@ -563,6 +606,11 @@ pub struct CrewWorkState {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
+    /// Durable pointer to the PR comment containing the claim's decision ledger.
+    /// Absence on a completed claim is an advisory fence flag, never grounds
+    /// for rejecting the claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_ledger_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -665,6 +713,7 @@ pub enum ConvoyStatusPatch {
         finished_at: DateTime<Utc>,
         message: Option<String>,
         disposition: Option<String>,
+        decision_ledger_ref: Option<String>,
     },
     MarkCrewFailed {
         vessel: String,
@@ -684,6 +733,19 @@ pub enum ConvoyStatusPatch {
         role: String,
         resumed_at: DateTime<Utc>,
         prompt: String,
+    },
+    SetPendingBrief {
+        pending_brief: PendingBrief,
+    },
+    ClearPendingBrief,
+    DeliverPendingBrief {
+        vessel: String,
+        role: String,
+        delivered_at: DateTime<Utc>,
+        content: String,
+        completion_message: Option<String>,
+        disposition: Option<String>,
+        decision_ledger_ref: Option<String>,
     },
     RecordTurnDelivery {
         source: String,
@@ -707,6 +769,15 @@ pub enum ConvoyStatusPatch {
 
 impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
     fn apply(&self, status: &mut ConvoyStatus) {
+        // Abandonment is an operator-authored terminal boundary. A controller
+        // may have computed any of the patches below from an older Active
+        // resource version; optimistic retry reapplies that patch to the
+        // current status, so accepting it here would resurrect the convoy and
+        // erase its terminal history. Once stamped, the historical record is
+        // immutable, including under duplicate abandon requests.
+        if status.phase == ConvoyPhase::Abandoned {
+            return;
+        }
         match self {
             Self::SetPlacementDecision { placement_decision } => {
                 status.placement_decision.get_or_insert_with(|| placement_decision.clone());
@@ -739,6 +810,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.phase = *phase;
                 status.message = Some(message.clone());
                 status.finished_at.get_or_insert(*finished_at);
+                if phase.is_terminal() {
+                    clear_operator_pending_brief(status);
+                }
             }
             Self::AdvanceWorkToReady { ready } => {
                 for (work, ready_at) in ready {
@@ -762,6 +836,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         state.finished_at.get_or_insert(*cancelled_at);
                     }
                 }
+                clear_operator_pending_brief(status);
             }
             Self::RollUpPhase { phase, started_at, finished_at } => {
                 // Derived Active roll-up is a continuation of the convoy voyage, not a new attempt.
@@ -780,6 +855,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     }
                     status.finished_at.get_or_insert(*finished_at);
                 }
+                if phase.is_terminal() {
+                    clear_operator_pending_brief(status);
+                }
             }
             Self::Settle { disposition, target_mismatches, finished_at } => {
                 let previous_phase = status.phase;
@@ -790,6 +868,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     status.finished_at = None;
                 }
                 status.finished_at.get_or_insert(*finished_at);
+                clear_operator_pending_brief(status);
             }
             Self::WorkLaunching { work, started_at, placement } => {
                 if let Some(state) = status.work.get_mut(work) {
@@ -862,15 +941,22 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::MarkConvoyAbandoned { finished_at, authority, reason } => {
                 status.phase = ConvoyPhase::Abandoned;
                 status.finished_at.get_or_insert(*finished_at);
-                status.message = Some(format!("abandoned by {authority:?}: {reason}"));
+                let actor = match authority {
+                    WorkCompletionAuthority::CrewRollup => "crew rollup".to_string(),
+                    WorkCompletionAuthority::HumanOverride => "human override".to_string(),
+                    WorkCompletionAuthority::Principal(principal) => principal.name.clone(),
+                    WorkCompletionAuthority::Unattributed => "unattributed".to_string(),
+                };
+                status.message = Some(format!("abandoned by {actor}: {reason}"));
                 for state in status.work.values_mut().filter(|state| !state.phase.is_terminal()) {
                     state.phase = WorkPhase::Abandoned;
-                    state.completion_authority = *authority;
+                    state.completion_authority = authority.clone();
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(reason.clone());
                 }
+                clear_operator_pending_brief(status);
             }
-            Self::MarkCrewCompleted { vessel, role, finished_at, message, disposition } => {
+            Self::MarkCrewCompleted { vessel, role, finished_at, message, disposition, decision_ledger_ref } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     // Duplicate settlement is sticky; changing the settled outcome records its own time.
                     if state.phase != CrewWorkPhase::Done
@@ -883,6 +969,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.message = message.clone();
                     if disposition.is_some() {
                         state.disposition = disposition.clone();
+                    }
+                    if decision_ledger_ref.is_some() {
+                        state.decision_ledger_ref = decision_ledger_ref.clone();
                     }
                 }
                 enter_landing_if_completion_claims_settled(status);
@@ -900,6 +989,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(message.clone());
                 }
+                clear_pending_brief_for(status, vessel, role);
             }
             Self::HandoffCrewWork { vessel, sender_role, target_role, handed_off_at, message } => {
                 if let Some(work) = status.work.get_mut(vessel) {
@@ -924,6 +1014,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         sender.finished_at = Some(*handed_off_at);
                         sender.message = Some(message.clone());
                     }
+                    clear_pending_brief_for(status, vessel, sender_role);
                 }
             }
             Self::ResumeCrewWork { vessel, role, resumed_at, prompt } => {
@@ -935,6 +1026,46 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.started_at.get_or_insert(*resumed_at);
                     state.finished_at = None;
                     state.message = Some(prompt.clone());
+                }
+                clear_pending_brief_for(status, vessel, role);
+            }
+            Self::SetPendingBrief { pending_brief } => {
+                status.turn_deliveries.entry(PENDING_BRIEF_DELIVERY_SOURCE.to_string()).or_default().pending_brief =
+                    Some(pending_brief.clone());
+            }
+            Self::ClearPendingBrief => {
+                clear_operator_pending_brief(status);
+            }
+            Self::DeliverPendingBrief { vessel, role, delivered_at, content, completion_message, disposition, decision_ledger_ref } => {
+                let matches_pending =
+                    status.pending_brief().is_some_and(|brief| brief.vessel == *vessel && brief.role == *role && brief.content == *content);
+                if !matches_pending {
+                    return;
+                }
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.phase = CrewWorkPhase::Done;
+                    state.finished_at = Some(*delivered_at);
+                    state.message = completion_message.clone();
+                    if disposition.is_some() {
+                        state.disposition = disposition.clone();
+                    }
+                    if decision_ledger_ref.is_some() {
+                        state.decision_ledger_ref = decision_ledger_ref.clone();
+                    }
+                }
+                clear_operator_pending_brief(status);
+                status.phase = ConvoyPhase::Active;
+                status.finished_at = None;
+                if let Some(work) = status.work.get_mut(vessel) {
+                    work.phase = WorkPhase::Running;
+                    work.finished_at = None;
+                    work.completion_authority = WorkCompletionAuthority::CrewRollup;
+                }
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.phase = CrewWorkPhase::Working;
+                    state.started_at.get_or_insert(*delivered_at);
+                    state.finished_at = None;
+                    state.message = Some(content.clone());
                 }
             }
             Self::RecordTurnDelivery { source, episode, vessel, role, prompt } => {
@@ -1097,8 +1228,9 @@ pub mod external_patches {
         finished_at: DateTime<Utc>,
         message: Option<String>,
         disposition: Option<String>,
+        decision_ledger_ref: Option<String>,
     ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::MarkCrewCompleted { vessel, role, finished_at, message, disposition }
+        ConvoyStatusPatch::MarkCrewCompleted { vessel, role, finished_at, message, disposition, decision_ledger_ref }
     }
 
     pub fn mark_crew_failed(vessel: String, role: String, finished_at: DateTime<Utc>, message: String) -> ConvoyStatusPatch {
@@ -1117,6 +1249,26 @@ pub mod external_patches {
 
     pub fn resume_crew_work(vessel: String, role: String, resumed_at: DateTime<Utc>, prompt: String) -> ConvoyStatusPatch {
         ConvoyStatusPatch::ResumeCrewWork { vessel, role, resumed_at, prompt }
+    }
+
+    pub fn set_pending_brief(pending_brief: PendingBrief) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::SetPendingBrief { pending_brief }
+    }
+
+    pub fn clear_pending_brief() -> ConvoyStatusPatch {
+        ConvoyStatusPatch::ClearPendingBrief
+    }
+
+    pub fn deliver_pending_brief(
+        vessel: String,
+        role: String,
+        delivered_at: DateTime<Utc>,
+        content: String,
+        completion_message: Option<String>,
+        disposition: Option<String>,
+        decision_ledger_ref: Option<String>,
+    ) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::DeliverPendingBrief { vessel, role, delivered_at, content, completion_message, disposition, decision_ledger_ref }
     }
 
     pub fn record_turn_delivery(

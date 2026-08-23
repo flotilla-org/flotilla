@@ -74,6 +74,7 @@ async fn vessel_metadata_and_status_roundtrip() {
     let created = resolver.create(&vessel_meta("convoy-fix-bug-123-implement"), &spec).await.expect("create should succeed");
     let updated = resolver
         .update_status("convoy-fix-bug-123-implement", &created.metadata.resource_version, &VesselStatus {
+            wait_reason: None,
             placement_decision: None,
             phase: VesselPhase::Ready,
             message: None,

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 pub use flotilla_protocol::IssueSource;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, ReplicationClass, Repository, RepositoryKey, TypedResolver};
+use crate::{resource::define_resource, status_patch::StatusPatch, ReplicaReadResolver, ReplicationClass, Repository, RepositoryKey};
 
 define_resource!(Project, "projects", ProjectSpec, ProjectStatus, ProjectStatusPatch, replication = ReplicationClass::Definitions);
 
@@ -44,6 +44,14 @@ pub struct ProjectStatus {
     pub dispatch_queue: Vec<DispatchQueueEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_queue_attention: Option<DispatchQueueAttention>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operational_entries: Option<OperationalEntriesCondition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationalEntriesCondition {
+    pub ready: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +75,7 @@ pub struct DispatchQueueAttention {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectStatusPatch {
     ReplaceDispatchQueue { queue: Vec<DispatchQueueEntry>, attention: Option<DispatchQueueAttention> },
+    ReplaceOperationalEntries { ready: bool, message: String },
 }
 
 impl StatusPatch<ProjectStatus> for ProjectStatusPatch {
@@ -75,6 +84,9 @@ impl StatusPatch<ProjectStatus> for ProjectStatusPatch {
             Self::ReplaceDispatchQueue { queue, attention } => {
                 status.dispatch_queue.clone_from(queue);
                 status.dispatch_queue_attention.clone_from(attention);
+            }
+            Self::ReplaceOperationalEntries { ready, message } => {
+                status.operational_entries = Some(OperationalEntriesCondition { ready: *ready, message: message.clone() });
             }
         }
     }
@@ -122,7 +134,7 @@ pub enum IssueSourceResolution {
     Unavailable(IssueSourceUnavailable),
 }
 
-pub async fn resolve_project_issue_sources(repositories: &TypedResolver<Repository>, project: &ProjectSpec) -> IssueSourceResolution {
+pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Repository>, project: &ProjectSpec) -> IssueSourceResolution {
     if let Some(source) = &project.issue_source {
         return IssueSourceResolution::Available { sources: vec![source.clone()] };
     }
@@ -138,7 +150,7 @@ pub async fn resolve_project_issue_sources(repositories: &TypedResolver<Reposito
                 });
             }
         };
-        if let Some(forge) = repository.spec.forge() {
+        if let Some(forge) = repository.object.spec.forge() {
             sources.insert(IssueSource { service: forge.service_url.clone(), scope: forge.repository.clone() });
         }
     }

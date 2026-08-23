@@ -80,7 +80,7 @@ pub(super) async fn resolve_binary_path(runner: &dyn CommandRunner, command: &st
             "sh",
             &["-c", "command -v \"$1\"", "flotilla-binary-discovery", command],
             Path::new("."),
-            &crate::providers::ChannelLabel::Noop,
+            &crate::providers::ChannelLabel::Default,
         )
         .await
     {

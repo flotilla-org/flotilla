@@ -92,6 +92,13 @@ impl ResourceBackend {
         }
     }
 
+    pub(crate) async fn delete_decode_quarantine<T: Resource>(&self, namespace: &str, name: &str) -> Result<bool, ResourceError> {
+        match self {
+            Self::Sqlite(backend) => backend.delete_decode_quarantine_typed::<T>(namespace, name).await,
+            Self::InMemory(_) | Self::Http(_) => Ok(false),
+        }
+    }
+
     async fn record_field_ownership_violation(&self, violation: FieldOwnershipViolation) -> Result<(), ResourceError> {
         match self {
             Self::InMemory(backend) => {
