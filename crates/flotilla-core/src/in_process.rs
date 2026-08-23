@@ -5583,7 +5583,7 @@ impl InProcessDaemon {
         Ok((name, project.spec.repositories.len()))
     }
 
-    async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>), String> {
+    async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
         validate_project_name(name)?;
         let namespace = self.provisioning_namespace().await;
         let project =
@@ -5613,10 +5613,7 @@ impl InProcessDaemon {
             .spec
             .repositories
             .len();
-        let converged = !changes.is_empty();
-        let mut reported = changes;
-        reported.extend(operational_entries.into_iter().map(|outcome| format!("entry outcome: {outcome}")));
-        Ok((members, converged, reported))
+        Ok((members, !changes.is_empty(), changes, operational_entries))
     }
 
     async fn materialize_project_declaration(
@@ -5809,7 +5806,7 @@ impl InProcessDaemon {
         let mut command_provenance = BTreeMap::<RepositoryKey, Vec<serde_json::Value>>::new();
         let mut outcomes = Vec::new();
         for source in sources {
-            if let Err(error) = self.collect_operational_entries(
+            self.collect_operational_entries(
                 project_name,
                 &aliases,
                 &all_code,
@@ -5819,10 +5816,7 @@ impl InProcessDaemon {
                 &mut commands,
                 &mut command_provenance,
                 &mut outcomes,
-            ) {
-                self.patch_project_operational_entries(&namespace, project_name, false, &error).await?;
-                return Err(error);
-            }
+            )?;
         }
 
         let templates = self.resource_backend.clone().using::<WorkflowTemplate>(&namespace);
@@ -9838,7 +9832,9 @@ impl InProcessDaemon {
                 description: command.description().to_string(),
             });
             let result = match self.project_refresh(name).await {
-                Ok((members, converged, changes)) => CommandValue::ProjectRefreshed { name: name.clone(), members, converged, changes },
+                Ok((members, converged, changes, operational_entries)) => {
+                    CommandValue::ProjectRefreshed { name: name.clone(), members, converged, changes, operational_entries }
+                }
                 Err(message) => CommandValue::Error { message },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {

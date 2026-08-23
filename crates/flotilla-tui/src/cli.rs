@@ -775,11 +775,9 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::ProjectAdded { name } => format!("project added: {name}"),
         CommandValue::ProjectApplied { name } => format!("project applied: {name}"),
         CommandValue::ProjectRegistered { name, members } => format!("project registered: {name} ({members} members)"),
-        CommandValue::ProjectRefreshed { name, members, converged, changes } => {
-            let entry_outcomes = changes.iter().filter_map(|change| change.strip_prefix("entry outcome: ")).collect::<Vec<_>>();
-            let material_changes = changes.iter().filter(|change| !change.starts_with("entry outcome: ")).cloned().collect::<Vec<_>>();
-            let outcome = if *converged { format!("changed: {}", material_changes.join(", ")) } else { "already current".to_string() };
-            let entries = if entry_outcomes.is_empty() { String::new() } else { format!("\n{}", entry_outcomes.join("\n")) };
+        CommandValue::ProjectRefreshed { name, members, converged, changes, operational_entries } => {
+            let outcome = if *converged { format!("changed: {}", changes.join(", ")) } else { "already current".to_string() };
+            let entries = if operational_entries.is_empty() { String::new() } else { format!("\n{}", operational_entries.join("\n")) };
             format!("project refreshed: {name} ({members} members, {outcome}){entries}")
         }
     }

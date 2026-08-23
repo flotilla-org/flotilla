@@ -489,10 +489,8 @@ async fn project_refresh_is_one_way_and_keeps_alias_repository_keys_stable_acros
             name: "demo".to_string(),
             members: 2,
             converged: true,
-            changes: vec![
-                "Project/demo".to_string(),
-                "entry outcome: operational entries refused: an ops member has no local checkout on this host".to_string(),
-            ],
+            changes: vec!["Project/demo".to_string()],
+            operational_entries: vec!["operational entries refused: an ops member has no local checkout on this host".to_string()],
         }
     );
     let refreshed = projects.get("demo").await.expect("refreshed project");
@@ -507,7 +505,8 @@ async fn project_refresh_is_one_way_and_keeps_alias_repository_keys_stable_acros
             name: "demo".to_string(),
             members: 2,
             converged: false,
-            changes: vec!["entry outcome: operational entries refused: an ops member has no local checkout on this host".to_string()],
+            changes: Vec::new(),
+            operational_entries: vec!["operational entries refused: an ops member has no local checkout on this host".to_string()],
         }
     );
 }
@@ -618,12 +617,12 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
             name: "demo".to_string(),
             members: 3,
             converged: true,
-            changes: vec![
-                "WorkflowTemplate/scoped".to_string(),
-                "entry outcome: all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
-                format!("entry outcome: quartermaster.entry: ConvoyEnsure/{ensure_name} accepted"),
-                "entry outcome: test-command.entry: verification command `test` accepted".to_string(),
-                "entry outcome: verification-commands/this-is-a-workflow.md: WorkflowTemplate/scoped accepted".to_string(),
+            changes: vec!["WorkflowTemplate/scoped".to_string()],
+            operational_entries: vec![
+                "all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
+                format!("quartermaster.entry: ConvoyEnsure/{ensure_name} accepted"),
+                "test-command.entry: verification command `test` accepted".to_string(),
+                "verification-commands/this-is-a-workflow.md: WorkflowTemplate/scoped accepted".to_string(),
             ],
         }
     );
@@ -636,11 +635,11 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
             name: "demo".to_string(),
             members: 3,
             converged: true,
-            changes: vec![
-                format!("deleted ConvoyEnsure/{ensure_name}"),
-                "entry outcome: all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
-                "entry outcome: test-command.entry: verification command `test` accepted".to_string(),
-                "entry outcome: verification-commands/this-is-a-workflow.md: WorkflowTemplate/scoped accepted".to_string(),
+            changes: vec![format!("deleted ConvoyEnsure/{ensure_name}"),],
+            operational_entries: vec![
+                "all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
+                "test-command.entry: verification command `test` accepted".to_string(),
+                "verification-commands/this-is-a-workflow.md: WorkflowTemplate/scoped accepted".to_string(),
             ],
         }
     );
@@ -657,10 +656,10 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
             name: "demo".to_string(),
             members: 3,
             converged: true,
-            changes: vec![
-                "deleted WorkflowTemplate/scoped".to_string(),
-                "entry outcome: all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
-                "entry outcome: test-command.entry: verification command `test` accepted".to_string(),
+            changes: vec!["deleted WorkflowTemplate/scoped".to_string()],
+            operational_entries: vec![
+                "all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
+                "test-command.entry: verification command `test` accepted".to_string(),
             ],
         }
     );
@@ -762,7 +761,8 @@ async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
         name: "replicated".to_string(),
         members: 2,
         converged: false,
-        changes: Vec::new()
+        changes: Vec::new(),
+        operational_entries: Vec::new(),
     });
     assert!(
         matches!(backend.using::<Project>("flotilla").get("replicated").await, Err(flotilla_resources::ResourceError::NotFound { .. })),
