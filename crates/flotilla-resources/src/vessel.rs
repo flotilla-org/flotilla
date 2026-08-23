@@ -156,6 +156,7 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
             }
             Self::MarkTearingDown => {
                 status.phase = VesselPhase::TearingDown;
+                status.wait_reason = None;
             }
             Self::MarkFailed { message } => {
                 status.phase = VesselPhase::Failed;

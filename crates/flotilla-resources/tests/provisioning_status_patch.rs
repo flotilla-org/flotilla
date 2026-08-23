@@ -325,6 +325,20 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
 }
 
 #[test]
+fn vessel_teardown_clears_a_provisioning_wait_reason() {
+    let mut status = VesselStatus {
+        phase: VesselPhase::Provisioning,
+        wait_reason: Some(flotilla_resources::EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: "codex-login".to_string() }),
+        ..Default::default()
+    };
+
+    VesselStatusPatch::MarkTearingDown.apply(&mut status);
+
+    assert_eq!(status.phase, VesselPhase::TearingDown);
+    assert_eq!(status.wait_reason, None);
+}
+
+#[test]
 fn presentation_status_patch_marks_active_torn_down_and_failed() {
     let mut status = PresentationStatus::default();
     let ready_at = Utc.timestamp_opt(10, 0).single().expect("timestamp");
