@@ -4628,6 +4628,9 @@ mod tests {
         fs::create_dir_all(&config_base).expect("config directory");
         fs::write(config_base.join("daemon.toml"), "machine_id = \"codex-material-test\"\n").expect("daemon config");
         let home = temp.path().join("home");
+        let skills = home.join(".codex/skills/pr-shepherd");
+        fs::create_dir_all(&skills).expect("skill directory");
+        fs::write(skills.join("SKILL.md"), "# PR shepherd\n").expect("skill definition");
         let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
         fs::create_dir_all(&slot).expect("slot directory");
         let auth = slot.join("auth.json");
@@ -4716,6 +4719,9 @@ mod tests {
         fs::create_dir_all(&config_base).expect("config directory");
         fs::write(config_base.join("daemon.toml"), "machine_id = \"codex-material-conflict-test\"\n").expect("daemon config");
         let home = temp.path().join("home");
+        let skills = home.join(".codex/skills/pr-shepherd");
+        fs::create_dir_all(&skills).expect("skill directory");
+        fs::write(skills.join("SKILL.md"), "# PR shepherd\n").expect("skill definition");
         let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
         fs::create_dir_all(&slot).expect("slot directory");
         let auth = slot.join("auth.json");
@@ -4803,6 +4809,9 @@ mod tests {
         fs::create_dir_all(&config_base).expect("config directory");
         fs::write(config_base.join("daemon.toml"), "machine_id = \"material-pool-registry-wait-test\"\n").expect("daemon config");
         let home = temp.path().join("home");
+        let skills = home.join(".codex/skills/pr-shepherd");
+        fs::create_dir_all(&skills).expect("skill directory");
+        fs::write(skills.join("SKILL.md"), "# PR shepherd\n").expect("skill definition");
         let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
         fs::create_dir_all(&slot).expect("slot directory");
         let auth = slot.join("auth.json");
