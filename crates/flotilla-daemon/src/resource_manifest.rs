@@ -202,6 +202,21 @@ impl ResourceManifestReconciler {
 
         if resolution == Some("adopt") {
             self.adopt_live_spec(source, &identity, &existing).await?;
+
+            // The manifest rewrite crosses an await boundary and can take long
+            // enough for another writer to change the object. Never clear the
+            // resolution marker or write the captured snapshot back unless it
+            // is still the live spec; the next pass will retry the adoption
+            // from the newer value.
+            let current = get_resource_kind(&self.backend, &identity.namespace, &identity.kind, &identity.name)
+                .await
+                .map_err(|error| format!("{identity}: verify live spec after adoption: {error}"))?
+                .value;
+            let current_hash = resource_document_spec_hash(&current).map_err(|error| format!("{identity}: {error}"))?;
+            if current_hash != live_hash {
+                return Err(format!("{identity}: live spec changed while adopting; retrying on the next pass"));
+            }
+
             let mut adopted = existing;
             set_annotation(&mut adopted, LAST_APPLIED_HASH_ANNOTATION, &live_hash)?;
             stamp_manifest_ownership(&mut adopted, source)?;
@@ -287,10 +302,27 @@ impl ResourceManifestReconciler {
 
     async fn adopt_live_spec(&self, source: &Path, identity: &ObjectIdentity, existing: &Value) -> Result<(), String> {
         let path = self.root.join(source);
-        let mut documents = parse_documents(&path).map_err(|error| format!("{identity}: {error}"))?;
+        let source = source.to_path_buf();
+        let identity = identity.clone();
+        let task_identity = identity.clone();
+        let existing = existing.clone();
+        let default_namespace = self.default_namespace.clone();
+        tokio::task::spawn_blocking(move || Self::adopt_live_spec_blocking(&path, &source, &task_identity, &existing, &default_namespace))
+            .await
+            .map_err(|error| format!("{identity}: manifest adoption task failed: {error}"))?
+    }
+
+    fn adopt_live_spec_blocking(
+        path: &Path,
+        source: &Path,
+        identity: &ObjectIdentity,
+        existing: &Value,
+        default_namespace: &str,
+    ) -> Result<(), String> {
+        let mut documents = parse_documents(path).map_err(|error| format!("{identity}: {error}"))?;
         let document = documents
             .iter_mut()
-            .find(|document| document_identity(document, &self.default_namespace).as_ref() == Ok(identity))
+            .find(|document| document_identity(document, default_namespace).as_ref() == Ok(identity))
             .ok_or_else(|| format!("{identity}: manifest source {} no longer contains the object", source.display()))?;
         document["spec"] = existing["spec"].clone();
         let rendered =
@@ -306,11 +338,18 @@ impl ResourceManifestReconciler {
         let parent = path.parent().ok_or_else(|| format!("{identity}: manifest source has no parent"))?;
         let mut temporary = tempfile::NamedTempFile::new_in(parent)
             .map_err(|error| format!("{identity}: create temporary manifest beside {}: {error}", source.display()))?;
+        let permissions = std::fs::metadata(path)
+            .map_err(|error| format!("{identity}: inspect manifest {} permissions: {error}", source.display()))?
+            .permissions();
+        temporary
+            .as_file()
+            .set_permissions(permissions)
+            .map_err(|error| format!("{identity}: preserve manifest {} permissions: {error}", source.display()))?;
         temporary
             .write_all(rendered.as_bytes())
             .and_then(|()| temporary.flush())
             .map_err(|error| format!("{identity}: write temporary manifest for {}: {error}", source.display()))?;
-        temporary.persist(&path).map_err(|error| format!("{identity}: replace manifest {}: {}", source.display(), error.error))?;
+        temporary.persist(path).map_err(|error| format!("{identity}: replace manifest {}: {}", source.display(), error.error))?;
         Ok(())
     }
 
