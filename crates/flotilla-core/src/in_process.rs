@@ -50,9 +50,9 @@ use flotilla_resources::{
     HoldAct, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
     InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
     LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
-    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ReadResourceObject,
-    Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
-    SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
+    ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
     WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
@@ -4928,7 +4928,7 @@ impl InProcessDaemon {
                 declaration.name
             ));
         }
-        let changes = self.materialize_project_declaration(declaration, inspection).await?;
+        let (changes, operational_entries) = self.materialize_project_declaration(declaration, inspection).await?;
         let members = self
             .resource_backend
             .clone()
@@ -4939,14 +4939,17 @@ impl InProcessDaemon {
             .spec
             .repositories
             .len();
-        Ok((members, !changes.is_empty(), changes))
+        let converged = !changes.is_empty();
+        let mut reported = changes;
+        reported.extend(operational_entries.into_iter().map(|outcome| format!("entry outcome: {outcome}")));
+        Ok((members, converged, reported))
     }
 
     async fn materialize_project_declaration(
         &self,
         declaration: ProjectDeclaration,
         inspection: ProjectDeclarationInspection,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<(Vec<String>, Vec<String>), String> {
         validate_project_name(&declaration.name)?;
         let namespace = self.provisioning_namespace().await;
         let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
@@ -5026,15 +5029,23 @@ impl InProcessDaemon {
             existing_project.as_ref().is_none_or(|project| project.spec != spec || project.metadata.annotations != meta.annotations);
         projects.apply(&meta, &spec).await.map_err(|error| error.to_string())?;
         let mut changes = if converged { vec![format!("Project/{}", declaration.name)] } else { Vec::new() };
-        changes.extend(self.materialize_project_operational_entries(&declaration.name, &bootstrap_inspection).await?);
-        Ok(changes)
+        let (operational_changes, operational_entries) =
+            match self.materialize_project_operational_entries(&declaration.name, &bootstrap_inspection).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.patch_project_operational_entries(&namespace, &declaration.name, false, &error).await?;
+                    return Err(format!("operational entry refused: {error}"));
+                }
+            };
+        changes.extend(operational_changes);
+        Ok((changes, operational_entries))
     }
 
     async fn materialize_project_operational_entries(
         &self,
         project_name: &str,
         bootstrap: &ProjectDeclarationInspection,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<(Vec<String>, Vec<String>), String> {
         let namespace = self.provisioning_namespace().await;
         let project =
             self.resource_backend.clone().definitions::<Project>(&namespace).get(project_name).await.map_err(|e| e.to_string())?;
@@ -5104,15 +5115,18 @@ impl InProcessDaemon {
         // unavailable source: that could erase definitions materialized by a
         // previous refresh on a host that had the checkout.
         if unavailable_source {
-            return Ok(Vec::new());
+            let message = "operational entries refused: an ops member has no local checkout on this host".to_string();
+            self.patch_project_operational_entries(&namespace, project_name, false, &message).await?;
+            return Ok((Vec::new(), vec![message]));
         }
 
         let mut workflows = BTreeMap::new();
         let mut ensures = BTreeMap::new();
         let mut commands = BTreeMap::<RepositoryKey, BTreeMap<String, String>>::new();
         let mut command_provenance = BTreeMap::<RepositoryKey, Vec<serde_json::Value>>::new();
+        let mut outcomes = Vec::new();
         for source in sources {
-            self.collect_operational_entries(
+            if let Err(error) = self.collect_operational_entries(
                 project_name,
                 &aliases,
                 &all_code,
@@ -5121,7 +5135,11 @@ impl InProcessDaemon {
                 &mut ensures,
                 &mut commands,
                 &mut command_provenance,
-            )?;
+                &mut outcomes,
+            ) {
+                self.patch_project_operational_entries(&namespace, project_name, false, &error).await?;
+                return Err(error);
+            }
         }
 
         let templates = self.resource_backend.clone().using::<WorkflowTemplate>(&namespace);
@@ -5259,7 +5277,25 @@ impl InProcessDaemon {
             changes.push(format!("Repository/{} verification commands", stale.metadata.name));
         }
         changes.sort();
-        Ok(changes)
+        self.patch_project_operational_entries(&namespace, project_name, true, &outcomes.join("; ")).await?;
+        Ok((changes, outcomes))
+    }
+
+    async fn patch_project_operational_entries(
+        &self,
+        namespace: &str,
+        project_name: &str,
+        ready: bool,
+        message: &str,
+    ) -> Result<(), String> {
+        apply_resource_status_patch(
+            &self.resource_backend.clone().using::<Project>(namespace),
+            project_name,
+            &ProjectStatusPatch::ReplaceOperationalEntries { ready, message: message.to_string() },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5273,14 +5309,14 @@ impl InProcessDaemon {
         ensures: &mut BTreeMap<String, (InputMeta, ConvoyEnsureSpec)>,
         commands: &mut BTreeMap<RepositoryKey, BTreeMap<String, String>>,
         command_provenance: &mut BTreeMap<RepositoryKey, Vec<serde_json::Value>>,
+        outcomes: &mut Vec<String>,
     ) -> Result<(), String> {
         let source_repository = source.repository.key();
         for file in source.files {
             let Some(entry) = parse_operational_entry(&file.contents).map_err(|error| format!("{}: {error}", file.path))? else {
                 continue;
             };
-            let requires_code_role =
-                matches!(&entry.definition, OperationalEntryDefinition::VerificationCommand { .. } | OperationalEntryDefinition::Ensure(_));
+            let requires_code_role = matches!(&entry.definition, OperationalEntryDefinition::VerificationCommand { .. });
             let targets = match entry.repos {
                 Some(repo_aliases) => repo_aliases
                     .into_iter()
@@ -5310,6 +5346,7 @@ impl InProcessDaemon {
             });
             match entry.definition {
                 OperationalEntryDefinition::WorkflowTemplate(mut spec) => {
+                    outcomes.push(format!("{}: WorkflowTemplate/{} accepted", file.path, entry.name));
                     for vessel in &mut spec.vessels {
                         vessel.repository_refs = Some(targets.clone());
                     }
@@ -5331,6 +5368,7 @@ impl InProcessDaemon {
                     }
                 }
                 OperationalEntryDefinition::VerificationCommand { command } => {
+                    outcomes.push(format!("{}: verification command `{}` accepted", file.path, entry.name));
                     for target in targets {
                         if commands.entry(target.clone()).or_default().insert(entry.name.clone(), command.clone()).is_some() {
                             return Err(format!("duplicate verification command `{}` for repository {target}", entry.name));
@@ -5339,6 +5377,7 @@ impl InProcessDaemon {
                     }
                 }
                 OperationalEntryDefinition::Ensure(ensure) => {
+                    outcomes.push(format!("{}: ConvoyEnsure/{} accepted", file.path, entry.name));
                     let mut meta = InputMeta::builder()
                         .name(entry.name.clone())
                         .annotations(BTreeMap::from([

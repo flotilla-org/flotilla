@@ -365,7 +365,15 @@ async fn project_refresh_is_one_way_and_keeps_alias_repository_keys_stable_acros
     .expect("update declaration");
     assert_eq!(
         execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,
-        CommandValue::ProjectRefreshed { name: "demo".to_string(), members: 2, converged: true, changes: vec!["Project/demo".to_string()] }
+        CommandValue::ProjectRefreshed {
+            name: "demo".to_string(),
+            members: 2,
+            converged: true,
+            changes: vec![
+                "Project/demo".to_string(),
+                "entry outcome: operational entries refused: an ops member has no local checkout on this host".to_string(),
+            ],
+        }
     );
     let refreshed = projects.get("demo").await.expect("refreshed project");
     assert_eq!(refreshed.spec.display_name, "demo");
@@ -375,7 +383,12 @@ async fn project_refresh_is_one_way_and_keeps_alias_repository_keys_stable_acros
     assert_eq!(refreshed.metadata.annotations.get(BOOTSTRAP_COMMIT_ANNOTATION).map(String::as_str), Some("commit-two"));
     assert_eq!(
         execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,
-        CommandValue::ProjectRefreshed { name: "demo".to_string(), members: 2, converged: false, changes: Vec::new() }
+        CommandValue::ProjectRefreshed {
+            name: "demo".to_string(),
+            members: 2,
+            converged: false,
+            changes: vec!["entry outcome: operational entries refused: an ops member has no local checkout on this host".to_string()],
+        }
     );
 }
 
@@ -410,7 +423,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let ensure_path = tmp.path().join("quartermaster.entry");
     std::fs::write(
         &ensure_path,
-        "---\nkind: ensure\nname: quartermaster\nrepos: [app]\n---\nworkflow: all-code\nstance: trusted\npresents-as: fleet\n",
+        "---\nkind: ensure\nname: quartermaster\nrepos: [operations]\n---\nworkflow: all-code\nstance: trusted\npresents-as: fleet\n",
     )
     .expect("write standing convoy ensure");
 
@@ -423,6 +436,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let project = backend.using::<Project>("flotilla").get("demo").await.expect("project");
     let app = project.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("app")).expect("app");
     let docs = project.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("docs")).expect("docs");
+    let operations = project.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("operations")).expect("operations");
     let workflows = backend.using::<WorkflowTemplate>("flotilla");
     let scoped = workflows.get("scoped").await.expect("scoped workflow");
     assert_eq!(scoped.spec.vessels[0].repository_refs.as_deref(), Some(std::slice::from_ref(&app.repo)));
@@ -442,7 +456,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let ensure = ensures.get("quartermaster").await.expect("materialized standing convoy ensure");
     assert_eq!(ensure.spec.project_ref, "demo");
     assert_eq!(ensure.spec.workflow_ref, "all-code");
-    assert_eq!(ensure.spec.repositories, vec![app.repo.clone()]);
+    assert_eq!(ensure.spec.repositories, vec![operations.repo.clone()]);
     assert_eq!(ensure.spec.stance, Some(Stance::Trusted));
     assert_eq!(ensure.metadata.annotations.get(SOURCE_COMMIT_ANNOTATION).map(String::as_str), Some("ops-commit"));
     assert_eq!(ensure.metadata.annotations.get(PRESENTS_AS_ANNOTATION).map(String::as_str), Some("fleet"));
@@ -461,7 +475,13 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
             name: "demo".to_string(),
             members: 3,
             converged: true,
-            changes: vec!["WorkflowTemplate/scoped".to_string()],
+            changes: vec![
+                "WorkflowTemplate/scoped".to_string(),
+                "entry outcome: all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
+                "entry outcome: quartermaster.entry: ConvoyEnsure/quartermaster accepted".to_string(),
+                "entry outcome: test-command.entry: verification command `test` accepted".to_string(),
+                "entry outcome: verification-commands/this-is-a-workflow.md: WorkflowTemplate/scoped accepted".to_string(),
+            ],
         }
     );
     assert_eq!(workflows.get("scoped").await.expect("converged workflow").spec, scoped.spec);
@@ -484,7 +504,12 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
             name: "demo".to_string(),
             members: 3,
             converged: true,
-            changes: vec!["deleted ConvoyEnsure/quartermaster".to_string()],
+            changes: vec![
+                "deleted ConvoyEnsure/quartermaster".to_string(),
+                "entry outcome: all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
+                "entry outcome: test-command.entry: verification command `test` accepted".to_string(),
+                "entry outcome: verification-commands/this-is-a-workflow.md: WorkflowTemplate/scoped accepted".to_string(),
+            ],
         }
     );
     assert!(matches!(ensures.get("quartermaster").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
@@ -500,7 +525,11 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
             name: "demo".to_string(),
             members: 3,
             converged: true,
-            changes: vec!["deleted WorkflowTemplate/scoped".to_string()],
+            changes: vec![
+                "deleted WorkflowTemplate/scoped".to_string(),
+                "entry outcome: all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
+                "entry outcome: test-command.entry: verification command `test` accepted".to_string(),
+            ],
         }
     );
     assert!(matches!(workflows.get("scoped").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
@@ -561,7 +590,7 @@ async fn ops_entry_rejects_a_hand_applied_workflow_name_collision() {
 
 #[tokio::test]
 async fn ops_entry_rejects_a_verification_command_targeting_a_non_code_member() {
-    let (daemon, _backend, _config, _runtime, tmp) = start_daemon().await;
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
     daemon
         .set_repository_inspector(Arc::new(DeclarationInspector {
@@ -591,6 +620,10 @@ async fn ops_entry_rejects_a_verification_command_targeting_a_non_code_member() 
                 && message.contains("without the code role")),
         "unexpected command result: {result:?}"
     );
+    let project = backend.definitions::<Project>("flotilla").get("demo").await.expect("project remains inspectable after refusal");
+    let condition = project.status.expect("project status").operational_entries.expect("operational entry condition");
+    assert!(!condition.ready);
+    assert!(condition.message.contains("invalid-command.entry"));
 }
 
 #[tokio::test]

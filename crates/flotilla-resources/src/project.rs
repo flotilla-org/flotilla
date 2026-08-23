@@ -44,6 +44,14 @@ pub struct ProjectStatus {
     pub dispatch_queue: Vec<DispatchQueueEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_queue_attention: Option<DispatchQueueAttention>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operational_entries: Option<OperationalEntriesCondition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationalEntriesCondition {
+    pub ready: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +75,7 @@ pub struct DispatchQueueAttention {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectStatusPatch {
     ReplaceDispatchQueue { queue: Vec<DispatchQueueEntry>, attention: Option<DispatchQueueAttention> },
+    ReplaceOperationalEntries { ready: bool, message: String },
 }
 
 impl StatusPatch<ProjectStatus> for ProjectStatusPatch {
@@ -75,6 +84,9 @@ impl StatusPatch<ProjectStatus> for ProjectStatusPatch {
             Self::ReplaceDispatchQueue { queue, attention } => {
                 status.dispatch_queue.clone_from(queue);
                 status.dispatch_queue_attention.clone_from(attention);
+            }
+            Self::ReplaceOperationalEntries { ready, message } => {
+                status.operational_entries = Some(OperationalEntriesCondition { ready: *ready, message: message.clone() });
             }
         }
     }

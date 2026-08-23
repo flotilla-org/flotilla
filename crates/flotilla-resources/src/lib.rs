@@ -112,8 +112,8 @@ pub use principal_attention::{
 };
 pub use project::{
     normalize_project_spec, resolve_project_issue_sources, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, IssueSource,
-    IssueSourceResolution, IssueSourceUnavailable, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatus,
-    ProjectStatusPatch, DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
+    IssueSourceResolution, IssueSourceUnavailable, OperationalEntriesCondition, Project, ProjectRepositoryRole, ProjectRepositorySpec,
+    ProjectSpec, ProjectStatus, ProjectStatusPatch, DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use registry::{
