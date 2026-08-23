@@ -787,8 +787,7 @@ impl CredentialStore {
         }
         let repositories = self
             .backend
-            .clone()
-            .using::<Repository>(&self.namespace)
+            .including_replicas::<Repository>(&self.namespace)
             .list()
             .await
             .map_err(|error| format!("list repository identities: {error}"))?;
@@ -797,9 +796,9 @@ impl CredentialStore {
             let repository = repositories
                 .items
                 .iter()
-                .find(|repository| repository.spec.key() == *key)
+                .find(|repository| repository.object.spec.key() == *key)
                 .ok_or_else(|| format!("repository scope references missing repository `{key}`"))?;
-            let forge = repository.spec.forge().ok_or_else(|| format!("repository `{key}` has no forge identity"))?;
+            let forge = repository.object.spec.forge().ok_or_else(|| format!("repository `{key}` has no forge identity"))?;
             let service = Url::parse(&forge.service_url).map_err(|error| format!("repository `{key}` has invalid forge URL: {error}"))?;
             if service.host_str() != Some("github.com") {
                 return Err(format!("repository `{key}` is not hosted on github.com"));
@@ -1578,7 +1577,7 @@ interactions:
     }
 
     #[tokio::test]
-    async fn github_app_delivery_rotates_the_file_before_expiry_without_restarting_the_environment() {
+    async fn github_app_delivery_uses_replicated_repository_scope_and_rotates_without_restarting_the_environment() {
         let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
         let clock = Arc::new(VirtualClock::new(now));
         let minter = Arc::new(FakeGithubAppTokenMinter {
@@ -1588,15 +1587,23 @@ interactions:
             ])),
             requests: StdMutex::new(Vec::new()),
         });
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let repository_root = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("repository-root"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("minting-root"));
         let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
         let repository_key = repository_spec.key();
-        backend
+        repository_root
             .clone()
             .using::<Repository>("flotilla")
             .create(&InputMeta::builder().name("flotilla".to_string()).build(), &repository_spec)
             .await
             .expect("create repository");
+        let repositories = repository_root.using::<Repository>("flotilla").list().await.expect("list repository source");
+        backend
+            .replica_writer::<Repository>(NodeId::new("repository-root"), "flotilla")
+            .replace(&repositories, Utc::now())
+            .await
+            .expect("replicate repository to minting root");
+        assert!(backend.using::<Repository>("flotilla").list().await.expect("list local repositories").items.is_empty());
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
