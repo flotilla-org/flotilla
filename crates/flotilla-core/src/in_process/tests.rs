@@ -482,6 +482,85 @@ async fn convoy_resolution_refuses_multiple_terminal_generations() {
 }
 
 #[tokio::test]
+async fn refused_convoy_reclaim_leaves_runtime_children_untouched() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    let repository = RepositoryKey("github.com-acme-standing".to_string());
+    let convoy_name = "failed-before-checkout";
+    let vessel_name = "failed-before-checkout-work";
+    let terminal_name = "terminal-failed-before-checkout-work-coder";
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &test_meta(convoy_name),
+            &ConvoySpec::builder()
+                .workflow_ref("quartermaster".to_string())
+                .adopted_checkout_refs(BTreeMap::from([(repository, "checkout-never-provisioned".to_string())]))
+                .build(),
+        )
+        .await
+        .expect("convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Failed,
+            ..Default::default()
+        })
+        .await
+        .expect("failed convoy");
+    backend
+        .clone()
+        .using::<Vessel>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name(vessel_name.to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]))
+                .build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: convoy_name.to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "contained".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("vessel");
+    backend
+        .clone()
+        .using::<ResourceTerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name(terminal_name.to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]))
+                .build(),
+            &ResourceTerminalSessionSpec {
+                env_ref: "environment-still-live".to_string(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("terminal session");
+
+    let refusal = daemon.reap_convoy_internal("flotilla", convoy_name, false).await.expect_err("unsafe reclaim must be refused");
+
+    assert!(refusal.contains("missing checkout integration evidence"));
+    assert!(convoys.get(convoy_name).await.is_ok(), "refusal must retain the convoy");
+    assert!(backend.clone().using::<Vessel>("flotilla").get(vessel_name).await.is_ok(), "refusal must retain the vessel");
+    assert!(
+        backend.clone().using::<ResourceTerminalSession>("flotilla").get(terminal_name).await.is_ok(),
+        "refusal must retain the terminal session"
+    );
+
+    daemon
+        .abandon_convoy_internal("flotilla", convoy_name, "operator accepts the unprovisioned checkout")
+        .await
+        .expect("the refused shape must remain recoverable through convoy abandon");
+    let abandoned = convoys.get(convoy_name).await.expect("abandon retains the convoy record");
+    assert_eq!(abandoned.status.expect("abandoned status").phase, ConvoyPhase::Abandoned);
+}
+
+#[tokio::test]
 async fn convoy_routing_falls_back_to_a_unique_terminal_generation_and_refuses_multiple() {
     let (daemon, _backend, _clock, _temp) = standing_ensure_fixture().await;
     seed_convoy_routing_row(&daemon, "convoy-one", Some("reviewer"), Some("flotilla"), flotilla_protocol::ConvoyPhase::Landed).await;
