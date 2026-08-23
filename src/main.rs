@@ -137,7 +137,7 @@ enum SubCommand {
     Ls,
     /// Attach to a running convoy crew session
     Attach {
-        /// Attach read-only without taking the controller seat
+        /// Observe without taking the controller seat from another client
         #[arg(long, conflicts_with_all = ["strict", "take"])]
         watch: bool,
         /// Refuse when another attachment holds the controller seat

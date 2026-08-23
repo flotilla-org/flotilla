@@ -8398,7 +8398,7 @@ impl InProcessDaemon {
         reference: &str,
         host: Option<&HostName>,
     ) -> Result<ResolvedAttach, String> {
-        self.resolve_attach_with_mode_internal(reference, host, false, AttachMode::Default).await
+        self.resolve_attach_with_mode_internal(reference, host, false, AttachMode::PreferTake).await
     }
 
     async fn resolve_attach_with_mode_internal(
@@ -8746,7 +8746,7 @@ impl InProcessDaemon {
             .as_deref()
             .or(binding.convoy.as_deref())
             .ok_or_else(|| "remote attach binding has neither a session nor convoy reference".to_string())?;
-        self.recursive_attach_plan_for_remote(&binding.host, reference, AttachMode::Default).await
+        self.recursive_attach_plan_for_remote(&binding.host, reference, AttachMode::PreferTake).await
     }
 
     async fn local_attach_plan_for_session(
