@@ -466,9 +466,7 @@ fn entry_rank(entry: &AwarenessEntry) -> (bool, std::cmp::Reverse<u8>, u8) {
 
 fn entry_is_terminal(entry: &AwarenessEntry) -> bool {
     match entry.phase {
-        Some(AwarenessPhase::Convoy(phase)) => {
-            matches!(phase, ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned)
-        }
+        Some(AwarenessPhase::Convoy(phase)) => phase.is_terminal(),
         Some(AwarenessPhase::Work(phase)) => {
             matches!(phase, WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled | WorkPhase::Abandoned)
         }
