@@ -10,7 +10,8 @@ use super::{ResolutionContext, ResolvedAction};
 const DOCKER_ATTACH_WRAPPER: &str = r#"
 container=$1
 workdir=$2
-shift 2
+attach_wrapper=$3
+shift 3
 lease=$$
 pid_file=/tmp/flotilla-attach-$lease.pid
 cleanup() {
@@ -22,16 +23,30 @@ cleanup() {
             kill -KILL "$pid" 2>/dev/null || true
         fi
         rm -f "$pid_file"
-    ' flotilla-attach-cleanup "$lease" "$pid_file" >/dev/null 2>&1 || true
+    ' flotilla-attach-cleanup "$lease" "$pid_file" >/dev/null 2>&1 &
+    cleanup_pid=$!
+    (
+        sleep 5
+        kill -TERM "$cleanup_pid" 2>/dev/null || exit 0
+        sleep 1
+        kill -KILL "$cleanup_pid" 2>/dev/null || true
+    ) &
+    watchdog_pid=$!
+    wait "$cleanup_pid" 2>/dev/null || true
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
 }
 trap cleanup EXIT HUP INT TERM
 if [ -n "$workdir" ]; then
-    set -- exec -it -w "$workdir" -e "FLOTILLA_ATTACH_LEASE=$lease" "$container" sh -c 'echo $$ > "$1"; shift; exec "$@"' flotilla-attach "$pid_file" "$@"
+    set -- exec -it -w "$workdir" -e "FLOTILLA_ATTACH_LEASE=$lease" "$container" sh -c "$attach_wrapper" flotilla-attach "$pid_file" "$@"
 else
-    set -- exec -it -e "FLOTILLA_ATTACH_LEASE=$lease" "$container" sh -c 'echo $$ > "$1"; shift; exec "$@"' flotilla-attach "$pid_file" "$@"
+    set -- exec -it -e "FLOTILLA_ATTACH_LEASE=$lease" "$container" sh -c "$attach_wrapper" flotilla-attach "$pid_file" "$@"
 fi
 docker "$@"
 "#;
+
+pub(super) const DOCKER_ATTACH_INNER_WRAPPER: &str =
+    r#"umask 077; set -C; exec 3>"$1" || exit 1; printf '%s\n' "$$" >&3; exec 3>&-; shift; exec "$@""#;
 
 /// Resolves a `Hop::EnterEnvironment` into environment-specific actions on the context.
 ///
@@ -72,6 +87,7 @@ impl EnvironmentHopResolver for DockerEnvironmentHopResolver {
             Arg::Literal("flotilla-docker-attach".into()),
             Arg::Quoted(container.to_string()),
             Arg::Quoted(context.working_directory.take().map_or_else(String::new, |dir| dir.to_string())),
+            Arg::Quoted(DOCKER_ATTACH_INNER_WRAPPER.into()),
         ];
         docker_args.extend(inner_args);
 

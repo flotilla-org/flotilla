@@ -1032,10 +1032,10 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
     assert_eq!(docker_nested[4], Arg::Quoted("container-abc".into()), "docker exec target should be container-abc");
 
     // Innermost args are flattened directly into the docker exec invocation
-    assert_eq!(docker_nested[6], Arg::Literal("cleat".into()), "innermost command should be cleat");
-    assert_eq!(docker_nested[7], Arg::Literal("attach".into()), "cleat subcommand should be attach");
-    assert_eq!(docker_nested[8], Arg::Literal(att_id.to_string()), "cleat should attach to correct session");
-    assert_eq!(docker_nested.len(), 9, "docker nested should have exactly 9 args");
+    assert_eq!(docker_nested[7], Arg::Literal("cleat".into()), "innermost command should be cleat");
+    assert_eq!(docker_nested[8], Arg::Literal("attach".into()), "cleat subcommand should be attach");
+    assert_eq!(docker_nested[9], Arg::Literal(att_id.to_string()), "cleat should attach to correct session");
+    assert_eq!(docker_nested.len(), 10, "docker nested should have exactly 10 args");
 
     // Verify flatten produces the expected structure
     let flat = flatten(outer_args, 0);

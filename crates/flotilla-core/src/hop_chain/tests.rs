@@ -140,10 +140,12 @@ fn docker_environment_wrap_supervises_and_reaps_the_exec_command() {
     assert!(wrapper.contains("trap cleanup EXIT HUP INT TERM"));
     assert!(wrapper.contains("FLOTILLA_ATTACH_LEASE=$lease"));
     assert!(wrapper.contains("kill -KILL \"$pid\""));
+    assert!(wrapper.contains("sleep 5"));
     assert_eq!(&args[3..], [
         Arg::Literal("flotilla-docker-attach".into()),
         Arg::Quoted("crew-container".into()),
         Arg::Quoted("/work/crew".into()),
+        Arg::Quoted(super::environment::DOCKER_ATTACH_INNER_WRAPPER.into()),
         Arg::Literal("cleat".into()),
         Arg::Literal("attach".into()),
         Arg::Quoted("session".into()),
@@ -206,7 +208,7 @@ wait "$pid"
     upstream
         .arg("-c")
         .arg(wrapper)
-        .args(["flotilla-docker-attach", "crew-container", "", "cleat", "attach"])
+        .args(["flotilla-docker-attach", "crew-container", "", super::environment::DOCKER_ATTACH_INNER_WRAPPER, "cleat", "attach"])
         .env("PATH", path)
         .env("FLOTILLA_TEST_PID", &observed_pid)
         .env("FLOTILLA_TEST_CALLS", &calls)
@@ -242,6 +244,77 @@ wait "$pid"
     assert!(process_state().is_none_or(|state| state == 'Z'), "lease owner should be dead");
     assert!(!std::path::Path::new(&pid_file).exists(), "cleanup should remove its pidfile");
     assert!(fs::read_to_string(calls).expect("fake Docker calls").contains("flotilla-attach-cleanup"));
+}
+
+#[cfg(unix)]
+#[test]
+fn docker_attach_lease_file_refuses_existing_symlink() {
+    use std::{fs, os::unix::fs::symlink, process::Command};
+
+    let temp = tempfile::tempdir().expect("lease test directory");
+    let target = temp.path().join("target");
+    let lease = temp.path().join("lease");
+    fs::write(&target, "preserve me").expect("write symlink target");
+    symlink(&target, &lease).expect("create hostile lease symlink");
+
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(super::environment::DOCKER_ATTACH_INNER_WRAPPER)
+        .arg("flotilla-attach")
+        .arg(&lease)
+        .arg("true")
+        .status()
+        .expect("run inner attach wrapper");
+
+    assert!(!status.success(), "an existing lease path must be refused");
+    assert_eq!(fs::read_to_string(target).expect("read symlink target"), "preserve me");
+}
+
+#[cfg(unix)]
+#[test]
+fn docker_attach_cleanup_is_bounded_when_transport_hangs() {
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        process::Command,
+        time::{Duration, Instant},
+    };
+
+    let environment = EnvironmentId::new("crew-box");
+    let resolver = DockerEnvironmentHopResolver::new(HashMap::from([(environment.clone(), "crew-container".to_string())]));
+    let mut context = context();
+    context.actions.push(ResolvedAction::Command(Vec::new()));
+    resolver.resolve_wrap(&environment, &mut context).expect("known environment");
+    let [ResolvedAction::Command(args)] = context.actions.as_slice() else { panic!("expected one supervised command") };
+    let Arg::Quoted(wrapper) = &args[2] else { panic!("wrapper must be a quoted shell program") };
+    let wrapper = wrapper.replace("sleep 5", "sleep 0.05").replace("sleep 1", "sleep 0.05");
+
+    let temp = tempfile::tempdir().expect("fake Docker directory");
+    let docker = temp.path().join("docker");
+    fs::write(
+        &docker,
+        r#"#!/bin/sh
+if [ "$6" = flotilla-attach-cleanup ]; then
+    trap '' HUP INT TERM
+    exec sleep 300
+fi
+"#,
+    )
+    .expect("write hanging Docker shim");
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).expect("make fake Docker shim executable");
+    let path = format!("{}:{}", temp.path().display(), std::env::var("PATH").unwrap_or_default());
+
+    let started = Instant::now();
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(wrapper)
+        .args(["flotilla-docker-attach", "crew-container", "", super::environment::DOCKER_ATTACH_INNER_WRAPPER])
+        .env("PATH", path)
+        .status()
+        .expect("run supervised attach with hanging cleanup");
+
+    assert!(status.success(), "cleanup timeout should preserve the attach command status");
+    assert!(started.elapsed() < Duration::from_secs(2), "cleanup watchdog should bound teardown delay");
 }
 
 #[derive(Default)]
@@ -306,7 +379,7 @@ fn resolver_composes_command_execution_inside_out() {
     assert_eq!(docker[0], Arg::Literal("sh".into()));
     assert_eq!(docker[1], Arg::Literal("-c".into()));
     assert_eq!(docker[4], Arg::Quoted("crew-container".into()));
-    assert_eq!(docker[6..], [Arg::Literal("cleat".into()), Arg::Literal("attach".into()), Arg::Quoted("session".into())]);
+    assert_eq!(docker[7..], [Arg::Literal("cleat".into()), Arg::Literal("attach".into()), Arg::Quoted("session".into())]);
     assert_eq!(*remote.calls.lock().expect("calls lock"), [HostName::new("udder")]);
     assert_eq!(*terminal.calls.lock().expect("calls lock"), [attachable]);
     assert_eq!(context.nesting_depth, 2);
