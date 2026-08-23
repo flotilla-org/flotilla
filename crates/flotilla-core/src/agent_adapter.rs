@@ -145,6 +145,7 @@ struct CrewBriefTemplateContext<'a> {
     assignment_text: &'a str,
     members: &'a [CrewBriefMember],
     handoff_members: Vec<&'a CrewBriefMember>,
+    has_in_crew_reviewer: bool,
 }
 
 pub fn build_crew_brief(
@@ -183,6 +184,7 @@ pub fn build_crew_brief_with_options(
         assignment_text,
         members,
         handoff_members: members.iter().filter(|member| member.is_agent && member.role != role).collect(),
+        has_in_crew_reviewer: members.iter().any(|member| member.is_agent && member.role == "reviewer"),
     })?;
     if !content.ends_with('\n') {
         content.push('\n');
@@ -963,6 +965,29 @@ mod tests {
         assert!(content.contains("--decision-ledger-ref '<comment URL>'"));
         assert!(content.contains("A claim without this pointer is accepted but flagged"));
         assert!(content.contains("## Assignment\n\nFix the flux capacitor."));
+    }
+
+    #[test]
+    fn duplicate_github_review_is_suppressed_only_for_in_crew_review() {
+        let single = brief_for(CrewAssignment::Prompt("Fix the flux capacitor."));
+        assert!(!single.contains("`in-vessel-review` label"));
+
+        let reviewed = build_crew_brief(
+            &TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "fix-delivery".to_string(),
+                vessel_ref: "vessel-fix-delivery-work".to_string(),
+            },
+            "work",
+            "coder",
+            CrewAssignment::Prompt("Fix the flux capacitor."),
+            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }, CrewBriefMember {
+                role: "reviewer".to_string(),
+                state: "latent".to_string(),
+                is_agent: true,
+            }],
+        );
+        assert!(reviewed.content.contains("apply the `in-vessel-review` label in the PR-create command itself"));
     }
 
     #[test]
