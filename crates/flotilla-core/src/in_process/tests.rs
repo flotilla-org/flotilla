@@ -249,10 +249,12 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
         .get("terminal-convoy-two-crew-work-reviewer")
         .await
         .expect("latent reviewer terminal");
-    let TerminalSessionSource::Agent { selector, .. } = &reviewer.spec.source else {
+    let TerminalSessionSource::Agent { selector, brief, .. } = &reviewer.spec.source else {
         panic!("reviewer must be an agent session");
     };
     assert_eq!(selector.adapter.as_deref(), Some("claude-code"));
+    assert!(brief.content.contains("- Minted credential repository scope:"));
+    assert!(brief.content.contains("  - `github-crew-pr`:\n    - `github.com-flotilla-org-flotilla`"));
     assert_eq!(reviewer.spec.env_ref, "contained-env");
     assert_eq!(reviewer.metadata.annotations.get(CREDENTIAL_REFS_ANNOTATION), Some(&r#"["claude-max","github-crew-pr"]"#.to_string()));
     assert_eq!(

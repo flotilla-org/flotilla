@@ -105,7 +105,7 @@ impl CrewBriefTemplateResolver {
         for repo_root in repo_roots {
             push_template_override(&mut overrides, repo_root.join(".flotilla").join(BRIEF_TEMPLATE_DIR).join(override_filename));
         }
-        CrewBriefRenderOptions { template: template.to_string(), overrides, fork_stance }
+        CrewBriefRenderOptions { template: template.to_string(), overrides, fork_stance, has_credential_scope: false }
     }
 }
 
@@ -122,11 +122,12 @@ pub struct CrewBriefRenderOptions {
     pub template: String,
     pub overrides: Vec<CrewBriefTemplateOverride>,
     pub fork_stance: bool,
+    pub has_credential_scope: bool,
 }
 
 impl Default for CrewBriefRenderOptions {
     fn default() -> Self {
-        Self { template: DEFAULT_CREW_BRIEF_TEMPLATE.to_string(), overrides: Vec::new(), fork_stance: false }
+        Self { template: DEFAULT_CREW_BRIEF_TEMPLATE.to_string(), overrides: Vec::new(), fork_stance: false, has_credential_scope: false }
     }
 }
 
@@ -145,6 +146,7 @@ struct CrewBriefTemplateContext<'a> {
     assignment_text: &'a str,
     members: &'a [CrewBriefMember],
     handoff_members: Vec<&'a CrewBriefMember>,
+    has_credential_scope: bool,
     has_in_crew_reviewer: bool,
 }
 
@@ -184,6 +186,7 @@ pub fn build_crew_brief_with_options(
         assignment_text,
         members,
         handoff_members: members.iter().filter(|member| member.is_agent && member.role != role).collect(),
+        has_credential_scope: options.has_credential_scope,
         has_in_crew_reviewer: members.iter().any(|member| member.is_agent && member.role == "reviewer"),
     })?;
     if !content.ends_with('\n') {
@@ -268,6 +271,7 @@ pub fn append_convoy_work_context(
     content: &mut String,
     convoy: &flotilla_resources::ResourceObject<flotilla_resources::Convoy>,
     repository_refs: &[flotilla_resources::RepositoryKey],
+    credential_scopes: &BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>,
 ) {
     content.push_str("\n\n## Work context\n\n");
     if let Some(branch) = &convoy.spec.r#ref {
@@ -276,6 +280,19 @@ pub fn append_convoy_work_context(
     content.push_str("- Repositories:\n");
     for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
         content.push_str(&format!("  - `{}` — {} (target `{}`)\n", repository.repo_ref, repository.url, repository.target_ref));
+    }
+    if !credential_scopes.is_empty() {
+        content.push_str("- Minted credential repository scope:\n");
+        for (credential, scope) in credential_scopes {
+            content.push_str(&format!("  - `{credential}`:\n"));
+            for repo_ref in scope {
+                let repository = convoy.spec.repositories.iter().find(|repository| &repository.repo_ref == repo_ref);
+                match repository {
+                    Some(repository) => content.push_str(&format!("    - `{}` — {}\n", repository.repo_ref, repository.url)),
+                    None => content.push_str(&format!("    - `{repo_ref}`\n")),
+                }
+            }
+        }
     }
     if let Some(change_request) = &convoy.spec.change_request {
         content.push_str(&format!(
@@ -852,7 +869,11 @@ impl AgentAdapterRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, process::Command as ProcessCommand, sync::Arc};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        process::Command as ProcessCommand,
+        sync::Arc,
+    };
 
     use chrono::Utc;
     use flotilla_protocol::{IssueRef, IssueSource, IssueState};
@@ -898,7 +919,7 @@ mod tests {
         let CrewSource::Agent { prompt, .. } = &coder.source else {
             panic!("default coder should be an agent");
         };
-        let brief = build_crew_brief(
+        let brief = build_crew_brief_with_options(
             &TerminalCrewContext {
                 namespace: "flotilla".to_string(),
                 convoy: "fix-delivery".to_string(),
@@ -908,7 +929,9 @@ mod tests {
             "coder",
             prompt.as_deref().map_or(CrewAssignment::Unassigned, CrewAssignment::Prompt),
             &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
-        );
+            &CrewBriefRenderOptions { has_credential_scope: true, ..CrewBriefRenderOptions::default() },
+        )
+        .expect("render scoped coder brief");
 
         assert!(brief.content.contains("The pull-request destination is the repository URL and target ref named in `## Work context`"));
         assert!(brief.content.contains("the issue source may be a different forge"));
@@ -919,6 +942,8 @@ mod tests {
         assert!(brief.content.contains("only when it explicitly supports the destination forge"));
         assert!(brief.content.contains("Do not merge it"));
         assert!(brief.content.contains("Clone scratch repositories outside the vessel checkout"));
+        assert!(brief.content.contains("park the verified commit"));
+        assert!(brief.content.contains("redispatched under the owning project"));
     }
 
     fn brief_for(assignment: CrewAssignment<'_>) -> String {
@@ -1028,7 +1053,12 @@ mod tests {
             "driver",
             CrewAssignment::Prompt("Pair with the user."),
             &[CrewBriefMember { role: "driver".to_string(), state: "active".to_string(), is_agent: true }],
-            &CrewBriefRenderOptions { template: "interactive-session.md".to_string(), overrides: Vec::new(), fork_stance: false },
+            &CrewBriefRenderOptions {
+                template: "interactive-session.md".to_string(),
+                overrides: Vec::new(),
+                fork_stance: false,
+                has_credential_scope: false,
+            },
         )
         .expect("render selected template")
         .content;
@@ -1054,7 +1084,12 @@ mod tests {
                 state: "active".to_string(),
                 is_agent: true,
             }],
-            &CrewBriefRenderOptions { template: "diff-review".to_string(), overrides: Vec::new(), fork_stance: true },
+            &CrewBriefRenderOptions {
+                template: "diff-review".to_string(),
+                overrides: Vec::new(),
+                fork_stance: true,
+                has_credential_scope: false,
+            },
         )
         .expect("render fork review brief")
         .content;
@@ -1079,7 +1114,12 @@ mod tests {
             "shepherd",
             CrewAssignment::Unassigned,
             &[CrewBriefMember { role: "shepherd".to_string(), state: "active".to_string(), is_agent: true }],
-            &CrewBriefRenderOptions { template: "shepherd".to_string(), overrides: Vec::new(), fork_stance: false },
+            &CrewBriefRenderOptions {
+                template: "shepherd".to_string(),
+                overrides: Vec::new(),
+                fork_stance: false,
+                has_credential_scope: true,
+            },
         )
         .expect("render shepherd brief")
         .content;
@@ -1093,6 +1133,8 @@ mod tests {
         assert!(brief.contains("Future events belong to a later engagement"));
         assert!(brief.contains("claim's linked `## Decision ledger` comment"));
         assert!(brief.contains("A missing ledger is a finding, not grounds to reject or wedge the claim"));
+        assert!(brief.contains("park the verified commit"));
+        assert!(brief.contains("redispatched under the owning project"));
         assert!(brief.contains("flotilla crew complete --message '<PR URL>'"));
         assert!(!brief.contains("wait-for-checks"));
         assert!(!brief.contains("No assignment was provided"));
@@ -1148,6 +1190,7 @@ mod tests {
                     source: "{% block delivery %}Pairing-specific delivery gate.{% endblock %}".to_string(),
                 }],
                 fork_stance: false,
+                has_credential_scope: false,
             },
         )
         .expect("render custom block-only template");
@@ -1257,9 +1300,16 @@ mod tests {
             status: None,
         };
         let mut content = String::new();
-        append_convoy_work_context(&mut content, &convoy, &[repo_ref]);
+        append_convoy_work_context(
+            &mut content,
+            &convoy,
+            std::slice::from_ref(&repo_ref),
+            &BTreeMap::from([("github-app".to_string(), BTreeSet::from([repo_ref.clone()]))]),
+        );
 
         assert!(content.contains("- `repo_widgets` — https://github.com/flotilla-org/flotilla (target `main`)"));
+        assert!(content.contains("- Minted credential repository scope:"));
+        assert!(content.contains("  - `github-app`:\n    - `repo_widgets` — https://github.com/flotilla-org/flotilla"));
         assert!(content.contains("- Bound pull request: `#1071` — Existing pull request (`repo_widgets`)"));
         assert!(content.contains("First issue body.\n\nSource-qualified reference: `https://github.com` / `flotilla-org/flotilla` / `810`"));
     }
