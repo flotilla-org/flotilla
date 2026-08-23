@@ -154,12 +154,16 @@ struct GithubAppDelivery {
     runner: Arc<dyn CommandRunner>,
     token_file: PathBuf,
     expires_at: DateTime<Utc>,
+    refresh_failures: usize,
 }
 
 pub(crate) struct CredentialRefreshError {
     pub(crate) environment_ref: String,
     pub(crate) message: String,
+    pub(crate) should_surface: bool,
 }
+
+const GITHUB_APP_REFRESH_FAILURE_THRESHOLD: usize = 3;
 
 #[derive(Debug)]
 struct ResolvedMaterial {
@@ -528,6 +532,7 @@ impl CredentialStore {
                         runner: Arc::clone(&runner),
                         token_file: github_app_token_file(paths, name),
                         expires_at,
+                        refresh_failures: 0,
                     },
                 );
             }
@@ -708,15 +713,18 @@ impl CredentialStore {
             let token = match self.github_app_minter.mint(&delivery.request).await {
                 Ok(token) => token,
                 Err(error) => {
+                    let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
                     errors.push(CredentialRefreshError {
                         environment_ref: key.0.clone(),
                         message: format!("credential `{}` adapter `github-app`: {error}", key.1),
+                        should_surface,
                     });
                     continue;
                 }
             };
             if let Err(error) = validate_scalar_material(&key.1, "github-app", token.value.trim_end()) {
-                errors.push(CredentialRefreshError { environment_ref: key.0.clone(), message: error });
+                let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                errors.push(CredentialRefreshError { environment_ref: key.0.clone(), message: error, should_surface });
                 continue;
             }
             let mut deliveries = self.github_app_deliveries.lock().await;
@@ -724,15 +732,28 @@ impl CredentialStore {
                 continue;
             };
             if let Err(error) = write_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
+                current.refresh_failures += 1;
                 errors.push(CredentialRefreshError {
                     environment_ref: key.0.clone(),
                     message: bounded_adapter_error(&key.1, "github-app", &error),
+                    should_surface: current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
+                        || self.clock.now() >= current.expires_at,
                 });
                 continue;
             }
             current.expires_at = token.expires_at;
+            current.refresh_failures = 0;
         }
         errors
+    }
+
+    async fn record_refresh_failure(&self, key: &(String, String), generation: uuid::Uuid) -> bool {
+        let mut deliveries = self.github_app_deliveries.lock().await;
+        let Some(current) = deliveries.get_mut(key).filter(|current| current.generation == generation) else {
+            return false;
+        };
+        current.refresh_failures += 1;
+        current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD || self.clock.now() >= current.expires_at
     }
 
     async fn spec(&self, name: &str) -> Result<CredentialSpecSpec, String> {
@@ -1316,7 +1337,7 @@ mod tests {
     }
 
     struct FakeGithubAppTokenMinter {
-        tokens: StdMutex<VecDeque<GithubAppToken>>,
+        tokens: StdMutex<VecDeque<Result<GithubAppToken, String>>>,
         requests: StdMutex<Vec<GithubAppMintRequest>>,
     }
 
@@ -1347,7 +1368,7 @@ mod tests {
     impl GithubAppTokenMinter for FakeGithubAppTokenMinter {
         async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, String> {
             self.requests.lock().expect("GitHub App requests lock").push(request.clone());
-            self.tokens.lock().expect("GitHub App tokens lock").pop_front().ok_or_else(|| "no fake token available".to_string())
+            self.tokens.lock().expect("GitHub App tokens lock").pop_front().unwrap_or_else(|| Err("no fake token available".to_string()))
         }
     }
 
@@ -1622,9 +1643,12 @@ interactions:
         let clock = Arc::new(VirtualClock::new(now));
         let minter = Arc::new(FakeGithubAppTokenMinter {
             tokens: StdMutex::new(VecDeque::from([
-                GithubAppToken { value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) },
-                GithubAppToken { value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) },
-                GithubAppToken { value: "installation-token-three".to_string(), expires_at: now + Duration::hours(3) },
+                Ok(GithubAppToken { value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) }),
+                Err("temporary outage one".to_string()),
+                Err("temporary outage two".to_string()),
+                Err("persistent outage".to_string()),
+                Ok(GithubAppToken { value: "installation-token-three".to_string(), expires_at: now + Duration::hours(3) }),
             ])),
             requests: StdMutex::new(Vec::new()),
         });
@@ -1699,8 +1723,15 @@ interactions:
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 2, "startup adoption must rebuild the delivery registration");
 
         clock.advance(Duration::minutes(115));
+        let first_failure = store.refresh_due_github_app_tokens().await;
+        assert_eq!(first_failure.len(), 1);
+        assert!(!first_failure[0].should_surface, "one transient failure must remain retryable");
+        let second_failure = store.refresh_due_github_app_tokens().await;
+        assert!(!second_failure[0].should_surface, "two transient failures must remain retryable");
+        let third_failure = store.refresh_due_github_app_tokens().await;
+        assert!(third_failure[0].should_surface, "a repeated unrefreshable delivery must become visible");
         assert!(store.refresh_due_github_app_tokens().await.is_empty());
-        assert_eq!(minter.requests.lock().expect("requests lock").len(), 3, "recovered material is re-minted at the refresh margin");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 6, "recovered material keeps retrying and eventually rotates");
         let token_writes =
             runner.writes.lock().expect("writes lock").iter().filter(|(path, _)| path.ends_with("token")).cloned().collect::<Vec<_>>();
         assert_eq!(token_writes.len(), 3);
