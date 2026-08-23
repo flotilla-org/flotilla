@@ -56,7 +56,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     agent_material::{AgentMaterialPrepareError, AgentMaterialRegistry},
-    credential::CredentialStore,
+    credential::{CredentialRefreshError, CredentialStore},
     dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
     environment_tools::EnvironmentToolProvisioner,
     resource_limits::file_descriptor_pressure_condition,
@@ -936,6 +936,18 @@ async fn reconcile_provisioned_environment(
         }
     }
 
+    if let Some(store) = &state.credential_store {
+        let credential_refs = credential_refs_from_environment(spec)?;
+        let credential_scopes = credential_scopes_from_environment(spec)?;
+        if let Err(error) = store.adopt_github_app_deliveries(env_id.as_str(), &credential_refs, &credential_scopes, handle.runner()).await
+        {
+            if error.should_surface {
+                surface_credential_refresh_error(&state.daemon, namespace, &error).await?;
+            }
+            return Err(format!("credential delivery adoption failed: {}; will retry", error.message));
+        }
+    }
+
     if state.daemon.environment_registry_for_environment(&env_id).is_none() {
         let adoption = async {
             let (bag, registry) = probe_provisioned_environment(state, &env_id, &handle).await?;
@@ -1362,7 +1374,10 @@ fn spawn_heartbeat_task_with_credentials(
         async move {
             if let Some(store) = credential_store.as_ref().as_ref() {
                 for error in store.refresh_due_github_app_tokens().await {
-                    warn!(%error, "failed to refresh GitHub App credential delivery");
+                    warn!(error = %error.message, environment = %error.environment_ref, "failed to refresh GitHub App credential delivery");
+                    if let Err(status_error) = surface_credential_refresh_error(&daemon, &namespace, &error).await {
+                        warn!(%status_error, environment = %error.environment_ref, "failed to surface credential refresh failure");
+                    }
                 }
             }
             if let Err(err) =
@@ -1373,6 +1388,20 @@ fn spawn_heartbeat_task_with_credentials(
             }
         }
     })
+}
+
+async fn surface_credential_refresh_error(daemon: &InProcessDaemon, namespace: &str, error: &CredentialRefreshError) -> Result<(), String> {
+    if !error.should_surface {
+        return Ok(());
+    }
+    flotilla_resources::apply_status_patch(
+        &daemon.resource_backend().using::<Environment>(namespace),
+        &error.environment_ref,
+        &EnvironmentStatusPatch::MarkFailed { message: format!("Credential delivery recovery failed: {}", error.message) },
+    )
+    .await
+    .map(|_| ())
+    .map_err(|status_error| status_error.to_string())
 }
 
 #[cfg(test)]
@@ -3612,6 +3641,57 @@ mod tests {
             )]),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_credential_refresh_failure_is_surfaced_but_a_transient_failure_is_not() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"credential-refresh-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let daemon = in_memory_daemon(Vec::new(), config).await;
+        let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
+        environments
+            .create(&InputMeta::builder().name("standing-vessel".to_string()).build(), &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    host_ref: "host-test".to_string(),
+                    image: "contained-image".to_string(),
+                    declared_agent_adapters: BTreeSet::new(),
+                    required_agent_adapters: BTreeSet::new(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: BTreeMap::new(),
+                }),
+            })
+            .await
+            .expect("create environment");
+        flotilla_resources::apply_status_patch(&environments, "standing-vessel", &EnvironmentStatusPatch::MarkReady {
+            docker_container_id: Some("container".to_string()),
+            image_ref: None,
+            image_digest: None,
+        })
+        .await
+        .expect("mark environment ready");
+
+        surface_credential_refresh_error(&daemon, NAMESPACE, &CredentialRefreshError {
+            environment_ref: "standing-vessel".to_string(),
+            message: "temporary outage".to_string(),
+            should_surface: false,
+        })
+        .await
+        .expect("ignore transient failure");
+        assert_eq!(environments.get("standing-vessel").await.expect("environment").status.expect("status").phase, EnvironmentPhase::Ready);
+
+        surface_credential_refresh_error(&daemon, NAMESPACE, &CredentialRefreshError {
+            environment_ref: "standing-vessel".to_string(),
+            message: "repeated outage".to_string(),
+            should_surface: true,
+        })
+        .await
+        .expect("surface repeated failure");
+        let status = environments.get("standing-vessel").await.expect("environment").status.expect("status");
+        assert_eq!(status.phase, EnvironmentPhase::Failed);
+        assert!(status.message.is_some_and(|message| message.contains("repeated outage")));
     }
 
     /// #1413 leg 1: once the convoy is Landed, the checkout authority's

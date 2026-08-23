@@ -143,6 +143,7 @@ pub(crate) struct CredentialStore {
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
     github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
+    github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
 }
 
 const GITHUB_APP_REFRESH_MARGIN: Duration = Duration::minutes(5);
@@ -154,7 +155,17 @@ struct GithubAppDelivery {
     runner: Arc<dyn CommandRunner>,
     token_file: PathBuf,
     expires_at: DateTime<Utc>,
+    refresh_failures: usize,
 }
+
+#[derive(Debug)]
+pub(crate) struct CredentialRefreshError {
+    pub(crate) environment_ref: String,
+    pub(crate) message: String,
+    pub(crate) should_surface: bool,
+}
+
+const GITHUB_APP_REFRESH_FAILURE_THRESHOLD: usize = 3;
 
 #[derive(Debug)]
 struct ResolvedMaterial {
@@ -321,6 +332,7 @@ impl CredentialStore {
             git_config_fragments: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
             github_app_deliveries: Mutex::new(BTreeMap::new()),
+            github_app_adoption_failures: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -523,6 +535,7 @@ impl CredentialStore {
                         runner: Arc::clone(&runner),
                         token_file: github_app_token_file(paths, name),
                         expires_at,
+                        refresh_failures: 0,
                     },
                 );
             }
@@ -574,6 +587,56 @@ impl CredentialStore {
         }
         self.prepared.lock().await.extend(prepared_cache_keys);
         Ok(env.into_iter().collect())
+    }
+
+    /// Rebuild refresh registrations for an already-running environment from
+    /// its durable credential requirements. Reconciliation calls this on every
+    /// pass, so a live registration makes the operation a no-op.
+    pub(crate) async fn adopt_github_app_deliveries(
+        &self,
+        environment_ref: &str,
+        credential_refs: &BTreeSet<String>,
+        credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<(), CredentialRefreshError> {
+        let mut github_app_refs = BTreeSet::new();
+        for name in credential_refs {
+            let spec = match self.spec(name).await {
+                Ok(spec) => spec,
+                Err(message) => return Err(self.record_adoption_failure(environment_ref, message).await),
+            };
+            if matches!(spec.consumer, CredentialConsumer::GithubApp { .. }) {
+                github_app_refs.insert(name.clone());
+            }
+        }
+        let deliveries = self.github_app_deliveries.lock().await;
+        let already_adopted = github_app_refs.iter().all(|name| deliveries.contains_key(&(environment_ref.to_string(), name.clone())));
+        drop(deliveries);
+        if github_app_refs.is_empty() || already_adopted {
+            self.github_app_adoption_failures.lock().await.remove(environment_ref);
+            return Ok(());
+        }
+        let github_app_scopes = credential_scopes
+            .iter()
+            .filter(|(name, _)| github_app_refs.contains(*name))
+            .map(|(name, scopes)| (name.clone(), scopes.clone()))
+            .collect();
+        if let Err(message) = self.prepare_scoped(environment_ref, &github_app_refs, &github_app_scopes, runner).await {
+            return Err(self.record_adoption_failure(environment_ref, message).await);
+        }
+        self.github_app_adoption_failures.lock().await.remove(environment_ref);
+        Ok(())
+    }
+
+    async fn record_adoption_failure(&self, environment_ref: &str, message: String) -> CredentialRefreshError {
+        let mut failures = self.github_app_adoption_failures.lock().await;
+        let failures = failures.entry(environment_ref.to_string()).or_default();
+        *failures += 1;
+        CredentialRefreshError {
+            environment_ref: environment_ref.to_string(),
+            message,
+            should_surface: *failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD,
+        }
     }
 
     pub(crate) async fn prepare_registry_pull(
@@ -652,6 +715,7 @@ impl CredentialStore {
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
         self.git_config_fragments.lock().await.remove(environment_ref);
         self.github_app_deliveries.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
+        self.github_app_adoption_failures.lock().await.remove(environment_ref);
         let config_dir = self.registry_configs.lock().await.remove(environment_ref);
         if let Some(config_dir) = config_dir {
             remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
@@ -662,7 +726,7 @@ impl CredentialStore {
     /// Re-mint and atomically replace GitHub App files that are approaching
     /// expiry. The daemon calls this from its host-side periodic loop; vessels
     /// receive only the resulting file and never the App signing material.
-    pub(crate) async fn refresh_due_github_app_tokens(&self) -> Vec<String> {
+    pub(crate) async fn refresh_due_github_app_tokens(&self) -> Vec<CredentialRefreshError> {
         let refresh_before = self.clock.now() + GITHUB_APP_REFRESH_MARGIN;
         let due = self
             .github_app_deliveries
@@ -677,12 +741,18 @@ impl CredentialStore {
             let token = match self.github_app_minter.mint(&delivery.request).await {
                 Ok(token) => token,
                 Err(error) => {
-                    errors.push(format!("credential `{}` adapter `github-app`: {error}", key.1));
+                    let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                    errors.push(CredentialRefreshError {
+                        environment_ref: key.0.clone(),
+                        message: format!("credential `{}` adapter `github-app`: {error}", key.1),
+                        should_surface,
+                    });
                     continue;
                 }
             };
             if let Err(error) = validate_scalar_material(&key.1, "github-app", token.value.trim_end()) {
-                errors.push(error);
+                let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                errors.push(CredentialRefreshError { environment_ref: key.0.clone(), message: error, should_surface });
                 continue;
             }
             let mut deliveries = self.github_app_deliveries.lock().await;
@@ -690,12 +760,28 @@ impl CredentialStore {
                 continue;
             };
             if let Err(error) = write_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
-                errors.push(bounded_adapter_error(&key.1, "github-app", &error));
+                current.refresh_failures += 1;
+                errors.push(CredentialRefreshError {
+                    environment_ref: key.0.clone(),
+                    message: bounded_adapter_error(&key.1, "github-app", &error),
+                    should_surface: current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
+                        || self.clock.now() >= current.expires_at,
+                });
                 continue;
             }
             current.expires_at = token.expires_at;
+            current.refresh_failures = 0;
         }
         errors
+    }
+
+    async fn record_refresh_failure(&self, key: &(String, String), generation: uuid::Uuid) -> bool {
+        let mut deliveries = self.github_app_deliveries.lock().await;
+        let Some(current) = deliveries.get_mut(key).filter(|current| current.generation == generation) else {
+            return false;
+        };
+        current.refresh_failures += 1;
+        current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD || self.clock.now() >= current.expires_at
     }
 
     async fn spec(&self, name: &str) -> Result<CredentialSpecSpec, String> {
@@ -1279,7 +1365,7 @@ mod tests {
     }
 
     struct FakeGithubAppTokenMinter {
-        tokens: StdMutex<VecDeque<GithubAppToken>>,
+        tokens: StdMutex<VecDeque<Result<GithubAppToken, String>>>,
         requests: StdMutex<Vec<GithubAppMintRequest>>,
     }
 
@@ -1310,7 +1396,7 @@ mod tests {
     impl GithubAppTokenMinter for FakeGithubAppTokenMinter {
         async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, String> {
             self.requests.lock().expect("GitHub App requests lock").push(request.clone());
-            self.tokens.lock().expect("GitHub App tokens lock").pop_front().ok_or_else(|| "no fake token available".to_string())
+            self.tokens.lock().expect("GitHub App tokens lock").pop_front().unwrap_or_else(|| Err("no fake token available".to_string()))
         }
     }
 
@@ -1580,13 +1666,20 @@ interactions:
     }
 
     #[tokio::test]
-    async fn github_app_delivery_uses_replicated_repository_scope_and_rotates_without_restarting_the_environment() {
+    async fn github_app_delivery_uses_replicated_scope_rebuilds_after_store_restart_and_rotates() {
         let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
         let clock = Arc::new(VirtualClock::new(now));
         let minter = Arc::new(FakeGithubAppTokenMinter {
             tokens: StdMutex::new(VecDeque::from([
-                GithubAppToken { value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) },
-                GithubAppToken { value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) },
+                Ok(GithubAppToken { value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) }),
+                Err("temporary adoption outage one".to_string()),
+                Err("temporary adoption outage two".to_string()),
+                Err("persistent adoption outage".to_string()),
+                Ok(GithubAppToken { value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) }),
+                Err("temporary outage one".to_string()),
+                Err("temporary outage two".to_string()),
+                Err("persistent outage".to_string()),
+                Ok(GithubAppToken { value: "installation-token-three".to_string(), expires_at: now + Duration::hours(3) }),
             ])),
             requests: StdMutex::new(Vec::new()),
         });
@@ -1623,7 +1716,7 @@ interactions:
             .expect("create credential declaration");
         let runner = Arc::new(RecordingRunner::default());
         let store = CredentialStore::new_with_github_app_minter(
-            backend,
+            backend.clone(),
             "flotilla",
             Arc::new(TestEnv::default()),
             EnvironmentBag::new(),
@@ -1647,31 +1740,75 @@ interactions:
         assert_eq!(environment.get("PATH"), Some(&"/state/credentials/github-app:/usr/bin:/bin".to_string()));
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 1);
 
-        clock.advance(Duration::minutes(54));
-        assert!(store.refresh_due_github_app_tokens().await.is_empty());
-        assert_eq!(minter.requests.lock().expect("requests lock").len(), 1, "fresh material must not be re-minted");
+        drop(store);
+        let store = CredentialStore::new_with_github_app_minter(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
+            PathBuf::from("/state"),
+        );
+        for expected_surface in [false, false, true] {
+            let error =
+                store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect_err("adoption outage");
+            assert_eq!(error.should_surface, expected_surface);
+        }
+        store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect("re-adopt standing vessel");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 5, "startup adoption retries and rebuilds the registration");
 
-        clock.advance(Duration::minutes(1));
+        clock.advance(Duration::minutes(115));
+        let first_failure = store.refresh_due_github_app_tokens().await;
+        assert_eq!(first_failure.len(), 1);
+        assert!(!first_failure[0].should_surface, "one transient failure must remain retryable");
+        let second_failure = store.refresh_due_github_app_tokens().await;
+        assert!(!second_failure[0].should_surface, "two transient failures must remain retryable");
+        let third_failure = store.refresh_due_github_app_tokens().await;
+        assert!(third_failure[0].should_surface, "a repeated unrefreshable delivery must become visible");
         assert!(store.refresh_due_github_app_tokens().await.is_empty());
-        assert_eq!(minter.requests.lock().expect("requests lock").len(), 2, "material is re-minted at the refresh margin");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 9, "recovered material keeps retrying and eventually rotates");
         let token_writes =
             runner.writes.lock().expect("writes lock").iter().filter(|(path, _)| path.ends_with("token")).cloned().collect::<Vec<_>>();
-        assert_eq!(token_writes.len(), 2);
+        assert_eq!(token_writes.len(), 3);
         assert!(token_writes[0].1.contains("installation-token-one"));
         assert!(token_writes[1].1.contains("installation-token-two"));
-        assert_eq!(token_writes[0].0, token_writes[1].0, "rotation replaces the file observed by the standing vessel");
-        let writes = runner.writes.lock().expect("writes lock");
-        let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
-        assert!(gh_wrapper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
-        let git_helper =
-            writes.iter().find(|(path, _)| path.ends_with("git-credential-github-app")).expect("GitHub App Git credential helper");
-        assert!(git_helper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
-        drop(writes);
-        let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls.iter().any(|(command, args, _)| {
-            command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
-        }));
-        assert!(calls.iter().any(|(command, args, _)| { command == "sh" && args.iter().any(|arg| arg.contains("git credential fill")) }));
+        assert!(token_writes[2].1.contains("installation-token-three"));
+        assert_eq!(token_writes[0].0, token_writes[2].0, "rotation replaces the file observed by the standing vessel");
+        {
+            let writes = runner.writes.lock().expect("writes lock");
+            let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
+            assert!(gh_wrapper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
+            let git_helper =
+                writes.iter().find(|(path, _)| path.ends_with("git-credential-github-app")).expect("GitHub App Git credential helper");
+            assert!(git_helper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
+        }
+        {
+            let calls = runner.calls.lock().expect("calls lock");
+            assert!(calls.iter().any(|(command, args, _)| {
+                command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
+            }));
+            assert!(calls
+                .iter()
+                .any(|(command, args, _)| { command == "sh" && args.iter().any(|arg| arg.contains("git credential fill")) }));
+        }
+
+        let missing_store = CredentialStore::new_with_github_app_minter(
+            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("missing-root")),
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock, minter },
+            PathBuf::from("/state"),
+        );
+        for expected_surface in [false, false, true] {
+            let error = missing_store
+                .adopt_github_app_deliveries("missing-github-app", &refs, &scopes, runner.clone())
+                .await
+                .expect_err("missing scoped GitHub App declaration must remain visible");
+            assert_eq!(error.should_surface, expected_surface);
+        }
     }
 
     #[tokio::test]
