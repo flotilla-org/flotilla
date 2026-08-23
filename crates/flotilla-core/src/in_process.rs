@@ -2454,12 +2454,13 @@ impl InProcessDaemon {
         let matches = self
             .resource_backend
             .clone()
-            .using::<Repository>(&namespace)
+            .including_replicas::<Repository>(&namespace)
             .list()
             .await
             .map_err(|error| error.to_string())?
             .items
             .into_iter()
+            .map(|repository| repository.object)
             .filter(|repository| repository.spec.declares_remote(canonical_remote))
             .collect::<Vec<_>>();
         let declared = matches.iter().filter(|repository| repository.spec.remotes().len() > 1).collect::<Vec<_>>();
