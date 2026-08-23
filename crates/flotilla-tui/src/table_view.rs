@@ -718,8 +718,9 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
         apply_family_summary(&mut independents, awareness, AwarenessFamily::Independents);
     }
     let mut convoys = TableView { title: convoys_title, ..convoys };
-    // The enclosing Project page already supplies this scope. Some convoy
-    // names arrive decorated for fleet-wide surfaces; omit that suffix here.
+    // The enclosing Project page already supplies this scope. The shared
+    // convoy projection decorates names for fleet-wide surfaces; omit that
+    // suffix here.
     for row in &mut convoys.rows {
         let name = &mut row.cells[0].text;
         for suffix in [format!(" @ {}/{}", scope.namespace, scope.name), format!(" @ {}", scope.name)] {
@@ -1707,7 +1708,6 @@ mod tests {
         let mut convoy = convoy(vec![vessel("implement", &[], WorkPhase::Running)]);
         convoy.id = ConvoyId::new("flotilla", "tables");
         convoy.namespace = "flotilla".into();
-        convoy.name = "tables @ roadmap".into();
         convoy.project_ref = Some("roadmap".into());
         let checkout = CheckoutRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "roadmap"))
@@ -1798,7 +1798,7 @@ mod tests {
             Salience::Info,
         ]);
         assert!(panels.iter().all(|panel| panel.table.meta.as_of == Some(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)));
-        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables @ roadmap");
+        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
         assert_eq!(panels[1].table.rows[0].cells[1].text, "/work/flotilla");
         assert_eq!(panels[2].table.rows[0].actions[0].intent, TableIntent::StartConvoy {
             namespace: "flotilla".into(),
@@ -1826,7 +1826,7 @@ mod tests {
 
         let panels = project_panels(&address, &TableRows { convoys: vec![&convoy], ..TableRows::default() }).expect("project panels");
 
-        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables @ roadmap");
+        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
         assert_eq!(panels[1].table.meta.availability, TableAvailability::Loading);
         assert_eq!(panels[2].table.meta.availability, TableAvailability::Loading);
         assert_eq!(panels[3].table.meta.availability, TableAvailability::Loading);
