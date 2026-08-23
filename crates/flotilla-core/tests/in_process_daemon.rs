@@ -44,8 +44,8 @@ use flotilla_protocol::{
     test_support::TestIssue,
     Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, ConvoyStartIntent, DaemonEvent, EnvironmentId,
     EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, ImageId, IssueRef,
-    IssueSelector, IssueSource, NodeId, NodeInfo, PeerConnectionState, ProviderData, RepoIdentity, RepoSelector, StepStatus, StreamKey,
-    SystemInfo, ToolInventory, TopologyRoute,
+    IssueSelector, IssueSource, ManifestResolution, NodeId, NodeInfo, PeerConnectionState, ProviderData, RepoIdentity, RepoSelector,
+    StepStatus, StreamKey, SystemInfo, ToolInventory, TopologyRoute,
 };
 use flotilla_resources::{
     apply_status_patch, controller_patches as convoy_controller_patches, implement_review_workflow_spec,
@@ -59,7 +59,7 @@ use flotilla_resources::{
     SqliteBackend, Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
     TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TypedResolver, WatchEvent, WatchStart,
     WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, HELD_CREDENTIALS_CAPABILITY,
-    REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    MANIFEST_RESOLUTION_ANNOTATION, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::Notify;
@@ -1141,6 +1141,41 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
     assert_eq!(stored.spec.provider, "codex");
     assert_eq!(stored.spec.account, "Ada@Example.com");
     assert_eq!(stored.status, Some(status));
+}
+
+#[tokio::test]
+async fn manifest_resolution_command_persists_the_reconciler_request_annotation() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let policies = daemon.resource_backend().using::<PlacementPolicy>("flotilla");
+    policies
+        .create(
+            &InputMeta::builder().name("resolve-me".to_string()).build(),
+            &PlacementPolicySpec::builder().pool("live".to_string()).build(),
+        )
+        .await
+        .expect("create policy");
+    let mut events = daemon.subscribe();
+
+    let command_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceManifestResolve {
+                    namespace: "flotilla".to_string(),
+                    kind: "PlacementPolicy".to_string(),
+                    name: "resolve-me".to_string(),
+                    resolution: ManifestResolution::Sync,
+                })
+                .build(),
+        )
+        .await
+        .expect("request manifest sync");
+    let result = recv_command_finished(&mut events, command_id).await;
+    let stored = policies.get("resolve-me").await.expect("resolved policy");
+
+    assert!(matches!(result, CommandValue::ResourceObject(response) if response.kind == "PlacementPolicy"));
+    assert_eq!(stored.metadata.annotations.get(MANIFEST_RESOLUTION_ANNOTATION).map(String::as_str), Some("sync"));
 }
 
 #[tokio::test]

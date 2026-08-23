@@ -63,8 +63,8 @@ use flotilla_resources::{
     TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
     WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
-    DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
-    VESSEL_REF_LABEL,
+    DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, MANIFEST_RESOLUTION_ANNOTATION,
+    PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -9150,7 +9150,7 @@ impl InProcessDaemon {
                     match annotations {
                         Some(annotations) => {
                             annotations
-                                .insert("flotilla.work/manifest-resolution".to_string(), serde_json::Value::String(resolution.to_string()));
+                                .insert(MANIFEST_RESOLUTION_ANNOTATION.to_string(), serde_json::Value::String(resolution.to_string()));
                             match apply_resource_document(&self.resource_backend, namespace, object.value).await {
                                 Ok(applied) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
                                     kind: applied.kind,

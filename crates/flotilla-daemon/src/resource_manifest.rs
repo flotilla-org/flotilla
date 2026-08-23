@@ -13,6 +13,7 @@ use std::{
 
 use flotilla_resources::{
     apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, ResourceBackend, ResourceError, MANAGED_BY_LABEL,
+    MANIFEST_RESOLUTION_ANNOTATION,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -25,7 +26,6 @@ pub const MANIFEST_REFUSAL_ANNOTATION: &str = "flotilla.work/manifest-refusal";
 pub const MANIFEST_LIVE_HASH_ANNOTATION: &str = "flotilla.work/manifest-live-hash";
 pub const MANIFEST_DESIRED_HASH_ANNOTATION: &str = "flotilla.work/manifest-desired-hash";
 pub const MANIFEST_BASELINE_HASH_ANNOTATION: &str = "flotilla.work/manifest-baseline-hash";
-pub const MANIFEST_RESOLUTION_ANNOTATION: &str = "flotilla.work/manifest-resolution";
 pub const MANIFEST_SUSPEND_ANNOTATION: &str = "flotilla.work/manifest-suspend";
 
 const REFUSAL_ANNOTATIONS: [&str; 4] =
