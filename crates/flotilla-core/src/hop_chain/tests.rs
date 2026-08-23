@@ -150,6 +150,97 @@ fn docker_environment_wrap_supervises_and_reaps_the_exec_command() {
     ]);
 }
 
+#[cfg(unix)]
+#[test]
+fn severing_supervised_docker_hop_reaps_lease_owner() {
+    use std::{
+        fs,
+        os::unix::{fs::PermissionsExt, process::CommandExt},
+        process::Command,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let environment = EnvironmentId::new("crew-box");
+    let resolver = DockerEnvironmentHopResolver::new(HashMap::from([(environment.clone(), "crew-container".to_string())]));
+    let mut context = context();
+    context.actions.push(ResolvedAction::Command(vec![Arg::Literal("cleat".into()), Arg::Literal("attach".into())]));
+    resolver.resolve_wrap(&environment, &mut context).expect("known environment");
+    let [ResolvedAction::Command(args)] = context.actions.as_slice() else { panic!("expected one supervised command") };
+    let Arg::Quoted(wrapper) = &args[2] else { panic!("wrapper must be a quoted shell program") };
+
+    let temp = tempfile::tempdir().expect("fake Docker directory");
+    let docker = temp.path().join("docker");
+    let observed_pid = temp.path().join("observed-pid");
+    let calls = temp.path().join("calls");
+    fs::write(
+        &docker,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FLOTILLA_TEST_CALLS"
+if [ "$6" = flotilla-attach-cleanup ]; then
+    exec sh -c "$5" "$6" "$7" "$8"
+fi
+lease=
+pid_file=
+for arg do
+    case "$arg" in
+        FLOTILLA_ATTACH_LEASE=*) lease=${arg#*=} ;;
+        /tmp/flotilla-attach-*.pid) pid_file=$arg ;;
+    esac
+done
+(trap '' HUP INT TERM; export FLOTILLA_ATTACH_LEASE="$lease"; exec sleep 300) &
+pid=$!
+printf '%s' "$pid" > "$pid_file"
+printf '%s\n%s' "$pid" "$pid_file" > "$FLOTILLA_TEST_PID"
+wait "$pid"
+"#,
+    )
+    .expect("write fake Docker shim");
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).expect("make fake Docker shim executable");
+
+    let path = format!("{}:{}", temp.path().display(), std::env::var("PATH").unwrap_or_default());
+    let mut upstream = Command::new("sh");
+    upstream
+        .arg("-c")
+        .arg(wrapper)
+        .args(["flotilla-docker-attach", "crew-container", "", "cleat", "attach"])
+        .env("PATH", path)
+        .env("FLOTILLA_TEST_PID", &observed_pid)
+        .env("FLOTILLA_TEST_CALLS", &calls)
+        .process_group(0);
+    let mut upstream = upstream.spawn().expect("start supervised attach hop");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !observed_pid.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let observed = fs::read_to_string(&observed_pid).expect("fake in-container process should start");
+    let mut observed = observed.lines();
+    let attach_pid: i32 = observed.next().expect("attach pid").parse().expect("numeric attach pid");
+    let pid_file = observed.next().expect("attach pidfile").to_string();
+
+    // SAFETY: the child was placed in its own process group above.
+    assert_eq!(unsafe { libc::kill(-(upstream.id() as i32), libc::SIGHUP) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while upstream.try_wait().expect("poll upstream").is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(upstream.try_wait().expect("poll reaped upstream").is_some(), "upstream wrapper should exit after severance");
+
+    let process_state = || {
+        fs::read_to_string(format!("/proc/{attach_pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.split_whitespace().nth(2).and_then(|state| state.chars().next()))
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_state().is_some_and(|state| state != 'Z') && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(process_state().is_none_or(|state| state == 'Z'), "lease owner should be dead");
+    assert!(!std::path::Path::new(&pid_file).exists(), "cleanup should remove its pidfile");
+    assert!(fs::read_to_string(calls).expect("fake Docker calls").contains("flotilla-attach-cleanup"));
+}
+
 #[derive(Default)]
 struct RecordingRemote {
     calls: Mutex<Vec<HostName>>,
