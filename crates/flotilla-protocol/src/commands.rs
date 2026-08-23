@@ -197,6 +197,8 @@ pub struct ExplainedChangeRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
     pub freshness: EvidenceFreshness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -618,6 +618,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 request.freshness,
                 fields
             );
+            if let Some(error) = &request.observation_error {
+                let _ = writeln!(output, "    observation_error={error}");
+            }
         }
     }
 
