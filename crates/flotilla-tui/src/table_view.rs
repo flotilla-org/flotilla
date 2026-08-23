@@ -718,6 +718,14 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
         apply_family_summary(&mut independents, awareness, AwarenessFamily::Independents);
     }
     let mut convoys = TableView { title: convoys_title, ..convoys };
+    // The enclosing Project page already supplies this scope. Repeating it in
+    // every convoy row spends scarce horizontal space without adding context.
+    if let Some(scope_column) = convoys.columns.iter().position(|column| column.id == "scope") {
+        convoys.columns.remove(scope_column);
+        for row in &mut convoys.rows {
+            row.cells.remove(scope_column);
+        }
+    }
     if let Some(awareness) = awareness {
         apply_family_summary(&mut convoys, awareness, AwarenessFamily::Convoys);
     }
@@ -1771,6 +1779,8 @@ mod tests {
             "Issues (1)",
             "Independents (1)",
         ]);
+        assert!(panels[0].table.columns.iter().all(|column| column.id != "scope"));
+        assert_eq!(panels[0].table.rows[0].cells.len(), panels[0].table.columns.len());
         assert_eq!(panels.iter().map(|panel| panel.table.meta.salience).collect::<Vec<_>>(), vec![
             Salience::Urgent,
             Salience::None,

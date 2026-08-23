@@ -182,7 +182,7 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
 fn project_awareness_node(catalog: &mut Catalog, node: &AwarenessNode, convoys: &[ConvoyRow], mint: &dyn RecipeMint) {
     let parent = awareness_parent_facts(node, convoys);
     if let Some((entity, mut facts)) = awareness_node_entity(node, convoys) {
-        facts.extend(status_and_counts(node.state, &node.counts));
+        facts.extend(status_and_counts(node.state, &node.counts, node.entries.len()));
         if let Some(recipe) = awareness_project_recipe(node, mint) {
             facts.extend(action_facts(&entity, &recipe, "workspace"));
         }
@@ -440,10 +440,10 @@ fn awareness_state(state: AwarenessState) -> &'static str {
     }
 }
 
-fn status_and_counts(state: AwarenessState, counts: &AwarenessCounts) -> Vec<(&'static str, MetadataValue)> {
+fn status_and_counts(state: AwarenessState, counts: &AwarenessCounts, visible: usize) -> Vec<(&'static str, MetadataValue)> {
     vec![
         (KEY_STATUS_STATE, MetadataValue::text(awareness_state(state))),
-        (KEY_SUMMARY_TEXT, MetadataValue::text(summary_text(counts))),
+        (KEY_SUMMARY_TEXT, MetadataValue::text(summary_text(counts, visible))),
         (KEY_COUNT_TOTAL, MetadataValue::Integer(counts.total as i64)),
         (KEY_COUNT_ISSUES, MetadataValue::Integer(counts.issues as i64)),
         (KEY_COUNT_CONVOYS, MetadataValue::Integer(counts.convoys as i64)),
@@ -453,8 +453,14 @@ fn status_and_counts(state: AwarenessState, counts: &AwarenessCounts) -> Vec<(&'
     ]
 }
 
-fn summary_text(counts: &AwarenessCounts) -> String {
-    format!("{} entries · {} issues · {} vessels · {} checkouts", counts.total, counts.issues, counts.vessels, counts.checkouts)
+fn summary_text(counts: &AwarenessCounts, visible: usize) -> String {
+    let mut summary =
+        format!("{} entries · {} issues · {} vessels · {} checkouts", counts.total, counts.issues, counts.vessels, counts.checkouts);
+    let omitted = counts.total.saturating_sub(visible);
+    if omitted > 0 {
+        summary.push_str(&format!(" · +{omitted} more"));
+    }
+    summary
 }
 
 fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMint) {

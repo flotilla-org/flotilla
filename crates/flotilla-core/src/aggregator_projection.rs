@@ -613,6 +613,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn awareness_result_set_keeps_live_convoy_when_terminal_history_exceeds_entry_limit() {
+        let state = AggregatorProjectionState::new();
+        let mut rows = (0..4)
+            .map(|index| {
+                let mut row = convoy_row("flotilla", &format!("terminal-{index}"), "roadmap");
+                row.phase = ConvoyPhase::Landed;
+                row
+            })
+            .collect::<Vec<_>>();
+        rows.push(convoy_row("flotilla", "live", "roadmap"));
+        {
+            let mut convoys = state.write().await;
+            convoys.local_rows = rows.into_iter().map(|row| (row.resource.clone(), row)).collect();
+            convoys.seq = 1;
+        }
+
+        let result =
+            state.awareness_result_set(&Some(scope("roadmap")), AwarenessGrouping::Project, AwarenessLimit { groups: 1, entries: 2 }).await;
+        let Rows::Awareness { rows, .. } = result.rows else { panic!("awareness rows") };
+
+        assert!(result.state.truncated);
+        assert!(rows[0].entries.iter().any(|entry| entry.label == "live"));
+    }
+
+    #[tokio::test]
     async fn convoy_result_sets_filter_by_optional_project_scope_without_changing_the_global_set() {
         let state = AggregatorProjectionState::new();
         let roadmap = convoy_row("flotilla", "roadmap-work", "roadmap");
