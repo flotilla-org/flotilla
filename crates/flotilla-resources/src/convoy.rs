@@ -329,7 +329,7 @@ fn bound_change_request_addresses(
     }))
 }
 
-fn change_request_address(repository_url: &str, id: &str) -> Result<LeafAddress, String> {
+pub fn change_request_address(repository_url: &str, id: &str) -> Result<LeafAddress, String> {
     let canonical = crate::canonicalize_repo_url(repository_url)?;
     let without_scheme = canonical
         .split_once("://")

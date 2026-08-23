@@ -3795,7 +3795,8 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let resolver = Arc::new(RecordingBoundChangeRequestResolver { calls: Mutex::new(Vec::new()) });
-        let mut aggregator = Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
+        let mut aggregator =
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
         let mut convoy = convoy_with_branch("convoy-a").await;
         convoy.spec.change_request = Some(BoundChangeRequest {
             id: "1071".to_string(),
@@ -3811,6 +3812,14 @@ mod tests {
         };
 
         assert_eq!(delta.changes.as_convoys().expect("convoy changes")[0].change_request.as_ref().expect("bound PR").id, "1071");
+        let result_set = state.result_set().await;
+        let bound = result_set.rows.as_convoys().expect("convoy result rows")[0]
+            .change_request
+            .as_ref()
+            .expect("bound PR remains in the aggregator result set");
+        assert_eq!(bound.id, "1071");
+        assert_eq!(bound.repository_key, RepositoryKey("repo_flotilla".to_string()));
+        assert_eq!(bound.status, flotilla_protocol::ChangeRequestStatus::Open);
         assert_eq!(resolver.calls.lock().await.as_slice(), &[(
             vec![RepositoryKey("repo_flotilla".to_string())],
             "feat/convoy".to_string(),
