@@ -1155,7 +1155,7 @@ async fn retracking_path_after_remote_appears_migrates_repository_identity() {
             &InputMeta::builder().name("github-com-flotilla-org-andamento".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("andamento".to_string())
-                .default_workflow_ref("single-agent-trusted".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(remote_key.clone()).build()])
                 .build(),
         )
@@ -1282,7 +1282,7 @@ async fn identity_change_preserves_migrated_project_when_local_and_remote_names_
             &InputMeta::builder().name("a-remote-name".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("a-remote-name".to_string())
-                .default_workflow_ref("single-agent-trusted".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(remote_key.clone()).build()])
                 .build(),
         )
