@@ -225,7 +225,7 @@ impl ConnectorState {
         QueryId::ALWAYS_MATERIALIZED
             .iter()
             .cloned()
-            .chain([QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::UNBOUNDED }])
+            .chain([QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default() }])
             .map(|query| QueryCursor { since: self.seqs.get(&query).copied(), query })
             .collect()
     }

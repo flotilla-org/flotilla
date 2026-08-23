@@ -117,7 +117,7 @@ fn gaps_and_unseeded_deltas_request_resubscription() {
 }
 
 #[test]
-fn awareness_subscription_is_unbounded_because_the_sidebar_scrolls() {
+fn awareness_subscription_uses_the_unbounded_default() {
     let state = ConnectorState::default();
     let awareness = state
         .cursors()
@@ -128,7 +128,7 @@ fn awareness_subscription_is_unbounded_because_the_sidebar_scrolls() {
         })
         .expect("awareness cursor");
 
-    assert_eq!(awareness, AwarenessLimit::UNBOUNDED);
+    assert_eq!(awareness, AwarenessLimit::default());
 }
 
 #[test]

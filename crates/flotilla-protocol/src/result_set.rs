@@ -423,7 +423,7 @@ pub struct AwarenessLimit {
 
 impl Default for AwarenessLimit {
     fn default() -> Self {
-        Self { groups: 32, entries: 32 }
+        Self::UNBOUNDED
     }
 }
 
