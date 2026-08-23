@@ -44,23 +44,24 @@ use flotilla_resources::{
     expected_checkout_refs, external_patches as convoy_external_patches, get_resource_kind_including_replicas, list_resource_kind,
     list_resource_kind_including_replicas, normalize_project_spec, repository_display_labels, resolve_project_issue_sources,
     terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
-    watch_resource_kind_replica_sources, BoundChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
-    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
-    ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec,
-    ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
-    CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand,
-    DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase,
-    HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
-    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
-    PendingBrief, PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation, Project, ProjectRepositoryRole,
-    ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch, ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource,
-    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief,
-    TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch,
-    TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
-    WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION,
-    CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
-    PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    watch_resource_kind_replica_sources, BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
+    CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition,
+    ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec,
+    ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase,
+    Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState,
+    Environment as ResourceEnvironment, EnvironmentPhase, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend,
+    InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
+    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
+    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
+    ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
+    WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
+    DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -3346,6 +3347,10 @@ impl InProcessDaemon {
         branch: &str,
         change_request_id: Option<&str>,
     ) -> Result<Option<ConvoyChangeRequest>, String> {
+        if let Some(change_request) = self.resolve_observed_convoy_change_request(repository_keys, change_request_id).await? {
+            return Ok(Some(change_request));
+        }
+
         let live_candidates = {
             let keys_by_path = self.repository_keys_by_path.read().await;
             let repos = self.repos.read().await;
@@ -3408,6 +3413,51 @@ impl InProcessDaemon {
             Some(error) => Err(error),
             None => Ok(None),
         }
+    }
+
+    async fn resolve_observed_convoy_change_request(
+        &self,
+        repository_keys: &[RepositoryKey],
+        change_request_id: Option<&str>,
+    ) -> Result<Option<ConvoyChangeRequest>, String> {
+        let Some(change_request_id) = change_request_id else { return Ok(None) };
+        let Ok(number) = change_request_id.parse::<u64>() else { return Ok(None) };
+        let namespace = self.provisioning_namespace().await;
+        let repositories =
+            self.resource_backend.clone().including_replicas::<Repository>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let change_requests = self
+            .resource_backend
+            .clone()
+            .including_replicas::<ResourceChangeRequest>(&namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?;
+
+        for repository_key in repository_keys {
+            let Some(repository) = repositories.items.iter().find(|repository| repository.object.metadata.name == repository_key.0) else {
+                continue;
+            };
+            let flotilla_resources::RepositoryIdentity::Remote { canonical_remote } = repository.object.spec.identity() else {
+                continue;
+            };
+            let qualified = canonical_remote.split_once("://").map_or(canonical_remote.as_str(), |(_, qualified)| qualified);
+            let Some((service, scope)) = qualified.split_once('/') else { continue };
+            let Some(observation) = change_requests.items.iter().find(|change_request| {
+                change_request.object.spec.service == service
+                    && change_request.object.spec.scope == scope
+                    && change_request.object.spec.number == number
+            }) else {
+                continue;
+            };
+            let Some(state) = observation.object.status.as_ref().and_then(|status| status.state.value) else { continue };
+            let status = match state {
+                ObservedChangeRequestState::Open => flotilla_protocol::ChangeRequestStatus::Open,
+                ObservedChangeRequestState::Merged => flotilla_protocol::ChangeRequestStatus::Merged,
+                ObservedChangeRequestState::Closed => flotilla_protocol::ChangeRequestStatus::Closed,
+            };
+            return Ok(Some(ConvoyChangeRequest { id: change_request_id.to_string(), status, repository_key: repository_key.clone() }));
+        }
+        Ok(None)
     }
 
     /// Add a virtual repo (no local filesystem path) for a remote-only repo.

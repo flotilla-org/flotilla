@@ -53,6 +53,69 @@ fn test_meta(name: &str) -> InputMeta {
 }
 
 #[tokio::test]
+async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_checkout() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"bound-pr-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla")
+        .expect("repository spec")
+        .with_remotes(["https://github.com/flotilla-org/flotilla".to_string(), "https://forgejo.example/flotilla/flotilla".to_string()])
+        .expect("mirror declaration");
+    let repository_key = repository_spec.key();
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&test_meta(&repository_key.to_string()), &repository_spec)
+        .await
+        .expect("repository");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend,
+    )
+    .await;
+    daemon.set_provisioning_namespace("flotilla".to_string()).await;
+    let change_requests = daemon.resource_backend().using::<ResourceChangeRequest>("flotilla");
+    let observation = change_requests
+        .create(
+            &test_meta("pr-1696"),
+            &flotilla_resources::ChangeRequestSpec::builder()
+                .service("github.com".to_string())
+                .scope("flotilla-org/flotilla".to_string())
+                .number(1696)
+                .observing_authority("github-observer".to_string())
+                .build(),
+        )
+        .await
+        .expect("change request observation");
+    let observed_at = Utc::now();
+    change_requests
+        .update_status(&observation.metadata.name, &observation.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+            state: flotilla_resources::Observation::known(ObservedChangeRequestState::Open, observed_at),
+            head_sha: flotilla_resources::Observation::unknown(observed_at),
+            checks: flotilla_resources::Observation::unknown(observed_at),
+            review: flotilla_resources::ChangeRequestReviewObservation {
+                actionable_at_head: flotilla_resources::Observation::unknown(observed_at),
+            },
+            mergeable: flotilla_resources::Observation::unknown(observed_at),
+        })
+        .await
+        .expect("change request status");
+
+    let resolved = daemon
+        .resolve_convoy_change_request(std::slice::from_ref(&repository_key), "fix/convoy-pr-linkage", Some("1696"))
+        .await
+        .expect("bound change request lookup")
+        .expect("durable observation should resolve the bound change request");
+
+    assert_eq!(resolved.id, "1696");
+    assert_eq!(resolved.repository_key, repository_key);
+    assert_eq!(resolved.status, flotilla_protocol::ChangeRequestStatus::Open);
+}
+
+#[tokio::test]
 async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_reviewer() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"two-crew-contained-test\"\n").expect("daemon config");
