@@ -1095,14 +1095,14 @@ impl StepResolver for ExecutorStepResolver {
             StepAction::OpenChangeRequest { id } => {
                 debug!(%id, "opening change request in browser");
                 if let Some(cr) = self.registry.change_requests.preferred() {
-                    let _ = cr.open_in_browser(self.repo.root.as_path(), &id).await;
+                    let _ = cr.open_in_browser(&id).await;
                 }
                 Ok(StepOutcome::Completed)
             }
             StepAction::CloseChangeRequest { id } => {
                 debug!(%id, "closing change request");
                 if let Some(cr) = self.registry.change_requests.preferred() {
-                    let _ = cr.close_change_request(self.repo.root.as_path(), &id).await;
+                    let _ = cr.close_change_request(&id).await;
                 }
                 Ok(StepOutcome::Completed)
             }
@@ -1113,7 +1113,7 @@ impl StepResolver for ExecutorStepResolver {
                     .change_requests
                     .preferred()
                     .ok_or_else(|| "no change request provider is active for this repository".to_string())?;
-                cr.merge_change_request(self.repo.root.as_path(), &id).await?;
+                cr.merge_change_request(&id).await?;
                 Ok(StepOutcome::Completed)
             }
             StepAction::OpenIssue { id } => {

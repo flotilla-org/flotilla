@@ -82,10 +82,10 @@ impl GitHubChangeRequest {
 
 #[async_trait]
 impl super::ChangeRequestTracker for GitHubChangeRequest {
-    async fn list_change_requests(&self, repo_root: &Path, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+    async fn list_change_requests(&self, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         let per_page = clamp_per_page(limit);
         let endpoint = format!("repos/{}/pulls?state=open&per_page={}", self.repo_slug, per_page);
-        let body = gh_api_get!(self.api, &endpoint, repo_root)?;
+        let body = gh_api_get!(self.api, &endpoint, Path::new("/"))?;
         let items: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
         Ok(items
@@ -97,9 +97,9 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
             .collect())
     }
 
-    async fn find_change_request_by_branch(&self, repo_root: &Path, branch: &str) -> Result<Option<(String, ChangeRequest)>, String> {
+    async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, String> {
         let endpoint = format!("repos/{}/pulls?state=all&per_page=100", self.repo_slug);
-        let body = gh_api_get!(self.api, &endpoint, repo_root)?;
+        let body = gh_api_get!(self.api, &endpoint, Path::new("/"))?;
         let items: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|error| error.to_string())?;
         Ok(items
             .iter()
@@ -108,43 +108,43 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
             .map(|pull_request| self.gh_pr_to_change_request(&pull_request)))
     }
 
-    async fn get_change_request(&self, repo_root: &Path, id: &str) -> Result<(String, ChangeRequest), String> {
+    async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
         let endpoint = format!("repos/{}/pulls/{}", self.repo_slug, id);
-        let body = gh_api_get!(self.api, &endpoint, repo_root)?;
+        let body = gh_api_get!(self.api, &endpoint, Path::new("/"))?;
         let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
         let pr = Self::parse_pull_request(&v).ok_or("malformed pull request")?;
         Ok(self.gh_pr_to_change_request(&pr))
     }
 
-    async fn get_change_request_for_admission(&self, repo_root: &Path, id: &str) -> Result<super::ChangeRequestAdmission, String> {
+    async fn get_change_request_for_admission(&self, id: &str) -> Result<super::ChangeRequestAdmission, String> {
         let endpoint = format!("repos/{}/pulls/{}", self.repo_slug, id);
-        let body = gh_api_get!(self.api, &endpoint, repo_root)?;
+        let body = gh_api_get!(self.api, &endpoint, Path::new("/"))?;
         let value: serde_json::Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
         let pull_request = Self::parse_pull_request(&value).ok_or("malformed pull request")?;
         let (id, change_request) = self.gh_pr_to_change_request(&pull_request);
         Ok(super::ChangeRequestAdmission { id, change_request, base_ref: pull_request.base_ref_name })
     }
 
-    async fn open_in_browser(&self, repo_root: &Path, id: &str) -> Result<(), String> {
-        run!(self.runner, "gh", &["pr", "view", id, "--web"], repo_root)?;
+    async fn open_in_browser(&self, id: &str) -> Result<(), String> {
+        run!(self.runner, "gh", &["pr", "view", id, "--repo", &self.repo_slug, "--web"], Path::new("/"))?;
         Ok(())
     }
 
-    async fn close_change_request(&self, repo_root: &Path, id: &str) -> Result<(), String> {
-        run!(self.runner, "gh", &["pr", "close", id], repo_root)?;
+    async fn close_change_request(&self, id: &str) -> Result<(), String> {
+        run!(self.runner, "gh", &["pr", "close", id, "--repo", &self.repo_slug], Path::new("/"))?;
         Ok(())
     }
 
-    async fn merge_change_request(&self, repo_root: &Path, id: &str) -> Result<(), String> {
-        run!(self.runner, "gh", &["pr", "merge", id, "--squash"], repo_root)?;
+    async fn merge_change_request(&self, id: &str) -> Result<(), String> {
+        run!(self.runner, "gh", &["pr", "merge", id, "--repo", &self.repo_slug, "--squash"], Path::new("/"))?;
         Ok(())
     }
 
-    async fn list_merged_branch_names(&self, repo_root: &Path, limit: usize) -> Result<Vec<String>, String> {
+    async fn list_merged_branch_names(&self, limit: usize) -> Result<Vec<String>, String> {
         let per_page = clamp_per_page(limit);
         let endpoint = format!("repos/{}/pulls?state=closed&sort=updated&direction=desc&per_page={}", self.repo_slug, per_page);
-        let body = gh_api_get!(self.api, &endpoint, repo_root)?;
+        let body = gh_api_get!(self.api, &endpoint, Path::new("/"))?;
         let items: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
         Ok(items
