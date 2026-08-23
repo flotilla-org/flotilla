@@ -4,6 +4,7 @@ A bootstrap repository may declare a Project in `project.yaml`:
 
 ```yaml
 name: example
+default_workflow: single-agent-contained
 members:
   - alias: app
     url: https://github.com/example/app
@@ -13,7 +14,9 @@ members:
     roles: [ops, knowledge]
 ```
 
-`name` is the Project resource name. Every member has a project-scoped,
+`name` is the Project resource name. `default_workflow` selects the workflow
+used when a dispatch does not specify one and defaults to `single-agent-contained`.
+Every member has a project-scoped,
 human-writable `alias`, a canonical repository `url`, and a non-empty set of
 roles drawn from `code`, `ops`, and `knowledge`. A repository may have several
 roles. The bootstrap repository contains the declaration but need not itself be

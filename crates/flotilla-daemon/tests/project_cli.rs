@@ -381,7 +381,7 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
 
     std::fs::write(
         tmp.path().join("project.yaml"),
-        "name: split\nmembers:\n  - alias: app\n    url: https://github.com/example/app\n    roles: [code]\n  - alias: operations\n    url: https://github.com/example/ops\n    roles: [ops]\n",
+        "name: split\ndefault_workflow: single-agent-trusted\nmembers:\n  - alias: app\n    url: https://github.com/example/app\n    roles: [code]\n  - alias: operations\n    url: https://github.com/example/ops\n    roles: [ops]\n",
     )
     .expect("write declaration");
     assert_eq!(
@@ -390,6 +390,7 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
         CommandValue::ProjectRegistered { name: "split".to_string(), members: 2 }
     );
     let split = backend.using::<Project>("flotilla").get("split").await.expect("split project");
+    assert_eq!(split.spec.default_workflow_ref, "single-agent-trusted");
     assert_eq!(split.spec.repositories.iter().map(|member| member.alias.as_deref()).collect::<Vec<_>>(), vec![
         Some("app"),
         Some("operations")
@@ -481,7 +482,7 @@ async fn project_refresh_is_one_way_and_keeps_alias_repository_keys_stable_acros
     *commit.write().expect("commit lock should not be poisoned") = "commit-two".to_string();
     std::fs::write(
         &declaration_path,
-        "name: demo\nmembers:\n  - alias: app\n    url: https://github.com/example/app-renamed\n    roles: [code, knowledge]\n  - alias: ops\n    url: https://github.com/example/ops\n    roles: [ops]\n",
+        "name: demo\ndefault_workflow: single-agent-trusted\nmembers:\n  - alias: app\n    url: https://github.com/example/app-renamed\n    roles: [code, knowledge]\n  - alias: ops\n    url: https://github.com/example/ops\n    roles: [ops]\n",
     )
     .expect("update declaration");
     assert_eq!(
@@ -496,6 +497,7 @@ async fn project_refresh_is_one_way_and_keeps_alias_repository_keys_stable_acros
     );
     let refreshed = projects.get("demo").await.expect("refreshed project");
     assert_eq!(refreshed.spec.display_name, "demo");
+    assert_eq!(refreshed.spec.default_workflow_ref, "single-agent-trusted");
     let app = refreshed.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("app")).expect("app member");
     assert_eq!(app.repo, app_key, "alias should preserve the rename-stable RepositoryKey");
     assert!(app.roles.contains(&ProjectRepositoryRole::Knowledge));
@@ -1099,7 +1101,7 @@ async fn tracked_repo_labels_matching_unlabelled_project_once() {
             &InputMeta::builder().name("tracked".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("tracked".to_string())
-                .default_workflow_ref("single-agent-trusted".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec {
                     repo: repository_key,
                     alias: None,

@@ -5793,7 +5793,7 @@ impl InProcessDaemon {
         }
         let spec = normalize_project_spec(ProjectSpec {
             display_name: declaration.name.clone(),
-            default_workflow_ref: "single-agent-contained".to_string(),
+            default_workflow_ref: declaration.default_workflow.unwrap_or_else(|| "single-agent-contained".to_string()),
             issue_source: None,
             repositories: members,
             dispatch_policy: existing_project.as_ref().and_then(|project| project.spec.dispatch_policy.clone()),
