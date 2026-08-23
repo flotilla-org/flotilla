@@ -604,6 +604,9 @@ impl CredentialStore {
             let spec = match self.spec(name).await {
                 Ok(spec) => spec,
                 Err(message) => {
+                    if credential_scopes.get(name).is_some_and(|scopes| !scopes.is_empty()) {
+                        return Err(self.record_adoption_failure(environment_ref, message).await);
+                    }
                     tracing::warn!(credential = %name, environment = %environment_ref, %message, "skipping unavailable credential while discovering GitHub App deliveries");
                     continue;
                 }
@@ -1785,18 +1788,40 @@ interactions:
         assert!(token_writes[1].1.contains("installation-token-two"));
         assert!(token_writes[2].1.contains("installation-token-three"));
         assert_eq!(token_writes[0].0, token_writes[2].0, "rotation replaces the file observed by the standing vessel");
-        let writes = runner.writes.lock().expect("writes lock");
-        let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
-        assert!(gh_wrapper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
-        let git_helper =
-            writes.iter().find(|(path, _)| path.ends_with("git-credential-github-app")).expect("GitHub App Git credential helper");
-        assert!(git_helper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
-        drop(writes);
-        let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls.iter().any(|(command, args, _)| {
-            command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
-        }));
-        assert!(calls.iter().any(|(command, args, _)| { command == "sh" && args.iter().any(|arg| arg.contains("git credential fill")) }));
+        {
+            let writes = runner.writes.lock().expect("writes lock");
+            let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
+            assert!(gh_wrapper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
+            let git_helper =
+                writes.iter().find(|(path, _)| path.ends_with("git-credential-github-app")).expect("GitHub App Git credential helper");
+            assert!(git_helper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
+        }
+        {
+            let calls = runner.calls.lock().expect("calls lock");
+            assert!(calls.iter().any(|(command, args, _)| {
+                command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
+            }));
+            assert!(calls
+                .iter()
+                .any(|(command, args, _)| { command == "sh" && args.iter().any(|arg| arg.contains("git credential fill")) }));
+        }
+
+        let missing_store = CredentialStore::new_with_github_app_minter(
+            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("missing-root")),
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock, minter },
+            PathBuf::from("/state"),
+        );
+        for expected_surface in [false, false, true] {
+            let error = missing_store
+                .adopt_github_app_deliveries("missing-github-app", &refs, &scopes, runner.clone())
+                .await
+                .expect_err("missing scoped GitHub App declaration must remain visible");
+            assert_eq!(error.should_surface, expected_surface);
+        }
     }
 
     #[tokio::test]
