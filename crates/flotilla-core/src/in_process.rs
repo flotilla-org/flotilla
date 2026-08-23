@@ -7800,13 +7800,15 @@ impl InProcessDaemon {
                         fork_stance |= repository.spec.is_fork();
                     }
                 }
-                let render_options = crate::agent_adapter::CrewBriefTemplateResolver::with_config_dir(self.config.base_path().as_path())
-                    .render_options_with_fork_stance(
-                        brief_template.as_deref(),
-                        convoy.spec.project_ref.as_deref(),
-                        repo_roots,
-                        fork_stance,
-                    );
+                let mut render_options =
+                    crate::agent_adapter::CrewBriefTemplateResolver::with_config_dir(self.config.base_path().as_path())
+                        .render_options_with_fork_stance(
+                            brief_template.as_deref(),
+                            convoy.spec.project_ref.as_deref(),
+                            repo_roots,
+                            fork_stance,
+                        );
+                render_options.has_credential_scope = !task.credential_scopes.is_empty();
                 let brief = handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, task, &render_options)?;
                 let terminal_meta = terminal_meta_with_vessel_credentials(identity.input_meta(), task);
                 sessions

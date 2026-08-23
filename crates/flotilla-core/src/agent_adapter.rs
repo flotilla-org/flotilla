@@ -105,7 +105,7 @@ impl CrewBriefTemplateResolver {
         for repo_root in repo_roots {
             push_template_override(&mut overrides, repo_root.join(".flotilla").join(BRIEF_TEMPLATE_DIR).join(override_filename));
         }
-        CrewBriefRenderOptions { template: template.to_string(), overrides, fork_stance }
+        CrewBriefRenderOptions { template: template.to_string(), overrides, fork_stance, has_credential_scope: false }
     }
 }
 
@@ -122,11 +122,12 @@ pub struct CrewBriefRenderOptions {
     pub template: String,
     pub overrides: Vec<CrewBriefTemplateOverride>,
     pub fork_stance: bool,
+    pub has_credential_scope: bool,
 }
 
 impl Default for CrewBriefRenderOptions {
     fn default() -> Self {
-        Self { template: DEFAULT_CREW_BRIEF_TEMPLATE.to_string(), overrides: Vec::new(), fork_stance: false }
+        Self { template: DEFAULT_CREW_BRIEF_TEMPLATE.to_string(), overrides: Vec::new(), fork_stance: false, has_credential_scope: false }
     }
 }
 
@@ -145,6 +146,7 @@ struct CrewBriefTemplateContext<'a> {
     assignment_text: &'a str,
     members: &'a [CrewBriefMember],
     handoff_members: Vec<&'a CrewBriefMember>,
+    has_credential_scope: bool,
     has_in_crew_reviewer: bool,
 }
 
@@ -184,6 +186,7 @@ pub fn build_crew_brief_with_options(
         assignment_text,
         members,
         handoff_members: members.iter().filter(|member| member.is_agent && member.role != role).collect(),
+        has_credential_scope: options.has_credential_scope,
         has_in_crew_reviewer: members.iter().any(|member| member.is_agent && member.role == "reviewer"),
     })?;
     if !content.ends_with('\n') {
@@ -916,7 +919,7 @@ mod tests {
         let CrewSource::Agent { prompt, .. } = &coder.source else {
             panic!("default coder should be an agent");
         };
-        let brief = build_crew_brief(
+        let brief = build_crew_brief_with_options(
             &TerminalCrewContext {
                 namespace: "flotilla".to_string(),
                 convoy: "fix-delivery".to_string(),
@@ -926,7 +929,9 @@ mod tests {
             "coder",
             prompt.as_deref().map_or(CrewAssignment::Unassigned, CrewAssignment::Prompt),
             &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
-        );
+            &CrewBriefRenderOptions { has_credential_scope: true, ..CrewBriefRenderOptions::default() },
+        )
+        .expect("render scoped coder brief");
 
         assert!(brief.content.contains("The pull-request destination is the repository URL and target ref named in `## Work context`"));
         assert!(brief.content.contains("the issue source may be a different forge"));
@@ -984,8 +989,6 @@ mod tests {
         assert!(content.contains("No decisions beyond the brief."));
         assert!(content.contains("--decision-ledger-ref '<comment URL>'"));
         assert!(content.contains("A claim without this pointer is accepted but flagged"));
-        assert!(content.contains("park the verified commit"));
-        assert!(content.contains("redispatched under the owning project"));
         assert!(content.contains("## Assignment\n\nFix the flux capacitor."));
     }
 
@@ -1050,7 +1053,12 @@ mod tests {
             "driver",
             CrewAssignment::Prompt("Pair with the user."),
             &[CrewBriefMember { role: "driver".to_string(), state: "active".to_string(), is_agent: true }],
-            &CrewBriefRenderOptions { template: "interactive-session.md".to_string(), overrides: Vec::new(), fork_stance: false },
+            &CrewBriefRenderOptions {
+                template: "interactive-session.md".to_string(),
+                overrides: Vec::new(),
+                fork_stance: false,
+                has_credential_scope: false,
+            },
         )
         .expect("render selected template")
         .content;
@@ -1076,7 +1084,12 @@ mod tests {
                 state: "active".to_string(),
                 is_agent: true,
             }],
-            &CrewBriefRenderOptions { template: "diff-review".to_string(), overrides: Vec::new(), fork_stance: true },
+            &CrewBriefRenderOptions {
+                template: "diff-review".to_string(),
+                overrides: Vec::new(),
+                fork_stance: true,
+                has_credential_scope: false,
+            },
         )
         .expect("render fork review brief")
         .content;
@@ -1101,7 +1114,12 @@ mod tests {
             "shepherd",
             CrewAssignment::Unassigned,
             &[CrewBriefMember { role: "shepherd".to_string(), state: "active".to_string(), is_agent: true }],
-            &CrewBriefRenderOptions { template: "shepherd".to_string(), overrides: Vec::new(), fork_stance: false },
+            &CrewBriefRenderOptions {
+                template: "shepherd".to_string(),
+                overrides: Vec::new(),
+                fork_stance: false,
+                has_credential_scope: true,
+            },
         )
         .expect("render shepherd brief")
         .content;
@@ -1172,6 +1190,7 @@ mod tests {
                     source: "{% block delivery %}Pairing-specific delivery gate.{% endblock %}".to_string(),
                 }],
                 fork_stance: false,
+                has_credential_scope: false,
             },
         )
         .expect("render custom block-only template");
