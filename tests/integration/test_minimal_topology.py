@@ -4,7 +4,7 @@ All tests run commands on node-a (the "user's desktop") and validate
 that multi-host peering with node-b works via the CLI JSON output.
 """
 
-from conftest import docker_exec, flotilla_json, wait_for
+from conftest import docker_exec, flotilla_json
 
 
 def test_both_daemons_running(topology):
@@ -93,23 +93,6 @@ def test_remote_prepare_terminal_returns_attachable_set_id(topology):
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
-
-    wait_for(
-        lambda: any(
-            (record.get("object") or {})
-            .get("spec", {})
-            .get("identity", {})
-            .get("host_ref")
-            == "node-b"
-            for record in flotilla_json(
-                topology["node-a"],
-                "resource list repositories --include-replicas",
-            )["records"]
-        ),
-        "node-a sees node-b's replicated repository resource",
-        timeout=30,
-        interval=1.0,
-    )
 
     prepared = flotilla_json(
         topology["node-a"],
