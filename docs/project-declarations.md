@@ -115,8 +115,18 @@ a presentation annotation; `fleet` has no special scope semantics. Fleet-level
 standing convoys are declared by convention in the fleet project.
 
 The ensure loop starts a missing convoy and restarts a failed or explicitly
-reaped convoy with exponential backoff. Convoy metadata records the entry name,
-source commit, repository, and path. Removing the entry and running `project
+reaped convoy with exponential backoff. For a declared `driver`, admission
+derives its consecutive-failure count and retry clock from the Convoy generation
+records homed by that driver; it stores no retry state on the `ConvoyEnsure`.
+The newest generation's creation time starts the backoff interval. Three
+consecutive failed generations raise a driver-homed, expiring Demand, and no
+new generation is admitted while that Demand remains unresolved. Resolving the
+Demand consents to one retry. Reaping failed generation records also resets the
+derived failure count: clearing the wreckage is an operator's explicit consent
+to retry.
+
+Convoy metadata records the entry name, source commit, repository, and path.
+Removing the entry and running `project
 refresh` reaps the convoy through the normal explicit teardown path before
 removing its `ConvoyEnsure` declaration. Declaration removal retains the normal
 checkout safety gate and fails refresh rather than discarding unsafe work. A
