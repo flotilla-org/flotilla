@@ -760,6 +760,7 @@ mod tests {
                     work_unsettled: true,
                     as_of: attention_at,
                 }],
+                pane_exits: Vec::new(),
             },
             state: ResultSetState {
                 demand: Some(flotilla_protocol::DemandBackedMetadata { as_of: base, has_more: false }),

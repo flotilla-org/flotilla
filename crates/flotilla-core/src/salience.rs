@@ -9,6 +9,7 @@ pub struct SalienceFacts {
     pub demands: Vec<DemandFact>,
     pub regards: Vec<RegardFact>,
     pub attention: Vec<AttentionFact>,
+    pub pane_exits: Vec<PaneExitFact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +35,12 @@ pub struct AttentionFact {
     pub as_of: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneExitFact {
+    pub target: ResourceRef,
+    pub as_of: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SalienceEvaluation {
     pub salience: Salience,
@@ -51,7 +58,7 @@ pub fn compute_salience(
 ) -> Salience {
     let attention_needs_human = matches!(attention, Some(TerminalAttentionState::NeedsInput))
         || matches!(attention, Some(TerminalAttentionState::Idle)) && work_unsettled;
-    let demand_is_unacknowledged = matches!(demand, Some(DemandState::Raised | DemandState::Satisfied));
+    let demand_is_unacknowledged = matches!(demand, Some(DemandState::Raised | DemandState::Satisfied | DemandState::Escalated));
     if demand_is_unacknowledged && regard_covers && attention_needs_human {
         return Salience::Urgent;
     }
@@ -59,6 +66,7 @@ pub fn compute_salience(
     let demand_salience = match demand {
         Some(DemandState::Raised) => Salience::Attention,
         Some(DemandState::Satisfied) => Salience::Info,
+        Some(DemandState::Escalated) => Salience::Urgent,
         Some(DemandState::Acknowledged) | None => Salience::None,
     };
     let attention_salience = match attention {
@@ -86,6 +94,8 @@ pub fn evaluate_entry(
         .iter()
         .filter(|observation| targets.iter().any(|target| references_match(&observation.target, target)))
         .collect::<Vec<_>>();
+    let pane_exits =
+        facts.pane_exits.iter().filter(|exit| targets.iter().any(|target| references_match(&exit.target, target))).collect::<Vec<_>>();
 
     let mut result = SalienceEvaluation { salience: Salience::None, as_of: base_as_of };
     evaluate_combination(None, None, coverage_targets, facts, &mut result);
@@ -97,6 +107,10 @@ pub fn evaluate_entry(
         for &observation in &attention {
             evaluate_combination(Some(demand), Some(observation), coverage_targets, facts, &mut result);
         }
+    }
+    for exit in pane_exits {
+        result.salience = result.salience.max(Salience::Attention);
+        result.as_of = result.as_of.max(exit.as_of);
     }
     result
 }
@@ -197,6 +211,7 @@ mod tests {
                 "out-of-searchlight demand",
             ),
             (Some(DemandState::Satisfied), false, None, true, Salience::Info, "satisfied demand awaiting acknowledgement"),
+            (Some(DemandState::Escalated), false, None, true, Salience::Urgent, "expired demand escalated"),
             (
                 Some(DemandState::Satisfied),
                 true,

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 pub use flotilla_protocol::IssueSource;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, ReplicationClass, Repository, RepositoryKey, TypedResolver};
+use crate::{resource::define_resource, status_patch::StatusPatch, ReplicaReadResolver, ReplicationClass, Repository, RepositoryKey};
 
 define_resource!(Project, "projects", ProjectSpec, ProjectStatus, ProjectStatusPatch, replication = ReplicationClass::Definitions);
 
@@ -134,7 +134,7 @@ pub enum IssueSourceResolution {
     Unavailable(IssueSourceUnavailable),
 }
 
-pub async fn resolve_project_issue_sources(repositories: &TypedResolver<Repository>, project: &ProjectSpec) -> IssueSourceResolution {
+pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Repository>, project: &ProjectSpec) -> IssueSourceResolution {
     if let Some(source) = &project.issue_source {
         return IssueSourceResolution::Available { sources: vec![source.clone()] };
     }
@@ -150,7 +150,7 @@ pub async fn resolve_project_issue_sources(repositories: &TypedResolver<Reposito
                 });
             }
         };
-        if let Some(forge) = repository.spec.forge() {
+        if let Some(forge) = repository.object.spec.forge() {
             sources.insert(IssueSource { service: forge.service_url.clone(), scope: forge.repository.clone() });
         }
     }

@@ -1,14 +1,18 @@
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use flotilla_protocol::{arg::Arg, commands::AttachMode};
 use serde::Deserialize;
 
-use super::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag};
+use super::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag, TerminalSize};
 use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{run, CommandRunner},
 };
+
+const BRACKETED_PASTE_START: &str = "\x1b[200~";
+const BRACKETED_PASTE_END: &str = "\x1b[201~";
+const DELIVERY_ENTER_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Deserialize)]
 struct SessionInfo {
@@ -65,6 +69,46 @@ impl CleatTerminalPool {
         args.push(Arg::Literal(session_name.into()));
         args
     }
+
+    async fn ensure_session_at_size(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        tags: &[TerminalSessionTag],
+        initial_size: Option<TerminalSize>,
+    ) -> Result<(), String> {
+        let existing = self.list_sessions().await.unwrap_or_default();
+        if existing.iter().any(|session| session.session_name == session_name) {
+            return Ok(());
+        }
+
+        let has_env = !env_vars.is_empty() || !self.terminal_env_defaults.is_empty();
+        let effective_cmd = if !has_env {
+            command.to_string()
+        } else {
+            let mut parts = vec!["env".to_string()];
+            for (key, value) in self.terminal_env_defaults.iter().chain(env_vars) {
+                parts.push(format!("{key}={}", flotilla_protocol::arg::shell_quote(value)));
+            }
+            parts.push(command.to_string());
+            parts.join(" ")
+        };
+        let cwd = cwd.as_path().display().to_string();
+        let mut args = vec!["launch", "--json", "--record", session_name, "--cwd", &cwd, "--cmd", &effective_cmd];
+        let encoded_size = initial_size.map(|size| size.to_string());
+        if let Some(size) = &encoded_size {
+            args.extend(["--size", size]);
+        }
+        let encoded_tags = tags.iter().map(|tag| format!("{}={}", tag.key, tag.value)).collect::<Vec<_>>();
+        for tag in &encoded_tags {
+            args.push("--tag");
+            args.push(tag);
+        }
+        run!(self.runner, &self.binary, &args, Path::new("/"))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -105,31 +149,19 @@ impl TerminalPool for CleatTerminalPool {
         env_vars: &TerminalEnvVars,
         tags: &[TerminalSessionTag],
     ) -> Result<(), String> {
-        let existing = self.list_sessions().await.unwrap_or_default();
-        if existing.iter().any(|session| session.session_name == session_name) {
-            return Ok(());
-        }
+        self.ensure_session_at_size(session_name, command, cwd, env_vars, tags, None).await
+    }
 
-        let has_env = !env_vars.is_empty() || !self.terminal_env_defaults.is_empty();
-        let effective_cmd = if !has_env {
-            command.to_string()
-        } else {
-            let mut parts = vec!["env".to_string()];
-            for (key, value) in self.terminal_env_defaults.iter().chain(env_vars) {
-                parts.push(format!("{key}={}", flotilla_protocol::arg::shell_quote(value)));
-            }
-            parts.push(command.to_string());
-            parts.join(" ")
-        };
-        let cwd = cwd.as_path().display().to_string();
-        let mut args = vec!["launch", "--json", "--record", session_name, "--cwd", &cwd, "--cmd", &effective_cmd];
-        let encoded_tags = tags.iter().map(|tag| format!("{}={}", tag.key, tag.value)).collect::<Vec<_>>();
-        for tag in &encoded_tags {
-            args.push("--tag");
-            args.push(tag);
-        }
-        run!(self.runner, &self.binary, &args, Path::new("/"))?;
-        Ok(())
+    async fn ensure_session_with_size(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        tags: &[TerminalSessionTag],
+        initial_size: Option<TerminalSize>,
+    ) -> Result<(), String> {
+        self.ensure_session_at_size(session_name, command, cwd, env_vars, tags, initial_size).await
     }
 
     fn attach_args(
@@ -184,13 +216,17 @@ impl TerminalPool for CleatTerminalPool {
         run!(self.runner, &self.binary, &["capture", session_name], Path::new("/")).map(Some)
     }
 
-    async fn deliver(&self, session_name: &str, text: &str, submit: bool) -> Result<(), String> {
-        let mut args = vec!["send", session_name, text];
-        if submit {
-            args.push("--submit");
-        }
-        run!(self.runner, &self.binary, &args, Path::new("/"))?;
+    async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
+        let paste = format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}");
+        run!(self.runner, &self.binary, &["send", session_name, &paste, "--no-enter"], Path::new("/"))?;
+        tokio::time::sleep(DELIVERY_ENTER_DELAY).await;
+        run!(self.runner, &self.binary, &["send-keys", session_name, "Enter"], Path::new("/"))?;
         Ok(())
+    }
+
+    async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
+        run!(self.runner, &self.binary, &["send-keys", session_name, "C-c"], Path::new("/"))?;
+        self.deliver(session_name, text).await
     }
 }
 
@@ -257,6 +293,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_launches_session_with_requested_initial_size() {
+        let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("{}".into())]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+
+        pool.ensure_session_with_size(
+            "my-session",
+            "bash",
+            &ExecutionEnvironmentPath::new("/repo"),
+            &vec![],
+            &[],
+            Some(TerminalSize::new(200, 50)),
+        )
+        .await
+        .expect("ensure sized session");
+
+        assert_eq!(runner.calls()[1].1, vec![
+            "launch",
+            "--json",
+            "--record",
+            "my-session",
+            "--cwd",
+            "/repo",
+            "--cmd",
+            "bash",
+            "--size",
+            "200x50",
+        ]);
+    }
+
+    #[tokio::test]
     async fn ensure_session_includes_env_vars_in_cmd() {
         let create_json = r#"{"id":"my-session","cwd":"/repo","cmd":"env FOO='bar' claude","status":"Detached"}"#;
         let runner = Arc::new(MockRunner::new(vec![
@@ -307,7 +373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_session_skips_if_session_exists() {
+    async fn ensure_sized_session_preserves_existing_live_session() {
         let list_json = r#"[{"id":"my-session","cwd":"/repo","cmd":"claude","status":"Detached"}]"#;
         let runner = Arc::new(MockRunner::new(vec![
             Ok(list_json.into()), // list_sessions: session exists
@@ -315,7 +381,16 @@ mod tests {
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
         let env = vec![("FOO".to_string(), "bar".to_string())];
 
-        pool.ensure_session("my-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env, &[]).await.expect("ensure session");
+        pool.ensure_session_with_size(
+            "my-session",
+            "claude",
+            &ExecutionEnvironmentPath::new("/repo"),
+            &env,
+            &[],
+            Some(TerminalSize::new(200, 50)),
+        )
+        .await
+        .expect("ensure session");
 
         let calls = runner.calls();
         assert_eq!(calls.len(), 1, "should only call list, not launch: {calls:?}");
@@ -346,16 +421,31 @@ mod tests {
         assert_eq!(calls[0].1, vec!["kill", "my-session"]);
     }
 
-    #[tokio::test]
-    async fn deliver_submits_text_to_the_existing_session() {
-        let runner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
+    #[tokio::test(start_paused = true)]
+    async fn delivery_writes_bracketed_paste_then_enter_for_single_and_multiline_messages() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok(String::new()), Ok(String::new()), Ok(String::new())]));
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
 
-        pool.deliver("reviewer-session", "Please review commit abc123", true).await.expect("deliver message");
+        let single_started = tokio::time::Instant::now();
+        pool.deliver("reviewer-session", "Please review commit abc123").await.expect("deliver single-line message");
+        assert_eq!(single_started.elapsed(), DELIVERY_ENTER_DELAY);
+        let multiline_started = tokio::time::Instant::now();
+        pool.deliver("reviewer-session", "handoff from coder@work\n\nPlease review commit abc123")
+            .await
+            .expect("deliver multiline message");
+        assert_eq!(multiline_started.elapsed(), DELIVERY_ENTER_DELAY);
 
         let calls = runner.calls();
         assert_eq!(calls[0].0, "cleat");
-        assert_eq!(calls[0].1, vec!["send", "reviewer-session", "Please review commit abc123", "--submit"]);
+        assert_eq!(calls[0].1, vec!["send", "reviewer-session", "\x1b[200~Please review commit abc123\x1b[201~", "--no-enter"]);
+        assert_eq!(calls[1].1, vec!["send-keys", "reviewer-session", "Enter"]);
+        assert_eq!(calls[2].1, vec![
+            "send",
+            "reviewer-session",
+            "\x1b[200~handoff from coder@work\n\nPlease review commit abc123\x1b[201~",
+            "--no-enter"
+        ]);
+        assert_eq!(calls[3].1, vec!["send-keys", "reviewer-session", "Enter"]);
     }
 
     // ── attach_args tests ──────────────────────────────────────────
@@ -504,5 +594,18 @@ mod tests {
         let term_pos = cmd_val.find("TERM=").expect("should contain TERM");
         let foo_pos = cmd_val.find("FOO=").expect("should contain FOO");
         assert!(term_pos < foo_pos, "terminal defaults should appear before caller env vars: {cmd_val}");
+    }
+
+    #[tokio::test]
+    async fn retry_delivery_clears_a_stuck_composer_before_resubmitting() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok(String::new()), Ok(String::new())]));
+        let pool = CleatTerminalPool::new(runner.clone(), "cleat");
+
+        pool.retry_delivery("reviewer-session", "Please review commit abc123").await.expect("retry delivery");
+
+        let calls = runner.calls();
+        assert_eq!(calls[0].1, vec!["send-keys", "reviewer-session", "C-c"]);
+        assert_eq!(calls[1].1, vec!["send", "reviewer-session", "\x1b[200~Please review commit abc123\x1b[201~", "--no-enter"]);
+        assert_eq!(calls[2].1, vec!["send-keys", "reviewer-session", "Enter"]);
     }
 }

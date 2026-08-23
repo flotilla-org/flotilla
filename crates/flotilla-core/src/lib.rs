@@ -10,6 +10,7 @@ pub mod config;
 pub mod convert;
 pub mod daemon;
 pub mod data;
+pub mod demand_lifecycle;
 pub mod environment_manager;
 pub mod executor;
 pub mod hop_chain;

@@ -1555,7 +1555,13 @@ impl SqliteBackend {
         self.call(move |connection| {
             let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource delete"))?;
             let existing = Self::select_existing::<T>(&tx, &key, &name)?;
-            let mut object = existing.ok_or_else(|| ResourceError::not_found(&name))?;
+            let Some(mut object) = existing else {
+                if Self::clear_decode_quarantine(&tx, &key, &name)? {
+                    tx.commit().map_err(|err| Self::map_sqlite(err, "commit quarantined sqlite resource delete"))?;
+                    return Ok(());
+                }
+                return Err(ResourceError::not_found(&name));
+            };
             if object.metadata.is_pending_finalization() {
                 return Ok(());
             }
@@ -1588,6 +1594,21 @@ impl SqliteBackend {
             tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource delete"))?;
             Self::notify_watchers(&watchers, &key, StoredEvent { kind: event_kind, object: encoded });
             Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn delete_decode_quarantine_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<bool, ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        let name = name.to_string();
+        self.call(move |connection| {
+            let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource quarantine delete"))?;
+            if Self::select_existing::<T>(&tx, &key, &name)?.is_some() {
+                return Err(ResourceError::conflict(&name, "cannot delete quarantine while a live resource exists"));
+            }
+            let deleted = Self::clear_decode_quarantine(&tx, &key, &name)?;
+            tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource quarantine delete"))?;
+            Ok(deleted)
         })
         .await
     }
@@ -1627,9 +1648,11 @@ impl SqliteBackend {
                 .optional()
                 .map_err(|err| Self::map_sqlite(err, "read sqlite resource tombstone"))?;
             if let Some(body) = existing {
+                Self::clear_decode_quarantine(&tx, &key, &name)?;
                 let value = serde_json::from_str(&body)
                     .map_err(|err| ResourceError::decode(format!("decode stored resource tombstone JSON: {err}")))?;
                 let tombstone = Self::decode_tombstone(value)?;
+                tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource quarantine cleanup"))?;
                 return Ok(crate::watch::TombstoneWrite { tombstone, created: false });
             }
             let version = Self::allocate_version_after(&tx, &key, minimum_resource_version)?;
@@ -1650,6 +1673,7 @@ impl SqliteBackend {
                 params![key.0, key.1, key.2, key.3, name, body_json],
             )
             .map_err(|err| Self::map_sqlite(err, "write sqlite resource tombstone"))?;
+            Self::clear_decode_quarantine(&tx, &key, &name)?;
             Self::insert_event(&tx, &key, version, StoredEventKind::Deleted, &body_json, event_retention, T::REPLICATION_CLASS)?;
             tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource tombstone"))?;
             Self::notify_watchers(&watchers, &key, StoredEvent { kind: StoredEventKind::Deleted, object: encoded });
@@ -1744,16 +1768,17 @@ impl SqliteBackend {
         Ok(())
     }
 
-    fn clear_decode_quarantine(tx: &rusqlite::Transaction<'_>, key: &StoreKey, name: &str) -> Result<(), ResourceError> {
-        tx.execute(
-            r#"
+    fn clear_decode_quarantine(tx: &rusqlite::Transaction<'_>, key: &StoreKey, name: &str) -> Result<bool, ResourceError> {
+        let deleted = tx
+            .execute(
+                r#"
             DELETE FROM resource_decode_quarantine
             WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
             "#,
-            params![key.0, key.1, key.2, key.3, name],
-        )
-        .map_err(|err| Self::map_sqlite(err, "clear sqlite resource decode quarantine"))?;
-        Ok(())
+                params![key.0, key.1, key.2, key.3, name],
+            )
+            .map_err(|err| Self::map_sqlite(err, "clear sqlite resource decode quarantine"))?;
+        Ok(deleted != 0)
     }
 
     fn replay_events<T: Resource>(
@@ -1843,5 +1868,59 @@ impl SqliteBackend {
         let quarantines =
             failures.into_iter().map(|(event_version, name, _, error)| EventDecodeWarning { event_version, name, error }).collect();
         Ok(ReplayedEvents { events, quarantines })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::{InputMeta, MaterialPool, MaterialPoolSpec};
+
+    #[tokio::test]
+    async fn quarantine_only_delete_refuses_a_concurrently_created_live_object() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("resources.sqlite");
+        let backend = SqliteBackend::open(&path).expect("sqlite backend should open");
+        backend
+            .create_typed::<MaterialPool>(
+                "flotilla",
+                &InputMeta::builder().name("contended".to_string()).build(),
+                &MaterialPoolSpec::default(),
+            )
+            .await
+            .expect("create live resource");
+
+        let connection = RusqliteConnection::open(&path).expect("open raw sqlite connection");
+        connection
+            .execute(
+                r#"
+                INSERT INTO resource_decode_quarantine
+                    (group_name, version, kind, namespace, name, body_json, error, quarantined_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, '{}', 'stale diagnosis', ?6)
+                "#,
+                params![
+                    MaterialPool::API_PATHS.group,
+                    MaterialPool::API_PATHS.version,
+                    MaterialPool::API_PATHS.kind,
+                    "flotilla",
+                    "contended",
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .expect("seed stale quarantine diagnosis beside live object");
+        drop(connection);
+
+        let error = backend
+            .delete_decode_quarantine_typed::<MaterialPool>("flotilla", "contended")
+            .await
+            .expect_err("quarantine-only deletion must not delete a live resource");
+        assert!(matches!(error, ResourceError::Conflict { .. }), "unexpected quarantine-delete error: {error}");
+        assert!(
+            backend.get_typed::<MaterialPool>("flotilla", "contended").await.is_ok(),
+            "the concurrent live resource must remain intact"
+        );
+        assert_eq!(backend.diagnostics().await.expect("read diagnostics").decode_quarantines.len(), 1);
     }
 }

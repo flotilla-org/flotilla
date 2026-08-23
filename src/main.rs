@@ -226,6 +226,19 @@ enum SubCommand {
 enum DaemonSubCommand {
     /// Gracefully stop the running daemon
     Stop,
+    /// Toggle the fleet launchd agent for local daemon development
+    DevMode {
+        #[command(subcommand)]
+        command: DevModeSubCommand,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum DevModeSubCommand {
+    /// Disable and stop the fleet agent so a dev-built daemon may spawn
+    Enable,
+    /// Re-enable and start the fleet agent
+    Disable,
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -301,8 +314,17 @@ enum ResourceSubCommand {
     Get(ResourceGetArgs),
     /// Delete exactly one raw resource object, bypassing lifecycle gates
     Delete(ResourceDeleteArgs),
+    /// Remove standing multi-authored Host and PlacementPolicy records from non-home roots
+    DedupSweep(ResourceDedupSweepArgs),
     /// Watch resources of a kind
     Watch(ResourceWatchArgs),
+}
+
+#[derive(clap::Args)]
+struct ResourceDedupSweepArgs {
+    /// Resource namespace
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
 }
 
 #[derive(clap::Args, bon::Builder)]
@@ -544,6 +566,7 @@ async fn main() -> Result<()> {
             run_tui(cli, Some(address)).await
         }
         Some(SubCommand::Daemon { command: Some(DaemonSubCommand::Stop), .. }) => run_daemon_stop(&cli).await,
+        Some(SubCommand::Daemon { command: Some(DaemonSubCommand::DevMode { command }), .. }) => run_daemon_dev_mode(&cli, command).await,
         Some(SubCommand::Daemon { command: None, timeout }) => run_daemon(&cli, timeout).await,
         Some(SubCommand::Status) => run_status(&cli, format).await,
         Some(SubCommand::Watch) => run_watch(&cli, format).await,
@@ -909,6 +932,12 @@ async fn run_daemon_stop(cli: &Cli) -> Result<()> {
     flotilla_tui::socket::shutdown_existing(&socket_path)
         .await
         .map_err(|error| color_eyre::eyre::eyre!("could not stop daemon at {}: {error}", socket_path.display()))?;
+    wait_for_socket_removal(&socket_path).await?;
+    println!("Daemon stopped.");
+    Ok(())
+}
+
+async fn wait_for_socket_removal(socket_path: &Path) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         while socket_path.exists() {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -916,8 +945,36 @@ async fn run_daemon_stop(cli: &Cli) -> Result<()> {
     })
     .await
     .map_err(|_| color_eyre::eyre::eyre!("daemon accepted shutdown but did not exit within 30s"))?;
-    println!("Daemon stopped.");
     Ok(())
+}
+
+async fn run_daemon_dev_mode(cli: &Cli, command: DevModeSubCommand) -> Result<()> {
+    match command {
+        DevModeSubCommand::Enable => {
+            // Disable first. Even if graceful shutdown fails, launchd cannot
+            // resurrect the fleet daemon while we finish unloading the job.
+            flotilla_tui::socket::launchd::set_agent_enabled(false).map_err(|error| color_eyre::eyre::eyre!(error))?;
+            let socket_path = cli.socket_path();
+            let shutdown_error =
+                if socket_path.exists() { flotilla_tui::socket::shutdown_existing(&socket_path).await.err() } else { None };
+            flotilla_tui::socket::launchd::bootout_agent().map_err(|error| color_eyre::eyre::eyre!(error))?;
+            if socket_path.exists() {
+                wait_for_socket_removal(&socket_path).await?;
+            }
+            if let Some(error) = shutdown_error {
+                tracing::debug!(%error, "fleet daemon did not accept graceful shutdown before launchd bootout");
+            }
+            println!("Daemon dev mode enabled; the fleet launchd agent is disabled and stopped.");
+            Ok(())
+        }
+        DevModeSubCommand::Disable => {
+            flotilla_tui::socket::launchd::set_agent_enabled(true).map_err(|error| color_eyre::eyre::eyre!(error))?;
+            flotilla_tui::socket::launchd::bootstrap_agent().map_err(|error| color_eyre::eyre::eyre!(error))?;
+            flotilla_tui::socket::launchd::kickstart_agent().map_err(|error| color_eyre::eyre::eyre!(error))?;
+            println!("Daemon dev mode disabled; the fleet launchd agent is enabled and started.");
+            Ok(())
+        }
+    }
 }
 
 fn resolve_flotillad_binary() -> Result<PathBuf> {
@@ -1110,12 +1167,16 @@ async fn run_attach(
 ) -> Result<()> {
     reset_sigpipe();
     let daemon = connect_daemon(cli).await?;
+    let context_repo = match resolve_repo_from_env(cli) {
+        Some(repo) => Some(repo),
+        None => startup_repo_roots(&[]).await.into_iter().next().map(RepoSelector::Path),
+    };
     let result = daemon
         .execute_query(
             Command {
                 node_id: None,
                 provisioning_target: None,
-                context_repo: None,
+                context_repo,
                 action: if transient {
                     CommandAction::AttachTransient {
                         reference: reference.to_string(),
@@ -1305,6 +1366,43 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 format,
             )
             .await
+        }
+        ResourceSubCommand::DedupSweep(args) => {
+            let daemon = connect_daemon(cli).await?;
+            let report = flotilla_client::resource::ResourceClient::new(daemon)
+                .dedup_single_home_records(&args.namespace)
+                .await
+                .map_err(color_eyre::eyre::Report::msg)?;
+            match format {
+                OutputFormat::Json => println!(
+                    "{}",
+                    flotilla_protocol::output::json_pretty(&serde_json::json!({
+                        "inspected_roots": report.inspected_roots,
+                        "duplicate_records": report.duplicate_records,
+                        "deletions": report.deletions.iter().map(|deletion| serde_json::json!({
+                            "kind": deletion.kind,
+                            "name": deletion.name,
+                            "deleted_root": deletion.deleted_root,
+                            "home_root": deletion.home_root,
+                        })).collect::<Vec<_>>(),
+                    }))
+                ),
+                OutputFormat::Human => {
+                    println!(
+                        "inspected {} roots; found {} duplicated records; deleted {} non-home copies",
+                        report.inspected_roots,
+                        report.duplicate_records,
+                        report.deletions.len()
+                    );
+                    for deletion in report.deletions {
+                        println!(
+                            "deleted {}/{} from root {} (home: {})",
+                            deletion.kind, deletion.name, deletion.deleted_root, deletion.home_root
+                        );
+                    }
+                }
+            }
+            Ok(())
         }
         ResourceSubCommand::Watch(args) => run_resource_watch(cli, args, format).await,
     }
@@ -1979,8 +2077,8 @@ mod tests {
         host_daemon_socket_required, incompatible_daemon_reexec_failure, provisioning_target_for_environment, replace_host_ids,
         run_replica_snapshot, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
         should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, Cli, CliPaths, CommandValue, DaemonSubCommand,
-        ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceStatusPatchArgs, ResourceSubCommand,
-        ResourceWatchArgs, SubCommand,
+        DevModeSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceStatusPatchArgs,
+        ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
 
     #[test]
@@ -2517,6 +2615,18 @@ mod tests {
 
         let foreground = Cli::try_parse_from(["flotilla", "daemon", "--timeout", "0"]).expect("foreground daemon should still parse");
         assert!(matches!(foreground.command, Some(SubCommand::Daemon { command: None, timeout: 0 })));
+
+        let dev_mode = Cli::try_parse_from(["flotilla", "daemon", "dev-mode", "enable"]).expect("daemon dev-mode enable should parse");
+        assert!(matches!(
+            dev_mode.command,
+            Some(SubCommand::Daemon { command: Some(DaemonSubCommand::DevMode { command: DevModeSubCommand::Enable }), .. })
+        ));
+
+        let fleet_mode = Cli::try_parse_from(["flotilla", "daemon", "dev-mode", "disable"]).expect("daemon dev-mode disable should parse");
+        assert!(matches!(
+            fleet_mode.command,
+            Some(SubCommand::Daemon { command: Some(DaemonSubCommand::DevMode { command: DevModeSubCommand::Disable }), .. })
+        ));
     }
 
     #[test]

@@ -98,6 +98,11 @@ fn convoy_ensure_crd_parses_with_expected_shape() {
     assert!(required.iter().any(|field| field == "project_ref"));
     assert!(required.iter().any(|field| field == "workflow_ref"));
     assert!(required.iter().any(|field| field == "repositories"));
+    assert_eq!(
+        ensure["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]["properties"]["conditions"]["items"]
+            ["properties"]["value"]["enum"],
+        serde_json::json!(["true", "false", "unknown"])
+    );
 }
 
 #[test]

@@ -555,6 +555,32 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         }
     }
 
+    output.push_str("\nDecision ledgers:\n");
+    if explanation.decision_ledgers.is_empty() {
+        output.push_str("  (no settlement claims)\n");
+    } else {
+        for ledger in &explanation.decision_ledgers {
+            if ledger.missing {
+                let _ = writeln!(
+                    output,
+                    "  - {}/{} claimed_at={} MISSING (flagged; claim accepted)",
+                    ledger.vessel,
+                    ledger.role,
+                    ledger.claimed_at.as_deref().unwrap_or("-")
+                );
+            } else {
+                let _ = writeln!(
+                    output,
+                    "  - {}/{} claimed_at={} comment={}",
+                    ledger.vessel,
+                    ledger.role,
+                    ledger.claimed_at.as_deref().unwrap_or("-"),
+                    ledger.comment_url.as_deref().unwrap_or("-")
+                );
+            }
+        }
+    }
+
     output.push_str("\nExpected checkouts:\n");
     if explanation.checkouts.is_empty() {
         output.push_str("  (none; artifact-less claim exit)\n");
@@ -644,6 +670,16 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
     use flotilla_protocol::commands::CommandValue;
     match result {
         CommandValue::Ok => "ok".to_string(),
+        CommandValue::ConvoyBriefDelivered { displaced: Some(displaced) } => {
+            format!("brief delivered now; displaced pending brief:\n{displaced}")
+        }
+        CommandValue::ConvoyBriefDelivered { displaced: None } => "brief delivered now".to_string(),
+        CommandValue::ConvoyBriefQueued { displaced: Some(displaced) } => {
+            format!("brief queued for turn end; displaced brief:\n{displaced}")
+        }
+        CommandValue::ConvoyBriefQueued { displaced: None } => "brief queued for turn end".to_string(),
+        CommandValue::ConvoyBriefWithdrawn { withdrawn: Some(withdrawn) } => format!("pending brief withdrawn:\n{withdrawn}"),
+        CommandValue::ConvoyBriefWithdrawn { withdrawn: None } => "no pending brief to withdraw".to_string(),
         CommandValue::RepoTracked { path, resolved_from, identity_change } => {
             let mut output = match resolved_from {
                 Some(original) => format!("repo tracked: {} (resolved from {})", path.display(), original.display()),

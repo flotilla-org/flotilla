@@ -231,6 +231,18 @@ completers proposing fuller specs; admission remains the backstop.
 _Avoid_: Defaulting webhook, enrichment, the governor's job, the crew's
 turn-ending report (that is a **Settlement Claim**, ADR 0017).
 
+**Decision Ledger**:
+The claims-plane disclosure a crew reports at **Settlement Claim** time:
+every decision made where the **Brief** was silent, ranked least-confident
+first — what was chosen, the alternative, and what the crew would have
+asked if asking were free. Review material pre-merge (wrong decisions get
+revised); triaged by the governor at settlement, each entry dispositioned
+*fine* / *revised* / *graduated* into an ADR, a glossary entry, an issue,
+or a brief-template fix. Lives on the change request, never as files in
+the repo. (ADR 0034.)
+_Avoid_: Audit (that is the future independent completeness check),
+decision log (too close to ADR), changelog.
+
 **Independent**:
 A terminal session with no **Convoy** association — sailing alone, per the
 convoy-era term. Adopted attachables, persistent agents, loose work sessions.
@@ -335,6 +347,24 @@ home yields readable memory and a truthful inventory, never resurrection.
 (ADR 0016.)
 _Avoid_: Local resource, host-pinned.
 
+**Homing seam**:
+One of exactly two places where a new record's home departs from its
+parent's: admission placement (a **Convoy** is born at its primary
+placement host) and per-child actuation locality (a convoy's vessels,
+environments, and terminal sessions are born where each is actuated).
+Everywhere else, a controller authors a child record only at the home of
+its parent — the creation cascade. (ADR 0033; seams ruled in ADR 0032.)
+_Avoid_: Re-home (reserved against by **Succession**), handoff, migration.
+
+**Code-seeded Builtin**:
+The micro-class of records seeded identically by code at every root's
+startup — builtin **WorkflowTemplates** such as `scratch`. Same-name
+multi-root authorship is legal for exactly this class; content is
+determined by the running generation, so divergence is expected only
+mid-roll and surfaces as a condition if it persists on a settled fleet.
+A human edit makes the record a **Definition** shadowing a seed. (ADR 0033.)
+_Avoid_: Builtin definition (conflates the classes), seeded default.
+
 **Succession**:
 How a **Convoy** record changes home: a new home authors a successor record
 (`succeeded_from` ref) and each vessel's host repoints its convoy ref —
@@ -356,7 +386,30 @@ observed state and starts a new generation (repopulated by a full provider
 refresh). Watch-from-version is valid only within a generation; a consumer or
 federated replica that sees the generation change must re-list. The durable
 **Managed** log has no generations — its version is continuous across restarts.
+Distinct sense: see **Convoy generation**.
 _Avoid_: Epoch, session, restart-id.
+
+**Convoy generation**:
+One incarnation of a standing **Convoy**: a single Convoy record holding that
+life's crew turns, archive pointers, and terminal reason (ADR 0032). Records
+are never reused across restarts — an ensure rebuilds by admitting the next
+generation; terminal generations are retained as history. At most one live
+generation exists per **Role address**. Distinct from the store-lifespan
+sense of **Generation**, and from the fleet-release generations of the
+deployment pipeline.
+_Avoid_: Incarnation (in code), husk (except informally for a terminal
+generation blocking nothing).
+
+**Role address**:
+The stable identity of a standing **Convoy**: `{project, role}`, written
+`role@project` (e.g. `governor@andamento`). What operators attach to, what
+ensures maintain, what surfaces display. Resolves via selector to the live
+**Convoy generation** — in project context a bare role suffices; in bare
+context resolution requires fleet-wide uniqueness or the qualified form.
+Convoy record names are generated machine identifiers and are never a human
+surface (ADR 0032).
+_Avoid_: Convoy name (for the human-facing identity), triple-barrelled
+generated names.
 
 **Provisioning**:
 Bringing an execution context into being — a checkout, an **Environment**

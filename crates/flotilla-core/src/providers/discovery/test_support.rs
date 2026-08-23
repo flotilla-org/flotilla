@@ -797,6 +797,7 @@ pub struct EnsuredTerminalSession {
     pub command: String,
     pub cwd: ExecutionEnvironmentPath,
     pub env_vars: super::super::terminal::TerminalEnvVars,
+    pub initial_size: Option<super::super::terminal::TerminalSize>,
 }
 
 impl Default for FakeTerminalPool {
@@ -850,7 +851,19 @@ impl TerminalPool for FakeTerminalPool {
         command: &str,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &super::super::terminal::TerminalEnvVars,
+        tags: &[super::super::terminal::TerminalSessionTag],
+    ) -> Result<(), String> {
+        self.ensure_session_with_size(session_name, command, cwd, env_vars, tags, None).await
+    }
+
+    async fn ensure_session_with_size(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &super::super::terminal::TerminalEnvVars,
         _tags: &[super::super::terminal::TerminalSessionTag],
+        initial_size: Option<super::super::terminal::TerminalSize>,
     ) -> Result<(), String> {
         let mut sessions = self.sessions.lock().await;
         if sessions.iter().any(|s| s.session_name == session_name) {
@@ -861,6 +874,7 @@ impl TerminalPool for FakeTerminalPool {
             command: command.to_string(),
             cwd: cwd.clone(),
             env_vars: env_vars.clone(),
+            initial_size,
         });
         sessions.push(super::super::terminal::TerminalSession {
             session_name: session_name.to_string(),
@@ -915,8 +929,8 @@ impl TerminalPool for FakeTerminalPool {
         Ok(self.captured_screens.lock().await.get(session_name).cloned())
     }
 
-    async fn deliver(&self, session_name: &str, text: &str, submit: bool) -> Result<(), String> {
-        self.delivered.lock().await.push((session_name.to_string(), text.to_string(), submit));
+    async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
+        self.delivered.lock().await.push((session_name.to_string(), text.to_string(), true));
         Ok(())
     }
 }

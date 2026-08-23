@@ -127,7 +127,10 @@ pub fn handle_attach_dispatch_completion(result: Result<CommandValue, String>, a
 /// Called when a `CommandFinished` event arrives from the daemon.
 pub fn handle_result(result: CommandValue, app: &mut App) {
     match result {
-        CommandValue::Ok => {}
+        CommandValue::Ok
+        | CommandValue::ConvoyBriefDelivered { .. }
+        | CommandValue::ConvoyBriefQueued { .. }
+        | CommandValue::ConvoyBriefWithdrawn { .. } => {}
         CommandValue::RepoTracked { path, .. } => {
             info!(path = %path.display(), "tracked repo");
         }

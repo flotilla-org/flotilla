@@ -75,9 +75,9 @@ impl RepositoryReconciler {
 
 impl Reconciler for RepositoryReconciler {
     type Resource = Repository;
-    type Dependencies = RepositoryStatus;
+    type Prepared = RepositoryStatus;
 
-    async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         let repository_key = RepositoryKey(obj.metadata.name.clone());
         obj.spec.verify_key(&repository_key).map_err(ResourceError::invalid)?;
         let mut status = RepositoryStatus::default();
@@ -149,10 +149,10 @@ impl Reconciler for RepositoryReconciler {
     fn reconcile(
         &self,
         _obj: &ResourceObject<Self::Resource>,
-        deps: &Self::Dependencies,
+        prepared: &Self::Prepared,
         _now: DateTime<Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
-        ReconcileOutcome::new(Some(RepositoryStatusPatch::Replace(deps.clone())))
+        ReconcileOutcome::new(Some(RepositoryStatusPatch::Replace(prepared.clone())))
     }
 
     async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {

@@ -7,7 +7,7 @@ use flotilla_resources::{
 #[tokio::test]
 async fn project_issue_source_override_resolves_without_a_checkout_or_repository_record() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let repositories = backend.using::<Repository>("flotilla");
+    let repositories = backend.including_replicas::<Repository>("flotilla");
     let override_source = IssueSource { service: "linear".into(), scope: "WIDGET".into() };
     let project = ProjectSpec {
         display_name: "Widgets".into(),
@@ -31,12 +31,13 @@ async fn project_issue_source_override_resolves_without_a_checkout_or_repository
 #[tokio::test]
 async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let repositories = backend.using::<Repository>("flotilla");
+    let repository_writer = backend.using::<Repository>("flotilla");
     let first = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("first repository");
     let second = RepositorySpec::remote("https://gitlab.com/widgets/api.git").expect("second repository");
     for spec in [&first, &second] {
-        repositories.create(&InputMeta::builder().name(spec.key().to_string()).build(), spec).await.expect("repository should create");
+        repository_writer.create(&InputMeta::builder().name(spec.key().to_string()).build(), spec).await.expect("repository should create");
     }
+    let repositories = backend.including_replicas::<Repository>("flotilla");
     let project = ProjectSpec {
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
@@ -66,9 +67,10 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
 #[tokio::test]
 async fn project_issue_source_resolution_reports_typed_unavailability() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let repositories = backend.using::<Repository>("flotilla");
+    let repository_writer = backend.using::<Repository>("flotilla");
     let local = RepositorySpec::local("host-01", "/srv/widgets/.git").expect("local repository");
-    repositories.create(&InputMeta::builder().name(local.key().to_string()).build(), &local).await.expect("repository should create");
+    repository_writer.create(&InputMeta::builder().name(local.key().to_string()).build(), &local).await.expect("repository should create");
+    let repositories = backend.including_replicas::<Repository>("flotilla");
     let local_only = ProjectSpec {
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
@@ -154,6 +156,27 @@ fn remote_less_worktrees_converge_on_host_and_git_common_directory() {
 
     assert_eq!(first.key(), second.key());
     assert!(matches!(first.identity(), RepositoryIdentity::Local { .. }));
+}
+
+#[test]
+fn declared_remotes_share_the_first_remote_identity() {
+    let canonical = "https://github.com/flotilla-org/flotilla";
+    let mirror = "https://forgejo.lab/lab/flotilla.git";
+    let repository =
+        RepositorySpec::remote(mirror).expect("mirror observation").with_remotes([canonical, mirror]).expect("multi-remote declaration");
+
+    assert_eq!(repository.key(), RepositorySpec::remote(canonical).expect("canonical repository").key());
+    assert_eq!(repository.remotes(), [canonical, "https://forgejo.lab/lab/flotilla"]);
+    assert!(repository.declares_remote(mirror));
+    assert_eq!(repository.forge().expect("canonical forge").service_url, "https://github.com");
+    assert_eq!(repository.repo_fact_value(), "flotilla-org/flotilla");
+}
+
+#[test]
+fn declared_remotes_must_include_the_observed_repository_and_remain_unique() {
+    let observed = RepositorySpec::remote("https://forgejo.lab/lab/flotilla").expect("mirror observation");
+    assert!(observed.clone().with_remotes(["https://github.com/flotilla-org/flotilla"]).is_err());
+    assert!(observed.with_remotes(["https://forgejo.lab/lab/flotilla", "https://forgejo.lab/lab/flotilla.git"]).is_err());
 }
 
 #[test]

@@ -11,14 +11,15 @@ use common::{
 use flotilla_resources::{
     change_request_record_name,
     controller::{Actuation, Reconciler},
-    controller_patches, interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest, ChangeRequestReviewObservation,
-    ChangeRequestSpec, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus,
-    CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatus, ConvoyStatusPatch,
-    ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, LandedEvidence,
-    LifecycleAuthority, Observation, ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability,
-    OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, StatusPatch, TargetMismatch, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority,
-    WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
+    controller_patches, evaluate_landing_settlement, interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest,
+    ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutPhase,
+    CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler,
+    ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue,
+    IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation, ObservedChangeRequestState, ObservedCheckoutSpec,
+    ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, StatusPatch,
+    TargetMismatch, TerminalSession, TerminalSessionSource, TerminalSessionSpec, UnmetSettlementExpectation, ValidationError, Vessel,
+    VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
+    VESSEL_LABEL,
 };
 
 struct AlwaysEligible;
@@ -93,7 +94,7 @@ async fn reconcile_once_with_resources(
         .with_vessels(vessels.clone())
         .with_presentations(presentations_resolver.clone())
         .with_teardown_runtime(Arc::new(AlwaysEligible));
-    let deps = reconciler.fetch_dependencies(&current).await.expect("dependency fetch should succeed");
+    let deps = reconciler.prepare(&current).await.expect("dependency fetch should succeed");
     reconciler.reconcile(&current, &deps, now)
 }
 
@@ -199,7 +200,7 @@ async fn reconcile_with_observed_change_request(
 
     let current = convoys.get("convoy-a").await.expect("convoy");
     let reconciler = ConvoyReconciler::new(templates).with_checkouts(checkouts).with_clock(Arc::new(FixedClock(timestamp(40))));
-    let deps = reconciler.fetch_dependencies(&current).await.expect("dependencies");
+    let deps = reconciler.prepare(&current).await.expect("dependencies");
     reconciler.reconcile(&current, &deps, timestamp(40))
 }
 
@@ -721,6 +722,45 @@ fn landing_convoy_with_no_declared_exit_never_settles() {
     assert_eq!(outcome.patch, None, "an absent exit must not synthesize a Landed transition");
 }
 
+#[test]
+fn missing_change_request_is_reported_once_across_terminal_exit_entries() {
+    let mut status = bootstrapped_convoy_status();
+    status.phase = ConvoyPhase::Landing;
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+    let repo_ref = RepositoryKey("repo-a".to_string());
+    let mut spec = valid_convoy_spec();
+    spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec::builder()
+        .url("https://github.com/flotilla-org/flotilla".to_string())
+        .repo_ref(repo_ref.clone())
+        .source_ref("feature/missing-observation".to_string())
+        .target_ref("main".to_string())
+        .workspace_slug("flotilla".to_string())
+        .subpaths(Vec::new())
+        .build()];
+    spec.change_request =
+        Some(BoundChangeRequest::builder().id("1624".to_string()).repository_ref(repo_ref).title("merged change".to_string()).build());
+    let convoy = convoy_object("missing-observation", spec, Some(status));
+
+    let evaluation = evaluate_landing_settlement(
+        &convoy,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        Duration::from_secs(180),
+        Duration::from_secs(180),
+        timestamp(40),
+    );
+
+    assert_eq!(
+        evaluation
+            .unmet
+            .iter()
+            .filter(|expectation| matches!(expectation, UnmetSettlementExpectation::MissingChangeRequest { .. }))
+            .count(),
+        1,
+        "merged and closed exit entries must not duplicate the same missing observation"
+    );
+}
+
 #[tokio::test]
 async fn landing_with_open_change_request_stays_warm() {
     let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::False), None, timestamp(40)).await;
@@ -876,7 +916,7 @@ async fn terminal_bound_change_request_settles_checkout_without_own_landed_evide
         .with_checkouts(checkouts)
         .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), std::time::Duration::from_secs(180))
         .with_clock(Arc::new(FixedClock(timestamp(40))));
-    let deps = reconciler.fetch_dependencies(&current).await.expect("dependencies");
+    let deps = reconciler.prepare(&current).await.expect("dependencies");
     let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
 
     assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
@@ -958,7 +998,7 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
     let current = convoys.get("cross-host").await.expect("get authority convoy");
     let reconciler = ConvoyReconciler::new(authority.clone().using::<WorkflowTemplate>("flotilla"))
         .with_federated_checkouts(authority.including_replicas::<Checkout>("flotilla"));
-    let deps = reconciler.fetch_dependencies(&current).await.expect("resolve federated dependencies");
+    let deps = reconciler.prepare(&current).await.expect("resolve federated dependencies");
     let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
 
     assert_eq!(outcome.patch, None, "an open remote change request must hold Landing");
@@ -1679,14 +1719,14 @@ async fn refused_reclaim_requeues_at_the_evidence_staleness_horizon() {
     let refused = ConvoyReconciler::new(templates.clone())
         .with_teardown_runtime(Arc::new(NeverEligible))
         .with_landing_evidence_stale_after(Duration::from_secs(7));
-    let deps = refused.fetch_dependencies(&convoy).await.expect("dependencies");
+    let deps = refused.prepare(&convoy).await.expect("dependencies");
     let outcome = refused.reconcile(&convoy, &deps, timestamp(21));
     assert_eq!(outcome.requeue_after, Some(Duration::from_secs(7)), "a refused reclaim must requeue at the staleness horizon");
 
     let eligible = ConvoyReconciler::new(templates)
         .with_teardown_runtime(Arc::new(AlwaysEligible))
         .with_landing_evidence_stale_after(Duration::from_secs(7));
-    let deps = eligible.fetch_dependencies(&convoy).await.expect("dependencies");
+    let deps = eligible.prepare(&convoy).await.expect("dependencies");
     let outcome = eligible.reconcile(&convoy, &deps, timestamp(21));
     assert_eq!(outcome.requeue_after, None, "an eligible reclaim pass must not keep requeueing");
 }
@@ -1731,7 +1771,7 @@ async fn abandoned_convoy_reclaims_managed_checkout_but_retains_adopted_owner_re
 
     let convoy = convoys.get("convoy-a").await.expect("convoy get");
     let reconciler = ConvoyReconciler::new(templates).with_checkouts(checkouts).with_teardown_runtime(Arc::new(AlwaysEligible));
-    let deps = reconciler.fetch_dependencies(&convoy).await.expect("dependencies");
+    let deps = reconciler.prepare(&convoy).await.expect("dependencies");
     let outcome = reconciler.reconcile(&convoy, &deps, timestamp(21));
 
     assert!(outcome

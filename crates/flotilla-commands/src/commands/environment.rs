@@ -90,7 +90,7 @@ impl fmt::Display for EnvironmentNoun {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use flotilla_protocol::{qualified_path::HostId, Command, CommandAction, EnvironmentId, RepoSelector};
+    use flotilla_protocol::{qualified_path::HostId, CommandAction, EnvironmentId, RepoSelector};
 
     use super::EnvironmentNoun;
     use crate::{
@@ -105,16 +105,12 @@ mod tests {
     #[test]
     fn environment_refresh_resolves_by_environment_identity() {
         let resolved = parse(&["environment", "host:alpha-env", "refresh"]).resolve().expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Refresh { repo: None },
-            },
-            repo: RepoContext::None,
-            host: HostResolution::ExplicitEnvironment(EnvironmentId::host(HostId::new("alpha-env"))),
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::Refresh { repo: None },
+            RepoContext::None,
+            HostResolution::ExplicitEnvironment(EnvironmentId::host(HostId::new("alpha-env"))),
+        );
     }
 
     #[test]
@@ -136,16 +132,12 @@ mod tests {
     #[test]
     fn environment_refresh_with_repo() {
         let resolved = parse(&["env", "prov:builder-1", "refresh", "my-repo"]).resolve().expect("resolve");
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Refresh { repo: Some(RepoSelector::Query("my-repo".into())) },
-            },
-            repo: RepoContext::None,
-            host: HostResolution::ExplicitEnvironment(EnvironmentId::new("builder-1")),
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::Refresh { repo: Some(RepoSelector::Query("my-repo".into())) },
+            RepoContext::None,
+            HostResolution::ExplicitEnvironment(EnvironmentId::new("builder-1")),
+        );
     }
 
     #[test]

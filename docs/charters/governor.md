@@ -137,6 +137,16 @@ A convoy's state lives on three planes and you keep them separate:
 - **Attention** (Working/NeedsInput/Idle) is what the process is doing now.
   It routes your monitoring; it never transitions phases.
 
+Read the claim's decision ledger before settlement. `flotilla convoy <name> explain`
+renders each settling claim's PR-comment pointer and flags a missing
+pointer without rejecting the claim. In the linked `## Decision ledger`
+comment, append exactly one disposition to every numbered entry:
+`- **Disposition:** fine`, `- **Disposition:** revised`, or
+`- **Disposition:** graduated → <ADR amendment | CONTEXT.md gloss | follow-up
+issue | brief-template fix>`. The comment is the audit trail; do not
+copy the ledger into a resource or repository file. A missing ledger is a
+settlement flag to record and follow up, never a reason to wedge settlement.
+
 Teardown:
 
 ```sh

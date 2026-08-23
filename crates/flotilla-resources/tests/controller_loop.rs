@@ -11,8 +11,8 @@ use std::{
 use common::{resource_meta, TestLoopHarness};
 use flotilla_resources::{
     controller::{
-        Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler,
-        ResolverLabelMappedWatch,
+        Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure,
+        ReconcileOutcome, Reconciler, ResolverLabelMappedWatch,
     },
     ApiPaths, Checkout, CheckoutSpec, CheckoutWorktreeSpec, InMemoryBackend, InputMeta, LifecycleAuthority, NoStatusPatch, Presentation,
     PresentationSpec, RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject, StatusPatch, TypedResolver, Vessel,
@@ -89,13 +89,14 @@ impl Resource for FailureResource {
 struct BudgetedFailureReconciler {
     attempts: Arc<AtomicUsize>,
     persist_degraded: bool,
+    wake_degraded: Arc<AtomicBool>,
 }
 
 impl Reconciler for BudgetedFailureReconciler {
     type Resource = FailureResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         self.attempts.fetch_add(1, Ordering::SeqCst);
         Err(ResourceError::other("provider registry unavailable"))
     }
@@ -103,7 +104,7 @@ impl Reconciler for BudgetedFailureReconciler {
     fn reconcile(
         &self,
         _obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         unreachable!("dependency failure should prevent reconcile")
@@ -122,6 +123,7 @@ impl Reconciler for BudgetedFailureReconciler {
             max_consecutive_failures: 3,
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
+            exhaustion: ReconcileErrorExhaustion::Park,
         })
     }
 
@@ -131,6 +133,10 @@ impl Reconciler for BudgetedFailureReconciler {
 
     fn is_reconcile_degraded(&self, obj: &ResourceObject<Self::Resource>) -> bool {
         obj.status.as_ref().is_some_and(|status| status.degraded)
+    }
+
+    async fn degraded_object_needs_reconcile(&self, _obj: &ResourceObject<Self::Resource>) -> Result<bool, ResourceError> {
+        Ok(self.wake_degraded.swap(false, Ordering::SeqCst))
     }
 }
 
@@ -152,16 +158,16 @@ impl RecordingReconciler {
 
 impl Reconciler for RecordingReconciler {
     type Resource = PrimaryResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
@@ -186,16 +192,16 @@ struct FailingObjectReconciler {
 
 impl Reconciler for FailingObjectReconciler {
     type Resource = PrimaryResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
@@ -221,16 +227,16 @@ struct FinalizingReconciler {
 
 impl Reconciler for FinalizingReconciler {
     type Resource = PrimaryResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         _obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         ReconcileOutcome::new(None)
@@ -254,16 +260,16 @@ struct RacingFinalizerRemovalReconciler {
 
 impl Reconciler for RacingFinalizerRemovalReconciler {
     type Resource = PrimaryResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         _obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         ReconcileOutcome::new(None)
@@ -302,16 +308,16 @@ struct RacingAttachReconciler {
 
 impl Reconciler for RacingAttachReconciler {
     type Resource = PrimaryResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         _obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         ReconcileOutcome::new(None)
@@ -371,16 +377,16 @@ struct RacingStatusPatchReconciler {
 
 impl Reconciler for RacingStatusPatchReconciler {
     type Resource = StatusfulResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
@@ -484,16 +490,16 @@ struct ActuatingReconciler {
 
 impl Reconciler for ActuatingReconciler {
     type Resource = PrimaryResource;
-    type Dependencies = ();
+    type Prepared = ();
 
-    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         Ok(())
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        _deps: &Self::Dependencies,
+        _deps: &Self::Prepared,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         if let Some(reconciled) = &self.reconciled {
@@ -1287,7 +1293,11 @@ async fn repeated_identical_reconcile_errors_back_off_and_park_as_degraded() {
         ControllerLoop {
             primary: failures.clone(),
             secondaries: Vec::new(),
-            reconciler: BudgetedFailureReconciler { attempts: Arc::clone(&attempts), persist_degraded: true },
+            reconciler: BudgetedFailureReconciler {
+                attempts: Arc::clone(&attempts),
+                persist_degraded: true,
+                wake_degraded: Arc::new(AtomicBool::new(false)),
+            },
             resync_interval: Duration::from_secs(60),
             backend,
         }
@@ -1354,6 +1364,64 @@ async fn repeated_identical_reconcile_errors_back_off_and_park_as_degraded() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn explicit_lifecycle_wake_bypasses_a_parked_objects_remaining_backoff() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let failures = backend.clone().using::<FailureResource>("flotilla");
+    failures
+        .create(&primary_meta("terminal-a"), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("failure resource should be created");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let wake_degraded = Arc::new(AtomicBool::new(false));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: failures.clone(),
+            secondaries: Vec::new(),
+            reconciler: BudgetedFailureReconciler {
+                attempts: Arc::clone(&attempts),
+                persist_degraded: true,
+                wake_degraded: Arc::clone(&wake_degraded),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    for delay in [0, 10, 20] {
+        tokio::time::advance(Duration::from_millis(delay)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if attempts.load(Ordering::SeqCst) == 3 {
+                break;
+            }
+        }
+    }
+    let degraded = failures.get("terminal-a").await.expect("degraded failure resource");
+    assert!(degraded.status.as_ref().is_some_and(|status| status.degraded));
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+    wake_degraded.store(true, Ordering::SeqCst);
+    failures
+        .update(&InputMeta::from(&degraded.metadata), &degraded.metadata.resource_version, &PrimarySpec {
+            value: "lifecycle-wake".to_string(),
+        })
+        .await
+        .expect("lifecycle change should be persisted");
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        if attempts.load(Ordering::SeqCst) == 4 {
+            break;
+        }
+    }
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 4, "explicit lifecycle wake must bypass the remaining retry delay");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn exhausted_budget_keeps_retrying_until_degraded_status_is_persistable() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let failures = backend.clone().using::<FailureResource>("flotilla");
@@ -1367,7 +1435,11 @@ async fn exhausted_budget_keeps_retrying_until_degraded_status_is_persistable() 
         ControllerLoop {
             primary: failures.clone(),
             secondaries: Vec::new(),
-            reconciler: BudgetedFailureReconciler { attempts: Arc::clone(&attempts), persist_degraded: false },
+            reconciler: BudgetedFailureReconciler {
+                attempts: Arc::clone(&attempts),
+                persist_degraded: false,
+                wake_degraded: Arc::new(AtomicBool::new(false)),
+            },
             resync_interval: Duration::from_secs(60),
             backend,
         }
