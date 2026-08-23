@@ -167,14 +167,14 @@ impl ResourceManifestReconciler {
         };
 
         let annotations = string_map(&existing, "annotations")?;
-        if annotations.get(MANIFEST_SUSPEND_ANNOTATION).is_some_and(|value| value == "true") {
+        let resolution = annotations.get(MANIFEST_RESOLUTION_ANNOTATION).map(String::as_str);
+        if resolution.is_none() && annotations.get(MANIFEST_SUSPEND_ANNOTATION).is_some_and(|value| value == "true") {
             report.unchanged += 1;
             return Ok(());
         }
 
         let live_hash = resource_document_spec_hash(&existing).map_err(|error| format!("{identity}: {error}"))?;
         let last_applied = annotations.get(LAST_APPLIED_HASH_ANNOTATION).cloned().unwrap_or_else(|| "<missing>".to_string());
-        let resolution = annotations.get(MANIFEST_RESOLUTION_ANNOTATION).map(String::as_str);
 
         // Equality is stronger evidence than a missing or stale baseline: this
         // write changes metadata only, so it is always safe to repair ownership
@@ -731,11 +731,13 @@ mod tests {
         assert_eq!(suspended.spec.pool, "hotfix");
 
         let mut meta = InputMeta::from(&suspended.metadata);
-        meta.annotations.remove(MANIFEST_SUSPEND_ANNOTATION);
         meta.annotations.insert(MANIFEST_RESOLUTION_ANNOTATION.to_string(), "sync".to_string());
-        resolver.update(&meta, &suspended.metadata.resource_version, &suspended.spec).await.expect("resume with sync");
-        assert_eq!(reconciler.reconcile_once().await.expect("resumed pass").updated, 1);
-        assert_eq!(resolver.get("suspended").await.expect("resumed policy").spec.pool, "new-manifest");
+        resolver.update(&meta, &suspended.metadata.resource_version, &suspended.spec).await.expect("explicit sync while suspended");
+        assert_eq!(reconciler.reconcile_once().await.expect("explicit resolution pass").updated, 1);
+        let resolved = resolver.get("suspended").await.expect("resolved policy");
+        assert_eq!(resolved.spec.pool, "new-manifest");
+        assert_eq!(resolved.metadata.annotations.get(MANIFEST_SUSPEND_ANNOTATION).map(String::as_str), Some("true"));
+        assert!(!resolved.metadata.annotations.contains_key(MANIFEST_RESOLUTION_ANNOTATION));
     }
 
     #[tokio::test]

@@ -44,7 +44,7 @@ use flotilla_resources::{
     change_request_record_name, controller::delete_lifecycle_owned_matching, ensure_repository, evaluate_landing_settlement,
     expected_change_request_leaves, expected_checkout_refs, external_patches as convoy_external_patches,
     get_resource_kind, get_resource_kind_including_replicas, list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec,
-    repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
+    patch_resource_annotation, repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
     watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
     ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
@@ -9140,33 +9140,19 @@ impl InProcessDaemon {
                 flotilla_protocol::ManifestResolution::Sync => "sync",
                 flotilla_protocol::ManifestResolution::Adopt => "adopt",
             };
-            let result = match get_resource_kind(&self.resource_backend, namespace, kind, name).await {
-                Ok(mut object) => {
-                    let annotations = object
-                        .value
-                        .get_mut("metadata")
-                        .and_then(|metadata| metadata.as_object_mut())
-                        .and_then(|metadata| metadata.entry("annotations").or_insert_with(|| serde_json::json!({})).as_object_mut());
-                    match annotations {
-                        Some(annotations) => {
-                            annotations
-                                .insert(MANIFEST_RESOLUTION_ANNOTATION.to_string(), serde_json::Value::String(resolution.to_string()));
-                            match apply_resource_document(&self.resource_backend, namespace, object.value).await {
-                                Ok(applied) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
-                                    kind: applied.kind,
-                                    plural: applied.plural,
-                                    namespace: applied.namespace,
-                                    value: applied.value,
-                                    replica_origin: None,
-                                })),
-                                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
-                            }
-                        }
-                        None => flotilla_protocol::CommandValue::Error { message: "stored resource metadata is invalid".to_string() },
-                    }
-                }
-                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
-            };
+            let result =
+                match patch_resource_annotation(&self.resource_backend, namespace, kind, name, MANIFEST_RESOLUTION_ANNOTATION, resolution)
+                    .await
+                {
+                    Ok(applied) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
+                        kind: applied.kind,
+                        plural: applied.plural,
+                        namespace: applied.namespace,
+                        value: applied.value,
+                        replica_origin: None,
+                    })),
+                    Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                };
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
