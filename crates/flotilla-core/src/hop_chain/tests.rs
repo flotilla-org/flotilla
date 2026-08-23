@@ -191,6 +191,9 @@ done
 (trap '' HUP INT TERM; export FLOTILLA_ATTACH_LEASE="$lease"; exec sleep 300) &
 pid=$!
 printf '%s' "$pid" > "$pid_file"
+while ! tr '\000' '\n' < "/proc/$pid/environ" | grep -Fqx "FLOTILLA_ATTACH_LEASE=$lease"; do
+    sleep 0.01
+done
 printf '%s\n%s' "$pid" "$pid_file" > "$FLOTILLA_TEST_PID"
 wait "$pid"
 "#,
