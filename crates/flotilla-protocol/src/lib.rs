@@ -116,7 +116,7 @@ pub use commands::{
     AgentOverride, AttachBinding, CheckoutArchiveOutcome, CheckoutArchiveStatus, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command,
     CommandAction, CommandValue, ConvoyAutoAttach, ConvoyDispatchRegard, ConvoyExplanation, ConvoyStartIntent, EvidenceFreshness,
     ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedLeafFiring,
-    ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, IssueSelector, PreparedTerminalCommand, PreparedWorkspace,
+    ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PreparedTerminalCommand, PreparedWorkspace,
     RepoSelector, ResolvedPaneCommand, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
     ResourceRecordProvenance, ResourceRecordType, StepStatus,
 };

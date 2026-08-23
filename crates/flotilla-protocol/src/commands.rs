@@ -131,6 +131,13 @@ pub enum ResourceRecordProvenance {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestResolution {
+    Sync,
+    Adopt,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceReadRecord {
     #[serde(rename = "type")]
@@ -704,6 +711,12 @@ pub enum CommandAction {
         namespace: String,
         document: serde_json::Value,
     },
+    ResourceManifestResolve {
+        namespace: String,
+        kind: String,
+        name: String,
+        resolution: ManifestResolution,
+    },
     ResourceStatusPatch {
         namespace: String,
         kind: String,
@@ -818,6 +831,10 @@ impl Command {
             CommandAction::QueryResourceList { .. } => "query resource list",
             CommandAction::QueryResourceGet { .. } => "query resource get",
             CommandAction::ResourceApply { .. } => "apply resource",
+            CommandAction::ResourceManifestResolve { resolution, .. } => match resolution {
+                ManifestResolution::Sync => "sync manifest resource",
+                ManifestResolution::Adopt => "adopt manifest resource",
+            },
             CommandAction::ResourceStatusPatch { .. } => "patch resource status",
             CommandAction::ResourceDelete { .. } => "delete resource",
             CommandAction::ResourceWatch { .. } => "watch resources",

@@ -43,7 +43,7 @@ use flotilla_resources::{
     apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name, change_request_address,
     change_request_record_name, controller::delete_lifecycle_owned_matching, ensure_repository, evaluate_landing_settlement,
     expected_change_request_leaves, expected_checkout_refs, external_patches as convoy_external_patches,
-    get_resource_kind_including_replicas, list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec,
+    get_resource_kind, get_resource_kind_including_replicas, list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec,
     repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
     watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
     ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
@@ -52,7 +52,8 @@ use flotilla_resources::{
     ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
     CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand,
     DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase,
-    HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
+    HoldAct, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
+    InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
     IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
@@ -9127,6 +9128,43 @@ impl InProcessDaemon {
                     value: applied.value,
                     replica_origin: None,
                 })),
+                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ResourceManifestResolve { namespace, kind, name, resolution } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let resolution = match resolution {
+                flotilla_protocol::ManifestResolution::Sync => "sync",
+                flotilla_protocol::ManifestResolution::Adopt => "adopt",
+            };
+            let result = match get_resource_kind(&self.resource_backend, namespace, kind, name).await {
+                Ok(mut object) => {
+                    let annotations = object
+                        .value
+                        .get_mut("metadata")
+                        .and_then(|metadata| metadata.as_object_mut())
+                        .and_then(|metadata| metadata.entry("annotations").or_insert_with(|| serde_json::json!({})).as_object_mut());
+                    match annotations {
+                        Some(annotations) => {
+                            annotations
+                                .insert("flotilla.work/manifest-resolution".to_string(), serde_json::Value::String(resolution.to_string()));
+                            match apply_resource_document(&self.resource_backend, namespace, object.value).await {
+                                Ok(applied) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
+                                    kind: applied.kind,
+                                    plural: applied.plural,
+                                    namespace: applied.namespace,
+                                    value: applied.value,
+                                    replica_origin: None,
+                                })),
+                                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                            }
+                        }
+                        None => flotilla_protocol::CommandValue::Error { message: "stored resource metadata is invalid".to_string() },
+                    }
+                }
                 Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
             };
             self.finish_context_free_command(id, empty_identity, result);

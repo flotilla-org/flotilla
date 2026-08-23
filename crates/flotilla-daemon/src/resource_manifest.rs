@@ -6,6 +6,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fmt,
+    io::Write,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -20,6 +21,15 @@ use tracing::{info, warn};
 pub const MANIFEST_MANAGED_BY_VALUE: &str = "manifest";
 pub const MANIFEST_SOURCE_ANNOTATION: &str = "flotilla.work/manifest-source";
 pub const LAST_APPLIED_HASH_ANNOTATION: &str = "flotilla.work/last-applied-hash";
+pub const MANIFEST_REFUSAL_ANNOTATION: &str = "flotilla.work/manifest-refusal";
+pub const MANIFEST_LIVE_HASH_ANNOTATION: &str = "flotilla.work/manifest-live-hash";
+pub const MANIFEST_DESIRED_HASH_ANNOTATION: &str = "flotilla.work/manifest-desired-hash";
+pub const MANIFEST_BASELINE_HASH_ANNOTATION: &str = "flotilla.work/manifest-baseline-hash";
+pub const MANIFEST_RESOLUTION_ANNOTATION: &str = "flotilla.work/manifest-resolution";
+pub const MANIFEST_SUSPEND_ANNOTATION: &str = "flotilla.work/manifest-suspend";
+
+const REFUSAL_ANNOTATIONS: [&str; 4] =
+    [MANIFEST_REFUSAL_ANNOTATION, MANIFEST_LIVE_HASH_ANNOTATION, MANIFEST_DESIRED_HASH_ANNOTATION, MANIFEST_BASELINE_HASH_ANNOTATION];
 
 type LoadedManifestFile = (PathBuf, Result<Vec<Value>, String>);
 
@@ -156,20 +166,64 @@ impl ResourceManifestReconciler {
             return Ok(());
         };
 
+        let annotations = string_map(&existing, "annotations")?;
+        if annotations.get(MANIFEST_SUSPEND_ANNOTATION).is_some_and(|value| value == "true") {
+            report.unchanged += 1;
+            return Ok(());
+        }
+
+        let live_hash = resource_document_spec_hash(&existing).map_err(|error| format!("{identity}: {error}"))?;
+        let last_applied = annotations.get(LAST_APPLIED_HASH_ANNOTATION).cloned().unwrap_or_else(|| "<missing>".to_string());
+        let resolution = annotations.get(MANIFEST_RESOLUTION_ANNOTATION).map(String::as_str);
+
+        // Equality is stronger evidence than a missing or stale baseline: this
+        // write changes metadata only, so it is always safe to repair ownership
+        // and record the spec that is already present.
+        if live_hash == desired_hash {
+            let source_value = source.to_string_lossy();
+            let labels = string_map(&existing, "labels")?;
+            let settled = last_applied == live_hash
+                && labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(MANIFEST_MANAGED_BY_VALUE)
+                && annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str) == Some(source_value.as_ref())
+                && resolution.is_none()
+                && REFUSAL_ANNOTATIONS.iter().all(|key| !annotations.contains_key(*key));
+            if settled {
+                self.clear_warnings(&identity);
+                report.unchanged += 1;
+                return Ok(());
+            }
+            preserve_external_metadata(&mut document, &existing)?;
+            clear_manifest_state(&mut document)?;
+            self.apply_manifest_document(document).await.map_err(|error| format!("{identity}: {error}"))?;
+            self.clear_warnings(&identity);
+            report.unchanged += 1;
+            return Ok(());
+        }
+
+        if resolution == Some("adopt") {
+            self.adopt_live_spec(source, &identity, &existing).await?;
+            let mut adopted = existing;
+            set_annotation(&mut adopted, LAST_APPLIED_HASH_ANNOTATION, &live_hash)?;
+            stamp_manifest_ownership(&mut adopted, source)?;
+            clear_manifest_state(&mut adopted)?;
+            self.apply_manifest_document(adopted).await.map_err(|error| format!("{identity}: {error}"))?;
+            self.clear_warnings(&identity);
+            report.updated += 1;
+            return Ok(());
+        }
+
         let labels = string_map(&existing, "labels")?;
         if labels.get(MANAGED_BY_LABEL).map(String::as_str) != Some(MANIFEST_MANAGED_BY_VALUE) {
             if self.warned_unmanaged.insert(identity.clone()) {
                 warn!(object = %identity, source = %source.display(), "manifest names an unmanaged object; refusing adoption");
             }
+            self.record_refusal(&existing, "unmanaged", &live_hash, &last_applied, &desired_hash).await?;
             report.unmanaged += 1;
             return Ok(());
         }
         self.warned_unmanaged.remove(&identity);
 
-        let annotations = string_map(&existing, "annotations")?;
-        let live_hash = resource_document_spec_hash(&existing).map_err(|error| format!("{identity}: {error}"))?;
-        let last_applied = annotations.get(LAST_APPLIED_HASH_ANNOTATION).cloned().unwrap_or_else(|| "<missing>".to_string());
-        if live_hash != last_applied {
+        if live_hash != last_applied && resolution != Some("sync") {
             if self.warned_drift.insert((identity.clone(), live_hash.clone(), last_applied.clone())) {
                 warn!(
                     object = %identity,
@@ -179,20 +233,84 @@ impl ResourceManifestReconciler {
                     "manifest-managed object has live drift; refusing overwrite"
                 );
             }
+            self.record_refusal(&existing, "drift", &live_hash, &last_applied, &desired_hash).await?;
             report.drifted += 1;
             return Ok(());
         }
 
         let source_value = source.to_string_lossy();
-        if desired_hash == last_applied && annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str) == Some(source_value.as_ref()) {
+        if resolution.is_none()
+            && desired_hash == last_applied
+            && annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str) == Some(source_value.as_ref())
+        {
             report.unchanged += 1;
             return Ok(());
         }
 
         preserve_external_metadata(&mut document, &existing)?;
+        clear_manifest_state(&mut document)?;
         self.apply_manifest_document(document).await.map_err(|error| format!("{identity}: {error}"))?;
-        self.warned_drift.retain(|(warned, _, _)| warned != &identity);
+        self.clear_warnings(&identity);
         report.updated += 1;
+        Ok(())
+    }
+
+    fn clear_warnings(&mut self, identity: &ObjectIdentity) {
+        self.warned_unmanaged.remove(identity);
+        self.warned_drift.retain(|(warned, _, _)| warned != identity);
+    }
+
+    async fn record_refusal(
+        &self,
+        existing: &Value,
+        reason: &str,
+        live_hash: &str,
+        baseline_hash: &str,
+        desired_hash: &str,
+    ) -> Result<(), String> {
+        let annotations = string_map(existing, "annotations")?;
+        if annotations.get(MANIFEST_REFUSAL_ANNOTATION).map(String::as_str) == Some(reason)
+            && annotations.get(MANIFEST_LIVE_HASH_ANNOTATION).map(String::as_str) == Some(live_hash)
+            && annotations.get(MANIFEST_BASELINE_HASH_ANNOTATION).map(String::as_str) == Some(baseline_hash)
+            && annotations.get(MANIFEST_DESIRED_HASH_ANNOTATION).map(String::as_str) == Some(desired_hash)
+        {
+            return Ok(());
+        }
+        let mut refused = existing.clone();
+        set_annotation(&mut refused, MANIFEST_REFUSAL_ANNOTATION, reason)?;
+        set_annotation(&mut refused, MANIFEST_LIVE_HASH_ANNOTATION, live_hash)?;
+        set_annotation(&mut refused, MANIFEST_BASELINE_HASH_ANNOTATION, baseline_hash)?;
+        set_annotation(&mut refused, MANIFEST_DESIRED_HASH_ANNOTATION, desired_hash)?;
+        apply_manifest_resource_document(&self.backend, &self.default_namespace, refused).await.map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    async fn adopt_live_spec(&self, source: &Path, identity: &ObjectIdentity, existing: &Value) -> Result<(), String> {
+        let path = self.root.join(source);
+        let mut documents = parse_documents(&path).map_err(|error| format!("{identity}: {error}"))?;
+        let document = documents
+            .iter_mut()
+            .find(|document| document_identity(document, &self.default_namespace).as_ref() == Ok(identity))
+            .ok_or_else(|| format!("{identity}: manifest source {} no longer contains the object", source.display()))?;
+        document["spec"] = existing["spec"].clone();
+        let rendered =
+            if path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("json")) {
+                serde_json::to_string_pretty(&documents[0]).map_err(|error| format!("serialize JSON: {error}"))? + "\n"
+            } else {
+                documents
+                    .iter()
+                    .map(|document| serde_yml::to_string(document).map_err(|error| format!("serialize YAML: {error}")))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join("---\n")
+            };
+        let parent = path.parent().ok_or_else(|| format!("{identity}: manifest source has no parent"))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|error| format!("{identity}: create temporary manifest beside {}: {error}", source.display()))?;
+        temporary
+            .write_all(rendered.as_bytes())
+            .and_then(|()| temporary.flush())
+            .map_err(|error| format!("{identity}: write temporary manifest for {}: {error}", source.display()))?;
+        temporary.persist(&path).map_err(|error| format!("{identity}: replace manifest {}: {}", source.display(), error.error))?;
         Ok(())
     }
 
@@ -289,6 +407,31 @@ fn stamp_manifest_metadata(document: &mut Value, source: &Path, hash: &str) -> R
     insert_metadata_value(metadata, "labels", MANAGED_BY_LABEL, MANIFEST_MANAGED_BY_VALUE)?;
     insert_metadata_value(metadata, "annotations", MANIFEST_SOURCE_ANNOTATION, &source.to_string_lossy())?;
     insert_metadata_value(metadata, "annotations", LAST_APPLIED_HASH_ANNOTATION, hash)
+}
+
+fn stamp_manifest_ownership(document: &mut Value, source: &Path) -> Result<(), String> {
+    let metadata =
+        document.get_mut("metadata").and_then(Value::as_object_mut).ok_or_else(|| "missing or non-object metadata".to_string())?;
+    insert_metadata_value(metadata, "labels", MANAGED_BY_LABEL, MANIFEST_MANAGED_BY_VALUE)?;
+    insert_metadata_value(metadata, "annotations", MANIFEST_SOURCE_ANNOTATION, &source.to_string_lossy())
+}
+
+fn set_annotation(document: &mut Value, key: &str, value: &str) -> Result<(), String> {
+    let metadata =
+        document.get_mut("metadata").and_then(Value::as_object_mut).ok_or_else(|| "missing or non-object metadata".to_string())?;
+    insert_metadata_value(metadata, "annotations", key, value)
+}
+
+fn clear_manifest_state(document: &mut Value) -> Result<(), String> {
+    let annotations = document
+        .get_mut("metadata")
+        .and_then(|metadata| metadata.get_mut("annotations"))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "missing or non-object metadata.annotations".to_string())?;
+    for key in REFUSAL_ANNOTATIONS.into_iter().chain([MANIFEST_RESOLUTION_ANNOTATION]) {
+        annotations.remove(key);
+    }
+    Ok(())
 }
 
 fn insert_metadata_value(metadata: &mut Map<String, Value>, field: &str, key: &str, value: &str) -> Result<(), String> {
@@ -516,6 +659,117 @@ mod tests {
 
         assert_eq!(report.drifted, 1);
         assert_eq!(object.spec.pool, "live-edit");
+        assert_eq!(object.metadata.annotations.get(MANIFEST_REFUSAL_ANNOTATION).map(String::as_str), Some("drift"));
+        assert!(object.metadata.annotations.contains_key(MANIFEST_LIVE_HASH_ANNOTATION));
+        assert!(object.metadata.annotations.contains_key(MANIFEST_BASELINE_HASH_ANNOTATION));
+        assert!(object.metadata.annotations.contains_key(MANIFEST_DESIRED_HASH_ANNOTATION));
+    }
+
+    #[tokio::test]
+    async fn convergent_live_spec_repairs_any_baseline_and_ownership() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir.path().join("policy.yaml"), &manifest("convergent", "same"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        resolver
+            .create(
+                &InputMeta::builder().name("convergent".to_string()).build(),
+                &PlacementPolicySpec::builder().pool("same".to_string()).build(),
+            )
+            .await
+            .expect("unmanaged but convergent policy");
+        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
+
+        let report = reconciler.reconcile_once().await.expect("repair pass");
+        let object = resolver.get("convergent").await.expect("policy");
+        let digest = resource_document_spec_hash(&serde_json::to_value(object.to_k8s_object()).expect("document")).expect("digest");
+
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.drifted, 0);
+        assert_eq!(report.unmanaged, 0);
+        assert_eq!(object.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(MANIFEST_MANAGED_BY_VALUE));
+        assert_eq!(object.metadata.annotations.get(LAST_APPLIED_HASH_ANNOTATION), Some(&digest));
+    }
+
+    #[tokio::test]
+    async fn fresh_object_has_persisted_baseline_on_following_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir.path().join("policy.yaml"), &manifest("fresh-baseline", "one"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+
+        assert_eq!(reconciler.reconcile_once().await.expect("creation pass").created, 1);
+        let next = reconciler.reconcile_once().await.expect("verification pass");
+        let object = backend.using::<PlacementPolicy>(NAMESPACE).get("fresh-baseline").await.expect("policy");
+        let digest = resource_document_spec_hash(&serde_json::to_value(object.to_k8s_object()).expect("document")).expect("digest");
+
+        assert_eq!(next.unchanged, 1);
+        assert_eq!(next.drifted, 0);
+        assert_eq!(object.metadata.annotations.get(LAST_APPLIED_HASH_ANNOTATION), Some(&digest));
+    }
+
+    #[tokio::test]
+    async fn sync_resolution_makes_manifest_win_at_reconciler_seam() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("policy.yaml");
+        write(&path, &manifest("sync-me", "manifest"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
+        reconciler.reconcile_once().await.expect("creation");
+        let applied = resolver.get("sync-me").await.expect("policy");
+        resolver
+            .update(
+                &InputMeta::from(&applied.metadata),
+                &applied.metadata.resource_version,
+                &PlacementPolicySpec::builder().pool("live".to_string()).build(),
+            )
+            .await
+            .expect("live edit");
+        reconciler.reconcile_once().await.expect("refusal");
+        let refused = resolver.get("sync-me").await.expect("refused policy");
+        let mut meta = InputMeta::from(&refused.metadata);
+        meta.annotations.insert(MANIFEST_RESOLUTION_ANNOTATION.to_string(), "sync".to_string());
+        resolver.update(&meta, &refused.metadata.resource_version, &refused.spec).await.expect("request sync");
+
+        let report = reconciler.reconcile_once().await.expect("sync pass");
+        let synced = resolver.get("sync-me").await.expect("synced policy");
+        assert!(report.errors.is_empty(), "sync errors: {:?}", report.errors);
+        assert_eq!(report.updated, 1, "report={report:?}, synced={synced:?}");
+        assert_eq!(synced.spec.pool, "manifest");
+        assert!(!synced.metadata.annotations.contains_key(MANIFEST_REFUSAL_ANNOTATION));
+        assert!(!synced.metadata.annotations.contains_key(MANIFEST_RESOLUTION_ANNOTATION));
+    }
+
+    #[tokio::test]
+    async fn adopt_resolution_writes_live_spec_to_manifest_at_reconciler_seam() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("policy.yaml");
+        write(&path, &manifest("adopt-me", "manifest"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
+        reconciler.reconcile_once().await.expect("creation");
+        let applied = resolver.get("adopt-me").await.expect("policy");
+        resolver
+            .update(
+                &InputMeta::from(&applied.metadata),
+                &applied.metadata.resource_version,
+                &PlacementPolicySpec::builder().pool("live".to_string()).build(),
+            )
+            .await
+            .expect("live edit");
+        reconciler.reconcile_once().await.expect("refusal");
+        let refused = resolver.get("adopt-me").await.expect("refused policy");
+        let mut meta = InputMeta::from(&refused.metadata);
+        meta.annotations.insert(MANIFEST_RESOLUTION_ANNOTATION.to_string(), "adopt".to_string());
+        resolver.update(&meta, &refused.metadata.resource_version, &refused.spec).await.expect("request adopt");
+
+        let report = reconciler.reconcile_once().await.expect("adopt pass");
+        let rendered = std::fs::read_to_string(path).expect("updated manifest");
+        assert_eq!(report.updated, 1);
+        assert!(rendered.contains("pool: live"));
+        assert_eq!(reconciler.reconcile_once().await.expect("settled pass").unchanged, 1);
     }
 
     #[tokio::test]

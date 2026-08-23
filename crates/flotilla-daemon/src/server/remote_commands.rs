@@ -219,6 +219,7 @@ impl RemoteCommandRouter {
                         | CommandAction::CrewFail { .. }
                         | CommandAction::CrewHandoff { .. }
                         | CommandAction::ResourceApply { .. }
+                        | CommandAction::ResourceManifestResolve { .. }
                         | CommandAction::ResourceDelete { .. }
                         | CommandAction::ResourceStatusPatch { .. }
                         | CommandAction::ResourceWatch { .. }
