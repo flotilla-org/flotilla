@@ -4603,27 +4603,12 @@ impl InProcessDaemon {
                     }
                     continue;
                 }
-                let ensure_is_local = match self.resource_backend.clone().using::<ConvoyEnsure>(namespace).get(&ensure.metadata.name).await
-                {
-                    Ok(_) => true,
-                    Err(ResourceError::NotFound { .. }) => false,
-                    Err(error) => {
-                        errors.push(format!("ConvoyEnsure/{}: could not determine ensure authority: {error}", ensure.metadata.name));
-                        continue;
-                    }
-                };
-                if !ensure_is_local {
-                    match self.reconcile_replica_driven_convoy_ensure(namespace, &ensure).await {
-                        Ok(Some(change)) => changes.push(change),
-                        Ok(None) => {}
-                        Err(error) => errors.push(format!("ConvoyEnsure/{}: {error}", ensure.metadata.name)),
-                    }
-                    continue;
+                match self.reconcile_driver_convoy_ensure(namespace, &ensure, backing_inspector).await {
+                    Ok(Some(change)) => changes.push(change),
+                    Ok(None) => {}
+                    Err(error) => errors.push(format!("ConvoyEnsure/{}: {error}", ensure.metadata.name)),
                 }
-                if let Err(error) = self.clear_ensure_driver_condition(namespace, &ensure).await {
-                    errors.push(format!("ConvoyEnsure/{}: could not clear driver condition: {error}", ensure.metadata.name));
-                    continue;
-                }
+                continue;
             } else {
                 match local_projects.get(&ensure.spec.project_ref).await {
                     Ok(project) if project.metadata.deletion_timestamp.is_none() => {}
@@ -4677,31 +4662,70 @@ impl InProcessDaemon {
         }
     }
 
-    /// Admit an ensure whose definition is homed at another root.
+    /// Admit a declared-driver ensure from the generation history homed here.
     ///
-    /// The driver decides from the merged definition view, but does not write
-    /// status onto its read-only replica.
-    async fn reconcile_replica_driven_convoy_ensure(
+    /// Driver admission deliberately has no companion control state and never
+    /// patches the ensure, even when this root also happens to home its
+    /// definition. Failed husks are the retry budget; deleting them is an
+    /// operator-authorized reset.
+    async fn reconcile_driver_convoy_ensure(
         &self,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
+        backing_inspector: &dyn StandingConvoyBackingInspector,
     ) -> Result<Option<String>, String> {
-        let has_live_generation = self
-            .resource_backend
-            .clone()
-            .using::<ResourceConvoy>(namespace)
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let mut generations = convoys
             .list()
             .await
             .map_err(|error| error.to_string())?
             .items
-            .iter()
-            .any(|convoy| {
-                convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name)
-                    && convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
-            });
-        if has_live_generation {
+            .into_iter()
+            .filter(|convoy| convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name))
+            .collect::<Vec<_>>();
+        generations.sort_by_key(|convoy| convoy.spec.generation);
+
+        if generations.last().is_some_and(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal())) {
             return Ok(None);
         }
+
+        let demands = self.resource_backend.clone().using::<ResourceDemand>(namespace);
+        let demand_name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{}", ensure.metadata.name);
+        let resolved_escalation = match demands.get(&demand_name).await {
+            Ok(demand)
+                if demand.status.as_ref().is_none_or(|status| matches!(status.state, DemandState::Raised | DemandState::Escalated)) =>
+            {
+                return Ok(None);
+            }
+            Ok(_) => {
+                demands.delete(&demand_name).await.map_err(|error| error.to_string())?;
+                true
+            }
+            Err(ResourceError::NotFound { .. }) => false,
+            Err(error) => return Err(error.to_string()),
+        };
+
+        let consecutive_failures = generations
+            .iter()
+            .rev()
+            .take_while(|convoy| convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Failed))
+            .count() as u32;
+        let latest = generations.last();
+        if !resolved_escalation && consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
+            let latest = latest.expect("a positive failure count requires a generation");
+            let failure = format!("ensured convoy entered a terminal failure phase; {consecutive_failures} consecutive generations failed");
+            self.raise_ensure_attention(ensure, latest, &failure, Some(self.clock.now() + ENSURE_ESCALATION_AFTER)).await?;
+            return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
+        }
+        if !resolved_escalation && consecutive_failures > 0 {
+            let latest = latest.expect("a positive failure count requires a generation");
+            backing_inspector.verify_backing_dead(latest).await?;
+            let retry_at = latest.metadata.creation_timestamp + ensure_retry_delay(consecutive_failures - 1);
+            if retry_at > self.clock.now() {
+                return Ok(None);
+            }
+        }
+
         self.start_ensured_convoy(namespace, ensure).await?;
         Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
     }

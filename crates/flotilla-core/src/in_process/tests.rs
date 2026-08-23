@@ -741,6 +741,30 @@ async fn fail_ensured_generation(backend: &ResourceBackend, clock: &VirtualClock
     convoy_ref
 }
 
+async fn fail_latest_ensured_generation(backend: &ResourceBackend, clock: &VirtualClock) -> String {
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let convoy = convoys
+        .list()
+        .await
+        .expect("generations")
+        .items
+        .into_iter()
+        .max_by_key(|convoy| convoy.spec.generation)
+        .expect("latest generation");
+    clock.set(convoy.metadata.creation_timestamp);
+    convoys
+        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Failed,
+            message: Some("placement failed".to_string()),
+            started_at: Some(clock.now()),
+            finished_at: Some(clock.now()),
+            ..Default::default()
+        })
+        .await
+        .expect("fail generation");
+    convoy.metadata.name
+}
+
 #[tokio::test]
 async fn standing_ensure_holds_after_three_failed_generations_and_resumes_when_attention_is_cleared() {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
@@ -856,9 +880,9 @@ async fn set_ensure_driver(backend: &ResourceBackend, driver_ref: &str) {
 }
 
 #[tokio::test]
-async fn declared_driver_admits_replica_homed_at_another_root_exactly_once() {
+async fn declared_driver_derives_bounded_backoff_from_its_homed_generations() {
     let (authority, authority_backend, _authority_clock, _authority_temp) = standing_ensure_fixture_for("kiwi", true).await;
-    let (driver, driver_backend, _driver_clock, _driver_temp) = standing_ensure_fixture_for("udder", false).await;
+    let (driver, driver_backend, driver_clock, _driver_temp) = standing_ensure_fixture_for("udder", false).await;
     let (other, other_backend, _other_clock, _other_temp) = standing_ensure_fixture_for("feta", false).await;
     let driver_id = driver.local_host_id().expect("driver host identity").to_string();
     set_ensure_driver(&authority_backend, &driver_id).await;
@@ -901,6 +925,85 @@ async fn declared_driver_admits_replica_homed_at_another_root_exactly_once() {
     assert!(authority_backend.using::<ResourceConvoy>("flotilla").list().await.expect("authority convoys").items.is_empty());
     assert!(other_backend.using::<ResourceConvoy>("flotilla").list().await.expect("other convoys").items.is_empty());
     assert!(driver_backend.using::<ConvoyEnsure>("flotilla").list().await.expect("driver local ensures").items.is_empty());
+
+    let reaped = fail_latest_ensured_generation(&driver_backend, &driver_clock).await;
+    assert!(driver
+        .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+        .await
+        .expect("failed generation starts backoff")
+        .is_empty());
+    driver_backend.using::<ResourceConvoy>("flotilla").delete(&reaped).await.expect("operator reaps failed husk");
+    assert_eq!(
+        driver
+            .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+            .await
+            .expect("reaping resets derived failure count")
+            .len(),
+        1
+    );
+
+    for delay in [30, 60] {
+        fail_latest_ensured_generation(&driver_backend, &driver_clock).await;
+        assert!(driver
+            .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+            .await
+            .expect("backoff pass")
+            .is_empty());
+        driver_clock.advance(ChronoDuration::seconds(delay - 1));
+        assert!(driver
+            .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+            .await
+            .expect("retry not yet due")
+            .is_empty());
+        driver_clock.advance(ChronoDuration::seconds(1));
+        assert_eq!(
+            driver
+                .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+                .await
+                .expect("admit replacement")
+                .len(),
+            1
+        );
+    }
+
+    fail_latest_ensured_generation(&driver_backend, &driver_clock).await;
+    assert_eq!(
+        driver
+            .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+            .await
+            .expect("escalate bounded failures"),
+        vec!["ConvoyEnsure/quartermaster exhausted restart budget"]
+    );
+    let demands = driver_backend.using::<ResourceDemand>("flotilla");
+    let demand = demands.get("ensure-attention-quartermaster").await.expect("driver-homed escalation");
+    assert!(demand.spec.expiry.is_some());
+    driver_clock.advance(ChronoDuration::hours(1));
+    assert!(driver
+        .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+        .await
+        .expect("unresolved escalation blocks admission")
+        .is_empty());
+    assert_eq!(driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("bounded generations").items.len(), 3);
+
+    apply_resource_status_patch(&demands, "ensure-attention-quartermaster", &DemandStatusPatch::Acknowledge {
+        as_of: driver_clock.now(),
+        authority: "operator".to_string(),
+    })
+    .await
+    .expect("resolve escalation");
+    assert_eq!(
+        driver
+            .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+            .await
+            .expect("resolved escalation resumes admission")
+            .len(),
+        1
+    );
+    assert_eq!(driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("resumed generations").items.len(), 4);
+    assert!(
+        authority_backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("authority ensure").status.is_none(),
+        "driver admission must not persist control state on its ensure definition"
+    );
 }
 
 #[tokio::test]
