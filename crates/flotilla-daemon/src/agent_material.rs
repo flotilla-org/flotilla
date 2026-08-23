@@ -13,7 +13,7 @@ use flotilla_core::providers::{
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{api_version, Environment, MaterialPoolSpec, MaterialPoolUnitSpec, Resource, ResourceBackend};
 use tokio::fs;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     material_pool::{MaterialLeaseOutcome, MaterialPoolManager},
@@ -22,6 +22,7 @@ use crate::{
 
 const CODEX_ADAPTER_ID: &str = "codex";
 const CODEX_POOL_REF: &str = "codex-login";
+const REQUIRED_BRIEF_SKILLS: &[&str] = &["pr-shepherd"];
 pub(crate) const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,8 +68,20 @@ impl AgentMaterialRegistry {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/var/lib/flotilla"))
             .join(".config/flotilla/credentials/codex-pool");
+        // `npx skills` uses ~/.agents/skills as its cross-agent canonical
+        // location and installs the same name/SKILL.md layout into Codex's
+        // config home. Prefer the latter because it is exactly what a direct
+        // Codex session sees, while accepting the canonical location when the
+        // per-agent target is not present.
+        let skills_dir = env
+            .get("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env.get("HOME").map(|home| PathBuf::from(home).join(".codex")))
+            .map(|home| home.join("skills"))
+            .filter(|path| path.is_dir())
+            .or_else(|| env.get("HOME").map(|home| PathBuf::from(home).join(".agents/skills")).filter(|path| path.is_dir()));
         let codex: Arc<dyn AgentMaterialAdapter> =
-            Arc::new(CodexMaterialAdapter::new(Arc::clone(&pools), pool_dir, cfg!(any(target_os = "linux", test))));
+            Arc::new(CodexMaterialAdapter::new(Arc::clone(&pools), pool_dir, skills_dir, cfg!(any(target_os = "linux", test))));
         Self { namespace: namespace.to_string(), pools, adapters: BTreeMap::from([(codex.id(), codex)]) }
     }
 
@@ -128,12 +141,13 @@ pub(crate) enum AgentMaterialPrepareError {
 struct CodexMaterialAdapter {
     pools: Arc<MaterialPoolManager>,
     pool_dir: PathBuf,
+    skills_dir: Option<PathBuf>,
     supported: bool,
 }
 
 impl CodexMaterialAdapter {
-    fn new(pools: Arc<MaterialPoolManager>, pool_dir: PathBuf, supported: bool) -> Self {
-        Self { pools, pool_dir, supported }
+    fn new(pools: Arc<MaterialPoolManager>, pool_dir: PathBuf, skills_dir: Option<PathBuf>, supported: bool) -> Self {
+        Self { pools, pool_dir, skills_dir, supported }
     }
 
     async fn usable_units(&self) -> Result<BTreeMap<String, MaterialPoolUnitSpec>, String> {
@@ -173,6 +187,70 @@ impl CodexMaterialAdapter {
             .map(|(number, path)| (format!("slot-{number:020}"), MaterialPoolUnitSpec { directory: path.to_string_lossy().into_owned() }))
             .collect())
     }
+
+    async fn stage_skills(&self, codex_home: &std::path::Path) -> Result<Vec<String>, String> {
+        let source = self
+            .skills_dir
+            .as_ref()
+            .ok_or_else(|| "contained Codex requires host skills at CODEX_HOME/skills, ~/.codex/skills, or ~/.agents/skills".to_string())?;
+        let source = source.clone();
+        let destination = codex_home.join("skills");
+        tokio::task::spawn_blocking(move || mirror_skills(&source, &destination))
+            .await
+            .map_err(|error| format!("stage Codex skills task failed: {error}"))?
+    }
+}
+
+fn mirror_skills(source: &std::path::Path, destination: &std::path::Path) -> Result<Vec<String>, String> {
+    let mut skills = Vec::new();
+    collect_skill_names(source, source, &mut skills)?;
+    skills.sort();
+    if let Some(missing) = REQUIRED_BRIEF_SKILLS.iter().find(|required| !skills.iter().any(|skill| skill == **required)) {
+        return Err(format!("Codex skill source {} is missing brief-required skill `{missing}`", source.display()));
+    }
+
+    let staged = destination.with_extension("flotilla-staging");
+    if staged.exists() {
+        std::fs::remove_dir_all(&staged).map_err(|error| format!("clear staged Codex skills {}: {error}", staged.display()))?;
+    }
+    copy_tree(source, &staged)?;
+    if destination.exists() {
+        std::fs::remove_dir_all(destination).map_err(|error| format!("replace Codex skills {}: {error}", destination.display()))?;
+    }
+    std::fs::rename(&staged, destination).map_err(|error| format!("publish Codex skills {}: {error}", destination.display()))?;
+    Ok(skills)
+}
+
+fn collect_skill_names(root: &std::path::Path, directory: &std::path::Path, skills: &mut Vec<String>) -> Result<(), String> {
+    if directory.join("SKILL.md").is_file() {
+        let relative = directory
+            .strip_prefix(root)
+            .map_err(|error| format!("resolve skill path {} beneath {}: {error}", directory.display(), root.display()))?;
+        skills.push(relative.to_string_lossy().into_owned());
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(directory).map_err(|error| format!("read skill directory {}: {error}", directory.display()))? {
+        let entry = entry.map_err(|error| format!("read skill entry in {}: {error}", directory.display()))?;
+        if entry.path().is_dir() {
+            collect_skill_names(root, &entry.path(), skills)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_tree(source: &std::path::Path, destination: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(destination).map_err(|error| format!("create skill directory {}: {error}", destination.display()))?;
+    for entry in std::fs::read_dir(source).map_err(|error| format!("read skill directory {}: {error}", source.display()))? {
+        let entry = entry.map_err(|error| format!("read skill entry in {}: {error}", source.display()))?;
+        let target = destination.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)
+                .map_err(|error| format!("copy skill file {} to {}: {error}", entry.path().display(), target.display()))?;
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -201,14 +279,19 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
         let spec = MaterialPoolSpec { units: self.usable_units().await? };
         self.pools.reconcile_pool(CODEX_POOL_REF, &spec).await?;
         match self.pools.acquire(CODEX_POOL_REF, holder_ref).await? {
-            MaterialLeaseOutcome::Leased { unit, .. } => Ok(AgentMaterialOutcome::Ready(AgentMaterialDelivery {
-                mount: ProvisionedMount::new(PathBuf::from(&unit.directory), CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw),
-                preflight: AgentMaterialPreflight {
-                    command: "codex".to_string(),
-                    args: vec!["login".to_string(), "status".to_string()],
-                    failure_context: "Codex login preflight failed".to_string(),
-                },
-            })),
+            MaterialLeaseOutcome::Leased { unit, .. } => {
+                let codex_home = PathBuf::from(&unit.directory);
+                let skills = self.stage_skills(&codex_home).await?;
+                info!(environment = %holder_ref.name, skills = ?skills, "staged contained Codex skills");
+                Ok(AgentMaterialOutcome::Ready(AgentMaterialDelivery {
+                    mount: ProvisionedMount::new(codex_home, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw),
+                    preflight: AgentMaterialPreflight {
+                        command: "codex".to_string(),
+                        args: vec!["login".to_string(), "status".to_string()],
+                        failure_context: "Codex login preflight failed".to_string(),
+                    },
+                }))
+            }
             MaterialLeaseOutcome::Waiting { unit_count } => Ok(AgentMaterialOutcome::Waiting {
                 pool_ref: CODEX_POOL_REF.to_string(),
                 message: format!(
@@ -256,7 +339,14 @@ mod tests {
         write_named_slot(root, &format!("slot-{number}"), number)
     }
 
+    fn write_skill(root: &Path, name: &str, body: &str) {
+        let skill = root.join(".codex/skills").join(name);
+        std::fs::create_dir_all(&skill).expect("create skill");
+        std::fs::write(skill.join("SKILL.md"), body).expect("write skill");
+    }
+
     fn registry(home: &Path) -> AgentMaterialRegistry {
+        write_skill(home, "pr-shepherd", "# PR shepherd\n");
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         AgentMaterialRegistry::new(backend, "flotilla", Arc::new(TestEnvVars::new([("HOME", home.to_string_lossy().into_owned())])))
     }
@@ -264,6 +354,7 @@ mod tests {
     #[tokio::test]
     async fn codex_adapter_specializes_a_generic_lease_as_codex_home() {
         let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(temp.path(), "code-review", "# Code review\n");
         let slot = write_slot(&temp.path().join(".config/flotilla/credentials/codex-pool"), 0);
         let registry = registry(temp.path());
 
@@ -271,7 +362,7 @@ mod tests {
             registry.prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new()).await.expect("prepare");
 
         assert_eq!(deliveries.len(), 1);
-        assert_eq!(deliveries[0].mount, ProvisionedMount::new(slot, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw));
+        assert_eq!(deliveries[0].mount, ProvisionedMount::new(&slot, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw));
         let composed = crate::vessel_config::compose(
             crate::vessel_config::TargetId::AgentEnvironment,
             registry.fragments(&BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new()),
@@ -279,6 +370,41 @@ mod tests {
         .expect("compose Codex home");
         assert_eq!(composed.environment, vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())]);
         assert!(composed.contents.contains("# fragment: agent-material/codex codex-login"));
+        assert_eq!(std::fs::read_to_string(slot.join("skills/code-review/SKILL.md")).expect("staged code-review skill"), "# Code review\n");
+        assert!(slot.join("skills/pr-shepherd/SKILL.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn codex_skills_are_staged_per_holder_and_reported() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pool = temp.path().join(".config/flotilla/credentials/codex-pool");
+        let first = write_slot(&pool, 0);
+        let second = write_slot(&pool, 1);
+        let registry = registry(temp.path());
+        let output = Arc::new(Mutex::new(Vec::new()));
+
+        {
+            let writer = LogCaptureWriter(Arc::clone(&output));
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
+            registry.prepare("crew-alice", &required, &BTreeMap::new()).await.expect("prepare Alice");
+            registry.prepare("crew-bob", &required, &BTreeMap::new()).await.expect("prepare Bob");
+        }
+
+        assert!(first.join("skills/pr-shepherd/SKILL.md").is_file());
+        assert!(second.join("skills/pr-shepherd/SKILL.md").is_file());
+        assert_ne!(first, second, "each holder must receive its own config home");
+        let logs = String::from_utf8(output.lock().expect("log capture lock should be healthy").clone()).expect("UTF-8 logs");
+        assert!(logs.contains("staged contained Codex skills"), "missing provisioning event: {logs}");
+        assert!(logs.contains("pr-shepherd"), "provisioning event must report staged skills: {logs}");
+        assert!(logs.contains("crew-alice") && logs.contains("crew-bob"), "provisioning events must identify each holder: {logs}");
     }
 
     #[tokio::test]
@@ -288,7 +414,7 @@ mod tests {
         let slot_zero = write_named_slot(&pool_dir, "slot-0", 0);
         let slot_zero_padded = write_named_slot(&pool_dir, "slot-00", 0);
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        let adapter = CodexMaterialAdapter::new(Arc::new(MaterialPoolManager::new(backend, "flotilla")), pool_dir, true);
+        let adapter = CodexMaterialAdapter::new(Arc::new(MaterialPoolManager::new(backend, "flotilla")), pool_dir, None, true);
         let log_output = Arc::new(Mutex::new(Vec::new()));
 
         let units = {
