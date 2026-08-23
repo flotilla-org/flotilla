@@ -117,10 +117,10 @@ fn gaps_and_unseeded_deltas_request_resubscription() {
 }
 
 #[test]
-fn awareness_subscription_uses_the_sidebar_viewport() {
+fn awareness_subscription_is_unbounded_because_the_sidebar_scrolls() {
     let state = ConnectorState::default();
     let awareness = state
-        .cursors_for_viewport(18)
+        .cursors()
         .into_iter()
         .find_map(|cursor| match cursor.query {
             QueryId::Awareness { limit, .. } => Some(limit),
@@ -128,7 +128,7 @@ fn awareness_subscription_uses_the_sidebar_viewport() {
         })
         .expect("awareness cursor");
 
-    assert_eq!(awareness, AwarenessLimit { groups: 18, entries: 16 });
+    assert_eq!(awareness, AwarenessLimit::UNBOUNDED);
 }
 
 #[test]

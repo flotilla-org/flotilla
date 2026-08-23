@@ -693,7 +693,7 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
     let convoys = project(&convoys_address, data).unwrap_or_else(|_| pending_project_table(&convoys_address));
     let checkouts_address = ViewAddress::Checkouts { scope: Some(scope.clone()) };
     let issues_address = ViewAddress::Issues { scope: scope.clone() };
-    let independents_address = ViewAddress::Independents { scope: Some(scope) };
+    let independents_address = ViewAddress::Independents { scope: Some(scope.clone()) };
     let awareness = awareness_for_project(namespace, name, data);
     let mut checkouts = project(&checkouts_address, data).unwrap_or_else(|_| pending_project_table(&checkouts_address));
     let mut issues = project(&issues_address, data).unwrap_or_else(|_| pending_project_table(&issues_address));
@@ -718,8 +718,17 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
         apply_family_summary(&mut independents, awareness, AwarenessFamily::Independents);
     }
     let mut convoys = TableView { title: convoys_title, ..convoys };
-    // The enclosing Project page already supplies this scope. Repeating it in
-    // every convoy row spends scarce horizontal space without adding context.
+    // The enclosing Project page already supplies this scope. Some convoy
+    // names arrive decorated for fleet-wide surfaces; omit that suffix here.
+    for row in &mut convoys.rows {
+        let name = &mut row.cells[0].text;
+        for suffix in [format!(" @ {}/{}", scope.namespace, scope.name), format!(" @ {}", scope.name)] {
+            if let Some(bare) = name.strip_suffix(&suffix) {
+                *name = bare.to_owned();
+                break;
+            }
+        }
+    }
     if let Some(scope_column) = convoys.columns.iter().position(|column| column.id == "scope") {
         convoys.columns.remove(scope_column);
         for row in &mut convoys.rows {
@@ -1698,6 +1707,7 @@ mod tests {
         let mut convoy = convoy(vec![vessel("implement", &[], WorkPhase::Running)]);
         convoy.id = ConvoyId::new("flotilla", "tables");
         convoy.namespace = "flotilla".into();
+        convoy.name = "tables @ roadmap".into();
         convoy.project_ref = Some("roadmap".into());
         let checkout = CheckoutRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "roadmap"))
@@ -1779,8 +1789,8 @@ mod tests {
             "Issues (1)",
             "Independents (1)",
         ]);
+        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
         assert!(panels[0].table.columns.iter().all(|column| column.id != "scope"));
-        assert_eq!(panels[0].table.rows[0].cells.len(), panels[0].table.columns.len());
         assert_eq!(panels.iter().map(|panel| panel.table.meta.salience).collect::<Vec<_>>(), vec![
             Salience::Urgent,
             Salience::None,

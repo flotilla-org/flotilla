@@ -37,13 +37,6 @@ use flotilla_protocol::{
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 
-/// One awareness entry occupies one sidebar row. Reserve a row for the group
-/// heading and one for the truncation indicator instead of inheriting the
-/// protocol's generic default window.
-fn sidebar_awareness_limit(viewport_rows: u16) -> AwarenessLimit {
-    AwarenessLimit { groups: usize::from(viewport_rows), entries: usize::from(viewport_rows.saturating_sub(2).max(1)) }
-}
-
 async fn run_reconnecting<Connect, ConnectFuture, Connected, ConnectedFuture>(
     mut connect: Connect,
     mut run_connected: Connected,
@@ -229,19 +222,10 @@ impl ConnectorState {
     /// stale by construction, so resubscribing with these gets it a full
     /// [`ResultSet`].
     pub fn cursors(&self) -> Vec<QueryCursor> {
-        let viewport_rows = crossterm::terminal::size().map_or(24, |(_, rows)| rows);
-        self.cursors_for_viewport(viewport_rows)
-    }
-
-    fn cursors_for_viewport(&self, viewport_rows: u16) -> Vec<QueryCursor> {
         QueryId::ALWAYS_MATERIALIZED
             .iter()
             .cloned()
-            .chain([QueryId::Awareness {
-                scope: None,
-                grouping: AwarenessGrouping::Project,
-                limit: sidebar_awareness_limit(viewport_rows),
-            }])
+            .chain([QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::UNBOUNDED }])
             .map(|query| QueryCursor { since: self.seqs.get(&query).copied(), query })
             .collect()
     }

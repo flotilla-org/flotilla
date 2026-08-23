@@ -427,6 +427,10 @@ impl Default for AwarenessLimit {
     }
 }
 
+impl AwarenessLimit {
+    pub const UNBOUNDED: Self = Self { groups: usize::MAX, entries: usize::MAX };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AwarenessKind {
