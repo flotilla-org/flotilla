@@ -1030,6 +1030,7 @@ impl Reconciler for VesselReconciler {
                     placement_decision: placement_decision.clone(),
                     started_at: now,
                     message: provisioning_stuck_message(obj, waiting_for, wait_reason.as_ref(), now),
+                    wait_reason: wait_reason.clone(),
                 })
             }
             PlannedPatch::Ready {
@@ -1165,7 +1166,10 @@ fn provisioning_stuck_message(
     now: DateTime<Utc>,
 ) -> Option<String> {
     if matches!(wait_reason, Some(EnvironmentWaitReason::MaterialPoolExhausted { .. })) {
-        return Some(waiting_for.to_string());
+        // Pool exhaustion is admission queueing, not a stalled provisioning
+        // attempt. Persist the typed wait reason as the holding signal without
+        // also publishing the generic stuck message.
+        return None;
     }
     let started_at = obj.status.as_ref().filter(|status| status.phase == VesselPhase::Provisioning).and_then(|status| status.started_at)?;
     (now.signed_duration_since(started_at) >= chrono::Duration::seconds(VESSEL_PROVISIONING_STUCK_SECONDS))
@@ -1192,7 +1196,7 @@ mod material_pool_wait_tests {
     use super::*;
 
     #[test]
-    fn material_pool_wait_is_visible_immediately_in_vessel_status() {
+    fn material_pool_wait_is_not_reported_as_stuck() {
         let now = Utc::now();
         let vessel = ResourceObject::<Vessel> {
             metadata: ObjectMeta {
@@ -1218,7 +1222,7 @@ mod material_pool_wait_tests {
         let message = "waiting for agent login material; 2 in pool, all leased";
         let reason = EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: "agent-login".to_string() };
 
-        assert_eq!(provisioning_stuck_message(&vessel, message, Some(&reason), now).as_deref(), Some(message));
+        assert_eq!(provisioning_stuck_message(&vessel, message, Some(&reason), now), None);
     }
 }
 

@@ -14,8 +14,8 @@ use flotilla_resources::{
     controller_patches, evaluate_landing_settlement, interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest,
     ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutPhase,
     CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler,
-    ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue,
-    IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation, ObservedChangeRequestState, ObservedCheckoutSpec,
+    ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, EnvironmentWaitReason, InMemoryBackend, InputMeta,
+    InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation, ObservedChangeRequestState, ObservedCheckoutSpec,
     ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, StatusPatch,
     TargetMismatch, TerminalSession, TerminalSessionSource, TerminalSessionSpec, UnmetSettlementExpectation, ValidationError, Vessel,
     VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
@@ -334,6 +334,7 @@ fn vessel_object_with_image_digest(
             placement_decision: None,
             phase,
             message: message.map(str::to_string),
+            wait_reason: None,
             observed_policy_ref: Some("laptop-docker".to_string()),
             observed_policy_version: Some("19".to_string()),
             environment_ref: Some(format!("env-{task}")),
@@ -1729,6 +1730,21 @@ async fn refused_reclaim_requeues_at_the_evidence_staleness_horizon() {
     let deps = eligible.prepare(&convoy).await.expect("dependencies");
     let outcome = eligible.reconcile(&convoy, &deps, timestamp(21));
     assert_eq!(outcome.requeue_after, None, "an eligible reclaim pass must not keep requeueing");
+}
+
+#[tokio::test]
+async fn terminal_convoy_waiting_on_an_exhausted_pool_is_not_reclaimed() {
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Failed;
+    status.finished_at = Some(timestamp(20));
+    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+    let mut vessel = vessel_object("convoy-a", "implement", VesselPhase::Provisioning, None);
+    vessel.status.as_mut().expect("vessel status").wait_reason =
+        Some(EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: "codex-login".to_string() });
+
+    let outcome = reconcile_once_with_resources(&convoy, None, vec![vessel], Vec::new(), timestamp(21)).await;
+
+    assert!(outcome.actuations.is_empty(), "pool starvation must hold every destructive reclaim actuation");
 }
 
 #[tokio::test]
