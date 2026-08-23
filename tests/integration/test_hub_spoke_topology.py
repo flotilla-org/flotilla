@@ -79,20 +79,20 @@ def wait_for_follower(follower: str):
     )
 
 
-def wait_for_repository_on_workstation(source: str):
-    """Wait until the remote repository resource has replicated to the hub."""
+def wait_for_checkout_on_workstation(source: str, path: str):
+    """Wait until the remote observed checkout has replicated to the hub."""
     wait_for(
         lambda: any(
             (record.get("object") or {})
             .get("spec", {})
-            .get("identity", {})
             .get("host_ref")
             == source
+            and (record.get("object") or {}).get("spec", {}).get("path") == path
             for record in hub_json(
-                "workstation", "resource list repositories --include-replicas"
+                "workstation", "resource list checkouts --include-replicas"
             )["records"]
         ),
-        f"workstation sees {source}'s replicated repository resource",
+        f"workstation sees {source}'s replicated checkout at {path}",
         timeout=30,
         interval=1.0,
     )
@@ -283,7 +283,7 @@ def test_shpool_attachable_set_survives_daemon_restart(
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
-    wait_for_repository_on_workstation("homelab-1")
+    wait_for_checkout_on_workstation("homelab-1", checkout_path)
     prepared = hub_json(
         "workstation",
         f"host homelab-1 repo /home/flotilla/repo prepare-terminal {checkout_path}",
@@ -329,7 +329,7 @@ def test_terminal_without_shpool_uses_passthrough(hub_spoke_topology):
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
-    wait_for_repository_on_workstation("homelab-2")
+    wait_for_checkout_on_workstation("homelab-2", checkout_path)
     prepared = hub_json(
         "workstation",
         f"host homelab-2 repo /home/flotilla/repo prepare-terminal {checkout_path}",
@@ -353,7 +353,7 @@ def test_reprepare_reuses_attachable_identity(hub_spoke_topology):
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
-    wait_for_repository_on_workstation("homelab-1")
+    wait_for_checkout_on_workstation("homelab-1", checkout_path)
     command = (
         f"host homelab-1 repo /home/flotilla/repo prepare-terminal {checkout_path}"
     )

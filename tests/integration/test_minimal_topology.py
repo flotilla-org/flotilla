@@ -98,15 +98,16 @@ def test_remote_prepare_terminal_returns_attachable_set_id(topology):
         lambda: any(
             (record.get("object") or {})
             .get("spec", {})
-            .get("identity", {})
             .get("host_ref")
             == "node-b"
+            and (record.get("object") or {}).get("spec", {}).get("path")
+            == checkout_path
             for record in flotilla_json(
                 topology["node-a"],
-                "resource list repositories --include-replicas",
+                "resource list checkouts --include-replicas",
             )["records"]
         ),
-        "node-a sees node-b's replicated repository resource",
+        f"node-a sees node-b's replicated checkout at {checkout_path}",
         timeout=30,
         interval=1.0,
     )
