@@ -180,6 +180,13 @@ def topology():
             )
             assert result.returncode == 0, f"git init failed on {node}: {result.stderr}"
 
+        result = docker_exec(
+            "node-b",
+            "git -C /home/flotilla/repo remote add origin "
+            "https://github.com/flotilla-org/compose-replica-source.git",
+        )
+        assert result.returncode == 0, f"git remote add failed on node-b: {result.stderr}"
+
         # Write flotilla config: node-a is leader with node-b as peer
         result = docker_exec(
             "node-a",
