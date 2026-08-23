@@ -1769,6 +1769,8 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
             })
             .build(),
     ];
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0].credential_scopes =
+        BTreeMap::from([("github-app".to_string(), BTreeSet::from([repo_ref.clone()]))]);
     backend
         .clone()
         .using::<Convoy>(NAMESPACE)
@@ -1785,7 +1787,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
             convoy_ref: "convoy-crew".to_string(),
             vessel_name: "implement".to_string(),
             placement_policy_ref: "policy-crew".to_string(),
-            adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-checkout-convoy-crew".to_string())]),
+            adopted_checkout_refs: BTreeMap::from([(repo_ref.clone(), "adopted-checkout-convoy-crew".to_string())]),
         })
         .await
         .expect("workspace create");
@@ -1812,6 +1814,9 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     assert!(brief.content.contains("- `reviewer`: latent"));
     assert!(brief.content.contains("flotilla crew reviewer handoff --message"));
     assert!(brief.content.contains("flotilla crew complete"));
+    assert!(brief.content.contains("- Minted credential repository scope:"));
+    assert!(brief.content.contains(&format!("  - `github-app`:\n    - `{repo_ref}` — {REPO_URL}")));
+    assert!(brief.content.contains("park the verified commit"));
     assert!(brief.content.contains("## Assignment\n\nImplement issue 668.\n"));
     assert_eq!(context.namespace, NAMESPACE);
     assert_eq!(context.vessel_ref, "workspace-crew");
