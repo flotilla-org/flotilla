@@ -201,6 +201,10 @@ impl LeafSubscriptionTable {
         self.inner.change_requests.stale_after()
     }
 
+    pub async fn change_request_observation_error(&self, subject: &ChangeRequestRef) -> Option<String> {
+        self.inner.change_requests.observation_error(subject).await
+    }
+
     pub async fn rows(&self) -> Vec<LeafSubscriptionRow> {
         self.inner.rows.lock().await.values().cloned().collect()
     }
@@ -583,7 +587,7 @@ impl ReconcilerWake {
                             namespace: namespace.to_string(),
                             leaves: entry.leaves,
                             watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
-                            freshness_demand: None,
+                            freshness_demand: Some(Utc::now()),
                             created_at: Utc::now(),
                             episode_key: EpisodeKeyFields::default(),
                         });
@@ -658,7 +662,7 @@ impl ReconcilerWake {
             row.id = id;
             self.subscriptions.inner.rows.lock().await.insert(id, row.clone());
             for subject in row.leaves.iter().filter_map(|leaf| ChangeRequestRef::from_address(namespace, &leaf.address)) {
-                if let Err(error) = self.subscriptions.inner.change_requests.demand(id, subject, None).await {
+                if let Err(error) = self.subscriptions.inner.change_requests.demand(id, subject, row.freshness_demand).await {
                     self.subscriptions.inner.rows.lock().await.remove(&id);
                     self.subscriptions.forget_firings(id).await;
                     self.subscriptions.inner.change_requests.release(id).await;
@@ -1055,7 +1059,7 @@ mod tests {
         let (event_tx, _) = broadcast::channel(16);
         let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
         let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
-            state: Duration::from_millis(20),
+            state: Duration::from_secs(3600),
             checks_pending: Duration::from_millis(20),
             freshness_demanded: Duration::from_millis(20),
             stale_after: Duration::from_secs(60),
@@ -1114,6 +1118,10 @@ mod tests {
         })
         .await
         .expect("boot must rederive a ReconcilerWake row");
+        assert!(
+            table.rows().await.iter().any(|row| row.freshness_demand.is_some()),
+            "Landing settlement must demand fresh targeted observations"
+        );
         assert_eq!(convoys.get("wake").await.expect("open convoy").status.expect("status").phase, ConvoyPhase::Landing);
 
         source.merged.store(true, Ordering::SeqCst);

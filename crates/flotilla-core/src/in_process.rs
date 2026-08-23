@@ -9052,6 +9052,17 @@ impl InProcessDaemon {
             })
             .collect::<BTreeSet<_>>();
         let bound_name = bound_change_request_record_name(&convoy).map_err(|error| format!("derive bound change request: {error}"))?;
+        let mut observation_errors = BTreeMap::new();
+        for leaf in expected_change_request_leaves(&convoy, &selected_checkouts)
+            .map_err(|error| format!("derive expected change requests: {error}"))?
+        {
+            if let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = leaf.address {
+                let subject = crate::change_request_observer::ChangeRequestRef { namespace: namespace.clone(), service, scope, number };
+                if let Some(error) = self.leaf_subscriptions.change_request_observation_error(&subject).await {
+                    observation_errors.insert(subject.record_name(), error);
+                }
+            }
+        }
         let change_requests = expected_change_requests
             .iter()
             .map(|record_name| {
@@ -9065,6 +9076,7 @@ impl InProcessDaemon {
                     fields: selected.and_then(|source| serde_json::to_value(&source.object).ok()),
                     observed_at: observed_at.map(|at| at.to_rfc3339()),
                     freshness: observed_freshness(observed_at, now, change_request_stale_after),
+                    observation_error: observation_errors.get(record_name).cloned(),
                 }
             })
             .collect::<Vec<_>>();
@@ -9077,6 +9089,12 @@ impl InProcessDaemon {
             LANDING_EVIDENCE_TTL,
             now,
         );
+        let mut unmet = evaluation.unmet.into_iter().map(explain_unmet_expectation).collect::<Vec<_>>();
+        unmet.extend(observation_errors.iter().map(|(record, error)| ExplainedUnmetExpectation {
+            reason: "observation_error".to_string(),
+            subject: format!("change_request/{record}"),
+            detail: error.clone(),
+        }));
         let settlement = ExplainedSettlement {
             mode: match evaluation.mode {
                 SettlementMode::NoExit => flotilla_protocol::commands::SETTLEMENT_MODE_STANDING,
@@ -9085,7 +9103,7 @@ impl InProcessDaemon {
             }
             .to_string(),
             satisfied: evaluation.satisfied,
-            unmet: evaluation.unmet.into_iter().map(explain_unmet_expectation).collect(),
+            unmet,
         };
 
         let subscriptions = self
