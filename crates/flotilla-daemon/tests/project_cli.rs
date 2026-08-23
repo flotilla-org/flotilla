@@ -370,6 +370,7 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
         CommandValue::ProjectRegistered { name: "flotilla".to_string(), members: 1 }
     );
     let flotilla = backend.using::<Project>("flotilla").get("flotilla").await.expect("flotilla project");
+    assert_eq!(flotilla.spec.default_workflow_ref, "single-agent-contained");
     assert_eq!(flotilla.spec.repositories[0].alias.as_deref(), Some("flotilla"));
     assert_eq!(
         flotilla.spec.repositories[0].roles,
@@ -907,7 +908,7 @@ async fn tracking_repo_materializes_whole_repo_project() {
 
     let project = backend.using::<Project>("flotilla").get("tracked").await.expect("whole-repository project should exist");
     assert_eq!(project.spec.display_name, "tracked");
-    assert_eq!(project.spec.default_workflow_ref, "single-agent-trusted");
+    assert_eq!(project.spec.default_workflow_ref, "single-agent-contained");
     assert_eq!(project.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("whole-repository-project"));
     assert_eq!(project.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
         repo: repository_key,
@@ -1154,7 +1155,7 @@ async fn retracking_path_after_remote_appears_migrates_repository_identity() {
             &InputMeta::builder().name("github-com-flotilla-org-andamento".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("andamento".to_string())
-                .default_workflow_ref("single-agent-trusted".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(remote_key.clone()).build()])
                 .build(),
         )
@@ -1281,7 +1282,7 @@ async fn identity_change_preserves_migrated_project_when_local_and_remote_names_
             &InputMeta::builder().name("a-remote-name".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("a-remote-name".to_string())
-                .default_workflow_ref("single-agent-trusted".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(remote_key.clone()).build()])
                 .build(),
         )
@@ -1620,7 +1621,7 @@ async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_p
     assert_eq!(checkouts.items.len(), 1);
     let project = backend.using::<Project>("flotilla").get("my-project").await.expect("project should exist");
     assert_eq!(project.spec.display_name, "My Project");
-    assert_eq!(project.spec.default_workflow_ref, "single-agent-trusted");
+    assert_eq!(project.spec.default_workflow_ref, "single-agent-contained");
     assert_eq!(project.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
         repo: repository_key,
         alias: None,
