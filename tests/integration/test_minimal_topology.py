@@ -4,7 +4,7 @@ All tests run commands on node-a (the "user's desktop") and validate
 that multi-host peering with node-b works via the CLI JSON output.
 """
 
-from conftest import docker_exec, flotilla_json
+from conftest import docker_exec, flotilla_json, wait_for
 
 
 def test_both_daemons_running(topology):
@@ -83,6 +83,28 @@ def test_status_shows_repos(topology):
 
     repo = result["repos"][0]
     assert "path" in repo
+
+
+def test_repository_federates_by_canonical_remote(topology):
+    """A repository tracked on node-b is visible in node-a's replica view."""
+    canonical_remote = "https://github.com/flotilla-org/compose-replica-source"
+
+    wait_for(
+        lambda: any(
+            (record.get("object") or {}).get("spec", {}).get("identity")
+            == {
+                "kind": "remote",
+                "canonical_remote": canonical_remote,
+            }
+            for record in flotilla_json(
+                topology["node-a"],
+                "resource list repositories --include-replicas",
+            )["records"]
+        ),
+        f"node-a sees node-b's repository replica for {canonical_remote}",
+        timeout=30,
+        interval=1.0,
+    )
 
 
 def test_remote_prepare_terminal_returns_attachable_set_id(topology):
