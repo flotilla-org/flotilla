@@ -7,7 +7,7 @@ use flotilla_resources::{
 #[tokio::test]
 async fn project_issue_source_override_resolves_without_a_checkout_or_repository_record() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let repositories = backend.using::<Repository>("flotilla");
+    let repositories = backend.including_replicas::<Repository>("flotilla");
     let override_source = IssueSource { service: "linear".into(), scope: "WIDGET".into() };
     let project = ProjectSpec {
         display_name: "Widgets".into(),
@@ -31,12 +31,13 @@ async fn project_issue_source_override_resolves_without_a_checkout_or_repository
 #[tokio::test]
 async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let repositories = backend.using::<Repository>("flotilla");
+    let repository_writer = backend.using::<Repository>("flotilla");
     let first = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("first repository");
     let second = RepositorySpec::remote("https://gitlab.com/widgets/api.git").expect("second repository");
     for spec in [&first, &second] {
-        repositories.create(&InputMeta::builder().name(spec.key().to_string()).build(), spec).await.expect("repository should create");
+        repository_writer.create(&InputMeta::builder().name(spec.key().to_string()).build(), spec).await.expect("repository should create");
     }
+    let repositories = backend.including_replicas::<Repository>("flotilla");
     let project = ProjectSpec {
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
@@ -66,9 +67,10 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
 #[tokio::test]
 async fn project_issue_source_resolution_reports_typed_unavailability() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let repositories = backend.using::<Repository>("flotilla");
+    let repository_writer = backend.using::<Repository>("flotilla");
     let local = RepositorySpec::local("host-01", "/srv/widgets/.git").expect("local repository");
-    repositories.create(&InputMeta::builder().name(local.key().to_string()).build(), &local).await.expect("repository should create");
+    repository_writer.create(&InputMeta::builder().name(local.key().to_string()).build(), &local).await.expect("repository should create");
+    let repositories = backend.including_replicas::<Repository>("flotilla");
     let local_only = ProjectSpec {
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),

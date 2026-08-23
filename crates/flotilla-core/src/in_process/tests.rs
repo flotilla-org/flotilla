@@ -1144,6 +1144,124 @@ async fn changing_ensure_config_starts_a_fresh_retry_episode() {
 }
 
 #[tokio::test]
+async fn standing_ensure_admission_reads_project_and_repositories_from_root_replicas() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"root-b\"\n").expect("daemon config");
+    let target = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("root-b"),
+        target.clone(),
+    )
+    .await;
+    let driver_ref = daemon.canonical_local_host_id().expect("root B host identity").to_string();
+    target
+        .using::<ResourceHost>("flotilla")
+        .create(&test_meta(&driver_ref), &HostSpec { display_name: "root-b".to_string() })
+        .await
+        .expect("root B host resource");
+    let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let repository_spec = RepositorySpec::remote("https://github.com/acme/cross-root").expect("repository spec");
+    let repository_key = repository_spec.key();
+    source
+        .using::<Repository>("flotilla")
+        .create(&test_meta(&repository_key.to_string()), &repository_spec)
+        .await
+        .expect("source repository");
+    source
+        .definitions::<Project>("flotilla")
+        .create(
+            &test_meta("cross-root-project"),
+            &ProjectSpec::builder()
+                .display_name("Cross Root Project".to_string())
+                .default_workflow_ref("cross-root-workflow".to_string())
+                .repositories(vec![ProjectRepositorySpec {
+                    repo: repository_key.clone(),
+                    alias: None,
+                    roles: BTreeSet::from([ProjectRepositoryRole::Code]),
+                    subpath: None,
+                    default_branch: Some("main".to_string()),
+                }])
+                .build(),
+        )
+        .await
+        .expect("source project");
+    target
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &test_meta("cross-root-workflow"),
+            &WorkflowTemplateSpec::builder()
+                .vessels(vec![VesselRequirement::builder()
+                    .name("work".to_string())
+                    .stance(Stance::Trusted)
+                    .repository_refs(vec![repository_key.clone()])
+                    .crew(Vec::new())
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("driver-local workflow");
+    source
+        .definitions::<ConvoyEnsure>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("cross-root".to_string())
+                .annotations(BTreeMap::from([
+                    (MATERIALIZED_PROJECT_ANNOTATION.to_string(), "cross-root-project".to_string()),
+                    (SOURCE_REPOSITORY_ANNOTATION.to_string(), repository_key.to_string()),
+                    (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
+                    (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), "ops/cross-root.md".to_string()),
+                ]))
+                .build(),
+            &ConvoyEnsureSpec {
+                project_ref: "cross-root-project".to_string(),
+                role: "quartermaster".to_string(),
+                driver_ref: Some(driver_ref),
+                workflow_ref: "cross-root-workflow".to_string(),
+                placement_policy: None,
+                stance: Some(Stance::Trusted),
+                repositories: vec![repository_key],
+                presents_as: None,
+            },
+        )
+        .await
+        .expect("source ensure");
+
+    let origin = NodeId::new("root-a");
+    target
+        .replica_writer::<Repository>(origin.clone(), "flotilla")
+        .replace(&source.using::<Repository>("flotilla").list().await.expect("source repositories"), Utc::now())
+        .await
+        .expect("replicate repositories");
+    target
+        .replica_writer::<Project>(origin.clone(), "flotilla")
+        .replace(&source.using::<Project>("flotilla").list().await.expect("source projects"), Utc::now())
+        .await
+        .expect("replicate projects");
+    target
+        .replica_writer::<ConvoyEnsure>(origin, "flotilla")
+        .replace(&source.using::<ConvoyEnsure>("flotilla").list().await.expect("source ensures"), Utc::now())
+        .await
+        .expect("replicate ensures");
+
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("cross-root ensure admission"), vec![
+        "started quartermaster@cross-root-project"
+    ]);
+    let convoy = target
+        .using::<ResourceConvoy>("flotilla")
+        .list()
+        .await
+        .expect("list admitted convoys")
+        .items
+        .into_iter()
+        .next()
+        .expect("admitted convoy on root B");
+    assert_eq!(convoy.spec.project_ref.as_deref(), Some("cross-root-project"));
+}
+
+#[tokio::test]
 async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts_after_verified_death() {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
