@@ -73,15 +73,16 @@ impl AgentMaterialRegistry {
         // config home. Prefer the latter because it is exactly what a direct
         // Codex session sees, while accepting the canonical location when the
         // per-agent target is not present.
-        let skills_dir = env
+        let mut skills_dirs = env
             .get("CODEX_HOME")
             .map(PathBuf::from)
             .or_else(|| env.get("HOME").map(|home| PathBuf::from(home).join(".codex")))
             .map(|home| home.join("skills"))
-            .filter(|path| path.is_dir())
-            .or_else(|| env.get("HOME").map(|home| PathBuf::from(home).join(".agents/skills")).filter(|path| path.is_dir()));
+            .into_iter()
+            .collect::<Vec<_>>();
+        skills_dirs.extend(env.get("HOME").map(|home| PathBuf::from(home).join(".agents/skills")));
         let codex: Arc<dyn AgentMaterialAdapter> =
-            Arc::new(CodexMaterialAdapter::new(Arc::clone(&pools), pool_dir, skills_dir, cfg!(any(target_os = "linux", test))));
+            Arc::new(CodexMaterialAdapter::new(Arc::clone(&pools), pool_dir, skills_dirs, cfg!(any(target_os = "linux", test))));
         Self { namespace: namespace.to_string(), pools, adapters: BTreeMap::from([(codex.id(), codex)]) }
     }
 
@@ -141,13 +142,13 @@ pub(crate) enum AgentMaterialPrepareError {
 struct CodexMaterialAdapter {
     pools: Arc<MaterialPoolManager>,
     pool_dir: PathBuf,
-    skills_dir: Option<PathBuf>,
+    skills_dirs: Vec<PathBuf>,
     supported: bool,
 }
 
 impl CodexMaterialAdapter {
-    fn new(pools: Arc<MaterialPoolManager>, pool_dir: PathBuf, skills_dir: Option<PathBuf>, supported: bool) -> Self {
-        Self { pools, pool_dir, skills_dir, supported }
+    fn new(pools: Arc<MaterialPoolManager>, pool_dir: PathBuf, skills_dirs: Vec<PathBuf>, supported: bool) -> Self {
+        Self { pools, pool_dir, skills_dirs, supported }
     }
 
     async fn usable_units(&self) -> Result<BTreeMap<String, MaterialPoolUnitSpec>, String> {
@@ -189,10 +190,10 @@ impl CodexMaterialAdapter {
     }
 
     async fn stage_skills(&self, codex_home: &std::path::Path) -> Result<Vec<String>, String> {
-        let source = self
-            .skills_dir
-            .as_ref()
-            .ok_or_else(|| "contained Codex requires host skills at CODEX_HOME/skills, ~/.codex/skills, or ~/.agents/skills".to_string())?;
+        let source =
+            self.skills_dirs.iter().find(|path| path.is_dir()).ok_or_else(|| {
+                "contained Codex requires host skills at CODEX_HOME/skills, ~/.codex/skills, or ~/.agents/skills".to_string()
+            })?;
         let source = source.clone();
         let destination = codex_home.join("skills");
         tokio::task::spawn_blocking(move || mirror_skills(&source, &destination))
@@ -413,7 +414,7 @@ mod tests {
         let slot_zero = write_named_slot(&pool_dir, "slot-0", 0);
         let slot_zero_padded = write_named_slot(&pool_dir, "slot-00", 0);
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        let adapter = CodexMaterialAdapter::new(Arc::new(MaterialPoolManager::new(backend, "flotilla")), pool_dir, None, true);
+        let adapter = CodexMaterialAdapter::new(Arc::new(MaterialPoolManager::new(backend, "flotilla")), pool_dir, Vec::new(), true);
         let log_output = Arc::new(Mutex::new(Vec::new()));
 
         let units = {
@@ -454,6 +455,29 @@ mod tests {
         let second = write_slot(&pool, 1);
         let delivery = registry.prepare("env-b", &required, &BTreeMap::new()).await.expect("lease new unit");
         assert_eq!(delivery[0].mount, ProvisionedMount::new(second, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw));
+    }
+
+    #[tokio::test]
+    async fn codex_adapter_discovers_skills_installed_after_registry_startup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let slot = write_slot(&temp.path().join(".config/flotilla/credentials/codex-pool"), 0);
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let registry = AgentMaterialRegistry::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnvVars::new([("HOME", temp.path().to_string_lossy().into_owned())])),
+        );
+
+        write_skill(temp.path(), "pr-shepherd", "# Installed after daemon startup\n");
+        registry
+            .prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new())
+            .await
+            .expect("late-installed skills should be discovered");
+
+        assert_eq!(
+            std::fs::read_to_string(slot.join("skills/pr-shepherd/SKILL.md")).expect("staged late skill"),
+            "# Installed after daemon startup\n"
+        );
     }
 
     #[tokio::test]
