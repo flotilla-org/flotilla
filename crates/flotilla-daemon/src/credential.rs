@@ -599,24 +599,32 @@ impl CredentialStore {
         credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<(), CredentialRefreshError> {
-        let mut github_app_refs = Vec::new();
+        let mut github_app_refs = BTreeSet::new();
         for name in credential_refs {
             let spec = match self.spec(name).await {
                 Ok(spec) => spec,
-                Err(message) => return Err(self.record_adoption_failure(environment_ref, message).await),
+                Err(message) => {
+                    tracing::warn!(credential = %name, environment = %environment_ref, %message, "skipping unavailable credential while discovering GitHub App deliveries");
+                    continue;
+                }
             };
             if matches!(spec.consumer, CredentialConsumer::GithubApp { .. }) {
-                github_app_refs.push(name);
+                github_app_refs.insert(name.clone());
             }
         }
         let deliveries = self.github_app_deliveries.lock().await;
-        let already_adopted = github_app_refs.iter().all(|name| deliveries.contains_key(&(environment_ref.to_string(), (*name).clone())));
+        let already_adopted = github_app_refs.iter().all(|name| deliveries.contains_key(&(environment_ref.to_string(), name.clone())));
         drop(deliveries);
         if github_app_refs.is_empty() || already_adopted {
             self.github_app_adoption_failures.lock().await.remove(environment_ref);
             return Ok(());
         }
-        if let Err(message) = self.prepare_scoped(environment_ref, credential_refs, credential_scopes, runner).await {
+        let github_app_scopes = credential_scopes
+            .iter()
+            .filter(|(name, _)| github_app_refs.contains(*name))
+            .map(|(name, scopes)| (name.clone(), scopes.clone()))
+            .collect();
+        if let Err(message) = self.prepare_scoped(environment_ref, &github_app_refs, &github_app_scopes, runner).await {
             return Err(self.record_adoption_failure(environment_ref, message).await);
         }
         self.github_app_adoption_failures.lock().await.remove(environment_ref);
@@ -1745,12 +1753,19 @@ interactions:
             GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
             PathBuf::from("/state"),
         );
+        let mut adoption_refs = refs.clone();
+        adoption_refs.insert("deleted-unrelated-codex".to_string());
         for expected_surface in [false, false, true] {
-            let error =
-                store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect_err("adoption outage");
+            let error = store
+                .adopt_github_app_deliveries("standing-vessel", &adoption_refs, &scopes, runner.clone())
+                .await
+                .expect_err("adoption outage");
             assert_eq!(error.should_surface, expected_surface);
         }
-        store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect("re-adopt standing vessel");
+        store
+            .adopt_github_app_deliveries("standing-vessel", &adoption_refs, &scopes, runner.clone())
+            .await
+            .expect("re-adopt standing vessel despite missing unrelated credential");
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 5, "startup adoption retries and rebuilds the registration");
 
         clock.advance(Duration::minutes(115));
