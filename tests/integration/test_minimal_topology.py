@@ -4,7 +4,7 @@ All tests run commands on node-a (the "user's desktop") and validate
 that multi-host peering with node-b works via the CLI JSON output.
 """
 
-from conftest import docker_exec, flotilla_json
+from conftest import docker_exec, flotilla_json, wait_for
 
 
 def test_both_daemons_running(topology):
