@@ -121,7 +121,7 @@ fn unknown_remote_hop_names_the_host() {
 }
 
 #[test]
-fn docker_environment_wrap_is_one_direct_exec_command() {
+fn docker_environment_wrap_supervises_and_reaps_the_exec_command() {
     let environment = EnvironmentId::new("crew-box");
     let resolver = DockerEnvironmentHopResolver::new(HashMap::from([(environment.clone(), "crew-container".to_string())]));
     let mut context = context();
@@ -134,17 +134,20 @@ fn docker_environment_wrap_is_one_direct_exec_command() {
 
     resolver.resolve_wrap(&environment, &mut context).expect("known environment");
 
-    assert_eq!(context.actions, [ResolvedAction::Command(vec![
-        Arg::Literal("docker".into()),
-        Arg::Literal("exec".into()),
-        Arg::Literal("-it".into()),
-        Arg::Literal("-w".into()),
-        Arg::Quoted("/work/crew".into()),
+    let [ResolvedAction::Command(args)] = context.actions.as_slice() else { panic!("expected one supervised command") };
+    assert_eq!(&args[..2], [Arg::Literal("sh".into()), Arg::Literal("-c".into())]);
+    let Arg::Quoted(wrapper) = &args[2] else { panic!("wrapper must be a quoted shell program") };
+    assert!(wrapper.contains("trap cleanup EXIT HUP INT TERM"));
+    assert!(wrapper.contains("FLOTILLA_ATTACH_LEASE=$lease"));
+    assert!(wrapper.contains("kill -KILL \"$pid\""));
+    assert_eq!(&args[3..], [
+        Arg::Literal("flotilla-docker-attach".into()),
         Arg::Quoted("crew-container".into()),
+        Arg::Quoted("/work/crew".into()),
         Arg::Literal("cleat".into()),
         Arg::Literal("attach".into()),
         Arg::Quoted("session".into()),
-    ])]);
+    ]);
 }
 
 #[derive(Default)]
@@ -206,13 +209,10 @@ fn resolver_composes_command_execution_inside_out() {
     let outer = command(&resolved.0[0]);
     assert_eq!(outer[0], Arg::Literal("ssh".into()));
     let docker = nested(&outer[2]);
-    assert_eq!(docker[..4], [
-        Arg::Literal("docker".into()),
-        Arg::Literal("exec".into()),
-        Arg::Literal("-it".into()),
-        Arg::Quoted("crew-container".into()),
-    ]);
-    assert_eq!(docker[4..], [Arg::Literal("cleat".into()), Arg::Literal("attach".into()), Arg::Quoted("session".into())]);
+    assert_eq!(docker[0], Arg::Literal("sh".into()));
+    assert_eq!(docker[1], Arg::Literal("-c".into()));
+    assert_eq!(docker[4], Arg::Quoted("crew-container".into()));
+    assert_eq!(docker[6..], [Arg::Literal("cleat".into()), Arg::Literal("attach".into()), Arg::Quoted("session".into())]);
     assert_eq!(*remote.calls.lock().expect("calls lock"), [HostName::new("udder")]);
     assert_eq!(*terminal.calls.lock().expect("calls lock"), [attachable]);
     assert_eq!(context.nesting_depth, 2);
