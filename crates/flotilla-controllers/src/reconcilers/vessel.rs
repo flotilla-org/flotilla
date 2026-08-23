@@ -1030,6 +1030,7 @@ impl Reconciler for VesselReconciler {
                     placement_decision: placement_decision.clone(),
                     started_at: now,
                     message: provisioning_stuck_message(obj, waiting_for, wait_reason.as_ref(), now),
+                    wait_reason: wait_reason.clone(),
                 })
             }
             PlannedPatch::Ready {
@@ -1166,9 +1167,8 @@ fn provisioning_stuck_message(
 ) -> Option<String> {
     if matches!(wait_reason, Some(EnvironmentWaitReason::MaterialPoolExhausted { .. })) {
         // Pool exhaustion is admission queueing, not a stalled provisioning
-        // attempt. Keep the typed wait reason as the visible holding signal,
-        // but do not publish the generic stuck message consumed by timeout
-        // reclaim automation.
+        // attempt. Persist the typed wait reason as the holding signal without
+        // also publishing the generic stuck message.
         return None;
     }
     let started_at = obj.status.as_ref().filter(|status| status.phase == VesselPhase::Provisioning).and_then(|status| status.started_at)?;

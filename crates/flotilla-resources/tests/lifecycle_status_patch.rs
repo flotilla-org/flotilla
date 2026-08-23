@@ -287,6 +287,7 @@ fn patch_variants_exhaustively_declare_their_lifecycle_classes() {
             observed_policy_version: "2".to_string(),
             started_at: ts(30),
             message: None,
+            wait_reason: None,
         }),
         PatchKind::VesselMarkProvisioning
     );
@@ -650,6 +651,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     observed_policy_version: "2".to_string(),
                     started_at: ts(30),
                     message: None,
+                    wait_reason: None,
                 };
                 apply_and_replay(&mut status, &patch);
                 let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };

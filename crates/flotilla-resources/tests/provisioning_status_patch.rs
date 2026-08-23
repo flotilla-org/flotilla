@@ -257,11 +257,16 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
         observed_policy_version: "12".to_string(),
         started_at,
         message: None,
+        wait_reason: Some(flotilla_resources::EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: "codex-login".to_string() }),
     }
     .apply(&mut status);
     assert_eq!(status.phase, VesselPhase::Provisioning);
     assert_eq!(status.observed_policy_ref.as_deref(), Some("docker-on-01HXYZ"));
     assert_eq!(status.placement_decision.as_ref(), Some(&placement_decision));
+    assert!(matches!(
+        status.wait_reason,
+        Some(flotilla_resources::EnvironmentWaitReason::MaterialPoolExhausted { ref pool_ref }) if pool_ref == "codex-login"
+    ));
 
     VesselStatusPatch::MarkProvisioning {
         placement_decision: Some(PlacementDecision {
@@ -273,6 +278,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
         observed_policy_ref: "docker-on-01HXYZ".to_string(),
         observed_policy_version: "13".to_string(),
         started_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
+        wait_reason: None,
         message: Some("still waiting".to_string()),
     }
     .apply(&mut status);

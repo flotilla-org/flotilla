@@ -499,7 +499,13 @@ impl Reconciler for ConvoyReconciler {
         } else {
             None
         };
-        let reclaim_eligible = if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+        let waiting_on_material_pool = vessels.values().any(|vessel| {
+            vessel
+                .status
+                .as_ref()
+                .is_some_and(|status| matches!(status.wait_reason, Some(crate::EnvironmentWaitReason::MaterialPoolExhausted { .. })))
+        });
+        let reclaim_eligible = if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) && !waiting_on_material_pool {
             match &self.teardown_runtime {
                 Some(runtime) => {
                     let checkout_list = checkouts.values().cloned().collect::<Vec<_>>();
