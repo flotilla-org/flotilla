@@ -2570,7 +2570,8 @@ impl InProcessDaemon {
             .get(&scope.name)
             .await
             .map_err(|error| format!("project {}/{}: {error}", scope.namespace, scope.name))?;
-        match resolve_project_issue_sources(&self.resource_backend.clone().using::<Repository>(&scope.namespace), &project.spec).await {
+        match resolve_project_issue_sources(&self.resource_backend.including_replicas::<Repository>(&scope.namespace), &project.spec).await
+        {
             IssueSourceResolution::Available { sources } => Ok(sources),
             IssueSourceResolution::Unavailable(IssueSourceUnavailable::RepositoryUnavailable { repository, message }) => {
                 Err(format!("repository {repository}: {message}"))
@@ -2973,9 +2974,10 @@ impl InProcessDaemon {
         let project = self
             .resource_backend
             .clone()
-            .definitions::<Project>(&project_namespace)
+            .including_replicas::<Project>(&project_namespace)
             .get(&project_ref)
             .await
+            .map(|source| source.object)
             .map_err(|error| project_not_ready_error(&project_namespace, &project_ref, error))?;
         let repositories = self.snapshot_project_repositories(&project_namespace, &project_ref).await?;
         let (_, workflow) =
@@ -3826,11 +3828,11 @@ async fn validate_fork_workflow_admission(
     if workflow_has_in_crew_review(workflow) {
         return Ok(());
     }
-    let resolver = backend.clone().using::<Repository>(namespace);
+    let resolver = backend.including_replicas::<Repository>(namespace);
     for repository in repositories {
         let repository =
             resolver.get(&repository.repo_ref.to_string()).await.map_err(|error| format!("repository {}: {error}", repository.repo_ref))?;
-        if repository.spec.is_fork() && !repository.spec.allows_reviewless_workflows() {
+        if repository.object.spec.is_fork() && !repository.object.spec.allows_reviewless_workflows() {
             return Err(format!("workflow {workflow_ref} not permitted for fork-stance repository — use implement-review"));
         }
     }
@@ -4255,7 +4257,7 @@ impl InProcessDaemon {
         selector: &flotilla_protocol::IssueSelector,
     ) -> Result<ConvoyIssue, String> {
         let sources =
-            match resolve_project_issue_sources(&self.resource_backend.clone().using::<Repository>(namespace), &project.spec).await {
+            match resolve_project_issue_sources(&self.resource_backend.including_replicas::<Repository>(namespace), &project.spec).await {
                 IssueSourceResolution::Available { sources } => sources,
                 IssueSourceResolution::Unavailable(IssueSourceUnavailable::RepositoryUnavailable { repository, message }) => {
                     return Err(format!("repository {repository}: {message}"));
@@ -4292,14 +4294,14 @@ impl InProcessDaemon {
             }
         };
 
-        let repositories = self.resource_backend.clone().using::<Repository>(namespace);
+        let repositories = self.resource_backend.including_replicas::<Repository>(namespace);
         let mut matching_repositories = Vec::new();
         for project_repository in &project.spec.repositories {
             let repository = repositories
                 .get(&project_repository.repo.to_string())
                 .await
                 .map_err(|error| format!("repository {}: {error}", project_repository.repo))?;
-            if repository.spec.forge().is_some_and(|forge| {
+            if repository.object.spec.forge().is_some_and(|forge| {
                 forge.service_url == issue.reference.source.service && forge.repository == issue.reference.source.scope
             }) {
                 matching_repositories.push(project_repository.repo.clone());
@@ -4378,9 +4380,10 @@ impl InProcessDaemon {
         let project = self
             .resource_backend
             .clone()
-            .definitions::<Project>(namespace)
+            .including_replicas::<Project>(namespace)
             .get(project_ref)
             .await
+            .map(|project| project.object)
             .map_err(|error| project_not_ready_error(namespace, project_ref, error))?;
         let mut repositories_snapshot = self.snapshot_project_repositories(namespace, project_ref).await?;
         if let Some(selected) = repositories {
@@ -5439,11 +5442,12 @@ impl InProcessDaemon {
         let project = self
             .resource_backend
             .clone()
-            .definitions::<Project>(namespace)
+            .including_replicas::<Project>(namespace)
             .get(project_ref)
             .await
+            .map(|project| project.object)
             .map_err(|error| project_not_ready_error(namespace, project_ref, error))?;
-        let repositories = self.resource_backend.clone().using::<Repository>(namespace);
+        let repositories = self.resource_backend.including_replicas::<Repository>(namespace);
         let mut unresolved = Vec::new();
         let mut snapshots = BTreeMap::<RepositoryKey, (String, RepositorySpec, Option<String>, BTreeSet<String>)>::new();
         for entry in &project.spec.repositories {
@@ -5452,6 +5456,7 @@ impl InProcessDaemon {
             }
             match repositories.get(&entry.repo.to_string()).await {
                 Ok(repository) => {
+                    let repository = repository.object;
                     if let Err(error) = repository.spec.verify_key(&entry.repo) {
                         unresolved.push(error);
                         continue;
