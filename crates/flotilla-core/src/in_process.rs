@@ -2451,17 +2451,40 @@ impl InProcessDaemon {
             return Ok(observed);
         };
         let namespace = self.provisioning_namespace().await;
-        let matches = self
+        let matching_sources = self
             .resource_backend
             .clone()
-            .using::<Repository>(&namespace)
+            .including_replicas::<Repository>(&namespace)
             .list()
             .await
             .map_err(|error| error.to_string())?
             .items
             .into_iter()
+            .map(|repository| repository.object)
             .filter(|repository| repository.spec.declares_remote(canonical_remote))
             .collect::<Vec<_>>();
+        let mut matches_by_name = BTreeMap::<String, Vec<ResourceObject<Repository>>>::new();
+        for repository in matching_sources {
+            matches_by_name.entry(repository.metadata.name.clone()).or_default().push(repository);
+        }
+        let mut matches = Vec::with_capacity(matches_by_name.len());
+        for sources in matches_by_name.into_values() {
+            let declared_remotes = sources
+                .iter()
+                .filter(|repository| repository.spec.remotes().len() > 1)
+                .map(|repository| repository.spec.remotes())
+                .collect::<BTreeSet<_>>();
+            if declared_remotes.len() > 1 {
+                return Err(format!("remote `{canonical_remote}` has conflicting declarations for one Repository"));
+            }
+            matches.push(
+                sources
+                    .iter()
+                    .find(|repository| repository.spec.remotes().len() > 1)
+                    .unwrap_or_else(|| sources.first().expect("Repository source group cannot be empty"))
+                    .clone(),
+            );
+        }
         let declared = matches.iter().filter(|repository| repository.spec.remotes().len() > 1).collect::<Vec<_>>();
         match declared.as_slice() {
             [repository] => return observed.with_remotes(repository.spec.remotes().iter().cloned()),

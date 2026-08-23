@@ -13,6 +13,7 @@ define_resource!(
     RepositorySpec,
     RepositoryStatus,
     RepositoryStatusPatch,
+    replication = crate::ReplicationClass::ConvergentFacts,
     validate_spec_update = validate_repository_spec_update
 );
 
