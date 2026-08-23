@@ -956,7 +956,7 @@ impl Reconciler for VesselReconciler {
                                 Ok(brief) => brief,
                                 Err(message) => return Ok(VesselPrepared::failed(message)),
                             };
-                            append_convoy_work_context(&mut brief.content, &convoy, &repository_refs);
+                            append_convoy_work_context(&mut brief.content, &convoy, &repository_refs, &requirement.credential_scopes);
                             brief.copies = brief_copies.clone();
                             flotilla_resources::TerminalSessionSource::Agent {
                                 selector: selector.clone(),

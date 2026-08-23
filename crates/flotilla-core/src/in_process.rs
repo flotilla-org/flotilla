@@ -1549,9 +1549,13 @@ fn handoff_crew_brief(
     target: &str,
     prompt: Option<&str>,
     members: &[CrewListMember],
-    repository_refs: &[RepositoryKey],
+    requirement: &flotilla_resources::VesselRequirement,
     render_options: &crate::agent_adapter::CrewBriefRenderOptions,
 ) -> Result<TerminalBrief, String> {
+    let repository_refs = requirement
+        .repository_refs
+        .clone()
+        .unwrap_or_else(|| convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect());
     let assignment = match prompt {
         Some(prompt) => crate::agent_adapter::CrewAssignment::Prompt(prompt),
         None if !convoy.spec.issues.is_empty() => crate::agent_adapter::CrewAssignment::CarriedIssue,
@@ -1578,7 +1582,7 @@ fn handoff_crew_brief(
         render_options,
     );
     let mut brief = brief?;
-    crate::agent_adapter::append_convoy_work_context(&mut brief.content, convoy, repository_refs);
+    crate::agent_adapter::append_convoy_work_context(&mut brief.content, convoy, &repository_refs, &requirement.credential_scopes);
     Ok(brief)
 }
 
@@ -7803,8 +7807,7 @@ impl InProcessDaemon {
                         repo_roots,
                         fork_stance,
                     );
-                let brief =
-                    handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, &repository_refs, &render_options)?;
+                let brief = handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, task, &render_options)?;
                 let terminal_meta = terminal_meta_with_vessel_credentials(identity.input_meta(), task);
                 sessions
                     .create(&terminal_meta, &flotilla_resources::TerminalSessionSpec {

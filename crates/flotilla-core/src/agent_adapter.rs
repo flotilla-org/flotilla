@@ -268,6 +268,7 @@ pub fn append_convoy_work_context(
     content: &mut String,
     convoy: &flotilla_resources::ResourceObject<flotilla_resources::Convoy>,
     repository_refs: &[flotilla_resources::RepositoryKey],
+    credential_scopes: &BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>,
 ) {
     content.push_str("\n\n## Work context\n\n");
     if let Some(branch) = &convoy.spec.r#ref {
@@ -276,6 +277,19 @@ pub fn append_convoy_work_context(
     content.push_str("- Repositories:\n");
     for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
         content.push_str(&format!("  - `{}` — {} (target `{}`)\n", repository.repo_ref, repository.url, repository.target_ref));
+    }
+    if !credential_scopes.is_empty() {
+        content.push_str("- Minted credential repository scope:\n");
+        for (credential, scope) in credential_scopes {
+            content.push_str(&format!("  - `{credential}`:\n"));
+            for repo_ref in scope {
+                let repository = convoy.spec.repositories.iter().find(|repository| &repository.repo_ref == repo_ref);
+                match repository {
+                    Some(repository) => content.push_str(&format!("    - `{}` — {}\n", repository.repo_ref, repository.url)),
+                    None => content.push_str(&format!("    - `{repo_ref}`\n")),
+                }
+            }
+        }
     }
     if let Some(change_request) = &convoy.spec.change_request {
         content.push_str(&format!(
@@ -852,7 +866,11 @@ impl AgentAdapterRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, process::Command as ProcessCommand, sync::Arc};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        process::Command as ProcessCommand,
+        sync::Arc,
+    };
 
     use chrono::Utc;
     use flotilla_protocol::{IssueRef, IssueSource, IssueState};
@@ -919,6 +937,8 @@ mod tests {
         assert!(brief.content.contains("only when it explicitly supports the destination forge"));
         assert!(brief.content.contains("Do not merge it"));
         assert!(brief.content.contains("Clone scratch repositories outside the vessel checkout"));
+        assert!(brief.content.contains("park the verified commit"));
+        assert!(brief.content.contains("redispatched under the owning project"));
     }
 
     fn brief_for(assignment: CrewAssignment<'_>) -> String {
@@ -964,6 +984,8 @@ mod tests {
         assert!(content.contains("No decisions beyond the brief."));
         assert!(content.contains("--decision-ledger-ref '<comment URL>'"));
         assert!(content.contains("A claim without this pointer is accepted but flagged"));
+        assert!(content.contains("park the verified commit"));
+        assert!(content.contains("redispatched under the owning project"));
         assert!(content.contains("## Assignment\n\nFix the flux capacitor."));
     }
 
@@ -1093,6 +1115,8 @@ mod tests {
         assert!(brief.contains("Future events belong to a later engagement"));
         assert!(brief.contains("claim's linked `## Decision ledger` comment"));
         assert!(brief.contains("A missing ledger is a finding, not grounds to reject or wedge the claim"));
+        assert!(brief.contains("park the verified commit"));
+        assert!(brief.contains("redispatched under the owning project"));
         assert!(brief.contains("flotilla crew complete --message '<PR URL>'"));
         assert!(!brief.contains("wait-for-checks"));
         assert!(!brief.contains("No assignment was provided"));
@@ -1257,9 +1281,16 @@ mod tests {
             status: None,
         };
         let mut content = String::new();
-        append_convoy_work_context(&mut content, &convoy, &[repo_ref]);
+        append_convoy_work_context(
+            &mut content,
+            &convoy,
+            std::slice::from_ref(&repo_ref),
+            &BTreeMap::from([("github-app".to_string(), BTreeSet::from([repo_ref.clone()]))]),
+        );
 
         assert!(content.contains("- `repo_widgets` — https://github.com/flotilla-org/flotilla (target `main`)"));
+        assert!(content.contains("- Minted credential repository scope:"));
+        assert!(content.contains("  - `github-app`:\n    - `repo_widgets` — https://github.com/flotilla-org/flotilla"));
         assert!(content.contains("- Bound pull request: `#1071` — Existing pull request (`repo_widgets`)"));
         assert!(content.contains("First issue body.\n\nSource-qualified reference: `https://github.com` / `flotilla-org/flotilla` / `810`"));
     }
