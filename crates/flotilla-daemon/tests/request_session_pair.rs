@@ -416,6 +416,12 @@ async fn implicit_human_abandon_remains_a_human_override() {
         .await;
 }
 
+#[tokio::test]
+async fn implicit_name_outside_the_convoy_namespace_is_attributed_as_a_principal() {
+    let principal = PrincipalRef { namespace: "automation".to_string(), name: PrincipalRef::IMPLICIT_NAME.to_string() };
+    assert_abandon_attribution(principal.clone(), WorkCompletionAuthority::Principal(principal), PrincipalRef::IMPLICIT_NAME).await;
+}
+
 // ---------------------------------------------------------------------------
 // MockIssueProvider — returns a fixed result for assertions
 // ---------------------------------------------------------------------------

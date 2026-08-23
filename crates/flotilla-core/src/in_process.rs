@@ -7697,8 +7697,9 @@ impl InProcessDaemon {
         }
         self.archive_convoy_checkouts_best_effort(namespace, name).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let implicit_principal = PrincipalRef::implicit_for_namespace(namespace);
         let authority = match principal_ref {
-            Some(principal) if principal.name == PrincipalRef::IMPLICIT_NAME => WorkCompletionAuthority::HumanOverride,
+            Some(principal) if principal == &implicit_principal => WorkCompletionAuthority::HumanOverride,
             Some(principal) => WorkCompletionAuthority::Principal(principal.clone()),
             None => WorkCompletionAuthority::Unattributed,
         };
