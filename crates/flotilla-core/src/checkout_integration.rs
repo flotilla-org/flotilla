@@ -344,6 +344,7 @@ async fn inspect_pushed_without_upstream(runner: &dyn CommandRunner, checkout_pa
                 .await
             {
                 Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
+                    Ok(0) => IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build(),
                     Ok(count) => IntegrationCondition::builder()
                         .value(ConditionValue::False)
                         .details(vec![format!("{count} unpushed commit{}", if count == 1 { "" } else { "s" })])
@@ -644,6 +645,15 @@ mod tests {
         assert_eq!(pushed.value, ConditionValue::False);
         assert_eq!(pushed.details, vec!["2 unpushed commits"]);
         assert_eq!(runner.calls()[2].1, vec!["rev-list", "--count", "HEAD", "--not", "--remotes"]);
+    }
+
+    #[tokio::test]
+    async fn branch_pushed_between_no_upstream_probes_reports_pushed() {
+        let runner = MockRunner::new(vec![Err("no upstream configured".into()), Ok(String::new()), Ok("0\n".into())]);
+
+        let pushed = inspect_pushed(&runner, Path::new("/checkout"), None, "2026-08-04T12:00:00Z").await;
+
+        assert_eq!(pushed.value, ConditionValue::True);
     }
 
     #[tokio::test]
