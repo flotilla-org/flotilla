@@ -603,13 +603,7 @@ impl CredentialStore {
         for name in credential_refs {
             let spec = match self.spec(name).await {
                 Ok(spec) => spec,
-                Err(message) => {
-                    if credential_scopes.get(name).is_some_and(|scopes| !scopes.is_empty()) {
-                        return Err(self.record_adoption_failure(environment_ref, message).await);
-                    }
-                    tracing::warn!(credential = %name, environment = %environment_ref, %message, "skipping unavailable credential while discovering GitHub App deliveries");
-                    continue;
-                }
+                Err(message) => return Err(self.record_adoption_failure(environment_ref, message).await),
             };
             if matches!(spec.consumer, CredentialConsumer::GithubApp { .. }) {
                 github_app_refs.insert(name.clone());
@@ -1756,19 +1750,12 @@ interactions:
             GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
             PathBuf::from("/state"),
         );
-        let mut adoption_refs = refs.clone();
-        adoption_refs.insert("deleted-unrelated-codex".to_string());
         for expected_surface in [false, false, true] {
-            let error = store
-                .adopt_github_app_deliveries("standing-vessel", &adoption_refs, &scopes, runner.clone())
-                .await
-                .expect_err("adoption outage");
+            let error =
+                store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect_err("adoption outage");
             assert_eq!(error.should_surface, expected_surface);
         }
-        store
-            .adopt_github_app_deliveries("standing-vessel", &adoption_refs, &scopes, runner.clone())
-            .await
-            .expect("re-adopt standing vessel despite missing unrelated credential");
+        store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect("re-adopt standing vessel");
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 5, "startup adoption retries and rebuilds the registration");
 
         clock.advance(Duration::minutes(115));

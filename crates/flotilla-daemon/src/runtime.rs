@@ -1397,7 +1397,7 @@ async fn surface_credential_refresh_error(daemon: &InProcessDaemon, namespace: &
     flotilla_resources::apply_status_patch(
         &daemon.resource_backend().using::<Environment>(namespace),
         &error.environment_ref,
-        &EnvironmentStatusPatch::MarkFailed { message: format!("GitHub App credential refresh failed: {}", error.message) },
+        &EnvironmentStatusPatch::MarkFailed { message: format!("Credential delivery recovery failed: {}", error.message) },
     )
     .await
     .map(|_| ())
