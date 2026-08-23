@@ -78,9 +78,10 @@ async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_c
     .await;
     daemon.set_provisioning_namespace("flotilla".to_string()).await;
     let change_requests = daemon.resource_backend().using::<ResourceChangeRequest>("flotilla");
+    let change_request_name = change_request_record_name("github.com", "flotilla-org/flotilla", 1696);
     let observation = change_requests
         .create(
-            &test_meta("pr-1696"),
+            &test_meta(&change_request_name),
             &flotilla_resources::ChangeRequestSpec::builder()
                 .service("github.com".to_string())
                 .scope("flotilla-org/flotilla".to_string())

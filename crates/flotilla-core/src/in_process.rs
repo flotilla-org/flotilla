@@ -30,29 +30,31 @@ use flotilla_protocol::{
     ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription,
     ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow,
     FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProviderStatus,
-    HostProvidersResponse, HostStatusResponse, HostSummary, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
-    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
-    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary,
-    ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
-    ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse,
-    TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState,
+    PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry,
+    ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoIdentity, RepoInfo,
+    RepoProvidersResponse, RepoSummary, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse,
+    ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus,
+    StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY,
+    TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
-    apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name,
-    controller::delete_lifecycle_owned_matching, ensure_repository, evaluate_landing_settlement, expected_change_request_leaves,
-    expected_checkout_refs, external_patches as convoy_external_patches, get_resource_kind_including_replicas, list_resource_kind,
-    list_resource_kind_including_replicas, normalize_project_spec, repository_display_labels, resolve_project_issue_sources,
-    terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
-    watch_resource_kind_replica_sources, BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
-    CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition,
-    ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec,
-    ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase,
-    Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState,
-    Environment as ResourceEnvironment, EnvironmentPhase, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend,
-    InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
-    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
+    apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name, change_request_address,
+    change_request_record_name, controller::delete_lifecycle_owned_matching, ensure_repository, evaluate_landing_settlement,
+    expected_change_request_leaves, expected_checkout_refs, external_patches as convoy_external_patches,
+    get_resource_kind_including_replicas, list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec,
+    repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
+    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
+    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
+    ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec,
+    ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
+    CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand,
+    DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase,
+    HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
+    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedChangeRequestState,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
     ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
     ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
@@ -3423,31 +3425,26 @@ impl InProcessDaemon {
         let Some(change_request_id) = change_request_id else { return Ok(None) };
         let Ok(number) = change_request_id.parse::<u64>() else { return Ok(None) };
         let namespace = self.provisioning_namespace().await;
-        let repositories =
-            self.resource_backend.clone().including_replicas::<Repository>(&namespace).list().await.map_err(|error| error.to_string())?;
-        let change_requests = self
-            .resource_backend
-            .clone()
-            .including_replicas::<ResourceChangeRequest>(&namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?;
+        let repositories = self.resource_backend.clone().including_replicas::<Repository>(&namespace);
+        let change_requests = self.resource_backend.clone().including_replicas::<ResourceChangeRequest>(&namespace);
 
         for repository_key in repository_keys {
-            let Some(repository) = repositories.items.iter().find(|repository| repository.object.metadata.name == repository_key.0) else {
-                continue;
+            let repository = match repositories.get(&repository_key.to_string()).await {
+                Ok(repository) => repository,
+                Err(ResourceError::NotFound { .. }) => continue,
+                Err(error) => return Err(error.to_string()),
             };
             let flotilla_resources::RepositoryIdentity::Remote { canonical_remote } = repository.object.spec.identity() else {
                 continue;
             };
-            let qualified = canonical_remote.split_once("://").map_or(canonical_remote.as_str(), |(_, qualified)| qualified);
-            let Some((service, scope)) = qualified.split_once('/') else { continue };
-            let Some(observation) = change_requests.items.iter().find(|change_request| {
-                change_request.object.spec.service == service
-                    && change_request.object.spec.scope == scope
-                    && change_request.object.spec.number == number
-            }) else {
-                continue;
+            let LeafAddress::ChangeRequest { service, scope, .. } = change_request_address(canonical_remote, change_request_id)? else {
+                unreachable!("change_request_address always returns a change-request address")
+            };
+            let record_name = change_request_record_name(&service, &scope, number);
+            let observation = match change_requests.get(&record_name).await {
+                Ok(observation) => observation,
+                Err(ResourceError::NotFound { .. }) => continue,
+                Err(error) => return Err(error.to_string()),
             };
             let Some(state) = observation.object.status.as_ref().and_then(|status| status.state.value) else { continue };
             let status = match state {
