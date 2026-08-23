@@ -274,6 +274,38 @@ async fn replicated_remote_declaration_resolves_and_keeps_mirror_residue_retired
     assert_eq!(projects[0].spec.repositories[0].repo, canonical_key);
 }
 
+#[tokio::test]
+async fn independently_observed_same_repository_remains_resolvable_after_replication() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config(tmp.path().join("config"));
+    let kiwi_root = NodeId::new("kiwi-root");
+    let feta_root = NodeId::new("feta-root");
+    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let feta = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(feta_root);
+    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    let repository_key = repository_spec.key();
+    let meta = InputMeta::builder().name(repository_key.to_string()).build();
+    kiwi.using::<Repository>("flotilla").create(&meta, &repository_spec).await.expect("observe repository on kiwi");
+    feta.using::<Repository>("flotilla").create(&meta, &repository_spec).await.expect("observe repository on feta");
+    let kiwi_repositories = kiwi.using::<Repository>("flotilla").list().await.expect("list kiwi repositories");
+    feta.replica_writer::<Repository>(kiwi_root, "flotilla")
+        .replace(&kiwi_repositories, Utc::now())
+        .await
+        .expect("replicate kiwi observation to feta");
+
+    let daemon =
+        InProcessDaemon::new_with_resource_backend(vec![], Arc::clone(&config), fake_discovery(false), HostName::new("feta"), feta.clone())
+            .await;
+    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "feta".to_string() })).await;
+    let checkout_path = tmp.path().join("canonical-checkout");
+    std::fs::create_dir(&checkout_path).expect("canonical checkout dir");
+    daemon.add_repo(&checkout_path).await.expect("refresh independently observed repository on feta");
+
+    let repositories = feta.using::<Repository>("flotilla").list().await.expect("list feta repositories");
+    assert_eq!(repositories.items.len(), 1);
+    assert_eq!(repositories.items[0].metadata.name, repository_key.to_string());
+}
+
 async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
