@@ -12,8 +12,8 @@ use std::{
 };
 
 use flotilla_resources::{
-    apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, ResourceBackend, ResourceError, MANAGED_BY_LABEL,
-    MANIFEST_RESOLUTION_ANNOTATION,
+    apply_manifest_resource_document, get_resource_kind, patch_resource_annotation, resource_document_spec_hash, ResourceBackend,
+    ResourceError, MANAGED_BY_LABEL, MANIFEST_RESOLUTION_ANNOTATION,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -201,6 +201,17 @@ impl ResourceManifestReconciler {
         }
 
         if resolution == Some("adopt") {
+            // Refresh immediately before touching the source file so the
+            // adopted snapshot is not the one used for earlier drift checks.
+            let existing = get_resource_kind(&self.backend, &identity.namespace, &identity.kind, &identity.name)
+                .await
+                .map_err(|error| format!("{identity}: refresh live spec for adoption: {error}"))?
+                .value;
+            let live_hash = resource_document_spec_hash(&existing).map_err(|error| format!("{identity}: {error}"))?;
+            let refreshed_annotations = string_map(&existing, "annotations")?;
+            if refreshed_annotations.get(MANIFEST_RESOLUTION_ANNOTATION).map(String::as_str) != Some("adopt") {
+                return Err(format!("{identity}: adopt resolution changed while reconciling; retrying on the next pass"));
+            }
             self.adopt_live_spec(source, &identity, &existing).await?;
 
             // The manifest rewrite crosses an await boundary and can take long
@@ -291,12 +302,17 @@ impl ResourceManifestReconciler {
         {
             return Ok(());
         }
-        let mut refused = existing.clone();
-        set_annotation(&mut refused, MANIFEST_REFUSAL_ANNOTATION, reason)?;
-        set_annotation(&mut refused, MANIFEST_LIVE_HASH_ANNOTATION, live_hash)?;
-        set_annotation(&mut refused, MANIFEST_BASELINE_HASH_ANNOTATION, baseline_hash)?;
-        set_annotation(&mut refused, MANIFEST_DESIRED_HASH_ANNOTATION, desired_hash)?;
-        apply_manifest_resource_document(&self.backend, &self.default_namespace, refused).await.map_err(|error| error.to_string())?;
+        let identity = document_identity(existing, &self.default_namespace)?;
+        for (key, value) in [
+            (MANIFEST_REFUSAL_ANNOTATION, reason),
+            (MANIFEST_LIVE_HASH_ANNOTATION, live_hash),
+            (MANIFEST_BASELINE_HASH_ANNOTATION, baseline_hash),
+            (MANIFEST_DESIRED_HASH_ANNOTATION, desired_hash),
+        ] {
+            patch_resource_annotation(&self.backend, &identity.namespace, &identity.kind, &identity.name, key, value)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 
