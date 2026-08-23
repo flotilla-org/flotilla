@@ -254,6 +254,10 @@ fn copy_tree(source: &std::path::Path, destination: &std::path::Path) -> Result<
     Ok(())
 }
 
+fn report_staged_skills(environment: &str, skills: &[String]) {
+    info!(environment, skills = ?skills, "staged contained Codex skills");
+}
+
 #[async_trait]
 impl AgentMaterialAdapter for CodexMaterialAdapter {
     fn id(&self) -> &'static str {
@@ -283,7 +287,7 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
             MaterialLeaseOutcome::Leased { unit, .. } => {
                 let codex_home = PathBuf::from(&unit.directory);
                 let skills = self.stage_skills(&codex_home).await?;
-                info!(environment = %holder_ref.name, skills = ?skills, "staged contained Codex skills");
+                report_staged_skills(&holder_ref.name, &skills);
                 Ok(AgentMaterialOutcome::Ready(AgentMaterialDelivery {
                     mount: ProvisionedMount::new(codex_home, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw),
                     preflight: AgentMaterialPreflight {
@@ -376,35 +380,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_skills_are_staged_per_holder_and_reported() {
+    async fn codex_skills_are_staged_per_holder() {
         let temp = tempfile::tempdir().expect("tempdir");
         let pool = temp.path().join(".config/flotilla/credentials/codex-pool");
         let first = write_slot(&pool, 0);
         let second = write_slot(&pool, 1);
         let registry = registry(temp.path());
-        let output = Arc::new(Mutex::new(Vec::new()));
-
-        {
-            let writer = LogCaptureWriter(Arc::clone(&output));
-            let subscriber = tracing_subscriber::fmt()
-                .without_time()
-                .with_ansi(false)
-                .with_target(false)
-                .with_max_level(tracing::Level::INFO)
-                .with_writer(move || writer.clone())
-                .finish();
-            let _guard = tracing::subscriber::set_default(subscriber);
-            let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
-            registry.prepare("crew-alice", &required, &BTreeMap::new()).await.expect("prepare Alice");
-            registry.prepare("crew-bob", &required, &BTreeMap::new()).await.expect("prepare Bob");
-        }
+        let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
+        registry.prepare("crew-alice", &required, &BTreeMap::new()).await.expect("prepare Alice");
+        registry.prepare("crew-bob", &required, &BTreeMap::new()).await.expect("prepare Bob");
 
         assert!(first.join("skills/pr-shepherd/SKILL.md").is_file());
         assert!(second.join("skills/pr-shepherd/SKILL.md").is_file());
         assert_ne!(first, second, "each holder must receive its own config home");
+    }
+
+    #[test]
+    fn staged_skill_list_is_reported() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogCaptureWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        report_staged_skills("crew-alice", &["code-review".to_string(), "pr-shepherd".to_string()]);
+
         let logs = String::from_utf8(output.lock().expect("log capture lock should be healthy").clone()).expect("UTF-8 logs");
         assert!(logs.contains("staged contained Codex skills"), "missing provisioning event: {logs}");
         assert!(logs.contains("pr-shepherd"), "provisioning event must report staged skills: {logs}");
+        assert!(logs.contains("crew-alice"), "provisioning event must identify its holder: {logs}");
     }
 
     #[tokio::test]
