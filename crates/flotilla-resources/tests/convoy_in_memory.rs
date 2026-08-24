@@ -515,7 +515,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
                 && matches!(presentations.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. }))
                 && matches!(checkouts.get("checkout-convoy-delete").await, Err(ResourceError::NotFound { .. }))
                 && matches!(
-                    backend.clone().using::<WorkflowTemplate>("flotilla").get(workflow_snapshot_name).await,
+                    backend.clone().definitions::<WorkflowTemplate>("flotilla").get(workflow_snapshot_name).await,
                     Err(ResourceError::NotFound { .. })
                 )
                 && matches!(
