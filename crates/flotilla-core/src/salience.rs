@@ -115,6 +115,15 @@ pub fn evaluate_entry(
     result
 }
 
+/// Evaluate checkout-targeted pane exits without admitting unrelated demand,
+/// attention, or regard facts into the owning Project's checkout family.
+pub fn evaluate_pane_exits(targets: &[ResourceRef], facts: &SalienceFacts, base_as_of: DateTime<Utc>) -> SalienceEvaluation {
+    facts.pane_exits.iter().filter(|exit| targets.iter().any(|target| references_match(&exit.target, target))).fold(
+        SalienceEvaluation { salience: Salience::None, as_of: base_as_of },
+        |result, exit| SalienceEvaluation { salience: result.salience.max(Salience::Attention), as_of: result.as_of.max(exit.as_of) },
+    )
+}
+
 fn evaluate_combination(
     demand: Option<&DemandFact>,
     attention: Option<&AttentionFact>,
