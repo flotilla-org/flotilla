@@ -161,6 +161,8 @@ pub struct VesselSummary {
 pub struct ConvoySummary {
     pub id: ConvoyId,
     pub namespace: String,
+    /// Unique resource identity (`Convoy.metadata.name`), distinct from the display role in `name`.
+    pub resource_name: String,
     pub name: String,
     #[builder(default)]
     pub generation: u64,
@@ -192,6 +194,7 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
         Self {
             id: ConvoyId::for_resource(&row.resource),
             namespace: row.resource.namespace.clone(),
+            resource_name: row.resource.name.clone(),
             name: row.name.clone(),
             generation: row.generation,
             origin_host: row.resource.host.clone(),
