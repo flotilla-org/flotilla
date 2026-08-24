@@ -542,7 +542,10 @@ async fn resource_mutations_targeting_a_peer_modify_only_the_peer_store() {
 
     assert!(matches!(await_command_result(&mut events, delete_id).await, CommandValue::ResourceDeleted(_)));
     assert!(
-        matches!(follower_templates.get(name).await, Err(ResourceError::NotFound { .. })),
+        matches!(
+            topology.follower.resource_backend().definitions::<WorkflowTemplate>(namespace).get(name).await,
+            Err(ResourceError::NotFound { .. })
+        ),
         "peer-targeted delete should remove the resource from the peer store"
     );
 }
