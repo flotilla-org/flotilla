@@ -189,6 +189,9 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             group.entries.sort_by(|left, right| entry_rank(left).cmp(&entry_rank(right)).then_with(|| left.label.cmp(&right.label)));
             let mut salience = group.entries.iter().map(|entry| entry.salience).max().unwrap_or(Salience::None);
             let mut node_as_of = group.entries.iter().map(|entry| entry.as_of).max().unwrap_or(as_of);
+            // Checkout targets currently arise only from pane-exit facts. Keep
+            // the generic evaluator, but do not treat this as a path for
+            // presenting checkout entities themselves.
             let node_evaluation = evaluate_entry(&group.salience_targets, &group.refs, &input.salience, node_as_of);
             salience = salience.max(node_evaluation.salience);
             node_as_of = node_as_of.max(node_evaluation.as_of);

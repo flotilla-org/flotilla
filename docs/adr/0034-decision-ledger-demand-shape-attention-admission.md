@@ -125,6 +125,12 @@ pane commands), so no classification vocabulary is imported:
   be observable, the path is adoption, not templates: run it in a cleat
   session and it becomes adopted crew, visible through the existing
   session machinery — observability arriving with the need.
+  *(Amended 2026-08-24: observed Checkouts are no longer presentable tree
+  entries. Checkout observation remains the path-matching source for pane
+  exits; the resulting attention is joined onto every real Project whose
+  repository catalog contains that checkout. A checkout with no catalogued
+  Project remains observation-only and does not create a repository-keyed
+  pseudo-project.)*
 - **Occupancy suppression.** A session the principal is currently
   attached to raises no Demands — the principal is looking at it. This
   is strictly better than a static "interactive tool" class: the same
