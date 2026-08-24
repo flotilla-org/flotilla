@@ -413,15 +413,16 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
 
 #[tokio::test]
 async fn checkout_authority_keeps_delete_evidence_fresh_for_replicated_convoy() {
-    for phase in [
-        ConvoyPhase::Pending,
-        ConvoyPhase::Active,
-        ConvoyPhase::Interrupted,
-        ConvoyPhase::Anchored,
-        ConvoyPhase::Landing,
-        ConvoyPhase::Landed,
-        ConvoyPhase::Failed,
-        ConvoyPhase::Cancelled,
+    for (phase, refreshes_delete_evidence) in [
+        (ConvoyPhase::Pending, true),
+        (ConvoyPhase::Active, true),
+        (ConvoyPhase::Interrupted, true),
+        (ConvoyPhase::Anchored, true),
+        (ConvoyPhase::Landing, true),
+        (ConvoyPhase::Landed, true),
+        (ConvoyPhase::Failed, true),
+        (ConvoyPhase::Cancelled, true),
+        (ConvoyPhase::Abandoned, false),
     ] {
         let authority_root = NodeId::new("convoy-authority");
         let checkout_root = NodeId::new("checkout-authority");
@@ -491,8 +492,16 @@ async fn checkout_authority_keeps_delete_evidence_fresh_for_replicated_convoy() 
 
         let deps = reconciler.prepare(&checkout).await.expect("resolve replicated delete-gated convoy");
 
-        assert!(matches!(deps, CheckoutPrepared::Integration { .. }), "{phase:?} must shorten the observation TTL to 30 seconds");
-        assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 1, "only the checkout authority should probe its checkout");
+        assert_eq!(
+            matches!(deps, CheckoutPrepared::Integration { .. }),
+            refreshes_delete_evidence,
+            "{phase:?} must use the cadence required by its delete gate"
+        );
+        assert_eq!(
+            *runtime.inspections.lock().expect("inspections lock"),
+            usize::from(refreshes_delete_evidence),
+            "only evidence-gated convoys should provoke an authority-side probe"
+        );
     }
 }
 
