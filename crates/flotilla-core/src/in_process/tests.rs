@@ -1679,14 +1679,13 @@ async fn abandoned_ensure_generation_survives_a_stale_reconcile_write_and_is_sup
 async fn standing_ensure_does_not_capture_another_projects_bare_workflow_but_accepts_a_global_builtin() {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
     let own_name = crate::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
-    let other_name = crate::ops_entry::materialized_workflow_name("other-project", "quartermaster");
     let own = backend.definitions::<WorkflowTemplate>("flotilla").get(&own_name).await.expect("own workflow");
     backend.definitions::<WorkflowTemplate>("flotilla").delete(&own_name).await.expect("remove own workflow");
     backend
         .definitions::<WorkflowTemplate>("flotilla")
         .apply(
             &InputMeta::builder()
-                .name(other_name)
+                .name("quartermaster".to_string())
                 .annotations(BTreeMap::from([(MATERIALIZED_PROJECT_ANNOTATION.to_string(), "other-project".to_string())]))
                 .build(),
             &own.spec,
@@ -1695,7 +1694,7 @@ async fn standing_ensure_does_not_capture_another_projects_bare_workflow_but_acc
         .expect("other project's workflow");
 
     let error = daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("cross-project bare name must not resolve");
-    assert!(error.contains("workflow template quartermaster for project standing-project"), "unexpected error: {error}");
+    assert!(error.contains("workflow template quartermaster is materialized by another project"), "unexpected error: {error}");
 
     backend
         .definitions::<WorkflowTemplate>("flotilla")
