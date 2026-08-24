@@ -26,6 +26,9 @@ pub struct AwarenessInput {
     pub projects: Vec<QueryScope>,
     pub convoys: Vec<ConvoyRow>,
     pub issues: Vec<ScopedIssueRow>,
+    /// Observed checkout identities used only to join checkout-targeted
+    /// salience onto real Project nodes. They are never emitted as entries.
+    pub checkout_refs_by_project: HashMap<QueryScope, Vec<ResourceRef>>,
     pub independents: Vec<IndependentRow>,
     pub salience: SalienceFacts,
     pub state: ResultSetState,
@@ -44,6 +47,7 @@ struct Group {
     scope: Option<QueryScope>,
     kind: AwarenessKind,
     refs: Vec<ResourceRef>,
+    salience_targets: Vec<ResourceRef>,
     entries: Vec<AwarenessEntry>,
     counts: AwarenessCounts,
     state: AwarenessState,
@@ -58,6 +62,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             let key = group_key_for_scope(project);
             let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, AwarenessKind::Project));
             group.refs.push(project_resource_ref(&project.namespace, &project.name));
+            group.salience_targets.extend(input.checkout_refs_by_project.get(project).into_iter().flatten().cloned());
         }
     }
 
@@ -182,8 +187,11 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
         .into_iter()
         .map(|mut group| {
             group.entries.sort_by(|left, right| entry_rank(left).cmp(&entry_rank(right)).then_with(|| left.label.cmp(&right.label)));
-            let salience = group.entries.iter().map(|entry| entry.salience).max().unwrap_or(Salience::None);
-            let node_as_of = group.entries.iter().map(|entry| entry.as_of).max().unwrap_or(as_of);
+            let mut salience = group.entries.iter().map(|entry| entry.salience).max().unwrap_or(Salience::None);
+            let mut node_as_of = group.entries.iter().map(|entry| entry.as_of).max().unwrap_or(as_of);
+            let node_evaluation = evaluate_entry(&group.salience_targets, &group.refs, &input.salience, node_as_of);
+            salience = salience.max(node_evaluation.salience);
+            node_as_of = node_as_of.max(node_evaluation.as_of);
             let family_summaries = awareness_family_summaries(&group.entries);
             let repo_facts =
                 group.entries.iter().filter_map(|entry| entry.annotations.get(REPO_FACT_ANNOTATION).cloned()).collect::<BTreeSet<_>>();
@@ -289,6 +297,7 @@ impl Group {
             scope: key.scope,
             kind,
             refs: Vec::new(),
+            salience_targets: Vec::new(),
             entries: Vec::new(),
             counts: AwarenessCounts::default(),
             state: AwarenessState::Idle,

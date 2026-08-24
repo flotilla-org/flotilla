@@ -372,6 +372,17 @@ impl AggregatorProjectionState {
         };
         let independents_set = self.independents_result_set(scope).await;
         let independents = independents_set.rows.as_independents().map_or_else(Vec::new, ToOwned::to_owned);
+        let checkout_sets = {
+            let mut checkouts = self.checkouts.write().await;
+            projects.iter().map(|project| (project.clone(), checkouts.result_set(&Some(project.clone())))).collect::<Vec<_>>()
+        };
+        let checkout_refs_by_project = checkout_sets
+            .iter()
+            .map(|(project, set)| {
+                let refs = set.rows.as_checkouts().into_iter().flatten().map(|checkout| checkout.resource.clone()).collect::<Vec<_>>();
+                (project.clone(), refs)
+            })
+            .collect();
         let issue_sets = self.issue_sets_for_awareness(scope).await;
         let issues = issue_sets
             .iter()
@@ -384,10 +395,15 @@ impl AggregatorProjectionState {
             let projection = self.salience.read().await;
             (projection.facts.clone(), projection.revision)
         };
-        let base_seq = [self.seq().await, independents_set.seq, issue_sets.iter().map(|(_, set)| set.seq).max().unwrap_or(0)]
-            .into_iter()
-            .max()
-            .unwrap_or(0);
+        let base_seq = [
+            self.seq().await,
+            independents_set.seq,
+            checkout_sets.iter().map(|(_, set)| set.seq).max().unwrap_or(0),
+            issue_sets.iter().map(|(_, set)| set.seq).max().unwrap_or(0),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
         let seq = base_seq.saturating_add(project_catalog_revision).saturating_add(salience_revision);
         let (rows, state) = project_awareness(AwarenessInput {
             scope: scope.clone(),
@@ -396,6 +412,7 @@ impl AggregatorProjectionState {
             projects,
             convoys,
             issues,
+            checkout_refs_by_project,
             independents,
             salience,
             state,
