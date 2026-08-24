@@ -698,12 +698,16 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
     let mut checkouts = project(&checkouts_address, data).unwrap_or_else(|_| pending_project_table(&checkouts_address));
     let mut issues = project(&issues_address, data).unwrap_or_else(|_| pending_project_table(&issues_address));
     let mut independents = project(&independents_address, data).unwrap_or_else(|_| pending_project_table(&independents_address));
+    let checkout_count = data
+        .checkout_results
+        .iter()
+        .find(|result| result.query == &QueryId::Checkouts { scope: Some(scope.clone()) })
+        .map(|result| result.rows.len());
+    checkouts.title = checkout_count.map_or_else(|| "Checkouts".to_string(), |count| format!("Checkouts ({count})"));
     if let Some(counts) = awareness.map(|node| &node.counts) {
-        checkouts.title = format!("Checkouts ({})", counts.checkouts);
         issues.title = format!("Issues ({})", counts.issues);
         independents.title = format!("Independents ({})", counts.independents);
     } else {
-        checkouts.title = "Checkouts".to_string();
         issues.title = "Issues".to_string();
         independents.title = "Independents".to_string();
     }
@@ -1734,7 +1738,7 @@ mod tests {
             .state(AwarenessState::Active)
             .salience(Salience::Urgent)
             .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
-            .counts(AwarenessCounts::builder().total(4).convoys(1).issues(1).checkouts(1).independents(1).build())
+            .counts(AwarenessCounts::builder().total(3).convoys(1).issues(1).independents(1).build())
             .family_summaries(vec![
                 AwarenessFamilySummary::builder()
                     .family(AwarenessFamily::Convoys)
