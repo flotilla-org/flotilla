@@ -38,6 +38,14 @@ link_generation() {
   basename "$(readlink "$1")"
 }
 
+add_test_skills() {
+  local bundle="$1"
+  local skills="$bundle/share/flotilla/skills"
+  mkdir -p "$skills"
+  printf '%s\n' '{"schema_version":1,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"2222222222222222222222222222222222222222"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}' \
+    >"$skills/.flotilla-sources.json"
+}
+
 generation_one="20260815T210000Z-r1-f111111111111-caaaaaaaaaaaa"
 generation_two="20260815T220000Z-r2-f222222222222-cbbbbbbbbbbbb"
 generation_incomplete="20260815T225000Z-r9-f999999999999-cffffffffffff"
@@ -62,6 +70,7 @@ make_generation() {
   printf 'ghostty\n' >"$bundle/lib/libghostty-vt.so.0"
   printf '#!/usr/bin/env bash\nexit 0\n' >"$bundle/install.sh"
   chmod 0755 "$bundle/install.sh"
+  add_test_skills "$bundle"
 TEST_BUNDLE="$bundle" TEST_PLATFORM="$platform" TEST_PROTOCOL="$protocol" TEST_CORRUPT_INNER="$corrupt_inner" python3 - <<'PY'
 import hashlib
 import json
@@ -71,7 +80,12 @@ from pathlib import Path
 
 bundle = Path(os.environ["TEST_BUNDLE"])
 identity = re.fullmatch(r".+-f([0-9a-f]{12})-c([0-9a-f]{12})", bundle.parent.name.removeprefix("bundle-"))
-sources = {"flotilla": identity.group(1) + "1" * 28, "cleat": identity.group(2) + "a" * 28}
+sources = {
+    "flotilla": identity.group(1) + "1" * 28,
+    "cleat": identity.group(2) + "a" * 28,
+    "mattpocock-skills": "2" * 40,
+    "rjw-skills": "b" * 40,
+}
 files = []
 for path in sorted(bundle.rglob("*")):
     if path.is_file():
@@ -108,7 +122,12 @@ import re
 from pathlib import Path
 
 identity = re.fullmatch(r".+-f([0-9a-f]{12})-c([0-9a-f]{12})", os.environ["TEST_GENERATION"])
-sources = {"flotilla": identity.group(1) + "1" * 28, "cleat": identity.group(2) + "a" * 28}
+sources = {
+    "flotilla": identity.group(1) + "1" * 28,
+    "cleat": identity.group(2) + "a" * 28,
+    "mattpocock-skills": "2" * 40,
+    "rjw-skills": "b" * 40,
+}
 manifest = {
     "schema_version": 1,
     "kind": "internal-promoted-fleet-generation",
@@ -144,6 +163,7 @@ add_darwin_derivative() {
   chmod 0755 "$bundle/lib/libghostty-vt.dylib"
   printf '#!/usr/bin/env bash\nexit 0\n' >"$bundle/install.sh"
   chmod 0755 "$bundle/install.sh"
+  add_test_skills "$bundle"
   TEST_BUNDLE="$bundle" TEST_GENERATION="$generation" TEST_SOURCE_GENERATION="$source_generation" TEST_PROTOCOL="$protocol" python3 - <<'PY'
 import hashlib
 import json
@@ -154,6 +174,8 @@ bundle = Path(os.environ["TEST_BUNDLE"])
 sources = {
     "flotilla": os.environ["TEST_GENERATION"].split("-f", 1)[1].split("-c", 1)[0] + "1" * 28,
     "cleat": os.environ["TEST_GENERATION"].rsplit("-c", 1)[1] + "a" * 28,
+    "mattpocock-skills": "2" * 40,
+    "rjw-skills": "b" * 40,
 }
 files = [
     {
@@ -467,6 +489,8 @@ grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad"' "$uni
   || fail 'systemd user unit does not use the stable flotillad path'
 grep -Fxq 'Environment="PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"' "$unit" \
   || fail 'systemd user unit does not expose the fleet binary PATH'
+grep -Fxq 'Environment="FLOTILLA_SKILLS_DIR=%h/.local/opt/flotilla-fleet/current/share/flotilla/skills"' "$unit" \
+  || fail 'systemd user unit does not select the generation-pinned skills'
 grep -Fxq 'Restart=on-failure' "$unit" || fail 'systemd user unit does not restart after failures'
 grep -Fxq -- '--user daemon-reload' "$test_root/systemctl.log" || fail 'systemd user manager was not reloaded'
 grep -Fxq -- '--user enable flotillad.service' "$test_root/systemctl.log" || fail 'systemd user unit was not enabled'
@@ -637,6 +661,8 @@ grep -Fxq "ExecStart=\"$custom_root/current/bin/flotillad\"" "$unit" \
   || fail 'systemd user unit ignored the configured fleet root'
 grep -Fxq "Environment=\"PATH=$custom_bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"" "$unit" \
   || fail 'systemd user unit ignored the configured fleet binary directory'
+grep -Fxq "Environment=\"FLOTILLA_SKILLS_DIR=$custom_root/current/share/flotilla/skills\"" "$unit" \
+  || fail 'systemd user unit ignored the configured generation skills'
 
 darwin_home="$test_root/darwin-home"
 mkdir -p "$darwin_home/.config/flotilla"
@@ -685,6 +711,7 @@ assert agent["ProgramArguments"] == [
     f"{home}/.config/flotilla/run/flotilla.sock",
 ]
 assert agent["EnvironmentVariables"]["PATH"].split(":")[0] == f"{home}/.local/bin"
+assert agent["EnvironmentVariables"]["FLOTILLA_SKILLS_DIR"] == f"{home}/.local/opt/flotilla-fleet/current/share/flotilla/skills"
 assert "/usr/sbin" in agent["EnvironmentVariables"]["PATH"].split(":")
 assert "/sbin" in agent["EnvironmentVariables"]["PATH"].split(":")
 assert agent["StandardErrorPath"] == f"{home}/Library/Logs/flotilla/flotillad.stderr.log"

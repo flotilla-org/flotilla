@@ -52,6 +52,8 @@ read_protocol_version() {
 main() {
 flotilla_sha="$(require_sha FLEET_FLOTILLA_SHA "${FLEET_FLOTILLA_SHA:-}")"
 cleat_sha="$(require_sha FLEET_CLEAT_SHA "${FLEET_CLEAT_SHA:-}")"
+mattpocock_skills_sha="$(require_sha FLEET_MATTPOCOCK_SKILLS_SHA "${FLEET_MATTPOCOCK_SKILLS_SHA:-}")"
+rjw_skills_sha="$(require_sha FLEET_RJW_SKILLS_SHA "${FLEET_RJW_SKILLS_SHA:-}")"
 
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)
@@ -107,6 +109,35 @@ install -m 0755 "$flotilla_root/target/release/flotilla" "$bundle/bin/flotilla"
 install -m 0755 "$flotilla_root/target/release/flotillad" "$bundle/bin/flotillad"
 install -m 0755 "$cleat_root/target/release/cleat" "$bundle/bin/cleat"
 
+skills_bundle="$bundle/share/flotilla/skills"
+mkdir -p "$skills_bundle"
+FLEET_SKILLS_BUNDLE="$skills_bundle" \
+  FLEET_MATTPOCOCK_SKILLS_SHA="$mattpocock_skills_sha" \
+  FLEET_RJW_SKILLS_SHA="$rjw_skills_sha" \
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+bundle = Path(os.environ["FLEET_SKILLS_BUNDLE"])
+manifest = {
+    "schema_version": 1,
+    "sources": [
+        {
+            "name": "mattpocock-skills",
+            "repository": "https://github.com/flotilla-org/mattpocock-skills.git",
+            "revision": os.environ["FLEET_MATTPOCOCK_SKILLS_SHA"],
+        },
+        {
+            "name": "rjw-skills",
+            "repository": "https://github.com/rjwittams/rjw-skills.git",
+            "revision": os.environ["FLEET_RJW_SKILLS_SHA"],
+        },
+    ],
+}
+(bundle / ".flotilla-sources.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+PY
+
 if [[ "$platform" == darwin-aarch64 && -f "$cleat_root/.tools/ghostty-install/lib/$ghostty_library" ]]; then
   install -m 0755 "$cleat_root/.tools/ghostty-install/lib/$ghostty_library" "$bundle/lib/$ghostty_library"
 fi
@@ -155,6 +186,8 @@ export FLEET_BUNDLE="$bundle"
 export FLEET_PLATFORM="$platform"
 export FLEET_FLOTILLA_SHA="$flotilla_sha"
 export FLEET_CLEAT_SHA="$cleat_sha"
+export FLEET_MATTPOCOCK_SKILLS_SHA="$mattpocock_skills_sha"
+export FLEET_RJW_SKILLS_SHA="$rjw_skills_sha"
 export FLEET_PROTOCOL_VERSION="$protocol_version"
 python3 - <<'PY'
 import hashlib
@@ -182,6 +215,8 @@ manifest = {
     "sources": {
         "flotilla": os.environ["FLEET_FLOTILLA_SHA"],
         "cleat": os.environ["FLEET_CLEAT_SHA"],
+        "mattpocock-skills": os.environ["FLEET_MATTPOCOCK_SKILLS_SHA"],
+        "rjw-skills": os.environ["FLEET_RJW_SKILLS_SHA"],
     },
     "build_profile": "release",
     "peer_protocol_version": int(os.environ["FLEET_PROTOCOL_VERSION"]),
@@ -211,6 +246,8 @@ metadata = {
     "sources": {
         "flotilla": os.environ["FLEET_FLOTILLA_SHA"],
         "cleat": os.environ["FLEET_CLEAT_SHA"],
+        "mattpocock-skills": os.environ["FLEET_MATTPOCOCK_SKILLS_SHA"],
+        "rjw-skills": os.environ["FLEET_RJW_SKILLS_SHA"],
     },
     "artifact": archive.name,
     "sha256": os.environ["FLEET_ARCHIVE_SHA"],

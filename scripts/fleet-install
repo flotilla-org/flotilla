@@ -254,7 +254,7 @@ if manifest.get("generation") != generation:
 sources = manifest.get("sources")
 if (
     not isinstance(sources, dict)
-    or set(sources) != {"flotilla", "cleat"}
+    or set(sources) != {"flotilla", "cleat", "mattpocock-skills", "rjw-skills"}
     or not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) for value in sources.values())
     or sources["flotilla"][:12] != identity.group(1)
     or sources["cleat"][:12] != identity.group(2)
@@ -503,14 +503,33 @@ actual = {
 }
 if actual != expected:
     raise SystemExit("release files do not match the manifest")
-required = {"bin/flotilla", "bin/flotillad", "bin/cleat", "install.sh"}
+required = {"bin/flotilla", "bin/flotillad", "bin/cleat", "install.sh", "share/flotilla/skills/.flotilla-sources.json"}
 if not required.issubset(expected):
     raise SystemExit("release is missing a required payload")
+skill_manifest = json.loads((root / "share/flotilla/skills/.flotilla-sources.json").read_text())
+expected_skill_sources = [
+    {
+        "name": "mattpocock-skills",
+        "repository": "https://github.com/flotilla-org/mattpocock-skills.git",
+        "revision": outer["sources"]["mattpocock-skills"],
+    },
+    {
+        "name": "rjw-skills",
+        "repository": "https://github.com/rjwittams/rjw-skills.git",
+        "revision": outer["sources"]["rjw-skills"],
+    },
+]
+if skill_manifest != {"schema_version": 1, "sources": expected_skill_sources}:
+    raise SystemExit("skill bundle source pins do not match the fleet generation")
 for rel in ("bin/flotilla", "bin/flotillad", "bin/cleat"):
     if not os.access(root / rel, os.X_OK):
         raise SystemExit(f"release binary is not executable: {rel}")
 if platform == "darwin-aarch64":
-    allowed = required | {rel for rel in expected if rel.startswith("lib/") and rel.endswith(".dylib")}
+    allowed = (
+        required
+        | {rel for rel in expected if rel.startswith("lib/") and rel.endswith(".dylib")}
+        | {rel for rel in expected if rel.startswith("share/flotilla/skills/")}
+    )
     if expected != allowed:
         raise SystemExit("signed Darwin derivative contains an unexpected payload set")
 PY
@@ -696,10 +715,11 @@ PY
 write_systemd_user_unit() {
   [[ "$PLATFORM" == linux-* ]] || return 0
   local unit="$SYSTEMD_USER_DIR/flotillad.service"
-  local temporary daemon_path fleet_bin_path cargo_bin_path
+  local temporary daemon_path fleet_bin_path cargo_bin_path skills_path
   daemon_path="$(systemd_path "$FLEET_ROOT/current/bin/flotillad")"
   fleet_bin_path="$(systemd_path "$FLEET_BIN_DIR")"
   cargo_bin_path="$(systemd_path "$HOME/.cargo/bin")"
+  skills_path="$(systemd_path "$FLEET_ROOT/current/share/flotilla/skills")"
   mkdir -p "$SYSTEMD_USER_DIR"
   temporary="$(mktemp "$SYSTEMD_USER_DIR/.flotillad.service.fleet-install.XXXXXX")"
   cat >"$temporary" <<UNIT
@@ -713,6 +733,7 @@ Wants=network-online.target
 Type=simple
 ExecStart="$daemon_path"
 Environment="PATH=$fleet_bin_path:$cargo_bin_path:/usr/local/bin:/usr/bin:/bin"
+Environment="FLOTILLA_SKILLS_DIR=$skills_path"
 Restart=on-failure
 
 [Install]
@@ -767,19 +788,20 @@ restart_linux_daemon_service() {
 write_launchd_agent() {
   [[ "$PLATFORM" == darwin-* ]] || return 0
   local plist="$LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist"
-  local temporary daemon_path daemon_path_value stderr_path stdout_path
+  local temporary daemon_path daemon_path_value skills_path stderr_path stdout_path
   daemon_path="$FLEET_ROOT/current/bin/flotillad"
   daemon_path_value="$FLEET_BIN_DIR:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  skills_path="$FLEET_ROOT/current/share/flotilla/skills"
   stderr_path="$LAUNCH_LOG_DIR/flotillad.stderr.log"
   stdout_path="$LAUNCH_LOG_DIR/flotillad.stdout.log"
   mkdir -p "$LAUNCH_AGENT_DIR" "$LAUNCH_LOG_DIR"
   temporary="$(mktemp "$LAUNCH_AGENT_DIR/.$LAUNCH_AGENT_LABEL.plist.fleet-install.XXXXXX")"
-  python3 - "$temporary" "$LAUNCH_AGENT_LABEL" "$daemon_path" "$daemon_path_value" \
+  python3 - "$temporary" "$LAUNCH_AGENT_LABEL" "$daemon_path" "$daemon_path_value" "$skills_path" \
     "$DAEMON_CONFIG_DIR" "$DAEMON_STATE_DIR" "$DAEMON_SOCKET" "$stderr_path" "$stdout_path" <<'PY'
 import plistlib
 import sys
 
-destination, label, daemon, path, config_dir, state_dir, socket, stderr_path, stdout_path = sys.argv[1:]
+destination, label, daemon, path, skills, config_dir, state_dir, socket, stderr_path, stdout_path = sys.argv[1:]
 content = {
     "Label": label,
     "ProgramArguments": [
@@ -791,7 +813,7 @@ content = {
         "--socket",
         socket,
     ],
-    "EnvironmentVariables": {"PATH": path},
+    "EnvironmentVariables": {"PATH": path, "FLOTILLA_SKILLS_DIR": skills},
     "StandardErrorPath": stderr_path,
     "StandardOutPath": stdout_path,
     "RunAtLoad": True,
