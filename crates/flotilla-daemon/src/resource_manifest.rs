@@ -432,7 +432,7 @@ impl ResourceManifestReconciler {
 
 fn resolve_clean_git_revision(root: &Path) -> Result<String, String> {
     let status = std::process::Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=all", "--", "."])
+        .args(["status", "--porcelain", "--untracked-files=all", "--ignored=matching", "--", "."])
         .current_dir(root)
         .output()
         .map_err(|error| format!("run git status in {}: {error}", root.display()))?;
@@ -708,6 +708,19 @@ mod tests {
         write(&dir.path().join("untracked.yaml"), &manifest("draft", "uncommitted"));
 
         let error = resolve_clean_git_revision(dir.path()).expect_err("dirty tree must be rejected");
+
+        assert!(error.contains("changes not represented by a Git revision"), "{error}");
+    }
+
+    #[test]
+    fn ignored_manifest_is_rejected_as_unversioned_input() {
+        let dir = committed_manifest_repo();
+        write(&dir.path().join(".gitignore"), "*.local.yaml\n");
+        git(dir.path(), &["add", ".gitignore"]);
+        git(dir.path(), &["commit", "-m", "ignore local manifests"]);
+        write(&dir.path().join("draft.local.yaml"), &manifest("draft", "ignored"));
+
+        let error = resolve_clean_git_revision(dir.path()).expect_err("ignored manifest must be rejected");
 
         assert!(error.contains("changes not represented by a Git revision"), "{error}");
     }
