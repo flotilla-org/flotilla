@@ -1099,7 +1099,7 @@ fn mark_builtin_managed(mut meta: InputMeta) -> InputMeta {
 /// Reconciles code-owned manifests as the builtin special case of the ruled
 /// manifest loop in https://github.com/flotilla-org/flotilla/issues/1192.
 async fn reconcile_builtin_workflow_templates(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
-    let templates = backend.clone().using::<WorkflowTemplate>(namespace);
+    let templates = backend.clone().definitions::<WorkflowTemplate>(namespace);
     for (name, spec) in builtin_workflow_templates() {
         match templates.get(name).await {
             Ok(existing) => {
@@ -1111,20 +1111,20 @@ async fn reconcile_builtin_workflow_templates(backend: &ResourceBackend, namespa
                 }
                 if !spec_diverged {
                     templates
-                        .update(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &existing.metadata.resource_version, &spec)
+                        .apply(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &spec)
                         .await
                         .map_err(|err| format!("reconcile builtin workflow template {name}: {err}"))?;
                     continue;
                 }
                 templates
-                    .update(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &existing.metadata.resource_version, &spec)
+                    .apply(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &spec)
                     .await
                     .map_err(|err| format!("reconcile builtin workflow template {name}: {err}"))?;
                 warn!(template = %name, "stored spec diverged from code builtin; overwriting");
             }
             Err(ResourceError::NotFound { .. }) => {
                 templates
-                    .create(&mark_builtin_managed(empty_meta(name)), &spec)
+                    .apply(&mark_builtin_managed(empty_meta(name)), &spec)
                     .await
                     .map_err(|err| format!("seed builtin workflow template {name}: {err}"))?;
             }
@@ -2041,7 +2041,7 @@ fn spawn_controller_loops(
                 secondaries.push(daemon.reconciler_wake_watch());
                 (
                     secondaries,
-                    ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
+                    ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(&namespace_string))
                         .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                         .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))
                         .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
@@ -3814,7 +3814,7 @@ mod tests {
 
         // The checkout authority's `OwnerTerminal` cascade already collected
         // the managed checkout: no checkout record exists for this pass.
-        let reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(NAMESPACE))
+        let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
             .with_vessels(vessels)
             .with_checkouts(backend.clone().using::<ResourceCheckout>(NAMESPACE))
             .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(Arc::clone(&daemon))));
@@ -4018,8 +4018,8 @@ mod tests {
     async fn builtin_workflow_templates_seeded_at_multiple_roots_do_not_raise_authorship_collisions() {
         assert_eq!(
             WorkflowTemplate::REPLICATION_CLASS,
-            ReplicationClass::None,
-            "code-seeded builtins must remain outside single-home replication and collision enforcement"
+            ReplicationClass::Definitions,
+            "code-seeded builtins share the fleet definitions view"
         );
         for root in ["builtin-root-a", "builtin-root-b", "builtin-root-c"] {
             let backend = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new(root));
@@ -6705,7 +6705,7 @@ mod tests {
     #[tokio::test]
     async fn startup_seeding_reconciles_existing_builtin_template_definition() {
         let backend = ResourceBackend::InMemory(Default::default());
-        let templates = backend.clone().using::<WorkflowTemplate>(NAMESPACE);
+        let templates = backend.definitions::<WorkflowTemplate>(NAMESPACE);
         let mut stale = flotilla_resources::single_agent_contained_workflow_spec();
         stale.vessels[0].stance = Stance::Trusted;
         templates
@@ -6756,7 +6756,7 @@ mod tests {
             .expect("raw delete should remove builtin");
         assert_eq!(deleted.object.value["metadata"]["name"], "single-agent-contained");
         assert!(matches!(
-            backend.using::<WorkflowTemplate>(NAMESPACE).get("single-agent-contained").await,
+            backend.definitions::<WorkflowTemplate>(NAMESPACE).get("single-agent-contained").await,
             Err(ResourceError::NotFound { .. })
         ));
 
@@ -6771,7 +6771,7 @@ mod tests {
     async fn startup_seeding_labels_matching_unlabelled_builtin_template_once() {
         const NAMESPACE: &str = "test";
         let backend = ResourceBackend::InMemory(Default::default());
-        let templates = backend.clone().using::<WorkflowTemplate>(NAMESPACE);
+        let templates = backend.definitions::<WorkflowTemplate>(NAMESPACE);
         templates
             .create(&empty_meta("single-agent-contained"), &flotilla_resources::single_agent_contained_workflow_spec())
             .await
@@ -7276,7 +7276,7 @@ mod tests {
             .await
             .expect("replicate fresh CR evidence to convoy authority A");
         let current = convoys.get("cross-host").await.expect("get Landing convoy");
-        let reconciler = ConvoyReconciler::new(authority.clone().using::<WorkflowTemplate>(NAMESPACE))
+        let reconciler = ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>(NAMESPACE))
             .with_federated_checkouts(authority.including_replicas::<Checkout>(NAMESPACE))
             .with_change_requests(
                 authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),

@@ -8,9 +8,16 @@ use flotilla_protocol::LeafOperator;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::NoStatusPatch, RepositoryKey};
+use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass, RepositoryKey};
 
-define_resource!(WorkflowTemplate, "workflowtemplates", WorkflowTemplateSpec, (), NoStatusPatch);
+define_resource!(
+    WorkflowTemplate,
+    "workflowtemplates",
+    WorkflowTemplateSpec,
+    (),
+    NoStatusPatch,
+    replication = ReplicationClass::Definitions
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct WorkflowTemplateSpec {

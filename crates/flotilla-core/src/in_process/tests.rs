@@ -67,6 +67,26 @@ fn test_meta(name: &str) -> InputMeta {
 }
 
 #[tokio::test]
+async fn prepared_workflow_snapshot_reuses_an_identical_replica() {
+    let home_root = NodeId::new("snapshot-home");
+    let driver_root = NodeId::new("snapshot-driver");
+    let home = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(home_root.clone());
+    let driver = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(driver_root);
+    let spec = flotilla_resources::single_agent_contained_workflow_spec();
+    let name = prepared_snapshot_name("workflow", &serde_json::to_value(&spec).expect("serialize workflow")).expect("snapshot name");
+
+    ensure_prepared_workflow_snapshot(&home, "flotilla", &name, &spec).await.expect("author snapshot on home");
+    driver
+        .replica_writer::<WorkflowTemplate>(home_root, "flotilla")
+        .replace(&home.using::<WorkflowTemplate>("flotilla").list().await.expect("home workflow log"), Utc::now())
+        .await
+        .expect("replicate snapshot to driver");
+
+    ensure_prepared_workflow_snapshot(&driver, "flotilla", &name, &spec).await.expect("reuse identical replicated snapshot");
+    assert!(driver.using::<WorkflowTemplate>("flotilla").list().await.expect("driver local workflow log").items.is_empty());
+}
+
+#[tokio::test]
 async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push_failure() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").expect("daemon config");
@@ -902,7 +922,10 @@ async fn standing_ensure_fixture_for(
     backend
         .using::<WorkflowTemplate>("flotilla")
         .create(
-            &test_meta("quartermaster"),
+            &InputMeta::builder()
+                .name(crate::ops_entry::materialized_workflow_name("standing-project", "quartermaster"))
+                .annotations(BTreeMap::from([(MATERIALIZED_PROJECT_ANNOTATION.to_string(), "standing-project".to_string())]))
+                .build(),
             &WorkflowTemplateSpec::builder()
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
@@ -1741,6 +1764,79 @@ async fn abandoned_ensure_generation_survives_a_stale_reconcile_write_and_is_sup
 }
 
 #[tokio::test]
+async fn standing_ensure_does_not_capture_another_projects_bare_workflow_but_accepts_a_global_builtin() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    let own_name = crate::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
+    let own = backend.definitions::<WorkflowTemplate>("flotilla").get(&own_name).await.expect("own workflow");
+    backend.definitions::<WorkflowTemplate>("flotilla").delete(&own_name).await.expect("remove own workflow");
+    backend
+        .definitions::<WorkflowTemplate>("flotilla")
+        .apply(
+            &InputMeta::builder()
+                .name("quartermaster".to_string())
+                .annotations(BTreeMap::from([(MATERIALIZED_PROJECT_ANNOTATION.to_string(), "other-project".to_string())]))
+                .build(),
+            &own.spec,
+        )
+        .await
+        .expect("other project's workflow");
+
+    let error = daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("cross-project bare name must not resolve");
+    assert!(error.contains("workflow template quartermaster is materialized by another project"), "unexpected error: {error}");
+
+    backend
+        .definitions::<WorkflowTemplate>("flotilla")
+        .apply(&test_meta("quartermaster"), &own.spec)
+        .await
+        .expect("global builtin workflow");
+    clock.advance(ChronoDuration::minutes(1));
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("global workflow admits"), vec![
+        "started quartermaster@standing-project"
+    ]);
+}
+
+#[tokio::test]
+async fn off_home_driver_admits_an_ensure_from_replicated_project_definitions() {
+    let (_home, home_backend, _clock, _home_temp) = standing_ensure_fixture().await;
+    let driver_temp = tempfile::tempdir().expect("driver tempdir");
+    std::fs::write(driver_temp.path().join("daemon.toml"), "machine_id = \"driver-test\"\n").expect("driver config");
+    let driver_backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("driver-root"));
+    let home_root = NodeId::new("home-root");
+    driver_backend
+        .replica_writer::<Project>(home_root.clone(), "flotilla")
+        .replace(&home_backend.using::<Project>("flotilla").list().await.expect("home projects"), Utc::now())
+        .await
+        .expect("replicate projects");
+    driver_backend
+        .replica_writer::<WorkflowTemplate>(home_root.clone(), "flotilla")
+        .replace(&home_backend.using::<WorkflowTemplate>("flotilla").list().await.expect("home workflows"), Utc::now())
+        .await
+        .expect("replicate workflows");
+    for repository in home_backend.using::<Repository>("flotilla").list().await.expect("home repositories").items {
+        driver_backend
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::from(&repository.metadata), &repository.spec)
+            .await
+            .expect("driver repository observation");
+    }
+    let driver = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(driver_temp.path())),
+        fake_discovery(false),
+        HostName::new("driver"),
+        driver_backend.clone(),
+    )
+    .await;
+    let ensure = home_backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("home ensure");
+
+    driver.start_ensured_convoy("flotilla", &ensure).await.expect("driver admits replicated template");
+
+    let admitted = driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("driver convoys").items;
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(admitted[0].metadata.labels.get(PROJECT_LABEL).map(String::as_str), Some("standing-project"));
+}
+
+#[tokio::test]
 async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_retry_survives_restart() {
     let (daemon, backend, clock, temp) = standing_ensure_fixture().await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
@@ -1768,7 +1864,8 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
     ]);
     assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 7);
 
-    backend.using::<WorkflowTemplate>("flotilla").delete("quartermaster").await.expect("temporary resolution loss");
+    let materialized_name = crate::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
+    backend.definitions::<WorkflowTemplate>("flotilla").delete(&materialized_name).await.expect("temporary resolution loss");
     let second_ref =
         ensures.get("quartermaster").await.expect("ensure").status.and_then(|status| status.convoy_ref).expect("second convoy ref");
     convoys.delete(&second_ref).await.expect("second operator reap");
@@ -1779,9 +1876,12 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
 
     let repository_key = backend.using::<Repository>("flotilla").list().await.expect("repositories").items[0].spec.key();
     backend
-        .using::<WorkflowTemplate>("flotilla")
-        .create(
-            &test_meta("quartermaster"),
+        .definitions::<WorkflowTemplate>("flotilla")
+        .apply(
+            &InputMeta::builder()
+                .name(materialized_name)
+                .annotations(BTreeMap::from([(MATERIALIZED_PROJECT_ANNOTATION.to_string(), "standing-project".to_string())]))
+                .build(),
             &WorkflowTemplateSpec::builder()
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
@@ -2109,6 +2209,7 @@ async fn default_remote_placement_routes_before_admission() {
     let (_, mut resolved_workflow) = daemon
         .resolve_convoy_admission_workflow(
             "flotilla",
+            "andamento",
             &backend.definitions::<Project>("flotilla").get("andamento").await.expect("project").spec,
             &[],
             &intent,

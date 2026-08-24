@@ -300,9 +300,44 @@ impl SqliteBackend {
                     body_json TEXT NOT NULL,
                     PRIMARY KEY (group_name, version, kind, namespace, name)
                 );
+
+                CREATE TABLE IF NOT EXISTS resource_store_migrations (
+                    name TEXT PRIMARY KEY
+                );
                 "#,
             )
             .map_err(|err| ResourceError::other(format!("initialize sqlite resource store: {err}")))?;
+        let workflow_templates_reset = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM resource_store_migrations WHERE name = 'workflow-template-definitions-v1')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|err| Self::map_sqlite(err, "inspect workflow template definitions migration"))?;
+        if !workflow_templates_reset {
+            let transaction =
+                connection.transaction().map_err(|err| Self::map_sqlite(err, "start workflow template definitions migration"))?;
+            for table in [
+                "resource_objects",
+                "resource_events",
+                "resource_decode_quarantine",
+                "resource_tombstones",
+                "replica_objects",
+                "replica_cursors",
+                "replica_tombstones",
+            ] {
+                transaction
+                    .execute(
+                        &format!("DELETE FROM {table} WHERE group_name = 'flotilla.work' AND version = 'v1' AND kind = 'WorkflowTemplate'"),
+                        [],
+                    )
+                    .map_err(|err| Self::map_sqlite(err, "wipe pre-definitions workflow templates"))?;
+            }
+            transaction
+                .execute("INSERT INTO resource_store_migrations (name) VALUES ('workflow-template-definitions-v1')", [])
+                .map_err(|err| Self::map_sqlite(err, "record workflow template definitions migration"))?;
+            transaction.commit().map_err(|err| Self::map_sqlite(err, "commit workflow template definitions migration"))?;
+        }
         let has_replica_object_sync_timestamp = {
             let mut statement = connection
                 .prepare("PRAGMA table_info(replica_objects)")

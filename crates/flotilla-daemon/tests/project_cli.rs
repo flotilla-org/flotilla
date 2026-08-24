@@ -1,7 +1,7 @@
 //! Integration tests for ProjectAdd/ProjectApply and Project-backed convoy metadata.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
@@ -15,8 +15,8 @@ use flotilla_core::{
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
     ops_entry::{
-        MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
-        SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
+        materialized_workflow_name, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
+        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
     },
     path_context::ExecutionEnvironmentPath,
     project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
@@ -556,7 +556,9 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let docs = project.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("docs")).expect("docs");
     let operations = project.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("operations")).expect("operations");
     let workflows = backend.using::<WorkflowTemplate>("flotilla");
-    let scoped = workflows.get("scoped").await.expect("scoped workflow");
+    let scoped_name = materialized_workflow_name("demo", "scoped");
+    let all_code_name = materialized_workflow_name("demo", "all-code");
+    let scoped = workflows.get(&scoped_name).await.expect("scoped workflow");
     assert_eq!(scoped.spec.vessels[0].repository_refs.as_deref(), Some(std::slice::from_ref(&app.repo)));
     assert_eq!(scoped.metadata.annotations.get(SOURCE_REPOSITORY_ANNOTATION), Some(&ops_spec.key().to_string()));
     assert_eq!(scoped.metadata.annotations.get(SOURCE_COMMIT_ANNOTATION).map(String::as_str), Some("ops-commit"));
@@ -564,7 +566,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
         scoped.metadata.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).map(String::as_str),
         Some("verification-commands/this-is-a-workflow.md")
     );
-    let all_code = workflows.get("all-code").await.expect("default-scoped workflow");
+    let all_code = workflows.get(&all_code_name).await.expect("default-scoped workflow");
     assert_eq!(all_code.spec.vessels[0].repository_refs.as_deref(), Some([app.repo.clone(), docs.repo.clone()].as_slice()));
     let app_repository = backend.using::<Repository>("flotilla").get(&app.repo.to_string()).await.expect("app repository");
     let docs_repository = backend.using::<Repository>("flotilla").get(&docs.repo.to_string()).await.expect("docs repository");
@@ -625,7 +627,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
             ],
         }
     );
-    assert_eq!(workflows.get("scoped").await.expect("converged workflow").spec, scoped.spec);
+    assert_eq!(workflows.get(&scoped_name).await.expect("converged workflow").spec, scoped.spec);
 
     std::fs::remove_file(ensure_path).expect("remove ensure entry");
     assert_eq!(
@@ -662,7 +664,10 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
             ],
         }
     );
-    assert!(matches!(workflows.get("scoped").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+    assert!(matches!(
+        backend.definitions::<WorkflowTemplate>("flotilla").get(&scoped_name).await,
+        Err(flotilla_resources::ResourceError::NotFound { .. })
+    ));
 
     std::fs::remove_file(tmp.path().join("test-command.entry")).expect("remove verification entry");
     std::fs::write(
@@ -790,7 +795,7 @@ async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
 }
 
 #[tokio::test]
-async fn ops_entry_rejects_a_hand_applied_workflow_name_collision() {
+async fn project_materialized_workflow_coexists_with_a_global_template_of_the_same_short_name() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
     daemon
@@ -817,13 +822,12 @@ async fn ops_entry_rejects_a_hand_applied_workflow_name_collision() {
     let result =
         execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: tmp.path().to_string_lossy().into_owned() })
             .await;
-    assert!(
-        matches!(&result, CommandValue::Error { message } if message.contains("already exists") && message.contains("not materialized")),
-        "unexpected command result: {result:?}"
-    );
+    assert!(matches!(&result, CommandValue::ProjectRegistered { name, .. } if name == "demo"), "unexpected command result: {result:?}");
     let preserved = workflows.get("existing").await.expect("hand-applied workflow remains");
     assert_eq!(preserved.spec, hand_applied);
     assert!(!preserved.metadata.annotations.contains_key(MATERIALIZED_PROJECT_ANNOTATION));
+    let materialized = workflows.get(&materialized_workflow_name("demo", "existing")).await.expect("project workflow");
+    assert_eq!(materialized.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).map(String::as_str), Some("demo"));
 }
 
 #[tokio::test]
@@ -1469,7 +1473,10 @@ async fn daemon_restart_does_not_create_project_while_preserving_applied_project
         DaemonRuntime::start_with_options(daemon, config, None, options).await.expect("runtime should restart after project overlap");
 
     let presentation = projects.get("presentation").await.expect("overlapping applied project should survive restart");
-    assert_eq!(presentation.spec.repositories.iter().map(|repository| &repository.repo).collect::<Vec<_>>(), [&local_key, &second_key]);
+    assert_eq!(
+        presentation.spec.repositories.iter().map(|repository| &repository.repo).collect::<BTreeSet<_>>(),
+        BTreeSet::from([&local_key, &second_key])
+    );
     assert_ne!(local_key, remote_key);
 }
 

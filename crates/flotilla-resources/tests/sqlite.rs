@@ -34,8 +34,8 @@ use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
     delete_resource_kind, ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, ConvoyTeardownRuntime, EventRetention, InMemoryBackend,
     InputMeta, NoStatusPatch, Project, ProjectSpec, Resource, ResourceBackend, ResourceError, SqliteBackend, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate, CONVOY_LABEL,
-    VESSEL_REF_LABEL,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate,
+    WorkflowTemplateSpec, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 use futures::StreamExt;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
@@ -44,6 +44,70 @@ use tokio::time::{timeout, Duration};
 
 fn backend() -> ResourceBackend {
     ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend should open"))
+}
+
+#[tokio::test]
+async fn workflow_template_definitions_migration_wipes_legacy_local_authorities_once() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("resources.sqlite");
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("initial store"));
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &InputMeta::builder().name("wheelhouse-governor".to_string()).build(),
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
+        .await
+        .expect("legacy hand-applied workflow");
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &InputMeta::builder().name("workflow-snapshot-stray".to_string()).build(),
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
+        .await
+        .expect("legacy stray snapshot");
+    drop(backend);
+    let connection = rusqlite::Connection::open(&path).expect("raw store");
+    connection
+        .execute("DELETE FROM resource_store_migrations WHERE name = 'workflow-template-definitions-v1'", [])
+        .expect("simulate pre-migration store");
+    connection
+        .execute(
+            r#"
+            INSERT INTO resource_decode_quarantine
+                (group_name, version, kind, namespace, name, body_json, error, quarantined_at)
+            VALUES ('flotilla.work', 'v1', 'WorkflowTemplate', 'flotilla', 'corrupt-template', '{}', 'legacy decode failure', ?1)
+            "#,
+            rusqlite::params![Utc::now().to_rfc3339()],
+        )
+        .expect("seed legacy workflow template quarantine");
+    drop(connection);
+
+    let migrated = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("migrate store"));
+    assert!(migrated.using::<WorkflowTemplate>("flotilla").list().await.expect("list templates").items.is_empty());
+    let connection = rusqlite::Connection::open(&path).expect("inspect migrated store");
+    let quarantined_templates: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM resource_decode_quarantine WHERE group_name = 'flotilla.work' AND version = 'v1' AND kind = 'WorkflowTemplate'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count quarantined templates");
+    assert_eq!(quarantined_templates, 0);
+    drop(connection);
+
+    migrated
+        .definitions::<WorkflowTemplate>("flotilla")
+        .apply(
+            &InputMeta::builder().name("single-agent-contained".to_string()).build(),
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
+        .await
+        .expect("new global definition");
+    drop(migrated);
+    let reopened = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("reopen migrated store"));
+    assert!(reopened.definitions::<WorkflowTemplate>("flotilla").get("single-agent-contained").await.is_ok());
 }
 
 #[tokio::test]
@@ -790,7 +854,7 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
         .await
         .expect("terminal child should be created");
 
-    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+    let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
         .with_vessels(vessels.clone())
         .with_teardown_runtime(Arc::new(AlwaysEligible));
     let completed_convoy = convoys.get("convoy-restart").await.expect("completed convoy should exist");
@@ -814,7 +878,7 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
     let terminals = backend.clone().using::<TerminalSession>("flotilla");
-    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+    let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
         .with_vessels(vessels.clone())
         .with_teardown_runtime(Arc::new(AlwaysEligible));
     let restarted_convoy = convoys.get("convoy-restart").await.expect("completed convoy should survive restart");

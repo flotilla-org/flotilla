@@ -19,7 +19,7 @@ use flotilla_resources::{
     ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, StatusPatch,
     TargetMismatch, TerminalSession, TerminalSessionSource, TerminalSessionSpec, UnmetSettlementExpectation, ValidationError, Vessel,
     VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
-    VESSEL_LABEL,
+    VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 
 struct AlwaysEligible;
@@ -35,6 +35,43 @@ impl ConvoyTeardownRuntime for AlwaysEligible {
     }
 }
 
+#[tokio::test]
+async fn convoy_reconciler_bootstraps_from_a_replica_only_workflow_snapshot() {
+    let source_root = flotilla_protocol::NodeId::new("snapshot-source");
+    let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(source_root.clone());
+    let driver = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("driver"));
+    let snapshot_name = "workflow-snapshot-replica";
+    let template = valid_workflow_template_object(snapshot_name);
+    source
+        .definitions::<WorkflowTemplate>("flotilla")
+        .apply(&workflow_template_meta(snapshot_name), &template.spec)
+        .await
+        .expect("author snapshot");
+    driver
+        .replica_writer::<WorkflowTemplate>(source_root, "flotilla")
+        .replace(&source.using::<WorkflowTemplate>("flotilla").list().await.expect("source templates"), chrono::Utc::now())
+        .await
+        .expect("replicate snapshot");
+    assert!(driver.using::<WorkflowTemplate>("flotilla").list().await.expect("driver local templates").items.is_empty());
+
+    let convoy = driver
+        .using::<Convoy>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("replica-bootstrap".to_string())
+                .annotations(BTreeMap::from([(WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), snapshot_name.to_string())]))
+                .build(),
+            &valid_convoy_spec(),
+        )
+        .await
+        .expect("create convoy");
+    let reconciler = ConvoyReconciler::new(driver.definitions::<WorkflowTemplate>("flotilla"));
+    let prepared = reconciler.prepare(&convoy).await.expect("read replica-only snapshot");
+    let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
+
+    assert!(outcome.patch.is_some(), "replica-only snapshot should bootstrap the convoy");
+}
+
 async fn reconcile_once_with_resources(
     convoy: &flotilla_resources::ResourceObject<Convoy>,
     template: Option<&flotilla_resources::ResourceObject<WorkflowTemplate>>,
@@ -43,7 +80,7 @@ async fn reconcile_once_with_resources(
     now: chrono::DateTime<chrono::Utc>,
 ) -> flotilla_resources::controller::ReconcileOutcome<Convoy> {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
     let presentations_resolver = backend.clone().using::<Presentation>("flotilla");
@@ -123,7 +160,7 @@ async fn reconcile_with_observed_change_request(
     observed_at: chrono::DateTime<chrono::Utc>,
 ) -> flotilla_resources::controller::ReconcileOutcome<Convoy> {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let checkouts = backend.clone().using::<Checkout>("flotilla");
     let mut status = bootstrapped_convoy_status();
@@ -227,7 +264,7 @@ async fn convoy_finalizer_deletes_orphaned_terminal_sessions() {
         .await
         .expect("terminal create should succeed");
 
-    ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+    ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
         .with_terminal_sessions(sessions.clone())
         .run_finalizer(&convoy)
         .await
@@ -267,7 +304,7 @@ async fn convoy_finalizer_waits_for_remote_checkout_authority() {
         .replace(&remote_checkouts.list().await.expect("list remote checkouts"), chrono::Utc::now())
         .await
         .expect("replicate checkout");
-    let reconciler = ConvoyReconciler::new(authority.clone().using::<WorkflowTemplate>("flotilla"))
+    let reconciler = ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>("flotilla"))
         .with_checkouts(authority.clone().using::<Checkout>("flotilla"))
         .with_federated_checkouts(authority.clone().including_replicas::<Checkout>("flotilla"));
 
@@ -816,7 +853,7 @@ async fn landing_holds_on_stale_vacuous_landed_evidence() {
 #[tokio::test]
 async fn terminal_bound_change_request_settles_checkout_without_own_landed_evidence() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let checkouts = backend.clone().using::<Checkout>("flotilla");
     let change_requests = backend.clone().using::<ChangeRequest>("flotilla");
@@ -997,7 +1034,7 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
         .expect("replicate remote checkout");
 
     let current = convoys.get("cross-host").await.expect("get authority convoy");
-    let reconciler = ConvoyReconciler::new(authority.clone().using::<WorkflowTemplate>("flotilla"))
+    let reconciler = ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>("flotilla"))
         .with_federated_checkouts(authority.including_replicas::<Checkout>("flotilla"));
     let deps = reconciler.prepare(&current).await.expect("resolve federated dependencies");
     let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
@@ -1700,7 +1737,7 @@ impl ConvoyTeardownRuntime for NeverEligible {
 #[tokio::test]
 async fn refused_reclaim_requeues_at_the_evidence_staleness_horizon() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let mut status = bootstrapped_tool_only_convoy_status();
     status.phase = ConvoyPhase::Landed;
@@ -1750,7 +1787,7 @@ async fn terminal_convoy_waiting_on_an_exhausted_pool_is_not_reclaimed() {
 #[tokio::test]
 async fn abandoned_convoy_reclaims_managed_checkout_but_retains_adopted_owner_record() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let checkouts = backend.clone().using::<Checkout>("flotilla");
     let mut status = bootstrapped_tool_only_convoy_status();
