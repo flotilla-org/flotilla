@@ -2616,10 +2616,13 @@ async fn recover_existing_clone(
 
 async fn verify_clone_origin(runner: &dyn CommandRunner, repo_url: &str, target_path: &str, target_label: &str) -> Result<(), String> {
     let origin = runner
-        .run("git", &["-C", target_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Default)
+        .run("git", &["-C", target_path, "config", "--get-all", "remote.origin.url"], Path::new("/"), &ChannelLabel::Default)
         .await
         .map_err(|error| format!("{target_label} {target_path} already exists but is not a reusable clone: {error}"))?;
-    let origin = origin.trim();
+    let origin =
+        origin.lines().map(str::trim).find(|url| !url.is_empty()).ok_or_else(|| {
+            format!("{target_label} {target_path} already exists but is not a reusable clone: origin has no configured URL")
+        })?;
     let same_origin = origin == repo_url
         || canonicalize_repo_url(origin)
             .ok()
@@ -4457,6 +4460,21 @@ mod tests {
             runtime.clone_and_inspect(repo_url, target_path).await.expect("clone should recover after obstruction removal");
 
         assert_eq!(default_branch.as_deref(), Some("main"));
+    }
+
+    #[tokio::test]
+    async fn clone_origin_verification_uses_the_configured_url_before_transport_rewrites() {
+        let runner = DiscoveryMockRunner::builder()
+            .on_run(
+                "git",
+                &["-C", "/tmp/clone", "config", "--get-all", "remote.origin.url"],
+                Ok("https://forgejo.lab.flotilla.work/fork-issues/ghostty.git\n".to_string()),
+            )
+            .build();
+
+        verify_clone_origin(&runner, "https://forgejo.lab.flotilla.work/fork-issues/ghostty.git", "/tmp/clone", "clone target")
+            .await
+            .expect("configured origin should match before Git applies insteadOf");
     }
 
     struct TestInteriorEnvironmentProvider {

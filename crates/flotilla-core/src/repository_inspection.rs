@@ -121,7 +121,13 @@ impl GitRepositoryInspector {
 
     async fn configured_remote_url(&self, cwd: &Path, remote: &str) -> Result<String, String> {
         let key = format!("remote.{remote}.url");
-        self.git(cwd, &["config", "--get", &key]).await
+        self.git(cwd, &["config", "--get-all", &key])
+            .await?
+            .lines()
+            .next()
+            .filter(|url| !url.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("remote `{remote}` has no configured URL"))
     }
 
     async fn selected_remote(&self, cwd: &Path, branch: &str, requested: Option<&str>) -> Result<Option<String>, String> {
@@ -381,7 +387,7 @@ mod tests {
             .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
             .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
             .on_run("git", &["remote"], Ok("origin\n".to_string()))
-            .on_run("git", &["config", "--get", "remote.origin.url"], Ok("work-github:org/repo.git\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("work-github:org/repo.git\n".to_string()))
             .on_run("ssh", &["-G", "work-github"], Ok("hostname github.com\nuser git\n".to_string()))
             .build();
         let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
@@ -403,7 +409,7 @@ mod tests {
             .on_run("git", &["remote"], Ok("origin\n".to_string()))
             .on_run(
                 "git",
-                &["config", "--get", "remote.origin.url"],
+                &["config", "--get-all", "remote.origin.url"],
                 Ok("https://forgejo.lab.flotilla.work/fork-issues/ghostty.git\n".to_string()),
             )
             .build();
@@ -420,13 +426,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_configured_url_determines_identity_for_a_multi_url_remote() {
+        let (_temp, root) = git_repo();
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
+            .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
+            .on_run("git", &["remote"], Ok("origin\n".to_string()))
+            .on_run(
+                "git",
+                &["config", "--get-all", "remote.origin.url"],
+                Ok("https://github.com/org/repo.git\nhttps://mirror.example/org/repo.git\n".to_string()),
+            )
+            .build();
+        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+
+        let inspected = inspector.inspect_path(&root, None).await.expect("multi-URL remote should use its first URL");
+
+        assert!(matches!(
+            inspected.spec.identity(),
+            RepositoryIdentity::Remote { canonical_remote } if canonical_remote == "https://github.com/org/repo"
+        ));
+    }
+
+    #[tokio::test]
     async fn unresolved_ssh_alias_fails_instead_of_becoming_a_repository_key() {
         let (_temp, root) = git_repo();
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
             .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
             .on_run("git", &["remote"], Ok("origin\n".to_string()))
-            .on_run("git", &["config", "--get", "remote.origin.url"], Ok("mystery:org/repo.git\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("mystery:org/repo.git\n".to_string()))
             .on_run("ssh", &["-G", "mystery"], Ok("hostname mystery\n".to_string()))
             .build();
         let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
@@ -443,7 +472,7 @@ mod tests {
             .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
             .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
             .on_run("git", &["remote"], Ok("origin\n".to_string()))
-            .on_run("git", &["config", "--get", "remote.origin.url"], Ok("github.work:org/repo.git\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("github.work:org/repo.git\n".to_string()))
             .on_run("ssh", &["-G", "github.work"], Ok("hostname github.com\nuser git\n".to_string()))
             .build();
         let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
@@ -509,8 +538,8 @@ mod tests {
             .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
             .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
             .on_run("git", &["remote"], Ok("origin\nupstream\n".to_string()))
-            .on_run("git", &["config", "--get", "remote.origin.url"], Ok("https://github.com/fork/repo.git\n".to_string()))
-            .on_run("git", &["config", "--get", "remote.upstream.url"], Ok("https://github.com/upstream/repo.git\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("https://github.com/fork/repo.git\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.upstream.url"], Ok("https://github.com/upstream/repo.git\n".to_string()))
             .build();
         let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
 
@@ -527,8 +556,8 @@ mod tests {
             .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
             .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
             .on_run("git", &["remote"], Ok("origin\nmirror\n".to_string()))
-            .on_run("git", &["config", "--get", "remote.origin.url"], Ok("https://github.com/org/repo.git\n".to_string()))
-            .on_run("git", &["config", "--get", "remote.mirror.url"], Ok("git@github.com:org/repo.git\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("https://github.com/org/repo.git\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.mirror.url"], Ok("git@github.com:org/repo.git\n".to_string()))
             .on_run("ssh", &["-G", "github.com"], Ok("hostname github.com\nuser git\n".to_string()))
             .on_run("ssh", &["-G", "github.com"], Ok("hostname github.com\nuser git\n".to_string()))
             .build();

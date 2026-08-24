@@ -5023,7 +5023,7 @@ hostname = "buildbox.example"
                     "buildbox.example",
                     "sh",
                     "-lc",
-                    format!("cd '{}' && exec 'git' 'config' '--get' 'remote.origin.url'", repo.display()).as_str(),
+                    format!("cd '{}' && exec 'git' 'config' '--get-all' 'remote.origin.url'", repo.display()).as_str(),
                 ],
                 Ok("git@github.com:owner/remote-repo.git\n".into()),
             )
