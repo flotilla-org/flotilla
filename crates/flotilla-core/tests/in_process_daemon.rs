@@ -4168,7 +4168,7 @@ async fn adopted_checkout_reconciliation_isolates_an_observed_name_collision() {
 }
 
 #[tokio::test]
-async fn whole_repository_materialization_skips_generated_name_occupied_by_multi_repository_project() {
+async fn tracking_does_not_materialize_when_project_name_is_occupied() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
@@ -4200,19 +4200,13 @@ async fn whole_repository_materialization_skips_generated_name_occupied_by_multi
     daemon.add_repo(&repo).await.expect("tracked repository should be added");
 
     let materialized = projects.list().await.expect("project list should succeed");
-    assert_eq!(materialized.items.len(), 2);
-    assert!(materialized.items.iter().any(|project| {
-        matches!(
-            project.spec.repositories.as_slice(),
-            [entry] if entry.repo == tracked.key() && entry.subpath.is_none()
-        )
-    }));
+    assert_eq!(materialized.items.len(), 1);
     let occupant = materialized.items.iter().find(|project| project.metadata.name == "repo").expect("collision occupant should remain");
     assert_eq!(occupant.spec.repositories.len(), 2);
 }
 
 #[tokio::test]
-async fn repository_identity_change_tolerates_missing_superseded_repository_retained_by_durable_checkout() {
+async fn repository_identity_change_does_not_materialize_project_when_superseded_repository_is_missing() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
@@ -4254,7 +4248,7 @@ async fn repository_identity_change_tolerates_missing_superseded_repository_reta
     repositories.get(&new_key.to_string()).await.expect("new Repository should be materialized");
     assert!(matches!(repositories.get(&old_key.to_string()).await, Err(flotilla_resources::ResourceError::NotFound { .. })));
     let projects = daemon.resource_backend().using::<Project>("flotilla").list().await.expect("project list");
-    assert!(projects.items.iter().any(|project| project.spec.repositories.iter().any(|entry| entry.repo == new_key)));
+    assert!(projects.items.is_empty());
 }
 
 async fn recv_event(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>) -> DaemonEvent {
