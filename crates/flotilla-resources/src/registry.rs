@@ -18,6 +18,8 @@ use crate::{
     WriterIdentity,
 };
 
+pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegisteredResourceKind {
     pub kind: &'static str,
@@ -252,10 +254,10 @@ macro_rules! dispatch_resource_kind {
 /// another resource changes one dispatch arm rather than adding a one-off
 /// apply function or branch.
 macro_rules! dispatch_apply_resource_kind {
-    ($resource:expr, $backend:expr, $namespace:expr, $metadata:expr, $spec:expr) => {
+    ($resource:expr, $backend:expr, $namespace:expr, $metadata:expr, $spec:expr, $writer:expr) => {
         match $resource {
             RegisteredResource::PlacementPolicy => apply_owned_typed::<PlacementPolicy>($backend, $namespace, $metadata, $spec).await,
-            resource => dispatch_resource_kind!(resource, apply_typed($backend, $namespace, $metadata, $spec).await),
+            resource => dispatch_resource_kind!(resource, apply_typed($backend, $namespace, $metadata, $spec, $writer).await),
         }
     };
 }
@@ -269,7 +271,10 @@ macro_rules! dispatch_manifest_apply_resource_kind {
             RegisteredResource::PlacementPolicy => {
                 apply_manifest_owned_typed::<PlacementPolicy>($backend, $namespace, $metadata, $spec).await
             }
-            resource => dispatch_resource_kind!(resource, apply_typed($backend, $namespace, $metadata, $spec).await),
+            resource => {
+                let writer = WriterIdentity::reconcile_loop().with_source(MANIFEST_WRITER_SOURCE);
+                dispatch_resource_kind!(resource, apply_typed($backend, $namespace, $metadata, $spec, &writer).await)
+            }
         }
     };
 }
@@ -491,7 +496,14 @@ pub async fn apply_resource_document(
     let document: DynamicApplyDocument =
         serde_json::from_value(document).map_err(|error| ResourceError::decode(format!("decode resource document: {error}")))?;
     let namespace = document.metadata.namespace.clone().unwrap_or_else(|| default_namespace.to_string());
-    dispatch_apply_resource_kind!(lookup_resource_kind(&document.kind)?.resource, backend, &namespace, document.metadata, document.spec)
+    dispatch_apply_resource_kind!(
+        lookup_resource_kind(&document.kind)?.resource,
+        backend,
+        &namespace,
+        document.metadata,
+        document.spec,
+        &WriterIdentity::operator().with_source("resource-apply")
+    )
 }
 
 pub async fn patch_resource_annotation(
@@ -530,7 +542,7 @@ async fn patch_annotations_typed<T: Resource>(
         let existing = resolver.get(name).await?;
         let mut meta = InputMeta::from(&existing.metadata);
         meta.annotations.extend(annotations.clone());
-        resolver.apply(&meta, &existing.spec).await?
+        resolver.update_metadata(&meta).await?
     } else {
         let resolver = backend.using::<T>(namespace);
         let existing = resolver.get(name).await?;
@@ -971,6 +983,7 @@ async fn apply_typed<T: Resource>(
     namespace: &str,
     metadata: DynamicApplyMetadata,
     spec: Value,
+    writer: &WriterIdentity,
 ) -> Result<DynamicResourceObject, ResourceError> {
     let spec = serde_json::from_value::<T::Spec>(spec)
         .map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", T::API_PATHS.kind)))?;
@@ -980,7 +993,7 @@ async fn apply_typed<T: Resource>(
             Err(ResourceError::NotFound { .. }) => metadata.input_meta_for_create(),
             Err(error) => return Err(error),
         };
-        let object = backend.definitions::<T>(namespace).apply(&meta, &spec).await?;
+        let object = backend.definitions::<T>(namespace).apply_as(writer, &meta, &spec).await?;
         return Ok(DynamicResourceObject {
             kind: T::API_PATHS.kind.to_string(),
             plural: T::API_PATHS.plural.to_string(),

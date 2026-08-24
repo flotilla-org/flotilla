@@ -523,8 +523,11 @@ fn string_map(document: &Value, field: &str) -> Result<BTreeMap<String, String>,
 mod tests {
     use std::time::Duration;
 
+    use chrono::Utc;
+    use flotilla_protocol::NodeId;
     use flotilla_resources::{
-        InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend, WatchEvent, WatchStart, WorkflowTemplate,
+        patch_resource_annotation, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, Project, ResourceBackend, WatchEvent,
+        WatchStart, WorkflowTemplate, MANIFEST_WRITER_SOURCE,
     };
     use futures::StreamExt;
 
@@ -543,6 +546,17 @@ mod tests {
     fn manifest_with_priority(name: &str, pool: &str, priority: i32) -> String {
         format!(
             "apiVersion: flotilla.work/v1\nkind: PlacementPolicy\nmetadata:\n  name: {name}\nspec:\n  pool: {pool}\n  priority: {priority}\n"
+        )
+    }
+
+    fn project_manifest(workflow: &str, detailed_repository: bool) -> String {
+        let repository = if detailed_repository {
+            "{\"repo\":\"repo-key\",\"alias\":\"andamento\",\"roles\":[\"code\",\"ops\",\"knowledge\"]}"
+        } else {
+            "{\"repo\":\"repo-key\"}"
+        };
+        format!(
+            "{{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Project\",\"metadata\":{{\"name\":\"andamento\"}},\"spec\":{{\"display_name\":\"andamento\",\"default_workflow_ref\":\"{workflow}\",\"repositories\":[{repository}]}}}}"
         )
     }
 
@@ -860,6 +874,76 @@ mod tests {
         assert_eq!(synced.spec.pool, "manifest");
         assert!(!synced.metadata.annotations.contains_key(MANIFEST_REFUSAL_ANNOTATION));
         assert!(!synced.metadata.annotations.contains_key(MANIFEST_RESOLUTION_ANNOTATION));
+    }
+
+    #[tokio::test]
+    async fn only_declared_manifest_reconciler_reauthors_a_divergent_project() {
+        // #1736 owns selecting exactly one reconciler per manifest source. Model
+        // that contract here by constructing only the declared root's loop.
+        let current_dir = tempfile::tempdir().expect("current manifest dir");
+        write(&current_dir.path().join("project.json"), &project_manifest("single-agent-contained", true));
+
+        let current = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("current-root"));
+        let stale = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("stale-root"));
+        let mut current_reconciler = ResourceManifestReconciler::new(current.clone(), NAMESPACE, current_dir.path());
+        current_reconciler.reconcile_once().await.expect("current creation");
+        let stale_document = serde_json::from_str(&project_manifest("single-agent-trusted", false)).expect("stale manifest document");
+        apply_manifest_resource_document(&stale, NAMESPACE, stale_document).await.expect("seed pre-existing divergent peer state");
+
+        current
+            .replica_writer::<Project>(NodeId::new("stale-root"), NAMESPACE)
+            .replace(&stale.using::<Project>(NAMESPACE).list().await.expect("stale projects"), Utc::now())
+            .await
+            .expect("replicate stale project to current root");
+        patch_resource_annotation(&current, NAMESPACE, "projects", "andamento", MANIFEST_RESOLUTION_ANNOTATION, "sync")
+            .await
+            .expect("request current manifest sync");
+        current_reconciler.reconcile_once().await.expect("sync current manifest");
+
+        stale
+            .replica_writer::<Project>(NodeId::new("current-root"), NAMESPACE)
+            .replace(&current.using::<Project>(NAMESPACE).list().await.expect("current projects"), Utc::now())
+            .await
+            .expect("replicate synced project to stale root");
+        for iteration in 0..3 {
+            patch_resource_annotation(
+                &stale,
+                NAMESPACE,
+                "projects",
+                "andamento",
+                "test.flotilla.work/peer-observation",
+                &iteration.to_string(),
+            )
+            .await
+            .expect("metadata-only peer observation");
+        }
+
+        let project = stale.definitions::<Project>(NAMESPACE).get("andamento").await.expect("merged project");
+        assert_eq!(project.spec.default_workflow_ref, "single-agent-contained");
+        assert_eq!(project.spec.repositories[0].alias.as_deref(), Some("andamento"));
+        assert_eq!(project.spec.repositories[0].roles.len(), 3);
+        let writer = project
+            .metadata
+            .merge
+            .as_ref()
+            .and_then(|merge| merge.fields.get("spec.default_workflow_ref"))
+            .and_then(|field| field.writer.as_ref())
+            .expect("workflow write attribution");
+        assert_eq!(writer.source.as_deref(), Some(MANIFEST_WRITER_SOURCE));
+        assert_eq!(writer.role, flotilla_resources::WriterRole::ReconcileLoop);
+        assert_eq!(
+            project
+                .metadata
+                .merge
+                .as_ref()
+                .and_then(|merge| merge.fields.get("spec.default_workflow_ref"))
+                .expect("workflow merge metadata")
+                .dot
+                .author_root
+                .as_str(),
+            "current-root",
+            "an undeclared peer's metadata writes must not re-author the declared reconciler's spec",
+        );
     }
 
     #[tokio::test]

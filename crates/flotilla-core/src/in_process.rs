@@ -61,7 +61,7 @@ use flotilla_resources::{
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
     WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
+    WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
     DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, MANIFEST_RESOLUTION_ANNOTATION,
     PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
@@ -3742,7 +3742,7 @@ async fn reconcile_whole_repository_project_definition(
     let mut meta = InputMeta::from(&existing.metadata);
     meta.labels.insert(MANAGED_BY_LABEL.to_string(), WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE.to_string());
     let reconciled = projects
-        .apply(&meta, &existing.spec)
+        .update_metadata(&meta)
         .await
         .map_err(|error| format!("reconcile generated whole-repository Project {}: {error}", existing.metadata.name))?;
     Ok(reconciled)
@@ -5799,7 +5799,10 @@ impl InProcessDaemon {
         meta.annotations.insert(BOOTSTRAP_PATH_ANNOTATION.to_string(), bootstrap_path);
         converged |=
             existing_project.as_ref().is_none_or(|project| project.spec != spec || project.metadata.annotations != meta.annotations);
-        projects.apply(&meta, &spec).await.map_err(|error| error.to_string())?;
+        projects
+            .apply_as(&WriterIdentity::operator().with_source("project-declaration"), &meta, &spec)
+            .await
+            .map_err(|error| error.to_string())?;
         let mut changes = if converged { vec![format!("Project/{}", declaration.name)] } else { Vec::new() };
         let (operational_changes, operational_entries) =
             match self.materialize_project_operational_entries(&declaration.name, &bootstrap_inspection).await {
@@ -6275,7 +6278,14 @@ impl InProcessDaemon {
         }
 
         let spec = whole_repository_project_spec(key, explicit_display_name.map(str::to_string).unwrap_or(default_name))?;
-        projects.apply(&whole_repository_project_meta(project_name.clone()), &spec).await.map_err(|error| error.to_string())?;
+        projects
+            .apply_as(
+                &WriterIdentity::reconcile_loop().with_source("whole-repository-project"),
+                &whole_repository_project_meta(project_name.clone()),
+                &spec,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(project_name)
     }
 
@@ -6397,7 +6407,14 @@ impl InProcessDaemon {
             }
             if changed {
                 updated = normalize_project_spec(updated)?;
-                projects.apply(&InputMeta::from(&project.metadata), &updated).await.map_err(|error| error.to_string())?;
+                projects
+                    .apply_as(
+                        &WriterIdentity::reconcile_loop().with_source("repository-identity-migration"),
+                        &InputMeta::from(&project.metadata),
+                        &updated,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
                 project.spec = updated;
                 migrated_project_names.insert(project.metadata.name.clone());
             }
@@ -6473,7 +6490,14 @@ impl InProcessDaemon {
         }
 
         for project_name in whole_repository_project_names(repository_spec)? {
-            match projects.create(&whole_repository_project_meta(project_name.clone()), &spec).await {
+            match projects
+                .create_as(
+                    &WriterIdentity::reconcile_loop().with_source("whole-repository-project"),
+                    &whole_repository_project_meta(project_name.clone()),
+                    &spec,
+                )
+                .await
+            {
                 Ok(_) => return Ok(identity_change),
                 Err(ResourceError::Conflict { .. }) => {
                     let existing = projects.get(&project_name).await.map_err(|error| error.to_string())?;
@@ -9937,12 +9961,20 @@ impl InProcessDaemon {
                                 Err(format!("project {name} is managed by a declaration; use project refresh to update it"))
                             }
                             Ok(existing) => projects
-                                .apply(&InputMeta::from(&existing.metadata), &spec)
+                                .apply_as(
+                                    &WriterIdentity::operator().with_source("project-apply"),
+                                    &InputMeta::from(&existing.metadata),
+                                    &spec,
+                                )
                                 .await
                                 .map(|_| ())
                                 .map_err(|error| error.to_string()),
                             Err(ResourceError::NotFound { .. }) => projects
-                                .apply(&InputMeta::builder().name(name.clone()).build(), &spec)
+                                .apply_as(
+                                    &WriterIdentity::operator().with_source("project-apply"),
+                                    &InputMeta::builder().name(name.clone()).build(),
+                                    &spec,
+                                )
                                 .await
                                 .map(|_| ())
                                 .map_err(|error| error.to_string()),
