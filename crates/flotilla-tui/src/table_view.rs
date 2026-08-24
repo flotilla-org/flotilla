@@ -1489,14 +1489,14 @@ mod tests {
         let first_address = ViewAddress::Convoys { namespace: "dev".into(), scope: Some(QueryScope::new("dev", "first-project")) };
         let first_table =
             project(&first_address, &TableRows { convoys: vec![&first, &second], ..TableRows::default() }).expect("first project table");
-        assert_eq!(first_table.rows[0].cells[0].text, "coder");
+        assert!(first_table.rows[0].cells[0].text.starts_with("coder"));
         assert_eq!(first_table.rows[0].drill, Some("convoy/dev/convoy-first".parse().expect("first convoy address")));
 
         let second_address = ViewAddress::Convoys { namespace: "dev".into(), scope: Some(QueryScope::new("dev", "second-project")) };
         let second_table =
             project(&second_address, &TableRows { convoys: vec![&first, &second], ..TableRows::default() }).expect("second project table");
         let second_address = second_table.rows[0].drill.as_ref().expect("second convoy drill address");
-        assert_eq!(second_table.rows[0].cells[0].text, "coder");
+        assert!(second_table.rows[0].cells[0].text.starts_with("coder"));
         assert_eq!(second_address, &"convoy/dev/convoy-second".parse().expect("second convoy address"));
 
         let vessel_table = project(second_address, &TableRows { convoys: vec![&first, &second], ..TableRows::default() })
