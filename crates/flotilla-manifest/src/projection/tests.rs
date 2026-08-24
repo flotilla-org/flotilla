@@ -258,6 +258,49 @@ fn truncated_awareness_summary_reports_exact_omitted_count() {
 }
 
 #[test]
+fn same_role_remote_governors_project_as_distinct_catalog_entities() {
+    let governor = |resource_name: &str, project: &str| {
+        ConvoyRow::builder()
+            .resource(convoy_ref("flotilla", resource_name).on_host(HostName::new("udder")))
+            .name("governor")
+            .workflow_ref("standing-governor")
+            .phase(ConvoyPhase::Active)
+            .project_ref(project)
+            .build()
+    };
+    let awareness = |resource_name: &str, project: &str| {
+        AwarenessNode::builder()
+            .id(format!("project/flotilla/{project}"))
+            .kind(AwarenessKind::Project)
+            .label(project.to_owned())
+            .scope(flotilla_protocol::QueryScope::new("flotilla", project))
+            .state(AwarenessState::Active)
+            .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+            .counts(AwarenessCounts::builder().total(1).convoys(1).build())
+            .entries(vec![AwarenessEntry::builder()
+                .id(format!("convoy/flotilla/{resource_name}"))
+                .kind(AwarenessKind::Convoy)
+                .label("governor".to_owned())
+                .state(AwarenessState::Active)
+                .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                .annotations(std::collections::HashMap::from([(KEY_CONVOY_NAME.to_owned(), "governor".to_owned())]))
+                .build()])
+            .build()
+    };
+    let convoys = [governor("governor-andamento-01234567", "andamento"), governor("governor-wheelhouse-89abcdef", "wheelhouse")];
+    let awareness = [awareness("governor-andamento-01234567", "andamento"), awareness("governor-wheelhouse-89abcdef", "wheelhouse")];
+
+    let patches =
+        project_catalog(&CatalogInput { awareness: Some(&awareness), convoys: &convoys, independents: &[] }, &mint()).reassert_patches();
+    for (resource_name, project) in [("governor-andamento-01234567", "andamento"), ("governor-wheelhouse-89abcdef", "wheelhouse")] {
+        let governor = find_entity(&patches, &entity::convoy("flotilla", resource_name, "udder"));
+        assert_eq!(text(governor, SEGMENT_PROJECT), format!("flotilla/{project}@fleet"));
+        assert_eq!(text(governor, KEY_CONVOY), format!("flotilla/{resource_name}@udder"));
+        assert_eq!(text(governor, KEY_CONVOY_NAME), "governor");
+    }
+}
+
+#[test]
 fn standing_checkout_mints_a_transient_terminal_action_but_convoy_checkout_does_not() {
     let checkout = |id: &str, path: &str, links: Vec<AwarenessLink>| {
         AwarenessEntry::builder()

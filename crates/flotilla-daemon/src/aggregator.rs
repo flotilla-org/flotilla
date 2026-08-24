@@ -2455,6 +2455,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_homed_idle_governor_remains_in_project_awareness() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx)
+            .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("udder-node-id", "udder")));
+        let now = Utc::now();
+        let provenance = ResourceProvenance::Replica { origin_root: flotilla_protocol::NodeId::new("udder-node-id"), last_synced_at: now };
+        let mut convoy = convoy_with_vessel("governor-andamento-01234567").await;
+        convoy.spec.role = "governor".to_string();
+        convoy.spec.project_ref = Some("andamento".to_string());
+        aggregator.replace_replica_convoys(vec![ReadResourceObject { object: convoy, provenance: provenance.clone() }]).await;
+
+        let mut session = session_object("terminal-governor-implement-coder").await;
+        session.metadata.labels = BTreeMap::from([
+            (CONVOY_LABEL.to_string(), "governor-andamento-01234567".to_string()),
+            (VESSEL_LABEL.to_string(), "implement".to_string()),
+        ]);
+        session.status.as_mut().expect("running status").attention =
+            Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Hook });
+        aggregator.replace_replica_sessions(vec![ReadResourceObject { object: session, provenance }]).await;
+
+        let facts = aggregator.salience_facts_at(now);
+        assert_eq!(facts.attention.len(), 1, "replica provenance must resolve both resources to udder");
+        assert_eq!(facts.attention[0].state, TerminalAttentionState::Idle);
+        let result = state
+            .awareness_result_set(
+                &Some(QueryScope::new("flotilla", "andamento")),
+                flotilla_protocol::AwarenessGrouping::Project,
+                Default::default(),
+            )
+            .await;
+        let nodes = result.rows.as_awareness().expect("awareness rows");
+        let node = nodes.iter().find(|node| node.scope.as_ref() == Some(&QueryScope::new("flotilla", "andamento"))).expect("project group");
+        assert!(
+            node.entries.iter().any(|entry| {
+                entry.kind == flotilla_protocol::AwarenessKind::Convoy
+                    && entry.id == "convoy/flotilla/governor-andamento-01234567"
+                    && entry.label == "governor"
+            }),
+            "an idle standing convoy remains an awareness entry"
+        );
+        assert!(node.entries.iter().any(|entry| {
+            entry.kind == flotilla_protocol::AwarenessKind::Vessel && entry.id == "vessel/flotilla/governor-andamento-01234567/implement"
+        }));
+    }
+
+    #[tokio::test]
     async fn subscribed_fleet_awareness_emits_when_project_catalog_changes() {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
