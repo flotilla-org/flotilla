@@ -371,7 +371,11 @@ where
                             },
                         });
                     }
-                    if obj.status.as_ref().is_some_and(|status| status.phase == PresentationPhase::TornDown) {
+                    if obj
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| matches!(status.phase, PresentationPhase::TornDown | PresentationPhase::Failed))
+                    {
                         return Ok(PresentationPrepared::InSync);
                     }
                     return Ok(PresentationPrepared::Failed(format!("convoy '{}' no longer exists", obj.spec.convoy_ref)));

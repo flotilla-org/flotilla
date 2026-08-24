@@ -194,14 +194,26 @@ async fn managed_presentation_without_its_convoy_is_failed_without_calling_the_r
         .await
         .expect("presentation create should succeed");
     let runtime = Arc::new(FakePresentationRuntime::default());
-    let reconciler = reconciler(Arc::clone(&runtime), backend);
+    let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
     let deps = reconciler.prepare(&presentation).await.expect("deps should load");
     let outcome = reconciler.reconcile(&presentation, &deps, Utc::now());
 
     assert!(matches!(
-        outcome.patch,
-        Some(PresentationStatusPatch::MarkFailed { ref message }) if message == "convoy 'missing-convoy' no longer exists"
+        outcome.patch.as_ref(),
+        Some(PresentationStatusPatch::MarkFailed { message }) if message == "convoy 'missing-convoy' no longer exists"
+    ));
+    let failed = update_presentation_status(&backend, &presentation, outcome.patch.expect("orphan should fail")).await;
+    let resynced = reconciler.prepare(&failed).await.expect("failed orphan should remain terminal");
+    assert!(matches!(resynced, flotilla_controllers::reconcilers::PresentationPrepared::InSync));
+    assert!(matches!(reconciler.reconcile(&failed, &resynced, Utc::now()).patch, None));
+    assert!(matches!(
+        failed.status,
+        Some(PresentationStatus {
+            phase: flotilla_resources::PresentationPhase::Failed,
+            ref message,
+            ..
+        }) if message.as_deref() == Some("convoy 'missing-convoy' no longer exists")
     ));
     assert!(runtime.apply_calls.lock().expect("apply calls lock").is_empty());
     assert!(runtime.tear_down_calls.lock().expect("tear down calls lock").is_empty());
