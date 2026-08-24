@@ -180,6 +180,22 @@ fn declared_remotes_must_include_the_observed_repository_and_remain_unique() {
 }
 
 #[test]
+fn remote_move_preserves_identity_and_tracks_live_forge() {
+    let original = "https://github.com/example/old-name";
+    let moved = "https://github.com/example/new-name";
+    let original_spec = RepositorySpec::remote(original).expect("original repository");
+    let key = original_spec.key();
+
+    let moved_spec = original_spec.update_remotes(moved).expect("remote move");
+
+    assert_eq!(moved_spec.key(), key);
+    assert_eq!(moved_spec.remotes(), [moved, original]);
+    assert_eq!(moved_spec.live_remote(), Some(moved));
+    assert_eq!(moved_spec.forge().expect("forge").repository, "example/new-name");
+    moved_spec.verify_key(&key).expect("birth identity remains valid");
+}
+
+#[test]
 fn repository_display_labels_use_forge_slugs_and_qualify_collisions() {
     let flotilla = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository");
     let flotilla_widgets = RepositorySpec::remote("https://github.com/flotilla-org/widgets").expect("flotilla widgets repository");

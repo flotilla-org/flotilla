@@ -18,7 +18,7 @@ standing evidence they were always the same intent.
 
 ## Decision
 
-**A Repository declares its remotes; the first is canonical and is the
+**A Repository declares its remotes; its first-declared remote is its stable
 identity.** The remotes list is part of the Repository record
 (user-editable, definitions-class like the rest of the record):
 
@@ -37,6 +37,11 @@ identity.** The remotes list is part of the Repository record
   Repository as today, with the provenance-edge machinery (ADR 0020's
   identity-upgrade path) merging it into the canonical Repository when
   the declaration is added.
+- When an already-associated checkout observes that its live remote moved, the
+  Repository is updated in place: the moved URL joins the declared remotes and
+  becomes the first (live) transport, while `identity.canonical_remote` remains
+  the original birth identity. Forge operations and credential scoping derive
+  their repository name from that live remote, never from the identity remote.
 
 ## Migration
 

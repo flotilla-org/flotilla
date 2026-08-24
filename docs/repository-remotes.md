@@ -1,9 +1,10 @@
 # Repository remote declarations
 
-A `Repository` may declare more than one transport remote. The first remote is
-canonical and defines the Repository key, forge attribution, issue source, and
-change-request lookup. Later entries are mirrors: observing any declared remote
-resolves to the same Repository.
+A `Repository` may declare more than one transport remote. Its first-declared
+remote defines the stable Repository key. The current live remote is ordered
+first in `spec.remotes` and defines forge attribution, credential scope, issue
+source, and change-request lookup. Observing any declared remote resolves to the
+same Repository.
 
 Declare the remotes in the tracked checkout's `repos/*.toml` file:
 
