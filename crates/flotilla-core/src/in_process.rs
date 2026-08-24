@@ -2086,6 +2086,7 @@ pub struct InProcessDaemon {
     active_commands: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     self_weak: Weak<InProcessDaemon>,
     pending_convoy_starts: Mutex<HashSet<ConvoyStartKey>>,
+    driver_ensure_retries: Mutex<HashMap<(String, String), DriverEnsureRetry>>,
     /// Serializes pending-brief state with its terminal-session delivery side effect.
     convoy_message_locks: Mutex<HashMap<ConvoyMessageKey, WeakConvoyMessageLock>>,
     /// Serializes the identity selector check with Convoy creation. The owner
@@ -2140,6 +2141,13 @@ const ENSURE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const ENSURE_ESCALATION_AFTER: ChronoDuration = ChronoDuration::minutes(15);
 const ENSURE_HOLD_ATTENTION_PREFIX: &str = "ensure-attention-";
 const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
+
+#[derive(Debug, Clone)]
+struct DriverEnsureRetry {
+    config_hash: String,
+    consecutive_failures: u32,
+    retry_at: DateTime<Utc>,
+}
 
 fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
     let exponent = restart_count.min(5);
@@ -2328,6 +2336,7 @@ impl InProcessDaemon {
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             self_weak: self_weak.clone(),
             pending_convoy_starts: Mutex::new(HashSet::new()),
+            driver_ensure_retries: Mutex::new(HashMap::new()),
             convoy_message_locks: Mutex::new(HashMap::new()),
             convoy_admission: Mutex::new(()),
             session_id: uuid::Uuid::new_v4(),
@@ -4632,6 +4641,26 @@ impl InProcessDaemon {
         let mut errors = Vec::new();
         for ensure in ensures {
             if let Some(driver_ref) = &ensure.spec.driver_ref {
+                if self.resource_backend.clone().using::<ConvoyEnsure>(namespace).get(&ensure.metadata.name).await.is_ok()
+                    && ensure.status.as_ref().is_some_and(|status| {
+                        status.convoy_ref.is_some()
+                            || status.running_since.is_some()
+                            || status.retry_at.is_some()
+                            || status.last_failure.is_some()
+                            || status.hold_reason.is_some()
+                            || status.observed_config_hash.is_some()
+                            || status.restart_count > 0
+                    })
+                {
+                    if let Err(error) =
+                        self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::DriverManaged).await
+                    {
+                        errors.push(format!(
+                            "ConvoyEnsure/{}: could not clear legacy status for driver ownership: {error}",
+                            ensure.metadata.name
+                        ));
+                    }
+                }
                 let target = match canonical_placement_host_ref(&self.resource_backend, namespace, driver_ref).await {
                     Ok(Some(target)) => target,
                     Ok(None) => {
@@ -4759,10 +4788,10 @@ impl InProcessDaemon {
 
     /// Admit a declared-driver ensure from the generation history homed here.
     ///
-    /// Driver admission deliberately has no companion control state and never
-    /// patches the ensure, even when this root also happens to home its
-    /// definition. Failed husks are the retry budget; deleting them is an
-    /// operator-authorized reset.
+    /// Driver admission keeps admission retry state on the driver because the
+    /// ensure definition may be homed on another root. Failed generations
+    /// remain the runtime retry budget; admission failures use the same bounded
+    /// backoff and surface a driver-local Demand when their budget is exhausted.
     async fn reconcile_driver_convoy_ensure(
         &self,
         namespace: &str,
@@ -4800,6 +4829,24 @@ impl InProcessDaemon {
             Err(error) => return Err(error.to_string()),
         };
 
+        let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
+        let config_hash = ensure_config_hash(&ensure.spec)?;
+        {
+            let mut retries = self.driver_ensure_retries.lock().await;
+            if retries.get(&retry_key).is_some_and(|retry| retry.config_hash != config_hash) {
+                retries.remove(&retry_key);
+            }
+            if !resolved_escalation {
+                if let Some(retry) = retries.get(&retry_key) {
+                    if retry.consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES || retry.retry_at > self.clock.now() {
+                        return Ok(None);
+                    }
+                }
+            } else {
+                retries.remove(&retry_key);
+            }
+        }
+
         let consecutive_failures = generations
             .iter()
             .rev()
@@ -4821,8 +4868,48 @@ impl InProcessDaemon {
             }
         }
 
-        self.start_ensured_convoy(namespace, ensure).await?;
-        Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
+        match self.start_ensured_convoy(namespace, ensure).await {
+            Ok(_) => {
+                self.driver_ensure_retries.lock().await.remove(&retry_key);
+                Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
+            }
+            Err(error) => {
+                let now = self.clock.now();
+                let (consecutive_failures, retry_at) = {
+                    let mut retries = self.driver_ensure_retries.lock().await;
+                    let consecutive_failures = retries.get(&retry_key).map_or(1, |retry| retry.consecutive_failures.saturating_add(1));
+                    let retry_at = now + ensure_retry_delay(consecutive_failures - 1);
+                    retries.insert(retry_key, DriverEnsureRetry { config_hash, consecutive_failures, retry_at });
+                    (consecutive_failures, retry_at)
+                };
+                if consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
+                    let failure = format!("driver admission failed {consecutive_failures} consecutive times: {error}");
+                    self.raise_driver_admission_attention(namespace, ensure, &failure, now + ENSURE_ESCALATION_AFTER).await?;
+                    return Ok(Some(format!("ConvoyEnsure/{} exhausted driver admission retry budget", ensure.metadata.name)));
+                }
+                Err(format!("driver admission failed; retry at {retry_at}: {error}"))
+            }
+        }
+    }
+
+    async fn raise_driver_admission_attention(
+        &self,
+        namespace: &str,
+        ensure: &ResourceObject<ConvoyEnsure>,
+        reason: &str,
+        escalation_deadline: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let demands = self.resource_backend.clone().using::<ResourceDemand>(namespace);
+        let name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{}", ensure.metadata.name);
+        let target = ResourceRef::new(api_version(ConvoyEnsure::API_PATHS), ConvoyEnsure::API_PATHS.kind, namespace, &ensure.metadata.name);
+        let meta = InputMeta::builder()
+            .name(name)
+            .annotations(BTreeMap::from([(RECLAIM_REFUSAL_REASON_ANNOTATION.to_string(), reason.to_string())]))
+            .build();
+        let mut spec =
+            DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, PrincipalRef::implicit_for_namespace(namespace));
+        spec.expiry = Some(DemandExpiry { deadline: escalation_deadline, disposition: DemandExpiryDisposition::Escalate });
+        demands.create(&meta, &spec).await.map(|_| ()).map_err(|error| error.to_string())
     }
 
     async fn set_ensure_driver_condition(

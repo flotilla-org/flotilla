@@ -1277,6 +1277,52 @@ async fn unavailable_declared_driver_surfaces_named_admission_conditions_without
 }
 
 #[tokio::test]
+async fn declared_driver_admission_failures_back_off_escalate_and_clear_legacy_status() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    let driver_id = daemon.local_host_id().expect("driver host identity").to_string();
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let host = hosts.create(&test_meta(&driver_id), &HostSpec { display_name: "local".to_string() }).await.expect("driver host");
+    hosts
+        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus { ready: true, ..Default::default() })
+        .await
+        .expect("ready driver host");
+    set_ensure_driver(&backend, &driver_id).await;
+    let ensures = backend.using::<ConvoyEnsure>("flotilla");
+    let ensure = ensures.get("quartermaster").await.expect("ensure");
+    let mut spec = ensure.spec.clone();
+    spec.workflow_ref = "missing-workflow".to_string();
+    ensures.update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &spec).await.expect("make admission fail");
+    let ensure = ensures.get("quartermaster").await.expect("updated ensure");
+    ensures
+        .update_status(&ensure.metadata.name, &ensure.metadata.resource_version, &ConvoyEnsureStatus {
+            convoy_ref: Some("stale-convoy".to_string()),
+            running_since: Some(clock.now() - ChronoDuration::days(1)),
+            ..Default::default()
+        })
+        .await
+        .expect("seed stale pre-driver status");
+
+    let first = daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("first admission refusal");
+    assert!(first.contains("retry at"), "{first}");
+    let status = ensures.get("quartermaster").await.expect("ensure").status.expect("driver-managed status");
+    assert_eq!(status.convoy_ref, None);
+    assert_eq!(status.running_since, None);
+
+    assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("backoff suppresses retry").is_empty());
+    clock.advance(ChronoDuration::seconds(30));
+    assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("second admission refusal").contains("retry at"));
+    clock.advance(ChronoDuration::seconds(60));
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("third refusal escalates"), vec![
+        "ConvoyEnsure/quartermaster exhausted driver admission retry budget"
+    ]);
+    let demand = backend.using::<ResourceDemand>("flotilla").get("ensure-attention-quartermaster").await.expect("admission demand");
+    assert_eq!(demand.spec.originating_work_ref.kind, "ConvoyEnsure");
+    assert!(demand.metadata.annotations[RECLAIM_REFUSAL_REASON_ANNOTATION].contains("missing-workflow"));
+    clock.advance(ChronoDuration::hours(1));
+    assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("active demand holds retries").is_empty());
+}
+
+#[tokio::test]
 async fn orphaned_ensure_reports_its_absent_parent_project() {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
     backend.definitions::<Project>("flotilla").delete("standing-project").await.expect("remove parent project");

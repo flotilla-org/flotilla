@@ -81,6 +81,7 @@ pub enum ConvoyEnsureStatusPatch {
     RestartLimitReached { convoy_ref: String, failure: String },
     ObserveConfig { config_hash: String, changed: bool },
     ResetBackoff,
+    DriverManaged,
     DriverAdmission { condition: Option<ConvoyEnsureCondition> },
 }
 
@@ -137,6 +138,15 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                 status.retry_at = None;
                 status.last_failure = None;
                 status.hold_reason = None;
+            }
+            Self::DriverManaged => {
+                status.convoy_ref = None;
+                status.restart_count = 0;
+                status.running_since = None;
+                status.retry_at = None;
+                status.last_failure = None;
+                status.hold_reason = None;
+                status.observed_config_hash = None;
             }
             Self::DriverAdmission { condition } => {
                 status.conditions.retain(|existing| existing.condition_type != DRIVER_ADMISSION_CONDITION_TYPE);
