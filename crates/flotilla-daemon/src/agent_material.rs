@@ -273,9 +273,7 @@ impl SkillBundle {
         if !Self::is_required(required_adapters) {
             return Ok(());
         }
-        if !required_adapters.contains(CLAUDE_CODE_ADAPTER_ID)
-            && environment.iter().any(|(name, value)| name == "CODEX_HOME" && value != CONTAINER_CODEX_HOME)
-        {
+        if !required_adapters.contains(CLAUDE_CODE_ADAPTER_ID) && !environment.iter().any(|(name, _)| name == "CODEX_HOME") {
             return Ok(());
         }
         let config_base = runner
@@ -608,6 +606,22 @@ mod tests {
         assert!(calls[0].1.contains(&format!("{CONTAINER_CODEX_HOME}/skills")));
         assert!(calls[0].1.contains(&"https://github.com/flotilla-org/mattpocock-skills.git".to_string()));
         assert!(calls[0].1.contains(&"1111111111111111111111111111111111111111".to_string()));
+    }
+
+    #[tokio::test]
+    async fn externally_managed_codex_home_skips_skill_staging() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
+        let environment = vec![
+            ("GIT_CONFIG_GLOBAL".to_string(), "/run/flotilla/config/credentials/gitconfig".to_string()),
+            ("GITHUB_TOKEN_FILE".to_string(), "/run/flotilla/config/credentials/github-app/token".to_string()),
+        ];
+        let runner = RecordingRunner::default();
+
+        registry.stage_skills("crew-codex", &required, &environment, &runner).await.expect("skip external Codex home");
+
+        assert!(runner.0.lock().expect("recording runner lock should be healthy").is_empty());
     }
 
     #[test]
