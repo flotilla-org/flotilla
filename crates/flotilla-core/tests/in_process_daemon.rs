@@ -170,6 +170,22 @@ struct EnvVarEchoHostDetector {
     assertion_key: &'static str,
 }
 
+struct FixedEnvVarHostDetector {
+    key: &'static str,
+    value: &'static str,
+}
+
+#[async_trait]
+impl HostDetector for FixedEnvVarHostDetector {
+    async fn detect(
+        &self,
+        _runner: &dyn CommandRunner,
+        _env: &dyn flotilla_core::providers::discovery::EnvVars,
+    ) -> Vec<EnvironmentAssertion> {
+        vec![EnvironmentAssertion::env_var(self.key, self.value)]
+    }
+}
+
 #[async_trait]
 impl HostDetector for EnvVarEchoHostDetector {
     async fn detect(
@@ -4863,12 +4879,10 @@ async fn add_repo_uses_manager_backed_local_environment_for_provider_discovery()
         .factories
         .terminal_pools
         .push(Box::new(EnvGatedTerminalPoolFactory { required_env_var: "ENABLE_MANAGER_TERMINALS", pool: terminal_pool }));
+    discovery.host_detectors.push(Box::new(FixedEnvVarHostDetector { key: "ENABLE_MANAGER_TERMINALS", value: "1" }));
     let daemon = InProcessDaemon::new(vec![], config, discovery, HostName::local()).await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("provider-discovery".to_string()))).await;
 
-    daemon
-        .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::env_var("ENABLE_MANAGER_TERMINALS", "1")))
-        .expect("replace local environment bag");
     daemon.add_repo(&repo).await.expect("add repo");
 
     let providers = daemon.get_repo_providers_internal(&RepoSelector::Path(repo.clone())).await.expect("get_repo_providers");
