@@ -513,6 +513,7 @@ fn fuzzy_matches(value: &str, pattern: &str) -> bool {
 struct VesselProjection {
     namespace: String,
     convoy: String,
+    convoy_name: String,
     origin_host: Option<HostName>,
     project_ref: Option<String>,
     repo_hint: Option<RepoKey>,
@@ -613,6 +614,7 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
             let rows = stable_topological_vessels(&convoy.vessels).into_iter().map(|vessel| VesselProjection {
                 namespace: namespace.clone(),
                 convoy: name.clone(),
+                convoy_name: convoy.name.clone(),
                 origin_host: convoy.origin_host.clone(),
                 project_ref: convoy.project_ref.clone(),
                 repo_hint: convoy.repo_hint.clone(),
@@ -620,8 +622,8 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                 vessel: vessel.clone(),
             });
             let title = convoy.change_request.as_ref().map_or_else(
-                || format!("Convoy · {name}"),
-                |change_request| format!("Convoy · {name} · PR #{} {}", change_request.id, change_request.status),
+                || format!("Convoy · {}", convoy.name),
+                |change_request| format!("Convoy · {} · PR #{} {}", convoy.name, change_request.id, change_request.status),
             );
             Ok(vessel_spec().project(title, rows))
         }
@@ -635,6 +637,7 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
             Ok(vessel_spec().project(format!("Vessel · {vessel}"), [VesselProjection {
                 namespace: namespace.clone(),
                 convoy: convoy.clone(),
+                convoy_name: convoy_row.name.clone(),
                 origin_host: convoy_row.origin_host.clone(),
                 project_ref: convoy_row.project_ref.clone(),
                 repo_hint: convoy_row.repo_hint.clone(),
@@ -796,7 +799,7 @@ fn find_convoy<'a>(convoys: &'a [&ConvoySummary], namespace: &str, name: &str) -
     convoys
         .iter()
         .copied()
-        .find(|convoy| convoy.namespace == namespace && convoy.name == name)
+        .find(|convoy| convoy.namespace == namespace && convoy.resource_name == name)
         .ok_or_else(|| format!("convoy not found: {namespace}/{name}"))
 }
 
@@ -1070,7 +1073,7 @@ fn convoy_id(row: &ConvoySummary) -> RowId {
 }
 
 fn convoy_drill(row: &ConvoySummary) -> Option<ViewAddress> {
-    Some(ViewAddress::Convoy { namespace: row.namespace.clone(), name: row.name.clone() })
+    Some(ViewAddress::Convoy { namespace: row.namespace.clone(), name: row.resource_name.clone() })
 }
 
 fn convoy_phase(row: &ConvoySummary) -> CellValue {
@@ -1342,7 +1345,7 @@ fn open_vessel_in_pm(row: &VesselProjection) -> Option<TableIntent> {
         namespace: row.namespace.clone(),
         convoy: row.convoy.clone(),
         vessel: Some(row.vessel.name.clone()),
-        label: if row.vessel_count == 1 { row.convoy.clone() } else { format!("{}:{}", row.convoy, row.vessel.name) },
+        label: if row.vessel_count == 1 { row.convoy_name.clone() } else { format!("{}:{}", row.convoy_name, row.vessel.name) },
         host: row.origin_host.clone().or_else(|| row.vessel.host.clone()),
         project_ref: row.project_ref.clone(),
         repo_hint: row.repo_hint.clone(),
@@ -1424,6 +1427,7 @@ mod tests {
             placement_decision: None,
             id: ConvoyId::new("dev", "tables"),
             namespace: "dev".into(),
+            resource_name: "tables".into(),
             name: "tables".into(),
             origin_host: None,
             workflow_ref: "implement-review".into(),
@@ -1468,6 +1472,38 @@ mod tests {
         assert_eq!(view.rows[0].cells[2], CellValue::toned("failed", CellTone::Error));
         assert_eq!(view.rows[0].cells[6].text, "workspace launch failed: disk full");
         assert_eq!(view.rows[0].drill, Some("convoy/dev/tables".parse().expect("valid address")));
+    }
+
+    #[test]
+    fn same_role_convoys_in_different_projects_drill_by_resource_identity() {
+        let mut first = convoy(vec![vessel("first-vessel", &[], WorkPhase::Running)]);
+        first.resource_name = "convoy-first".into();
+        first.name = "coder".into();
+        first.project_ref = Some("first-project".into());
+
+        let mut second = convoy(vec![vessel("second-vessel", &[], WorkPhase::Running)]);
+        second.resource_name = "convoy-second".into();
+        second.name = "coder".into();
+        second.project_ref = Some("second-project".into());
+
+        let first_address = ViewAddress::Convoys { namespace: "dev".into(), scope: Some(QueryScope::new("dev", "first-project")) };
+        let first_table =
+            project(&first_address, &TableRows { convoys: vec![&first, &second], ..TableRows::default() }).expect("first project table");
+        assert_eq!(first_table.rows[0].cells[0].text, "coder");
+        assert_eq!(first_table.rows[0].drill, Some("convoy/dev/convoy-first".parse().expect("first convoy address")));
+
+        let second_address = ViewAddress::Convoys { namespace: "dev".into(), scope: Some(QueryScope::new("dev", "second-project")) };
+        let second_table =
+            project(&second_address, &TableRows { convoys: vec![&first, &second], ..TableRows::default() }).expect("second project table");
+        let second_address = second_table.rows[0].drill.as_ref().expect("second convoy drill address");
+        assert_eq!(second_table.rows[0].cells[0].text, "coder");
+        assert_eq!(second_address, &"convoy/dev/convoy-second".parse().expect("second convoy address"));
+
+        let vessel_table = project(second_address, &TableRows { convoys: vec![&first, &second], ..TableRows::default() })
+            .expect("second convoy vessel table");
+        assert_eq!(vessel_table.title, "Convoy · coder");
+        assert_eq!(vessel_table.rows[0].cells[1].text, "second-vessel");
+        assert_eq!(vessel_table.rows[0].drill, Some("vessel/dev/convoy-second/second-vessel".parse().expect("vessel address")));
     }
 
     #[test]

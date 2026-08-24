@@ -770,6 +770,7 @@ mod tests {
             placement_decision: None,
             id: ConvoyId::new("flotilla", name),
             namespace: "flotilla".into(),
+            resource_name: name.into(),
             name: name.into(),
             origin_host: None,
             workflow_ref: "wf".into(),
