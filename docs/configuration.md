@@ -169,14 +169,21 @@ documents as additive desired state:
 ```toml
 [manifests]
 dir = "/home/alice/dev/project-map/flotilla"
+source = "https://github.com/example/project-map"
+reconciler_root = "01J..." # stable Host resource name
 ```
 
 Each file contains one or more full resource envelopes (`apiVersion`, `kind`,
-`metadata`, and `spec`). The daemon labels created objects as managed by the
-manifest reconciler and records the relative source path and last-applied spec
-digest. It fast-forwards a changed manifest only while the live spec still
+`metadata`, and `spec`). Only the daemon whose Host identity matches
+`reconciler_root` starts the loop; other daemons apply nothing even if a stale
+clone remains on disk. Remove `[manifests]` entirely from hosts that are not the
+declared root. The daemon labels created objects as managed by the manifest
+reconciler and records the declared source, relative source path, clean Git
+revision, reconciling root, and last-applied spec digest. It fast-forwards a
+changed manifest only while the live spec still
 matches that digest; live drift and collisions with unmanaged objects are
-reported and left untouched.
+reported and left untouched. The manifest directory must be tracked and clean;
+files with changes not represented by `HEAD` are not applied.
 
 This first manifest-reconciliation slice is deliberately additive: removing a
 file does not delete its object, and existing unmanaged objects are never
