@@ -222,7 +222,7 @@ impl ResourceManifestReconciler {
                 && labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(MANIFEST_MANAGED_BY_VALUE)
                 && annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str) == Some(self.source.as_str())
                 && annotations.get(MANIFEST_PATH_ANNOTATION).map(String::as_str) == Some(path.to_string_lossy().as_ref())
-                && annotations.get(MANIFEST_REVISION_ANNOTATION).map(String::as_str) == Some(revision)
+                && annotations.contains_key(MANIFEST_REVISION_ANNOTATION)
                 && annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION).map(String::as_str) == Some(self.reconciler_root.as_str())
                 && resolution.is_none()
                 && REFUSAL_ANNOTATIONS.iter().all(|key| !annotations.contains_key(*key));
@@ -306,7 +306,7 @@ impl ResourceManifestReconciler {
             && desired_hash == last_applied
             && annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str) == Some(self.source.as_str())
             && annotations.get(MANIFEST_PATH_ANNOTATION).map(String::as_str) == Some(path.to_string_lossy().as_ref())
-            && annotations.get(MANIFEST_REVISION_ANNOTATION).map(String::as_str) == Some(revision)
+            && annotations.contains_key(MANIFEST_REVISION_ANNOTATION)
             && annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION).map(String::as_str) == Some(self.reconciler_root.as_str())
         {
             report.unchanged += 1;
@@ -751,6 +751,27 @@ mod tests {
         assert_eq!(report.unchanged, 1);
         assert_eq!(before.metadata.resource_version, after.metadata.resource_version);
         assert!(tokio::time::timeout(Duration::from_millis(20), events.next()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unrelated_source_revision_does_not_rewrite_unchanged_object() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir.path().join("policy.yaml"), &manifest("steady-revision", "one"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path())
+            .with_declared_source("project-map", "kiwi")
+            .with_revision("revision-one");
+        reconciler.reconcile_once().await.expect("initial pass");
+        let before = backend.using::<PlacementPolicy>(NAMESPACE).get("steady-revision").await.expect("policy");
+
+        reconciler.fixed_revision = Some("revision-two".to_string());
+        let report = reconciler.reconcile_once().await.expect("unrelated revision pass");
+        let after = backend.using::<PlacementPolicy>(NAMESPACE).get("steady-revision").await.expect("policy");
+
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.updated, 0);
+        assert_eq!(after.metadata.resource_version, before.metadata.resource_version);
+        assert_eq!(after.metadata.annotations.get(MANIFEST_REVISION_ANNOTATION).map(String::as_str), Some("revision-one"));
     }
 
     #[tokio::test]
