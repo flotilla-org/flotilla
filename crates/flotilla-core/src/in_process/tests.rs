@@ -1763,7 +1763,9 @@ async fn off_home_driver_admits_an_ensure_from_replicated_project_definitions() 
 
     driver.start_ensured_convoy("flotilla", &ensure).await.expect("driver admits replicated template");
 
-    assert!(driver_backend.using::<ResourceConvoy>("flotilla").get("quartermaster").await.is_ok());
+    let admitted = driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("driver convoys").items;
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(admitted[0].metadata.labels.get(PROJECT_LABEL).map(String::as_str), Some("standing-project"));
 }
 
 #[tokio::test]
@@ -2139,6 +2141,7 @@ async fn default_remote_placement_routes_before_admission() {
     let (_, mut resolved_workflow) = daemon
         .resolve_convoy_admission_workflow(
             "flotilla",
+            "andamento",
             &backend.definitions::<Project>("flotilla").get("andamento").await.expect("project").spec,
             &[],
             &intent,

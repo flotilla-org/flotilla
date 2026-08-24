@@ -34,8 +34,8 @@ use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
     delete_resource_kind, ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, ConvoyTeardownRuntime, EventRetention, InMemoryBackend,
     InputMeta, NoStatusPatch, Project, ProjectSpec, Resource, ResourceBackend, ResourceError, SqliteBackend, TerminalSession,
-    TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
-    VESSEL_REF_LABEL,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate,
+    WorkflowTemplateSpec, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 use futures::StreamExt;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
@@ -72,10 +72,30 @@ async fn workflow_template_definitions_migration_wipes_legacy_local_authorities_
     connection
         .execute("DELETE FROM resource_store_migrations WHERE name = 'workflow-template-definitions-v1'", [])
         .expect("simulate pre-migration store");
+    connection
+        .execute(
+            r#"
+            INSERT INTO resource_decode_quarantine
+                (group_name, version, kind, namespace, name, body_json, error, quarantined_at)
+            VALUES ('flotilla.work', 'v1', 'WorkflowTemplate', 'flotilla', 'corrupt-template', '{}', 'legacy decode failure', ?1)
+            "#,
+            rusqlite::params![Utc::now().to_rfc3339()],
+        )
+        .expect("seed legacy workflow template quarantine");
     drop(connection);
 
     let migrated = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("migrate store"));
     assert!(migrated.using::<WorkflowTemplate>("flotilla").list().await.expect("list templates").items.is_empty());
+    let connection = rusqlite::Connection::open(&path).expect("inspect migrated store");
+    let quarantined_templates: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM resource_decode_quarantine WHERE group_name = 'flotilla.work' AND version = 'v1' AND kind = 'WorkflowTemplate'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count quarantined templates");
+    assert_eq!(quarantined_templates, 0);
+    drop(connection);
 
     migrated
         .definitions::<WorkflowTemplate>("flotilla")

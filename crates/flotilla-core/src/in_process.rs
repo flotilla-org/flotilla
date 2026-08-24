@@ -3003,7 +3003,7 @@ impl InProcessDaemon {
             .map_err(|error| project_not_ready_error(&project_namespace, &project_ref, error))?;
         let repositories = self.snapshot_project_repositories(&project_namespace, &project_ref, None).await?;
         let (_, mut workflow) =
-            self.resolve_convoy_admission_workflow(&project_namespace, &project.spec, &repositories, intent, None).await?;
+            self.resolve_convoy_admission_workflow(&project_namespace, &project_ref, &project.spec, &repositories, intent, None).await?;
         let placement = self.resolve_convoy_placement(&project_namespace, Some(&project_ref), &repositories, &workflow, None).await?;
         resolve_and_validate_workflow_credentials(
             &self.resource_backend,
@@ -4398,6 +4398,7 @@ impl InProcessDaemon {
     async fn resolve_convoy_admission_workflow(
         &self,
         namespace: &str,
+        project_ref: &str,
         project: &ProjectSpec,
         repositories: &[ConvoyRepositorySpec],
         intent: &flotilla_protocol::ConvoyStartIntent,
@@ -4408,14 +4409,19 @@ impl InProcessDaemon {
             None if intent.change_request.is_some() => "single-agent-shepherd".to_string(),
             None => project.default_workflow_ref.clone(),
         };
-        let mut workflow = self
-            .resource_backend
-            .clone()
-            .including_replicas::<WorkflowTemplate>(namespace)
-            .get(&workflow_ref)
-            .await
-            .map(|source| source.object)
-            .map_err(|error| format!("workflow template {workflow_ref}: {error}"))?;
+        let templates = self.resource_backend.definitions::<WorkflowTemplate>(namespace);
+        let scoped_workflow_ref = crate::ops_entry::materialized_workflow_name(project_ref, &workflow_ref);
+        let mut workflow = match templates.get(&scoped_workflow_ref).await {
+            Ok(workflow) => workflow,
+            Err(ResourceError::NotFound { .. }) => templates
+                .get(&workflow_ref)
+                .await
+                .map_err(|error| format!("workflow template {workflow_ref} for project {project_ref}: {error}"))?,
+            Err(error) => return Err(format!("workflow template {workflow_ref} for project {project_ref}: {error}")),
+        };
+        if workflow.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).is_some_and(|owner| owner != project_ref) {
+            return Err(format!("workflow template {workflow_ref} is materialized by another project"));
+        }
         if let Some(stance) = stance {
             for vessel in &mut workflow.spec.vessels {
                 vessel.stance = stance;
@@ -4487,7 +4493,7 @@ impl InProcessDaemon {
             }
         }
         let (workflow_ref, mut workflow) =
-            self.resolve_convoy_admission_workflow(namespace, &project.spec, &repositories_snapshot, intent, stance).await?;
+            self.resolve_convoy_admission_workflow(namespace, project_ref, &project.spec, &repositories_snapshot, intent, stance).await?;
 
         let fallback_slug = change_request
             .as_ref()

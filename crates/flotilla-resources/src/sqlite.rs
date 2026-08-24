@@ -317,9 +317,15 @@ impl SqliteBackend {
         if !workflow_templates_reset {
             let transaction =
                 connection.transaction().map_err(|err| Self::map_sqlite(err, "start workflow template definitions migration"))?;
-            for table in
-                ["resource_objects", "resource_events", "resource_tombstones", "replica_objects", "replica_cursors", "replica_tombstones"]
-            {
+            for table in [
+                "resource_objects",
+                "resource_events",
+                "resource_decode_quarantine",
+                "resource_tombstones",
+                "replica_objects",
+                "replica_cursors",
+                "replica_tombstones",
+            ] {
                 transaction
                     .execute(
                         &format!("DELETE FROM {table} WHERE group_name = 'flotilla.work' AND version = 'v1' AND kind = 'WorkflowTemplate'"),
