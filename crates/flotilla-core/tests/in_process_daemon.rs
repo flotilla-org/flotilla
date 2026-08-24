@@ -1386,7 +1386,7 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
         .expect("contained policy create");
 }
 
-async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBackend, issue_source: Option<IssueSource>) {
+async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBackend, issue_sources: Option<IssueSource>) {
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     backend
         .clone()
@@ -1407,7 +1407,7 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
-            issue_source,
+            issue_sources: issue_sources.into_iter().map(Into::into).collect(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -1486,7 +1486,10 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .create(&InputMeta::builder().name("zellij".to_string()).build(), &ProjectSpec {
             display_name: "Zellij".into(),
             default_workflow_ref: "single-agent-contained".into(),
-            issue_source: Some(IssueSource { service: "https://forgejo.lab".into(), scope: "fork-issues/zellij".into() }),
+            issue_sources: vec![flotilla_resources::IssueSourceBindingSpec::builder()
+                .source(IssueSource { service: "https://forgejo.lab".into(), scope: "fork-issues/zellij".into() })
+                .alias("zellij".to_string())
+                .build()],
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -1606,7 +1609,7 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".to_string(),
             default_workflow_ref: "single-agent-contained".to_string(),
-            issue_source: None,
+            issue_sources: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository_key.clone(),
@@ -1791,7 +1794,7 @@ async fn trusted_host_direct_convoy_start_requires_explicit_workflow_acknowledge
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-trusted".into(),
-            issue_source: None,
+            issue_sources: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -1915,7 +1918,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
-            issue_source: None,
+            issue_sources: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -2038,7 +2041,7 @@ async fn convoy_start_accepts_project_list_identifier() {
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
-            issue_source: None,
+            issue_sources: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -2176,7 +2179,10 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
-            issue_source: Some(reference.source.clone()),
+            issue_sources: vec![flotilla_resources::IssueSourceBindingSpec::builder()
+                .source(reference.source.clone())
+                .alias("planning".to_string())
+                .build()],
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -2383,7 +2389,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .create(&InputMeta::builder().name("explicit-workflow".to_string()).build(), &ProjectSpec {
             display_name: "Explicit workflow".into(),
             default_workflow_ref: "missing-default".into(),
-            issue_source: None,
+            issue_sources: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -2545,7 +2551,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
-            issue_source: None,
+            issue_sources: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -4229,7 +4235,7 @@ async fn tracking_does_not_materialize_when_project_name_is_occupied() {
         .create(&InputMeta::builder().name("repo".to_string()).build(), &ProjectSpec {
             display_name: "repo suite".to_string(),
             default_workflow_ref: "single-agent-contained".to_string(),
-            issue_source: None,
+            issue_sources: Vec::new(),
             dispatch_policy: None,
             repositories: vec![
                 ProjectRepositorySpec { repo: tracked.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },

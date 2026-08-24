@@ -936,7 +936,7 @@ async fn tracked_repo_labels_materialized_project_without_overwriting_user_field
     let user_spec = ProjectSpec::builder()
         .display_name("My Tracked Repository".to_string())
         .default_workflow_ref("single-agent-contained".to_string())
-        .maybe_issue_source(Some(IssueSource { service: "https://linear.app".to_string(), scope: "TRACK".to_string() }))
+        .issue_sources(vec![IssueSource { service: "https://linear.app".to_string(), scope: "TRACK".to_string() }.into()])
         .repositories(vec![flotilla_resources::ProjectRepositorySpec {
             repo: repository_key,
             alias: None,
@@ -1522,7 +1522,7 @@ async fn tracking_repo_does_not_widen_project_name_or_overwrite_custom_project()
     let custom_spec = flotilla_resources::ProjectSpec {
         display_name: "Shared product".to_string(),
         default_workflow_ref: "custom-workflow".to_string(),
-        issue_source: None,
+        issue_sources: Vec::new(),
         dispatch_policy: None,
         repositories: vec![flotilla_resources::ProjectRepositorySpec {
             repo: RepositoryKey("other-repository".to_string()),
@@ -1548,7 +1548,7 @@ async fn tracking_repo_does_not_use_naming_cascade_when_slug_candidates_collide(
             .create(&InputMeta::builder().name(name.to_string()).build(), &flotilla_resources::ProjectSpec {
                 display_name: name.to_string(),
                 default_workflow_ref: "custom-workflow".to_string(),
-                issue_source: None,
+                issue_sources: Vec::new(),
                 dispatch_policy: None,
                 repositories: vec![flotilla_resources::ProjectRepositorySpec {
                     repo: RepositoryKey(repo_ref.to_string()),
@@ -1795,7 +1795,7 @@ async fn repeated_project_add_preserves_user_edits_to_materialized_project() {
     let mut evolved = original.spec.clone();
     evolved.display_name = "Evolved".to_string();
     evolved.default_workflow_ref = "governor-refined".to_string();
-    evolved.issue_source = Some(IssueSource { service: "linear".to_string(), scope: "FLOT".to_string() });
+    evolved.issue_sources = vec![IssueSource { service: "linear".to_string(), scope: "FLOT".to_string() }.into()];
     projects
         .update(&InputMeta::builder().name("core".to_string()).build(), &original.metadata.resource_version, &evolved)
         .await
@@ -1869,9 +1869,11 @@ async fn project_apply_preserves_existing_metadata() {
     let yaml = r#"
 display_name: After
 default_workflow_ref: single-agent-trusted
-issue_source:
-  service: https://linear.app
-  scope: KEEP
+issue_sources:
+  - source:
+      service: https://linear.app
+      scope: KEEP
+    alias: keep
 repositories:
   - repo: repository
 "#;

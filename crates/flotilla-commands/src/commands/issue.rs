@@ -64,7 +64,7 @@ impl IssueNoun {
                     // SENTINEL: repo is empty — dispatch must fill it from --repo or FLOTILLA_REPO.
                     action: CommandAction::QueryIssues {
                         repo: RepoSelector::Query("".into()),
-                        params: IssueQuery { search: Some(query.join(" ")), label: None },
+                        params: IssueQuery { search: Some(query.join(" ")), label: None, match_fields: Default::default() },
                         page: 1,
                         count: 50,
                     },
@@ -158,7 +158,11 @@ mod tests {
             resolved,
             CommandAction::QueryIssues {
                 repo: RepoSelector::Query("".into()),
-                params: flotilla_protocol::issue_query::IssueQuery { search: Some("my query".into()), label: None },
+                params: flotilla_protocol::issue_query::IssueQuery {
+                    search: Some("my query".into()),
+                    label: None,
+                    match_fields: Default::default(),
+                },
                 page: 1,
                 count: 50,
             },

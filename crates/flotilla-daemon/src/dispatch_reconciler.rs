@@ -43,7 +43,12 @@ impl DispatchIssueSource for DaemonDispatchIssueSource {
             let mut page = 1;
             loop {
                 let result = provider
-                    .query(&source, &IssueQuery { search: None, label: Some(READY_ISSUE_LABEL.to_string()) }, page, ISSUE_PAGE_SIZE)
+                    .query(
+                        &source,
+                        &IssueQuery { search: None, label: Some(READY_ISSUE_LABEL.to_string()), match_fields: Default::default() },
+                        page,
+                        ISSUE_PAGE_SIZE,
+                    )
                     .await?;
                 issues.extend(result.items);
                 if !result.has_more {
@@ -455,7 +460,10 @@ mod tests {
             .create(&InputMeta::builder().name("widgets".to_string()).build(), &ProjectSpec {
                 display_name: "Widgets".to_string(),
                 default_workflow_ref: "implement".to_string(),
-                issue_source: Some(source()),
+                issue_sources: vec![flotilla_resources::IssueSourceBindingSpec::builder()
+                    .source(source())
+                    .alias("widgets".to_string())
+                    .build()],
                 repositories: vec![flotilla_resources::ProjectRepositorySpec {
                     repo: RepositoryKey("acme/widgets".to_string()),
                     alias: None,

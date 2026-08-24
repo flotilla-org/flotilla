@@ -555,19 +555,19 @@ pub async fn assert_project_definition_optional_field_can_be_cleared_with_backen
     let feta = backend.with_local_root(feta_root.clone());
     let meta = InputMeta::builder().name("widgets".to_string()).build();
     let mut original = project_spec("Widgets", "default");
-    original.issue_source = Some(IssueSource { service: "github".to_string(), scope: "acme/widgets".to_string() });
+    original.issue_sources = vec![IssueSource { service: "github".to_string(), scope: "acme/widgets".to_string() }.into()];
 
     kiwi.definitions::<Project>("flotilla").apply(&meta, &original).await.expect("create Project with issue source");
     let baseline = kiwi.using::<Project>("flotilla").list().await.expect("list Project baseline");
     feta.replica_writer::<Project>(kiwi_root.clone(), "flotilla").replace(&baseline, Utc::now()).await.expect("replicate baseline");
 
     let mut cleared = feta.definitions::<Project>("flotilla").get("widgets").await.expect("get replicated Project").spec;
-    cleared.issue_source = None;
+    cleared.issue_sources = Vec::new();
     feta.definitions::<Project>("flotilla").apply(&meta, &cleared).await.expect("clear replicated issue source");
     assert_eq!(
-        feta.definitions::<Project>("flotilla").get("widgets").await.expect("get locally cleared Project").spec.issue_source,
-        None,
-        "an explicit null must causally supersede the replicated value"
+        feta.definitions::<Project>("flotilla").get("widgets").await.expect("get locally cleared Project").spec.issue_sources,
+        Vec::new(),
+        "an explicit empty list must causally supersede the replicated value"
     );
 
     let feta_log = feta.using::<Project>("flotilla").list().await.expect("list cleared Project log");
@@ -576,7 +576,7 @@ pub async fn assert_project_definition_optional_field_can_be_cleared_with_backen
         kiwi.definitions::<Project>("flotilla").get("widgets").await.expect("cleared Project on kiwi"),
         feta.definitions::<Project>("flotilla").get("widgets").await.expect("cleared Project on feta"),
     ] {
-        assert_eq!(merged.spec.issue_source, None);
+        assert_eq!(merged.spec.issue_sources, Vec::new());
         assert!(merged.metadata.merge.as_ref().expect("definition merge metadata").conflicts.is_empty());
     }
 }
