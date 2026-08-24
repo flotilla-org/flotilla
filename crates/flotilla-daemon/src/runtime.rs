@@ -1096,7 +1096,7 @@ fn mark_builtin_managed(mut meta: InputMeta) -> InputMeta {
 /// Reconciles code-owned manifests as the builtin special case of the ruled
 /// manifest loop in https://github.com/flotilla-org/flotilla/issues/1192.
 async fn reconcile_builtin_workflow_templates(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
-    let templates = backend.clone().using::<WorkflowTemplate>(namespace);
+    let templates = backend.clone().definitions::<WorkflowTemplate>(namespace);
     for (name, spec) in builtin_workflow_templates() {
         match templates.get(name).await {
             Ok(existing) => {
@@ -1108,20 +1108,20 @@ async fn reconcile_builtin_workflow_templates(backend: &ResourceBackend, namespa
                 }
                 if !spec_diverged {
                     templates
-                        .update(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &existing.metadata.resource_version, &spec)
+                        .apply(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &spec)
                         .await
                         .map_err(|err| format!("reconcile builtin workflow template {name}: {err}"))?;
                     continue;
                 }
                 templates
-                    .update(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &existing.metadata.resource_version, &spec)
+                    .apply(&mark_builtin_managed(InputMeta::from(&existing.metadata)), &spec)
                     .await
                     .map_err(|err| format!("reconcile builtin workflow template {name}: {err}"))?;
                 warn!(template = %name, "stored spec diverged from code builtin; overwriting");
             }
             Err(ResourceError::NotFound { .. }) => {
                 templates
-                    .create(&mark_builtin_managed(empty_meta(name)), &spec)
+                    .apply(&mark_builtin_managed(empty_meta(name)), &spec)
                     .await
                     .map_err(|err| format!("seed builtin workflow template {name}: {err}"))?;
             }
@@ -4015,8 +4015,8 @@ mod tests {
     async fn builtin_workflow_templates_seeded_at_multiple_roots_do_not_raise_authorship_collisions() {
         assert_eq!(
             WorkflowTemplate::REPLICATION_CLASS,
-            ReplicationClass::None,
-            "code-seeded builtins must remain outside single-home replication and collision enforcement"
+            ReplicationClass::Definitions,
+            "code-seeded builtins share the fleet definitions view"
         );
         for root in ["builtin-root-a", "builtin-root-b", "builtin-root-c"] {
             let backend = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new(root));
@@ -6711,7 +6711,7 @@ mod tests {
             .expect("raw delete should remove builtin");
         assert_eq!(deleted.object.value["metadata"]["name"], "single-agent-contained");
         assert!(matches!(
-            backend.using::<WorkflowTemplate>(NAMESPACE).get("single-agent-contained").await,
+            backend.definitions::<WorkflowTemplate>(NAMESPACE).get("single-agent-contained").await,
             Err(ResourceError::NotFound { .. })
         ));
 
