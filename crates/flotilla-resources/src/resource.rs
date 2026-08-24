@@ -156,6 +156,8 @@ pub struct FieldMergeMetadata {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub seen: BTreeMap<NodeId, u64>,
     pub written_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<crate::WriterIdentity>,
 }
 
 /// One causally-maximal value shown when a definitions field conflicts.

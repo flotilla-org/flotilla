@@ -129,7 +129,7 @@ pub use registry::{
     quarantine_undecodable_stored_objects, replica_cursor_for_resource_kind, resource_document_spec_hash, resource_list_api_version,
     watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources,
     DynamicResourceDelete, DynamicResourceList, DynamicResourceObject, DynamicResourceWatch, HomeBoundAuthorshipCollision,
-    RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
+    RegisteredResourceKind, MANIFEST_WRITER_SOURCE, REGISTERED_RESOURCE_KINDS,
 };
 pub use replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass, ResourceProvenance};
 pub use repository::{
