@@ -105,7 +105,7 @@ impl CrewBriefTemplateResolver {
         for repo_root in repo_roots {
             push_template_override(&mut overrides, repo_root.join(".flotilla").join(BRIEF_TEMPLATE_DIR).join(override_filename));
         }
-        CrewBriefRenderOptions { template: template.to_string(), overrides, fork_stance }
+        CrewBriefRenderOptions { template: template.to_string(), overrides, fork_stance, has_credential_scope: false }
     }
 }
 
@@ -122,11 +122,12 @@ pub struct CrewBriefRenderOptions {
     pub template: String,
     pub overrides: Vec<CrewBriefTemplateOverride>,
     pub fork_stance: bool,
+    pub has_credential_scope: bool,
 }
 
 impl Default for CrewBriefRenderOptions {
     fn default() -> Self {
-        Self { template: DEFAULT_CREW_BRIEF_TEMPLATE.to_string(), overrides: Vec::new(), fork_stance: false }
+        Self { template: DEFAULT_CREW_BRIEF_TEMPLATE.to_string(), overrides: Vec::new(), fork_stance: false, has_credential_scope: false }
     }
 }
 
@@ -145,6 +146,8 @@ struct CrewBriefTemplateContext<'a> {
     assignment_text: &'a str,
     members: &'a [CrewBriefMember],
     handoff_members: Vec<&'a CrewBriefMember>,
+    has_credential_scope: bool,
+    has_in_crew_reviewer: bool,
 }
 
 pub fn build_crew_brief(
@@ -183,6 +186,8 @@ pub fn build_crew_brief_with_options(
         assignment_text,
         members,
         handoff_members: members.iter().filter(|member| member.is_agent && member.role != role).collect(),
+        has_credential_scope: options.has_credential_scope,
+        has_in_crew_reviewer: members.iter().any(|member| member.is_agent && member.role == "reviewer"),
     })?;
     if !content.ends_with('\n') {
         content.push('\n');
@@ -266,6 +271,7 @@ pub fn append_convoy_work_context(
     content: &mut String,
     convoy: &flotilla_resources::ResourceObject<flotilla_resources::Convoy>,
     repository_refs: &[flotilla_resources::RepositoryKey],
+    credential_scopes: &BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>,
 ) {
     content.push_str("\n\n## Work context\n\n");
     if let Some(branch) = &convoy.spec.r#ref {
@@ -274,6 +280,19 @@ pub fn append_convoy_work_context(
     content.push_str("- Repositories:\n");
     for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
         content.push_str(&format!("  - `{}` — {} (target `{}`)\n", repository.repo_ref, repository.url, repository.target_ref));
+    }
+    if !credential_scopes.is_empty() {
+        content.push_str("- Minted credential repository scope:\n");
+        for (credential, scope) in credential_scopes {
+            content.push_str(&format!("  - `{credential}`:\n"));
+            for repo_ref in scope {
+                let repository = convoy.spec.repositories.iter().find(|repository| &repository.repo_ref == repo_ref);
+                match repository {
+                    Some(repository) => content.push_str(&format!("    - `{}` — {}\n", repository.repo_ref, repository.url)),
+                    None => content.push_str(&format!("    - `{repo_ref}`\n")),
+                }
+            }
+        }
     }
     if let Some(change_request) = &convoy.spec.change_request {
         content.push_str(&format!(
@@ -599,7 +618,7 @@ impl AgentAdapter for CliAgentAdapter {
                 }
                 let invocation_state = if let Some(config_dir) = self.claude_invocation_config_dir(environment) {
                     let config_dir_string = config_dir.display().to_string();
-                    self.runner.run("mkdir", &["-p", &config_dir_string], Path::new("/"), &ChannelLabel::Noop).await?;
+                    self.runner.run("mkdir", &["-p", &config_dir_string], Path::new("/"), &ChannelLabel::Default).await?;
                     Some(ClaudeStateConfig { path: config_dir.join(".claude.json"), lock: Arc::clone(state_lock) })
                 } else {
                     None
@@ -684,7 +703,7 @@ fn codex_screen_needs_input(screen: &str) -> bool {
 async fn seed_codex_workspace_trust(runner: &dyn CommandRunner, cwd: &Path, config: &CodexTrustConfig) -> Result<(), String> {
     let _guard = config.lock.lock().await;
     let output = runner
-        .run_output("pwd", &["-P"], cwd, &ChannelLabel::Noop)
+        .run_output("pwd", &["-P"], cwd, &ChannelLabel::Default)
         .await
         .map_err(|error| format!("resolve canonical Codex workspace {}: {error}", cwd.display()))?;
     if !output.success {
@@ -717,7 +736,7 @@ async fn seed_codex_workspace_trust(runner: &dyn CommandRunner, cwd: &Path, conf
 async fn seed_claude_headless_state(runner: &dyn CommandRunner, cwd: &Path, config: &ClaudeStateConfig) -> Result<(), String> {
     let _guard = config.lock.lock().await;
     let output = runner
-        .run_output("pwd", &["-P"], cwd, &ChannelLabel::Noop)
+        .run_output("pwd", &["-P"], cwd, &ChannelLabel::Default)
         .await
         .map_err(|error| format!("resolve canonical Claude workspace {}: {error}", cwd.display()))?;
     if !output.success {
@@ -749,7 +768,7 @@ async fn seed_claude_headless_state(runner: &dyn CommandRunner, cwd: &Path, conf
 }
 
 async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, cwd: &Path) -> Result<(), String> {
-    let Ok(output) = runner.run_output("git", &["rev-parse", "--git-path", "info/exclude"], cwd, &ChannelLabel::Noop).await else {
+    let Ok(output) = runner.run_output("git", &["rev-parse", "--git-path", "info/exclude"], cwd, &ChannelLabel::Default).await else {
         return Ok(());
     };
     if !output.success {
@@ -764,7 +783,7 @@ async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, cwd: &Path) -> 
         "set -eu; exclude={}; mkdir -p \"$(dirname \"$exclude\")\"; touch \"$exclude\"; grep -qxF '.flotilla/' \"$exclude\" || printf '%s\\n' '.flotilla/' >> \"$exclude\"",
         flotilla_protocol::arg::shell_quote(exclude_path),
     );
-    let _ = runner.run("sh", &["-lc", &script], cwd, &ChannelLabel::Noop).await;
+    let _ = runner.run("sh", &["-lc", &script], cwd, &ChannelLabel::Default).await;
     Ok(())
 }
 
@@ -777,7 +796,7 @@ async fn remove_agent_files(runner: &dyn CommandRunner, cwd: &Path, brief: &Term
 
     for path in &paths {
         let path_str = path.to_str().ok_or_else(|| format!("agent file path is not valid UTF-8: {}", path.display()))?;
-        runner.run("rm", &["-f", path_str], Path::new("/"), &ChannelLabel::Noop).await?;
+        runner.run("rm", &["-f", path_str], Path::new("/"), &ChannelLabel::Default).await?;
     }
 
     let mut directories = paths
@@ -792,7 +811,7 @@ async fn remove_agent_files(runner: &dyn CommandRunner, cwd: &Path, brief: &Term
         let Some(directory) = directory.to_str() else {
             continue;
         };
-        let _ = runner.run("rmdir", &[directory], Path::new("/"), &ChannelLabel::Noop).await;
+        let _ = runner.run("rmdir", &[directory], Path::new("/"), &ChannelLabel::Default).await;
     }
     Ok(())
 }
@@ -850,7 +869,11 @@ impl AgentAdapterRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, process::Command as ProcessCommand, sync::Arc};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        process::Command as ProcessCommand,
+        sync::Arc,
+    };
 
     use chrono::Utc;
     use flotilla_protocol::{IssueRef, IssueSource, IssueState};
@@ -896,7 +919,7 @@ mod tests {
         let CrewSource::Agent { prompt, .. } = &coder.source else {
             panic!("default coder should be an agent");
         };
-        let brief = build_crew_brief(
+        let brief = build_crew_brief_with_options(
             &TerminalCrewContext {
                 namespace: "flotilla".to_string(),
                 convoy: "fix-delivery".to_string(),
@@ -906,7 +929,9 @@ mod tests {
             "coder",
             prompt.as_deref().map_or(CrewAssignment::Unassigned, CrewAssignment::Prompt),
             &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
-        );
+            &CrewBriefRenderOptions { has_credential_scope: true, ..CrewBriefRenderOptions::default() },
+        )
+        .expect("render scoped coder brief");
 
         assert!(brief.content.contains("The pull-request destination is the repository URL and target ref named in `## Work context`"));
         assert!(brief.content.contains("the issue source may be a different forge"));
@@ -917,6 +942,8 @@ mod tests {
         assert!(brief.content.contains("only when it explicitly supports the destination forge"));
         assert!(brief.content.contains("Do not merge it"));
         assert!(brief.content.contains("Clone scratch repositories outside the vessel checkout"));
+        assert!(brief.content.contains("park the verified commit"));
+        assert!(brief.content.contains("redispatched under the owning project"));
     }
 
     fn brief_for(assignment: CrewAssignment<'_>) -> String {
@@ -935,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn default_brief_template_matches_legacy_bytes() {
+    fn default_brief_template_includes_decision_ledger_contract() {
         let content = build_crew_brief(
             &TerminalCrewContext {
                 namespace: "flotilla".to_string(),
@@ -953,10 +980,39 @@ mod tests {
         )
         .content;
 
-        assert_eq!(
-            content,
-            "# Flotilla crew brief\n\nYou are `coder` in convoy `fix-delivery`, aboard vessel `work` (`vessel-fix-delivery-work`).\n\n## Crew\n\n- `coder`: active\n- `reviewer`: latent\n- `watcher`: active\n\nRun `flotilla crew list` for current crew state.\nClone scratch repositories outside the vessel checkout (for example under a `mktemp -d` directory); embedded repositories make teardown refuse by default.\nHand off to reviewer with `flotilla crew reviewer handoff --message '...'`.\nFor assignments that change a repository, delivery is part of the assignment. The pull-request destination is the repository URL and target ref named in `## Work context`; the issue source may be a different forge. Inspect the existing remotes and push to the one whose URL matches that destination; never add or repoint a remote. Open a pull request that closes the issue (ready for review, never a draft), and shepherd it until all checks pass; if it is a draft for any reason, mark it ready once checks are green. For a Forgejo destination, use the injected `FORGEJO_SERVER_URL`, `FORGEJO_API_URL`, `FORGEJO_USERNAME`, and `FORGEJO_TOKEN_FILE` values for API operations; Git is configured with a destination-scoped credential helper. Do not use `gh`, a GitHub-only shepherding helper, or ambient human credentials for Forgejo delivery. Use a shepherding tool only when it explicitly supports the destination forge; otherwise inspect the Forgejo PR, reviews, and checks through its API. If those credentials are unavailable or rejected, fail the assignment instead of delivering to another forge. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`. For other assignments, complete with `flotilla crew complete --message '...'`. If the assignment cannot be completed, report the failure with `flotilla crew fail --message '...'`. Run the applicable `flotilla crew complete` command as your final act so the convoy can enter landing.\n\n## Assignment\n\nFix the flux capacitor.\n"
+        assert!(content.contains("## Decision ledger"));
+        assert!(content.contains("ordered least-confident first"));
+        assert!(content.contains("**Brief silence:**"));
+        assert!(content.contains("**Choice:**"));
+        assert!(content.contains("**Alternative:**"));
+        assert!(content.contains("**If asking were free:**"));
+        assert!(content.contains("No decisions beyond the brief."));
+        assert!(content.contains("--decision-ledger-ref '<comment URL>'"));
+        assert!(content.contains("A claim without this pointer is accepted but flagged"));
+        assert!(content.contains("## Assignment\n\nFix the flux capacitor."));
+    }
+
+    #[test]
+    fn duplicate_github_review_is_suppressed_only_for_in_crew_review() {
+        let single = brief_for(CrewAssignment::Prompt("Fix the flux capacitor."));
+        assert!(!single.contains("`in-vessel-review` label"));
+
+        let reviewed = build_crew_brief(
+            &TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "fix-delivery".to_string(),
+                vessel_ref: "vessel-fix-delivery-work".to_string(),
+            },
+            "work",
+            "coder",
+            CrewAssignment::Prompt("Fix the flux capacitor."),
+            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }, CrewBriefMember {
+                role: "reviewer".to_string(),
+                state: "latent".to_string(),
+                is_agent: true,
+            }],
         );
+        assert!(reviewed.content.contains("apply the `in-vessel-review` label in the PR-create command itself"));
     }
 
     #[test]
@@ -979,6 +1035,7 @@ mod tests {
         .expect("render brief");
 
         assert!(brief.content.contains("Complete when the local demo is ready."));
+        assert!(brief.content.contains("## Decision ledger"));
         assert!(brief.content.contains("## Assignment\n\nDemo the override."));
         assert!(!brief.content.contains("For assignments that change a repository"));
     }
@@ -996,7 +1053,12 @@ mod tests {
             "driver",
             CrewAssignment::Prompt("Pair with the user."),
             &[CrewBriefMember { role: "driver".to_string(), state: "active".to_string(), is_agent: true }],
-            &CrewBriefRenderOptions { template: "interactive-session.md".to_string(), overrides: Vec::new(), fork_stance: false },
+            &CrewBriefRenderOptions {
+                template: "interactive-session.md".to_string(),
+                overrides: Vec::new(),
+                fork_stance: false,
+                has_credential_scope: false,
+            },
         )
         .expect("render selected template")
         .content;
@@ -1022,7 +1084,12 @@ mod tests {
                 state: "active".to_string(),
                 is_agent: true,
             }],
-            &CrewBriefRenderOptions { template: "diff-review".to_string(), overrides: Vec::new(), fork_stance: true },
+            &CrewBriefRenderOptions {
+                template: "diff-review".to_string(),
+                overrides: Vec::new(),
+                fork_stance: true,
+                has_credential_scope: false,
+            },
         )
         .expect("render fork review brief")
         .content;
@@ -1047,7 +1114,12 @@ mod tests {
             "shepherd",
             CrewAssignment::Unassigned,
             &[CrewBriefMember { role: "shepherd".to_string(), state: "active".to_string(), is_agent: true }],
-            &CrewBriefRenderOptions { template: "shepherd".to_string(), overrides: Vec::new(), fork_stance: false },
+            &CrewBriefRenderOptions {
+                template: "shepherd".to_string(),
+                overrides: Vec::new(),
+                fork_stance: false,
+                has_credential_scope: true,
+            },
         )
         .expect("render shepherd brief")
         .content;
@@ -1059,6 +1131,10 @@ mod tests {
         assert!(brief.contains("with the `pr-shepherd` skill for a GitHub destination, or through the injected Forgejo API credentials for a Forgejo destination"));
         assert!(!brief.contains("pull request using the `pr-shepherd` skill"));
         assert!(brief.contains("Future events belong to a later engagement"));
+        assert!(brief.contains("claim's linked `## Decision ledger` comment"));
+        assert!(brief.contains("A missing ledger is a finding, not grounds to reject or wedge the claim"));
+        assert!(brief.contains("park the verified commit"));
+        assert!(brief.contains("redispatched under the owning project"));
         assert!(brief.contains("flotilla crew complete --message '<PR URL>'"));
         assert!(!brief.contains("wait-for-checks"));
         assert!(!brief.contains("No assignment was provided"));
@@ -1114,6 +1190,7 @@ mod tests {
                     source: "{% block delivery %}Pairing-specific delivery gate.{% endblock %}".to_string(),
                 }],
                 fork_stance: false,
+                has_credential_scope: false,
             },
         )
         .expect("render custom block-only template");
@@ -1196,6 +1273,8 @@ mod tests {
             },
             spec: ConvoySpec {
                 workflow_ref: "workflow".to_string(),
+                role: "work".to_string(),
+                generation: 1,
                 dispatching_principal_ref: Default::default(),
                 inputs: BTreeMap::new(),
                 placement_policy: None,
@@ -1221,9 +1300,16 @@ mod tests {
             status: None,
         };
         let mut content = String::new();
-        append_convoy_work_context(&mut content, &convoy, &[repo_ref]);
+        append_convoy_work_context(
+            &mut content,
+            &convoy,
+            std::slice::from_ref(&repo_ref),
+            &BTreeMap::from([("github-app".to_string(), BTreeSet::from([repo_ref.clone()]))]),
+        );
 
         assert!(content.contains("- `repo_widgets` — https://github.com/flotilla-org/flotilla (target `main`)"));
+        assert!(content.contains("- Minted credential repository scope:"));
+        assert!(content.contains("  - `github-app`:\n    - `repo_widgets` — https://github.com/flotilla-org/flotilla"));
         assert!(content.contains("- Bound pull request: `#1071` — Existing pull request (`repo_widgets`)"));
         assert!(content.contains("First issue body.\n\nSource-qualified reference: `https://github.com` / `flotilla-org/flotilla` / `810`"));
     }
@@ -1427,6 +1513,12 @@ mod tests {
             ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string()),
             ("CLAUDE_CONFIG_DIR".to_string(), "/home/crew/flotilla/credentials/claude-max/claude".to_string()),
         ];
+
+        let missing = claude
+            .prepare_with_environment(&workspace, &brief, &Vec::new())
+            .await
+            .expect_err("contained Claude must refuse a session without delivered authentication");
+        assert_eq!(missing, "contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`");
 
         claude.prepare_with_environment(&workspace, &brief, &invocation_environment).await.expect("prepare contained Claude");
         let plan = claude

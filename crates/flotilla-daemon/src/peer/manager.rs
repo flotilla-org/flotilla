@@ -22,7 +22,14 @@ pub enum HandleResult {
     /// Peer intentionally retired this connection; reconnect should be suppressed briefly.
     ReconnectSuppressed { peer: NodeId },
     /// A routed command targeted this daemon and should be executed locally.
-    CommandRequested { request_id: u64, requester_node_id: NodeId, reply_via: NodeId, command: Command, session_id: Option<uuid::Uuid> },
+    CommandRequested {
+        request_id: u64,
+        requester_node_id: NodeId,
+        reply_via: NodeId,
+        command: Command,
+        principal_ref: Option<flotilla_protocol::PrincipalRef>,
+        session_id: Option<uuid::Uuid>,
+    },
     /// A routed command cancel request targeted this daemon.
     CommandCancelRequested { cancel_id: u64, requester_node_id: NodeId, reply_via: NodeId, command_request_id: u64 },
     /// A routed command lifecycle event reached the original requester.
@@ -597,7 +604,15 @@ impl PeerManager {
 
     fn handle_routed(&mut self, connection_peer: NodeId, connection_generation: u64, msg: RoutedPeerMessage) -> HandleResult {
         match msg {
-            RoutedPeerMessage::CommandRequest { request_id, requester_node_id, target_node_id, remaining_hops, command, session_id } => {
+            RoutedPeerMessage::CommandRequest {
+                request_id,
+                requester_node_id,
+                target_node_id,
+                remaining_hops,
+                command,
+                principal_ref,
+                session_id,
+            } => {
                 if remaining_hops == 0 {
                     return HandleResult::Ignored;
                 }
@@ -607,6 +622,7 @@ impl PeerManager {
                         requester_node_id,
                         reply_via: connection_peer,
                         command: *command,
+                        principal_ref,
                         session_id,
                     };
                 }
@@ -629,6 +645,7 @@ impl PeerManager {
                     target_node_id: target_node_id.clone(),
                     remaining_hops: remaining_hops.saturating_sub(1),
                     command,
+                    principal_ref,
                     session_id,
                 };
                 self.queue_send_to(&target_node_id, PeerWireMessage::Routed(forwarded));
@@ -1307,7 +1324,7 @@ impl PeerManager {
     }
 
     /// Reconnect a specific configured target: disconnect, then connect + subscribe.
-    pub async fn reconnect_target(&mut self, label: &ConfigLabel) -> Result<ConnectedConfiguredPeer, String> {
+    pub async fn reconnect_target(&mut self, label: &ConfigLabel, attempt_timeout: Duration) -> Result<ConnectedConfiguredPeer, String> {
         let current_peer = self.transport_peers.get(label).cloned();
         if let Some(current_peer) = current_peer.as_ref() {
             if let Some(deadline) = self.reconnect_suppressed_until(current_peer) {
@@ -1316,7 +1333,10 @@ impl PeerManager {
         }
 
         self.note_dial_attempt(label);
-        let result = async {
+        // Keep cancellation before activation: once the connection is installed
+        // in the routing maps, dropping this future could strand a ghost generation
+        // that rejects every later outbound candidate as a duplicate.
+        let result = tokio::time::timeout(attempt_timeout, async {
             let target = self.configured_targets.get_mut(label).ok_or_else(|| format!("unknown configured target: {}", label.0))?;
             let transport = &mut target.transport;
 
@@ -1328,8 +1348,9 @@ impl PeerManager {
             let remote_node = transport.remote_node_info();
             let remote_session_id = transport.remote_session_id();
             Ok::<_, String>((sender, rx, remote_node, remote_session_id))
-        }
-        .await;
+        })
+        .await
+        .unwrap_or_else(|_| Err(format!("reconnection attempt timed out after {}s", attempt_timeout.as_secs())));
         let (sender, rx, remote_node, remote_session_id) = match result {
             Ok(connection) => connection,
             Err(error) => {
@@ -1365,7 +1386,7 @@ impl PeerManager {
                 }
                 ActivationResult::Rejected { .. } => {
                     if let Some(target) = self.configured_targets.get_mut(label) {
-                        let _ = target.transport.disconnect().await;
+                        let _ = tokio::time::timeout(attempt_timeout, target.transport.disconnect()).await;
                     }
                     let error = format!("connection for {name} lost duplicate arbitration");
                     self.note_dial_result(label, Err(&error));
@@ -1374,7 +1395,9 @@ impl PeerManager {
             };
             if let Some(displaced_generation) = displaced {
                 if let Some(displaced_sender) = self.take_displaced_sender(&name, displaced_generation) {
-                    let _ = displaced_sender.retire(GoodbyeReason::Superseded).await;
+                    // Activation has committed, so bound retirement locally rather
+                    // than letting it hold the reconnect worker forever.
+                    let _ = tokio::time::timeout(attempt_timeout, displaced_sender.retire(GoodbyeReason::Superseded)).await;
                 }
             }
         }

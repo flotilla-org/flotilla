@@ -20,7 +20,7 @@ use flotilla_core::{
     HostName,
 };
 use flotilla_manifest::{entity, stamp::WorkspaceStamp};
-use flotilla_protocol::{arg, EnvironmentId};
+use flotilla_protocol::{arg, CanonicalHostId, EnvironmentId};
 use flotilla_resources::{
     controller::{LabelJoinWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     Convoy, Environment, Host, LifecycleAuthority, Presentation, PresentationStatus, PresentationStatusPatch, ResourceBackend,
@@ -30,18 +30,6 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 type RegistryLookup = dyn Fn(&str) -> Result<Arc<ProviderRegistry>, String> + Send + Sync;
-
-fn canonical_host_ref(hosts: &[ResourceObject<Host>], host_ref: &str) -> Result<String, String> {
-    if hosts.iter().any(|host| host.metadata.name == host_ref) {
-        return Ok(host_ref.to_string());
-    }
-    let mut matching = hosts.iter().filter(|host| host.spec.display_name == host_ref);
-    let host = matching.next().ok_or_else(|| format!("host {host_ref} lookup failed: not found"))?;
-    if matching.any(|candidate| candidate.metadata.name != host.metadata.name) {
-        return Err(format!("host reference {host_ref} is ambiguous"));
-    }
-    Ok(host.metadata.name.clone())
-}
 
 #[async_trait]
 pub trait PresentationRuntime: Send + Sync {
@@ -157,7 +145,7 @@ impl PresentationPolicy for DefaultPolicy {
 
 #[derive(Clone)]
 pub struct HopChainContext {
-    local_host_ref: String,
+    local_host_ref: CanonicalHostId,
     local_host: HostName,
     config_base: DaemonHostPath,
     repo_root: Option<ExecutionEnvironmentPath>,
@@ -165,11 +153,11 @@ pub struct HopChainContext {
 }
 
 impl HopChainContext {
-    pub fn new<F>(local_host_ref: impl Into<String>, local_host: HostName, config_base: DaemonHostPath, registry_lookup: F) -> Self
+    pub fn new<F>(local_host_ref: CanonicalHostId, local_host: HostName, config_base: DaemonHostPath, registry_lookup: F) -> Self
     where
         F: Fn(&str) -> Result<Arc<ProviderRegistry>, String> + Send + Sync + 'static,
     {
-        Self { local_host_ref: local_host_ref.into(), local_host, config_base, repo_root: None, registry_lookup: Arc::new(registry_lookup) }
+        Self { local_host_ref, local_host, config_base, repo_root: None, registry_lookup: Arc::new(registry_lookup) }
     }
 
     pub fn with_repo_root(mut self, repo_root: ExecutionEnvironmentPath) -> Self {
@@ -204,11 +192,11 @@ impl HopChainContext {
         ExecutionEnvironmentPath::new(self.config_base.as_path())
     }
 
-    fn target_host(&self, host_ref: &str) -> HostName {
-        if host_ref == self.local_host_ref {
+    fn target_host(&self, host_ref: &CanonicalHostId) -> HostName {
+        if host_ref == &self.local_host_ref {
             self.local_host.clone()
         } else {
-            HostName::new(host_ref)
+            HostName::new(host_ref.as_str())
         }
     }
 }
@@ -246,9 +234,9 @@ impl<R> PresentationReconciler<R> {
         vec![Box::new(LabelJoinWatch::<TerminalSession, Presentation> { label_key: CONVOY_LABEL, _marker: PhantomData })]
     }
 
-    async fn canonical_host_ref(&self, host_ref: &str) -> Result<String, String> {
+    async fn canonical_host_ref(&self, host_ref: &str) -> Result<CanonicalHostId, String> {
         let hosts = self.hosts.list().await.map_err(|error| format!("host list failed: {error}"))?;
-        canonical_host_ref(&hosts.items, host_ref)
+        flotilla_resources::canonical_host_id(&hosts.items, host_ref)?.ok_or_else(|| format!("host {host_ref} lookup failed: not found"))
     }
 
     async fn resolve_process(&self, session: &ResourceObject<TerminalSession>) -> Result<ResolvedProcess, String> {
@@ -309,7 +297,7 @@ impl<R> PresentationReconciler<R> {
         &self,
         session: &ResourceObject<TerminalSession>,
         environment: &ResourceObject<Environment>,
-        host_ref: &str,
+        host_ref: &CanonicalHostId,
         attach_args: Vec<arg::Arg>,
     ) -> Result<String, String> {
         let ssh_resolver = ssh_resolver_from_config(self.hop_chain.config_base())?;
@@ -349,7 +337,7 @@ impl<R> PresentationReconciler<R> {
     }
 }
 
-pub enum PresentationDeps {
+pub enum PresentationPrepared {
     InSync,
     Applied(AppliedPresentation),
     TornDown { message: Option<String> },
@@ -362,14 +350,14 @@ where
     R: PresentationRuntime + 'static,
 {
     type Resource = Presentation;
-    type Dependencies = PresentationDeps;
+    type Prepared = PresentationPrepared;
 
-    async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         if obj.metadata.labels.get(AUTHORITY_LABEL).map(String::as_str) == Some(LifecycleAuthority::Managed.as_label_value()) {
             match self.convoys.get(&obj.spec.convoy_ref).await {
                 Ok(_) => {}
                 Err(ResourceError::NotFound { .. }) => {
-                    return Ok(PresentationDeps::Failed(format!("convoy '{}' no longer exists", obj.spec.convoy_ref)));
+                    return Ok(PresentationPrepared::Failed(format!("convoy '{}' no longer exists", obj.spec.convoy_ref)));
                 }
                 Err(error) => return Err(error),
             }
@@ -390,16 +378,16 @@ where
         if sessions.is_empty() {
             if let Some(previous) = previous {
                 self.runtime.tear_down(&previous.presentation_manager, &previous.workspace_ref).await.map_err(ResourceError::other)?;
-                return Ok(PresentationDeps::TornDown { message: None });
+                return Ok(PresentationPrepared::TornDown { message: None });
             }
             if has_any_observed_state(obj.status.as_ref()) {
-                return Ok(PresentationDeps::TornDown { message: obj.status.as_ref().and_then(|status| status.message.clone()) });
+                return Ok(PresentationPrepared::TornDown { message: obj.status.as_ref().and_then(|status| status.message.clone()) });
             }
-            return Ok(PresentationDeps::InSync);
+            return Ok(PresentationPrepared::InSync);
         }
 
         if self.policies.resolve(&obj.spec.presentation_policy_ref).is_none() {
-            return Ok(PresentationDeps::UnknownPolicy(obj.spec.presentation_policy_ref.clone()));
+            return Ok(PresentationPrepared::UnknownPolicy(obj.spec.presentation_policy_ref.clone()));
         }
 
         let mut processes = Vec::with_capacity(sessions.len());
@@ -408,7 +396,7 @@ where
         }
         let spec_hash = presentation_spec_hash(&obj.spec.presentation_policy_ref, &processes);
         if observed_in_sync(obj.status.as_ref(), &spec_hash) {
-            return Ok(PresentationDeps::InSync);
+            return Ok(PresentationPrepared::InSync);
         }
 
         let plan = PresentationPlan::builder()
@@ -425,30 +413,30 @@ where
         // authoritative observed workspace state we need to patch into PresentationStatus, and the
         // controller loop processes a given primary object serially through fetch/reconcile/patch.
         Ok(match self.runtime.apply(&plan).await {
-            Ok(applied) => PresentationDeps::Applied(applied),
-            Err(ApplyPresentationError::UnknownPolicy(name)) => PresentationDeps::UnknownPolicy(name),
-            Err(ApplyPresentationError::RetryFromCleanSlate(message)) => PresentationDeps::TornDown { message: Some(message) },
-            Err(ApplyPresentationError::Failed(message)) => PresentationDeps::Failed(message),
+            Ok(applied) => PresentationPrepared::Applied(applied),
+            Err(ApplyPresentationError::UnknownPolicy(name)) => PresentationPrepared::UnknownPolicy(name),
+            Err(ApplyPresentationError::RetryFromCleanSlate(message)) => PresentationPrepared::TornDown { message: Some(message) },
+            Err(ApplyPresentationError::Failed(message)) => PresentationPrepared::Failed(message),
         })
     }
 
     fn reconcile(
         &self,
         _obj: &ResourceObject<Self::Resource>,
-        deps: &Self::Dependencies,
+        prepared: &Self::Prepared,
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
-        let patch = match deps {
-            PresentationDeps::InSync => None,
-            PresentationDeps::Applied(applied) => Some(PresentationStatusPatch::MarkActive {
+        let patch = match prepared {
+            PresentationPrepared::InSync => None,
+            PresentationPrepared::Applied(applied) => Some(PresentationStatusPatch::MarkActive {
                 presentation_manager: applied.presentation_manager.clone(),
                 workspace_ref: applied.workspace_ref.clone(),
                 spec_hash: applied.spec_hash.clone(),
                 ready_at: now,
             }),
-            PresentationDeps::TornDown { message } => Some(PresentationStatusPatch::MarkTornDown { message: message.clone() }),
-            PresentationDeps::Failed(message) => Some(PresentationStatusPatch::MarkFailed { message: message.clone() }),
-            PresentationDeps::UnknownPolicy(name) => {
+            PresentationPrepared::TornDown { message } => Some(PresentationStatusPatch::MarkTornDown { message: message.clone() }),
+            PresentationPrepared::Failed(message) => Some(PresentationStatusPatch::MarkFailed { message: message.clone() }),
+            PresentationPrepared::UnknownPolicy(name) => {
                 Some(PresentationStatusPatch::MarkFailed { message: format!("unknown presentation policy '{name}'") })
             }
         };
@@ -637,9 +625,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::Utc;
+    use flotilla_protocol::CanonicalHostId;
     use flotilla_resources::{HostSpec, ObjectMeta};
 
-    use super::{canonical_host_ref, yaml_string, HopChainContext, Host, HostName, ResourceObject};
+    use super::{yaml_string, HopChainContext, Host, HostName, ResourceObject};
 
     #[test]
     fn yaml_string_escapes_control_characters() {
@@ -664,9 +653,10 @@ mod tests {
             spec: HostSpec { display_name: "local-host".to_string() },
             status: None,
         }];
-        let canonical = canonical_host_ref(&hosts, "local-host").expect("resolve display-name alias");
+        let canonical =
+            flotilla_resources::canonical_host_id(&hosts, "local-host").expect("resolve display-name alias").expect("host alias exists");
         let context = HopChainContext::new(
-            "local-host-id",
+            CanonicalHostId::resolved("local-host-id"),
             HostName::new("local-host"),
             flotilla_core::path_context::DaemonHostPath::new("/tmp"),
             |_| Err("registry is not used by host routing".to_string()),

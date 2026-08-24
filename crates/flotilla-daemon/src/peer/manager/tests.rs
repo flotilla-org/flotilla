@@ -1,9 +1,17 @@
-use std::sync::Arc;
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
-use flotilla_protocol::{NodeId, NodeInfo, PeerWireMessage};
+use async_trait::async_trait;
+use flotilla_protocol::{ConfigLabel, HostName, NodeId, NodeInfo, PeerWireMessage};
+use tokio::sync::mpsc;
 
 use super::{ActivationResult, ConnectionDirection, ConnectionMeta, HandleResult, InboundPeerEnvelope, PeerManager};
-use crate::peer::test_support::MockPeerSender;
+use crate::peer::{test_support::MockPeerSender, PeerConnectionStatus, PeerSender, PeerTransport};
 
 fn activate(mgr: &mut PeerManager, peer: &str, sender: Arc<MockPeerSender>) -> u64 {
     match mgr.activate_connection(NodeId::new(peer), sender, ConnectionMeta {
@@ -15,6 +23,79 @@ fn activate(mgr: &mut PeerManager, peer: &str, sender: Arc<MockPeerSender>) -> u
         ActivationResult::Accepted { generation, .. } => generation,
         ActivationResult::Rejected { reason } => panic!("connection unexpectedly rejected: {reason:?}"),
     }
+}
+
+struct HangingOnceTransport {
+    attempts: Arc<AtomicUsize>,
+    sender: Arc<dyn PeerSender>,
+    remote: NodeInfo,
+    status: PeerConnectionStatus,
+}
+
+#[async_trait]
+impl PeerTransport for HangingOnceTransport {
+    async fn connect(&mut self) -> Result<(), String> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::future::pending().await
+        } else {
+            self.status = PeerConnectionStatus::Connected;
+            Ok(())
+        }
+    }
+
+    async fn disconnect(&mut self) -> Result<(), String> {
+        self.status = PeerConnectionStatus::Disconnected;
+        Ok(())
+    }
+
+    fn status(&self) -> PeerConnectionStatus {
+        self.status.clone()
+    }
+
+    fn connection_address(&self) -> String {
+        format!("mock://{}", self.remote.node_id)
+    }
+
+    async fn subscribe(&mut self) -> Result<mpsc::Receiver<PeerWireMessage>, String> {
+        let (_tx, rx) = mpsc::channel(1);
+        Ok(rx)
+    }
+
+    fn sender(&self) -> Option<Arc<dyn PeerSender>> {
+        Some(Arc::clone(&self.sender))
+    }
+
+    fn remote_node_info(&self) -> Option<NodeInfo> {
+        Some(self.remote.clone())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn timed_out_reconnect_can_recover_on_the_next_attempt() {
+    let label = ConfigLabel("remote".into());
+    let remote = NodeInfo::new(NodeId::new("remote-node"), "Remote");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (sender, _) = MockPeerSender::new();
+    let mut manager = PeerManager::new(NodeId::new("local"));
+    manager.add_configured_target(
+        label.clone(),
+        HostName::new("Remote"),
+        Some(remote.node_id.clone()),
+        Box::new(HangingOnceTransport {
+            attempts: Arc::clone(&attempts),
+            sender: Arc::new(sender),
+            remote: remote.clone(),
+            status: PeerConnectionStatus::Disconnected,
+        }),
+    );
+
+    let error = manager.reconnect_target(&label, Duration::from_secs(1)).await.expect_err("first transport dial should time out");
+    assert!(error.contains("timed out"));
+
+    let connection =
+        manager.reconnect_target(&label, Duration::from_secs(1)).await.expect("next dial should recover without restarting the manager");
+    assert_eq!(connection.node, remote);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

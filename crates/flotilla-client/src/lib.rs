@@ -12,12 +12,13 @@ use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
     Command, ConnectionRole, DaemonEvent, LeafFire, Message, NodeId, QueryCursor, QueryId, ReplayCursor, RepoInfo, Request, Response,
-    ResponseResult, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, PROTOCOL_VERSION,
+    ResponseResult, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION,
 };
 use flotilla_transport::message::{connect_unix_message_session, MessageSession};
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{debug, error, warn};
 
+pub mod launchd;
 pub mod reconnect;
 pub mod resource;
 pub const BUILD_ID: &str = env!("FLOTILLA_BUILD_ID");
@@ -76,7 +77,7 @@ async fn do_client_hello_with_surface(
         .write(Message::Hello {
             protocol_version: PROTOCOL_VERSION,
             node_id: NodeId::new("client"),
-            display_name: flotilla_protocol::hello_display_name("client", BUILD_ID),
+            display_name: flotilla_protocol::hello_display_name("client", BUILD_ID, PROTOCOL_FINGERPRINT),
             session_id,
             connection_role: Some(ConnectionRole::Client),
             surface,
@@ -86,25 +87,25 @@ async fn do_client_hello_with_surface(
 
     match session.read().await.map_err(|e| format!("failed to read Hello reply: {e}"))? {
         Some(Message::Hello { protocol_version, display_name, .. }) if protocol_version != PROTOCOL_VERSION => {
-            let daemon_build = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
+            let daemon_info = flotilla_protocol::hello_build_info(&display_name);
+            let daemon_build = daemon_info.map_or("unknown", |info| info.build_id);
+            let daemon_fingerprint = daemon_info.map_or("unknown", |info| info.protocol_fingerprint);
             Err(format!(
-                "daemon protocol version mismatch: client built {} speaks proto {PROTOCOL_VERSION}; daemon built {daemon_build} speaks \
-                 proto {protocol_version} — rebuild/reinstall the CLI",
-                BUILD_ID,
+                "daemon protocol version mismatch: client fingerprint {PROTOCOL_FINGERPRINT} speaks proto {PROTOCOL_VERSION} (build \
+                 {BUILD_ID}); daemon fingerprint {daemon_fingerprint} speaks proto {protocol_version} (build {daemon_build})"
             ))
         }
         Some(Message::Hello { display_name, .. }) => {
-            let daemon_generation = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
-            if !flotilla_protocol::wire_generations_match(daemon_generation, BUILD_ID)
-                && matches!(wire_generation_policy, WireGenerationPolicy::RequireMatch)
-            {
+            let daemon_info = flotilla_protocol::hello_build_info(&display_name);
+            let daemon_build = daemon_info.map_or("unknown", |info| info.build_id);
+            let daemon_fingerprint = daemon_info.map_or("unknown", |info| info.protocol_fingerprint);
+            if daemon_fingerprint != PROTOCOL_FINGERPRINT && matches!(wire_generation_policy, WireGenerationPolicy::RequireMatch) {
                 return Err(format!(
-                    "wire generation mismatch: client built {} speaks proto {PROTOCOL_VERSION}; daemon built {daemon_generation} speaks \
-                     proto {PROTOCOL_VERSION} — rebuild/reinstall the CLI",
-                    BUILD_ID,
+                    "wire generation mismatch: client fingerprint {PROTOCOL_FINGERPRINT} speaks proto {PROTOCOL_VERSION} (build \
+                     {BUILD_ID}); daemon fingerprint {daemon_fingerprint} speaks proto {PROTOCOL_VERSION} (build {daemon_build})"
                 ));
             }
-            Ok(Some(daemon_generation.to_owned()))
+            Ok(Some(daemon_build.to_owned()))
         }
         Some(other) => Err(format!("expected Hello reply, got: {other:?}")),
         None => Err("connection closed before Hello reply".into()),
@@ -113,10 +114,10 @@ async fn do_client_hello_with_surface(
 
 /// Stop an existing daemon through the same-protocol deployment seam.
 ///
-/// Normal client sessions still require an identical wire generation. This
-/// path permits a build mismatch only long enough to send the typed shutdown
-/// request and receive its typed acknowledgement. Protocol mismatches remain
-/// rejected by the Hello handshake.
+/// Normal client sessions require an identical protocol fingerprint. This path
+/// permits a fingerprint mismatch only long enough to send the typed shutdown
+/// request and receive its typed acknowledgement. Protocol-version mismatches
+/// remain rejected by the Hello handshake.
 pub async fn shutdown_existing(socket_path: &Path) -> Result<(), String> {
     let session = connect_unix_message_session(socket_path).await?;
     tokio::time::timeout(
@@ -469,16 +470,33 @@ async fn connect_or_spawn_with_optional_surface(
     state_dir: &Path,
     surface: Option<SurfaceDeclaration>,
 ) -> Result<Arc<SocketDaemon>, String> {
-    connect_or_spawn_with_optional_surface_using(socket_path, config_dir, state_dir, surface, &spawn_daemon).await
+    connect_or_spawn_with_optional_surface_using(socket_path, config_dir, state_dir, surface, &launchd_startup_owner, &spawn_daemon).await
 }
 
 type DaemonSpawner = dyn Fn(&Path, &Path, &Path) -> Result<(), String> + Send + Sync;
+type DaemonSupervisor = dyn Fn(&Path, &Path, &Path) -> Result<DaemonStartupOwner, String> + Send + Sync;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonStartupOwner {
+    Client,
+    LaunchdAgent,
+}
+
+fn launchd_startup_owner(socket_path: &Path, config_dir: &Path, state_dir: &Path) -> Result<DaemonStartupOwner, String> {
+    if launchd::agent_manages_daemon(socket_path, config_dir, state_dir)? {
+        launchd::kickstart_agent()?;
+        Ok(DaemonStartupOwner::LaunchdAgent)
+    } else {
+        Ok(DaemonStartupOwner::Client)
+    }
+}
 
 async fn connect_or_spawn_with_optional_surface_using(
     socket_path: &Path,
     config_dir: &Path,
     state_dir: &Path,
     surface: Option<SurfaceDeclaration>,
+    supervisor: &DaemonSupervisor,
     spawner: &DaemonSpawner,
 ) -> Result<Arc<SocketDaemon>, String> {
     // An existing socket must complete the stateful Hello handshake. A
@@ -494,6 +512,10 @@ async fn connect_or_spawn_with_optional_surface_using(
     // delay an error the user has to act on anyway.
     if let Some(daemon) = connect_existing_stateful(socket_path, surface.as_ref()).await? {
         return Ok(daemon);
+    }
+
+    if supervisor(socket_path, config_dir, state_dir)? == DaemonStartupOwner::LaunchdAgent {
+        return wait_for_daemon(socket_path, surface.as_ref(), "launchd agent").await;
     }
 
     // Config identity constrains daemon creation, not client connectivity. A
@@ -603,26 +625,28 @@ async fn connect_or_spawn_with_optional_surface_using(
         spawner(socket_path, config_dir, state_dir)?;
     }
 
-    // Poll for connection with a 10s deadline (soft: the deadline is checked
-    // between probes, and a probe can block up to HELLO_HANDSHAKE_TIMEOUT, so
-    // the true worst-case is deadline + handshake timeout). Handshake errors here are
-    // retried rather than propagated: the daemon on this socket was spawned by
-    // us moments ago, so an error is far more likely a startup race (accepted
-    // before the serve loop is up) than a genuine incompatibility. The last
-    // error is surfaced if the deadline expires without a successful handshake.
+    wait_for_daemon(socket_path, surface.as_ref(), "spawned daemon").await
+}
+
+/// Poll for a daemon started through the selected owner with a 10s deadline
+/// (soft: the deadline is checked between probes, and a probe can block up to
+/// HELLO_HANDSHAKE_TIMEOUT). Handshake errors are retried because the daemon is
+/// expected to be in its startup window. The last error is surfaced if the
+/// deadline expires without a successful handshake.
+async fn wait_for_daemon(socket_path: &Path, surface: Option<&SurfaceDeclaration>, owner: &str) -> Result<Arc<SocketDaemon>, String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut last_handshake_error: Option<String> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        match connect_existing_stateful(socket_path, surface.as_ref()).await {
+        match connect_existing_stateful(socket_path, surface).await {
             Ok(Some(daemon)) => return Ok(daemon),
             Ok(None) => {}
             Err(e) => last_handshake_error = Some(e),
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(match last_handshake_error {
-                Some(e) => format!("daemon spawned but handshake kept failing until the 10s deadline; last error: {e}"),
-                None => "timed out waiting for daemon to start (10s)".into(),
+                Some(e) => format!("{owner} started the daemon, but its handshake kept failing until the 10s deadline; last error: {e}"),
+                None => format!("timed out waiting for {owner} to start the daemon (10s)"),
             });
         }
     }
@@ -1056,7 +1080,10 @@ mod tests;
 
 #[cfg(test)]
 mod spawn_lock_tests {
-    use std::fs;
+    use std::{
+        fs,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
 
@@ -1071,5 +1098,49 @@ mod spawn_lock_tests {
             assert!(lock_path.exists(), "lock file should exist while guard is held");
         }
         assert!(lock_path.exists(), "lock file inode must remain stable across owners");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn launchd_owned_startup_never_calls_the_direct_spawner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("config");
+        let state_dir = dir.path().join("state");
+        let socket_path = config_dir.join("run/flotilla.sock");
+        let direct_spawns = Arc::new(AtomicUsize::new(0));
+        let counted_spawns = Arc::clone(&direct_spawns);
+        let supervisor = |_: &Path, _: &Path, _: &Path| Ok(DaemonStartupOwner::LaunchdAgent);
+        let spawner = move |_: &Path, _: &Path, _: &Path| {
+            counted_spawns.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        };
+
+        let result = connect_or_spawn_with_optional_surface_using(&socket_path, &config_dir, &state_dir, None, &supervisor, &spawner).await;
+        let Err(error) = result else { panic!("an absent fake launchd daemon should time out") };
+
+        assert!(error.contains("launchd agent"), "unexpected error: {error}");
+        assert_eq!(direct_spawns.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn client_owned_startup_reaches_the_direct_spawner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("config");
+        let state_dir = dir.path().join("state");
+        let socket_path = config_dir.join("run/flotilla.sock");
+        fs::create_dir_all(socket_path.parent().expect("socket parent")).expect("create socket parent");
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        let direct_spawns = Arc::new(AtomicUsize::new(0));
+        let counted_spawns = Arc::clone(&direct_spawns);
+        let supervisor = |_: &Path, _: &Path, _: &Path| Ok(DaemonStartupOwner::Client);
+        let spawner = move |_: &Path, _: &Path, _: &Path| {
+            counted_spawns.fetch_add(1, Ordering::Relaxed);
+            Err("direct spawner reached".to_string())
+        };
+
+        let result = connect_or_spawn_with_optional_surface_using(&socket_path, &config_dir, &state_dir, None, &supervisor, &spawner).await;
+        let Err(error) = result else { panic!("the fake direct spawner should fail") };
+
+        assert_eq!(error, "direct spawner reached");
+        assert_eq!(direct_spawns.load(Ordering::Relaxed), 1);
     }
 }

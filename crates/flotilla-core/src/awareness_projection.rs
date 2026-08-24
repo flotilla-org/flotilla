@@ -444,12 +444,17 @@ fn state_rank(state: AwarenessState) -> u8 {
     }
 }
 
-fn group_rank(group: &Group) -> (std::cmp::Reverse<u8>, std::cmp::Reverse<usize>, String) {
-    (std::cmp::Reverse(state_rank(group.state)), std::cmp::Reverse(group.counts.total), group.label.clone())
+fn group_rank(group: &Group) -> (bool, std::cmp::Reverse<u8>, std::cmp::Reverse<usize>, String) {
+    (
+        group.entries.iter().all(entry_is_terminal),
+        std::cmp::Reverse(state_rank(group.state)),
+        std::cmp::Reverse(group.counts.total),
+        group.label.clone(),
+    )
 }
 
-fn entry_rank(entry: &AwarenessEntry) -> (u8, u8) {
-    (std::cmp::Reverse(state_rank(entry.state)).0, match entry.kind {
+fn entry_rank(entry: &AwarenessEntry) -> (bool, std::cmp::Reverse<u8>, u8) {
+    (entry_is_terminal(entry), std::cmp::Reverse(state_rank(entry.state)), match entry.kind {
         AwarenessKind::Issue => 0,
         AwarenessKind::Convoy => 1,
         AwarenessKind::Vessel => 2,
@@ -457,6 +462,22 @@ fn entry_rank(entry: &AwarenessEntry) -> (u8, u8) {
         AwarenessKind::Checkout => 4,
         AwarenessKind::Fleet | AwarenessKind::Project => 5,
     })
+}
+
+fn entry_is_terminal(entry: &AwarenessEntry) -> bool {
+    match entry.phase {
+        Some(AwarenessPhase::Convoy(phase)) => {
+            matches!(phase, ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned)
+        }
+        Some(AwarenessPhase::Work(phase)) => {
+            matches!(phase, WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled | WorkPhase::Abandoned)
+        }
+        Some(AwarenessPhase::Session(phase)) => {
+            matches!(phase, flotilla_protocol::SessionPhase::Stopped | flotilla_protocol::SessionPhase::Failed)
+        }
+        Some(AwarenessPhase::Issue(phase)) => phase == flotilla_protocol::IssueState::Closed,
+        None => matches!(entry.state, AwarenessState::Done | AwarenessState::Failed | AwarenessState::Cancelled),
+    }
 }
 
 #[cfg(test)]
@@ -718,6 +739,24 @@ mod tests {
     }
 
     #[test]
+    fn entry_limit_keeps_live_convoy_ahead_of_terminal_convoys() {
+        let terminal = [ConvoyPhase::Landed, ConvoyPhase::Abandoned, ConvoyPhase::Failed]
+            .into_iter()
+            .enumerate()
+            .map(|(index, phase)| convoy(Some("flotilla/platform"), &format!("terminal-{index}"), phase));
+        let (nodes, state) = project_awareness(AwarenessInput {
+            scope: Some(QueryScope::new("flotilla", "platform")),
+            limit: AwarenessLimit { groups: 1, entries: 2 },
+            convoys: terminal.chain([convoy(Some("flotilla/platform"), "live", ConvoyPhase::Active)]).collect(),
+            ..AwarenessInput::default()
+        });
+
+        assert!(state.truncated);
+        assert_eq!(nodes[0].entries.len(), 2);
+        assert!(nodes[0].entries.iter().any(|entry| entry.label == "live"));
+    }
+
+    #[test]
     fn salience_is_joined_onto_entries_and_aggregated_to_their_node() {
         let base = Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).single().expect("timestamp");
         let demand_at = Utc.with_ymd_and_hms(2026, 7, 22, 12, 1, 0).single().expect("timestamp");
@@ -760,6 +799,7 @@ mod tests {
                     work_unsettled: true,
                     as_of: attention_at,
                 }],
+                pane_exits: Vec::new(),
             },
             state: ResultSetState {
                 demand: Some(flotilla_protocol::DemandBackedMetadata { as_of: base, has_more: false }),

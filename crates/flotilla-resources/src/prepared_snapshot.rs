@@ -90,7 +90,8 @@ impl PreparedSnapshotGarbageCollector {
     }
 }
 
-fn is_prepared_snapshot(name: &str, labels: &std::collections::BTreeMap<String, String>, kind: &str) -> bool {
+/// Whether a resource is a prepared snapshot of `kind`, including legacy names.
+pub fn is_prepared_snapshot(name: &str, labels: &std::collections::BTreeMap<String, String>, kind: &str) -> bool {
     labels.get(PREPARED_SNAPSHOT_LABEL).is_some_and(|value| value == kind)
         || has_content_hash_suffix(name, &format!("{kind}-snapshot-"))
         || has_content_hash_suffix(name, &format!("-remote-{kind}-"))

@@ -157,10 +157,10 @@ async fn no_sessions_and_no_observed_workspace_is_in_sync() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    let deps = reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    let deps = reconciler.prepare(&presentation).await.expect("deps should load");
     let outcome = reconciler.reconcile(&presentation, &deps, Utc::now());
 
-    assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationDeps::InSync));
+    assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationPrepared::InSync));
     assert!(outcome.patch.is_none());
     assert!(runtime.apply_calls.lock().expect("apply calls lock").is_empty());
     assert!(runtime.tear_down_calls.lock().expect("tear down calls lock").is_empty());
@@ -191,7 +191,7 @@ async fn managed_presentation_without_its_convoy_is_failed_without_calling_the_r
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend);
 
-    let deps = reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    let deps = reconciler.prepare(&presentation).await.expect("deps should load");
     let outcome = reconciler.reconcile(&presentation, &deps, Utc::now());
 
     assert!(matches!(
@@ -222,7 +222,7 @@ async fn first_apply_marks_presentation_active() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    let deps = reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    let deps = reconciler.prepare(&presentation).await.expect("deps should load");
     let outcome = reconciler.reconcile(&presentation, &deps, Utc::now());
 
     let plan = runtime.apply_calls.lock().expect("apply calls lock").clone();
@@ -285,7 +285,7 @@ async fn dispatched_convoy_workspace_stamp_uses_project_and_repository_dialect()
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend);
 
-    reconciler.fetch_dependencies(&presentation).await.expect("dependencies");
+    reconciler.prepare(&presentation).await.expect("dependencies");
 
     let plans = runtime.apply_calls.lock().expect("apply calls lock");
     assert_eq!(plans[0].stamp.as_ref().map(|stamp| &stamp.entity), Some(&entity::vessel("flotilla", "convoy-a", "implement", "local")));
@@ -323,7 +323,7 @@ async fn presentation_uses_running_sessions_and_ignores_stopped_crew() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    reconciler.fetch_dependencies(&presentation).await.expect("stopped crew should not prevent presentation");
+    reconciler.prepare(&presentation).await.expect("stopped crew should not prevent presentation");
 
     let apply_calls = runtime.apply_calls.lock().expect("apply calls lock");
     assert_eq!(apply_calls.len(), 1);
@@ -350,17 +350,17 @@ async fn unchanged_world_is_a_no_op() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
     let created = create_presentation(&backend, "presentation-a", "default").await;
-    let first_deps = reconciler.fetch_dependencies(&created).await.expect("deps should load");
+    let first_deps = reconciler.prepare(&created).await.expect("deps should load");
     let first_outcome = reconciler.reconcile(&created, &first_deps, Utc::now());
     let first_patch = first_outcome.patch.expect("first reconcile should produce a patch");
     let updated = update_presentation_status(&backend, &created, first_patch).await;
 
     runtime.apply_calls.lock().expect("apply calls lock").clear();
 
-    let deps = reconciler.fetch_dependencies(&updated).await.expect("deps should load");
+    let deps = reconciler.prepare(&updated).await.expect("deps should load");
     let outcome = reconciler.reconcile(&updated, &deps, Utc::now());
 
-    assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationDeps::InSync));
+    assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationPrepared::InSync));
     assert!(outcome.patch.is_none());
     assert!(runtime.apply_calls.lock().expect("apply calls lock").is_empty());
 }
@@ -396,7 +396,7 @@ async fn sorted_session_determinism_uses_task_and_process_ordinals() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    reconciler.prepare(&presentation).await.expect("deps should load");
 
     let apply_calls = runtime.apply_calls.lock().expect("apply calls lock");
     assert_eq!(apply_calls[0].crew.iter().map(|process| process.attach_command.as_str()).collect::<Vec<_>>(), vec![
@@ -419,10 +419,10 @@ async fn empty_sessions_trigger_teardown() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    let deps = reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    let deps = reconciler.prepare(&presentation).await.expect("deps should load");
     let outcome = reconciler.reconcile(&presentation, &deps, Utc::now());
 
-    assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationDeps::TornDown { message: None }));
+    assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationPrepared::TornDown { message: None }));
     assert_eq!(runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(), &[(
         "fake-manager".to_string(),
         "workspace-a".to_string()
@@ -463,12 +463,12 @@ async fn retry_from_clean_slate_clears_previous_workspace_before_retry() {
     })
     .await;
 
-    let first_deps = reconciler.fetch_dependencies(&created).await.expect("deps should load");
+    let first_deps = reconciler.prepare(&created).await.expect("deps should load");
     let first_outcome = reconciler.reconcile(&created, &first_deps, Utc::now());
     let first_patch = first_outcome.patch.expect("first reconcile should patch");
     let updated = update_presentation_status(&backend, &created, first_patch).await;
 
-    let second_deps = reconciler.fetch_dependencies(&updated).await.expect("deps should load");
+    let second_deps = reconciler.prepare(&updated).await.expect("deps should load");
     let second_outcome = reconciler.reconcile(&updated, &second_deps, Utc::now());
 
     let apply_calls = runtime.apply_calls.lock().expect("apply calls lock");
@@ -507,12 +507,12 @@ async fn unknown_policy_fails_without_runtime_invocation() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    let deps = reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    let deps = reconciler.prepare(&presentation).await.expect("deps should load");
     let outcome = reconciler.reconcile(&presentation, &deps, Utc::now());
 
     assert!(matches!(
         deps,
-        flotilla_controllers::reconcilers::PresentationDeps::UnknownPolicy(ref name) if name == "missing-policy"
+        flotilla_controllers::reconcilers::PresentationPrepared::UnknownPolicy(ref name) if name == "missing-policy"
     ));
     assert!(runtime.apply_calls.lock().expect("apply calls lock").is_empty());
     assert!(matches!(
@@ -563,7 +563,7 @@ async fn working_directory_fallback_is_separate_from_session_cwd() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    reconciler.prepare(&presentation).await.expect("deps should load");
 
     let apply_calls = runtime.apply_calls.lock().expect("apply calls lock");
     let plan = &apply_calls[0];
@@ -693,7 +693,12 @@ fn reconciler(runtime: Arc<FakePresentationRuntime>, backend: ResourceBackend) -
         runtime,
         backend,
         NAMESPACE,
-        HopChainContext::new(HOST_REF, HostName::new("local"), temp_config_base(), move |_env_ref| Ok(Arc::clone(&registry))),
+        HopChainContext::new(
+            flotilla_protocol::CanonicalHostId::resolved(HOST_REF),
+            HostName::new("local"),
+            temp_config_base(),
+            move |_env_ref| Ok(Arc::clone(&registry)),
+        ),
         Arc::new(PresentationPolicyRegistry::with_defaults()),
     )
 }

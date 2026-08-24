@@ -22,13 +22,21 @@ pub enum WriterRole {
 #[non_exhaustive]
 pub struct WriterIdentity {
     pub role: WriterRole,
+    /// Stable code-path identity for operator legibility and write attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_authority: Option<NodeId>,
 }
 
 impl WriterIdentity {
     pub fn new(role: WriterRole) -> Self {
-        Self { role, store_authority: None }
+        Self { role, source: None, store_authority: None }
+    }
+
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
     }
 
     pub fn operator() -> Self {

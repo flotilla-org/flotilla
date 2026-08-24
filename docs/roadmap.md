@@ -7,19 +7,18 @@ companion to the glossary ([`/CONTEXT.md`](../CONTEXT.md)) and the decisions in
 
 ## The situation
 
-Two complete data planes live inside one daemon and barely touch:
+The old fleet-observer data plane has been removed. Providers and adapters remain
+in `flotilla-core`, but they no longer feed correlation, WorkItems, or the old
+snapshot pipeline. Discovered checkout facts are represented as observed
+resources in an ephemeral store; the Aggregator combines those facts with the
+durable resource store and emits query result sets for surfaces.
 
-- **Plane A — the fleet observer** (`flotilla-core` + `flotilla-tui` +
-  `flotilla-daemon`, ~93k LOC, the bulk of recent commits): providers →
-  correlation (union-find) → WorkItems → snapshots → TUI. *Descriptive.*
-- **Plane B — the control plane** (`flotilla-resources` + `flotilla-controllers`
-  + `flotilla-commands`, ~8.6k LOC, newest work): k8s-isomorphic resources →
-  reconcilers → projection → convoy view. *Prescriptive.*
-
-The destination: **Plane B subsumes Plane A's prescriptive role**, with a
-long transition. Observed reality and desired state share one resource store
-(ADR 0003); correlation demotes to an on-demand Aggregator; convoys become the
-unit of launched work.
+The remaining straddle is narrower: resource-store federation already runs over
+`HttpBackend`, while the bespoke peer subsystem still supplies mesh transport and
+legacy multi-host behavior. The destination is one resource-based control plane:
+observed reality and desired state use the same kinds (ADR 0003), lifecycle
+authority distinguishes their ownership, and convoys are the unit of launched
+work.
 
 ## Decisions already recorded
 
@@ -33,12 +32,10 @@ unit of launched work.
   set of kinds; lifecycle authority is a per-resource property. The user's
   hand-managed local clone is permanently *adopted*, never reconciled away.
 
-## Two freezes (the most important near-term discipline)
+## Near-term discipline
 
-1. **Plane A is bugfix-only.** No net-new features on correlation, WorkItem, the
-   old `ProviderData → WorkItem → Snapshot` pipeline, or peer-merge. The
-   151-vs-22 commit imbalance *is* the straddle; stopping it is the highest-value
-   move.
+1. **The remaining peer layer is bugfix-only.** Put new multi-host capability in
+   resource federation and the eventual Tender rather than extending peer-merge.
 2. **The TUI is *factored*, not frozen.** Both the TUI and uishell stay relevant:
    ~70% of `flotilla-tui` is legitimate ratatui rendering; ~30% is a
    surface-agnostic domain/view-model layer (intent/action engine, declarative
@@ -52,15 +49,15 @@ immediately, but extract generic pieces only after Flotilla has proven the
 boundary by consuming them.** Keep extractions as workspace crates in this repo
 until boundary-proven, *then* promote to separate repos (as cleat/porthole are).
 
-| Phase | Work | Why here |
-|------|------|----------|
-| **0** | **Freeze Plane A** (bugfix-only). | Stops the bleed; costs nothing to start. |
-| **1** | **Non-k8s backing store** (sqlite/libsql) + **lift the k8s projection into the resource model** (ADR 0001-B). | Precondition for dogfooding convoys without a live cluster. Low conceptual risk — semantics are proven. Makes the sqlite store a near-mechanical port of the in-memory backend. |
-| **2** | **Convoy as the real end-to-end launch path** (create → provision → present → TUI), dogfooded. | Proves the resource/reconciler/provisioning boundaries *in the real consumer* before any extraction. |
-| **3** | **Reshape the observer**: providers contribute *observed resources*; add lifecycle-authority; build the **Aggregator** view; delete the old `ProviderData→WorkItem→Snapshot` pipeline. | Plane A is now gone, not just frozen. Correlation/union-find demotes to an on-demand Aggregator utility. |
-| **4** | **Extract the Tender** (generic federation); delete peer-merge. | Boundary now informed by real store-federation needs. Not rushed — porthole is the likeliest first external consumer, and the family can wait a little. |
-| **5** | **Extract the minimal control-plane core** (generic resource-client + controller runtime) as a standalone crate/repo, leaving Flotilla-specific kinds behind. | Boundary-proven by phases 1–3. Yields a small, coherent piece "that could have been in the training data." |
-| **6** | **Provisioning extraction** (if still warranted) + **TUI↔uishell sharing**: extract the surface-agnostic domain/view-model layer; TUI/web/uishell become thin **Surfaces** over it. | Depends on a stable resource/aggregator API beneath. |
+| Phase | Status | Work | Why here |
+|------|--------|------|----------|
+| **0** | **Substantially complete** | Keep only the remaining peer layer bugfix-only. | The deleted observer pipeline no longer needs a freeze; peer-merge still does. |
+| **1** | **Complete** | **Non-k8s backing store** (sqlite) + **lift the k8s projection into the resource model** (ADR 0001-B). | Enables dogfooding convoys without a live cluster and gives resources one typed API across backends. |
+| **2** | **Complete** | **Convoy as the real end-to-end launch path** (create → provision → present → TUI), dogfooded. | Proves the resource/reconciler/provisioning boundaries in the real consumer. |
+| **3** | **Substantially complete** | Provider refreshes publish observed Checkout resources; lifecycle authority, the Aggregator, and deletion of the old observer pipeline have landed. Finish the Aggregator's target shape and lifecycle-authority coverage. | Completes the move from a parallel observer data plane to resource-backed observation and queries. |
+| **4** | **In progress** | **Finish and extract the Tender** (generic federation); delete peer-merge. Store replication over `HttpBackend` already exists in `crates/flotilla-daemon/src/server/replicator.rs`. | The extraction boundary can now be informed by working federation rather than designed in the abstract. |
+| **5** | **Pending** | **Extract the minimal control-plane core** (generic resource-client + controller runtime) as a standalone crate/repo, leaving Flotilla-specific kinds behind. | Boundary-proven by phases 1–3. Yields a small, coherent piece "that could have been in the training data." |
+| **6** | **In progress** | **Provisioning extraction** (if still warranted) + **TUI↔uishell sharing**: continue extracting the surface-agnostic domain/view-model layer; TUI/web/uishell become thin **Surfaces** over it. | Depends on a stable resource/Aggregator API beneath; the TUI table view model is already factored. |
 
 ## Cross-cutting
 
@@ -75,6 +72,6 @@ until boundary-proven, *then* promote to separate repos (as cleat/porthole are).
 
 ## The unbuilt layer above all this
 
-Meta-agents (Quartermaster, Bosun, Purser, Governor, Yeoman) sit above observer +
+Meta-agents (Quartermaster, Bosun, Purser, Governor, Yeoman) sit above the
 control plane and are explicitly *later*. The Aggregator's "possibly agentic"
 piecing-together is the first place they touch this roadmap.

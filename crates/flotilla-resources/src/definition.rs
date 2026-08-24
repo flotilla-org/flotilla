@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     CausalDot, FieldMergeMetadata, InputMeta, MergeConflictSibling, MergeMetadata, ReplicationClass, Resource, ResourceBackend,
-    ResourceError, ResourceObject, ResourceProvenance,
+    ResourceError, ResourceObject, ResourceProvenance, WriterIdentity,
 };
 
 const DELETION_FIELD: &str = "$deleted";
@@ -71,14 +71,22 @@ impl<T: Resource> DefinitionResolver<T> {
     }
 
     pub async fn create(&self, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
+        self.create_as(&WriterIdentity::operator().with_source("definition-create"), meta, spec).await
+    }
+
+    pub async fn create_as(&self, writer: &WriterIdentity, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
         match self.get(&meta.name).await {
             Ok(_) => Err(ResourceError::conflict(&meta.name, "resource already exists")),
-            Err(ResourceError::NotFound { .. }) => self.apply(meta, spec).await,
+            Err(ResourceError::NotFound { .. }) => self.apply_as(writer, meta, spec).await,
             Err(error) => Err(error),
         }
     }
 
     pub async fn apply(&self, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
+        self.apply_as(&WriterIdentity::operator().with_source("definition-apply"), meta, spec).await
+    }
+
+    pub async fn apply_as(&self, writer: &WriterIdentity, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
         let local_root = self.backend.local_root()?;
         let sources = self.sources_for_name(&meta.name).await?;
@@ -101,6 +109,7 @@ impl<T: Resource> DefinitionResolver<T> {
         let has_value_changes =
             requested.iter().any(|(field, value)| current_spec.as_ref().and_then(|current| current.get(field)) != Some(value));
         let resolves_existing_view = current.is_some() && !has_value_changes;
+        let mut spec_changed = false;
 
         for (field, value) in &requested {
             let path = format!("spec.{field}");
@@ -112,8 +121,25 @@ impl<T: Resource> DefinitionResolver<T> {
             let resolves_conflict = resolves_existing_view && merge.conflicts.contains_key(&path);
             if value_changed || resolves_conflict || current.is_none() {
                 changed = true;
-                merge.fields.insert(path, FieldMergeMetadata { dot: dot.clone(), seen: context.clone(), written_at: now });
+                spec_changed = true;
+                merge.fields.insert(path, FieldMergeMetadata {
+                    dot: dot.clone(),
+                    seen: context.clone(),
+                    written_at: now,
+                    writer: Some(writer.clone()),
+                });
             }
+        }
+        if spec_changed {
+            tracing::info!(
+                kind = T::API_PATHS.kind,
+                namespace = %self.namespace,
+                name = %meta.name,
+                writer_role = ?writer.role,
+                writer_source = writer.source.as_deref().unwrap_or("unknown"),
+                writer_root = %local_root,
+                "applying definition spec"
+            );
         }
         if merge.conflicts.contains_key(DELETION_FIELD)
             || current.as_ref().is_some_and(|object| object.metadata.deletion_timestamp.is_some())
@@ -124,7 +150,12 @@ impl<T: Resource> DefinitionResolver<T> {
             return current.ok_or_else(|| ResourceError::not_found(&meta.name));
         }
 
-        merge.fields.insert(DELETION_FIELD.to_string(), FieldMergeMetadata { dot: dot.clone(), seen: context.clone(), written_at: now });
+        merge.fields.insert(DELETION_FIELD.to_string(), FieldMergeMetadata {
+            dot: dot.clone(),
+            seen: context.clone(),
+            written_at: now,
+            writer: Some(writer.clone()),
+        });
         merge.seen = context;
         merge.seen.insert(local_root, next_counter);
         merge.conflicts.clear();
@@ -173,7 +204,12 @@ impl<T: Resource> DefinitionResolver<T> {
             seen: BTreeMap::new(),
             conflicts: BTreeMap::new(),
         });
-        merge.fields.insert(DELETION_FIELD.to_string(), FieldMergeMetadata { dot, seen: context.clone(), written_at: Utc::now() });
+        merge.fields.insert(DELETION_FIELD.to_string(), FieldMergeMetadata {
+            dot,
+            seen: context.clone(),
+            written_at: Utc::now(),
+            writer: Some(WriterIdentity::operator().with_source("definition-delete")),
+        });
         merge.seen = context;
         merge.seen.insert(local_root, next_counter);
         merge.conflicts.clear();
@@ -206,6 +242,43 @@ impl<T: Resource> DefinitionResolver<T> {
             Err(error) => return Err(error),
         }
         Ok(())
+    }
+
+    /// Update definition metadata without replaying or re-authoring its spec.
+    pub async fn update_metadata(&self, meta: &InputMeta) -> Result<ResourceObject<T>, ResourceError> {
+        ensure_definitions::<T>()?;
+        let current = self.get(&meta.name).await?;
+        let merge = current.metadata.merge.clone().unwrap_or_else(|| MergeMetadata {
+            fields: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            conflicts: BTreeMap::new(),
+        });
+        match self.backend.using::<T>(&self.namespace).get(&meta.name).await {
+            Ok(local) => match &self.backend {
+                ResourceBackend::InMemory(backend) => {
+                    backend
+                        .update_definition_typed::<T>(&self.namespace, meta, &local.metadata.resource_version, &current.spec, merge)
+                        .await?;
+                }
+                ResourceBackend::Sqlite(backend) => {
+                    backend
+                        .update_definition_typed::<T>(&self.namespace, meta, &local.metadata.resource_version, &current.spec, merge)
+                        .await?;
+                }
+                ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP backends cannot author definitions")),
+            },
+            Err(ResourceError::NotFound { .. }) => match &self.backend {
+                ResourceBackend::InMemory(backend) => {
+                    backend.create_definition_typed::<T>(&self.namespace, meta, &current.spec, merge).await?;
+                }
+                ResourceBackend::Sqlite(backend) => {
+                    backend.create_definition_typed::<T>(&self.namespace, meta, &current.spec, merge).await?;
+                }
+                ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP backends cannot author definitions")),
+            },
+            Err(error) => return Err(error),
+        }
+        self.get(&meta.name).await
     }
 
     async fn sources_for_name(&self, name: &str) -> Result<Vec<DefinitionSource<T>>, ResourceError> {
@@ -402,6 +475,7 @@ fn legacy_field<T: Resource>(source: &DefinitionSource<T>) -> FieldMergeMetadata
         dot: CausalDot { author_root: source.origin.clone(), author_counter: legacy_counter(&source.object) },
         seen: BTreeMap::new(),
         written_at: source.synced_at.unwrap_or(source.object.metadata.creation_timestamp),
+        writer: None,
     }
 }
 

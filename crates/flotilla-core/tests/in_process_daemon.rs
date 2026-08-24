@@ -24,10 +24,10 @@ use flotilla_core::{
         coding_agent::CloudAgentService,
         discovery::{
             test_support::{
-                fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_providers, fake_vcs_discovery, git_process_discovery,
-                init_git_repo, init_git_repo_with_remote, DiscoveryMockRunner, FakeChangeRequest, FakeCheckoutManager,
-                FakeCheckoutManagerFactory, FakeDiscoveryProviders, FakeIssueProvider, FakePresentationManager, FakeTerminalPool,
-                FakeVcsFactory, FakeVcsState, TestEnvVars,
+                fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_providers, fake_discovery_with_runner,
+                fake_vcs_discovery, git_process_discovery, init_git_repo, init_git_repo_with_remote, DiscoveryMockRunner,
+                FakeChangeRequest, FakeCheckoutManager, FakeCheckoutManagerFactory, FakeDiscoveryProviders, FakeIssueProvider,
+                FakePresentationManager, FakeTerminalPool, FakeVcsFactory, FakeVcsState, TestEnvVars,
             },
             DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, Factory, HostDetector, HostPlatform, ProviderCategory,
             ProviderDescriptor, RepoDetector, UnmetRequirement,
@@ -44,24 +44,39 @@ use flotilla_protocol::{
     test_support::TestIssue,
     Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, ConvoyStartIntent, DaemonEvent, EnvironmentId,
     EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, ImageId, IssueRef,
-    IssueSelector, IssueSource, NodeId, NodeInfo, PeerConnectionState, ProviderData, RepoIdentity, RepoSelector, StepStatus, StreamKey,
-    SystemInfo, ToolInventory, TopologyRoute,
+    IssueSelector, IssueSource, ManifestResolution, NodeId, NodeInfo, PeerConnectionState, ProviderData, RepoIdentity, RepoSelector,
+    StepStatus, StreamKey, SystemInfo, ToolInventory, TopologyRoute,
 };
 use flotilla_resources::{
     apply_status_patch, controller_patches as convoy_controller_patches, implement_review_workflow_spec,
-    single_agent_contained_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
-    CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase, CredentialConsumer, CredentialGrant,
-    CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host as ResourceHost,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, LifecycleAuthority,
-    ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy,
-    RegardSource, Repository, RepositoryRelation, RepositorySpec, ResourceBackend, ResourceError, SqliteBackend, Stance, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatusPatch, TypedResolver, WatchEvent, WatchStart,
-    WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL,
-    REPO_LABEL,
+    single_agent_contained_workflow_spec, single_agent_shepherd_workflow_spec, Checkout as ResourceCheckout,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase,
+    CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
+    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, DockerCheckoutStrategy,
+    DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
+    HostStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
+    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryRelation, RepositorySpec, ResourceBackend, ResourceError,
+    SqliteBackend, Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TypedResolver, WatchEvent, WatchStart,
+    WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, HELD_CREDENTIALS_CAPABILITY,
+    MANIFEST_RESOLUTION_ANNOTATION, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::Notify;
+
+async fn admitted_convoy(backend: &ResourceBackend, role: &str) -> flotilla_resources::ResourceObject<ResourceConvoy> {
+    let selector = BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), role.to_string())]);
+    backend
+        .clone()
+        .using::<ResourceConvoy>("flotilla")
+        .list_matching_labels(&selector)
+        .await
+        .expect("list admitted convoy")
+        .items
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("admitted convoy role {role}"))
+}
 
 struct FixedRemoteHostDetector {
     owner: &'static str,
@@ -143,7 +158,7 @@ impl HostDetector for RunnerEchoHostDetector {
         runner: &dyn CommandRunner,
         _env: &dyn flotilla_core::providers::discovery::EnvVars,
     ) -> Vec<EnvironmentAssertion> {
-        match runner.run("probe-env", &[self.probe], Path::new("/"), &ChannelLabel::Noop).await {
+        match runner.run("probe-env", &[self.probe], Path::new("/"), &ChannelLabel::Default).await {
             Ok(value) => vec![EnvironmentAssertion::env_var(self.assertion_key, value.trim())],
             Err(_) => Vec::new(),
         }
@@ -617,27 +632,27 @@ struct FailingChangeRequestTracker;
 
 #[async_trait]
 impl ChangeRequestTracker for FailingChangeRequestTracker {
-    async fn list_change_requests(&self, _: &Path, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+    async fn list_change_requests(&self, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         Err("change request listing failed".into())
     }
 
-    async fn get_change_request(&self, _: &Path, id: &str) -> Result<(String, ChangeRequest), String> {
+    async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
         Err(format!("change request {id} not found"))
     }
 
-    async fn open_in_browser(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn open_in_browser(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn close_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn close_change_request(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn merge_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn merge_change_request(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn list_merged_branch_names(&self, _: &Path, _: usize) -> Result<Vec<String>, String> {
+    async fn list_merged_branch_names(&self, _: usize) -> Result<Vec<String>, String> {
         Err("merged branch listing failed".into())
     }
 }
@@ -648,28 +663,28 @@ struct CountingChangeRequestTracker {
 
 #[async_trait]
 impl ChangeRequestTracker for CountingChangeRequestTracker {
-    async fn list_change_requests(&self, _: &Path, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+    async fn list_change_requests(&self, _: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         self.polls.fetch_add(1, Ordering::SeqCst);
         Ok(Vec::new())
     }
 
-    async fn get_change_request(&self, _: &Path, id: &str) -> Result<(String, ChangeRequest), String> {
+    async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
         Err(format!("change request {id} not found"))
     }
 
-    async fn open_in_browser(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn open_in_browser(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn close_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn close_change_request(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn merge_change_request(&self, _: &Path, _: &str) -> Result<(), String> {
+    async fn merge_change_request(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn list_merged_branch_names(&self, _: &Path, _: usize) -> Result<Vec<String>, String> {
+    async fn list_merged_branch_names(&self, _: usize) -> Result<Vec<String>, String> {
         self.polls.fetch_add(1, Ordering::SeqCst);
         Ok(Vec::new())
     }
@@ -748,16 +763,13 @@ async fn resource_list_and_get_queries_return_wire_json() {
 
     let listed = daemon
         .execute_query(
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryResourceList {
+            Command::builder()
+                .action(CommandAction::QueryResourceList {
                     namespace: "flotilla".to_string(),
                     kind: "convoys".to_string(),
                     include_replicas: false,
-                },
-            },
+                })
+                .build(),
             uuid::Uuid::new_v4(),
         )
         .await
@@ -772,16 +784,13 @@ async fn resource_list_and_get_queries_return_wire_json() {
 
     let fetched = daemon
         .execute_query(
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryResourceGet {
+            Command::builder()
+                .action(CommandAction::QueryResourceGet {
                     namespace: "flotilla".to_string(),
                     kind: "Convoy".to_string(),
                     name: "resource-demo".to_string(),
-                },
-            },
+                })
+                .build(),
             uuid::Uuid::new_v4(),
         )
         .await
@@ -810,16 +819,13 @@ async fn resource_list_and_get_queries_return_local_non_replicated_resources() {
 
     let listed = daemon
         .execute_query(
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryResourceList {
+            Command::builder()
+                .action(CommandAction::QueryResourceList {
                     namespace: "flotilla".to_string(),
                     kind: "workflowtemplates".to_string(),
                     include_replicas: true,
-                },
-            },
+                })
+                .build(),
             uuid::Uuid::new_v4(),
         )
         .await
@@ -832,16 +838,13 @@ async fn resource_list_and_get_queries_return_local_non_replicated_resources() {
 
     let fetched = daemon
         .execute_query(
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryResourceGet {
+            Command::builder()
+                .action(CommandAction::QueryResourceGet {
                     namespace: "flotilla".to_string(),
                     kind: "WorkflowTemplate".to_string(),
                     name: "local-workflow".to_string(),
-                },
-            },
+                })
+                .build(),
             uuid::Uuid::new_v4(),
         )
         .await
@@ -879,17 +882,16 @@ async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
     let mut events = daemon.subscribe();
     InProcessDaemon::publish_peer_connection_status(daemon.as_ref(), &authority_node, PeerConnectionState::Connected).await;
     let refused_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceDelete {
-                namespace: "flotilla".to_string(),
-                kind: "convoys".to_string(),
-                name: "orphaned-convoy".to_string(),
-                replica_origin: Some(origin.clone()),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: "orphaned-convoy".to_string(),
+                    replica_origin: Some(origin.clone()),
+                })
+                .build(),
+        )
         .await
         .expect("request collection while authority is connected");
     let refused = recv_command_finished(&mut events, refused_id).await;
@@ -900,17 +902,16 @@ async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
 
     InProcessDaemon::publish_peer_connection_status(daemon.as_ref(), &authority_node, PeerConnectionState::Disconnected).await;
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceDelete {
-                namespace: "flotilla".to_string(),
-                kind: "convoys".to_string(),
-                name: "orphaned-convoy".to_string(),
-                replica_origin: Some(origin),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: "orphaned-convoy".to_string(),
+                    replica_origin: Some(origin),
+                })
+                .build(),
+        )
         .await
         .expect("collect orphaned replica");
 
@@ -984,17 +985,16 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
         peer_one.resource_backend().including_replicas::<ResourceConvoy>("flotilla").watch().await.expect("watch first peer replicas");
     let mut authority_events = authority.subscribe();
     let delete_id = authority
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceDelete {
-                namespace: "flotilla".to_string(),
-                kind: "convoys".to_string(),
-                name: "lost-at-authority".to_string(),
-                replica_origin: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: "lost-at-authority".to_string(),
+                    replica_origin: None,
+                })
+                .build(),
+        )
         .await
         .expect("delete missing authority resource");
     let deleted = recv_command_finished(&mut authority_events, delete_id).await;
@@ -1057,17 +1057,16 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
     }
 
     let repeated_id = authority
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceDelete {
-                namespace: "flotilla".to_string(),
-                kind: "convoys".to_string(),
-                name: "lost-at-authority".to_string(),
-                replica_origin: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: "lost-at-authority".to_string(),
+                    replica_origin: None,
+                })
+                .build(),
+        )
         .await
         .expect("repeat delete missing authority resource");
     let repeated = recv_command_finished(&mut authority_events, repeated_id).await;
@@ -1082,19 +1081,18 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
     let mut events = daemon.subscribe();
     let name = flotilla_resources::usage_record_name("codex", "ada@example.com");
     let create_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceApply {
-                namespace: "flotilla".to_string(),
-                document: serde_json::json!({
-                    "kind": "Usage",
-                    "metadata": {"name": name},
-                    "spec": {"provider": "codex", "account": "Ada@Example.com"},
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceApply {
+                    namespace: "flotilla".to_string(),
+                    document: serde_json::json!({
+                        "kind": "Usage",
+                        "metadata": {"name": name},
+                        "spec": {"provider": "codex", "account": "Ada@Example.com"},
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("create usage command");
     let create_result = recv_command_finished(&mut events, create_id).await;
@@ -1107,17 +1105,16 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
         .build();
 
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceStatusPatch {
-                namespace: "flotilla".to_string(),
-                kind: "usages".to_string(),
-                name: name.clone(),
-                status: serde_json::to_value(&status).expect("encode usage status"),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceStatusPatch {
+                    namespace: "flotilla".to_string(),
+                    kind: "usages".to_string(),
+                    name: name.clone(),
+                    status: serde_json::to_value(&status).expect("encode usage status"),
+                })
+                .build(),
+        )
         .await
         .expect("patch usage status command");
 
@@ -1125,17 +1122,16 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
     assert!(matches!(result, CommandValue::ResourceObject(response) if response.kind == "Usage"));
 
     let malformed_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceStatusPatch {
-                namespace: "flotilla".to_string(),
-                kind: "usages".to_string(),
-                name: name.clone(),
-                status: serde_json::json!({"windows": []}),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceStatusPatch {
+                    namespace: "flotilla".to_string(),
+                    kind: "usages".to_string(),
+                    name: name.clone(),
+                    status: serde_json::json!({"windows": []}),
+                })
+                .build(),
+        )
         .await
         .expect("malformed status patch command");
     let malformed_result = recv_command_finished(&mut events, malformed_id).await;
@@ -1145,6 +1141,41 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
     assert_eq!(stored.spec.provider, "codex");
     assert_eq!(stored.spec.account, "Ada@Example.com");
     assert_eq!(stored.status, Some(status));
+}
+
+#[tokio::test]
+async fn manifest_resolution_command_persists_the_reconciler_request_annotation() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let policies = daemon.resource_backend().using::<PlacementPolicy>("flotilla");
+    policies
+        .create(
+            &InputMeta::builder().name("resolve-me".to_string()).build(),
+            &PlacementPolicySpec::builder().pool("live".to_string()).build(),
+        )
+        .await
+        .expect("create policy");
+    let mut events = daemon.subscribe();
+
+    let command_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceManifestResolve {
+                    namespace: "flotilla".to_string(),
+                    kind: "PlacementPolicy".to_string(),
+                    name: "resolve-me".to_string(),
+                    resolution: ManifestResolution::Sync,
+                })
+                .build(),
+        )
+        .await
+        .expect("request manifest sync");
+    let result = recv_command_finished(&mut events, command_id).await;
+    let stored = policies.get("resolve-me").await.expect("resolved policy");
+
+    assert!(matches!(result, CommandValue::ResourceObject(response) if response.kind == "PlacementPolicy"));
+    assert_eq!(stored.metadata.annotations.get(MANIFEST_RESOLUTION_ANNOTATION).map(String::as_str), Some("sync"));
 }
 
 #[tokio::test]
@@ -1170,19 +1201,18 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
 
     let mut rx = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceWatch {
-                namespace: "flotilla".to_string(),
-                kind: "convoys".to_string(),
-                name: Some("watched-convoy".to_string()),
-                include_replicas: false,
-                replica_sources: false,
-                cursor: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceWatch {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: Some("watched-convoy".to_string()),
+                    include_replicas: false,
+                    replica_sources: false,
+                    cursor: None,
+                })
+                .build(),
+        )
         .await
         .expect("watch command");
 
@@ -1248,19 +1278,18 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
 
     let mut resumed_events = daemon.subscribe();
     let resumed_command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ResourceWatch {
-                namespace: "flotilla".to_string(),
-                kind: "convoys".to_string(),
-                name: Some("watched-convoy".to_string()),
-                include_replicas: false,
-                replica_sources: false,
-                cursor: Some(resume_cursor),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceWatch {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: Some("watched-convoy".to_string()),
+                    include_replicas: false,
+                    replica_sources: false,
+                    cursor: Some(resume_cursor),
+                })
+                .build(),
+        )
         .await
         .expect("resume watch command");
     let deleted = loop {
@@ -1429,26 +1458,25 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .expect("project create");
 
     let mut events = daemon.subscribe();
-    let start = |name: &str, workflow_ref: &str| Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: None,
-        action: CommandAction::ConvoyStart {
-            intent: Box::new(ConvoyStartIntent {
-                namespace: None,
-                project_ref: "zellij".into(),
-                change_request: None,
-                issues: Vec::new(),
-                name: Some(name.to_string()),
-                branch: Some(format!("stack/{name}")),
-                workflow_ref: Some(workflow_ref.to_string()),
-                inputs: Vec::new(),
-                instruction: None,
-                placement_policy: Some("docker-test".into()),
-                agent_overrides: Vec::new(),
-                auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-            }),
-        },
+    let start = |name: &str, workflow_ref: &str| {
+        Command::builder()
+            .action(CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "zellij".into(),
+                    change_request: None,
+                    issues: Vec::new(),
+                    name: Some(name.to_string()),
+                    branch: Some(format!("stack/{name}")),
+                    workflow_ref: Some(workflow_ref.to_string()),
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: Some("docker-test".into()),
+                    agent_overrides: Vec::new(),
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                }),
+            })
+            .build()
     };
     let rejected_id = daemon.execute(start("reviewless", "single-agent-contained")).await.expect("dispatch command");
     assert_eq!(recv_command_finished(&mut events, rejected_id).await, CommandValue::Error {
@@ -1467,18 +1495,18 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .expect("explicit reviewless override");
     let overridden_id = daemon.execute(start("overridden", "single-agent-contained")).await.expect("override dispatch command");
     assert_eq!(recv_command_finished(&mut events, overridden_id).await, CommandValue::ConvoyStarted {
-        name: "overridden".into(),
+        name: "overridden@zellij".into(),
         attach_plan: None,
         binding: None
     });
 
     let admitted_id = daemon.execute(start("reviewed", "implement-review")).await.expect("dispatch command");
     assert_eq!(recv_command_finished(&mut events, admitted_id).await, CommandValue::ConvoyStarted {
-        name: "reviewed".into(),
+        name: "reviewed@zellij".into(),
         attach_plan: None,
         binding: None
     });
-    let convoy = backend.using::<ResourceConvoy>("flotilla").get("reviewed").await.expect("reviewed convoy");
+    let convoy = admitted_convoy(&backend, "reviewed").await;
     assert_eq!(convoy.spec.workflow_ref, "implement-review");
     let workflow = backend.using::<WorkflowTemplate>("flotilla").get("implement-review").await.expect("implement-review workflow");
     assert_eq!(workflow.spec.vessels[0].crew.len(), 2);
@@ -1491,23 +1519,44 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
 
 #[tokio::test]
 async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
-    let provider = Arc::new(FakeChangeRequest::new());
-    provider
-        .add_change_requests(vec![("1071".to_string(), ChangeRequest {
-            title: "Convoy adoption of an existing PR".to_string(),
-            branch: "feat/existing-pr".to_string(),
-            status: flotilla_protocol::ChangeRequestStatus::Open,
-            body: Some("Existing implementation work.".to_string()),
-            provider_name: "fake-cr".to_string(),
-            provider_display_name: "Fake PRs".to_string(),
-        })])
-        .await;
-    let discovery =
-        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_change_request(provider as Arc<dyn ChangeRequestTracker>));
-    let (_temp, repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
-    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repository");
-    let repository_key = daemon.repository_key_for_path(&repo).await.expect("repository key");
+    let response = concat!(
+        "HTTP/2.0 200 OK\r\nEtag: \"pr-1071\"\r\nContent-Type: application/json\r\n\r\n",
+        r#"{"number":1071,"title":"Convoy adoption of an existing PR","head":{"ref":"feat/existing-pr"},"base":{"ref":"main"},"state":"open","body":"Existing implementation work.","draft":false,"merged_at":null}"#,
+    );
+    let runner = Arc::new(
+        DiscoveryMockRunner::builder()
+            .on_run("git", &["--version"], Ok("git version 2.43.0".to_string()))
+            .on_run("gh", &["api", "--include", "repos/owner/repo/pulls/1071"], Ok(response.to_string()))
+            .on_run(
+                "gh",
+                &["api", "--include", "repos/owner/repo/pulls/1071", "-H", "If-None-Match: \"pr-1071\""],
+                Ok("HTTP/2.0 304 Not Modified\r\nEtag: \"pr-1071\"\r\n\r\n".to_string()),
+            )
+            .build(),
+    );
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        test_config_store(temp.path().join("config")),
+        fake_discovery_with_runner(false, runner),
+        HostName::local(),
+    )
+    .await;
     let backend = daemon.resource_backend();
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("single-agent-shepherd".to_string()).build(), &single_agent_shepherd_workflow_spec())
+        .await
+        .expect("shepherd workflow create");
+    let repository_spec = RepositorySpec::remote("https://github.com/owner/repo").expect("repository spec");
+    let repository_key = repository_spec.key();
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
+        .await
+        .expect("repository create");
     create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
@@ -1530,49 +1579,58 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
 
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".to_string(),
-                    change_request: Some("1071".to_string()),
-                    issues: Vec::new(),
-                    name: None,
-                    branch: None,
-                    workflow_ref: None,
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".to_string(),
+                        change_request: Some("1071".to_string()),
+                        issues: Vec::new(),
+                        name: None,
+                        branch: None,
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("PR adoption command accepted");
 
     assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::ConvoyStarted {
-        name: "convoy-adoption-of-an-existing-pr-1071".to_string(),
+        name: "convoy-adoption-of-an-existing-pr-1071@flotilla".to_string(),
         attach_plan: None,
         binding: None,
     });
-    let convoy =
-        backend.using::<ResourceConvoy>("flotilla").get("convoy-adoption-of-an-existing-pr-1071").await.expect("persisted adopted convoy");
+    let convoy = admitted_convoy(&backend, "convoy-adoption-of-an-existing-pr-1071").await;
     assert_eq!(convoy.spec.workflow_ref, "single-agent-shepherd");
     assert_eq!(convoy.spec.r#ref.as_deref(), Some("feat/existing-pr"));
     assert_eq!(
         convoy.spec.change_request,
         Some(flotilla_resources::BoundChangeRequest {
             id: "1071".to_string(),
-            repository_ref: repository_key,
+            repository_ref: repository_key.clone(),
             title: "Convoy adoption of an existing PR".to_string(),
         })
     );
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");
     assert_eq!(convoy.spec.repositories[0].target_ref, "main");
+    assert_eq!(
+        daemon
+            .resolve_convoy_change_request(std::slice::from_ref(&repository_key), "feat/existing-pr", Some("1071"))
+            .await
+            .expect("repeated change request resolution"),
+        Some(flotilla_protocol::ConvoyChangeRequest {
+            id: "1071".to_string(),
+            status: flotilla_protocol::ChangeRequestStatus::Open,
+            repository_key,
+        })
+    );
 }
 
 #[tokio::test]
@@ -1605,19 +1663,19 @@ async fn fork_stance_refuses_change_request_merge_without_calling_provider() {
 
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: Some(RepoSelector::Path(repo)),
-            action: CommandAction::MergeChangeRequest { id: "42".to_string(), confirmed: true },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::MergeChangeRequest { id: "42".to_string(), confirmed: true })
+                .context_repo(RepoSelector::Path(repo))
+                .build(),
+        )
         .await
         .expect("dispatch merge command");
 
     assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::Error {
         message: "merging change request 42 is forbidden for fork-stance repository; landing is human-only".to_string(),
     });
-    let (_, request) = provider.get_change_request(Path::new("/unused"), "42").await.expect("change request should remain available");
+    let (_, request) = provider.get_change_request("42").await.expect("change request should remain available");
     assert_eq!(request.status, flotilla_protocol::ChangeRequestStatus::Open);
 }
 
@@ -1661,7 +1719,7 @@ async fn create_test_host_direct_policy(
 }
 
 #[tokio::test]
-async fn bare_convoy_start_uses_priority_and_records_every_placement_candidate() {
+async fn trusted_host_direct_convoy_start_requires_explicit_workflow_acknowledgement() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -1708,30 +1766,62 @@ async fn bare_convoy_start_uses_priority_and_records_every_placement_candidate()
     create_test_host_direct_policy(&backend, "host-direct-z-local", &local_host_ref, -100, BTreeSet::from(["codex".to_string()])).await;
 
     let mut events = daemon.subscribe();
-    let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("local-default".into()),
-                    branch: Some("fix/local-default".into()),
-                    workflow_ref: None,
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+    let implicit_command_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("local-default".into()),
+                        branch: Some("fix/local-default".into()),
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("start command accepted");
+
+    let implicit_result = recv_command_finished(&mut events, implicit_command_id).await;
+    let CommandValue::Error { message } = implicit_result else {
+        panic!("expected implicit trusted dispatch to be rejected, got {implicit_result:?}");
+    };
+    assert!(message.contains("trusted host-direct placement `host-direct-b-remote` on `remote-host`"));
+    assert!(message.contains("inherit ambient human credentials"));
+    assert!(message.contains("operator's forge identity"));
+    assert!(message.contains("--workflow single-agent-trusted"));
+
+    let command_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("local-default".into()),
+                        branch: Some("fix/local-default".into()),
+                        workflow_ref: Some("single-agent-trusted".into()),
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
+        .await
+        .expect("explicitly acknowledged start command accepted");
 
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -1744,8 +1834,8 @@ async fn bare_convoy_start_uses_priority_and_records_every_placement_candidate()
     })
     .await
     .expect("start command should finish");
-    assert_eq!(result, CommandValue::ConvoyStarted { name: "local-default".into(), attach_plan: None, binding: None });
-    let convoy = backend.using::<ResourceConvoy>("flotilla").get("local-default").await.expect("persisted convoy");
+    assert_eq!(result, CommandValue::ConvoyStarted { name: "local-default@flotilla".into(), attach_plan: None, binding: None });
+    let convoy = admitted_convoy(&backend, "local-default").await;
     assert_eq!(convoy.spec.placement_policy.as_deref(), Some("host-direct-b-remote"));
     let decision =
         convoy.status.and_then(|status| status.placement_decision).expect("admission should persist the complete placement decision");
@@ -1798,27 +1888,26 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
 
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("missing-adapter".into()),
-                    branch: Some("fix/missing-adapter".into()),
-                    workflow_ref: None,
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: Some("docker-test".into()),
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("missing-adapter".into()),
+                        branch: Some("fix/missing-adapter".into()),
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: Some("docker-test".into()),
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("start command accepted");
     let result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1843,21 +1932,20 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
     ));
 
     let legacy_command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "missing-adapter-legacy".into(),
-                workflow_ref: "single-agent-contained".into(),
-                inputs: Vec::new(),
-                repository_url: None,
-                r#ref: Some("fix/missing-adapter-legacy".into()),
-                project_ref: Some("flotilla".into()),
-                placement_policy: Some("docker-test".into()),
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "missing-adapter-legacy".into(),
+                    workflow_ref: "single-agent-contained".into(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: Some("fix/missing-adapter-legacy".into()),
+                    project_ref: Some("flotilla".into()),
+                    placement_policy: Some("docker-test".into()),
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("legacy create command accepted");
     let legacy_result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1922,10 +2010,7 @@ async fn convoy_start_accepts_project_list_identifier() {
         .expect("project create");
 
     let list_result = daemon
-        .execute_query(
-            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },
-            uuid::Uuid::new_v4(),
-        )
+        .execute_query(Command::builder().action(CommandAction::QueryProjectList {}).build(), uuid::Uuid::new_v4())
         .await
         .expect("project list");
     let CommandValue::ProjectList(projects) = list_result else {
@@ -1938,36 +2023,35 @@ async fn convoy_start_accepts_project_list_identifier() {
     for (index, project_ref) in project_identifiers.into_iter().enumerate() {
         let name = format!("listed-project-{index}");
         let start_id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyStart {
-                    intent: Box::new(ConvoyStartIntent {
-                        namespace: None,
-                        project_ref,
-                        change_request: None,
-                        issues: Vec::new(),
-                        name: Some(name.clone()),
-                        branch: Some(format!("fix/{name}")),
-                        workflow_ref: None,
-                        inputs: Vec::new(),
-                        instruction: None,
-                        placement_policy: None,
-                        agent_overrides: Vec::new(),
-                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                    }),
-                },
-            })
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyStart {
+                        intent: Box::new(ConvoyStartIntent {
+                            namespace: None,
+                            project_ref,
+                            change_request: None,
+                            issues: Vec::new(),
+                            name: Some(name.clone()),
+                            branch: Some(format!("fix/{name}")),
+                            workflow_ref: None,
+                            inputs: Vec::new(),
+                            instruction: None,
+                            placement_policy: None,
+                            agent_overrides: Vec::new(),
+                            auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        }),
+                    })
+                    .build(),
+            )
             .await
             .expect("convoy start command accepted");
 
         assert_eq!(recv_command_finished(&mut events, start_id).await, CommandValue::ConvoyStarted {
-            name: name.clone(),
+            name: format!("{name}@flotilla"),
             attach_plan: None,
             binding: None
         });
-        let convoy = backend.using::<ResourceConvoy>("flotilla").get(&name).await.expect("persisted convoy");
+        let convoy = admitted_convoy(&backend, &name).await;
         assert_eq!(convoy.spec.project_ref.as_deref(), Some("flotilla"));
     }
 }
@@ -1980,27 +2064,26 @@ async fn convoy_start_unknown_project_reports_resolved_reference_tried() {
     let mut events = daemon.subscribe();
 
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "missing".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("unknown-project".into()),
-                    branch: Some("fix/unknown-project".into()),
-                    workflow_ref: None,
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "missing".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("unknown-project".into()),
+                        branch: Some("fix/unknown-project".into()),
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("convoy start command accepted");
 
@@ -2066,27 +2149,26 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
 
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: vec![IssueSelector::Reference(reference.clone())],
-                    name: Some("issue-732".into()),
-                    branch: Some("fix/issue-732".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: vec![("review".into(), "required".into())],
-                    instruction: Some("Keep the snapshot durable.".into()),
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: vec![IssueSelector::Reference(reference.clone())],
+                        name: Some("issue-732".into()),
+                        branch: Some("fix/issue-732".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: vec![("review".into(), "required".into())],
+                        instruction: Some("Keep the snapshot durable.".into()),
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("start command accepted");
     let result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2101,8 +2183,8 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     .await
     .expect("start command should finish");
 
-    assert_eq!(result, CommandValue::ConvoyStarted { name: "issue-732".into(), attach_plan: None, binding: None });
-    let persisted = backend.using::<ResourceConvoy>("flotilla").get("issue-732").await.expect("persisted convoy");
+    assert_eq!(result, CommandValue::ConvoyStarted { name: "issue-732@flotilla".into(), attach_plan: None, binding: None });
+    let persisted = admitted_convoy(&backend, "issue-732").await;
     assert_eq!(persisted.spec.project_ref.as_deref(), Some("flotilla"));
     assert_eq!(persisted.spec.workflow_ref, "single-agent-contained");
     assert_eq!(persisted.spec.dispatching_principal_ref, flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"));
@@ -2123,68 +2205,69 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(utility.calls.load(Ordering::SeqCst), 0, "fully specified admission must not call AI");
 
     let default_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("default-regard".into()),
-                    branch: Some("fix/default-regard".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("default-regard".into()),
+                        branch: Some("fix/default-regard".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("default start command accepted");
     assert_eq!(recv_command_finished(&mut events, default_id).await, CommandValue::ConvoyStarted {
-        name: "default-regard".into(),
+        name: "default-regard@flotilla".into(),
         attach_plan: None,
         binding: None
     });
-    let default_convoy = backend.using::<ResourceConvoy>("flotilla").get("default-regard").await.expect("default convoy");
+    let default_convoy = admitted_convoy(&backend, "default-regard").await;
     let regards = backend.using::<Regard>("flotilla").list().await.expect("list default dispatcher regard");
-    let regard =
-        regards.items.iter().find(|regard| regard.spec.target.name == "default-regard").expect("default implicit dispatcher regard");
+    let regard = regards
+        .items
+        .iter()
+        .find(|regard| regard.spec.target.name == default_convoy.metadata.name)
+        .expect("default implicit dispatcher regard");
     assert_eq!(regard.spec.principal_ref, default_convoy.spec.dispatching_principal_ref);
     assert_eq!(regard.spec.source, RegardSource::Implicit { policy: "convoy-dispatch".to_string() });
     assert_eq!(regard.spec.expiry, RegardExpiryPolicy::Decaying { expires_after_seconds: 300 });
 
     let batch_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: vec![
-                        IssueSelector::Reference(reference.clone()),
-                        IssueSelector::Reference(reference_two.clone()),
-                        IssueSelector::Reference(reference_two.clone()),
-                    ],
-                    name: Some("batch-732-733".into()),
-                    branch: Some("fix/batch-732-733".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: Vec::new(),
-                    instruction: Some("Fix both issues in one convoy.".into()),
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: vec![
+                            IssueSelector::Reference(reference.clone()),
+                            IssueSelector::Reference(reference_two.clone()),
+                            IssueSelector::Reference(reference_two.clone()),
+                        ],
+                        name: Some("batch-732-733".into()),
+                        branch: Some("fix/batch-732-733".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: Vec::new(),
+                        instruction: Some("Fix both issues in one convoy.".into()),
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("batch command accepted");
     let batch_result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2198,8 +2281,8 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     })
     .await
     .expect("batch start should finish");
-    assert_eq!(batch_result, CommandValue::ConvoyStarted { name: "batch-732-733".into(), attach_plan: None, binding: None });
-    let batch = backend.using::<ResourceConvoy>("flotilla").get("batch-732-733").await.expect("batch convoy");
+    assert_eq!(batch_result, CommandValue::ConvoyStarted { name: "batch-732-733@flotilla".into(), attach_plan: None, binding: None });
+    let batch = admitted_convoy(&backend, "batch-732-733").await;
     assert_eq!(batch.spec.issues.iter().map(|issue| &issue.reference).collect::<Vec<_>>(), vec![&reference, &reference_two]);
     assert_eq!(batch.spec.instruction.as_deref(), Some("Fix both issues in one convoy."));
     let regards = backend.using::<Regard>("flotilla").list().await.expect("list batch dispatcher regards");
@@ -2210,27 +2293,26 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
 
     utility.fail.store(true, Ordering::SeqCst);
     let fallback_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: vec![IssueSelector::Reference(reference)],
-                    name: None,
-                    branch: None,
-                    workflow_ref: None,
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: vec![IssueSelector::Reference(reference)],
+                        name: None,
+                        branch: None,
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("offline fallback command accepted");
     let fallback_result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2245,11 +2327,11 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     .await
     .expect("offline fallback should finish");
     assert_eq!(fallback_result, CommandValue::ConvoyStarted {
-        name: "start-convoy-from-an-issue-732".into(),
+        name: "start-convoy-from-an-issue-732@flotilla".into(),
         attach_plan: None,
         binding: None,
     });
-    let fallback = backend.using::<ResourceConvoy>("flotilla").get("start-convoy-from-an-issue-732").await.expect("fallback convoy");
+    let fallback = admitted_convoy(&backend, "start-convoy-from-an-issue-732").await;
     assert_eq!(fallback.spec.r#ref.as_deref(), Some("start-convoy-from-an-issue-732"));
     assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
 
@@ -2272,27 +2354,26 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .await
         .expect("project with unresolved default should persist");
     let explicit_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: Some("flotilla".into()),
-                    project_ref: "explicit-workflow".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("explicit-workflow".into()),
-                    branch: Some("fix/explicit-workflow".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: Some("flotilla".into()),
+                        project_ref: "explicit-workflow".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("explicit-workflow".into()),
+                        branch: Some("fix/explicit-workflow".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("explicit workflow command accepted");
     let explicit_result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2306,30 +2387,33 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     })
     .await
     .expect("explicit workflow should not consult the missing default");
-    assert_eq!(explicit_result, CommandValue::ConvoyStarted { name: "explicit-workflow".into(), attach_plan: None, binding: None });
+    assert_eq!(explicit_result, CommandValue::ConvoyStarted {
+        name: "explicit-workflow@explicit-workflow".into(),
+        attach_plan: None,
+        binding: None,
+    });
 
     let wrong_namespace_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: Some("other".into()),
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("wrong-namespace".into()),
-                    branch: Some("fix/wrong-namespace".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: Some("other".into()),
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("wrong-namespace".into()),
+                        branch: Some("fix/wrong-namespace".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("namespace rejection command accepted");
     let wrong_namespace_result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2350,27 +2434,26 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     ));
 
     let invalid_branch_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("invalid-branch".into()),
-                    branch: Some("bad branch".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("invalid-branch".into()),
+                        branch: Some("bad branch".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("invalid branch command accepted");
     let invalid_branch_result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2435,27 +2518,26 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
 
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: None,
-                    branch: None,
-                    workflow_ref: None,
-                    inputs: Vec::new(),
-                    instruction: Some("Implement the admission snapshot.".into()),
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: None,
+                        branch: None,
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: Some("Implement the admission snapshot.".into()),
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("start command accepted");
     let result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2470,10 +2552,141 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
     .await
     .expect("start command should finish");
 
-    assert_eq!(result, CommandValue::ConvoyStarted { name: "generated-convoy".into(), attach_plan: None, binding: None });
-    let persisted = backend.using::<ResourceConvoy>("flotilla").get("generated-convoy").await.expect("persisted convoy");
+    assert_eq!(result, CommandValue::ConvoyStarted { name: "generated-convoy@flotilla".into(), attach_plan: None, binding: None });
+    let persisted = admitted_convoy(&backend, "generated-convoy").await;
     assert_eq!(persisted.spec.r#ref.as_deref(), Some("fix/generated-convoy"));
     assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
+    drop(temp);
+}
+
+#[tokio::test]
+async fn convoy_admission_generates_records_and_enforces_one_live_role_generation() {
+    let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    let command = Command::builder()
+        .action(CommandAction::ConvoyStart {
+            intent: Box::new(
+                ConvoyStartIntent::builder()
+                    .project_ref("flotilla".to_string())
+                    .name("governor".to_string())
+                    .branch("governor".to_string())
+                    .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                    .build(),
+            ),
+        })
+        .build();
+    let mut events = daemon.subscribe();
+
+    let first_id = daemon.execute(command.clone()).await.expect("first admission");
+    assert_eq!(recv_command_finished(&mut events, first_id).await, CommandValue::ConvoyStarted {
+        name: "governor@flotilla".to_string(),
+        attach_plan: None,
+        binding: None,
+    });
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let first = convoys.list().await.expect("list first generation").items.pop().expect("first generation");
+    assert!(first.metadata.name.starts_with("convoy-"));
+    assert_ne!(first.metadata.name, "governor");
+    assert_eq!(first.metadata.labels.get(flotilla_resources::PROJECT_LABEL).map(String::as_str), Some("flotilla"));
+    assert_eq!(first.metadata.labels.get(flotilla_resources::ROLE_LABEL).map(String::as_str), Some("governor"));
+    assert_eq!(first.metadata.labels.get(flotilla_resources::GENERATION_LABEL).map(String::as_str), Some("1"));
+
+    let duplicate_id = daemon.execute(command.clone()).await.expect("duplicate admission result");
+    assert_eq!(recv_command_finished(&mut events, duplicate_id).await, CommandValue::Error {
+        message: "live convoy governor@flotilla generation 1 already exists".to_string(),
+    });
+
+    convoys
+        .update_status(&first.metadata.name, &first.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+            phase: flotilla_resources::ConvoyPhase::Failed,
+            ..Default::default()
+        })
+        .await
+        .expect("settle first generation");
+    let second_id = daemon.execute(command).await.expect("second generation admission");
+    assert!(
+        matches!(recv_command_finished(&mut events, second_id).await, CommandValue::ConvoyStarted { name, .. } if name == "governor@flotilla")
+    );
+    let generations = convoys.list().await.expect("list generations").items;
+    assert_eq!(generations.len(), 2, "terminal history must be retained");
+    assert!(generations.iter().any(|convoy| convoy.spec.generation == 2));
+
+    let delete_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: None, name: "governor@flotilla".to_string(), force: true })
+                .build(),
+        )
+        .await
+        .expect("delete by role address");
+    assert_eq!(recv_command_finished(&mut events, delete_id).await, CommandValue::Ok);
+    assert_eq!(convoys.list().await.expect("list after addressed delete").items.len(), 1);
+
+    let terminal_delete_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: None, name: "governor@flotilla".to_string(), force: true })
+                .build(),
+        )
+        .await
+        .expect("delete sole terminal generation by role address");
+    assert_eq!(recv_command_finished(&mut events, terminal_delete_id).await, CommandValue::Ok);
+    assert!(convoys.list().await.expect("list after terminal generation delete").items.is_empty());
+    drop(temp);
+}
+
+#[tokio::test]
+async fn convoy_delete_reaps_a_landed_pre_identity_record_and_its_terminal_sessions() {
+    let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &InputMeta::builder().name("command-builder".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("legacy-workflow".to_string()).build(),
+        )
+        .await
+        .expect("create pre-identity convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+            phase: ConvoyPhase::Landed,
+            ..Default::default()
+        })
+        .await
+        .expect("mark pre-identity convoy landed");
+
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    sessions
+        .create(
+            &InputMeta::builder()
+                .name("legacy-session".to_string())
+                .labels(BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), "command-builder".to_string())]))
+                .build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("legacy-environment".to_string())
+                .role("coder".to_string())
+                .source(TerminalSessionSource::Tool { command: "legacy-agent".to_string() })
+                .cwd("/workspace".to_string())
+                .pool("cleat".to_string())
+                .build(),
+        )
+        .await
+        .expect("create legacy terminal session");
+
+    let mut events = daemon.subscribe();
+    let delete_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: None, name: "command-builder".to_string(), force: false })
+                .build(),
+        )
+        .await
+        .expect("delete command accepted");
+
+    assert_eq!(recv_command_finished(&mut events, delete_id).await, CommandValue::Ok);
+    assert!(matches!(convoys.get("command-builder").await, Err(ResourceError::NotFound { .. })));
+    assert!(matches!(sessions.get("legacy-session").await, Err(ResourceError::NotFound { .. })));
     drop(temp);
 }
 
@@ -2489,27 +2702,26 @@ async fn convoy_start_acknowledges_while_admission_is_in_flight() {
         let daemon = Arc::clone(&daemon);
         async move {
             daemon
-                .execute(Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::ConvoyStart {
-                        intent: Box::new(ConvoyStartIntent {
-                            namespace: None,
-                            project_ref: "flotilla".into(),
-                            change_request: None,
-                            issues: Vec::new(),
-                            name: None,
-                            branch: None,
-                            workflow_ref: None,
-                            inputs: Vec::new(),
-                            instruction: None,
-                            placement_policy: None,
-                            agent_overrides: Vec::new(),
-                            auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
-                        }),
-                    },
-                })
+                .execute(
+                    Command::builder()
+                        .action(CommandAction::ConvoyStart {
+                            intent: Box::new(ConvoyStartIntent {
+                                namespace: None,
+                                project_ref: "flotilla".into(),
+                                change_request: None,
+                                issues: Vec::new(),
+                                name: None,
+                                branch: None,
+                                workflow_ref: None,
+                                inputs: Vec::new(),
+                                instruction: None,
+                                placement_policy: None,
+                                agent_overrides: Vec::new(),
+                                auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                            }),
+                        })
+                        .build(),
+                )
                 .await
         }
     });
@@ -2555,11 +2767,8 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, Some(reference.source.clone())).await;
-    let command = Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: None,
-        action: CommandAction::ConvoyStart {
+    let command = Command::builder()
+        .action(CommandAction::ConvoyStart {
             intent: Box::new(ConvoyStartIntent {
                 namespace: None,
                 project_ref: "flotilla".into(),
@@ -2574,8 +2783,8 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
                 agent_overrides: Vec::new(),
                 auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
             }),
-        },
-    };
+        })
+        .build();
     let mut events = daemon.subscribe();
 
     let first_id = daemon.execute(command.clone()).await.expect("first convoy start should be accepted");
@@ -2618,19 +2827,16 @@ async fn convoy_start_worker_panic_finishes_the_command_and_allows_retry() {
     discovery.factories.ai_utilities.push(Box::new(PanicOnceAiUtilityFactory { utility }));
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
     create_test_convoy_project(&daemon.resource_backend(), None).await;
-    let command = Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: None,
-        action: CommandAction::ConvoyStart {
+    let command = Command::builder()
+        .action(CommandAction::ConvoyStart {
             intent: Box::new(
                 ConvoyStartIntent::builder()
                     .project_ref("flotilla".to_string())
                     .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                     .build(),
             ),
-        },
-    };
+        })
+        .build();
     let mut events = daemon.subscribe();
 
     let first_id = daemon.execute(command.clone()).await.expect("first convoy start should be accepted");
@@ -2639,7 +2845,7 @@ async fn convoy_start_worker_panic_finishes_the_command_and_allows_retry() {
 
     let retry_id = daemon.execute(command).await.expect("matching convoy start retry should be accepted");
     let retry_result = recv_command_finished(&mut events, retry_id).await;
-    assert_eq!(retry_result, CommandValue::ConvoyStarted { name: "retried-convoy".into(), attach_plan: None, binding: None });
+    assert_eq!(retry_result, CommandValue::ConvoyStarted { name: "retried-convoy@flotilla".into(), attach_plan: None, binding: None });
 
     drop(temp);
 }
@@ -2651,34 +2857,34 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
     create_test_convoy_project(&backend, None).await;
     let mut events = daemon.subscribe();
     let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyStart {
-                intent: Box::new(ConvoyStartIntent {
-                    namespace: None,
-                    project_ref: "flotilla".into(),
-                    change_request: None,
-                    issues: Vec::new(),
-                    name: Some("bootstrap-failure".into()),
-                    branch: Some("fix/bootstrap-failure".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
-                    inputs: Vec::new(),
-                    instruction: None,
-                    placement_policy: None,
-                    agent_overrides: Vec::new(),
-                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Always,
-                }),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: Vec::new(),
+                        name: Some("bootstrap-failure".into()),
+                        branch: Some("fix/bootstrap-failure".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Always,
+                    }),
+                })
+                .build(),
+        )
         .await
         .expect("convoy start should be accepted");
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let record_name = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if convoys.get("bootstrap-failure").await.is_ok() {
-                break;
+            let selector = BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "bootstrap-failure".to_string())]);
+            if let Some(convoy) = convoys.list_matching_labels(&selector).await.expect("list bootstrap convoy").items.into_iter().next() {
+                break convoy.metadata.name;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -2689,7 +2895,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
     let workflow = single_agent_contained_workflow_spec();
     apply_status_patch(
         &convoys,
-        "bootstrap-failure",
+        &record_name,
         &convoy_controller_patches::bootstrap(
             WorkflowSnapshot { exit: None, turn_delivery: workflow.turn_delivery, vessels: workflow.vessels },
             "single-agent-contained".into(),
@@ -2706,14 +2912,14 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
     let work_message = "agent adapter claude cannot realize contained stance";
     apply_status_patch(
         &convoys,
-        "bootstrap-failure",
+        &record_name,
         &convoy_controller_patches::roll_up_work("work".into(), WorkPhase::Failed, chrono::Utc::now(), Some(work_message.into())),
     )
     .await
     .expect("work failure patch");
     apply_status_patch(
         &convoys,
-        "bootstrap-failure",
+        &record_name,
         &convoy_controller_patches::fail_convoy(BTreeMap::new(), chrono::Utc::now(), Some("convoy bootstrap failed".into())),
     )
     .await
@@ -4086,12 +4292,10 @@ async fn execute_broadcasts_lifecycle_events() {
     // ArchiveSession with a non-existent ID returns immediately with
     // "session not found" — no external API calls, deterministic.
     // We only care about the lifecycle events, not the command result.
-    let command = Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: Some(RepoSelector::Identity(identity.clone())),
-        action: CommandAction::ArchiveSession { session_id: "nonexistent-session".into() },
-    };
+    let command = Command::builder()
+        .action(CommandAction::ArchiveSession { session_id: "nonexistent-session".into() })
+        .context_repo(RepoSelector::Identity(identity.clone()))
+        .build();
     let command_id = daemon.execute(command).await.expect("execute should return a command id");
 
     // Collect CommandStarted and CommandFinished events, skipping any
@@ -4140,12 +4344,10 @@ async fn fetch_checkout_status_accepts_identity_context_repo() {
     let (_temp, _repo, daemon, identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();
 
-    let command = Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: Some(RepoSelector::Identity(identity.clone())),
-        action: CommandAction::FetchCheckoutStatus { branch: "main".into(), checkout_path: None, change_request_id: None },
-    };
+    let command = Command::builder()
+        .action(CommandAction::FetchCheckoutStatus { branch: "main".into(), checkout_path: None, change_request_id: None })
+        .context_repo(RepoSelector::Identity(identity.clone()))
+        .build();
 
     let command_id = daemon.execute(command).await.expect("status command should resolve via identity context repo");
 
@@ -4180,12 +4382,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     let mut rx = daemon.subscribe();
 
     let add_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: repo.clone() },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: repo.clone() }).build())
         .await
         .expect("add_repo command should return an id");
 
@@ -4223,12 +4420,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     assert_eq!(repos[0].repository_key, added.repository_key);
 
     let remove_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::UntrackRepo { repo: RepoSelector::Query("new-repo".into()) },
-        })
+        .execute(Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Query("new-repo".into()) }).build())
         .await
         .expect("remove_repo command should return an id");
     let (finished_remove, removed) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -4326,12 +4518,7 @@ async fn execute_on_untracked_repo_returns_error_without_started_event() {
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
 
     let err = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) },
-        })
+        .execute(Command::builder().action(CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) }).build())
         .await
         .expect_err("untracked repo should fail");
     assert!(err.contains("repo not tracked"));
@@ -4358,12 +4545,7 @@ async fn untrack_missing_repo_returns_error_without_started_event() {
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
 
     let err = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::UntrackRepo { repo: RepoSelector::Path(repo.clone()) },
-        })
+        .execute(Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Path(repo.clone()) }).build())
         .await
         .expect_err("untracked repo removal should fail");
     assert!(err.contains("repo not tracked"));
@@ -4394,7 +4576,7 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
     let mut rx = daemon.subscribe();
 
     let refresh_id = daemon
-        .execute(Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } })
+        .execute(Command::builder().action(CommandAction::Refresh { repo: None }).build())
         .await
         .expect("refresh all should return an id");
 
@@ -4417,12 +4599,9 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
 async fn remove_checkout_command_accepts_selector_queries() {
     let (_temp, repo, daemon) = daemon_for_cwd().await;
     let err = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("does-not-exist".into()) },
-        })
+        .execute(
+            Command::builder().action(CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("does-not-exist".into()) }).build(),
+        )
         .await
         .expect_err("missing checkout should fail cleanly");
 
@@ -4437,12 +4616,10 @@ async fn fetch_checkout_status_uses_context_repo_when_checkout_path_is_absent() 
     let (_temp, repo, daemon) = daemon_for_cwd().await;
     let mut rx = daemon.subscribe();
 
-    let command = Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: Some(RepoSelector::Path(repo.clone())),
-        action: CommandAction::FetchCheckoutStatus { branch: "main".into(), checkout_path: None, change_request_id: None },
-    };
+    let command = Command::builder()
+        .action(CommandAction::FetchCheckoutStatus { branch: "main".into(), checkout_path: None, change_request_id: None })
+        .context_repo(RepoSelector::Path(repo.clone()))
+        .build();
 
     let command_id = daemon.execute(command).await.expect("status command should resolve via context repo");
 
@@ -4467,30 +4644,28 @@ async fn checkout_target_branch_and_fresh_branch_are_distinct_errors() {
     let mut rx = daemon.subscribe();
 
     let branch_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Path(repo.clone()),
-                target: CheckoutTarget::Branch("definitely-missing-branch".into()),
-                issue_ids: vec![],
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Path(repo.clone()),
+                    target: CheckoutTarget::Branch("definitely-missing-branch".into()),
+                    issue_ids: vec![],
+                })
+                .build(),
+        )
         .await
         .expect("checking out a missing existing branch should return a command id");
 
     let fresh_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Checkout {
-                repo: RepoSelector::Path(repo),
-                target: CheckoutTarget::FreshBranch("main".into()),
-                issue_ids: vec![],
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::Checkout {
+                    repo: RepoSelector::Path(repo),
+                    target: CheckoutTarget::FreshBranch("main".into()),
+                    issue_ids: vec![],
+                })
+                .build(),
+        )
         .await
         .expect("creating a fresh branch that already exists should return a command id");
     let mut branch_err = None;
@@ -4915,4 +5090,368 @@ async fn cancel_nonexistent_command_returns_error() {
     let result = daemon.cancel(999).await;
     assert!(result.is_err(), "cancelling a non-existent command should fail");
     assert!(result.unwrap_err().contains("no matching active command"), "error should mention no matching active command");
+}
+
+#[tokio::test]
+async fn convoy_resume_queues_a_brief_while_crew_is_working() {
+    let (_temp, _repo, daemon) = daemon_for_cwd().await;
+    let backend = daemon.resource_backend();
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &InputMeta::builder().name("busy-convoy".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            crew_work: BTreeMap::from([(
+                "work".to_string(),
+                BTreeMap::from([(
+                    "coder".to_string(),
+                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                )]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("mark crew working");
+
+    daemon
+        .convoy_resume_internal("flotilla", "busy-convoy", "Check the edge case", Some("work"), Some("coder"))
+        .await
+        .expect("queue brief for busy crew");
+
+    let convoy = convoys.get("busy-convoy").await.expect("read convoy");
+    let status = serde_json::to_value(convoy.status.expect("convoy status")).expect("serialize convoy status");
+    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["content"], "Check the edge case");
+    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["vessel"], "work");
+    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["role"], "coder");
+
+    let outcome = daemon
+        .convoy_resume_internal("flotilla", "busy-convoy", "Use the newer instruction", Some("work"), Some("coder"))
+        .await
+        .expect("replace pending brief");
+    assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: Some("Check the edge case".to_string()) });
+    let convoy = convoys.get("busy-convoy").await.expect("read updated convoy");
+    let status = serde_json::to_value(convoy.status.expect("convoy status")).expect("serialize convoy status");
+    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["content"], "Use the newer instruction");
+
+    let withdrawn = daemon.convoy_withdraw_pending_brief_internal("flotilla", "busy-convoy").await.expect("withdraw pending brief");
+    assert_eq!(withdrawn.as_deref(), Some("Use the newer instruction"));
+    assert!(convoys.get("busy-convoy").await.expect("read withdrawn convoy").status.expect("convoy status").pending_brief().is_none());
+
+    apply_status_patch(&convoys, "busy-convoy", &flotilla_resources::ConvoyStatusPatch::RollUpPhase {
+        phase: ConvoyPhase::Landed,
+        started_at: None,
+        finished_at: Some(chrono::Utc::now()),
+    })
+    .await
+    .expect("mark convoy terminal");
+    let error = daemon
+        .convoy_resume_internal("flotilla", "busy-convoy", "too late", Some("work"), Some("coder"))
+        .await
+        .expect_err("terminal convoy should refuse a brief");
+    assert!(error.contains("terminal phase `Landed`"), "unexpected refusal: {error}");
+}
+
+#[tokio::test]
+async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_idle() {
+    let terminal_pool = Arc::new(FakeTerminalPool::new());
+    let discovery = fake_discovery_with_provider_set(
+        FakeDiscoveryProviders::new().with_terminal_pool(Arc::clone(&terminal_pool) as Arc<dyn TerminalPool>),
+    );
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    let backend = daemon.resource_backend();
+    let local_host_ref = daemon.local_host_id().expect("local host identity").to_string();
+    backend
+        .clone()
+        .using::<ResourceHost>("flotilla")
+        .create(&InputMeta::builder().name(local_host_ref.clone()).build(), &HostSpec { display_name: daemon.host_name().to_string() })
+        .await
+        .expect("create local host resource");
+    backend
+        .clone()
+        .using::<flotilla_resources::Environment>("flotilla")
+        .create(&InputMeta::builder().name("idle-environment".to_string()).build(), &flotilla_resources::EnvironmentSpec {
+            host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
+                host_ref: local_host_ref,
+                repo_default_dir: "/workspace".to_string(),
+            }),
+            docker: None,
+        })
+        .await
+        .expect("create idle crew environment");
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &InputMeta::builder().name("idle-convoy".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            crew_work: BTreeMap::from([
+                (
+                    "work".to_string(),
+                    BTreeMap::from([(
+                        "coder".to_string(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                    )]),
+                ),
+                (
+                    "review".to_string(),
+                    BTreeMap::from([(
+                        "qa".to_string(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Done).build(),
+                    )]),
+                ),
+            ]),
+            ..Default::default()
+        })
+        .await
+        .expect("mark crew working");
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let session = sessions
+        .create(
+            &InputMeta::builder()
+                .name("idle-coder-session".to_string())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "idle-convoy".to_string()),
+                    (VESSEL_LABEL.to_string(), "work".to_string()),
+                    (ROLE_LABEL.to_string(), "coder".to_string()),
+                ]))
+                .build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("idle-environment".to_string())
+                .role("coder".to_string())
+                .source(TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: ".flotilla/briefs/coder.md".to_string(),
+                        content: "Initial turn".to_string(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "idle-convoy".to_string(),
+                        vessel_ref: "work-vessel".to_string(),
+                    }),
+                    message: None,
+                })
+                .cwd("/workspace".to_string())
+                .pool("fake-terminals".to_string())
+                .build(),
+        )
+        .await
+        .expect("create idle crew session");
+    sessions
+        .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            session_id: Some("idle-coder".to_string()),
+            attention: Some(TerminalAttention {
+                state: TerminalAttentionState::Working,
+                as_of: chrono::Utc::now() - chrono::Duration::minutes(2),
+                source: TerminalAttentionSource::Screen,
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("observe working crew session");
+    let review_session = sessions
+        .create(
+            &InputMeta::builder()
+                .name("idle-review-session".to_string())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "idle-convoy".to_string()),
+                    (VESSEL_LABEL.to_string(), "review".to_string()),
+                    (ROLE_LABEL.to_string(), "qa".to_string()),
+                ]))
+                .build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("idle-environment".to_string())
+                .role("qa".to_string())
+                .source(TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("review"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: ".flotilla/briefs/qa.md".to_string(),
+                        content: "Initial turn".to_string(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "idle-convoy".to_string(),
+                        vessel_ref: "review-vessel".to_string(),
+                    }),
+                    message: None,
+                })
+                .cwd("/workspace".to_string())
+                .pool("fake-terminals".to_string())
+                .build(),
+        )
+        .await
+        .expect("create review crew session");
+    sessions
+        .update_status(&review_session.metadata.name, &review_session.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            session_id: Some("idle-review".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("mark review crew session running");
+
+    let queued = daemon
+        .convoy_resume_internal("flotilla", "idle-convoy", "Finish the current turn", Some("work"), Some("coder"))
+        .await
+        .expect("queue brief while crew is working");
+    assert_eq!(queued, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: None });
+    let unrelated = daemon
+        .convoy_resume_internal("flotilla", "idle-convoy", "Start the review", Some("review"), Some("qa"))
+        .await
+        .expect("resume unrelated crew");
+    assert_eq!(unrelated, flotilla_core::in_process::ConvoyResumeOutcome::Delivered { displaced: None });
+    assert_eq!(
+        convoys
+            .get("idle-convoy")
+            .await
+            .expect("read convoy with queued brief")
+            .status
+            .expect("convoy status")
+            .pending_brief()
+            .map(|brief| brief.content.as_str()),
+        Some("Finish the current turn")
+    );
+    apply_status_patch(&sessions, "idle-coder-session", &TerminalSessionStatusPatch::ObserveAttention {
+        attention: TerminalAttention {
+            state: TerminalAttentionState::Idle,
+            as_of: chrono::Utc::now() - chrono::Duration::minutes(1),
+            source: TerminalAttentionSource::Screen,
+        },
+    })
+    .await
+    .expect("observe idle crew session");
+
+    let outcome = daemon
+        .convoy_resume_internal("flotilla", "idle-convoy", "Start the next turn", Some("work"), Some("coder"))
+        .await
+        .expect("deliver brief to idle crew");
+
+    assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Delivered {
+        displaced: Some("Finish the current turn".to_string())
+    });
+    assert!(terminal_pool.delivered.lock().await.is_empty(), "agent messages should await reconciled delivery confirmation");
+    let review_session = sessions.get("idle-review-session").await.expect("read queued review session");
+    let TerminalSessionSource::Agent { message: review_message, .. } = review_session.spec.source else {
+        panic!("review session should remain agent-backed")
+    };
+    assert_eq!(review_message.expect("queued review delivery").text, "Start the review");
+    let coder_session = sessions.get("idle-coder-session").await.expect("read queued coder session");
+    let TerminalSessionSource::Agent { message: coder_message, .. } = coder_session.spec.source else {
+        panic!("coder session should remain agent-backed")
+    };
+    assert_eq!(coder_message.expect("queued coder delivery").text, "Start the next turn");
+    let status = convoys.get("idle-convoy").await.expect("read resumed convoy").status.expect("convoy status");
+    assert!(status.pending_brief().is_none());
+    assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("Start the next turn"));
+}
+
+#[tokio::test]
+async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
+    let (_temp, _repo, daemon) = daemon_for_cwd().await;
+    let backend = daemon.resource_backend();
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &InputMeta::builder().name("turn-boundary".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            crew_work: BTreeMap::from([(
+                "work".to_string(),
+                BTreeMap::from([(
+                    "coder".to_string(),
+                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                )]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("mark crew working");
+    backend
+        .clone()
+        .using::<flotilla_resources::Vessel>("flotilla")
+        .create(&InputMeta::builder().name("work-vessel".to_string()).build(), &flotilla_resources::VesselSpec {
+            convoy_ref: "turn-boundary".to_string(),
+            vessel_name: "work".to_string(),
+            placement_policy_ref: "test".to_string(),
+            adopted_checkout_refs: BTreeMap::new(),
+        })
+        .await
+        .expect("create vessel");
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    sessions
+        .create(
+            &InputMeta::builder().name("coder-session".to_string()).build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("test-env".to_string())
+                .role("coder".to_string())
+                .source(TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: ".flotilla/briefs/coder.md".to_string(),
+                        content: "Initial turn".to_string(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "turn-boundary".to_string(),
+                        vessel_ref: "work-vessel".to_string(),
+                    }),
+                    message: None,
+                })
+                .cwd("/workspace".to_string())
+                .pool("cleat".to_string())
+                .build(),
+        )
+        .await
+        .expect("create crew session");
+    daemon
+        .convoy_resume_internal("flotilla", "turn-boundary", "Begin the follow-up turn", Some("work"), Some("coder"))
+        .await
+        .expect("queue pending brief");
+
+    daemon
+        .crew_complete_with_disposition_internal(
+            &flotilla_protocol::CrewCommandContext {
+                crew_id: None,
+                namespace: Some("flotilla".to_string()),
+                convoy: Some("turn-boundary".to_string()),
+                vessel_ref: Some("work-vessel".to_string()),
+                role: Some("coder".to_string()),
+            },
+            Some("first turn complete".to_string()),
+            Some("satisfied".to_string()),
+            None,
+        )
+        .await
+        .expect("complete first turn");
+
+    let convoy = convoys.get("turn-boundary").await.expect("read convoy");
+    let status = convoy.status.expect("convoy status");
+    assert!(status.pending_brief().is_none());
+    assert_eq!(status.phase, ConvoyPhase::Active);
+    assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["work"]["coder"].disposition.as_deref(), Some("satisfied"));
+    let session = sessions.get("coder-session").await.expect("read crew session");
+    let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("crew session should be agent-backed") };
+    assert_eq!(message.expect("next turn message").text, "Begin the follow-up turn");
 }
