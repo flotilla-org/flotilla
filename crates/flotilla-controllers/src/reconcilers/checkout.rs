@@ -177,10 +177,8 @@ fn integration_is_fresh(status: &CheckoutStatus, now: DateTime<Utc>, max_age: Du
     now.signed_duration_since(oldest_observation).to_std().is_ok_and(|age| age < max_age)
 }
 
-fn convoy_needs_terminal_evidence(convoy: Option<&ResourceObject<Convoy>>) -> bool {
-    convoy.and_then(|convoy| convoy.status.as_ref()).is_some_and(|status| {
-        matches!(status.phase, ConvoyPhase::Landing | ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Cancelled)
-    })
+fn convoy_needs_delete_evidence(convoy: Option<&ResourceObject<Convoy>>) -> bool {
+    convoy.is_some_and(|convoy| convoy.status.as_ref().is_none_or(|status| status.phase != ConvoyPhase::Abandoned))
 }
 
 impl<R> Reconciler for CheckoutReconciler<R>
@@ -203,13 +201,13 @@ where
         }
 
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) != CheckoutPhase::Pending {
-            let terminal_evidence = convoy_needs_terminal_evidence(convoy.as_ref());
-            let refresh_after = if terminal_evidence { LANDING_EVIDENCE_TTL } else { CHECKOUT_INTEGRATION_REFRESH_AFTER };
+            let delete_evidence = convoy_needs_delete_evidence(convoy.as_ref());
+            let refresh_after = if delete_evidence { LANDING_EVIDENCE_TTL } else { CHECKOUT_INTEGRATION_REFRESH_AFTER };
             let expected_change_request_id = convoy.as_ref().and_then(|convoy| convoy_change_request_id_for_checkout(convoy, obj));
             if obj.status.as_ref().is_some_and(|status| {
                 status.phase == CheckoutPhase::Ready
                     && (!integration_is_fresh(status, self.clock.now(), refresh_after)
-                        || (terminal_evidence && checkout_observation_lacks_convoy_association(&status.integration))
+                        || (delete_evidence && checkout_observation_lacks_convoy_association(&status.integration))
                         || expected_change_request_id.as_ref().is_some_and(|expected| {
                             status.integration.change_request.as_ref().is_some_and(|observed| &observed.id != expected)
                         }))

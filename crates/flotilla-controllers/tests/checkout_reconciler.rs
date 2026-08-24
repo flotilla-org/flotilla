@@ -412,8 +412,17 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
 }
 
 #[tokio::test]
-async fn checkout_authority_observes_when_replicated_convoy_needs_terminal_evidence() {
-    for phase in [ConvoyPhase::Landing, ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Cancelled] {
+async fn checkout_authority_keeps_delete_evidence_fresh_for_replicated_convoy() {
+    for phase in [
+        ConvoyPhase::Pending,
+        ConvoyPhase::Active,
+        ConvoyPhase::Interrupted,
+        ConvoyPhase::Anchored,
+        ConvoyPhase::Landing,
+        ConvoyPhase::Landed,
+        ConvoyPhase::Failed,
+        ConvoyPhase::Cancelled,
+    ] {
         let authority_root = NodeId::new("convoy-authority");
         let checkout_root = NodeId::new("checkout-authority");
         let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(authority_root.clone());
@@ -432,7 +441,7 @@ async fn checkout_authority_observes_when_replicated_convoy_needs_terminal_evide
         convoys
             .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus { phase, ..Default::default() })
             .await
-            .expect("mark convoy in evidence-consuming phase");
+            .expect("mark convoy in delete-gated phase");
         checkout_host
             .replica_writer::<Convoy>(authority_root, NAMESPACE)
             .replace(&convoys.list().await.expect("list authority convoys"), now)
@@ -480,7 +489,7 @@ async fn checkout_authority_observes_when_replicated_convoy_needs_terminal_evide
         let reconciler = CheckoutReconciler::with_clock(runtime.clone(), checkout_host.clone(), NAMESPACE, clock)
             .with_federated_convoys(&checkout_host, NAMESPACE);
 
-        let deps = reconciler.prepare(&checkout).await.expect("resolve replicated evidence-consuming convoy");
+        let deps = reconciler.prepare(&checkout).await.expect("resolve replicated delete-gated convoy");
 
         assert!(matches!(deps, CheckoutPrepared::Integration { .. }), "{phase:?} must shorten the observation TTL to 30 seconds");
         assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 1, "only the checkout authority should probe its checkout");
