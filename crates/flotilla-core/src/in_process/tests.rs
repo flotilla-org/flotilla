@@ -1704,7 +1704,7 @@ async fn standing_ensure_does_not_capture_another_projects_bare_workflow_but_acc
         .expect("global builtin workflow");
     clock.advance(ChronoDuration::minutes(1));
     assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("global workflow admits"), vec![
-        "started Convoy/quartermaster"
+        "started quartermaster@standing-project"
     ]);
 }
 
