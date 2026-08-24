@@ -206,7 +206,7 @@ async fn managed_presentation_without_its_convoy_is_failed_without_calling_the_r
     let failed = update_presentation_status(&backend, &presentation, outcome.patch.expect("orphan should fail")).await;
     let resynced = reconciler.prepare(&failed).await.expect("failed orphan should remain terminal");
     assert!(matches!(resynced, flotilla_controllers::reconcilers::PresentationPrepared::InSync));
-    assert!(matches!(reconciler.reconcile(&failed, &resynced, Utc::now()).patch, None));
+    assert!(reconciler.reconcile(&failed, &resynced, Utc::now()).patch.is_none());
     assert!(matches!(
         failed.status,
         Some(PresentationStatus {
