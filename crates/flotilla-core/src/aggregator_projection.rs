@@ -372,8 +372,6 @@ impl AggregatorProjectionState {
         };
         let independents_set = self.independents_result_set(scope).await;
         let independents = independents_set.rows.as_independents().map_or_else(Vec::new, ToOwned::to_owned);
-        let checkouts_set = self.checkouts.write().await.result_set(scope);
-        let checkouts = checkouts_set.rows.as_checkouts().map_or_else(Vec::new, ToOwned::to_owned);
         let issue_sets = self.issue_sets_for_awareness(scope).await;
         let issues = issue_sets
             .iter()
@@ -386,11 +384,10 @@ impl AggregatorProjectionState {
             let projection = self.salience.read().await;
             (projection.facts.clone(), projection.revision)
         };
-        let base_seq =
-            [self.seq().await, independents_set.seq, checkouts_set.seq, issue_sets.iter().map(|(_, set)| set.seq).max().unwrap_or(0)]
-                .into_iter()
-                .max()
-                .unwrap_or(0);
+        let base_seq = [self.seq().await, independents_set.seq, issue_sets.iter().map(|(_, set)| set.seq).max().unwrap_or(0)]
+            .into_iter()
+            .max()
+            .unwrap_or(0);
         let seq = base_seq.saturating_add(project_catalog_revision).saturating_add(salience_revision);
         let (rows, state) = project_awareness(AwarenessInput {
             scope: scope.clone(),
@@ -399,7 +396,6 @@ impl AggregatorProjectionState {
             projects,
             convoys,
             issues,
-            checkouts,
             independents,
             salience,
             state,
@@ -583,6 +579,38 @@ mod tests {
                 && node.scope.as_ref() == Some(&project)
                 && node.entries.iter().any(|entry| entry.kind == AwarenessKind::Issue)
         }));
+    }
+
+    #[tokio::test]
+    async fn awareness_omits_observed_checkouts_while_scoped_checkout_queries_remain_available() {
+        let state = AggregatorProjectionState::new();
+        let project = scope("roadmap");
+        state
+            .replace_store_catalog(
+                HashMap::from([(RepositoryKey("repo-a".into()), "github.com/flotilla-org/flotilla".to_string())]),
+                HashMap::from([(project.clone(), vec![RepositoryKey("repo-a".into())])]),
+            )
+            .await;
+        let checkout = CheckoutRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "observed"))
+            .repo(RepositoryKey("repo-a".into()))
+            .repo_label("github.com/flotilla-org/flotilla")
+            .path("/work/flotilla")
+            .branch("main")
+            .host(HostName::new("local"))
+            .authority(flotilla_protocol::LifecycleAuthority::Observed)
+            .build();
+        state.replace_local_checkout_rows(vec![checkout.clone()]).await;
+
+        let awareness = state.awareness_result_set(&None, AwarenessGrouping::Project, AwarenessLimit::default()).await;
+        let rows = awareness.rows.as_awareness().expect("awareness rows");
+        assert_eq!(rows.len(), 1, "only the catalogued project is present");
+        assert_eq!(rows[0].scope.as_ref(), Some(&project));
+        assert!(rows[0].entries.iter().all(|entry| entry.kind != AwarenessKind::Checkout));
+        assert_eq!(rows[0].counts.checkouts, 0);
+
+        let scoped = state.result_set_for(&QueryId::Checkouts { scope: Some(project) }).await.expect("scoped checkout result set");
+        assert_eq!(scoped.rows.as_checkouts().expect("checkout rows"), &[checkout]);
     }
 
     #[tokio::test]

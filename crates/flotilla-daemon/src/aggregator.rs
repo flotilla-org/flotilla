@@ -2671,7 +2671,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_pane_exits_surface_once_as_checkout_attention() {
+    async fn managed_pane_exits_remain_observed_without_checkout_awareness_entries() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(16);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
@@ -2689,21 +2689,6 @@ mod tests {
             .await
             .expect("nested checkout projection");
 
-        let checkout_salience = async |state: &AggregatorProjectionState, name: &str| {
-            let result = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
-            result
-                .rows
-                .as_awareness()
-                .expect("awareness rows")
-                .iter()
-                .flat_map(|node| &node.entries)
-                .find(|entry| {
-                    entry.kind == flotilla_protocol::AwarenessKind::Checkout && entry.refs.iter().any(|reference| reference.name == name)
-                })
-                .expect("checkout entry")
-                .salience
-        };
-
         let fingerprint = HashMap::from([("change-1".to_string(), ("feature".to_string(), "open".to_string()))]);
         aggregator.repo_change_requests.insert(repo_identity.clone(), fingerprint.clone());
 
@@ -2712,14 +2697,11 @@ mod tests {
         assert!(!aggregator.repo_delta_changed_change_requests(&running));
         assert_eq!(aggregator.repo_change_requests.get(&repo_identity), Some(&fingerprint));
         assert!(!aggregator.rebuild_salience_projection().await);
-        assert_eq!(checkout_salience(&state, "flotilla").await, flotilla_protocol::Salience::None);
 
         let exited =
             managed_terminal_delta(repo_identity.clone(), "pane-1", "/work/flotilla/app", Some(PaneExitAttention { exit_code: 7 }), true);
         assert!(aggregator.apply_managed_terminal_delta(&exited));
         assert!(aggregator.rebuild_salience_projection().await);
-        assert_eq!(checkout_salience(&state, "flotilla").await, flotilla_protocol::Salience::Attention);
-        assert_eq!(checkout_salience(&state, "nested").await, flotilla_protocol::Salience::None);
         assert!(aggregator.apply_managed_terminal_delta(&exited));
         assert!(!aggregator.rebuild_salience_projection().await, "the same exit is not admitted twice");
 
@@ -2733,11 +2715,20 @@ mod tests {
             errors: Vec::new(),
         };
         assert!(!aggregator.replace_managed_terminals(&partial_snapshot));
-        assert_eq!(checkout_salience(&state, "flotilla").await, flotilla_protocol::Salience::Attention);
+        let checkouts = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout result set");
+        assert_eq!(checkouts.rows.as_checkouts().expect("checkout rows").len(), 2, "checkout observation remains available");
+        let awareness = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
+        assert!(awareness
+            .rows
+            .as_awareness()
+            .expect("awareness rows")
+            .iter()
+            .flat_map(|node| &node.entries)
+            .all(|entry| entry.kind != flotilla_protocol::AwarenessKind::Checkout));
     }
 
     #[tokio::test]
-    async fn local_pane_exit_matches_cosmetically_different_checkout_path() {
+    async fn local_pane_exit_matching_remains_observed_without_checkout_awareness_entries() {
         let temp = tempfile::tempdir().expect("tempdir");
         let real_checkout = temp.path().join("private").join("repo");
         let alias_checkout = temp.path().join("repo-alias");
@@ -2774,19 +2765,16 @@ mod tests {
         assert!(aggregator.apply_managed_terminal_delta(&exited));
         assert!(aggregator.rebuild_salience_projection().await);
 
-        let result = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
-        let checkout = result
+        let checkouts = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout result set");
+        assert_eq!(checkouts.rows.as_checkouts().expect("checkout rows").len(), 1);
+        let awareness = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
+        assert!(awareness
             .rows
             .as_awareness()
             .expect("awareness rows")
             .iter()
             .flat_map(|node| &node.entries)
-            .find(|entry| {
-                entry.kind == flotilla_protocol::AwarenessKind::Checkout
-                    && entry.refs.iter().any(|reference| reference.name == "local-checkout")
-            })
-            .expect("local checkout entry");
-        assert_eq!(checkout.salience, flotilla_protocol::Salience::Attention);
+            .all(|entry| entry.kind != flotilla_protocol::AwarenessKind::Checkout));
     }
 
     fn attention_meta(name: &str, creation_timestamp: chrono::DateTime<Utc>) -> ObjectMeta {
@@ -3426,7 +3414,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn awareness_repository_labels_use_forge_slugs_and_qualify_collisions() {
+    async fn awareness_repository_groups_exclude_observed_checkouts() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(16);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
@@ -3459,11 +3447,11 @@ mod tests {
         let mut labels = result.rows.as_awareness().expect("awareness rows").iter().map(|node| node.label.as_str()).collect::<Vec<_>>();
         labels.sort_unstable();
 
-        assert_eq!(labels, ["acme/widgets", "changedirection/reticulate", "flotilla-org/flotilla", "flotilla-org/widgets"]);
+        assert_eq!(labels, ["changedirection/reticulate"]);
     }
 
     #[tokio::test]
-    async fn fleet_awareness_qualifies_matching_forge_slugs_from_different_services() {
+    async fn fleet_awareness_excludes_replica_checkout_repository_groups() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(16);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("receiver"), event_tx);
@@ -3478,7 +3466,7 @@ mod tests {
         let mut labels = result.rows.as_awareness().expect("awareness rows").iter().map(|node| node.label.as_str()).collect::<Vec<_>>();
         labels.sort_unstable();
 
-        assert_eq!(labels, ["github.com/acme/widgets", "gitlab.com/acme/widgets"]);
+        assert!(labels.is_empty());
     }
 
     #[tokio::test]
