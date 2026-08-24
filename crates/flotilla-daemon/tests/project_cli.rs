@@ -212,7 +212,7 @@ async fn track_repository(daemon: &Arc<InProcessDaemon>, tmp: &tempfile::TempDir
 }
 
 #[tokio::test]
-async fn replicated_remote_declaration_resolves_and_keeps_mirror_residue_retired_across_refreshes() {
+async fn replicated_remote_declaration_resolution_preserves_existing_mirror_project_residue() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let kiwi_root = NodeId::new("kiwi-root");
@@ -957,7 +957,7 @@ async fn tracked_repo_labels_materialized_project_without_overwriting_user_field
 }
 
 #[tokio::test]
-async fn mirror_and_canonical_roots_materialize_one_repository_and_project() {
+async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mirror_root = tmp.path().join("mirror-root");
     let github_root = tmp.path().join("github-root");
