@@ -1,11 +1,14 @@
 # On-demand fleet candidates
 
-`.forgejo/workflows/fleet-candidates.yml` is the first credential-free half of
-the coordinated fleet release path. A human starts one workflow with exact
-40-character Flotilla and Cleat commits. The workflow fetches those public
-canonical commits from GitHub, builds both projects on the real lab Linux and
-Darwin runners, verifies the resulting programs, and retains unsigned
-run-scoped bundles for seven days.
+`.forgejo/workflows/fleet-candidates.yml` is the first durable-credential-free
+half of the coordinated fleet release path. A human starts one workflow with
+exact 40-character Flotilla, Cleat, mattpocock-skills, and rjw-skills commits.
+The workflow fetches the public program sources from GitHub, records the two
+skill repository revisions in a provisioning manifest, builds on the real lab
+Linux and Darwin runners, verifies the resulting payload, and retains unsigned
+run-scoped bundles for seven days. It does not fetch the private skill fork:
+Forgejo run tokens are repository-scoped, while each contained crew receives a
+scoped GitHub credential during provisioning.
 
 The build workers receive no durable release credential or signing identity.
 Forgejo's per-run artifact token expires with the workflow. These candidates
@@ -48,7 +51,9 @@ central-signing linkage.
   "source_generation": "20260815T223755Z-r84-f63871b20ec6f-c4e78c7c83873",
   "sources": {
     "flotilla": "63871b20ec6f5a9e41308b5d56a90a4fefd41f8e",
-    "cleat": "4e78c7c83873916dcb2342a51001bdfed3d63eda"
+    "cleat": "4e78c7c83873916dcb2342a51001bdfed3d63eda",
+    "mattpocock-skills": "<40-character fork commit>",
+    "rjw-skills": "<40-character fork commit>"
   },
   "peer_protocol_version": 20,
   "central_signing": {
@@ -162,7 +167,12 @@ while dev mode is enabled.
 
 The consumer verifies the outer size and digest, safely extracts the archive,
 and verifies every inner file against its manifest before atomically selecting
-the read-only generation. Linux requires the exact unsigned candidate selected
+the read-only generation. The same generation carries both exact skill source
+revisions in `share/flotilla/skills/.flotilla-sources.json` and configures
+`flotillad` to fetch those commits with the contained crew's scoped GitHub
+credential. The daemon flattens every discovered skill into the seam-resolved
+Claude config home and copies the source manifest alongside it as provenance.
+Linux requires the exact unsigned candidate selected
 by the trusted promoter. Darwin additionally requires the completed central
 derivative, fixed Apple team `973L4GV58R`, matching source/signing metadata,
 strict Apple signature and designated-requirement verification, the recorded

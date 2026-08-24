@@ -2301,11 +2301,25 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         };
 
         let container_id = handle.container_name().map(ToString::to_string).unwrap_or_else(|| format!("flotilla-env-{}", env_id));
-        if let Some(store) = &self.state.credential_store {
-            if let Err(error) = store.prepare_scoped(name, &credential_refs, &credential_scopes, handle.runner()).await {
-                return Err(discard_failed_environment(&handle, Some(store), self.state.agent_material.as_deref(), name, error)
-                    .await
-                    .into());
+        let delivered_credential_environment = if let Some(store) = &self.state.credential_store {
+            let github_repository_grants =
+                material_deliveries.iter().flat_map(|delivery| delivery.github_repository_grants.iter().cloned()).collect::<BTreeSet<_>>();
+            match store
+                .prepare_scoped_with_github_repository_grants(
+                    name,
+                    &credential_refs,
+                    &credential_scopes,
+                    &github_repository_grants,
+                    handle.runner(),
+                )
+                .await
+            {
+                Ok(environment) => environment,
+                Err(error) => {
+                    return Err(discard_failed_environment(&handle, Some(store), self.state.agent_material.as_deref(), name, error)
+                        .await
+                        .into())
+                }
             }
         } else if !credential_refs.is_empty() {
             return Err(discard_failed_environment(
@@ -2317,7 +2331,9 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             )
             .await
             .into());
-        }
+        } else {
+            Vec::new()
+        };
         let resolved_credential_fragments = match &self.state.credential_store {
             Some(store) => match store.vessel_config_fragments_for_runner(&credential_refs, &spec.env, &*handle.runner()).await {
                 Ok(fragments) => fragments,
@@ -2342,6 +2358,21 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             if let Err(error) =
                 stage_agent_environment(&*handle.runner(), self.state.config.state_dir().as_path(), &composed.contents).await
             {
+                return Err(discard_failed_environment(
+                    &handle,
+                    self.state.credential_store.as_deref(),
+                    self.state.agent_material.as_deref(),
+                    name,
+                    error,
+                )
+                .await
+                .into());
+            }
+        }
+        if let Some(agent_material) = &self.state.agent_material {
+            let mut environment = resolved_agent_environment.as_ref().map(|composed| composed.environment.clone()).unwrap_or_default();
+            environment.extend(delivered_credential_environment.iter().cloned());
+            if let Err(error) = agent_material.stage_skills(name, &spec.required_agent_adapters, &environment, &*handle.runner()).await {
                 return Err(discard_failed_environment(
                     &handle,
                     self.state.credential_store.as_deref(),
@@ -3538,7 +3569,7 @@ mod tests {
 
     use super::{test_git_repo::TestGitRepo, *};
     use crate::{
-        agent_material::CONTAINER_CODEX_HOME,
+        agent_material::{CONTAINER_CODEX_HOME, FLOTILLA_SKILLS_DIR_ENV},
         environment_tools::{
             ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH, ENVIRONMENT_CLEAT_LIBRARY_DIR, ENVIRONMENT_CLEAT_PATH, ENVIRONMENT_CLEAT_RUNTIME_DIR,
             ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH,
@@ -3554,6 +3585,17 @@ mod tests {
             DaemonHostPath::new("/opt/flotilla/lib/libghostty-vt.so.0"),
             state_root.into(),
         )
+    }
+
+    fn write_test_skill_sources(root: &Path) -> PathBuf {
+        let skills = root.join("generation/skills");
+        fs::create_dir_all(&skills).expect("create skill source manifest directory");
+        fs::write(
+            skills.join(".flotilla-sources.json"),
+            r#"{"schema_version":1,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+        )
+        .expect("write skill source manifest");
+        skills
     }
 
     async fn publish_merged_change_request(backend: &ResourceBackend, number: u64, authority: &str) {
@@ -4110,7 +4152,7 @@ mod tests {
         }
     }
 
-    struct CredentialInteriorRunner(DiscoveryMockRunner);
+    struct CredentialInteriorRunner(DiscoveryMockRunner, Option<Arc<AtomicBool>>);
 
     #[derive(Default)]
     struct PersistentPathRecordingRunner {
@@ -4160,21 +4202,34 @@ mod tests {
     #[async_trait]
     impl CommandRunner for CredentialInteriorRunner {
         async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-            self.0.run(cmd, args, cwd, label).await
+            if self.1.is_some() || cmd == "mkdir" || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight"))) {
+                Ok(String::new())
+            } else {
+                self.0.run(cmd, args, cwd, label).await
+            }
         }
 
         async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-            self.0.run_output(cmd, args, cwd, label).await
+            if self.1.is_some() {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            } else {
+                self.0.run_output(cmd, args, cwd, label).await
+            }
         }
 
         async fn run_with_input(
             &self,
-            _cmd: &str,
-            _args: &[&str],
+            cmd: &str,
+            args: &[&str],
             _cwd: &Path,
             _label: &ChannelLabel,
             _input: &[u8],
         ) -> Result<String, String> {
+            if cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-stage-skills")) {
+                if let Some(staged) = &self.1 {
+                    staged.store(true, Ordering::SeqCst);
+                }
+            }
             Ok("ok".to_string())
         }
 
@@ -4713,6 +4768,106 @@ mod tests {
             "cleat unavailable for environment provisioning: binary unavailable for contained environment delivery"
         );
         assert!(provider.create_opts.lock().await.is_none(), "the incomplete container must not be created");
+    }
+
+    #[tokio::test]
+    async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"claude-skills-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+        let backend = daemon.resource_backend();
+        for (name, consumer, source) in [
+            ("claude-max", CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() }, "TEST_CLAUDE_TOKEN"),
+            ("github-crew-pr", CredentialConsumer::Gh, "TEST_GITHUB_TOKEN"),
+        ] {
+            backend
+                .clone()
+                .definitions::<CredentialSpec>(NAMESPACE)
+                .create(&empty_meta(name), &CredentialSpecSpec {
+                    consumer,
+                    source: CredentialSource::Env { name: source.to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                })
+                .await
+                .expect("credential declaration");
+        }
+
+        let staged = Arc::new(AtomicBool::new(false));
+        let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
+            DiscoveryMockRunner::builder().tool_exists("claude", true).build(),
+            Some(Arc::clone(&staged)),
+        ));
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+            id: EnvironmentId::new("contained-claude"),
+            image: ImageId::new("contained-image"),
+            runner: Arc::clone(&runner),
+            env_vars: HashMap::from([("HOME".to_string(), "/home/crew".to_string())]),
+            destroyed: Arc::clone(&destroyed),
+        });
+        let mut local_registry = ProviderRegistry::new();
+        local_registry.environment_providers.insert(
+            "docker",
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
+            Arc::new(TestInteriorEnvironmentProvider { handle: Mutex::new(Some(handle)) }),
+        );
+        let host_env = Arc::new(TestEnvVars::new([
+            ("HOME", temp.path().join("home").display().to_string()),
+            ("TEST_CLAUDE_TOKEN", "claude-secret".to_string()),
+            ("TEST_GITHUB_TOKEN", "github-secret".to_string()),
+        ]));
+        let credential_store = Arc::new(CredentialStore::new(
+            backend.clone(),
+            NAMESPACE,
+            host_env.clone(),
+            EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude")),
+            Arc::clone(&runner),
+            config.state_dir().as_path().to_path_buf(),
+        ));
+        let agent_material = Arc::new(AgentMaterialRegistry::new(
+            backend,
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([
+                ("HOME", temp.path().join("home").display().to_string()),
+                (FLOTILLA_SKILLS_DIR_ENV, write_test_skill_sources(temp.path()).display().to_string()),
+            ])),
+        ));
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                daemon,
+                Arc::clone(&config),
+                Arc::new(local_registry),
+                Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+                "host-test".to_string(),
+                None,
+                "host-direct-host-test".to_string(),
+            )
+            .with_environment_tools(fixed_environment_tools(config.state_dir().join("contained-cleat").as_path().to_path_buf()))
+            .with_credential_store(credential_store)
+            .with_agent_material(agent_material),
+        );
+        let credential_refs = BTreeSet::from(["claude-max".to_string(), "github-crew-pr".to_string()]);
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host-test".to_string(),
+            image: "contained-image".to_string(),
+            declared_agent_adapters: BTreeSet::new(),
+            required_agent_adapters: BTreeSet::from(["claude-code".to_string()]),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: BTreeMap::from([(
+                CREDENTIAL_REFS_ENV.to_string(),
+                serde_json::to_string(&credential_refs).expect("encode credential refs"),
+            )]),
+        };
+
+        DockerControllerRuntime { state }.provision("contained-claude", &spec).await.expect("provision Claude vessel");
+
+        assert!(staged.load(Ordering::SeqCst), "provisioning must stage pinned skills before interior discovery");
+        assert!(!destroyed.load(Ordering::SeqCst), "successful skill staging must keep the fresh vessel");
     }
 
     #[tokio::test]
@@ -8830,6 +8985,7 @@ mod tests {
                 .on_run("mkdir", &["-p", &preflight_config_dir.to_string_lossy()], Ok(String::new()))
                 .on_run("mkdir", &["-p", &crew_config_dir.to_string_lossy()], Ok(String::new()))
                 .build(),
+            None,
         ));
         let bag = EnvironmentBag::new()
             .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", env_id.to_string()))
