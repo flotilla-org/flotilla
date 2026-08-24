@@ -2718,7 +2718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_pane_exits_remain_observed_without_checkout_awareness_entries() {
+    async fn managed_pane_exits_surface_on_real_projects_without_checkout_entries() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(16);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
@@ -2735,6 +2735,32 @@ mod tests {
             .apply_checkout_event(WatchEvent::Added(checkout_object("nested", "/work/flotilla/app", nested_repository.spec.key()).await))
             .await
             .expect("nested checkout projection");
+        let outer_project = QueryScope::new("flotilla", "outer");
+        let nested_project = QueryScope::new("flotilla", "nested");
+        state
+            .replace_store_catalog(
+                HashMap::from([
+                    (repository.spec.key(), "flotilla-org/flotilla".to_string()),
+                    (nested_repository.spec.key(), "flotilla-org/nested".to_string()),
+                ]),
+                HashMap::from([
+                    (outer_project.clone(), vec![repository.spec.key()]),
+                    (nested_project.clone(), vec![nested_repository.spec.key()]),
+                ]),
+            )
+            .await;
+
+        let project_salience = async |state: &AggregatorProjectionState, project: &QueryScope| {
+            let result = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
+            result
+                .rows
+                .as_awareness()
+                .expect("awareness rows")
+                .iter()
+                .find(|node| node.scope.as_ref() == Some(project))
+                .expect("project node")
+                .salience
+        };
 
         let fingerprint = HashMap::from([("change-1".to_string(), ("feature".to_string(), "open".to_string()))]);
         aggregator.repo_change_requests.insert(repo_identity.clone(), fingerprint.clone());
@@ -2744,11 +2770,14 @@ mod tests {
         assert!(!aggregator.repo_delta_changed_change_requests(&running));
         assert_eq!(aggregator.repo_change_requests.get(&repo_identity), Some(&fingerprint));
         assert!(!aggregator.rebuild_salience_projection().await);
+        assert_eq!(project_salience(&state, &outer_project).await, flotilla_protocol::Salience::None);
 
         let exited =
             managed_terminal_delta(repo_identity.clone(), "pane-1", "/work/flotilla/app", Some(PaneExitAttention { exit_code: 7 }), true);
         assert!(aggregator.apply_managed_terminal_delta(&exited));
         assert!(aggregator.rebuild_salience_projection().await);
+        assert_eq!(project_salience(&state, &outer_project).await, flotilla_protocol::Salience::Attention);
+        assert_eq!(project_salience(&state, &nested_project).await, flotilla_protocol::Salience::None);
         assert!(aggregator.apply_managed_terminal_delta(&exited));
         assert!(!aggregator.rebuild_salience_projection().await, "the same exit is not admitted twice");
 
@@ -2764,18 +2793,11 @@ mod tests {
         assert!(!aggregator.replace_managed_terminals(&partial_snapshot));
         let checkouts = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout result set");
         assert_eq!(checkouts.rows.as_checkouts().expect("checkout rows").len(), 2, "checkout observation remains available");
-        let awareness = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
-        assert!(awareness
-            .rows
-            .as_awareness()
-            .expect("awareness rows")
-            .iter()
-            .flat_map(|node| &node.entries)
-            .all(|entry| entry.kind != flotilla_protocol::AwarenessKind::Checkout));
+        assert_eq!(project_salience(&state, &outer_project).await, flotilla_protocol::Salience::Attention);
     }
 
     #[tokio::test]
-    async fn local_pane_exit_matching_remains_observed_without_checkout_awareness_entries() {
+    async fn local_pane_exit_matches_checkout_path_and_surfaces_on_its_project() {
         let temp = tempfile::tempdir().expect("tempdir");
         let real_checkout = temp.path().join("private").join("repo");
         let alias_checkout = temp.path().join("repo-alias");
@@ -2800,6 +2822,13 @@ mod tests {
             ))
             .await
             .expect("local checkout projection");
+        let project = QueryScope::new("flotilla", "local-project");
+        state
+            .replace_store_catalog(
+                HashMap::from([(repository.spec.key(), "local-repo".to_string())]),
+                HashMap::from([(project.clone(), vec![repository.spec.key()])]),
+            )
+            .await;
 
         let repo_identity = RepoIdentity { authority: "local".to_string(), path: real_checkout.to_string_lossy().into_owned() };
         let exited = managed_terminal_delta(
@@ -2815,13 +2844,15 @@ mod tests {
         let checkouts = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout result set");
         assert_eq!(checkouts.rows.as_checkouts().expect("checkout rows").len(), 1);
         let awareness = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
-        assert!(awareness
+        let project_node = awareness
             .rows
             .as_awareness()
             .expect("awareness rows")
             .iter()
-            .flat_map(|node| &node.entries)
-            .all(|entry| entry.kind != flotilla_protocol::AwarenessKind::Checkout));
+            .find(|node| node.scope.as_ref() == Some(&project))
+            .expect("project node");
+        assert_eq!(project_node.salience, flotilla_protocol::Salience::Attention);
+        assert!(project_node.entries.iter().all(|entry| entry.kind != flotilla_protocol::AwarenessKind::Checkout));
     }
 
     fn attention_meta(name: &str, creation_timestamp: chrono::DateTime<Utc>) -> ObjectMeta {
@@ -3462,6 +3493,8 @@ mod tests {
 
     #[tokio::test]
     async fn awareness_repository_groups_exclude_observed_checkouts() {
+        // #1758 deliberately removes repository-keyed pseudo-groups created
+        // solely from observed checkouts; only the real independent remains.
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(16);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
@@ -3499,6 +3532,8 @@ mod tests {
 
     #[tokio::test]
     async fn fleet_awareness_excludes_replica_checkout_repository_groups() {
+        // Replica checkout repositories are observation inputs, not real
+        // Projects, so they must not create awareness tree nodes.
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(16);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("receiver"), event_tx);
